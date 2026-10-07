@@ -239,15 +239,16 @@ class TestWebSettingsValidation:
                 shareable_link_signing_key=b"\x00" * 32,
             )
 
-    def test_composer_timeout_must_leave_transport_headroom(self) -> None:
-        with pytest.raises(ValidationError, match="transport idle ceiling"):
-            WebSettings(
-                composer_max_composition_turns=15,
-                composer_max_discovery_turns=10,
-                composer_timeout_seconds=300.0,
-                composer_rate_limit_per_minute=10,
-                shareable_link_signing_key=b"\x00" * 32,
-            )
+    def test_async_composer_budget_is_independent_of_transport_headroom(self) -> None:
+        settings = WebSettings(
+            composer_max_composition_turns=15,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=300.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+        assert settings.composer_timeout_seconds == 300.0
+        assert settings.composer_sync_timeout_seconds == 270.0
 
     def test_composer_timeout_allows_explicit_larger_transport_ceiling(self) -> None:
         settings = WebSettings(

@@ -571,6 +571,9 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
     # ── terminal classes (from the captured body only) ──
     post: Mapping[str, Any] = next((h for h in http_steps if h.get("step") == "post_message"), {})
     post_status = post.get("status")
+    durable = next((h for h in reversed(http_steps) if h.get("step") == "composer_operation" and "terminal_status" in h), None)
+    if durable is not None:
+        post_status = durable["terminal_status"]
     budget = terminal.get("budget_exhausted")
     if not is_valid:
         if budget in {"composition", "discovery"}:

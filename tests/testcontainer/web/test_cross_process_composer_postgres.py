@@ -7,115 +7,45 @@ import multiprocessing
 from collections.abc import Iterator
 from contextlib import contextmanager
 from multiprocessing.connection import Connection
-from typing import Annotated
-from uuid import UUID, uuid4
+from pathlib import Path
+from uuid import uuid4
 
+import psycopg
 import pytest
 import structlog
-from fastapi import Depends, FastAPI, Request
-from httpx import ASGITransport, AsyncClient, Response
-from pydantic import SecretBytes, ValidationError
-from sqlalchemy import Engine, func, select, update
+from psycopg import sql
+from pydantic import ValidationError
+from sqlalchemy import Engine, create_engine, func, select, text, update
+from sqlalchemy.exc import ProgrammingError
+from tests.fixtures.identities import grant_test_pipeline_user
+from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
+from tests.helpers.composer_pg_http import mounted_pg_http_process, pg_http_settings
+from tests.testcontainer.web.test_external_deployment_postgres import _DatabasePair, _identifier
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent
-from elspeth.web.auth.models import IdentityClaims, UserIdentity
+from elspeth.web.app import create_app
+from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.composer.progress import ComposerProgressSnapshot, ComposerRequestLease, tool_completed_progress_event
-from elspeth.web.config import WebSettings
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.composer_progress_authority import (
     ComposerRequestLeaseLost,
-    DatabaseComposerProgressRegistry,
     SessionComposerProgressAuthority,
 )
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
+from elspeth.web.schema_probe import SchemaState, init_landscape_schema, init_session_schema, probe_landscape_schema, probe_session_schema
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import composer_inflight_requests_table, composer_progress_snapshots_table, identities_table
-from elspeth.web.sessions.routes import _helpers
-from elspeth.web.sessions.routes.composer import state
+from elspeth.web.sessions.models import (
+    chat_messages_table,
+    composer_inflight_requests_table,
+    composer_progress_snapshots_table,
+    identities_table,
+)
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 pytestmark = pytest.mark.testcontainer
-
-
-def _http_lifecycle_process(url: str, session_id: str, user_id: str, pipe: Connection) -> None:
-    """Drive a real FastAPI dependency stack in a process owning its own engine."""
-    asyncio.run(_serve_lifecycle_commands(url, session_id, user_id, pipe))
-
-
-async def _serve_lifecycle_commands(url: str, session_id: str, user_id: str, pipe: Connection) -> None:
-    engine = create_session_engine(url)
-    app = FastAPI()
-    registry = DatabaseComposerProgressRegistry(SessionComposerProgressAuthority(engine, owner_instance_id=uuid4().hex, lease_seconds=2))
-    app.state.session_service = SessionServiceImpl(
-        engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.composer-http-pg")
-    )
-    app.state.settings = WebSettings(
-        composer_max_composition_turns=15,
-        composer_max_discovery_turns=10,
-        composer_timeout_seconds=85.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=SecretBytes(b"\x00" * 32),
-    )
-    app.state.composer_progress_registry = registry
-    app.dependency_overrides[_helpers.require_pipeline_user] = lambda: UserIdentity(
-        user_id=user_id,
-        username="composer-pg-user",
-    )
-    app.include_router(state.router)
-    entered: dict[str, asyncio.Event] = {}
-    requests: dict[str, asyncio.Task[Response]] = {}
-
-    @app.post("/{session_id}/test-compose/{request_id}")
-    async def compose_probe(
-        session_id: UUID,
-        request_id: str,
-        request: Request,
-        _inflight: Annotated[None, Depends(_helpers._track_compose_inflight)],
-    ) -> None:
-        sink = await _helpers._composer_progress_sink(registry, request, session_id=str(session_id), request_id=request_id, user_id=user_id)
-        await sink(ComposerProgressEvent(phase="calling_model", headline="Waiting for the test provider"))
-        # A controlled provider wait makes HTTP cancellation deterministic;
-        # production lifecycle/heartbeat/publication/teardown remain intact.
-        entered[request_id].set()
-        await asyncio.Event().wait()
-
-    try:
-        with pytest.MonkeyPatch.context() as monkeypatch:
-            monkeypatch.setattr(_helpers, "_COMPOSER_HEARTBEAT_SECONDS", 0.2)
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://composer.test") as client:
-                pipe.send("ready")
-                while True:
-                    command, argument = await asyncio.to_thread(pipe.recv)
-                    if command == "stop":
-                        break
-                    if command == "start":
-                        entered[argument] = asyncio.Event()
-                        requests[argument] = asyncio.create_task(client.post(f"/{session_id}/test-compose/{argument}"))
-                        await asyncio.wait_for(entered[argument].wait(), timeout=20)
-                        pipe.send("provider-entered")
-                    elif command == "abort":
-                        task = requests.pop(argument)
-                        task.cancel()
-                        with pytest.raises(asyncio.CancelledError):
-                            await task
-                        pipe.send("aborted")
-                    elif command == "poll":
-                        # A fresh HTTP client on every poll represents reload
-                        # or reconnect without inheriting a prior response.
-                        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://composer.test") as reader:
-                            response = await reader.get(f"/{session_id}/composer-progress")
-                            assert response.status_code == 200, response.text
-                            pipe.send(ComposerProgressSnapshot.model_validate_json(response.content))
-                    else:
-                        raise AssertionError(f"Unknown lifecycle command: {command}")
-                for task in requests.values():
-                    task.cancel()
-                await asyncio.gather(*requests.values(), return_exceptions=True)
-    finally:
-        engine.dispose()
-        pipe.close()
 
 
 @pytest.fixture()
@@ -236,14 +166,114 @@ def _read(pipe: Connection) -> ComposerProgressSnapshot:
     return result
 
 
+@pytest.fixture
+def composer_http_databases(external_deployment_postgres_url: str) -> Iterator[_DatabasePair]:
+    """Separate task-owned databases; owner bootstrap and DDL-denied runtime role."""
+    databases = _DatabasePair(
+        postgres_url=external_deployment_postgres_url,
+        session_database=_identifier("composer_http_session"),
+        landscape_database=_identifier("composer_http_landscape"),
+        runtime_role=_identifier("composer_http_runtime"),
+        runtime_password=uuid4().hex,
+    )
+    assert databases.session_database != databases.landscape_database
+    admin = create_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as connection:
+            for name in (databases.session_database, databases.landscape_database):
+                connection.exec_driver_sql(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)).as_string())
+        yield databases
+    finally:
+        with admin.connect() as connection:
+            for name in (databases.session_database, databases.landscape_database):
+                connection.exec_driver_sql(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)).as_string())
+            if databases.role_created:
+                connection.exec_driver_sql(sql.SQL("DROP ROLE {}").format(sql.Identifier(databases.runtime_role)).as_string())
+        admin.dispose()
+
+
 def test_fastapi_abort_heartbeat_and_reload_share_durable_lifecycle_across_processes(
-    external_deployment_postgres_url: str, composer_session: tuple[Engine, str, str]
+    composer_http_databases: _DatabasePair, tmp_path: Path
 ) -> None:
-    engine, session_id, user_id = composer_session
+    # Historical abort now means observer detach. User Stop is a separate actor.
+    # Both peers mount the production app; only the external SDK is offline.
+    databases = composer_http_databases
+    session_owner = create_session_engine(databases.session_owner_url)
+    landscape_owner = create_engine(databases.landscape_owner_url)
+    try:
+        init_session_schema(session_owner)
+        init_landscape_schema(landscape_owner)
+        assert probe_session_schema(session_owner) is SchemaState.CURRENT
+        assert probe_landscape_schema(landscape_owner) is SchemaState.CURRENT
+        # Same explicit role topology as the external-state acceptance helper:
+        # fresh schema-owner bootstrap, then a non-owner LOGIN role.
+        databases.provision_runtime_role()
+        for owner, permissions in (
+            (session_owner, "SELECT, INSERT, UPDATE, DELETE"),
+            (landscape_owner, "SELECT, INSERT, UPDATE"),
+        ):
+            with owner.begin() as connection:
+                connection.exec_driver_sql(
+                    sql.SQL("GRANT " + permissions + " ON ALL TABLES IN SCHEMA public TO {}")
+                    .format(sql.Identifier(databases.runtime_role))
+                    .as_string()
+                )
+                connection.exec_driver_sql(
+                    sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {}")
+                    .format(sql.Identifier(databases.runtime_role))
+                    .as_string()
+                )
+    finally:
+        session_owner.dispose()
+        landscape_owner.dispose()
+    for url in (databases.session_runtime_url, databases.landscape_runtime_url):
+        runtime = create_engine(url)
+        try:
+            with runtime.connect() as connection:
+                identity = connection.execute(
+                    text("SELECT current_user, rolsuper, rolcreatedb, rolcreaterole FROM pg_roles WHERE rolname = current_user")
+                ).one()
+                assert identity == (databases.runtime_role, False, False, False)
+                assert connection.execute(text("SELECT has_schema_privilege(current_user, 'public', 'CREATE')")).scalar_one() is False
+            with pytest.raises(ProgrammingError) as refused, runtime.begin() as connection:
+                connection.exec_driver_sql("CREATE TABLE composer_http_runtime_ddl_must_fail (id integer)")
+            assert isinstance(refused.value.orig, psycopg.errors.InsufficientPrivilege)
+            assert refused.value.orig.sqlstate == "42501"
+        finally:
+            runtime.dispose()
+    for directory in (tmp_path, tmp_path / "blobs", tmp_path / "payloads"):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+
+    async def prepare() -> tuple[str, str, str]:
+        with pytest.MonkeyPatch.context() as credential_patch:
+            credential_patch.setenv("OPENAI_API_KEY", "offline-pg-http-test-only-not-a-provider-credential")
+            app = create_app(
+                settings=pg_http_settings(databases.session_runtime_url, databases.landscape_runtime_url, tmp_path),
+                process_watchdog_factory=OwnedTestProcessWatchdog,
+            )
+            async with app.router.lifespan_context(app):
+                provider = app.state.auth_provider
+                assert isinstance(provider, LocalAuthProvider)
+                username = f"http-custody-{uuid4().hex}"
+                provider.create_user(username, "test mounted composer password", "HTTP Custody")
+                token = await provider.login(username, "test mounted composer password")
+                principal = await provider.authenticate(token)
+                with app.state.session_engine.begin() as connection:
+                    grant_test_pipeline_user(connection, identity_id=principal.user_id)
+                session = await app.state.session_service.create_session(principal.user_id, "Shared durable HTTP Composer", "local")
+                return str(session.id), principal.user_id, username
+
+    session_id, user_id, username = asyncio.run(prepare())
+    engine = create_session_engine(databases.session_runtime_url)
+    operation_id = str(uuid4())
     context = multiprocessing.get_context("spawn")
     pairs = [context.Pipe() for _ in range(2)]
     processes = [
-        context.Process(target=_http_lifecycle_process, args=(external_deployment_postgres_url, session_id, user_id, child))
+        context.Process(
+            target=mounted_pg_http_process,
+            args=(databases.session_runtime_url, databases.landscape_runtime_url, str(tmp_path), session_id, user_id, username, child),
+        )
         for _, child in pairs
     ]
     try:
@@ -252,28 +282,70 @@ def test_fastapi_abort_heartbeat_and_reload_share_durable_lifecycle_across_proce
         first, second = (pair[0] for pair in pairs)
         assert _receive(first) == "ready"
         assert _receive(second) == "ready"
-        assert _command(first, "start", "old-http-request") == "provider-entered"
-        assert _command(second, "start", "new-http-request") == "provider-entered"
-        snapshot = _command(second, "poll")
-        assert isinstance(snapshot, ComposerProgressSnapshot)
-        assert snapshot.inflight_requests == 2
-        assert snapshot.request_id == "new-http-request"
-        # No manual heartbeat: both real yield dependencies must renew while
-        # their request tasks remain suspended beyond the original two seconds.
+        admitted = _command(first, "start", operation_id)
+        assert admitted["accepted"]["operation_id"] == operation_id
+        assert admitted["sdk_calls"] == 1
+        own_observation = _command(first, "observe", operation_id)
+        peer_observation = _command(second, "observe", operation_id)
+        assert own_observation == {"observed": operation_id, "permits": 1, "sdk_calls": 1}
+        assert peer_observation == {"observed": operation_id, "permits": 1, "sdk_calls": 0}
+        snapshot = _command(second, "poll", operation_id)
+        assert snapshot["snapshot"]["operation_id"] == operation_id
+        assert snapshot["snapshot"]["status"] == "running"
+        assert snapshot["attempt"] == 1
+        assert snapshot["cancel_requested_at"] is None
+        assert snapshot["claim_expires_at"] is None
+        initial_fence = snapshot["fence"]
+        assert initial_fence["operation_kind"] == "compose"
+        assert initial_fence["owner_instance_id"] == snapshot["claim_owner"]
+        assert initial_fence["released_at"] is None
+        assert initial_fence["lease_expires_at"] > snapshot["fence_database_now"]
+        # Production SessionService uses its30-second default; WebSettings
+        # does not expose a shorter session TTL. Advance real PostgreSQL time
+        # past the actual originally observed session fence expiry.
         with engine.connect() as conn:
-            conn.exec_driver_sql("SELECT pg_sleep(2.5)")
-        reloaded = _command(second, "poll")
-        assert isinstance(reloaded, ComposerProgressSnapshot)
-        assert reloaded.inflight_requests == 2
-        assert _command(first, "abort", "old-http-request") == "aborted"
-        after_abort = _command(second, "poll")
-        assert isinstance(after_abort, ComposerProgressSnapshot)
-        assert after_abort.inflight_requests == 1
-        assert after_abort.request_id == "new-http-request"
-        assert _command(second, "abort", "new-http-request") == "aborted"
-        settled = _command(second, "poll")
-        assert isinstance(settled, ComposerProgressSnapshot)
-        assert settled.inflight_requests == 0
+            conn.exec_driver_sql("SELECT pg_sleep(31.0)")
+        reloaded = _command(second, "poll", operation_id)
+        assert reloaded["snapshot"]["status"] == "running"
+        assert reloaded["claim_owner"] == snapshot["claim_owner"]
+        assert reloaded["attempt"] == 1
+        assert reloaded["claim_expires_at"] is None
+        renewed_fence = reloaded["fence"]
+        assert reloaded["fence_database_now"] > initial_fence["lease_expires_at"]
+        assert renewed_fence["operation_id"] == initial_fence["operation_id"]
+        assert renewed_fence["operation_epoch"] == initial_fence["operation_epoch"]
+        assert renewed_fence["owner_instance_id"] == initial_fence["owner_instance_id"]
+        assert renewed_fence["released_at"] is None
+        assert renewed_fence["lease_expires_at"] > reloaded["fence_database_now"]
+        assert renewed_fence["lease_expires_at"] > initial_fence["lease_expires_at"]
+        assert reloaded["sdk_calls"] == 0
+        assert reloaded["permits"] == 1
+        detached = _command(first, "disconnect", operation_id)
+        assert detached == {"detached": operation_id, "permits": 0, "sdk_calls": 1, "sdk_cancelled": 0}
+        after_abort = _command(second, "poll", operation_id)
+        assert after_abort["snapshot"]["status"] == "running"
+        assert after_abort["cancel_requested_at"] is None
+        assert after_abort["permits"] == 1
+        assert after_abort["attempt"] == 1
+        stopped = _command(first, "cancel", operation_id)
+        assert stopped["terminal"]["operation_id"] == operation_id
+        assert stopped["terminal"]["status"] == "failed"
+        assert stopped["terminal"]["error"]["http_status"] == 499
+        assert stopped["sdk_calls"] == 1
+        assert stopped["sdk_cancelled"] == 1
+        observed_terminal = _command(second, "finish-observer", operation_id)
+        assert observed_terminal == {"terminal_observed": operation_id, "permits": 0, "sdk_calls": 0}
+        settled = _command(second, "poll", operation_id)
+        assert settled["snapshot"] == stopped["terminal"]
+        assert settled["cancel_requested_at"] is not None
+        assert settled["attempt"] == 1
+        assert settled["sdk_calls"] == 0
+        with engine.connect() as connection:
+            roles = (
+                connection.execute(select(chat_messages_table.c.role).where(chat_messages_table.c.session_id == session_id)).scalars().all()
+            )
+        assert roles.count("user") == 1
+        assert roles.count("assistant") == 0
         for parent, _ in pairs:
             parent.send(("stop", None))
         for process in processes:
@@ -287,6 +359,7 @@ def test_fastapi_abort_heartbeat_and_reload_share_durable_lifecycle_across_proce
         for parent, child in pairs:
             parent.close()
             child.close()
+        engine.dispose()
 
 
 def test_spawned_requests_count_queued_work_and_preserve_latest_custody(

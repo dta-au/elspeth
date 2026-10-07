@@ -1951,7 +1951,7 @@ def test_persist_compose_turn_rejects_duplicate_tool_call_id_in_rows(service):
 
 
 @pytest.mark.asyncio
-async def test_persist_compose_turn_async_caller_cancellation_commits_anyway(service):
+async def test_persist_compose_turn_async_caller_cancellation_commits_anyway(service, monkeypatch):
     """Q-F2 commit-wins contract: caller cancellation does NOT roll
     back the worker. The post-cancel DB state must contain the
     persisted rows, and the integrity counter MUST NOT have moved on
@@ -1997,11 +1997,7 @@ async def test_persist_compose_turn_async_caller_cancellation_commits_anyway(ser
         finally:
             worker_finished.set()
 
-    # SessionServiceImpl is a plain class with no __slots__; bound-method
-    # rebinding via attribute assignment is the standard test-time
-    # monkey-patch. The mypy ignore is required because mypy treats
-    # bound methods as immutable on classes that declare them.
-    service.persist_compose_turn = gated_persist  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "persist_compose_turn", gated_persist)
 
     async def _do_persist() -> None:
         await service.persist_compose_turn_async(
@@ -2031,12 +2027,13 @@ async def test_persist_compose_turn_async_caller_cancellation_commits_anyway(ser
         pytest.fail("worker thread never reached the gate within 2s")
 
     inner.cancel()
+    await asyncio.sleep(0.03)
+    assert not inner.done()
+    assert not worker_finished.is_set()
+    release.set()
     with pytest.raises(asyncio.CancelledError):
         await inner
-
-    # Now release the worker so it can commit. The worker is shielded;
-    # the cancel above only affected the awaiter.
-    release.set()
+    assert worker_finished.is_set()
 
     # Wait until the shielded worker has finished. The async bridge has
     # no public completion handle after caller cancellation, so the test

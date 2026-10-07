@@ -52,10 +52,11 @@ from elspeth.web.execution.envelope import RunExecutionInput
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import protocol as sessions_protocol
+from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
+from elspeth.web.sessions.composer_turn import run_composer_turn
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import RunEventRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes import interpretation as interpretation_routes
-from elspeth.web.sessions.routes import messages as message_routes
 from elspeth.web.sessions.service import SessionServiceImpl
 
 
@@ -81,32 +82,100 @@ def test_run_admission_requires_the_exact_session_context(owner: type[Any], meth
     assert parameter.annotation is SessionOperationContext or parameter.annotation == "SessionOperationContext"
 
 
-def test_send_message_acquires_compose_authority_before_state_or_message_access() -> None:
-    source = textwrap.dedent(inspect.getsource(message_routes.register_message_routes))
-    tree = ast.parse(source)
-    send_message = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "send_message")
-    compose_scope = next(
+def _assert_composer_turn_authority(source: str) -> None:
+    tree = ast.parse(textwrap.dedent(source))
+    function = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_composer_turn")
+    guard = next(
         node
-        for node in ast.walk(send_message)
-        if isinstance(node, ast.AsyncWith) and any(ast.unparse(item.context_expr) == "compose_lock" for item in node.items)
+        for node in ast.walk(function)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "lease.context != running.session_operation_context"
     )
-    lease_item = next(item for item in compose_scope.items if "SessionOperationLease.acquire" in ast.unparse(item.context_expr))
-    assert isinstance(lease_item.optional_vars, ast.Name)
-    assert lease_item.optional_vars.id == "compose_operation_lease"
-
+    assert any(isinstance(node, ast.Raise) for node in ast.walk(guard))
     state_read = next(
-        node for node in ast.walk(compose_scope) if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.get_current_state"
+        node for node in ast.walk(function) if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.get_current_state"
     )
     transcript_write = next(
         node
-        for node in ast.walk(compose_scope)
+        for node in ast.walk(function)
         if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.add_message_with_transcript"
     )
-    assert lease_item.context_expr.lineno < state_read.lineno < transcript_write.lineno
-    assert any(
-        keyword.arg == "session_operation_context" and ast.unparse(keyword.value) == "compose_operation_lease.context"
-        for keyword in transcript_write.keywords
+    assert guard.lineno < state_read.lineno < transcript_write.lineno
+    assert [
+        (keyword.arg, ast.unparse(keyword.value)) for keyword in transcript_write.keywords if keyword.arg == "session_operation_context"
+    ] == [("session_operation_context", "lease.context")]
+    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in transcript_write.keywords if keyword.arg == "running"] == [
+        ("running", "running")
+    ]
+    parent = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and node is not transcript_write
+        and transcript_write in ast.walk(node)
+        and ast.unparse(node.func) == "lease.create_task"
     )
+    assert parent is not None
+
+
+def test_detached_turn_checks_exact_adopted_authority_before_state_or_message_access() -> None:
+    _assert_composer_turn_authority(inspect.getsource(run_composer_turn))
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("lease.context != running.session_operation_context", "lease.context != other_context"),
+        ("session_operation_context=lease.context", "session_operation_context=other_context"),
+        ("running=running", "running=other_running"),
+        ("ingress = lease.create_task", "ingress = asyncio.create_task"),
+    ],
+)
+def test_detached_turn_authority_control_rejects_changed_fence_or_child_owner(before: str, after: str) -> None:
+    source = inspect.getsource(run_composer_turn)
+    assert before in source
+    _assert_composer_turn_authority(source)
+    with pytest.raises((AssertionError, StopIteration)):
+        _assert_composer_turn_authority(source.replace(before, after))
+
+
+def _assert_worker_adopted_lease_transfer(source: str) -> None:
+    tree = ast.parse(textwrap.dedent(source))
+    turn = next(node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.unparse(node.func) == "run_composer_turn")
+    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in turn.keywords if keyword.arg in {"lease", "running"}] == [
+        ("lease", "lease"),
+        ("running", "running"),
+    ]
+    outer = ast.parse(textwrap.dedent(inspect.getsource(ComposerAsyncWorker._run_started)))
+    transfer = next(
+        node for node in ast.walk(outer) if isinstance(node, ast.Call) and ast.unparse(node.func) == "self._run_started_under_lease"
+    )
+    assert [ast.unparse(arg) for arg in transfer.args] == ["services", "running", "lease", "settlement"]
+    scope = next(node for node in ast.walk(outer) if isinstance(node, ast.AsyncWith) and transfer in ast.walk(node))
+    assert any(ast.unparse(item.context_expr) == "lease" for item in scope.items)
+
+
+def test_worker_runs_detached_turn_inside_adopted_renewable_lease() -> None:
+    _assert_worker_adopted_lease_transfer(inspect.getsource(ComposerAsyncWorker._run_started_under_lease))
+    source = inspect.getsource(ComposerAsyncWorker._job)
+    assert "start_composer_async_operation" in source
+    assert "SessionOperationLease.adopt" in source
+    assert "await self._run_started(services, running, lease)" in source
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("lease=lease", "lease=other_lease"),
+        ("running=running", "running=other_running"),
+        ("await run_composer_turn(", "await other_turn("),
+    ],
+)
+def test_worker_transfer_rejects_changed_turn_or_exact_authority(before: str, after: str) -> None:
+    source = inspect.getsource(ComposerAsyncWorker._run_started_under_lease)
+    assert before in source
+    _assert_worker_adopted_lease_transfer(source)
+    with pytest.raises((AssertionError, StopIteration)):
+        _assert_worker_adopted_lease_transfer(source.replace(before, after))
 
 
 @pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
@@ -316,21 +385,20 @@ def test_rate_cap_no_surfaces_write_reuses_compose_context() -> None:
 
 
 def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
-    route_source = textwrap.dedent(inspect.getsource(message_routes.register_message_routes))
+    route_source = textwrap.dedent(inspect.getsource(run_composer_turn))
     route_tree = ast.parse(route_source)
     auto_title_call = next(
         node for node in ast.walk(route_tree) if isinstance(node, ast.Call) and ast.unparse(node.func) == "maybe_auto_title_session"
     )
     assert any(
-        keyword.arg == "session_operation_context" and ast.unparse(keyword.value) == "compose_operation_lease.context"
-        for keyword in auto_title_call.keywords
+        keyword.arg == "session_operation_context" and ast.unparse(keyword.value) == "lease.context" for keyword in auto_title_call.keywords
     )
     parent = next(
         node
         for node in ast.walk(route_tree)
         if isinstance(node, ast.Call) and auto_title_call in ast.walk(node) and node is not auto_title_call
     )
-    assert ast.unparse(parent.func) == "compose_operation_lease.create_task"
+    assert ast.unparse(parent.func) == "lease.create_task"
 
     title_source = textwrap.dedent(inspect.getsource(_auto_title.maybe_auto_title_session))
     assert "session_operation_context=session_operation_context" in title_source

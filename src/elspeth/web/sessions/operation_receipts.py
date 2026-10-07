@@ -14,6 +14,7 @@ from sqlalchemy.engine import RowMapping
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.web.sessions.models import session_operation_receipt_events_table, session_operation_receipts_table, sessions_table
+from elspeth.web.sessions.operation_codec import session_operation_request_hash, strict_response_hash
 from elspeth.web.sessions.protocol import (
     OperationReceiptActive,
     OperationReceiptClaimed,
@@ -33,33 +34,15 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.time_normalization import restore_utc
 
-_REQUEST_SCHEMA = "session-operation-receipt-request.v1"
-
 
 def operation_receipt_request_hash(*, session_id: UUID, kind: OperationReceiptKind, request: BaseModel) -> str:
     """Bind normalized request semantics, excluding transport retry identity."""
-    config = type(request).model_config
-    if config.get("strict") is not True or config.get("extra") != "forbid":
-        raise AuditIntegrityError("Operation receipt requires a strict, extra-forbid request DTO")
-    if "operation_id" not in type(request).model_fields:
-        raise AuditIntegrityError("Operation receipt request DTO is missing operation_id")
-    normalized: dict[str, Any] = request.model_dump(
-        mode="json",
-        exclude={"operation_id"},
-        exclude_unset=False,
-        exclude_defaults=False,
-        exclude_none=False,
-    )
-    return stable_hash({"schema": _REQUEST_SCHEMA, "session_id": str(session_id), "kind": kind, "request": normalized})
+    return session_operation_request_hash(schema="session-operation-receipt-request.v1", session_id=session_id, kind=kind, request=request)
 
 
 def operation_receipt_response_hash(response: BaseModel) -> str:
     """Hash the strict response domain that a terminal replay must reproduce."""
-    config = type(response).model_config
-    if config.get("strict") is not True or config.get("extra") != "forbid":
-        raise AuditIntegrityError("Operation receipt replay requires a strict, extra-forbid response DTO")
-    strict_response = type(response).model_validate(response.model_dump(mode="python"), strict=True)
-    return stable_hash(strict_response.model_dump(mode="json"))
+    return strict_response_hash(response)
 
 
 def _validate_identity(*, operation_id: str, kind: OperationReceiptKind, request_hash: str) -> None:

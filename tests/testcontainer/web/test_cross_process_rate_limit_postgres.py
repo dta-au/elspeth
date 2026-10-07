@@ -33,22 +33,25 @@ def rate_url() -> Iterator[str]:
 
 
 def _admit_process(url: str, subject: str, pipe: Connection) -> None:
-    engine = create_engine(url)
-    try:
-        limiter = SharedRateLimiter(3, authority=RepositoryRateLimitAuthority(engine, signing_key=_KEY), scope="composer")
-        pipe.send("ready")
-        pipe.recv()
-        results = []
-        for _ in range(3):
-            try:
-                asyncio.run(limiter.check(subject))
-                results.append(200)
-            except HTTPException as exc:
-                results.append(exc.status_code)
-        pipe.send(results)
-    finally:
-        engine.dispose()
-        pipe.close()
+    from tests.helpers.child_executor_lifecycle import child_executor_lifecycle
+
+    with child_executor_lifecycle():
+        engine = create_engine(url)
+        try:
+            limiter = SharedRateLimiter(3, authority=RepositoryRateLimitAuthority(engine, signing_key=_KEY), scope="composer")
+            pipe.send("ready")
+            pipe.recv()
+            results = []
+            for _ in range(3):
+                try:
+                    asyncio.run(limiter.check(subject))
+                    results.append(200)
+                except HTTPException as exc:
+                    results.append(exc.status_code)
+            pipe.send(results)
+        finally:
+            engine.dispose()
+            pipe.close()
 
 
 def test_two_processes_share_budget(rate_url: str) -> None:

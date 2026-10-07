@@ -779,6 +779,19 @@ class InterpretationSurfacing:
             session_operation_context=session_operation_context,
         )
 
+    def prepare_pending_interpretation_reviews(self, state: CompositionState) -> tuple[PreparedInterpretationEventDraft, ...]:
+        """Freeze the planner candidate's review cohort before its atomic write."""
+        if unsurfaceable_pending_interpretation_review_sites(state):
+            raise InvariantError("pipeline candidate has an unsurfaceable pending interpretation site")
+        return prepare_pending_interpretation_event_drafts_for_state(
+            state,
+            surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
+            model_identifier=self._model_identifier,
+            model_version=self._model_identifier,
+            provider=self._provider,
+            composer_skill_hash=self._composer_skill_hash,
+        )
+
     async def surface_pending_interpretation_reviews(
         self,
         state: CompositionState,

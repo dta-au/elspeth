@@ -366,7 +366,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 70 stores the tutorial Build stage as build.
     # Epoch 71 removes the Composer mode preference and adds mode-neutral
     # fork/revert receipts.
-    assert SESSION_SCHEMA_EPOCH == 71
+    # Epoch 72 persists durable composer operations and exact operation ingress binding.
+    assert SESSION_SCHEMA_EPOCH == 72
     expected_tables = frozenset(
         {
             "web_instances",
@@ -411,7 +412,7 @@ def test_message_ingress_receipt_schema_has_exact_same_session_bindings() -> Non
     initialize_session_schema(engine)
     inspector = inspect(engine)
     assert "message_ingress_receipts" in inspector.get_table_names()
-    assert inspector.get_pk_constraint("message_ingress_receipts")["constrained_columns"] == ["session_id", "client_request_id"]
+    assert inspector.get_pk_constraint("message_ingress_receipts")["constrained_columns"] == ["session_id", "operation_id"]
     assert {tuple(item["column_names"]) for item in inspector.get_unique_constraints("message_ingress_receipts")} == {("user_message_id",)}
     bindings = {
         (tuple(item["constrained_columns"]), item["referred_table"], tuple(item["referred_columns"]))
@@ -419,6 +420,7 @@ def test_message_ingress_receipt_schema_has_exact_same_session_bindings() -> Non
     }
     assert bindings == {
         (("session_id",), "sessions", ("id",)),
+        (("session_id", "operation_id", "user_message_id"), "composer_async_operations", ("session_id", "operation_id", "user_message_id")),
         (("user_message_id", "session_id"), "chat_messages", ("id", "session_id")),
         (("requested_state_id", "session_id"), "composition_states", ("id", "session_id")),
     }

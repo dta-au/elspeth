@@ -25,6 +25,7 @@ from elspeth.web.composer.tool_error_payloads import (
 )
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.interpretation_state import pending_execution_interpretation_sites
+from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow, RejectionRecord
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 
@@ -225,6 +226,7 @@ async def persist_turn_audit(
     assistant_row_uses_current_dispatch: bool,
     ingress: CompositionIngressRecord | None = None,
     chat_ingress_inputs: list[ChatIngressInput] | None = None,
+    required_work: RequiredWorkBinding | None = None,
 ) -> _PersistOutcome:
     """Phase P4 of the compose loop — redact then persist the turn audit.
 
@@ -395,27 +397,64 @@ async def persist_turn_audit(
             raise AuditIntegrityError("Compose turn audit persistence requires exact session operation authority")
         if sessions_service is None:
             raise RuntimeError("sessions_service not wired")
-        try:
-            audit_outcome = await sessions_service.persist_compose_turn_async(
-                session_id=session_id,
-                assistant_content=assistant_message.content or "",
-                raw_content=raw_assistant_content,
-                redacted_assistant_tool_calls=redacted_assistant_tool_calls,
-                redacted_tool_rows=redacted_tool_rows,
-                rejection_records=build_rejection_records(tool_outcomes),
-                parent_composition_state_id=current_state_id,
-                expected_current_state_id=current_state_id,
-                writer_principal="compose_loop",
-                plugin_crash_pending=crash_pending,
-                session_operation_context=session_operation_context,
+        checkpoint_sql = checkpoint_projection = None
+        if required_work is not None:
+            if type(required_work) is not RequiredWorkBinding:
+                raise AuditIntegrityError("Compose checkpoint requires a nominal required-work binding")
+            required_work.validate_context(session_operation_context)
+            checkpoint_sql, checkpoint_projection = required_work.reserve_pair(
+                RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
             )
+        try:
+            if checkpoint_sql is None:
+                audit_outcome = await sessions_service.persist_compose_turn_async(
+                    session_id=session_id,
+                    assistant_content=assistant_message.content or "",
+                    raw_content=raw_assistant_content,
+                    redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+                    redacted_tool_rows=redacted_tool_rows,
+                    rejection_records=build_rejection_records(tool_outcomes),
+                    parent_composition_state_id=current_state_id,
+                    expected_current_state_id=current_state_id,
+                    writer_principal="compose_loop",
+                    plugin_crash_pending=crash_pending,
+                    session_operation_context=session_operation_context,
+                )
+            else:
+                audit_outcome = await sessions_service.persist_compose_turn_async(
+                    session_id=session_id,
+                    assistant_content=assistant_message.content or "",
+                    raw_content=raw_assistant_content,
+                    redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+                    redacted_tool_rows=redacted_tool_rows,
+                    rejection_records=build_rejection_records(tool_outcomes),
+                    parent_composition_state_id=current_state_id,
+                    expected_current_state_id=current_state_id,
+                    writer_principal="compose_loop",
+                    plugin_crash_pending=crash_pending,
+                    session_operation_context=session_operation_context,
+                    required_work=checkpoint_sql,
+                )
         except AuditIntegrityError as exc:
+            if checkpoint_projection is not None and checkpoint_sql is not None and checkpoint_sql.complete:
+                checkpoint_projection.complete_without_submission()
             exc.failed_turn = FailedTurnMetadata(
                 assistant_message_id=None,
                 tool_calls_attempted=len(assistant_tool_calls),
                 tool_responses_persisted=0,
             )
             raise
+        except BaseException:
+            if checkpoint_projection is not None and checkpoint_sql is not None and checkpoint_sql.complete:
+                checkpoint_projection.complete_without_submission()
+            raise
+        if checkpoint_projection is not None:
+            checkpoint_projection.begin_projection()
+            if type(audit_outcome) is not AuditOutcome:
+                failure = AuditIntegrityError("Compose checkpoint returned a foreign audit outcome")
+                checkpoint_projection.complete_owned(failure)
+                raise failure
+            checkpoint_projection.complete_owned()
         unwind_audit_failed = audit_outcome.unwind_audit_failed
         current_state_id = audit_outcome.current_state_id
         failed_turn = FailedTurnMetadata(

@@ -6,6 +6,9 @@ import asyncio
 import hashlib
 import multiprocessing
 import os
+import sys
+from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -17,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.landscape import leader_coordination_token, register_test_node
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.helpers.process_diagnostics import ProcessDiagnostics, trace_child_process
 from tests.testcontainer.web.test_cross_process_run_control_postgres import _envelope
 from tests.testcontainer.web.test_global_run_recovery_postgres import _expire_fence, _expire_instance, _register_live_instance
@@ -147,65 +151,161 @@ def _die_after_engine_result(session_url, landscape_url, data_dir, terminal, con
 
 def _run_reconciler(session_url, landscape_url, data_dir, crash_before_outputs, connection):
     async def recover():
-        engine = create_session_engine(session_url)
-        owner = f"reconciler-{uuid4()}"
-        sessions = _service(engine, owner)
-        telemetry = build_sessions_telemetry()
-        blobs = BlobServiceImpl(engine, Path(data_dir))
-        execution = ExecutionServiceImpl.for_trained_operator(
-            loop=asyncio.get_running_loop(),
-            broadcaster=ProgressBroadcaster(asyncio.get_running_loop(), telemetry=telemetry),
-            settings=_settings(Path(data_dir)),
-            session_service=sessions,
-            yaml_generator=yaml_generator,
-            telemetry=telemetry,
-            blob_service=blobs,
-        )
-        coordinator = RunRecoveryCoordinator(sessions, execution, blobs, landscape_url=landscape_url, create_tables=False)
-        if crash_before_outputs == "pause_after_observe":
-            from unittest.mock import patch
+        execution_fixture = ExecutionTestCustody(asyncio.get_running_loop(), Path(data_dir))
+        primary: BaseException | None = None
+        try:
+            engine = create_session_engine(session_url)
+            owner = f"reconciler-{uuid4()}"
+            sessions = _service(engine, owner)
+            telemetry = build_sessions_telemetry()
+            blobs = BlobServiceImpl(engine, Path(data_dir))
+            execution = execution_fixture.bind(
+                ExecutionServiceImpl.for_trained_operator(
+                    loop=asyncio.get_running_loop(),
+                    broadcaster=ProgressBroadcaster(asyncio.get_running_loop(), telemetry=telemetry),
+                    settings=_settings(Path(data_dir)),
+                    session_service=sessions,
+                    yaml_generator=yaml_generator,
+                    telemetry=telemetry,
+                    blob_service=blobs,
+                    execution_lease_release_registry=execution_fixture.registry(asyncio.get_running_loop()),
+                )
+            )
+            coordinator = RunRecoveryCoordinator(sessions, execution, blobs, landscape_url=landscape_url, create_tables=False)
+            if crash_before_outputs == "pause_after_observe":
+                from unittest.mock import patch
 
-            from elspeth.web.execution import recovery as recovery_module
+                from elspeth.web.execution import recovery as recovery_module
 
-            original_observe = recovery_module.observe_run
-            paused = False
+                original_observe = recovery_module.observe_run
+                paused = False
 
-            def observe_then_pause(*args, **kwargs):
-                nonlocal paused
-                observation = original_observe(*args, **kwargs)
-                if not paused:
-                    paused = True
-                    connection.send(("observed", observation.status.value))
-                    assert connection.recv() == "continue"
-                return observation
+                def observe_then_pause(*args, **kwargs):
+                    nonlocal paused
+                    observation = original_observe(*args, **kwargs)
+                    if not paused:
+                        paused = True
+                        connection.send(("observed", observation.status.value))
+                        assert connection.recv() == "continue"
+                    return observation
 
-            with patch.object(recovery_module, "observe_run", observe_then_pause):
+                with patch.object(recovery_module, "observe_run", observe_then_pause):
+                    await coordinator.recover()
+            elif crash_before_outputs:
+                from unittest.mock import patch
+
+                async def die_before_outputs(*args, **kwargs):
+                    connection.send(("projection_committed", owner))
+                    os._exit(74)
+
+                with patch.object(blobs, "finalize_run_output_blobs", die_before_outputs):
+                    await coordinator.recover()
+                raise AssertionError("expected the process to die at output finalization")
+            else:
                 await coordinator.recover()
-        elif crash_before_outputs:
-            from unittest.mock import patch
-
-            async def die_before_outputs(*args, **kwargs):
-                connection.send(("projection_committed", owner))
-                os._exit(74)
-
-            with patch.object(blobs, "finalize_run_output_blobs", die_before_outputs):
-                await coordinator.recover()
-            raise AssertionError("expected the process to die at output finalization")
-        else:
             await coordinator.recover()
-        await coordinator.recover()
-        await execution.shutdown()
-        engine.dispose()
-        connection.send(("recovered", owner))
+            await execution_fixture.shutdown_service(execution)
+            engine.dispose()
+            connection.send(("recovered", owner))
+        except BaseException as original:
+            primary = original
+            raise
+        finally:
+            try:
+                await execution_fixture.close()
+            except BaseException as cleanup:
+                if primary is not None and cleanup is not primary:
+                    raise BaseExceptionGroup("Child execution and owned cleanup failed", [primary, cleanup]) from None
+                raise
 
     asyncio.run(recover())
 
 
 def _traced_process_target(target, args, sender, diagnostic_path):
-    with trace_child_process(diagnostic_path) as phase:
+    from tests.helpers.child_executor_lifecycle import child_executor_lifecycle
+
+    with child_executor_lifecycle(), trace_child_process(diagnostic_path) as phase:
         phase(f"running {target.__module__}.{target.__qualname__}")
         target(*args, sender)
         phase("target returned")
+
+
+class _RecoveryProcessCustodyUnknown(AssertionError):
+    """Keep the exact unresolved child and diagnostics rooted; never a RED proof."""
+
+    def __init__(self, process: BaseProcess, diagnostics: ProcessDiagnostics) -> None:
+        super().__init__("INCONCLUSIVE: owned recovery subprocess exit was not joined")
+        self.process = process
+        self.diagnostics = diagnostics
+
+
+def _close_owned_recovery_process(
+    process: BaseProcess,
+    connections: tuple[Connection, ...],
+    diagnostics: ProcessDiagnostics,
+    primary: BaseException | None,
+) -> None:
+    failures: list[BaseException] = []
+    joined = False
+
+    def observe_alive() -> bool | None:
+        try:
+            return process.is_alive()
+        except BaseException as original:
+            failures.append(original)
+            return None
+
+    def join_and_observe_exit() -> bool:
+        try:
+            process.join(timeout=10)
+        except BaseException as original:
+            failures.append(original)
+            return False
+        alive = observe_alive()
+        try:
+            exitcode = process.exitcode
+        except BaseException as original:
+            failures.append(original)
+            return False
+        # join(timeout) returning alone does not prove the child exited.
+        return alive is False and exitcode is not None
+
+    if observe_alive() is not False:
+        try:
+            process.terminate()
+        except BaseException as original:
+            failures.append(original)
+    joined = join_and_observe_exit()
+    if not joined:
+        if observe_alive() is not False:
+            try:
+                process.kill()
+            except BaseException as original:
+                failures.append(original)
+        joined = join_and_observe_exit()
+    for connection in connections:
+        try:
+            connection.close()
+        except BaseException as original:
+            failures.append(original)
+    if joined:
+        try:
+            process.close()
+        except BaseException as original:
+            failures.append(original)
+        try:
+            diagnostics.close()
+        except BaseException as original:
+            failures.append(original)
+    else:
+        # Neither a signal nor a missing Process.start return proves absence.
+        # Retain this exact owner and diagnostic path for the parent controller.
+        failures.append(_RecoveryProcessCustodyUnknown(process, diagnostics))
+    if failures:
+        roots = ([primary] if primary is not None else []) + failures
+        if len(roots) == 1:
+            raise roots[0]
+        raise BaseExceptionGroup("Recovery body and owned cleanup originals", roots) from None
 
 
 def _process(target, *args, expected_exit):
@@ -226,17 +326,7 @@ def _process(target, *args, expected_exit):
         assert process.exitcode == expected_exit, diagnostics.snapshot(process)
         return result
     finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=10)
-        if process.is_alive():
-            process.kill()
-            process.join(timeout=10)
-        assert not process.is_alive(), "could not stop owned recovery subprocess"
-        receiver.close()
-        sender.close()
-        process.close()
-        diagnostics.close()
+        _close_owned_recovery_process(process, (receiver, sender), diagnostics, sys.exc_info()[1])
 
 
 def _expire_dead_owner(session_url, session_id, owner):
@@ -343,9 +433,15 @@ def test_cli_takeover_after_resumable_snapshot_defers_all_web_projection(recover
     original_run, original_blob, original_events = _web_snapshot(session_url, run_id, blob_id)
     spawn = multiprocessing.get_context("spawn")
     controller, participant = spawn.Pipe()
+    diagnostics = ProcessDiagnostics()
     process = spawn.Process(
-        target=_run_reconciler,
-        args=(session_url, landscape_url, str(tmp_path), "pause_after_observe", participant),
+        target=_traced_process_target,
+        args=(
+            _run_reconciler,
+            (session_url, landscape_url, str(tmp_path), "pause_after_observe"),
+            participant,
+            diagnostics.path,
+        ),
     )
     try:
         process.start()
@@ -396,10 +492,7 @@ def test_cli_takeover_after_resumable_snapshot_defers_all_web_projection(recover
         recovered_run, recovered_blob, recovered_events = _web_snapshot(session_url, run_id, blob_id)
         assert (recovered_run.status, recovered_blob.status, len(recovered_events)) == ("empty", "ready", 1)
     finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=10)
-        controller.close()
+        _close_owned_recovery_process(process, (controller, participant), diagnostics, sys.exc_info()[1])
 
 
 @pytest.mark.parametrize(

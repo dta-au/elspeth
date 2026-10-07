@@ -211,7 +211,8 @@ def test_resolver_wires_independent_endpoints_and_extra_secrets(launch: tuple[di
         ("maxReplicas", 2.5),
         ("composerMaxCompositionTurns", True),
         ("composerTransportIdleCeilingSeconds", 241),
-        ("composerTimeoutSeconds", 181),
+        ("composerTimeoutSeconds", 0),
+        ("composerTransportIdleCeilingSeconds", 30),
         ("extraEnvironment", [{"name": "ELSPETH_WEB__COMPOSER_TRANSPORT_HEADROOM_SECONDS", "value": "20"}]),
         ("extraEnvironment", [{"name": "ELSPETH_WEB__SSO_CLIENT_ID", "value": "REPLACE_CLIENT_ID"}]),
         ("tags", {"operator": "replace_name"}),
@@ -265,3 +266,23 @@ def test_resolver_rejects_swapped_or_unversioned_capture(
     result = _resolve(launch)
     assert result.returncode != 0
     assert not target.exists()
+
+
+@pytest.mark.parametrize(("ceiling", "accepted"), [(31, True), (30, False)])
+def test_validator_keeps_sync_headroom_with_independent_durable_job_budget(
+    launch: tuple[dict[str, str], Path, Path], ceiling: int, accepted: bool
+) -> None:
+    _, _, target = launch
+    result = _resolve(launch)
+    assert result.returncode == 0, result.stderr
+    parameters = json.loads(target.read_text())
+    parameters["parameters"]["composerTimeoutSeconds"] = {"value": 1200}
+    parameters["parameters"]["composerTransportIdleCeilingSeconds"] = {"value": ceiling}
+    target.write_text(json.dumps(parameters))
+    result = subprocess.run(
+        ["jq", "-e", "-f", str(SCRIPTS / "validate-workload-parameters.jq"), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr

@@ -17,6 +17,7 @@ from sqlalchemy import select
 
 from elspeth.web.sessions.models import chat_messages_table
 from tests.helpers.composer_graphs import assert_isomorphic
+from tests.helpers.composer_operations import submit_and_settle
 
 from .conftest import (
     PARITY_FIXTURES,
@@ -243,13 +244,16 @@ async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(pa
         # terminal spends the hatch, so the original REPAIR_EXHAUSTED stands.
         completion = _ScriptedCompletion(malformed, malformed, malformed, malformed)
         parity_env.monkeypatch.setattr("litellm.acompletion", completion)
-        response = await client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": _LINEAR["intent"], "client_request_id": str(uuid4())},
+        settled = await submit_and_settle(
+            client,
+            parity_env.app,
+            path=f"/api/sessions/{session_id}/messages",
+            body={"content": _LINEAR["intent"], "operation_id": str(uuid4()), "state_id": None},
         )
 
-    assert response.status_code == 500, response.text
-    detail = response.json()["detail"]
+    status, body = settled.error()
+    assert status == 500, settled.final.text
+    detail = body["detail"]
     assert detail["error_type"] == "composer_planner_failure"
     assert detail["failure_code"] == "planner_repair_exhausted"
     assert len(completion.requests) == 4, "repair_budget + 1 primary calls, then the spent escape-hatch turn"

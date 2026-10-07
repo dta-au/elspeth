@@ -248,7 +248,12 @@ def run_fence_trials(
         pinned_clients=clients,
     )
     trials = [
-        driver.fence_conflict_trial(session, ProbeRequest("POST", f"/api/sessions/{session}/messages", body)) for session, body in requests
+        driver.fence_conflict_trial(
+            session,
+            ProbeRequest("POST", f"/api/sessions/{session}/messages", body),
+            kind="same_operation" if index % 2 == 0 else "distinct_operations",
+        )
+        for index, (session, body) in enumerate(requests)
     ]
     return decide_fence_conflict(trials, required_trials=required)
 

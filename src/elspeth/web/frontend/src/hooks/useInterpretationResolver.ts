@@ -1,3 +1,4 @@
+import { useSessionStore } from "@/stores/sessionStore";
 
 import { useState } from "react";
 import type { ApiError, CompositionState } from "@/types/index";
@@ -190,6 +191,7 @@ export function useInterpretationResolver({
   // state) keeps re-renders scoped: this hook never reads pendingBySession
   // / resolvedCountBySession / optedOutBySession directly — the parent's
   // re-render on resolution will unmount the consumer widget.
+  const isComposing = useSessionStore((state) => state.activeSessionId === sessionId && state.isComposing);
   const resolveEvent = useInterpretationEventsStore((s) => s.resolveEvent);
   const optOut = useInterpretationEventsStore((s) => s.optOut);
 
@@ -221,11 +223,11 @@ export function useInterpretationResolver({
   const amendByteLength = byteLength(amendText);
   const amendIsEmpty = trimmedAmendText.length === 0;
   const amendIsTooLong = amendByteLength > INTERPRETATION_AMENDMENT_MAX_BYTES;
-  const submitDisabled = amendIsEmpty || amendIsTooLong || resolveInFlight;
-  const primaryButtonsDisabled = resolveInFlight || optOutInFlight;
+  const submitDisabled = amendIsEmpty || amendIsTooLong || resolveInFlight || isComposing;
+  const primaryButtonsDisabled = resolveInFlight || optOutInFlight || isComposing;
 
   async function handleUseMine(): Promise<void> {
-    if (primaryButtonsDisabled) return;
+    if (primaryButtonsDisabled || useSessionStore.getState().isComposing) return;
     setDisplayedError(null);
     setResolveInFlight(true);
     try {
@@ -241,20 +243,20 @@ export function useInterpretationResolver({
   }
 
   function handleOpenAmend(): void {
-    if (primaryButtonsDisabled) return;
+    if (primaryButtonsDisabled || useSessionStore.getState().isComposing) return;
     setDisplayedError(null);
     setAmendText(llmDraft);
     setMode("amend");
   }
 
   function handleCancelAmend(): void {
-    if (resolveInFlight) return;
+    if (resolveInFlight || useSessionStore.getState().isComposing) return;
     setDisplayedError(null);
     setMode("choose");
   }
 
   async function handleSubmitAmend(): Promise<void> {
-    if (submitDisabled) return;
+    if (submitDisabled || useSessionStore.getState().isComposing) return;
     // Belt-and-suspenders: even if the Submit button is disabled, an
     // Enter-key press in the textarea (or a test that bypasses pointer
     // events) could route here with empty / too-long text.  Surface the
@@ -291,7 +293,7 @@ export function useInterpretationResolver({
   }
 
   function handleRequestOptOut(): void {
-    if (primaryButtonsDisabled) return;
+    if (primaryButtonsDisabled || useSessionStore.getState().isComposing) return;
     setDisplayedError(null);
     setShowOptOutConfirm(true);
   }

@@ -77,8 +77,8 @@ param maxReplicas int = 4
 @maxValue(600)
 param terminationGracePeriodSeconds int = 60
 
-@description('REQUIRED, NO DEFAULT. The composer transport idle ceiling is the minimum idle timeout of every hop in front of the process. The Container Apps ingress request timeout is a fixed 240 seconds (facts §2.2); a Front Door in front lowers it further.')
-@minValue(1)
+@description('REQUIRED, NO DEFAULT. The composer transport idle ceiling is the minimum idle timeout of every hop in front of the process. The Container Apps ingress request timeout is a fixed 240 seconds (facts §2.2); a Front Door in front lowers it further. It bounds synchronous request waits and must exceed the reserved 30-second headroom.')
+@minValue(31)
 @maxValue(240)
 param composerTransportIdleCeilingSeconds int
 
@@ -90,7 +90,7 @@ param composerMaxCompositionTurns int
 @minValue(1)
 param composerMaxDiscoveryTurns int
 
-@description('Composer request budget; must leave the runtime-required headroom below the transport ceiling.')
+@description('Positive durable composer job budget, independent of the transport idle ceiling. Synchronous request headroom remains required.')
 @minValue(1)
 param composerTimeoutSeconds int
 

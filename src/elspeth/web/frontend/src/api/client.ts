@@ -1,3 +1,4 @@
+import { canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerOperationAck, decodeComposerOperationSnapshot } from "./composerOperationDecoder";
 import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwnsCredential } from "./authSession";
 // ============================================================================
 // ELSPETH API Client
@@ -302,18 +303,25 @@ export async function parseResponse<T>(
       }
     }
 
+    let body: unknown;
+    try { body = await response.json(); } catch { body = null; }
+    throw buildApiError(response.status, body, response.statusText, optionalResponseHeader(response, "X-ELSPETH-Plugin-Snapshot"));
+  }
+
+  return response.json() as Promise<T>;
+}
+
+function buildApiError(status: number, errorBody: unknown, statusText: string, snapshotHeader?: string): ApiError {
     // Parse the error envelope into one ApiError contract. Canonical backend
     // fields are `error_type`, `detail`, and optional `errors`; `kind` and
     // `message` remain accepted as compatibility aliases for older execution
     // responses.
-    let detail = response.statusText;
+    let detail = statusText;
     let errorType: string | undefined;
     let currentState: string | undefined;
     let storageQuota: ApiError["storage_quota"];
     let sources: string[] | undefined;
     let requestId: string | undefined;
-    let clientRequestId: string | undefined;
-    let userMessageId: string | undefined;
     let failureCode: string | undefined;
     let guidance: string | undefined;
     let componentId: string | undefined;
@@ -334,10 +342,10 @@ export async function parseResponse<T>(
     let partialStateSaveFailed: ApiError["partial_state_save_failed"];
     let partialStateSaveError: ApiError["partial_state_save_error"];
     try {
-      const body = await response.json();
+      const body = errorBody as Record<string, unknown>;
       const nestedDetail =
         typeof body.detail === "object" && body.detail !== null
-          ? body.detail
+          ? body.detail as Record<string, unknown>
           : null;
 
       errorType = firstStringField(
@@ -345,7 +353,7 @@ export async function parseResponse<T>(
         ["error_type", "error_code", "refusal", "code", "kind"],
       );
       currentState = firstStringField([body, nestedDetail], ["current_state"]);
-      if (response.status === 413 && errorType === "storage_quota_exceeded") {
+      if (status === 413 && errorType === "storage_quota_exceeded") {
         const dimension = firstDefined(ownField(nestedDetail, "dimension"), ownField(body, "dimension"));
         const cap = firstDefined(ownField(nestedDetail, "cap"), ownField(body, "cap"));
         const ceiling = firstDefined(ownField(nestedDetail, "ceiling"), ownField(body, "ceiling"));
@@ -361,8 +369,6 @@ export async function parseResponse<T>(
         : undefined;
 
       requestId = firstStringField([body, nestedDetail], ["request_id"]);
-      clientRequestId = firstStringField([body, nestedDetail], ["client_request_id"]);
-      userMessageId = firstStringField([body, nestedDetail], ["user_message_id"]);
       failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
       guidance = firstStringField([body, nestedDetail], ["guidance"]);
 
@@ -429,13 +435,13 @@ export async function parseResponse<T>(
         : undefined;
 
       fanoutGuard =
-        body.fanout_guard ?? nestedDetail?.fanout_guard;
+        (body.fanout_guard ?? nestedDetail?.fanout_guard) as ApiError["fanout_guard"];
 
       secretGuard =
-        body.secret_guard ?? nestedDetail?.secret_guard;
+        (body.secret_guard ?? nestedDetail?.secret_guard) as ApiError["secret_guard"];
 
       validationErrors =
-        body.validation_errors ?? nestedDetail?.validation_errors;
+        (body.validation_errors ?? nestedDetail?.validation_errors) as ApiError["validation_errors"];
 
       const rawErrors = firstDefined(
         ownField(body, "errors"),
@@ -508,15 +514,13 @@ export async function parseResponse<T>(
     }
 
     const error: ApiError = {
-      status: response.status,
+      status: status,
       detail,
       error_type: errorType,
       current_state: currentState,
       storage_quota: storageQuota,
       sources,
       request_id: requestId,
-      client_request_id: clientRequestId,
-      user_message_id: userMessageId,
       failure_code: failureCode,
       guidance,
       component_id: componentId,
@@ -536,13 +540,10 @@ export async function parseResponse<T>(
       validation_errors: validationErrors,
       errors,
       snapshot_fingerprint:
-        optionalResponseHeader(response, "X-ELSPETH-Plugin-Snapshot") ??
+        snapshotHeader ??
         nestedSnapshotFingerprint,
     };
-    throw error;
-  }
-
-  return response.json() as Promise<T>;
+    return error;
 }
 
 // ── Auth ────────────────────────────────────────────────────────────────────
@@ -803,12 +804,30 @@ export async function archiveSession(sessionId: string): Promise<void> {
 
 // ── Messages ────────────────────────────────────────────────────────────────
 
-/** Get all messages for a session. */
-export async function fetchMessages(sessionId: string): Promise<ChatMessage[]> {
-  const response = await authFetch(`/api/sessions/${sessionId}/messages`, {
-    headers: authHeaders(),
-  });
-  return parseResponse<ChatMessage[]>(response);
+/** Get the complete conversational history, preserving the server's order. */
+export async function fetchMessages(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<ChatMessage[]> {
+  const limit = 500;
+  const messages = new Map<string, ChatMessage>();
+  for (let offset = 0; ; offset += limit) {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    const response = await authFetch(`/api/sessions/${sessionId}/messages?${params}`, {
+      headers: authHeaders(),
+      signal,
+    });
+    // Do not publish a partial transcript if any later page fails. History is
+    // append-only and ordered by sequence number, so new rows cannot move the
+    // earlier page boundaries. Preserve that order and avoid duplicate rows.
+    const page = await parseResponse<ChatMessage[]>(response);
+    const previousCount = messages.size;
+    for (const message of page) messages.set(message.id, message);
+    if (page.length < limit) return [...messages.values()];
+    if (messages.size === previousCount) {
+      throw new Error("Conversation history pagination did not advance.");
+    }
+  }
 }
 
 /** Fetch the audit-grade recovery transcript for a failed compose turn. */
@@ -949,43 +968,75 @@ export async function rejectCompositionProposal(
  * The response wire format uses `state` (not `compositionState`) --
  * the sessionStore maps the key on destructure.
  */
-export async function sendMessage(
-  sessionId: string,
-  content: string,
-  clientRequestId: string,
-  stateId?: string | null,
-  signal?: AbortSignal,
-): Promise<MessageWithStateResponse> {
-  const body: { content: string; client_request_id: string; state_id?: string | null } = {
-    content,
-    client_request_id: clientRequestId,
-  };
-  if (stateId !== undefined) {
-    body.state_id = stateId;
-  }
-  const response = await authFetch(`/api/sessions/${sessionId}/messages`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify(body),
-    signal,
-  });
-  return parseResponse<MessageWithStateResponse>(response);
+export function apiErrorFromBody(status: number, body: unknown): ApiError {
+  validateComposerRecoveryBody(body);
+  const admitted = buildApiError(status, body, "Request failed");
+  return admitted.partial_state == null ? admitted : { ...admitted, partial_state: decodeCompositionState(admitted.partial_state) };
 }
 
-/** Re-run the composer without inserting a new user message.
- *  Used by the retry flow when the user message is already persisted. */
-export async function recompose(
-  sessionId: string,
-  expectedUserMessageId: string,
-  signal?: AbortSignal,
-): Promise<MessageWithStateResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/recompose`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify({ expected_user_message_id: expectedUserMessageId }),
-    signal,
+export function isDefinitiveComposerRefusal(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("status" in error)) return false;
+  return typeof error.status === "number" && error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429;
+}
+export function composerActiveOperation(error: unknown): { operation_id: string; kind: import("@/types/composerOperations").OperationKind } | null {
+  if (typeof error !== "object" || error === null || !("error_type" in error) || error.error_type !== "composer_operation_active" || !("operation_id" in error) || !("kind" in error)) return null;
+  return { operation_id: canonicalUuid(error.operation_id), kind: operationKind(error.kind) };
+}
+export async function submitComposerOperation(descriptor: import("@/types/composerOperations").SubmittedCustody): Promise<import("@/types/composerOperations").ComposerOperationAck> {
+  const path = descriptor.kind === "compose_message" ? "messages" : "recompose";
+  const response = await authFetch(`/api/sessions/${descriptor.sessionId}/${path}`, {
+    method: "POST", headers: authHeaders("application/json"), body: JSON.stringify(descriptor.body), signal: AbortSignal.timeout(15000),
   });
-  return parseResponse<MessageWithStateResponse>(response);
+  if (!response.ok) {
+    const body: unknown = await response.json();
+    const error = await apiErrorFromBody(response.status, body as Record<string, unknown>);
+    if (typeof body === "object" && body !== null && "detail" in body && typeof body.detail === "object" && body.detail !== null && "operation_id" in body.detail && "kind" in body.detail) throw { ...error, operation_id: body.detail.operation_id, kind: body.detail.kind };
+    throw error;
+  }
+  if (response.status !== 202) throw new Error("Composer admission must return 202");
+  return decodeComposerOperationAck(await response.json());
+}
+export async function fetchComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
+  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}`, { headers: authHeaders(), signal: AbortSignal.timeout(15000), cache: "no-store" });
+  if (response.status === 404) {
+    const body: unknown = await response.json();
+    if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.keys(body).length === 1 && "detail" in body) {
+      if (body.detail === "Session not found") return { kind: "session_missing" };
+      if (body.detail === "Operation not found") return { kind: "operation_missing" };
+    }
+    throw await apiErrorFromBody(404, body as Record<string, unknown>);
+  }
+  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
+}
+export async function cancelComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
+  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}/cancel`, { method: "POST", headers: authHeaders(), signal: AbortSignal.timeout(15000) });
+  if (response.status === 404) {
+    const body: unknown = await response.json();
+    if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.keys(body).length === 1 && "detail" in body) {
+      if (body.detail === "Session not found") return { kind: "session_missing" };
+      if (body.detail === "Operation not found") return { kind: "operation_missing" };
+    }
+    throw apiErrorFromBody(404, body);
+  }
+  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
+}
+export function fetchComposerOperationStream(sessionId: string, operationId: string, signal: AbortSignal): Promise<Response> {
+  return authFetch(`/api/sessions/${sessionId}/operations/${operationId}/stream`, { headers: { ...authHeaders(), Accept: "text/event-stream" }, signal, cache: "no-store" });
+}
+export async function sendMessage(sessionId: string, content: string, operationId: string, stateId: string | null = null, signal?: AbortSignal): Promise<MessageWithStateResponse> {
+  const { submitAndObserveComposerOperation } = await import("./composerOperationObserver");
+  const { composerCustodyScope } = await import("@/stores/composerOperationCustody");
+  const scope = composerCustodyScope();
+  if (scope === null) throw new Error("Authenticated composer scope is not ready");
+  return submitAndObserveComposerOperation({ mode: "submitted", scope, sessionId, operationId, kind: "compose_message", createdAt: Date.now(), body: { operation_id: operationId, content, state_id: stateId } }, { signal });
+}
+export async function recompose(sessionId: string, expectedUserMessageId: string, signal?: AbortSignal, stateId: string | null = null): Promise<MessageWithStateResponse> {
+  const { submitAndObserveComposerOperation } = await import("./composerOperationObserver");
+  const { composerCustodyScope } = await import("@/stores/composerOperationCustody");
+  const scope = composerCustodyScope();
+  if (scope === null) throw new Error("Authenticated composer scope is not ready");
+  const operationId = crypto.randomUUID();
+  return submitAndObserveComposerOperation({ mode: "submitted", scope, sessionId, operationId, kind: "compose_recompose", createdAt: Date.now(), body: { operation_id: operationId, expected_user_message_id: expectedUserMessageId, state_id: stateId } }, { signal });
 }
 
 

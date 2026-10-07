@@ -128,7 +128,7 @@ from elspeth.web.composer.provider_gateway import (
     advisor_provider_failure_types,
     composer_loop_tool_definitions,
 )
-from elspeth.web.composer.provider_quota import composer_quota_scope
+from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner, composer_quota_scope
 from elspeth.web.composer.reasoning import warn_if_not_reasoning_capable
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.session_tool import SessionToolOwner
@@ -151,6 +151,7 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+from elspeth.web.required_work import RequiredWorkBinding
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
 
@@ -883,7 +884,7 @@ class ComposerServiceImpl:
 
                 return await self._provider_gateway._call_text_llm_with_audit(
                     messages,
-                    timeout=self._timeout_seconds,
+                    timeout=self._settings.composer_sync_timeout_seconds,
                     recorder=recorder,
                 )
             except TimeoutError:
@@ -895,6 +896,13 @@ class ComposerServiceImpl:
                 GuardrailRaisedException,
             ) as exc:
                 raise ComposerServiceError(f"LLM unavailable ({type(exc).__name__})") from exc
+
+    @staticmethod
+    def _require_required_work(required_work: RequiredWorkBinding | None, context: SessionOperationContext | None) -> RequiredWorkBinding:
+        if type(required_work) is not RequiredWorkBinding:
+            raise AuditIntegrityError("Required composer work has no explicit registered owner")
+        required_work.validate_context(context)
+        return required_work
 
     async def compose(
         self,
@@ -910,6 +918,9 @@ class ComposerServiceImpl:
         # Durable advisor gate fact from the prior state row (ruling
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
+        budget_seconds: float | None = None,
+        required_work: RequiredWorkBinding | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -930,6 +941,15 @@ class ComposerServiceImpl:
             ComposerConvergenceError: If a budget is exhausted or
                 the timeout is exceeded.
         """
+        if (required_work is None) != (provider_owner is None):
+            raise AuditIntegrityError("Required Composer provider ownership must be supplied with its turn binding")
+        if provider_owner is not None:
+            if type(provider_owner) is not ProviderInvocationOwner or provider_owner.service is not self._require_sessions_service():
+                raise AuditIntegrityError("Composer provider owner belongs to another exact service")
+            if provider_owner.required_work is not required_work:
+                raise AuditIntegrityError("Composer provider owner replaced its actual turn binding")
+            provider_owner.required_work.validate_context(session_operation_context)
+
         if not self._availability.available:
             raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
         if session_operation_context is not None:
@@ -953,7 +973,15 @@ class ComposerServiceImpl:
 
         await self._chargeable_admission.require(session_operation_context)
         with composer_quota_scope(self._require_sessions_service(), session_operation_context):
-            deadline = asyncio.get_event_loop().time() + self._timeout_seconds
+            turn_budget = self._timeout_seconds if budget_seconds is None else budget_seconds
+            if turn_budget <= 0:
+                raise ComposerConvergenceError.capture(
+                    0,
+                    budget_exhausted="timeout",
+                    state=state,
+                    initial_version=state.version,
+                )
+            deadline = asyncio.get_event_loop().time() + turn_budget
             # One recorder spans planning or the ordinary loop so every provider
             # and discovery audit for this request is accounted for.
             recorder = BufferingRecorder()
@@ -1003,6 +1031,14 @@ class ComposerServiceImpl:
                     and session_id is not None
                     and user_message_id is not None
                 ):
+                    planner_budget_seconds = deadline - asyncio.get_event_loop().time()
+                    if planner_budget_seconds <= 0:
+                        raise ComposerConvergenceError.capture(
+                            0,
+                            budget_exhausted="timeout",
+                            state=state,
+                            initial_version=state.version,
+                        )
                     return await self._planning_application._plan_and_stage_empty_pipeline(
                         message=message,
                         session_operation_context=session_operation_context,
@@ -1016,6 +1052,9 @@ class ComposerServiceImpl:
                         recorder=recorder,
                         plugin_snapshot=plugin_snapshot,
                         policy_catalog=policy_catalog,
+                        budget_seconds=planner_budget_seconds,
+                        required_work=required_work,
+                        provider_owner=provider_owner,
                     )
                 return await self._compose_loop(
                     message,
@@ -1032,6 +1071,8 @@ class ComposerServiceImpl:
                     policy_catalog=policy_catalog,
                     session_operation_context=session_operation_context,
                     completion_gates=completion_gates,
+                    required_work=required_work,
+                    provider_owner=provider_owner,
                 )
             except ComposerConvergenceError as exc:
                 await emit_progress(
@@ -1171,6 +1212,7 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> _CallModelOutcome:
         """Phase P1 of the compose loop — one LLM call with cap enforcement.
 
@@ -1197,6 +1239,7 @@ class ComposerServiceImpl:
             composition_turns_used=composition_turns_used,
             discovery_turns_used=discovery_turns_used,
             failed_turn=failed_turn,
+            provider_owner=provider_owner,
         )
         assistant_tool_calls = completion.tool_batch.calls
         self._enforce_tool_call_cap(
@@ -1235,6 +1278,7 @@ class ComposerServiceImpl:
         ingress: CompositionIngressRecord | None = None,
         chat_ingress_inputs: list[ChatIngressInput] | None = None,
         advisor_repair_context_introduced: bool = False,
+        required_work: RequiredWorkBinding | None = None,
     ) -> _PersistOutcome:
         """Phase P4 of the compose loop — delegates to :func:`turn_audit.persist_turn_audit`."""
         from elspeth.web.composer.turn_audit import persist_turn_audit
@@ -1273,6 +1317,7 @@ class ComposerServiceImpl:
             ingress=ingress,
             chat_ingress_inputs=chat_ingress_inputs,
             assistant_row_uses_current_dispatch=not advisor_repair_context_introduced,
+            required_work=required_work,
         )
 
     async def _dispatch_tool_batch(
@@ -1305,6 +1350,7 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> tuple[_DispatchOutcome, int]:
         """Phase P3 of the compose loop — delegates to :func:`tool_batch.run_tool_batch`."""
         from elspeth.web.composer.tool_batch import (
@@ -1340,6 +1386,7 @@ class ComposerServiceImpl:
             preflight=self._preflight,
             schema_disclosure=self._schema_disclosure,
             advisor_checkpoint=self._advisor_checkpoint,
+            provider_owner=provider_owner,
             advisor_max_calls_per_compose=self._settings.composer_advisor_max_calls_per_compose,
             advisor_timeout_seconds=self._settings.composer_advisor_timeout_seconds,
             recorder=recorder,
@@ -1410,6 +1457,7 @@ class ComposerServiceImpl:
         # Durable advisor gate fact from the prior state row (ruling
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> _ClassifyOutcome:
         """Phase P5 of the compose loop — anti-anchor + budget classify.
 
@@ -1621,7 +1669,11 @@ class ComposerServiceImpl:
                     )
                     try:
                         completion = await self._provider_gateway._call_llm_with_audit(
-                            reply_messages, [], timeout=remaining, recorder=recorder
+                            reply_messages,
+                            [],
+                            timeout=remaining,
+                            recorder=recorder,
+                            provider_custody=self._new_primary_custody(provider_owner),
                         )
                     except provider_failures:
                         # The call audit retains the failure; a trusted notice
@@ -1746,6 +1798,7 @@ class ComposerServiceImpl:
                     composition_turns_used=new_composition_turns_used,
                     discovery_turns_used=new_discovery_turns_used,
                     failed_turn=failed_turn,
+                    provider_owner=provider_owner,
                 )
                 self._enforce_tool_call_cap(
                     assistant_tool_calls=completion.tool_batch.calls,
@@ -1796,6 +1849,7 @@ class ComposerServiceImpl:
                             advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                             deadline=deadline,
                             completion_gates=completion_gates,
+                            provider_owner=provider_owner,
                         )
                     except _AdvisorCheckpointComposeDeadlineExpired:
                         # The model had already replied; the timeout envelope
@@ -1917,6 +1971,8 @@ class ComposerServiceImpl:
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
         diagnostics: _ComposeLoopDiagnostics | None = None,
+        required_work: RequiredWorkBinding | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> ComposerResult:
         """Inner composition loop with dual-counter budget tracking.
 
@@ -2100,6 +2156,7 @@ class ComposerServiceImpl:
                 composition_turns_used=composition_turns_used,
                 discovery_turns_used=discovery_turns_used,
                 failed_turn=failed_turn,
+                provider_owner=provider_owner,
             )
             # If no tool calls, the LLM is done — apply the final gate and return
             if not call_model.completion.tool_batch.calls:
@@ -2147,6 +2204,7 @@ class ComposerServiceImpl:
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
                     completion_gates=completion_gates,
+                    provider_owner=provider_owner,
                 )
                 if terminate.advisor_review_state is not None:
                     advisor_review_state = terminate.advisor_review_state
@@ -2249,6 +2307,7 @@ class ComposerServiceImpl:
                     composition_turns_used=_composition_turns_used,
                     discovery_turns_used=_discovery_turns_used,
                     failed_turn=_failed_turn,
+                    provider_owner=provider_owner,
                 )
                 if diagnostics is not None:
                     diagnostics.tool_outcomes = dispatch_result.tool_outcomes
@@ -2276,6 +2335,7 @@ class ComposerServiceImpl:
                                 progress=progress,
                                 deadline=deadline,
                                 session_operation_context=session_operation_context,
+                                provider_owner=provider_owner,
                             )
                         except _AdvisorCheckpointComposeDeadlineExpired:
                             # The driver converts this signal after persistence
@@ -2303,6 +2363,7 @@ class ComposerServiceImpl:
                         ingress=ingress,
                         chat_ingress_inputs=chat_ingress_inputs,
                         advisor_repair_context_introduced=_advisor_repair_context_introduced,
+                        required_work=required_work,
                     )
                     if diagnostics is not None:
                         diagnostics.redacted_assistant_tool_calls = persist_result.redacted_assistant_tool_calls
@@ -2503,6 +2564,7 @@ class ComposerServiceImpl:
                 plugin_snapshot=plugin_snapshot,
                 advisor_review_state=advisor_review_state,
                 completion_gates=completion_gates,
+                provider_owner=provider_owner,
             )
             composition_turns_used += classify.composition_turns_delta
             discovery_turns_used += classify.discovery_turns_delta
@@ -2586,6 +2648,13 @@ class ComposerServiceImpl:
         except OSError as exc:
             raise ComposerServiceError(f"Failed to load deployment skill ({type(exc).__name__})") from exc
 
+    def _new_primary_custody(self, provider_owner: ProviderInvocationOwner | None) -> ProviderCallCustody | None:
+        if provider_owner is None:
+            return None
+        if type(provider_owner) is not ProviderInvocationOwner or provider_owner.service is not self._require_sessions_service():
+            raise AuditIntegrityError("Primary invocation owner belongs to another exact service")
+        return provider_owner.mint(ProviderInvocationFamily.PRIMARY)
+
     async def _call_llm_before_deadline(
         self,
         messages: list[dict[str, Any]],
@@ -2598,12 +2667,13 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call the LLM with a per-call timeout derived from the deadline.
 
-        LLM calls are pure network I/O with no side effects, so they
-        are safe to cancel via asyncio.wait_for.  If the deadline has
-        already passed or the call exceeds the remaining budget, raise
+        The Gateway retains admitted provider accounting and joins its owned
+        SQL work when the deadline cancels a provider coroutine. If the deadline
+        has already passed or the call exceeds the remaining budget, raise
         ComposerConvergenceError with the current partial state.
 
         ``recorder`` is the in-flight :class:`BufferingRecorder` from
@@ -2636,6 +2706,7 @@ class ComposerServiceImpl:
         def _captured_llm_calls() -> tuple[ComposerLLMCall, ...]:
             return recorder.llm_calls if recorder is not None else ()
 
+        provider_custody = self._new_primary_custody(provider_owner)
         attempt = 0
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
@@ -2650,11 +2721,14 @@ class ComposerServiceImpl:
                     failed_turn=failed_turn,
                 )
             try:
+                if provider_custody is None:
+                    return await self._provider_gateway._call_llm_with_audit(messages, tools, timeout=remaining, recorder=recorder)
                 return await self._provider_gateway._call_llm_with_audit(
                     messages,
                     tools,
                     timeout=remaining,
                     recorder=recorder,
+                    provider_custody=provider_custody,
                 )
             except TimeoutError:
                 raise ComposerConvergenceError.capture(

@@ -1,0 +1,55 @@
+<!-- Durable copy: machine-specific prefixes normalized; private original retained. -->
+
+# Actual Astra coherent app assembly review 1
+
+**Verdict: bounded source GO for `coherent-app-assembly-1`.** The complete assembled app is exactly the reviewed failed-physical successor plus the exact V7 decorated manual-failure handler and its two imports. No blocking composition defect was found. The previously conditional registry getter is now supplied by the exact immutable `49cc` dependency. This does not clear its controls, app control successor2, constructor fixture5, canonical maps, runtime, application or merge.
+
+Actual internal Astra review; not Daybreak. No candidate definition/import, production execution, collection, SQL, provider/network action, repository edit, application, merge or deployment was performed. Reviewer work was source inspection and standard-library byte/AST checks in the authorized workspace. The root owns later repository and runtime actions.
+
+## Exact assembly and review scope
+
+I read the complete assembly report, manifest, root preparation generator, V7 handler/descriptor and prior app failed-physical review. Fresh source reading covered the app imports, actual `_create_app` registration scope, complete new handler and every existing handler it dispatches to, `_join_execution_lifecycle`, outer lifespan and shutdown completion paths, the relevant registry getter/success/completion methods, and the V7 consumer/import boundaries. The full affected app assessment otherwise carries forward from prior app5/failed-physical/CODE7 reviews through complete byte equality. This is not a fresh line-by-line audit of every unrelated method in the large app file.
+
+Independent measurements bind:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Current live app / full preimage | `de6b6bef766380c7e629f7f86fdf0dea5188fed3dbd6379e65c4634b985da05e` |
+| Reviewed Sol app input | `08ee4e26a0d1d2713e7ba7ff2b3580133ac8372b9796597148a52a7b5445aedf` |
+| V7 decorated handler | `3278f9919e961b067968c733f1c72b87b67f68233a262f7ca7160b5779d333d1` |
+| Assembled app | `145a21bf0ccdbda295f7f0da6be4b6af3b37e688da7e1542c63cc5d2bfbead29` |
+| Complete patch | `5e93be33676da790184dda79976baf533947d528fd90ee77e126bd65e4f4c1b3` |
+| Manifest | `a37f0820f9986d5b244dc46aa616839c9368eba06cf28dc5cb275f1a2d5f749a` |
+| Registry dependency | `49cc0c0235dc9e0b30dbeef4ca9a7ef029cf01358514d6f28f19add72692e9f4` |
+
+The entire patch reconstructs exactly from the complete live preimage and replacement. Removing precisely the decorated handler and two imports returns every byte of the reviewed Sol app, and its complete AST. No provider path, startup, shutdown, existing error handler or module statement outside those additions changed. All V7 manifest entries and its frozen manifest hash still match CODE7.
+
+The handler occurs once inside the actual `_create_app` implementation, with one exact `@app.exception_handler(ComposerManualProposalFailure)` registration. Both new imports occur once and have the exact declared bindings. Its full nested AST, annotations, body and decorator equal the V7 source. There is no duplicate definition or registration introduced by the assembly. The public `create_app` wrapper is unchanged and remains distinct from the inner implementation.
+
+## Presentation custody and existing handlers
+
+The new handler first calls `consume_manual_proposal_failure` on the actual private carrier. That consumer remains the exact V7 implementation: it verifies actual issuer/carrier/closed invocation, unconsumed state, exact lease/coordinator binding, complete current custody, physical handoffs, raw explicit originals, selected cause/context, current reduction and saved policy before marking consumption. The handler cannot obtain presentation authority merely from a public exception constructor or arbitrary group. It does not re-run the rejection SQL or close a lease.
+
+Only after consumption does it project the selected failure using the captured settings/request ID. If the shared reduction differs from the nominal single-witness projection, it emits the validated shared DTO. Otherwise it calls the existing captured integrity, database, generation, storage, secret or HTTP handler for that selected nominal domain. Each target's complete source is unchanged from the reviewed Sol app. The private full exception group is not serialized. Existing diagnostic behavior is preserved; no universal side-effect-free claim is made for those handlers or generic projection.
+
+The new handler does not widen the DTO's 400..599 status domain or turn it into a public group selector. The V7 issuer's existing HTTP204/304 refusal/original fallback and unresolved full-group behavior remain dependencies of the unchanged custody source. No source/rank policy, source51/52 writer-map admission, retry or Unknown waiver is introduced by app registration.
+
+The new import boundaries were checked in source. The manual-failure module imports lifecycle/required-work; required-work's reverse manual-failure type references are behind `TYPE_CHECKING`, and relevant runtime dispatch imports are local. The projector uses existing worker/contracts imports. The reviewed reader's lifecycle/worker dependencies are likewise guarded or local. No new direct import-time back edge to the app was found at these changed boundaries. This bounded source inspection is not a measured import of the full composed graph; root must still prove actual provenance and successful imports with the final dependency set.
+
+## Shutdown success remains distinct from physical failure observation
+
+The complete `_join_execution_lifecycle`, outer lifespan and service lifespan are byte-identical to the reviewed Sol app. The three already-reviewed waits use `executor_join_physically_observed`, preserving actual observer Tasks/results and all retained originals. The final completion gate still uses `registry.assert_completed()` and the unchanged success contract, while any primary failure or unavailable generation prevents the successful watchdog branch. The V7 handler has no path into those conditions.
+
+The frozen getter dependency matches the exact `49cc` source assessed conditionally in the earlier review. Removing only its getter and reversing the one joined-pipeline-failure predicate reproduces all core4 registry bytes. `executor_join_succeeded` and `assert_completed` are unchanged. The getter snapshots its actual registered capability and actual private-executor-return flag under the registry lock, releases that lock, then requires real owner registration and a core4 successful or physically known failed closure. Copied capability, done Future, failed observer or joined unrelated generation does not meet that source contract.
+
+Core4's failed closure still requires actual counter return and the exact registering-generation join in addition to private executor return and invocation evidence. Missing counter return remains Unknown. Known failed closure authorizes observation and the narrowly declared literal-submit-no-return follow-up; it grants neither healthy retirement nor COMPLETE. Shared quarantine continues rejecting fresh ordinary submissions. This review does not claim successful later PostgreSQL membership stop or release SQL from a getter that merely permits cleanup observation.
+
+## Independent controls and limitations
+
+`astra-coherent-app-source-evidence.py` completed with native exit 0. Its companion `astra-coherent-app-assembly-code-review-1-evidence.json` records all complete artifact hashes, fresh live guards, exact patch reconstruction, full byte/AST reversal, handler scope/registration and dependency preservation. The instrument independently rejects absent or changed handler, missing or duplicate import, duplicate handler, changed COMPLETE guard and an extra module binding. Each file/hash guard rejects changed bytes. No root preparation script or candidate code was executed by the reviewer.
+
+The root generator was read in full. Its writes begin after all checks and syntax compilation. The preserved initial native-1 log records its earlier wrong handler-scope assertion; the corrected root native-0 log was read. Those are source preparation results, not runtime evidence. The reviewer instrument also stopped twice before producing evidence: first because an unanchored `registry.assert_completed()` substring was nonunique, then because it compared AST node identity across separate parses. The corrected instrument uses the exact outer guard line and nodes from one parsed tree. Both native-1 logs/exits are preserved as reviewer instrument failures; the final controlled native-0 run supplies this report's evidence.
+
+The separate app/consumer controls and constructor fixture remain under their own review. Prior negative control findings are not erased by this source assembly. Root must establish actual baseline registrations, bounded causal mutation outcomes, cancellation identity, no early private/shared completion, failed-counter Unknown, eventual app/consumer composition, canonical descriptor/global/storage closure, source51/52 maps, operator signatures and all applicable frozen gates. The original **102 obligations, four collections and two UNKNOWNs** remain unchanged.
+
+No provider bypass, tutorial-special path or server-authored proposal is added. No provider/paid test, production action, runtime/canonical clearance, final merge readiness, merge or deployment is granted. John's local testing/manual Daybreak/merge decision and the denied external Daybreak hold remain intact.

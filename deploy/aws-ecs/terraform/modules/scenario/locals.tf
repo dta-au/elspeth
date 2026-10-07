@@ -469,15 +469,9 @@ locals {
     { name = "ELSPETH_WEB__PAYLOAD_STORE_PATH", value = local.payload_store_path },
     { name = "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS", value = "12" },
     { name = "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS", value = "8" },
-    # The composer envelope is a coupled three-leg chain driven by
-    # var.alb_idle_timeout_seconds: the ALB idle_timeout (network.tf), the
-    # transport ceiling below (so the app's boot guard validates against the
-    # real proxy limit, not the WebSettings default 300), and the wall clock
-    # (var.composer_timeout_seconds, plan-time capped at ceiling - 30s
-    # headroom). Defaults 900/840 (elspeth-09c91778f5): the prior 300/240
-    # envelope could not fund the shipped corpus - battery round-5 g03's
-    # first authoring call lands at t=413s and its compose settles at
-    # ~490-514s. Wall history: 120 hardcoded, then 240 (elspeth-f159d2394b).
+    # Advertise the real ALB transport ceiling for synchronous request
+    # headroom. The durable composer job budget is independent of observer
+    # sockets; preserve the measured 900/840 defaults without coupling them.
     { name = "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS", value = tostring(var.alb_idle_timeout_seconds) },
     { name = "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS", value = tostring(var.composer_timeout_seconds) },
     # "medium", not the code default "high": the candidate role is the other

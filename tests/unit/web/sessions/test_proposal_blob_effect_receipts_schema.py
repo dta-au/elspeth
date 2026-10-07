@@ -24,7 +24,7 @@ def test_proposal_blob_effect_receipt_schema_is_exact(engine) -> None:
     # Epoch 67 binds coalesce branch order and sources order in authority hashes.
     # Epoch 68 adds ordinary proposal checkpoint rebase reasons.
     # Epoch 71 adds mode-neutral fork/revert receipts.
-    assert SESSION_SCHEMA_EPOCH == 71
+    assert SESSION_SCHEMA_EPOCH == 72
     assert tuple(proposal_blob_effect_receipts_table.primary_key.columns.keys()) == ("proposal_id",)
     assert set(proposal_blob_effect_receipts_table.c.keys()) == {
         "proposal_id",

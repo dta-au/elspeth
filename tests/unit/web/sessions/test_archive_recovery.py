@@ -73,13 +73,16 @@ async def test_failed_delete_restores_only_current_truth(deployment, monkeypatch
     app, sessions, _blobs, data_dir = deployment
     authority = sessions.session_operation_authority
     real_delete = authority.archive_delete
+    injected_storage_errors: list[OSError] = []
 
     def fail_delete(context):
         if delete_outcome == "committed":
             real_delete(context)
         if delete_outcome == "fence_lost":
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
-        raise OSError(errno.EIO, "ambiguous database acknowledgement")
+        error = OSError(errno.EIO, "ambiguous database acknowledgement")
+        injected_storage_errors.append(error)
+        raise error
 
     monkeypatch.setattr(authority, "archive_delete", fail_delete)
     if delete_outcome in {"unknown", "fence_lost"}:
@@ -87,7 +90,9 @@ async def test_failed_delete_restores_only_current_truth(deployment, monkeypatch
         def fail_reconciliation(_context):
             if delete_outcome == "fence_lost":
                 raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
-            raise OSError(errno.EIO, "terminal truth unavailable")
+            error = OSError(errno.EIO, "terminal truth unavailable")
+            injected_storage_errors.append(error)
+            raise error
 
         monkeypatch.setattr(authority, "reconcile_archive_delete", fail_reconciliation)
 
@@ -102,11 +107,19 @@ async def test_failed_delete_restores_only_current_truth(deployment, monkeypatch
             return
         expected_error = {
             "current": OSError,
-            "unknown": SessionOperationTerminalOutcomeUnknown,
+            "unknown": ExceptionGroup,
             "fence_lost": SessionOperationFenceLost,
         }[delete_outcome]
-        with pytest.raises(expected_error):
+        with pytest.raises(expected_error) as captured:
             await sessions.archive_session(session_id)
+        if delete_outcome == "unknown":
+            assert isinstance(captured.value, ExceptionGroup)
+            terminal, delete_error, reconciliation_error = captured.value.exceptions
+            assert isinstance(terminal, SessionOperationTerminalOutcomeUnknown)
+            assert len(injected_storage_errors) == 2
+            assert delete_error is injected_storage_errors[0]
+            assert reconciliation_error is injected_storage_errors[1]
+            assert all(error.errno == errno.EIO for error in injected_storage_errors)
         await sessions.get_session(session_id)
         root = data_dir / "blobs" / str(session_id)
         assert next(root.glob(f"{blob_id}_*")).read_bytes() == b"x\n1\n"

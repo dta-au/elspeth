@@ -28,8 +28,12 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
+
+execution_fixture = execution_custody.execution_fixture
 
 
 def _settings(tmp_path: Path) -> WebSettings:
@@ -66,18 +70,18 @@ class _UnusedYamlGenerator:
 
 
 def _execution_service(
-    *,
-    loop: asyncio.AbstractEventLoop,
-    tmp_path: Path,
-    session_service: SessionServiceImpl,
+    *, loop: asyncio.AbstractEventLoop, tmp_path: Path, session_service: SessionServiceImpl, execution_fixture: ExecutionTestCustody
 ) -> ExecutionServiceImpl:
-    return ExecutionServiceImpl.for_trained_operator(
-        loop=loop,
-        broadcaster=ProgressBroadcaster(loop),
-        settings=_settings(tmp_path),
-        session_service=session_service,
-        yaml_generator=_UnusedYamlGenerator(),
-        telemetry=build_sessions_telemetry(),
+    return execution_fixture.bind(
+        ExecutionServiceImpl.for_trained_operator(
+            loop=loop,
+            broadcaster=ProgressBroadcaster(loop),
+            settings=_settings(tmp_path),
+            session_service=session_service,
+            yaml_generator=_UnusedYamlGenerator(),
+            telemetry=build_sessions_telemetry(),
+            execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+        )
     )
 
 
@@ -128,8 +132,7 @@ def _pending_requirement(kind: InterpretationKind, *, user_term: str) -> dict[st
 
 
 async def _seed_and_execute(
-    tmp_path: Path,
-    state_data: CompositionStateData,
+    tmp_path: Path, state_data: CompositionStateData, execution_fixture: ExecutionTestCustody
 ) -> UnresolvedInterpretationPlaceholderError:
     session_service = _session_service()
     session = await session_service.create_session(
@@ -145,9 +148,7 @@ async def _seed_and_execute(
         provenance="session_seed",
     )
     execution_service = _execution_service(
-        loop=asyncio.get_running_loop(),
-        tmp_path=tmp_path,
-        session_service=session_service,
+        loop=asyncio.get_running_loop(), tmp_path=tmp_path, session_service=session_service, execution_fixture=execution_fixture
     )
     try:
         lease = await SessionOperationLease.acquire(
@@ -156,6 +157,12 @@ async def _seed_and_execute(
             operation_kind=SessionOperationKind.EXECUTE,
             owner_instance_id=session_service.session_operation_owner_instance_id,
             lease_seconds=session_service.session_operation_lease_seconds,
+            execution_obligation=execution_service.execution_lease_release_registry.admit(
+                session_service.session_operation_authority,
+                session_id=session_id,
+                owner_instance_id=session_service.session_operation_owner_instance_id,
+                lease_seconds=session_service.session_operation_lease_seconds,
+            ),
         )
         async with lease:
             with pytest.raises(UnresolvedInterpretationPlaceholderError) as exc_info:
@@ -165,12 +172,12 @@ async def _seed_and_execute(
                     user_id="alice",
                 )
     finally:
-        await execution_service.shutdown()
+        await execution_fixture.shutdown_service(execution_service)
     return exc_info.value
 
 
 @pytest.mark.asyncio
-async def test_execute_rejects_unreviewed_vague_term(tmp_path: Path) -> None:
+async def test_execute_rejects_unreviewed_vague_term(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
     exc = await _seed_and_execute(
         tmp_path,
         _llm_state_with_options(
@@ -179,6 +186,7 @@ async def test_execute_rejects_unreviewed_vague_term(tmp_path: Path) -> None:
                 "model": "stub-model",
             }
         ),
+        execution_fixture=execution_fixture,
     )
 
     # This hand-built fixture skips the mutation-time auto-stager, so the LLM
@@ -196,7 +204,7 @@ async def test_execute_rejects_unreviewed_vague_term(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_rejects_unreviewed_invented_source(tmp_path: Path) -> None:
+async def test_execute_rejects_unreviewed_invented_source(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
     exc = await _seed_and_execute(
         tmp_path,
         CompositionStateData(
@@ -232,6 +240,7 @@ async def test_execute_rejects_unreviewed_invented_source(tmp_path: Path) -> Non
             ],
             metadata_={"name": None, "description": None},
         ),
+        execution_fixture=execution_fixture,
     )
 
     assert [(site.component_id, site.kind) for site in exc.sites] == [("source", InterpretationKind.INVENTED_SOURCE)]
@@ -239,7 +248,7 @@ async def test_execute_rejects_unreviewed_invented_source(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_execute_rejects_unreviewed_llm_prompt_template(tmp_path: Path) -> None:
+async def test_execute_rejects_unreviewed_llm_prompt_template(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
     exc = await _seed_and_execute(
         tmp_path,
         _llm_state_with_options(
@@ -254,6 +263,7 @@ async def test_execute_rejects_unreviewed_llm_prompt_template(tmp_path: Path) ->
                 ],
             }
         ),
+        execution_fixture=execution_fixture,
     )
 
     # Hand-built fixture (no auto-stager): the declared model also surfaces a
@@ -269,7 +279,7 @@ async def test_execute_rejects_unreviewed_llm_prompt_template(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_execute_gate_ignores_persisted_is_valid_true(tmp_path: Path) -> None:
+async def test_execute_gate_ignores_persisted_is_valid_true(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
     """FENCE (elspeth-67c6fa691d): /execute must re-derive the strict predicate
     unconditionally — ``materialize_state_for_execution`` runs regardless of
     what ``composition_states.is_valid`` says.
@@ -287,6 +297,8 @@ async def test_execute_gate_ignores_persisted_is_valid_true(tmp_path: Path) -> N
             "model": "stub-model",
         }
     )
-    exc = await _seed_and_execute(tmp_path, replace_dc(state_data, is_valid=True, validation_errors=None))
+    exc = await _seed_and_execute(
+        tmp_path, replace_dc(state_data, is_valid=True, validation_errors=None), execution_fixture=execution_fixture
+    )
 
     assert ("rate", InterpretationKind.VAGUE_TERM) in [(site.component_id, site.kind) for site in exc.sites]

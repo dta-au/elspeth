@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from opentelemetry import metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult, MetricsData, PeriodicExportingMetricReader
 
@@ -19,13 +20,23 @@ from elspeth.web.config import WebSettings
 from elspeth.web.operator_telemetry import (
     AWS_OTLP_ENDPOINT,
     SAFE_CLOUDWATCH_METRIC_ATTRIBUTES,
-    OperatorTelemetryFactories,
+    OwnedTestOperatorTelemetryFactories,
     apply_operator_pipeline_telemetry,
     bootstrap_operator_telemetry,
     build_aws_operator_pipeline_telemetry,
     record_operator_pipeline_queue_drops,
     reset_operator_telemetry_for_tests,
 )
+from elspeth.web.operator_telemetry_custody import (
+    OperatorTelemetryCleanupOwner,
+    OwnedMeterProvider,
+    OwnedPeriodicExportingMetricReader,
+    OwnedPrometheusMetricReader,
+    OwnedProviderFactory,
+    RawMetricExporterCustodian,
+    TelemetryCustodyUnresolved,
+)
+from elspeth.web.operator_telemetry_installation import OwnedTestTelemetryInstallation
 from tests.fixtures.telemetry import FailingExporter, MockTelemetryConfig
 
 
@@ -189,9 +200,11 @@ class _FakeExporter(MetricExporter):
         self.headers = headers
         self.timeout = timeout
         self.results: list[MetricExportResult] = []
+        self.exports: list[MetricsData] = []
 
     def export(self, _data: object, timeout_millis: float = 10_000, **_kwargs: object) -> MetricExportResult:
         del timeout_millis
+        self.exports.append(_data)
         return self.results.pop(0) if self.results else MetricExportResult.SUCCESS
 
     def force_flush(self, timeout_millis: float = 10_000) -> bool:
@@ -222,7 +235,7 @@ class _CapturingMetricExporter(MetricExporter):
 
 def test_aws_metric_export_preserves_only_bounded_acceptance_correlation() -> None:
     inner = _CapturingMetricExporter()
-    exporter = operator_telemetry._HealthTrackingMetricExporter(inner, operator_telemetry._ExportHealth())
+    exporter = operator_telemetry._HealthTrackingMetricExporter(RawMetricExporterCustodian(inner), operator_telemetry._ExportHealth())
     reader = PeriodicExportingMetricReader(exporter, export_interval_millis=60_000)
     provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
     try:
@@ -269,110 +282,51 @@ def test_periodic_reader_shutdown_performs_final_collection() -> None:
 
 
 @dataclass
-class _FakeSynchronousInstrument:
-    points: list[tuple[int | float, dict[str, object] | None]] = field(default_factory=list)
-
-    def add(self, value: int | float, attributes: dict[str, object] | None = None) -> None:
-        self.points.append((value, attributes))
-
-    def record(self, value: int | float, attributes: dict[str, object] | None = None) -> None:
-        self.points.append((value, attributes))
+class _FactoryRecord:
+    providers: list[operator_telemetry._Provider] = field(default_factory=list)
+    exporters: list[_FakeExporter] = field(default_factory=list)
+    installed: list[object] = field(default_factory=list)
 
 
-@dataclass
-class _FakeProvider:
-    readers: list[object]
-    resource: object
-    views: tuple[object, ...]
-    force_flush_calls: list[float] = field(default_factory=list)
-    shutdown_calls: list[float] = field(default_factory=list)
-    force_flush_error: BaseException | None = None
-    shutdown_error: BaseException | None = None
-    shutdown_observer: Any | None = None
-    gauges: dict[str, list[Any]] = field(default_factory=dict)
-    synchronous_instruments: dict[str, _FakeSynchronousInstrument] = field(default_factory=dict)
+class _RecordingFactories(OwnedTestOperatorTelemetryFactories):
+    def __init__(self, record: _FactoryRecord) -> None:
+        class Installation(OwnedTestTelemetryInstallation):
+            def set_provider(self, provider: OwnedMeterProvider) -> None:
+                super().set_provider(provider)
+                record.installed.append(provider)
 
-    def get_meter(self, _name: str, _version: str) -> _FakeProvider:
-        return self
+        class ProviderFactory(OwnedProviderFactory):
+            def construct_into(self, provider: OwnedMeterProvider, *, resource, views, shutdown_on_exit) -> None:
+                assert shutdown_on_exit is False
+                super().construct_into(provider, resource=resource, views=views, shutdown_on_exit=shutdown_on_exit)
+                record.providers.append(provider)
 
-    def create_observable_gauge(self, name: str, *, callbacks: list[Any], **_kwargs: object) -> object:
-        self.gauges[name] = callbacks
-        return object()
+        def exporter_factory(**kwargs) -> _FakeExporter:
+            exporter = _FakeExporter(**kwargs)
+            record.exporters.append(exporter)
+            return exporter
 
-    def create_counter(self, name: str, **_kwargs: object) -> _FakeSynchronousInstrument:
-        instrument = _FakeSynchronousInstrument()
-        self.synchronous_instruments[name] = instrument
-        return instrument
-
-    def create_histogram(self, name: str, **_kwargs: object) -> _FakeSynchronousInstrument:
-        instrument = _FakeSynchronousInstrument()
-        self.synchronous_instruments[name] = instrument
-        return instrument
-
-    def force_flush(self, timeout_millis: float = 10_000) -> bool:
-        self.force_flush_calls.append(timeout_millis)
-        if self.force_flush_error is not None:
-            raise self.force_flush_error
-        return True
-
-    def shutdown(self, timeout_millis: float = 30_000) -> None:
-        self.shutdown_calls.append(timeout_millis)
-        if self.shutdown_observer is not None:
-            self.shutdown_observer()
-        if self.shutdown_error is not None:
-            raise self.shutdown_error
+        super().__init__(exporter_factory=exporter_factory, provider_factory=ProviderFactory())
+        self.owner = OperatorTelemetryCleanupOwner(installation=Installation())
 
 
-def _factories(record: dict[str, object]) -> OperatorTelemetryFactories:
-    def prometheus_reader() -> _FakeReader:
-        reader = _FakeReader("prometheus")
-        record.setdefault("prometheus", []).append(reader)  # type: ignore[union-attr]
-        return reader
-
-    def otlp_exporter(**kwargs: object) -> _FakeExporter:
-        exporter = _FakeExporter(**kwargs)  # type: ignore[arg-type]
-        record.setdefault("exporters", []).append(exporter)  # type: ignore[union-attr]
-        return exporter
-
-    def periodic_reader(exporter: object, *, export_interval_millis: int, export_timeout_millis: int) -> _FakeReader:
-        assert export_timeout_millis > 0
-        reader = _FakeReader("periodic", exporter, export_interval_millis)
-        record.setdefault("periodic", []).append(reader)  # type: ignore[union-attr]
-        return reader
-
-    def provider(readers: list[object], *, resource: object, views: tuple[object, ...]) -> _FakeProvider:
-        value = _FakeProvider(readers, resource, views)
-        record.setdefault("providers", []).append(value)  # type: ignore[union-attr]
-        return value
-
-    def set_provider(provider: object) -> None:
-        record.setdefault("set_provider", []).append(provider)  # type: ignore[union-attr]
-
-    return OperatorTelemetryFactories(
-        prometheus_reader=prometheus_reader,
-        otlp_exporter=otlp_exporter,
-        periodic_reader=periodic_reader,
-        meter_provider=provider,
-        set_meter_provider=set_provider,
-    )
+def _factories(record: _FactoryRecord) -> _RecordingFactories:
+    return _RecordingFactories(record)
 
 
-def test_process_bootstrap_local_is_idempotent_prometheus_only() -> None:
-    record: dict[str, object] = {}
-    factories = _factories(record)
-
-    first = bootstrap_operator_telemetry(_web_settings(), factories=factories)
-    second = bootstrap_operator_telemetry(_web_settings(), factories=factories)
-
-    assert first is second
-    assert len(record["providers"]) == 1  # type: ignore[arg-type]
-    assert len(record["set_provider"]) == 1  # type: ignore[arg-type]
-    assert [reader.kind for reader in first.readers] == ["prometheus"]
+def _bootstrap(settings: WebSettings, *, factories: _RecordingFactories):
+    try:
+        return bootstrap_operator_telemetry(settings, cleanup_owner=factories.owner, factories=factories)
+    except BaseException as original:
+        try:
+            factories.owner.shutdown_sync()
+        except BaseException as cleanup:
+            raise BaseExceptionGroup("Test bootstrap and actual cleanup failed", [original, cleanup]) from None
+        raise
 
 
-def test_process_bootstrap_aws_adds_one_fixed_otlp_reader_and_safe_resource() -> None:
-    record: dict[str, object] = {}
-    settings = _web_settings(
+def _aws_settings() -> WebSettings:
+    return _web_settings(
         deployment_target="aws-ecs",
         operator_telemetry="aws-otlp",
         operator_telemetry_environment="production",
@@ -381,18 +335,46 @@ def test_process_bootstrap_aws_adds_one_fixed_otlp_reader_and_safe_resource() ->
         operator_telemetry_ecs_service="elspeth-web",
         operator_telemetry_task_definition_family="elspeth-web-task",
         operator_telemetry_task_definition_revision="42",
-        operator_telemetry_export_interval_seconds=17,
     )
 
-    runtime = bootstrap_operator_telemetry(settings, factories=_factories(record))
 
-    assert [reader.kind for reader in runtime.readers] == ["prometheus", "periodic"]
-    exporter = record["exporters"][0]  # type: ignore[index]
+def _gauge_value(runtime, exporter: _FakeExporter, name: str) -> int | float:
+    assert runtime.provider.force_flush(timeout_millis=5_000)
+    return next(
+        point.value
+        for resource in exporter.exports[-1].resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.name == name
+        for point in metric.data.data_points
+    )
+
+
+def test_process_bootstrap_local_is_idempotent_prometheus_only() -> None:
+    record = _FactoryRecord()
+    factories = _factories(record)
+    first = _bootstrap(_web_settings(), factories=factories)
+    second = _bootstrap(_web_settings(), factories=factories)
+    assert first is second
+    assert len(record.providers) == len(record.installed) == 1
+    assert len(first.readers) == 1
+    assert isinstance(first.readers[0], OwnedPrometheusMetricReader)
+
+
+def test_process_bootstrap_aws_adds_one_fixed_otlp_reader_and_safe_resource() -> None:
+    record = _FactoryRecord()
+    runtime = _bootstrap(
+        _aws_settings().model_copy(update={"operator_telemetry_export_interval_seconds": 17}), factories=_factories(record)
+    )
+    assert len(runtime.readers) == 2
+    assert isinstance(runtime.readers[0], OwnedPrometheusMetricReader)
+    assert isinstance(runtime.readers[1], OwnedPeriodicExportingMetricReader)
+    exporter = record.exporters[0]
     assert exporter.endpoint == AWS_OTLP_ENDPOINT
     assert exporter.insecure is True
     assert exporter.headers == {}
     assert exporter.timeout == 5.0
-    assert runtime.readers[1].interval_ms == 17_000
+    assert runtime.readers[1]._export_interval_millis == 17_000
     assert runtime.resource.attributes == {
         "service.name": "elspeth-web",
         "service.version": "git-deadbeef",
@@ -406,62 +388,24 @@ def test_process_bootstrap_aws_adds_one_fixed_otlp_reader_and_safe_resource() ->
 
 
 def test_aws_bootstrap_rejects_provider_without_meter_contract() -> None:
-    @dataclass
-    class _ProviderWithoutMeter:
-        readers: list[object]
-        resource: object
-        views: tuple[object, ...]
-
-        def force_flush(self, timeout_millis: float = 10_000) -> bool:
-            del timeout_millis
-            return True
-
-        def shutdown(self, timeout_millis: float = 30_000) -> None:
-            del timeout_millis
-
-    record: dict[str, object] = {}
-    base = _factories(record)
-    factories = replace(
-        base,
-        meter_provider=lambda readers, *, resource, views: _ProviderWithoutMeter(readers, resource, views),
-    )
-
-    with pytest.raises(AttributeError, match="get_meter"):
-        bootstrap_operator_telemetry(
-            _web_settings(
-                deployment_target="aws-ecs",
-                operator_telemetry="aws-otlp",
-                operator_telemetry_environment="production",
-                operator_telemetry_release="git-deadbeef",
-                operator_telemetry_ecs_cluster="elspeth-production",
-                operator_telemetry_ecs_service="elspeth-web",
-                operator_telemetry_task_definition_family="elspeth-web-task",
-                operator_telemetry_task_definition_revision="42",
-            ),
-            factories=factories,
-        )
-
-    assert "set_provider" not in record
+    factories = _factories(_FactoryRecord())
+    factories.provider_factory = object()
+    with pytest.raises(TypeError, match="nominal"):
+        _bootstrap(_aws_settings(), factories=factories)
+    assert factories.owner.provider is None
+    assert factories.owner.witness is not None
 
 
 def test_aws_bootstrap_rejects_exporter_outside_factory_contract() -> None:
-    base = _factories({})
-    factories = replace(base, otlp_exporter=lambda **_kwargs: object())
+    factories = _factories(_FactoryRecord())
+    factories.exporter_factory = lambda **kwargs: object()
+    with pytest.raises(BaseExceptionGroup) as failure:
+        _bootstrap(_aws_settings(), factories=factories)
+    assert factories.owner.provider is None
 
-    with pytest.raises(AttributeError):
-        bootstrap_operator_telemetry(
-            _web_settings(
-                deployment_target="aws-ecs",
-                operator_telemetry="aws-otlp",
-                operator_telemetry_environment="production",
-                operator_telemetry_release="git-deadbeef",
-                operator_telemetry_ecs_cluster="elspeth-production",
-                operator_telemetry_ecs_service="elspeth-web",
-                operator_telemetry_task_definition_family="elspeth-web-task",
-                operator_telemetry_task_definition_revision="42",
-            ),
-            factories=factories,
-        )
+    assert isinstance(failure.value.exceptions[0], TypeError)
+    assert isinstance(failure.value.exceptions[1], TelemetryCustodyUnresolved)
+    assert factories.owner.witness is None
 
 
 @pytest.mark.parametrize(
@@ -476,188 +420,127 @@ def test_aws_bootstrap_rejects_exporter_outside_factory_contract() -> None:
     ],
 )
 def test_aws_bootstrap_defensively_rejects_unvalidated_resource_labels(field: str, raw_value: str) -> None:
-    settings = _web_settings(
-        deployment_target="aws-ecs",
-        operator_telemetry="aws-otlp",
-        operator_telemetry_environment="production",
-        operator_telemetry_release="git-deadbeef",
-        operator_telemetry_ecs_cluster="elspeth-production",
-        operator_telemetry_ecs_service="elspeth-web",
-        operator_telemetry_task_definition_family="elspeth-web-task",
-        operator_telemetry_task_definition_revision="42",
-    ).model_copy(update={field: raw_value})
-
     with pytest.raises(ValueError, match=field) as caught:
-        bootstrap_operator_telemetry(settings, factories=_factories({}))
-
+        _bootstrap(_aws_settings().model_copy(update={field: raw_value}), factories=_factories(_FactoryRecord()))
     assert raw_value not in str(caught.value)
 
 
 def test_pipeline_exporter_failures_are_excluded_from_operator_queue_drop_gauge() -> None:
-    record: dict[str, object] = {}
-    settings = _web_settings(
-        deployment_target="aws-ecs",
-        operator_telemetry="aws-otlp",
-        operator_telemetry_environment="production",
-        operator_telemetry_release="git-deadbeef",
-        operator_telemetry_ecs_cluster="elspeth-production",
-        operator_telemetry_ecs_service="elspeth-web",
-        operator_telemetry_task_definition_family="elspeth-web-task",
-        operator_telemetry_task_definition_revision="42",
-    )
-    runtime = bootstrap_operator_telemetry(settings, factories=_factories(record))
-    provider = runtime.provider
-    assert isinstance(provider, _FakeProvider)
-    gauge_callback = provider.gauges["operator.telemetry.queue_drops"][0]
-    assert gauge_callback(None)[0].value == 0
+    record = _FactoryRecord()
+    runtime = _bootstrap(_aws_settings(), factories=_factories(record))
+    exporter = record.exporters[0]
+    assert _gauge_value(runtime, exporter, "operator.telemetry.queue_drops") == 0
     manager = TelemetryManager(MockTelemetryConfig(), exporters=[FailingExporter()])
     try:
         manager.handle_event(
-            RunStarted(
-                timestamp=datetime(2026, 7, 14, tzinfo=UTC),
-                run_id="run-dropped",
-                config_hash="config-hash",
-                source_plugin="text",
-            )
+            RunStarted(timestamp=datetime(2026, 7, 14, tzinfo=UTC), run_id="run-dropped", config_hash="config-hash", source_plugin="text")
         )
         manager.flush()
         assert manager.health_metrics["events_dropped"] == 1
         assert manager.health_metrics["queue_drops"] == 0
-
         record_operator_pipeline_queue_drops(manager.health_metrics["queue_drops"])
-
-        assert gauge_callback(None)[0].value == 0
+        assert _gauge_value(runtime, exporter, "operator.telemetry.queue_drops") == 0
     finally:
         manager.close()
 
 
 def test_pipeline_queue_drop_fact_is_observed_by_operator_queue_drop_gauge() -> None:
-    record: dict[str, object] = {}
-    runtime = bootstrap_operator_telemetry(
-        _web_settings(
-            deployment_target="aws-ecs",
-            operator_telemetry="aws-otlp",
-            operator_telemetry_environment="production",
-            operator_telemetry_release="git-deadbeef",
-            operator_telemetry_ecs_cluster="elspeth-production",
-            operator_telemetry_ecs_service="elspeth-web",
-            operator_telemetry_task_definition_family="elspeth-web-task",
-            operator_telemetry_task_definition_revision="42",
-        ),
-        factories=_factories(record),
-    )
-    provider = runtime.provider
-    assert isinstance(provider, _FakeProvider)
-    gauge_callback = provider.gauges["operator.telemetry.queue_drops"][0]
-
+    record = _FactoryRecord()
+    runtime = _bootstrap(_aws_settings(), factories=_factories(record))
     record_operator_pipeline_queue_drops(1)
-
-    assert gauge_callback(None)[0].value == 1
+    assert _gauge_value(runtime, record.exporters[0], "operator.telemetry.queue_drops") == 1
 
 
 @pytest.mark.asyncio
-async def test_shutdown_is_bounded_and_once_only() -> None:
-    record: dict[str, object] = {}
-    settings = _web_settings(
-        deployment_target="aws-ecs",
-        operator_telemetry="aws-otlp",
-        operator_telemetry_environment="production",
-        operator_telemetry_release="git-deadbeef",
-        operator_telemetry_ecs_cluster="elspeth-production",
-        operator_telemetry_ecs_service="elspeth-web",
-        operator_telemetry_task_definition_family="elspeth-web-task",
-        operator_telemetry_task_definition_revision="42",
-    )
-    runtime = bootstrap_operator_telemetry(settings, factories=_factories(record))
+async def test_shutdown_is_bounded_and_once_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _FactoryRecord()
+    runtime = _bootstrap(_aws_settings(), factories=_factories(record))
+    provider = runtime.provider
+    calls: list[float] = []
+    shutdown = provider.shutdown
 
+    def observed(timeout_millis: float = 30_000) -> None:
+        calls.append(timeout_millis)
+        shutdown(timeout_millis=timeout_millis)
+
+    monkeypatch.setattr(provider, "shutdown", observed)
     await runtime.shutdown()
     await runtime.shutdown()
-
-    provider = record["providers"][0]  # type: ignore[index]
-    # MeterProvider.shutdown() performs the reader's final collection. A
-    # preceding force_flush() would spend the same exporter budget twice.
-    assert provider.force_flush_calls == []
-    assert provider.shutdown_calls == [5_000]
+    assert calls == [5_000]
+    assert runtime.cleanup_owner.witness is not None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shutdown_error", [TimeoutError(), ConnectionError("collector unavailable")])
-async def test_shutdown_failure_is_handled_once(shutdown_error: BaseException) -> None:
-    record: dict[str, object] = {}
-    settings = _web_settings(
-        deployment_target="aws-ecs",
-        operator_telemetry="aws-otlp",
-        operator_telemetry_environment="production",
-        operator_telemetry_release="git-deadbeef",
-        operator_telemetry_ecs_cluster="elspeth-production",
-        operator_telemetry_ecs_service="elspeth-web",
-        operator_telemetry_task_definition_family="elspeth-web-task",
-        operator_telemetry_task_definition_revision="42",
+async def test_shutdown_failure_is_handled_once(shutdown_error: BaseException, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Keep projection-pointer restoration scoped before publishing this
+    # deliberately failed isolated domain; its authority record is retained.
+    monkeypatch.setattr(operator_telemetry, "_runtime", None)
+    record = _FactoryRecord()
+    runtime = _bootstrap(_aws_settings(), factories=_factories(record))
+    calls: list[float] = []
+
+    def fail(timeout_millis: float = 30_000) -> None:
+        calls.append(timeout_millis)
+        raise shutdown_error
+
+    monkeypatch.setattr(runtime.provider, "shutdown", fail)
+    # This negative owns an isolated retained failed domain, never a reset.
+    monkeypatch.setattr(operator_telemetry, "_runtime", None)
+    for _ in range(2):
+        with pytest.raises(type(shutdown_error)) as caught:
+            await runtime.shutdown()
+        assert caught.value is shutdown_error
+    assert calls == [5_000]
+    assert runtime.cleanup_owner.witness is None
+    assert all(reader.cleanup.finished for reader in runtime.cleanup_owner.readers)
+    assert all(
+        not reader._daemon_thread.is_alive()
+        for reader in runtime.cleanup_owner.readers
+        if isinstance(reader, OwnedPeriodicExportingMetricReader)
     )
-    runtime = bootstrap_operator_telemetry(settings, factories=_factories(record))
-    provider = record["providers"][0]  # type: ignore[index]
-    provider.shutdown_error = shutdown_error
-
-    await runtime.shutdown()
-    await runtime.shutdown()
-
-    assert provider.force_flush_calls == []
-    assert provider.shutdown_calls == [5_000]
 
 
 @pytest.mark.asyncio
-async def test_shutdown_finishes_on_calling_thread() -> None:
-    record: dict[str, object] = {}
-    runtime = bootstrap_operator_telemetry(
-        _web_settings(
-            deployment_target="aws-ecs",
-            operator_telemetry="aws-otlp",
-            operator_telemetry_environment="production",
-            operator_telemetry_release="git-deadbeef",
-            operator_telemetry_ecs_cluster="elspeth-production",
-            operator_telemetry_ecs_service="elspeth-web",
-            operator_telemetry_task_definition_family="elspeth-web-task",
-            operator_telemetry_task_definition_revision="42",
-        ),
-        factories=_factories(record),
-    )
-    provider = record["providers"][0]  # type: ignore[index]
+async def test_shutdown_finishes_on_calling_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = _bootstrap(_aws_settings(), factories=_factories(_FactoryRecord()))
+    threads: list[int] = []
+    shutdown = runtime.provider.shutdown
+
+    def observed(timeout_millis: float = 30_000) -> None:
+        threads.append(threading.get_ident())
+        shutdown(timeout_millis=timeout_millis)
+
+    monkeypatch.setattr(runtime.provider, "shutdown", observed)
     calling_thread = threading.get_ident()
-    shutdown_threads: list[int] = []
-    provider.shutdown_observer = lambda: shutdown_threads.append(threading.get_ident())
-
     await runtime.shutdown()
-
-    assert shutdown_threads == [calling_thread]
+    assert threads == [calling_thread]
     assert runtime._shutdown_complete is True
 
 
-def test_reset_shuts_down_provider_before_forgetting_runtime() -> None:
-    record: dict[str, object] = {}
-    runtime = bootstrap_operator_telemetry(
-        _web_settings(),
-        factories=_factories(record),
-    )
-    provider = record["providers"][0]  # type: ignore[index]
-    observed_runtimes: list[object | None] = []
-    provider.shutdown_observer = lambda: observed_runtimes.append(operator_telemetry._runtime)
+def test_reset_shuts_down_provider_before_forgetting_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = _bootstrap(_web_settings(), factories=_factories(_FactoryRecord()))
+    observed: list[object] = []
+    shutdown = runtime.provider.shutdown
 
+    def check(timeout_millis: float = 30_000) -> None:
+        observed.append(operator_telemetry._runtime)
+        shutdown(timeout_millis=timeout_millis)
+
+    monkeypatch.setattr(runtime.provider, "shutdown", check)
     reset_operator_telemetry_for_tests()
-
-    assert provider.shutdown_calls == [5_000]
-    assert observed_runtimes == [runtime]
-    replacement = bootstrap_operator_telemetry(_web_settings(), factories=_factories({}))
+    assert observed == [runtime]
+    assert runtime.cleanup_owner.witness is not None
+    replacement = _bootstrap(_web_settings(), factories=_factories(_FactoryRecord()))
     assert replacement is not runtime
 
 
 def test_reset_does_not_shutdown_process_global_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    record: dict[str, object] = {}
-    runtime = bootstrap_operator_telemetry(_web_settings(), factories=_factories(record))
-    provider = record["providers"][0]  # type: ignore[index]
-    monkeypatch.setattr(operator_telemetry.metrics, "get_meter_provider", lambda: provider)
-
-    reset_operator_telemetry_for_tests()
-
-    assert provider.shutdown_calls == []
-    replacement = bootstrap_operator_telemetry(_web_settings(), factories=_factories({}))
-    assert replacement is not runtime
+    runtime = _bootstrap(_web_settings(), factories=_factories(_FactoryRecord()))
+    monkeypatch.setattr(metrics, "get_meter_provider", lambda: runtime.provider)
+    with pytest.raises(TelemetryCustodyUnresolved, match="reset"):
+        reset_operator_telemetry_for_tests()
+    # No domain is forgotten, even after physical cleanup was completed.
+    assert operator_telemetry._runtime is runtime
+    assert runtime.cleanup_owner.installation.record is not None
+    monkeypatch.undo()

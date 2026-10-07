@@ -108,26 +108,89 @@ async def test_seed_review_debt_check_does_not_stall_a_concurrent_request(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_seed_review_debt_check_refuses_at_the_configured_bound(tmp_path: Path) -> None:
+async def test_seed_review_debt_check_refuses_at_the_configured_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The bound is the runtime-preflight knob; the refusal is static and the
     state is not persisted — the lease is released instead of outlived."""
+    from concurrent.futures import Future
+    from functools import partial
+
+    from elspeth.web import async_workers
+    from elspeth.web.required_executor import InvocationReservation, RequiredExecutorGenerationCustodian
+
+    actual_futures: list[Future[object]] = []
+    reservations: list[InvocationReservation] = []
+    submission_states: list[tuple[bool, bool]] = []
+    submitted = asyncio.Event()
+    physically_done = asyncio.Event()
+    release_physical = threading.Event()
+    loop = asyncio.get_running_loop()
+    baseline = async_workers.outstanding_admissions()
+    original_submit = async_workers._submit_shared
+
+    async def observe_submit(callable_, *args, **kwargs):
+        actual = await original_submit(callable_, *args, **kwargs)
+        if isinstance(callable_, partial) and callable_.func is controlled_check:
+            assert isinstance(actual, Future)
+            generation = async_workers._GENERATION_CUSTODIAN
+            assert isinstance(generation, RequiredExecutorGenerationCustodian)
+            with generation.submission_lock:
+                matching = [reservation for reservation in generation.reservations.values() if reservation.future is actual]
+                assert len(matching) == 1
+                reservation = matching[0]
+                assert reservation.ticket is None
+                assert reservation.held and not reservation.released
+            submission_states.append((actual.running(), actual.done()))
+            actual_futures.append(actual)
+            reservations.append(reservation)
+            actual.add_done_callback(lambda _completed: loop.call_soon_threadsafe(physically_done.set))
+            submitted.set()
+        return actual
+
     app, service = _make_app(tmp_path, e2e_state_seed_enabled=True)
     app.state.settings = app.state.settings.model_copy(update={"composer_runtime_preflight_timeout_seconds": 0.2})
     session = await service.create_session("alice", "Seed", "local")
     seeded = _valid_state(tmp_path, session_id=str(session.id))
     entered = threading.Event()
 
-    with (
-        patch(_CHECK_TARGET, new=_blocking_check(1.0, entered)),
-        patch(_PREFLIGHT_TARGET, side_effect=_pass_preflight),
-    ):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post(f"/api/sessions/{session.id}/state/e2e-seed", json={"state": seeded.to_dict()})
+    original_check = _blocking_check(1.0, entered)
 
-    assert entered.is_set()
-    assert response.status_code == 504, response.text
-    assert response.json()["detail"] == "Review-debt check did not complete within the configured bound; seed aborted."
-    assert await service.get_current_state(session.id) is None
+    def controlled_check(state):
+        entered.set()
+        assert release_physical.wait(timeout=5), "controlled review check was not released"
+        return original_check(state)
+
+    with (
+        patch(_CHECK_TARGET, new=controlled_check),
+        patch(_PREFLIGHT_TARGET, side_effect=_pass_preflight),
+        monkeypatch.context() as physical_observer,
+    ):
+        physical_observer.setattr(async_workers, "_submit_shared", observe_submit)
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post(f"/api/sessions/{session.id}/state/e2e-seed", json={"state": seeded.to_dict()})
+
+            assert entered.is_set()
+            assert response.status_code == 504, response.text
+            assert response.json()["detail"] == "Review-debt check did not complete within the configured bound; seed aborted."
+            assert await service.get_current_state(session.id) is None
+            assert submitted.is_set() and entered.is_set()
+            assert len(actual_futures) == len(reservations) == 1
+            assert len(submission_states) == 1 and submission_states[0][1] is False
+            actual = actual_futures[0]
+            reservation = reservations[0]
+            assert actual.running() and not actual.done(), "timed-out caller must retain its running physical invocation"
+            assert reservation.future is actual and reservation.held and not reservation.released
+            assert async_workers.outstanding_admissions() >= baseline + 1
+        finally:
+            release_physical.set()
+            for actual in actual_futures:
+                await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(actual)), timeout=5)
+            if actual_futures:
+                await asyncio.wait_for(physically_done.wait(), timeout=5)
+        assert len(actual_futures) == len(reservations) == 1
+        assert actual_futures[0].done() and not actual_futures[0].cancelled()
+        assert reservations[0].released
+        assert async_workers.outstanding_admissions() == baseline
 
 
 @pytest.mark.asyncio

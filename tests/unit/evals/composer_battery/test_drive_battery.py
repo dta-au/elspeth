@@ -23,6 +23,11 @@ ENV = {"advisor_model": tg.ADVISOR, "composition_turns": 30, "discovery_turns": 
 
 
 def _battery(tmp_path: Path, client: FakeClient, **kw) -> db.Battery:
+    elapsed = [0.0]
+
+    def advance(seconds: float) -> None:
+        elapsed[0] += seconds
+
     b = db.Battery(
         client,
         base="https://elspeth.example.gov.au",
@@ -30,7 +35,8 @@ def _battery(tmp_path: Path, client: FakeClient, **kw) -> db.Battery:
         runs_dir=tmp_path / "runs",
         corpus_version=0,
         env_budgets=ENV,
-        sleep=lambda s: None,
+        sleep=advance,
+        clock=lambda: elapsed[0],
         **kw,
     )
     b.login("battery_local", "pw")
@@ -55,17 +61,19 @@ def test_patch_title_precedes_post_message_and_label_format(tmp_path: Path) -> N
     assert steps.index("PATCH /api/sessions/s1") < steps.index("POST /api/sessions/s1/messages")
     assert client.calls[steps.index("PATCH /api/sessions/s1")].json == {"title": "battery/r1/fork_coalesce/1"}
     message_call = client.calls[steps.index("POST /api/sessions/s1/messages")]
-    assert message_call.timeout == 620.0
+    assert message_call.timeout == 30.0
     assert message_call.json["content"] == "p"
-    assert str(UUID(message_call.json["client_request_id"])) == message_call.json["client_request_id"]
+    assert str(UUID(message_call.json["operation_id"])) == message_call.json["operation_id"]
     assert verdict is None
     meta = json.loads((tmp_path / "runs/r1/fork_coalesce/1/meta.json").read_text())
-    assert [h["step"] for h in meta["http"]][:5] == [
+    assert [h["step"] for h in meta["http"]][:7] == [
         "create_session",
         "patch_title",
         "patch_preferences",
         "get_preferences",
+        "get_composition_head",
         "post_message",
+        "composer_operation",
     ]
     assert meta["preferences"] == {"trust_mode": "auto_commit", "density_default": "high"}
     assert meta["identity"]["binding"]["tools_spec_hash"] == tg.TOOLS_HASH and meta["identity"]["binding"]["advisor_model"] == tg.ADVISOR
@@ -109,7 +117,7 @@ def test_422_detail_is_captured_as_the_terminal_reason(tmp_path: Path) -> None:
     assert client.steps().count("GET /api/sessions/s1/messages") >= 3
 
 
-def test_client_timeout_reads_composer_progress_once(tmp_path: Path) -> None:
+def test_client_timeout_retains_same_operation_and_does_not_borrow_progress(tmp_path: Path) -> None:
     r = happy_responders([tg.user_row(1), tg.audit_row(2)], state=None)
 
     def timeout_then(c):
@@ -122,12 +130,11 @@ def test_client_timeout_reads_composer_progress_once(tmp_path: Path) -> None:
     b = _battery(tmp_path, client)
     b.run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/fork_coalesce/1", case="fork_coalesce", repeat=1)
     meta = json.loads((tmp_path / "runs/r1/fork_coalesce/1/meta.json").read_text())
-    assert client.steps().count("GET /api/sessions/s1/composer-progress") == 1
-    assert meta["server_terminal"] == {
-        "budget_exhausted": "timeout",
-        "reason": "convergence_wall_clock_timeout",
-        "source": "composer_progress",
-    }
+    assert client.steps().count("GET /api/sessions/s1/composer-progress") == 0
+    assert meta["server_terminal"] == {"budget_exhausted": None, "reason": None, "source": "none"}
+    bodies = [call.json for call in client.calls if call.method == "POST" and call.path.endswith("/messages")]
+    assert len(bodies) > 1 and all(body == bodies[0] for body in bodies)
+    assert meta["instrument"]["http_unrecovered"] is not None
     post = next(h for h in meta["http"] if h["step"] == "post_message")
     assert post["status"] is None
 
@@ -179,9 +186,8 @@ def test_capture_step_server_failures_are_instrument_exclusions_not_product_find
     feeds the abort rule."""
     # (a) validate 5xx: state.json is written, validate.json is not
     r = happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS))
-    r["POST /api/sessions/"] = lambda c: (
-        ok({"detail": "boom"}, 503) if c.path.endswith("/validate") else ok({"message": {}, "state": None, "proposals": []})
-    )
+    original_child = r["POST /api/sessions/"]
+    r["POST /api/sessions/"] = lambda c: ok({"detail": "boom"}, 503) if c.path.endswith("/validate") else original_child(c)
     b = _battery(tmp_path, FakeClient(r), repeats=1)
     verdict = b.run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/x/1", case="x", repeat=1)
     inst = json.loads((tmp_path / "runs/r1/x/1/meta.json").read_text())["instrument"]
@@ -194,7 +200,7 @@ def test_capture_step_server_failures_are_instrument_exclusions_not_product_find
     b2 = _battery(tmp_path, FakeClient(r2), repeats=1)
     v2 = b2.run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/x/2", case="x", repeat=2)
     inst2 = json.loads((tmp_path / "runs/r1/x/2/meta.json").read_text())["instrument"]
-    assert inst2["http_unrecovered"] == "get_state 502" and v2 in db.INSTRUMENT_KINDS
+    assert inst2["http_unrecovered"] == "get_composition_head 502" and v2 in db.INSTRUMENT_KINDS
     r3 = happy_responders(tg.ideal_thread(ARGS), state=None)  # 200 + null body
     b3 = _battery(tmp_path, FakeClient(r3), repeats=1)
     b3.run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/x/3", case="x", repeat=3)
@@ -216,7 +222,7 @@ def test_a_state_read_that_times_out_is_an_instrument_fault_too(tmp_path: Path) 
     run_dir = tmp_path / "runs/r1/x/1"
     verdict = _battery(tmp_path, client, repeats=1).run_prompt(label="l", prompt="p", run_dir=run_dir, case="x", repeat=1)
     meta = json.loads((run_dir / "meta.json").read_text())
-    assert meta["instrument"]["http_unrecovered"].startswith("get_state timeout")
+    assert meta["instrument"]["http_unrecovered"].startswith("get_composition_head timeout")
     assert not (run_dir / "state.json").exists() and not (run_dir / "validate.json").exists()
     assert "POST /api/sessions/s1/validate" not in client.steps()  # the validate seam never ran at all
     assert verdict in db.INSTRUMENT_KINDS and path_from_disk(run_dir).excluded_by_instrument
@@ -290,7 +296,7 @@ def test_a_5xx_carrying_a_planner_terminal_is_a_product_outcome_not_an_instrumen
     assert meta2["instrument"]["http_unrecovered"] == "post_message 500"
 
 
-def test_composer_progress_reasons_map_to_every_budget_and_a_missing_snapshot_is_source_none(tmp_path: Path) -> None:
+def test_unowned_progress_never_supplies_an_ambiguous_operation_terminal(tmp_path: Path) -> None:
     """M1: the scorer's terminal_missing keys on ``source``, so a progress read that produced no reason must
     not claim one; and the composition/discovery budgets must map as well as the wall clock."""
     for reason, budget in (("convergence_composition_budget", "composition"), ("convergence_discovery_budget", "discovery")):
@@ -307,7 +313,8 @@ def test_composer_progress_reasons_map_to_every_budget_and_a_missing_snapshot_is
             label="l", prompt="p", run_dir=tmp_path / "runs/r1/x" / budget, case="x", repeat=1
         )
         meta = json.loads((tmp_path / "runs/r1/x" / budget / "meta.json").read_text())
-        assert meta["server_terminal"] == {"budget_exhausted": budget, "reason": reason, "source": "composer_progress"}
+        assert meta["server_terminal"] == {"budget_exhausted": None, "reason": None, "source": "none"}
+        assert meta["instrument"]["http_unrecovered"] is not None
     r2 = happy_responders([tg.user_row(1), tg.audit_row(2)], state=None)
 
     def timeout_then_none(c):
@@ -761,3 +768,35 @@ def test_read_env_budgets(tmp_path: Path) -> None:
     env.write_text("ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10\n")
     with pytest.raises(ValueError, match="COMPOSER_ADVISOR_MODEL"):
         db.read_env_budgets(env)
+
+
+def test_incomplete_resume_keeps_submitted_session_operation_and_exact_body(tmp_path: Path) -> None:
+    responders = happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS))
+    operation_read = responders["GET /api/sessions/s1/operations/"]
+    interrupted = False
+
+    def interrupt_once(call):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+        return operation_read(call)
+
+    responders["GET /api/sessions/s1/operations/"] = interrupt_once
+    client = FakeClient(responders)
+    run_dir = tmp_path / "runs/r1/fork_coalesce/1"
+    first = _battery(tmp_path, client)
+    with pytest.raises(KeyboardInterrupt):
+        first.run_prompt(label="l", prompt="p", run_dir=run_dir, case="fork_coalesce", repeat=1)
+    retained = (run_dir / "composer_request.json").read_bytes()
+    assert not db.run_dir_is_complete(run_dir)
+    second = _battery(tmp_path, client, resume=True)
+    assert second.run_prompt(label="l", prompt="p", run_dir=run_dir, case="fork_coalesce", repeat=1) is None
+    assert (run_dir / "composer_request.json").read_bytes() == retained
+    assert db.run_dir_is_complete(run_dir)
+    assert client.steps().count("POST /api/sessions") == 1
+    submissions = [call for call in client.calls if call.method == "POST" and call.path.endswith("/messages")]
+    assert len(submissions) == 1
+    assert submissions[0].json == json.loads(retained)["request"]
+    with pytest.raises(ValueError, match="Retained Composer action differs"):
+        second.run_prompt(label="l", prompt="changed", run_dir=run_dir, case="fork_coalesce", repeat=1)

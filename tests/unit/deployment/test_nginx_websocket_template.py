@@ -62,7 +62,9 @@ def _assert_websocket_contract(config: str) -> None:
     assert ("proxy_send_timeout", f"{ceiling}s") in directives
     timeout = int(environment["ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS"])
     headroom = int(environment["ELSPETH_WEB__COMPOSER_TRANSPORT_HEADROOM_SECONDS"])
-    assert timeout <= ceiling - headroom
+    assert timeout > 0
+    assert ceiling > headroom
+    assert ("proxy_buffering", "off") in directives
     log_format = next(d for d in document if d.words[:2] == ("log_format", "elspeth_safe"))
     assert "$uri" in " ".join(log_format.words)
     assert "$request " not in " ".join(log_format.words)

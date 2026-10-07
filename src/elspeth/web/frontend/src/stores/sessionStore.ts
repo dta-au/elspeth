@@ -1,3 +1,7 @@
+import { currentAuthGeneration, isCurrentAuthGeneration } from "@/api/authSession";
+import { observeComposerOperation, submitAndObserveComposerOperation, cancelObservedComposerOperation, detachComposerObservers, ComposerObservationDetached, ComposerSessionMissing } from "@/api/composerOperationObserver";
+import { composerCustodySessionIds, composerCustodyRecoveryNotice, composerStopPersistenceLimited, composerCustodyScope, findComposerOperationCustody, samePrincipal } from "./composerOperationCustody";
+import type { OperationCustody, SubmittedCustody } from "@/types/composerOperations";
 // src/stores/sessionStore.ts
 import { create } from "zustand";
 import type {
@@ -20,14 +24,13 @@ import type {
 } from "./sessionOperationRetry";
 import * as api from "@/api/client";
 import {
-  COMPOSE_TIMEOUT_ABORT_REASON,
   COMPOSE_USER_CANCEL_ABORT_REASON,
-  runComposeWithTimeout,
+  isComposeRefreshOnlyFailureCode,
+  isComposePermanentRefusal,
 } from "@/config/composer";
 import { useBlobStore } from "./blobStore";
 import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
-import { isGenuineReply } from "@/components/chat/turns";
 import {
   acquireSessionOperationRetry,
   clearAllSessionOperationRetries,
@@ -42,14 +45,6 @@ function getExecutionStore() {
   return useExecutionStore.getState();
 }
 
-function localComposeRequestIsPending(sessionId: string): boolean {
-  return useSessionStore.getState().composeRequests.has(sessionId);
-}
-
-
-
-
-
 const COMPOSER_PROGRESS_POLL_INTERVAL_MS = 1500;
 const LLM_UNAVAILABLE_MESSAGE =
   "The AI service is temporarily unavailable. Please try again in a moment.";
@@ -59,10 +54,6 @@ const LLM_AUTH_ERROR_MESSAGE =
 // COMPOSE_TIMEOUT_MS guard in useComposer). Distinct from the backend's
 // 422/convergence_wall_clock_timeout copy because the cause is different:
 // the browser gave up before the server reached its own deadline.
-const COMPOSE_TIMEOUT_MESSAGE =
-  "ELSPETH took too long to compose a response. Try a smaller request or split it into multiple steps.";
-const COMPOSE_CANCELLED_MESSAGE =
-  "Composition stopped. You can revise your request and send it again.";
 // The two turn-budget convergence causes: the model kept calling tools
 // without settling, so the user's lever is a smaller request.
 const CONVERGENCE_BUDGET_MESSAGE =
@@ -118,27 +109,6 @@ function formatConvergenceError(apiErr: ApiError): string {
  * it, and this fold-in is neither concurrent nor third-party — leaving it
  * behind would make every timeout Apply raise a false alarm.
  */
-function convergencePartialStatePatch(
-  apiErr: ApiError,
-  selectedNodeId: string | null,
-): {
-  compositionState?: CompositionState;
-  selectedNodeId?: null;
-  recoveryStartedCompositionVersion?: number;
-} {
-  const partial =
-    apiErr.error_type === "convergence" ? apiErr.partial_state : null;
-  if (partial == null) {
-    return {};
-  }
-  const nodeStillExists =
-    !selectedNodeId || partial.nodes.some((node) => node.id === selectedNodeId);
-  return {
-    compositionState: partial,
-    recoveryStartedCompositionVersion: partial.version,
-    ...(nodeStillExists ? {} : { selectedNodeId: null }),
-  };
-}
 // Human names for the pending action in a live custody conflict — the copy
 // must tell the user WHAT is unsettled, because "retry the same action" is
 // only actionable when they know which action it means (session 09cde460:
@@ -215,99 +185,6 @@ async function reconcileSessionOperationRetryConflict(
     return { status: "conflict", existing };
   }
   return acquireSessionOperationRetry(kind, sessionId, requestIdentity);
-}
-
-function isAbortError(err: unknown): boolean {
-  // DOMException ('AbortError'/'TimeoutError') is not always an Error
-  // subclass across runtimes (browsers, jsdom, Node). Match on the
-  // structural `name` field — that's the cross-platform contract.
-  if (typeof err !== "object" || err === null) {
-    return false;
-  }
-  const name = (err as { name?: unknown }).name;
-  return name === "AbortError" || name === "TimeoutError";
-}
-
-function isComposeAbort(err: unknown): boolean {
-  // abort() with NO argument rejects the fetch with a DOMException named
-  // 'AbortError' — but useComposer aborts with a bare-string reason
-  // (compose_timeout / compose_user_cancel), and per WHATWG semantics the
-  // fetch then rejects with that RAW string. Classify on the rejection
-  // value as well as the structural shape (elspeth-475647c47a).
-  return (
-    isAbortError(err) ||
-    err === COMPOSE_TIMEOUT_ABORT_REASON ||
-    err === COMPOSE_USER_CANCEL_ABORT_REASON
-  );
-}
-
-/**
- * A fetch transport failure does not tell the browser whether the POST
- * reached the server.  Treating that failure as a definitive rejection leaves
- * the optimistic row marked retryable while the server may already have
- * persisted the user's message and advanced the pipeline.  Reconcile the
- * read-only session surfaces before offering a retry.
- *
- * HTTP errors are intentionally excluded: parseResponse received a response
- * and the route's structured error contract is authoritative for those
- * outcomes.  Abort errors have their own server-settlement resync above.
- */
-function isAmbiguousComposeNetworkFailure(err: unknown): boolean {
-  if (isComposeAbort(err) || typeof err !== "object" || err === null) {
-    return false;
-  }
-  if (err instanceof TypeError) {
-    return true;
-  }
-  const record = err as { name?: unknown; status?: unknown };
-  return record.name === "NetworkError" || record.status === 0;
-}
-
-function abortReason(signal?: AbortSignal): unknown {
-  return signal?.aborted === true ? signal.reason : undefined;
-}
-
-function composeAbortMessage(signal?: AbortSignal): string {
-  return abortReason(signal) === COMPOSE_USER_CANCEL_ABORT_REASON
-    ? COMPOSE_CANCELLED_MESSAGE
-    : COMPOSE_TIMEOUT_MESSAGE;
-}
-
-/**
- * Refine the abort banner once the post-stop resync knows the durable head
- * (elspeth-2784531888). In auto_commit mode a Stop can land after committed
- * mutations; the generic abort copy ("revise your request and send it
- * again") then misrepresents what persisted. Composition-state versions are
- * allocated COALESCE(MAX(version), 0) + 1 per session (sessions/service.py),
- * so `resyncedVersion - (preTurnVersion ?? 0)` is an exact count of pipeline
- * changes the stopped turn saved.
- *
- * Returns null when the banner must not be rewritten: the current error is
- * not this turn's abort copy (a newer surface owns the banner), or the
- * resync learned nothing (state fetch returned no version) — a false "no
- * changes were saved" claim is worse than the generic copy.
- */
-function stoppedComposeOutcomeMessage(
-  currentError: string | null,
-  preTurnVersion: number | null,
-  resyncedVersion: number | null,
-): string | null {
-  if (resyncedVersion === null) return null;
-  const isCancel = currentError === COMPOSE_CANCELLED_MESSAGE;
-  const isTimeout = currentError === COMPOSE_TIMEOUT_MESSAGE;
-  if (!isCancel && !isTimeout) return null;
-  const saved = resyncedVersion - (preTurnVersion ?? 0);
-  if (saved <= 0) {
-    return isCancel
-      ? "Composition stopped. No pipeline changes had been saved yet. You can revise your request and send it again."
-      : "ELSPETH took too long to compose a response. No pipeline changes had been saved yet. Try a smaller request or split it into multiple steps.";
-  }
-  const changes =
-    saved === 1 ? "1 pipeline change" : `${saved} pipeline changes`;
-  const outcome = `${changes} had already been saved (now at version ${resyncedVersion}). Your next message continues from the saved draft.`;
-  return isCancel
-    ? `Composition stopped — ${outcome}`
-    : `ELSPETH took too long to compose a response and was stopped — ${outcome}`;
 }
 
 function isHttpConflict(err: unknown): boolean {
@@ -414,6 +291,12 @@ async function reconcileProposalConflict(
   }
 }
 
+export function captureSessionPublicationGuard(sessionId: string): () => boolean {
+  const generation = sessionPublicationGeneration;
+  const authGeneration = currentAuthGeneration();
+  return () => isCurrentAuthGeneration(authGeneration) && sessionPublicationIsCurrent(sessionId, generation);
+}
+
 function sessionPublicationIsCurrent(
   sessionId: string,
   generation: number,
@@ -455,13 +338,6 @@ const inflightMessagesLatestClaimBySession = new Map<string, number>();
 // A session can become active again while its earlier POST is unresolved.
 // The poller's per-session claim also owns POST metadata and error publication;
 // stopping its timer on navigation does not invalidate an unsuperseded turn.
-function freeformComposeClaimIsCurrent(sessionId: string, generation: number): boolean {
-  return (
-    useSessionStore.getState().activeSessionId === sessionId &&
-    inflightMessagesLatestClaimBySession.get(sessionId) === generation
-  );
-}
-
 function clearInflightMessagesPollTimer(): void {
   if (inflightMessagesPollTimer !== null) {
     clearInterval(inflightMessagesPollTimer);
@@ -507,370 +383,93 @@ function formatAuditIntegrityError(apiErr: ApiError): string {
   );
 }
 
+function composerSessionHasCustody(sessionId: string): boolean {
+  const scope = composerCustodyScope();
+  if (scope === null) return false;
+  const record = findComposerOperationCustody(scope, sessionId);
+  return record.foreground !== null || record.unresolvedSubmissions.size > 0;
+}
+
+async function runDurableComposerTurn(descriptor: OperationCustody, localMessageId: string | null, signal: AbortSignal | undefined, submit: boolean, reconciliationOnly = false): Promise<void> {
+  const sessionId = descriptor.sessionId;
+  const generation = sessionPublicationGeneration;
+  const authGeneration = currentAuthGeneration();
+  const current = () => isCurrentAuthGeneration(authGeneration) && sessionPublicationIsCurrent(sessionId, generation);
+  const beforeVersion = useSessionStore.getState().compositionState?.version ?? null;
+  let result: import("@/types/index").MessageWithStateResponse | null = null;
+  let failure: unknown = null;
+  try {
+    const options = { signal, current, reconciliationOnly, progress: (snapshot: ComposerProgressSnapshot) => { if (current() && !reconciliationOnly) useSessionStore.setState({ composerProgress: snapshot }); } };
+    result = submit && descriptor.mode === "submitted"
+      ? await submitAndObserveComposerOperation(descriptor, options)
+      : await observeComposerOperation(descriptor, options);
+  } catch (error) {
+    if (!current() || error instanceof ComposerObservationDetached) return;
+    if (error instanceof ComposerSessionMissing) { useSessionStore.getState().unbindMissingSession(sessionId); return; }
+    failure = error;
+  }
+  if (!current()) return;
+  const messagesAtReadDispatch = useSessionStore.getState().messages;
+  const proposalSnapshot = beginProposalSnapshot();
+  let authoritativeMessages: ChatMessage[] | null = null;
+  let authoritativeState: CompositionState | null | undefined;
+  let proposals: CompositionProposal[] | null = null;
+  let refreshed = false;
+  try {
+    [authoritativeMessages, authoritativeState, proposals] = await Promise.all([api.fetchMessages(sessionId), api.fetchCompositionState(sessionId), api.fetchCompositionProposals(sessionId)]);
+    refreshed = true;
+  } catch { /* Preserve the terminal result; a failed reload never authorizes a replay. */ }
+  if (!current()) return;
+  const error = failure as ApiError | null;
+  const errorText = error === null ? null : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
+  useSessionStore.setState((state) => {
+    const local = localMessageId === null ? undefined : state.messages.find((row) => row.id === localMessageId);
+    let messages = authoritativeMessages ?? state.messages;
+    if (authoritativeMessages !== null) {
+      const staleRead = state.messages !== messagesAtReadDispatch;
+      const byId = new Map(authoritativeMessages.map((row) => [row.id, row]));
+      for (const existing of state.messages) {
+        if (existing.id.startsWith("local-") && authoritativeMessages.some((row) => row.role === "user" && existing.operation_id != null && row.operation_id === existing.operation_id)) continue;
+        if (!byId.has(existing.id) || staleRead) byId.set(existing.id, existing);
+      }
+      messages = [...byId.values()].sort((a, b) => a.sequence_no != null && b.sequence_no != null ? a.sequence_no - b.sequence_no : 0);
+    }
+    if (local && !messages.some((row) => row.id === local.id || (row.operation_id != null && row.operation_id === local.operation_id))) messages = [...messages, local];
+    if (result) messages = messages.some((row) => row.id === result!.message.id) ? messages.map((row) => row.id === result!.message.id ? result!.message : row) : [...messages, result.message];
+    messages = messages.map((row, index) => {
+      if (!(row.id === localMessageId || (row.role === "user" && row.operation_id === descriptor.operationId))) return row;
+      if (error && error.error_type !== "audit_integrity_error" && !hasGenuineReplyForUser(messages, index)) return { ...row, local_status: "failed", local_error: errorText ?? undefined, local_failure_code: error.error_type === "stale_compose_state" ? "stale_compose_state" : error.failure_code ?? error.error_type };
+      return { ...row, local_status: undefined, local_error: undefined, local_failure_code: undefined };
+    });
+    const savedPartial = error?.partial_state_save_failed !== true ? error?.partial_state : null;
+    const candidates = [state.compositionState, result?.state, authoritativeState, savedPartial].filter((candidate): candidate is CompositionState => candidate !== null && candidate !== undefined && candidate.session_id === sessionId);
+    const nextState = candidates.reduce<CompositionState | null>((latest, candidate) => latest === null || candidate.version > latest.version ? candidate : latest, null);
+    const changed = nextState?.version !== beforeVersion && nextState !== null;
+    const savedChanges = nextState !== null && beforeVersion !== null ? Math.max(0, nextState.version - beforeVersion) : 0;
+    const terminalErrorText = error?.error_type === "request_cancelled"
+      ? savedChanges > 0
+        ? `Composition stopped — ${savedChanges} pipeline ${savedChanges === 1 ? "change had" : "changes had"} already been saved (now at version ${nextState!.version}). Your next message continues from the saved draft.`
+        : "Composition stopped. Your next message continues from the current draft."
+      : errorText;
+    if (changed) getExecutionStore().clearValidation();
+    const recovery = error && isComposerRecoveryError(error) ? { recoveryError: error, recoveryStartedCompositionVersion: nextState?.id === error.partial_state.id ? nextState.version : beforeVersion } : {};
+    return { messages, compositionState: nextState, compositionStateLoaded: refreshed, compositionProposals: proposals !== null ? proposalSnapshot.reconcile(state.compositionProposals, mergeCompositionProposals(proposals, result?.proposals ?? [])) : proposalSnapshot.isCurrent() ? mergeCompositionProposals(state.compositionProposals, result?.proposals ?? []) : state.compositionProposals, isComposing: composerSessionHasCustody(sessionId), error: composerCustodyRecoveryNotice() ?? (reconciliationOnly ? state.error : terminalErrorText), lastComposeChangedPipeline: reconciliationOnly ? state.lastComposeChangedPipeline : failure === null ? changed : null, ...(state.selectedNodeId && !nextState?.nodes.some((node) => node.id === state.selectedNodeId) ? { selectedNodeId: null } : {}), ...recovery };
+  });
+  const pendingScope = composerCustodyScope();
+  if (!reconciliationOnly && pendingScope !== null) {
+    const pending = findComposerOperationCustody(pendingScope, sessionId);
+    if (pending.foreground === null && pending.unresolvedSubmissions.size > 0) void useSessionStore.getState().resumeComposerOperation(sessionId);
+  }
+  void useSessionStore.getState().loadSessions();
+  void useBlobStore.getState().loadBlobs(sessionId);
+  void refreshInterpretationEventsForSession(sessionId);
+}
+
 async function refreshInterpretationEventsForSession(
   sessionId: string,
 ): Promise<void> {
   await useInterpretationEventsStore.getState().refreshAll(sessionId);
 }
-
-// Settle-wait pacing for resyncAfterAbortedComposeTurn. Deliberately NO
-// wall-clock budget: synchronous tools are cancel-safe by running to
-// completion (tool_batch.py — never wrapped in asyncio.wait_for), so the
-// shielded window is unbounded by design and any time budget here would
-// reintroduce the reconciliation race past its edge. The wait is bounded
-// SEMANTICALLY instead — see waitForCancelledComposeToSettle.
-const ABORT_RESYNC_SETTLE_POLL_MS = 500;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function waitForCancelledComposeToSettle(
-  sessionId: string,
-  ownerGeneration: number,
-): Promise<void> {
-  for (;;) {
-    const current = useSessionStore.getState();
-    if (
-      current.activeSessionId !== sessionId ||
-      composerProgressLatestClaimBySession.get(sessionId) !== ownerGeneration
-    ) {
-      return;
-    }
-    let inflightRequests: number;
-    try {
-      const snapshot = await api.fetchComposerProgress(sessionId);
-      inflightRequests = snapshot.inflight_requests ?? 0;
-    } catch {
-      // Progress is advisory — settle best-effort and resync now.
-      return;
-    }
-    if (inflightRequests === 0) {
-      return;
-    }
-    await sleep(ABORT_RESYNC_SETTLE_POLL_MS);
-  }
-}
-
-/**
- * INVARIANT (elspeth-06a23adfcc): every freeform compose entry point that
- * can be aborted client-side (sendMessage, retryMessage) MUST call this from
- * its abort branch. A client-side abort (Stop button / COMPOSE_TIMEOUT_MS
- * guard) only rejects the local fetch — the server turn keeps mutating the
- * session until the disconnect watcher cancels it, and every step it
- * completed before the cancel (canonical user row, assistant rows,
- * composition-state advances, proposals, interpretation reviews, blobs) is
- * committed by per-operation transactions, with the shielded in-flight
- * tool's P4 publish landing shortly AFTER the client's fetch has rejected
- * (see waitForCancelledComposeToSettle). The route's cancelled unwind then
- * persists only LLM-call telemetry, so waiting for terminal progress and
- * resyncing once observes everything renderable. Without this the
- * transcript/side rail keep the pre-send snapshot until a manual reload
- * (stale "No pipeline yet" at v1 while the server head is v3 with pending
- * review cards).
- *
- * Best-effort: the abort copy is already on screen, so a refetch failure
- * keeps the stale snapshot rather than stacking a second error on top.
- */
-async function resyncAfterAbortedComposeTurn(
-  sessionId: string,
-  ownerGeneration: number,
-  inflightOwnerGeneration: number,
-  preTurnVersion: number | null,
-): Promise<void> {
-  const superseded = () =>
-    useSessionStore.getState().activeSessionId !== sessionId ||
-    composerProgressLatestClaimBySession.get(sessionId) !== ownerGeneration;
-  await waitForCancelledComposeToSettle(sessionId, ownerGeneration);
-  if (superseded()) {
-    // The wait exited because the resync became moot (the user navigated
-    // away) or because a newer turn owns the state sync now — abandon
-    // instead of fetching results only to discard them.
-    return;
-  }
-  // Reuse the inflight reconciler: it drops the optimistic local-* row only
-  // when its canonical counterpart was actually persisted, so a request
-  // that never reached the route keeps its failed row + retry affordance.
-  await useSessionStore
-    .getState()
-    .loadInflightMessages(sessionId, inflightOwnerGeneration);
-  let state: CompositionState | null | undefined;
-  let proposals: CompositionProposal[] | null | undefined;
-  try {
-    [state, proposals] = await Promise.all([
-      api.fetchCompositionState(sessionId),
-      api.fetchCompositionProposals(sessionId),
-    ]);
-  } catch {
-    return;
-  }
-  if (superseded()) {
-    // A newer turn started (and possibly finished) while the GETs were in
-    // flight — this snapshot is stale against its results. Drop it.
-    return;
-  }
-  useSessionStore.setState((s) => {
-    const previousVersion = s.compositionState?.version ?? null;
-    const newVersion = state?.version ?? null;
-    const versionChanged =
-      newVersion !== null && newVersion !== previousVersion;
-    // R4-H3 mirror of the success branches: a new state version invalidates
-    // any validation verdict rendered against the old one.
-    if (versionChanged) {
-      getExecutionStore().clearValidation();
-    }
-    const newState = state ?? s.compositionState;
-    const nodeStillExists =
-      !s.selectedNodeId ||
-      newState?.nodes.some((n) => n.id === s.selectedNodeId);
-    // Now that the durable head is known, replace the generic abort copy
-    // with what actually persisted (elspeth-2784531888). Exact-match on the
-    // current error keeps this from clobbering any newer banner.
-    const refinedError = stoppedComposeOutcomeMessage(
-      s.error,
-      preTurnVersion,
-      state?.version ?? null,
-    );
-    return {
-      compositionState: newState,
-      compositionProposals: proposals ?? s.compositionProposals,
-      ...(refinedError !== null ? { error: refinedError } : {}),
-      ...(nodeStillExists ? {} : { selectedNodeId: null }),
-    };
-  });
-  // Same fire-and-forget refreshes as the success branches: the cancelled
-  // turn may have created blobs, auto-titled the session, and minted
-  // interpretation reviews before the cancel landed.
-  useBlobStore.getState().loadBlobs(sessionId);
-  void useSessionStore.getState().loadSessions();
-  void refreshInterpretationEventsForSession(sessionId);
-}
-
-/**
- * Reconcile a freeform turn whose POST result was lost at the transport
- * boundary.  The request may still be running after fetch rejects, so wait for
- * the same semantic quiescence used by the abort path before reading the
- * durable message/state/proposal surfaces.  This helper performs no write and
- * never replays the user's request.
- *
- * `baselineMessageIds` lets the caller distinguish a reply created by this
- * turn from messages that were already visible.  When no new durable evidence
- * is found, the failed-row retry contract remains in place; a later explicit
- * retry is then the only path that can issue another POST.
- */
-async function resyncAfterAmbiguousComposeFailure(
-  sessionId: string,
-  ownerGeneration: number,
-  inflightOwnerGeneration: number,
-  baselineVersion: number | null,
-  baselineMessageIds: ReadonlySet<string>,
-  messageId: string,
-  messageContent: string,
-  clientRequestId?: string,
-): Promise<void> {
-  const superseded = () =>
-    useSessionStore.getState().activeSessionId !== sessionId ||
-    composerProgressLatestClaimBySession.get(sessionId) !== ownerGeneration;
-  await waitForCancelledComposeToSettle(sessionId, ownerGeneration);
-  if (superseded()) return;
-
-  const freshMessages = await useSessionStore
-    .getState()
-    .loadInflightMessages(sessionId, inflightOwnerGeneration);
-  if (superseded()) return;
-  if (clientRequestId !== undefined) {
-    const accepted = freshMessages?.find((message) =>
-      message.role === "user" && message.client_request_id === clientRequestId
-    );
-    if (accepted) {
-      await reconcileAcceptedSend(
-        sessionId, messageId, clientRequestId, accepted.id,
-        inflightOwnerGeneration, ownerGeneration,
-      );
-      return;
-    }
-  }
-
-  let state: CompositionState | null | undefined;
-  let proposals: CompositionProposal[] | null | undefined;
-  const [stateResult, proposalsResult] = await Promise.allSettled([
-    api.fetchCompositionState(sessionId),
-    api.fetchCompositionProposals(sessionId),
-  ]);
-  if (stateResult.status === "fulfilled") state = stateResult.value;
-  if (proposalsResult.status === "fulfilled") proposals = proposalsResult.value;
-  if (superseded()) return;
-
-  const newDurableUser =
-    freshMessages?.some(
-      (message) =>
-        !baselineMessageIds.has(message.id) &&
-        message.role === "user" &&
-        (clientRequestId !== undefined
-          ? message.client_request_id === clientRequestId
-          : message.content === messageContent),
-    ) ?? false;
-  const newAssistant = freshMessages?.some((message) =>
-    !baselineMessageIds.has(message.id) && message.role === "assistant"
-  ) ?? false;
-  const stateAdvanced = state?.version != null && state.version > (baselineVersion ?? 0);
-  // State advances and assistant rows can belong to another turn. The
-  // acceptance identity is the only proof that a new POST was saved.
-  const durableEvidence = clientRequestId !== undefined
-    ? newDurableUser
-    : newDurableUser || newAssistant || stateAdvanced;
-
-  useSessionStore.setState((s) => {
-    const previousVersion = s.compositionState?.version ?? null;
-    const newVersion = state?.version ?? null;
-    if (newVersion !== null && newVersion !== previousVersion) {
-      getExecutionStore().clearValidation();
-    }
-    const newState = state ?? s.compositionState;
-    const nodeStillExists =
-      !s.selectedNodeId ||
-      newState?.nodes.some((node) => node.id === s.selectedNodeId);
-    const repairedMessages = durableEvidence
-      ? s.messages.map((message) =>
-          message.id === messageId
-            ? {
-                ...message,
-                local_status: undefined,
-                local_error: undefined,
-                local_failure_code: undefined,
-              }
-            : message,
-        )
-      : s.messages;
-    return {
-      compositionState: newState,
-      compositionProposals: proposals ?? s.compositionProposals,
-      ...(durableEvidence
-        ? {
-            messages: repairedMessages,
-            error:
-              "Your request was saved, but its response could not be confirmed. The latest messages and pipeline state are shown; reload if anything looks missing.",
-          }
-        : {}),
-      ...(nodeStillExists ? {} : { selectedNodeId: null }),
-    };
-  });
-  useBlobStore.getState().loadBlobs(sessionId);
-  void useSessionStore.getState().loadSessions();
-  void refreshInterpretationEventsForSession(sessionId);
-}
-
-/** Reconcile an ingress receipt without ever starting a second model call. */
-async function reconcileAcceptedSend(
-  sessionId: string,
-  localMessageId: string,
-  clientRequestId: string,
-  canonicalUserMessageId: string,
-  inflightGeneration: number,
-  progressGeneration: number,
-): Promise<void> {
-  const current = () =>
-    freeformComposeClaimIsCurrent(sessionId, inflightGeneration) &&
-    composerProgressPollGeneration === progressGeneration;
-  // Stop both periodic readers first. A progress tick that starts while a
-  // slow state/proposal read is pending would otherwise claim a later ticket
-  // and make the receipt's complete four-surface snapshot look stale.
-  useSessionStore.getState().stopInflightMessagesPolling(sessionId, inflightGeneration);
-  useSessionStore.getState().stopComposerProgressPolling(sessionId, progressGeneration);
-  const messageTicket = ++inflightMessagesReadTicket;
-  const progressTicket = ++composerProgressReadTicket;
-  const proposalSnapshot = beginProposalSnapshot();
-  const stateAtDispatch = useSessionStore.getState().compositionState;
-  const stateLoadedAtDispatch = useSessionStore.getState().compositionStateLoaded;
-  const acceptedDecisionAtDispatch = acceptedProposalDecisionSequence;
-  try {
-    const [messages, state, proposals, progress] = await Promise.all([
-      api.fetchMessages(sessionId),
-      api.fetchCompositionState(sessionId),
-      api.fetchCompositionProposals(sessionId),
-      api.fetchComposerProgress(sessionId),
-    ]);
-    if (!current()) return;
-    if (!messages.some((message) =>
-      message.id === canonicalUserMessageId &&
-      message.role === "user" &&
-      message.client_request_id === clientRequestId
-    )) {
-      throw new Error("Accepted message is not yet visible in the transcript");
-    }
-    if (messageTicket <= inflightMessagesAppliedTicket || progressTicket <= composerProgressAppliedTicket) {
-      throw new Error("A newer session snapshot owns the display");
-    }
-    inflightMessagesAppliedTicket = messageTicket;
-    composerProgressAppliedTicket = progressTicket;
-    useSessionStore.setState((s) => {
-      if (!current()) return s;
-      const localIntent = s.messages.find((message) =>
-        message.id === localMessageId ||
-        (message.role === "user" && message.client_request_id === clientRequestId)
-      );
-      const acceptedIndex = messages.findIndex((message) => message.id === canonicalUserMessageId);
-      const isLastUser = !messages.slice(acceptedIndex + 1).some((message) => message.role === "user");
-      const hasReply = hasGenuineReplyForUser(messages, acceptedIndex);
-      const canDeliberatelyRetry = isLastUser && !hasReply &&
-        (progress.inflight_requests ?? 0) === 0 &&
-        (progress.phase === "idle" || TERMINAL_COMPOSER_PROGRESS_PHASES.has(progress.phase));
-      const reconciledMessages = canDeliberatelyRetry
-        ? messages.map((message) => message.id === canonicalUserMessageId
-          ? {
-              ...message,
-              local_status: "failed" as const,
-              local_error: "Your message was saved, but no reply is available. Retry to request a response.",
-              local_failure_code: localIntent?.local_failure_code,
-            }
-          : message)
-        : messages;
-      // A proposal acceptance can replace the pipeline while these four
-      // reads are pending. Its receipt and hydration own that newer state.
-      const stateSuperseded = acceptedProposalDecisionSequence !== acceptedDecisionAtDispatch ||
-        s.compositionState !== stateAtDispatch ||
-        s.compositionStateLoaded !== stateLoadedAtDispatch;
-      const nextState = stateSuperseded ? s.compositionState : state ?? s.compositionState;
-      const previousVersion = s.compositionState?.version ?? null;
-      if (!stateSuperseded && nextState?.version != null && nextState.version !== previousVersion) {
-        getExecutionStore().clearValidation();
-      }
-      const nodeStillExists = !s.selectedNodeId ||
-        nextState?.nodes.some((node) => node.id === s.selectedNodeId);
-      return {
-        messages: reconciledMessages,
-        compositionState: nextState,
-        compositionProposals: proposalSnapshot.reconcile(s.compositionProposals, proposals),
-        composerProgress: progress.phase === "idle" ? null : progress,
-        isComposing: localComposeRequestIsPending(sessionId),
-        error: canDeliberatelyRetry
-          ? "Your message was saved without a reply. Retry the saved message to request a response."
-          : "Your message was saved. The latest session state is shown.",
-        ...(nodeStillExists ? {} : { selectedNodeId: null }),
-      };
-    });
-    useBlobStore.getState().loadBlobs(sessionId);
-    void useSessionStore.getState().loadSessions();
-    void refreshInterpretationEventsForSession(sessionId);
-  } catch {
-    if (!current()) return;
-    useSessionStore.setState((s) => ({
-      isComposing: localComposeRequestIsPending(sessionId),
-      error: "Your message was saved, but the latest session state could not be confirmed. Retry to refresh it; this will not resend the message.",
-      messages: s.messages.map((message) =>
-        message.id === localMessageId ||
-        (message.role === "user" && message.client_request_id === clientRequestId)
-        ? {
-            ...message,
-            local_status: "failed",
-            local_error: "Message saved; retry to refresh the session without resending.",
-            local_accepted_user_message_id: canonicalUserMessageId,
-          }
-        : message),
-    }));
-  }
-}
-
 
 function mergeCompositionProposals(
   existing: CompositionProposal[],
@@ -889,6 +488,7 @@ function mergeCompositionProposals(
 }
 
 let proposalSnapshotSequence = 0;
+let stateVersionsReadSequence = 0;
 let acceptedProposalDecisionSequence = 0;
 
 /** A tool-call row is narration; only the final answer closes this user turn. */
@@ -896,7 +496,7 @@ function hasGenuineReplyForUser(messages: ChatMessage[], userIndex: number): boo
   for (let index = userIndex + 1; index < messages.length; index += 1) {
     const message = messages[index];
     if (message.role === "user") break;
-    if (message.role === "assistant" && message.content.length > 0 && isGenuineReply(message)) {
+    if (message.role === "assistant" && !message.tool_calls?.length) {
       return true;
     }
   }
@@ -1038,18 +638,6 @@ interface SessionState {
   composeRequests: ReadonlyMap<string, ComposeRequestOwner>;
   composeRequest: (kind: "send" | "retry", value: string) => Promise<void>;
   cancelComposition: () => void;
-  composeTimeoutReady: boolean;
-  setComposeTimeoutReady: (ready: boolean) => void;
-  /**
-   * TRUE when the backend is reachable (GET /api/system/status returned) but
-   * did NOT supply a usable composer_timeout_seconds, so composeTimeoutReady
-   * can never latch. Distinguishes "still booting" (both false) from "up but
-   * misconfigured" (this true) so the Send affordances can show a distinct
-   * diagnostic instead of a perpetual "Connecting…". Reset to false whenever a
-   * valid ceiling lands or the backend goes unreachable.
-   */
-  composerTimeoutUnavailable: boolean;
-  setComposerTimeoutUnavailable: (unavailable: boolean) => void;
   /**
    * Deployment-level composer model identity (ELSPETH_WEB__COMPOSER_MODEL),
    * written by App's health poll — the single /api/system/status consumer —
@@ -1115,6 +703,8 @@ interface SessionState {
   unbindMissingSession: (sessionId: string) => void;
   renameSession: (id: string, title: string) => Promise<void>;
   archiveSession: (id: string) => Promise<void>;
+  resumeComposerOperation: (sessionId: string) => Promise<void>;
+  reconcileInactiveComposerCustody: () => Promise<void>;
   sendMessage: (content: string, signal?: AbortSignal, retryLocalMessageId?: string) => Promise<void>;
   loadCompositionProposals: (sessionId?: string) => Promise<void>;
   acceptProposal: (proposalId: string) => Promise<void>;
@@ -1187,8 +777,6 @@ const initialState = {
   composerProgress: null as ComposerProgressSnapshot | null,
   isComposing: false,
   composeRequests: new Map<string, ComposeRequestOwner>(),
-  composeTimeoutReady: false,
-  composerTimeoutUnavailable: false,
   composerModel: null as string | null,
   composerAdvisorModel: null as string | null,
   stateVersions: [] as CompositionStateVersion[],
@@ -1204,18 +792,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   ...initialState,
 
   async composeRequest(kind, value) {
-    const { activeSessionId, isComposing, composeTimeoutReady, composeRequests } = get();
-    if (!activeSessionId || isComposing || !composeTimeoutReady || composeRequests.has(activeSessionId)) return;
+    const { activeSessionId, isComposing, composeRequests } = get();
+    if (!activeSessionId || isComposing || !get().compositionStateLoaded || composeRequests.has(activeSessionId)) return;
     const owner: ComposeRequestOwner = { current: null };
     set((state) => ({
       composeRequests: new Map(state.composeRequests).set(activeSessionId, owner),
     }));
     try {
-      await runComposeWithTimeout(owner, composeTimeoutReady, (signal) =>
-        kind === "send"
-          ? get().sendMessage(value, signal)
-          : get().retryMessage(value, signal),
-      );
+      const controller = new AbortController();
+      owner.current = controller;
+      if (kind === "send") await get().sendMessage(value, controller.signal);
+      else await get().retryMessage(value, controller.signal);
     } finally {
       if (get().composeRequests.get(activeSessionId) === owner) {
         set((state) => {
@@ -1223,7 +810,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           remaining.delete(activeSessionId);
           return {
             composeRequests: remaining,
-            ...(state.activeSessionId === activeSessionId ? { isComposing: false } : {}),
+            ...(state.activeSessionId === activeSessionId ? { isComposing: composerSessionHasCustody(activeSessionId) } : {}),
           };
         });
       }
@@ -1233,20 +820,15 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   cancelComposition() {
     const { activeSessionId, composeRequests } = get();
     if (activeSessionId !== null) {
-      composeRequests.get(activeSessionId)?.current?.abort(COMPOSE_USER_CANCEL_ABORT_REASON);
+      const observing = cancelObservedComposerOperation(activeSessionId);
+      if (composerStopPersistenceLimited()) set({ error: "Stop requested. Keep this tab open until the action settles; this browser could not save the pending cancellation." });
+      if (!observing && composerSessionHasCustody(activeSessionId)) void get().resumeComposerOperation(activeSessionId);
+      if (!composerSessionHasCustody(activeSessionId)) composeRequests.get(activeSessionId)?.current?.abort(COMPOSE_USER_CANCEL_ABORT_REASON);
     }
   },
 
   setExportedYamlBlobBinding(binding) {
     set({ exportedYamlBlobBinding: binding });
-  },
-
-  setComposeTimeoutReady(ready) {
-    set({ composeTimeoutReady: ready });
-  },
-
-  setComposerTimeoutUnavailable(unavailable) {
-    set({ composerTimeoutUnavailable: unavailable });
   },
 
   setComposerModel(model) {
@@ -1295,6 +877,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async createSession() {
+    detachComposerObservers();
     let session;
     try {
       session = await api.createSession();
@@ -1416,6 +999,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     clearInflightMessagesPollTimer();
     // Activation's authoritative reads supersede orphaned browser descriptors.
     clearOrphanedSessionOperationRetriesForSession(id);
+    detachComposerObservers();
     const selectionGeneration = advanceSessionPublicationGeneration();
 
     useBlobStore.getState().activateSession(id);
@@ -1433,7 +1017,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       composerProgress: null,
       stateVersions: [],
       isLoadingVersions: false,
-      isComposing: get().composeRequests.has(id),
+      isComposing: composerSessionHasCustody(id),
       error: null,
       errorDetails: null,
       selectedNodeId: null,
@@ -1458,6 +1042,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       });
       useBlobStore.getState().loadBlobs(id);
       void useInterpretationEventsStore.getState().refreshAll(id);
+      await get().resumeComposerOperation(id);
     } catch (err) {
       if ((err as ApiError).status === 404 && sessionPublicationIsCurrent(id, selectionGeneration)) {
         advanceSessionPublicationGeneration();
@@ -1483,7 +1068,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (sessionPublicationIsCurrent(id, selectionGeneration)) {
         set({
           error: "Failed to load session. Please refresh the page.",
-          compositionStateLoaded: true,
+          compositionStateLoaded: false,
         });
       }
     }
@@ -1537,286 +1122,62 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async sendMessage(content: string, signal?: AbortSignal, retryLocalMessageId?: string) {
-    const { activeSessionId, isComposing } = get();
-    if (!activeSessionId) return;
-    // Synchronous admission gate (elspeth-3f38ebb1b5): exactly one freeform
-    // compose may be in flight. isComposing is set synchronously below
-    // before any await, so this check cannot race another entry point —
-    // without it Retry / Use-as-input could start a second compose whose
-    // AbortController displaced the first one's, leaving Stop owning only
-    // the newest request. Entry surfaces are disabled while composing;
-    // this gate is the invariant for programmatic callers.
-    if (isComposing) return;
-    const recoveryStartedCompositionVersion =
-      get().compositionState?.version ?? null;
-    const baselineMessageIds = new Set(get().messages.map((message) => message.id));
-
-    const retriedIntent = retryLocalMessageId
-      ? get().messages.find((message) => message.id === retryLocalMessageId && message.id.startsWith("local-"))
-      : undefined;
-    if (retryLocalMessageId && (!retriedIntent || !retriedIntent.client_request_id)) return;
-    const stateId = retriedIntent
-      ? retriedIntent.local_requested_state_id ?? null
-      : get().compositionState?.id ?? null;
-    const clientRequestId = retriedIntent?.client_request_id ?? crypto.randomUUID();
-    const optimisticMessage: ChatMessage = retriedIntent ?? {
-      id: `local-${clientRequestId}`,
-      session_id: activeSessionId,
-      role: "user",
-      content,
-      client_request_id: clientRequestId,
-      local_requested_state_id: stateId,
-      tool_calls: null,
-      created_at: new Date().toISOString(),
-      local_status: "pending",
+    const state = get();
+    if (!state.activeSessionId || state.isComposing || !state.compositionStateLoaded) return;
+    const scope = composerCustodyScope();
+    if (scope === null) { set({ error: "Authenticate before composing." }); return; }
+    const operationId = crypto.randomUUID();
+    const existing = retryLocalMessageId ? state.messages.find((row) => row.id === retryLocalMessageId) : undefined;
+    const optimistic: ChatMessage = {
+      ...(existing ?? { session_id: state.activeSessionId, role: "user", tool_calls: null, created_at: new Date().toISOString() }),
+      id: existing?.id ?? `local-${operationId}`, content, operation_id: operationId, local_status: "pending", local_error: undefined, local_failure_code: undefined,
     };
+    const descriptor: SubmittedCustody = { mode: "submitted", scope, sessionId: state.activeSessionId, operationId, kind: "compose_message", createdAt: Date.now(), body: { operation_id: operationId, content, state_id: state.compositionState?.id ?? null } };
+    set((current) => ({ isComposing: true, error: null, composerProgress: null, lastComposeChangedPipeline: null, messages: existing ? current.messages.map((row) => row.id === existing.id ? optimistic : row) : [...current.messages, optimistic] }));
+    await runDurableComposerTurn(descriptor, optimistic.id, signal, true);
+  },
 
-    set((state) => ({
-      isComposing: true,
-      error: null,
-      composerProgress: null,
-      // In flight the mutation verdict is unknown — a stale verdict from the
-      // previous turn must not label this turn's completion badge.
-      lastComposeChangedPipeline: null,
-      messages: retriedIntent
-        ? state.messages.map((message) => message.id === optimisticMessage.id
-          ? { ...message, local_status: "pending", local_error: undefined }
-          : message)
-        : [...state.messages, optimisticMessage],
-    }));
-    const progressPollGeneration =
-      get().startComposerProgressPolling(activeSessionId);
-    const inflightPollGeneration =
-      get().startInflightMessagesPolling(activeSessionId);
-
+  async resumeComposerOperation(sessionId: string) {
+    const scope = composerCustodyScope();
+    if (scope === null || get().activeSessionId !== sessionId) return;
+    const generation = sessionPublicationGeneration;
+    const authGeneration = currentAuthGeneration();
     try {
-      const result = await api.sendMessage(activeSessionId, optimisticMessage.content, clientRequestId, stateId, signal);
-      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
-        return;
-      }
-      // Sync the chat panel against the durable DB state before applying the
-      // POST's metadata. After this await, get().messages contains every
-      // assistant row the compose loop persisted (and the canonical user row
-      // — the optimistic local-* version is gone). The set() block below
-      // then only needs to update derived state (compositionState, proposals,
-      // isComposing) without re-appending the final assistant message that
-      // the poll has already pulled in.
-      await get().loadInflightMessages(activeSessionId, inflightPollGeneration);
-      // Navigation or a newer turn can happen during this sync. The older
-      // response must not publish metadata over the newer turn's state.
-      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
-        return;
-      }
-      const { message, state } = result;
-      const proposals = result.proposals ?? [];
-      set((s) => {
-        const previousVersion = s.compositionState?.version ?? null;
-        const newVersion = state?.version ?? null;
-        const versionChanged =
-          newVersion !== null && newVersion !== previousVersion;
-
-        // R4-H3: Clear validation BEFORE updating compositionState
-        // when a new state version arrives from the composer
-        if (versionChanged) {
-          getExecutionStore().clearValidation();
-        }
-
-        // Clear selection if the selected node no longer exists in new state
-        const newState = state ?? s.compositionState;
-        const nodeStillExists =
-          !s.selectedNodeId ||
-          newState?.nodes.some((n) => n.id === s.selectedNodeId);
-
-        // After loadInflightMessages the message list reflects the canonical
-        // DB state — the optimistic local-* row has been dropped and every
-        // assistant row the compose loop persisted (including the final
-        // ``message`` the POST returned) is present. We still defensively
-        // backfill in case the poll request failed: clear the optimistic's
-        // pending status and append the final message only when neither is
-        // already represented in s.messages (dedup by id).
-        const seen = new Set(s.messages.map((m) => m.id));
-        const repaired = s.messages.map((existing) =>
-          existing.id === optimisticMessage.id
-            ? {
-                ...existing,
-                local_status: undefined,
-                local_error: undefined,
-                local_failure_code: undefined,
-              }
-            : existing,
-        );
-        const finalMessages = seen.has(message.id)
-          ? repaired
-          : repaired.concat(message);
-
-        return {
-          messages: finalMessages,
-          compositionState: newState,
-          // Persist the mutation verdict for the terminal completion badge
-          // (elspeth-bf9c296ee5): "Pipeline updated" vs "Response ready" is
-          // this comparison, not the generic terminal phase.
-          lastComposeChangedPipeline: versionChanged,
-          compositionProposals: mergeCompositionProposals(
-            s.compositionProposals,
-            proposals,
-          ),
-          isComposing: localComposeRequestIsPending(activeSessionId),
-          ...(nodeStillExists ? {} : { selectedNodeId: null }),
-        };
-      });
-
-      // Fire-and-forget: refresh blob list in case the LLM created files
-      useBlobStore.getState().loadBlobs(activeSessionId);
-      // Fire-and-forget: refresh the session list. The backend send_message
-      // route may have auto-titled this session (first-message-of-session
-      // generates a 3-6 word title via a side LLM call and writes it
-      // before send_message returns). Refreshing keeps the session switcher
-      // title in step with the DB without a manual reload.
-      void get().loadSessions();
-      void refreshInterpretationEventsForSession(activeSessionId);
-    } catch (err) {
-      const acceptedError = err as ApiError;
-      if (
-        acceptedError.status === 409 &&
-        acceptedError.error_type === "message_already_accepted" &&
-        acceptedError.client_request_id === clientRequestId &&
-        typeof acceptedError.user_message_id === "string"
-      ) {
-        if (freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
-          set((state) => ({
-            isComposing: localComposeRequestIsPending(activeSessionId),
-            messages: state.messages.map((message) =>
-              message.id === optimisticMessage.id ||
-              (message.role === "user" && message.client_request_id === clientRequestId)
-              ? { ...message, local_accepted_user_message_id: acceptedError.user_message_id }
-              : message),
-          }));
-          await reconcileAcceptedSend(
-            activeSessionId,
-            optimisticMessage.id,
-            clientRequestId,
-            acceptedError.user_message_id,
-            inflightPollGeneration,
-            progressPollGeneration,
-          );
-        }
-        return;
-      }
-      let errorMessage: string;
-      // Client-side abort (the useComposer COMPOSE_TIMEOUT_MS guard or any
-      // user-supplied signal) rejects with the raw abort-reason string, or a
-      // DOMException named 'AbortError' when aborted without a reason —
-      // never a structured ApiError. The apiErr.detail fallback below would
-      // otherwise mask it as a generic send failure.
-      if (isComposeAbort(err)) {
-        errorMessage = composeAbortMessage(signal);
-      } else {
-        const apiErr = err as ApiError;
-        // Error dispatch based on HTTP status + error_type field
-        if (apiErr.status === 422 && apiErr.error_type === "convergence") {
-          errorMessage = formatConvergenceError(apiErr);
-        } else if (
-          apiErr.status === 502 &&
-          apiErr.error_type === "llm_unavailable"
-        ) {
-          errorMessage = formatLlmUnavailableError(apiErr);
-        } else if (
-          apiErr.status === 502 &&
-          apiErr.error_type === "llm_auth_error"
-        ) {
-          errorMessage = formatLlmAuthError(apiErr);
-        } else if (apiErr.error_type === "audit_integrity_error") {
-          errorMessage = formatAuditIntegrityError(apiErr);
-        } else {
-          errorMessage =
-            apiErr.detail ?? "Failed to send message. Please try again.";
-        }
-      }
-      const apiErr = err as ApiError;
-      // F-4b: on an audit-integrity refusal the user row IS committed (the
-      // insert precedes every audit-guard raise site) — marking it failed is
-      // the lie the user acts on (re-sending a duplicate). Clear the pending
-      // bit instead: saved, no reply.
-      const auditIntegrityRefusal =
-        !isComposeAbort(err) && apiErr.error_type === "audit_integrity_error";
-      const localFailureCode =
-        !isComposeAbort(err) && apiErr.error_type === "message_idempotency_conflict"
-          ? "message_idempotency_conflict"
-          : !isComposeAbort(err) && typeof apiErr.failure_code === "string"
-            ? apiErr.failure_code
-            : undefined;
-      const recoveryPatch = isComposerRecoveryError(apiErr)
-        ? {
-            recoveryError: apiErr,
-            recoveryStartedCompositionVersion,
-          }
-        : {};
-      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
-        return;
-      }
-      // Applied AFTER recoveryPatch below so a salvaged draft rebaselines the
-      // apply-confirmation gate onto the version the store now shows.
-      const partialStatePatch = isComposeAbort(err)
-        ? {}
-        : convergencePartialStatePatch(apiErr, get().selectedNodeId);
-      set((state) => ({
-        isComposing: localComposeRequestIsPending(activeSessionId),
-        error: errorMessage,
-        messages: state.messages.map((existing) =>
-          existing.id === optimisticMessage.id ||
-          (existing.role === "user" && existing.client_request_id === clientRequestId)
-            ? auditIntegrityRefusal
-              ? {
-                  ...existing,
-                  local_status: undefined,
-                  local_error: undefined,
-                  local_failure_code: undefined,
-                }
-              : {
-                  ...existing,
-                  local_status: "failed",
-                  local_error: errorMessage,
-                  local_failure_code: localFailureCode,
-                }
-            : existing,
-        ),
-        ...recoveryPatch,
-        ...partialStatePatch,
-      }));
-      if (isComposeAbort(err)) {
-        // The turn ran (and was cancelled) server-side; pull its durable
-        // partial results into view (see resyncAfterAbortedComposeTurn).
-        await resyncAfterAbortedComposeTurn(
-          activeSessionId,
-          progressPollGeneration,
-          inflightPollGeneration,
-          recoveryStartedCompositionVersion,
-        );
-      } else if (isAmbiguousComposeNetworkFailure(err)) {
-        await resyncAfterAmbiguousComposeFailure(
-          activeSessionId,
-          progressPollGeneration,
-          inflightPollGeneration,
-          recoveryStartedCompositionVersion,
-          baselineMessageIds,
-          optimisticMessage.id,
-          content,
-          clientRequestId,
-        );
-      }
-    } finally {
-      get().stopInflightMessagesPolling(activeSessionId, inflightPollGeneration);
-      get().stopComposerProgressPolling(activeSessionId, progressPollGeneration);
-      // One-shot terminal pickup — only while this turn still owns the
-      // poller; a newer turn's own polling handles it otherwise. The
-      // generation goes THROUGH the read as well, because a newer turn can
-      // claim the poller during its await.
-      if (composerProgressLatestClaimBySession.get(activeSessionId) === progressPollGeneration) {
-        await get().loadComposerProgress(activeSessionId, {
-          ownerGeneration: progressPollGeneration,
-        });
-      }
+      const [user, config] = await Promise.all([api.fetchCurrentUser({ logoutOnUnauthorized: false }), api.fetchAuthConfig()]);
+      if (!isCurrentAuthGeneration(authGeneration) || !sessionPublicationIsCurrent(sessionId, generation) || !samePrincipal(scope, { principalId: user.user_id, authProvider: config.provider })) return;
+    } catch { return; }
+    const record = findComposerOperationCustody(scope, sessionId);
+    if (record.foreground !== null) {
+      set({ isComposing: true });
+      void runDurableComposerTurn(record.foreground, null, undefined, false);
     }
+    // Every older ambiguous admission keeps its own ID/body and resolves only
+    // against that ID. Another observer's terminal cannot settle it.
+    for (const descriptor of record.unresolvedSubmissions.values()) {
+      void runDurableComposerTurn(descriptor, null, undefined, false, true);
+    }
+  },
+
+  async reconcileInactiveComposerCustody() {
+    const authGeneration = currentAuthGeneration();
+    const scope = composerCustodyScope();
+    if (scope === null) return;
+    try {
+      const [principal, config] = await Promise.all([api.fetchCurrentUser({ logoutOnUnauthorized: false }), api.fetchAuthConfig()]);
+      const fresh = composerCustodyScope();
+      if (!isCurrentAuthGeneration(authGeneration) || fresh === null || !samePrincipal(fresh, scope) || principal.user_id !== scope.principalId || config.provider !== scope.authProvider) return;
+      const notice = composerCustodyRecoveryNotice();
+      if (notice !== null) set({ error: notice });
+      for (const sessionId of composerCustodySessionIds(scope)) {
+        if (sessionId === get().activeSessionId) continue;
+        const record = findComposerOperationCustody(scope, sessionId);
+        for (const descriptor of [...record.unresolvedSubmissions.values(), ...(record.foreground === null ? [] : [record.foreground])]) {
+          void observeComposerOperation(descriptor, { reconciliationOnly: true, current: () => get().activeSessionId !== sessionId }).catch(() => undefined).finally(() => {
+            if (isCurrentAuthGeneration(authGeneration) && notice !== null && get().error === notice) set({ error: composerCustodyRecoveryNotice() });
+          });
+        }
+      }
+    } catch { /* Fresh scope failure grants no recovery or replay authority. */ }
   },
 
   async loadCompositionProposals(sessionId?: string) {
@@ -1838,6 +1199,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async acceptProposal(proposalId: string) {
+    if (get().isComposing) return;
     const { activeSessionId } = get();
     const publicationGeneration = sessionPublicationGeneration;
     const isCurrent = () =>
@@ -2164,22 +1526,20 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           (local) =>
             !fresh.some(
               (f) => f.role === "user" &&
-                local.client_request_id != null &&
-                f.client_request_id === local.client_request_id,
+                local.operation_id != null &&
+                f.operation_id === local.operation_id,
             ),
         );
         const reconciled = fresh.map((message, index) => {
-          if (message.role !== "user" || !message.client_request_id) return message;
+          if (message.role !== "user" || !message.operation_id) return message;
           const prior = s.messages.find((existing) =>
             existing.role === "user" &&
-            existing.client_request_id === message.client_request_id
+            existing.operation_id === message.operation_id
           );
           if (!prior) return message;
           const hasReply = hasGenuineReplyForUser(fresh, index);
           return {
             ...message,
-            local_requested_state_id: prior.local_requested_state_id,
-            local_accepted_user_message_id: prior.local_accepted_user_message_id,
             ...(!hasReply && prior.local_status === "failed"
               ? {
                   local_status: "failed" as const,
@@ -2231,212 +1591,25 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async retryMessage(messageId: string, signal?: AbortSignal) {
-    const { activeSessionId, messages, isComposing } = get();
-    if (!activeSessionId) return;
-    // Same synchronous admission gate as sendMessage (elspeth-3f38ebb1b5).
-    if (isComposing) return;
-    const recoveryStartedCompositionVersion =
-      get().compositionState?.version ?? null;
-
-    const message = messages.find((entry) => entry.id === messageId);
+    const state = get();
+    if (!state.activeSessionId || state.isComposing || !state.compositionStateLoaded) return;
+    const message = state.messages.find((row) => row.id === messageId);
     if (!message || message.role !== "user") return;
-    if (message.client_request_id && message.local_accepted_user_message_id) {
-      set({ error: null });
-      const progressGeneration = get().startComposerProgressPolling(activeSessionId);
-      const inflightGeneration = get().startInflightMessagesPolling(activeSessionId);
-      try {
-        await reconcileAcceptedSend(
-          activeSessionId, message.id, message.client_request_id,
-          message.local_accepted_user_message_id, inflightGeneration, progressGeneration,
-        );
-      } finally {
-        get().stopInflightMessagesPolling(activeSessionId, inflightGeneration);
-        get().stopComposerProgressPolling(activeSessionId, progressGeneration);
-      }
-      return;
+    if (isComposePermanentRefusal(message.local_failure_code)) return;
+    if (isComposeRefreshOnlyFailureCode(message.local_failure_code)) {
+      await get().selectSession(state.activeSessionId); return;
     }
     if (message.id.startsWith("local-")) {
-      if (!message.client_request_id) return;
-      await get().sendMessage(message.content, signal, message.id);
-      return;
+      await get().sendMessage(message.content, signal, message.id); return;
     }
-    const baselineMessageIds = new Set(messages.map((entry) => entry.id));
-
-    set((state) => ({
-      isComposing: true,
-      error: null,
-      composerProgress: null,
-      // Same unknown-while-in-flight contract as sendMessage.
-      lastComposeChangedPipeline: null,
-      messages: state.messages.map((existing) =>
-        existing.id === messageId
-          ? { ...existing, local_status: "pending" }
-          : existing,
-      ),
-    }));
-    const progressPollGeneration =
-      get().startComposerProgressPolling(activeSessionId);
-    const inflightPollGeneration =
-      get().startInflightMessagesPolling(activeSessionId);
-
-    try {
-      // Use recompose (not sendMessage) — the user message is already
-      // persisted from the original send. Calling sendMessage again
-      // would insert a duplicate user message.
-      const result = await api.recompose(activeSessionId, messageId, signal);
-      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
-        return;
-      }
-      // Sync the chat panel against the DB state (see sendMessage for
-      // rationale).
-      await get().loadInflightMessages(activeSessionId, inflightPollGeneration);
-      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
-        return;
-      }
-      const { message: assistantMessage, state } = result;
-      const proposals = result.proposals ?? [];
-      set((s) => {
-        const previousVersion = s.compositionState?.version ?? null;
-        const newVersion = state?.version ?? null;
-        const versionChanged =
-          newVersion !== null && newVersion !== previousVersion;
-
-        if (versionChanged) {
-          getExecutionStore().clearValidation();
-        }
-
-        // Clear selection if the selected node no longer exists in new state
-        const newState = state ?? s.compositionState;
-        const nodeStillExists =
-          !s.selectedNodeId ||
-          newState?.nodes.some((n) => n.id === s.selectedNodeId);
-
-        // Polling has loaded the canonical messages list. Defensive backfill
-        // mirrors the sendMessage success branch: clear the retried message's
-        // pending status, and only append the recomposed assistant message
-        // if it isn't already represented (dedup by id).
-        const seen = new Set(s.messages.map((m) => m.id));
-        const repaired = s.messages.map((existing) =>
-          existing.id === messageId
-            ? {
-                ...existing,
-                local_status: undefined,
-                local_error: undefined,
-                local_failure_code: undefined,
-              }
-            : existing,
-        );
-        const finalMessages = seen.has(assistantMessage.id)
-          ? repaired
-          : repaired.concat(assistantMessage);
-
-        return {
-          messages: finalMessages,
-          compositionState: newState,
-          // Mirror of the sendMessage success branch (elspeth-bf9c296ee5).
-          lastComposeChangedPipeline: versionChanged,
-          compositionProposals: mergeCompositionProposals(
-            s.compositionProposals,
-            proposals,
-          ),
-          isComposing: localComposeRequestIsPending(activeSessionId),
-          ...(nodeStillExists ? {} : { selectedNodeId: null }),
-        };
-      });
-
-      // Fire-and-forget: refresh blob list in case the LLM created files
-      useBlobStore.getState().loadBlobs(activeSessionId);
-      void refreshInterpretationEventsForSession(activeSessionId);
-    } catch (err) {
-      let errorMessage: string;
-      if (isComposeAbort(err)) {
-        errorMessage = composeAbortMessage(signal);
-      } else {
-        const apiErr = err as ApiError;
-        errorMessage =
-          apiErr.status === 502 && apiErr.error_type === "llm_unavailable"
-            ? formatLlmUnavailableError(apiErr)
-            : apiErr.status === 502 && apiErr.error_type === "llm_auth_error"
-              ? formatLlmAuthError(apiErr)
-              : apiErr.status === 422 && apiErr.error_type === "convergence"
-                ? formatConvergenceError(apiErr)
-                : apiErr.detail ?? "Failed to send message. Please try again.";
-      }
-      const apiErr = err as ApiError;
-      // S1: mirror the sendMessage catch handler — a retry that itself fails
-      // with a permanent code ("policy_blocked") must not re-render the
-      // Retry invitation it just disproved.
-      const localFailureCode =
-        !isComposeAbort(err) && apiErr.error_type === "recompose_user_message_mismatch"
-          ? "recompose_user_message_mismatch"
-          : !isComposeAbort(err) && typeof apiErr.failure_code === "string"
-            ? apiErr.failure_code
-            : undefined;
-      const recoveryPatch = isComposerRecoveryError(apiErr)
-        ? {
-            recoveryError: apiErr,
-            recoveryStartedCompositionVersion,
-          }
-        : {};
-
-      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
-        return;
-      }
-      // Mirror of the sendMessage catch: the shared 422 handler already
-      // persisted the salvaged draft, so both entry points must show it.
-      const partialStatePatch = isComposeAbort(err)
-        ? {}
-        : convergencePartialStatePatch(apiErr, get().selectedNodeId);
-      set((state) => ({
-        isComposing: localComposeRequestIsPending(activeSessionId),
-        error: errorMessage,
-        messages: state.messages.map((existing) =>
-          existing.id === messageId
-            ? {
-                ...existing,
-                local_status: "failed",
-                local_error: errorMessage,
-                local_failure_code: localFailureCode,
-              }
-            : existing,
-        ),
-        ...recoveryPatch,
-        ...partialStatePatch,
-      }));
-      if (isComposeAbort(err)) {
-        // The recompose turn ran (and was cancelled) server-side; pull its
-        // durable partial results into view (see
-        // resyncAfterAbortedComposeTurn).
-        await resyncAfterAbortedComposeTurn(
-          activeSessionId,
-          progressPollGeneration,
-          inflightPollGeneration,
-          recoveryStartedCompositionVersion,
-        );
-      } else if (isAmbiguousComposeNetworkFailure(err)) {
-        await resyncAfterAmbiguousComposeFailure(
-          activeSessionId,
-          progressPollGeneration,
-          inflightPollGeneration,
-          recoveryStartedCompositionVersion,
-          baselineMessageIds,
-          messageId,
-          message.content,
-        );
-      }
-    } finally {
-      get().stopInflightMessagesPolling(activeSessionId, inflightPollGeneration);
-      get().stopComposerProgressPolling(activeSessionId, progressPollGeneration);
-      // One-shot terminal pickup — only while this turn still owns the
-      // poller; a newer turn's own polling handles it otherwise. The
-      // generation goes THROUGH the read as well, because a newer turn can
-      // claim the poller during its await.
-      if (composerProgressLatestClaimBySession.get(activeSessionId) === progressPollGeneration) {
-        await get().loadComposerProgress(activeSessionId, {
-          ownerGeneration: progressPollGeneration,
-        });
-      }
-    }
+    const index = state.messages.indexOf(message);
+    if (state.messages.slice(index + 1).some((row) => row.role === "user") || hasGenuineReplyForUser(state.messages, index)) return;
+    const scope = composerCustodyScope();
+    if (scope === null) return;
+    const operationId = crypto.randomUUID();
+    const descriptor: SubmittedCustody = { mode: "submitted", scope, sessionId: state.activeSessionId, operationId, kind: "compose_recompose", createdAt: Date.now(), body: { operation_id: operationId, expected_user_message_id: message.id, state_id: state.compositionState?.id ?? null } };
+    set((current) => ({ isComposing: true, error: null, composerProgress: null, lastComposeChangedPipeline: null, messages: current.messages.map((row) => row.id === message.id ? { ...row, local_status: "pending", local_error: undefined } : row) }));
+    await runDurableComposerTurn(descriptor, message.id, signal, true);
   },
 
   async forkFromMessage(messageId: string, newContent: string) {
@@ -2631,23 +1804,32 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     const { activeSessionId } = get();
     if (!activeSessionId) return;
 
+    const publicationIsCurrent = captureSessionPublicationGuard(activeSessionId);
+    const readSequence = ++stateVersionsReadSequence;
+    const isCurrent = () => publicationIsCurrent() && readSequence === stateVersionsReadSequence;
     set({ isLoadingVersions: true });
     try {
       const versions = await api.fetchStateVersions(activeSessionId);
-      set({ stateVersions: versions, isLoadingVersions: false });
+      if (isCurrent()) set({ stateVersions: versions, isLoadingVersions: false });
     } catch {
       // Version history is non-critical -- fail silently
-      set({ isLoadingVersions: false });
+      if (isCurrent()) set({ isLoadingVersions: false });
     }
   },
 
   async revertToVersion(stateId: string) {
+    if (get().isComposing) return;
     const { activeSessionId } = get();
     if (!activeSessionId) return;
+    const publicationGeneration = sessionPublicationGeneration;
+    const authGeneration = currentAuthGeneration();
+    const isCurrent = () => isCurrentAuthGeneration(authGeneration) && sessionPublicationIsCurrent(activeSessionId, publicationGeneration);
+    const headAtDispatch = get().compositionState;
     let acquisition = acquireSessionOperationRetry("state_revert", activeSessionId, [stateId]);
     if (acquisition.status === "conflict") {
       acquisition = await reconcileSessionOperationRetryConflict(acquisition.existing, "state_revert", activeSessionId, [stateId]);
     }
+    if (!isCurrent()) return;
     if (acquisition.status === "conflict") {
       set(sessionOperationRetryConflictState(acquisition.existing.kind));
       return;
@@ -2665,15 +1847,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         retry.operationId,
       );
       // Drop a result that settles after the user switches sessions.
-      if (get().activeSessionId !== activeSessionId) {
+      if (!isCurrent()) {
         clearSessionOperationRetry(retry);
         return;
       }
       // Clear selection — the reverted version may not contain the selected node
-      set({
-        compositionState,
-        selectedNodeId: null,
+      set((state) => {
+        const current = state.compositionState;
+        if (current !== null && current.session_id === activeSessionId && (current.version > compositionState.version || (current !== headAtDispatch && current.version === compositionState.version))) return {};
+        return { compositionState, selectedNodeId: null };
       });
+      void get().loadCompositionProposals(activeSessionId);
       // Revert is a state-producing route: restoring an older pending
       // interpretation requirement can mint fresh backend review events.
       // Pull them into the independent event store so execution does not stay
@@ -2684,7 +1868,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (!isAmbiguousSessionOperationRetryFailure(err)) {
         clearSessionOperationRetry(retry);
       }
-      set({ error: "Failed to revert to version. Please try again." });
+      if (isCurrent()) set({ error: "Failed to revert to version. Please try again." });
     }
   },
 
@@ -2759,6 +1943,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   reset() {
+    detachComposerObservers();
     for (const owner of get().composeRequests.values()) {
       owner.current?.abort(COMPOSE_USER_CANCEL_ABORT_REASON);
     }
@@ -2769,10 +1954,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     clearAllSessionOperationRetries();
     advanceSessionPublicationGeneration();
     useBlobStore.getState().activateSession(null);
-    // composeTimeoutReady resets to false via initialState; App.checkHealth
-    // re-latches it on re-authentication. The module ceiling (composeTimeoutMs)
-    // is a backend property that harmlessly persists — it is only read while
-    // ready, which a fresh checkHealth re-establishes before any send.
     // Fresh array (not initialState.sessions) so loadSessions' reference
     // guard can't mistake a post-reset store for the pre-reset one it
     // captured before a still-in-flight fetch (logout/login ABA).

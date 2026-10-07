@@ -27,10 +27,11 @@ import threading
 from asyncio.tasks import run_coroutine_threadsafe
 from asyncio.threads import to_thread
 from collections.abc import Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -72,7 +73,17 @@ from elspeth.web.sessions.protocol import CompositionStateData, SessionOperation
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import (
+    ActualPrivatePipelineExecutorControl,
+    CanonicalExecutionAuthorityObservation,
+    ExecutionTestCustody,
+    PhysicalPipelineCompletionControl,
+)
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
+
+execution_fixture = execution_custody.execution_fixture
+
 
 _USER_ID = "execution-lease-user"
 
@@ -234,7 +245,9 @@ class _YamlGenerator:
         return "source:\n  plugin: csv\n  options: {}\n"
 
 
-def _execution_service(loop: asyncio.AbstractEventLoop) -> tuple[ExecutionServiceImpl, Any, _ControllableExecutor]:
+def _execution_service(
+    loop: asyncio.AbstractEventLoop, execution_fixture: ExecutionTestCustody
+) -> tuple[ExecutionServiceImpl, Any, ActualPrivatePipelineExecutorControl]:
     session_service = create_autospec(SessionServiceProtocol, instance=True)
     session_id = uuid4()
     state = SimpleNamespace(
@@ -258,17 +271,67 @@ def _execution_service(loop: asyncio.AbstractEventLoop) -> tuple[ExecutionServic
     session_service.get_current_state.return_value = state
     session_service.create_run.return_value = run
     session_service.update_run_status.return_value = None
-    service = ExecutionServiceImpl.for_trained_operator(
-        loop=loop,
-        broadcaster=ProgressBroadcaster(loop),
-        settings=cast(Any, _ExecutionSettings()),
-        session_service=session_service,
-        yaml_generator=_YamlGenerator(),
-        telemetry=build_sessions_telemetry(),
+    service = execution_fixture.bind(
+        ExecutionServiceImpl.for_trained_operator(
+            loop=loop,
+            broadcaster=ProgressBroadcaster(loop),
+            settings=cast(Any, _ExecutionSettings()),
+            session_service=session_service,
+            yaml_generator=_YamlGenerator(),
+            telemetry=build_sessions_telemetry(),
+            execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+        )
     )
-    executor = _ControllableExecutor()
-    service._executor = cast(Any, executor)
+    executor = ActualPrivatePipelineExecutorControl(service._executor, execution_fixture)
     return service, session_service, executor
+
+
+async def _submit_terminal_callback(
+    service: ExecutionServiceImpl,
+    lease: SessionOperationLease,
+    executor: ActualPrivatePipelineExecutorControl,
+    *,
+    error: BaseException | None = None,
+) -> tuple[asyncio.Task[None], Future[object]]:
+    obligation = lease.execution_obligation
+    assert obligation is not None
+    watcher = service._create_loss_watcher(lease, threading.Event(), run_id=uuid4())
+    service._submit_owned_pipeline(obligation, lease, watcher, partial(lambda: None))
+    actual = obligation.pipeline
+    assert actual is not None and actual is executor.future.actual
+    if error is None:
+        executor.future.set_result(None)
+    else:
+        executor.future.set_exception(error)
+    for _ in range(200):
+        if obligation.completion is not None:
+            break
+        await asyncio.sleep(0.01)
+    completion = obligation.completion
+    assert completion is not None, "source callback did not bind its actual completion wrapper"
+    # Genuine exact duplicate after the production observer's first handoff.
+    service._on_pipeline_done(actual, session_operation_lease=lease, loss_watcher=watcher)
+    return watcher, completion
+
+
+async def _canonical_execute_lease(
+    service: ExecutionServiceImpl,
+    execution_fixture: ExecutionTestCustody,
+    *,
+    session_id: UUID,
+    renew_interval_seconds: float = 10.0,
+) -> tuple[SessionOperationLease, CanonicalExecutionAuthorityObservation]:
+    observed = execution_fixture.observe_authority(session_id)
+    observed.release_allowed.clear()
+    lease = await execution_fixture.acquire(
+        service.execution_lease_release_registry,
+        observed.authority,
+        session_id=session_id,
+        owner_instance_id="execution-lease-test",
+        lease_seconds=30,
+        renew_interval_seconds=renew_interval_seconds,
+    )
+    return lease, observed
 
 
 async def _real_lease(
@@ -288,13 +351,83 @@ async def _real_lease(
     return lease, authority
 
 
+class _CanonicalRouteSignal:
+    """Observe actual producer state; this Event-like API grants no receipt."""
+
+    def __init__(self, predicate):
+        self.predicate = predicate
+
+    def is_set(self):
+        return self.predicate()
+
+    async def wait(self):
+        while not self.predicate():
+            await asyncio.sleep(0.001)
+        return True
+
+
+class _CanonicalRouteLeaseControl:
+    """Test driver only: the route always receives the actual nominal lease."""
+
+    def __init__(self, sessions: _RouteSessionService, execution_fixture: ExecutionTestCustody):
+        self.observation = sessions.observation
+        self.execution_fixture = execution_fixture
+        self.actual: SessionOperationLease | None = None
+        self.close_allowed = self.observation.release_allowed
+        self.close_allowed.clear()
+        self.close_started = _CanonicalRouteSignal(self.observation.release_called.is_set)
+        self.close_finished = _CanonicalRouteSignal(self._actual_close_finished)
+
+    def bind(self, actual: SessionOperationLease) -> None:
+        assert type(actual) is SessionOperationLease and self.actual is None
+        assert actual.execution_obligation is not None
+        assert actual.execution_obligation.authority is self.observation.authority
+        self.actual = actual
+        self.execution_fixture.track_route_lease(actual)
+
+    def _actual_close_finished(self):
+        actual = self.actual
+        if actual is None:
+            return False
+        obligation = actual.execution_obligation
+        assert obligation is not None
+        task = obligation.lifecycle_task
+        return actual.closed and task is not None and task.done() and obligation.lifecycle_outcome_recorded
+
+    @property
+    def context(self):
+        assert self.actual is not None
+        return self.actual.context
+
+    @property
+    def close_calls(self):
+        return len(self.observation.release_calls)
+
+    @property
+    def close_cancelled(self):
+        if self.actual is None:
+            return False
+        obligation = self.actual.execution_obligation
+        assert obligation is not None
+        return isinstance(obligation.lifecycle_original_error, asyncio.CancelledError)
+
+    @property
+    def close_error(self):
+        return self.observation.release_error
+
+    @close_error.setter
+    def close_error(self, original):
+        self.observation.release_error = original
+
+
 class _RouteSessionService:
-    def __init__(self, session_id: UUID, *, trace: list[str] | None = None) -> None:
-        self.session_operation_authority = cast("SessionOperationAuthority", object())
+    def __init__(self, session_id: UUID, *, execution_fixture: ExecutionTestCustody, trace: list[str] | None = None) -> None:
+        self.observation = execution_fixture.observe_authority(session_id)
+        self.session_operation_authority = self.observation.authority
         self.session_operation_owner_instance_id = "execution-route-test"
         self.session_operation_lease_seconds = 41
-        self._session_id = session_id
-        self._trace = trace
+        self.registry = execution_fixture.registry(asyncio.get_running_loop())
+        self._session_id, self._trace = session_id, trace
         self.authorized = True
 
     async def get_session(self, session_id: UUID) -> SimpleNamespace:
@@ -302,10 +435,7 @@ class _RouteSessionService:
         if self._trace is not None:
             self._trace.append("ownership")
         return SimpleNamespace(
-            id=session_id,
-            user_id=_USER_ID if self.authorized else "different-user",
-            auth_provider_type="local",
-            archived_at=None,
+            id=session_id, user_id=_USER_ID if self.authorized else "different-user", auth_provider_type="local", archived_at=None
         )
 
 
@@ -337,10 +467,11 @@ class _RouteHarness:
     session_service: _RouteSessionService
 
 
-def _route_harness(session_id: UUID) -> _RouteHarness:
+def _route_harness(session_id: UUID, execution_fixture: ExecutionTestCustody) -> _RouteHarness:
     app = FastAPI()
-    session_service = _RouteSessionService(session_id)
+    session_service = _RouteSessionService(session_id, execution_fixture=execution_fixture)
     app.state.session_service = session_service
+    app.state.execution_lease_release_registry = session_service.registry
     app.state.settings = SimpleNamespace(auth_provider="local")
     wire_test_pipeline_user_authority(app, identity_id=_USER_ID)
     request = Request(
@@ -362,18 +493,18 @@ def _route_harness(session_id: UUID) -> _RouteHarness:
 
 
 def _install_acquire(
-    monkeypatch: pytest.MonkeyPatch,
-    lease: _ControllableLease,
-    *,
-    trace: list[str] | None = None,
+    monkeypatch: pytest.MonkeyPatch, lease: _CanonicalRouteLeaseControl, *, trace: list[str] | None = None
 ) -> list[dict[str, object]]:
     calls: list[dict[str, object]] = []
+    canonical_acquire = SessionOperationLease.acquire
 
-    async def acquire(_cls: type[SessionOperationLease], authority: object, **kwargs: object) -> _ControllableLease:
+    async def acquire(_cls: type[SessionOperationLease], authority: object, **kwargs: object) -> SessionOperationLease:
         if trace is not None:
             trace.append("acquire")
         calls.append({"authority": authority, **kwargs})
-        return lease
+        actual = await canonical_acquire(authority, **kwargs)
+        lease.bind(actual)
+        return actual
 
     monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
     return calls
@@ -386,6 +517,7 @@ def _http_route_app(
 ) -> FastAPI:
     app = FastAPI()
     app.state.session_service = session_service
+    app.state.execution_lease_release_registry = session_service.registry
     app.state.execution_service = execution_service
     app.state.settings = SimpleNamespace(auth_provider="local")
     wire_test_pipeline_user_authority(app, identity_id=_USER_ID)
@@ -416,11 +548,13 @@ async def _invoke_execute_route(
 
 
 @pytest.mark.asyncio
-async def test_execute_route_acquires_exact_execute_lease_and_transfers_it(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_execute_route_acquires_exact_execute_lease_and_transfers_it(
+    monkeypatch: pytest.MonkeyPatch, execution_fixture: ExecutionTestCustody
+) -> None:
     session_id = uuid4()
     run_id = uuid4()
-    harness = _route_harness(session_id)
-    lease = _ControllableLease(_context(session_id))
+    harness = _route_harness(session_id, execution_fixture)
+    lease = _CanonicalRouteLeaseControl(harness.session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease)
     service = _RouteExecutionService(run_id)
     service.allowed.set()
@@ -445,13 +579,14 @@ async def test_execute_route_acquires_exact_execute_lease_and_transfers_it(monke
 @pytest.mark.asyncio
 async def test_fastapi_execute_orders_ownership_before_acquire_before_exact_service_handoff(
     monkeypatch: pytest.MonkeyPatch,
+    execution_fixture: ExecutionTestCustody,
 ) -> None:
     session_id = uuid4()
     trace: list[str] = []
-    session_service = _RouteSessionService(session_id, trace=trace)
+    session_service = _RouteSessionService(session_id, execution_fixture=execution_fixture, trace=trace)
     execution_service = _RouteExecutionService(uuid4(), trace=trace)
     execution_service.allowed.set()
-    lease = _ControllableLease(_context(session_id))
+    lease = _CanonicalRouteLeaseControl(session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease, trace=trace)
     app = _http_route_app(session_service=session_service, execution_service=execution_service)
 
@@ -477,13 +612,14 @@ async def test_fastapi_execute_orders_ownership_before_acquire_before_exact_serv
 @pytest.mark.asyncio
 async def test_fastapi_denied_ownership_never_acquires_or_invokes_execution(
     monkeypatch: pytest.MonkeyPatch,
+    execution_fixture: ExecutionTestCustody,
 ) -> None:
     session_id = uuid4()
     trace: list[str] = []
-    session_service = _RouteSessionService(session_id, trace=trace)
+    session_service = _RouteSessionService(session_id, execution_fixture=execution_fixture, trace=trace)
     session_service.authorized = False
     execution_service = _RouteExecutionService(uuid4(), trace=trace)
-    lease = _ControllableLease(_context(session_id))
+    lease = _CanonicalRouteLeaseControl(session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease, trace=trace)
     app = _http_route_app(session_service=session_service, execution_service=execution_service)
 
@@ -497,10 +633,12 @@ async def test_fastapi_denied_ownership_never_acquires_or_invokes_execution(
 
 
 @pytest.mark.asyncio
-async def test_execute_route_pretransfer_failure_closes_and_joins_exact_lease(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_execute_route_pretransfer_failure_closes_and_joins_exact_lease(
+    monkeypatch: pytest.MonkeyPatch, execution_fixture: ExecutionTestCustody
+) -> None:
     session_id = uuid4()
-    harness = _route_harness(session_id)
-    lease = _ControllableLease(_context(session_id))
+    harness = _route_harness(session_id, execution_fixture)
+    lease = _CanonicalRouteLeaseControl(harness.session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease)
     lease.close_allowed.set()
     service = _RouteExecutionService(uuid4())
@@ -519,10 +657,11 @@ async def test_execute_route_pretransfer_failure_closes_and_joins_exact_lease(mo
 @pytest.mark.asyncio
 async def test_cancelled_execute_request_before_transfer_cannot_interrupt_lease_join(
     monkeypatch: pytest.MonkeyPatch,
+    execution_fixture: ExecutionTestCustody,
 ) -> None:
     session_id = uuid4()
-    harness = _route_harness(session_id)
-    lease = _ControllableLease(_context(session_id))
+    harness = _route_harness(session_id, execution_fixture)
+    lease = _CanonicalRouteLeaseControl(harness.session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease)
     service = _RouteExecutionService(uuid4())
     task = asyncio.create_task(_invoke_execute_route(harness, service, session_id=session_id))
@@ -558,16 +697,17 @@ async def test_cancelled_execute_request_before_transfer_cannot_interrupt_lease_
 @pytest.mark.parametrize("repeat_cancellation", [False, True])
 async def test_cancelled_http_execute_observes_cleanup_failure_without_losing_primary(
     monkeypatch: pytest.MonkeyPatch,
+    execution_fixture: ExecutionTestCustody,
     cleanup_error_type: type[Exception],
     logger_error_type: type[Exception] | None,
     repeat_cancellation: bool,
 ) -> None:
     session_id = uuid4()
-    lease = _ControllableLease(_context(session_id))
+    session_service = _RouteSessionService(session_id, execution_fixture=execution_fixture)
+    lease = _CanonicalRouteLeaseControl(session_service, execution_fixture)
     cleanup_error = cleanup_error_type("private lease failure detail")
     lease.close_error = cleanup_error
     _install_acquire(monkeypatch, lease)
-    session_service = _RouteSessionService(session_id)
     execution_service = _RouteExecutionService(uuid4())
     app = _http_route_app(session_service=session_service, execution_service=execution_service)
     logger_error = None if logger_error_type is None else logger_error_type("private logger failure detail")
@@ -622,12 +762,12 @@ async def test_cancelled_http_execute_observes_cleanup_failure_without_losing_pr
     ["success", "failure", "graceful_cancel", "cancelled_future", "already_done"],
 )
 async def test_submitted_worker_retains_exact_lease_until_every_terminal_outcome(
-    worker_outcome: str,
+    worker_outcome: str, execution_fixture: ExecutionTestCustody
 ) -> None:
     loop = asyncio.get_running_loop()
-    service, session_service, executor = _execution_service(loop)
+    service, session_service, executor = _execution_service(loop, execution_fixture=execution_fixture)
     session_id = session_service.get_current_state.return_value.session_id
-    lease, authority = await _real_lease(_context(session_id))
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=session_id)
     authority.release_allowed.set()
     validation = ValidationResult(
         is_valid=True,
@@ -677,15 +817,15 @@ async def test_submitted_worker_retains_exact_lease_until_every_terminal_outcome
         await asyncio.sleep(0.01)
     assert lease.closed
     assert authority.release_calls == [lease.context]
-    await asyncio.wait_for(service.shutdown(), timeout=2)
+    await asyncio.wait_for(execution_fixture.shutdown_service(service), timeout=2)
 
 
 @pytest.mark.asyncio
-async def test_execute_rejects_lease_subclass_before_any_effect() -> None:
+async def test_execute_rejects_lease_subclass_before_any_effect(execution_fixture: ExecutionTestCustody) -> None:
     class _LeaseSubclass(SessionOperationLease):
         pass
 
-    service, session_service, executor = _execution_service(asyncio.get_running_loop())
+    service, session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
     session_id = session_service.get_current_state.return_value.session_id
     forged = object.__new__(_LeaseSubclass)
 
@@ -708,14 +848,11 @@ def _durable_effect_call_counts(session_service: Any) -> dict[str, int]:
 
 
 @pytest.mark.asyncio
-async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_retains_lease() -> None:
-    service, session_service, executor = _execution_service(asyncio.get_running_loop())
+async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_retains_lease(execution_fixture: ExecutionTestCustody) -> None:
+    service, session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
     session_id = session_service.get_current_state.return_value.session_id
     loss = SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
-    lease, authority = await _real_lease(
-        _context(session_id),
-        renew_interval_seconds=0.01,
-    )
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=session_id, renew_interval_seconds=0.01)
     validation = ValidationResult(
         is_valid=True,
         checks=[],
@@ -762,15 +899,15 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
     assert lease.closed
     assert authority.release_calls == [], "a proven-lost lease closes without releasing a successor's authority"
     with pytest.raises(ExceptionGroup) as cleanup_failure:
-        await asyncio.wait_for(service.shutdown(), timeout=2)
+        await asyncio.wait_for(execution_fixture.shutdown_service(service), timeout=2)
     assert cleanup_failure.value.exceptions == (loss,)
 
 
 @pytest.mark.asyncio
-async def test_submit_failure_after_run_creation_terminalizes_before_return() -> None:
-    service, session_service, executor = _execution_service(asyncio.get_running_loop())
+async def test_submit_failure_after_run_creation_terminalizes_before_return(execution_fixture: ExecutionTestCustody) -> None:
+    service, session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
     session_id = session_service.get_current_state.return_value.session_id
-    lease, authority = await _real_lease(_context(session_id))
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=session_id)
     authority.release_allowed.set()
     trace: list[str] = []
     run = session_service.create_run.return_value
@@ -814,36 +951,29 @@ async def test_submit_failure_after_run_creation_terminalizes_before_return() ->
 
 
 @pytest.mark.asyncio
-async def test_completion_cancellation_still_joins_exact_close_once() -> None:
-    service, _session_service, executor = _execution_service(asyncio.get_running_loop())
-    lease, authority = await _real_lease(_context(uuid4()))
+async def test_completion_cancellation_still_joins_exact_close_once(execution_fixture: ExecutionTestCustody) -> None:
+    service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=uuid4())
     watcher_cancelled = asyncio.Event()
     watcher_allowed = asyncio.Event()
 
-    async def stubborn_watcher() -> None:
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            watcher_cancelled.set()
-            await watcher_allowed.wait()
-            raise
+    actual_signal = service._signal_shutdown_on_operation_loss
 
-    watcher = asyncio.create_task(stubborn_watcher())
-    await asyncio.sleep(0)
-    worker: Future[object] = Future()
-    worker.set_result(None)
-    service._on_pipeline_done(
-        cast(Any, worker),
-        session_operation_lease=lease,
-        loss_watcher=watcher,
-    )
-    await asyncio.wait_for(watcher_cancelled.wait(), timeout=2)
-    with service._shutdown_events_lock:
-        completion = next(iter(service._lease_completion_futures))
+    async def stubborn_watcher(current_lease, shutdown_event, *, run_id, close_requested) -> None:
+        assert current_lease is lease and close_requested is not None
+        await close_requested.wait()
+        watcher_cancelled.set()  # Historical name: now the source cooperative-close request.
+        await watcher_allowed.wait()
+        await actual_signal(current_lease, shutdown_event, run_id=run_id, close_requested=close_requested)
+
+    with patch.object(service, "_signal_shutdown_on_operation_loss", side_effect=stubborn_watcher):
+        watcher, completion = await _submit_terminal_callback(service, lease, executor)
+        await asyncio.wait_for(watcher_cancelled.wait(), timeout=2)
+    assert watcher is service._loss_watcher_owner(watcher, lease).task
     completion.cancel()
     completion.cancel()  # Repeated observer cancellation must not retire the underlying join.
 
-    shutdown = asyncio.create_task(service.shutdown())
+    shutdown = asyncio.create_task(execution_fixture.shutdown_service(service))
     try:
         await asyncio.wait_for(run_sync_in_worker(executor.shutdown_started.wait, 2), timeout=2)
         await asyncio.sleep(0)
@@ -859,15 +989,13 @@ async def test_completion_cancellation_still_joins_exact_close_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_shutdown_waits_for_blocked_lease_completion() -> None:
-    service, _session_service, executor = _execution_service(asyncio.get_running_loop())
-    lease, authority = await _real_lease(_context(uuid4()))
-    worker: Future[object] = Future()
-    worker.set_result(None)
-    service._on_pipeline_done(cast(Any, worker), session_operation_lease=lease)
+async def test_runtime_shutdown_waits_for_blocked_lease_completion(execution_fixture: ExecutionTestCustody) -> None:
+    service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=uuid4())
+    _watcher, _completion = await _submit_terminal_callback(service, lease, executor)
     await asyncio.wait_for(run_sync_in_worker(authority.release_called.wait, 2), timeout=2)
 
-    shutdown = asyncio.create_task(service.shutdown())
+    shutdown = asyncio.create_task(execution_fixture.shutdown_service(service))
     await asyncio.wait_for(run_sync_in_worker(executor.shutdown_started.wait, 2), timeout=2)
     await asyncio.sleep(0)
     assert not shutdown.done()
@@ -880,12 +1008,13 @@ async def test_runtime_shutdown_waits_for_blocked_lease_completion() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [OSError, AuditIntegrityError, FrameworkBugError])
-async def test_done_callback_logger_failure_is_tracked_after_exact_lease_close(error_type: type[Exception]) -> None:
-    service, _session_service, _executor = _execution_service(asyncio.get_running_loop())
-    lease, authority = await _real_lease(_context(uuid4()))
+async def test_done_callback_logger_failure_is_tracked_after_exact_lease_close(
+    error_type: type[Exception], execution_fixture: ExecutionTestCustody
+) -> None:
+    service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=uuid4())
     authority.release_allowed.set()
-    worker: Future[object] = Future()
-    worker.set_exception(RuntimeError("pipeline failed"))
+    pipeline_error = RuntimeError("pipeline failed")
     logging_error = error_type("diagnostic unavailable")
 
     def fail_diagnostic(event: str, **kwargs: object) -> None:
@@ -894,43 +1023,56 @@ async def test_done_callback_logger_failure_is_tracked_after_exact_lease_close(e
             raise logging_error
 
     with patch("elspeth.web.execution.service.slog.error", side_effect=fail_diagnostic):
-        service._on_pipeline_done(cast(Any, worker), session_operation_lease=lease)
-        completion = next(iter(service._lease_completion_futures))
+        _watcher, completion = await _submit_terminal_callback(service, lease, executor, error=pipeline_error)
         with pytest.raises(error_type) as caught:
             await asyncio.wait_for(asyncio.wrap_future(completion), timeout=2)
         assert caught.value is logging_error
         assert authority.release_calls == [lease.context]
         assert completion in service._lease_completion_futures
         with pytest.raises(ExceptionGroup) as shutdown_failure:
-            await asyncio.wait_for(service.shutdown(), timeout=2)
+            await asyncio.wait_for(execution_fixture.shutdown_service(service), timeout=2)
         assert shutdown_failure.value.exceptions == (logging_error,)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [RuntimeError, AuditIntegrityError, FrameworkBugError])
 @pytest.mark.parametrize("peer_fails", [False, True])
-async def test_shutdown_preserves_completed_lease_failure_and_joins_peer(error_type: type[Exception], peer_fails: bool) -> None:
-    service, _session_service, executor = _execution_service(asyncio.get_running_loop())
-    failed_lease, failed_authority = await _real_lease(_context(uuid4()))
+async def test_shutdown_preserves_completed_lease_failure_and_joins_peer(
+    error_type: type[Exception], peer_fails: bool, execution_fixture: ExecutionTestCustody
+) -> None:
+    service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    failed_lease, failed_authority = await _canonical_execute_lease(service, execution_fixture, session_id=uuid4())
     cleanup_error = error_type("authority release failure")
     failed_authority.release_error = cleanup_error
     failed_authority.release_allowed.set()
-    worker: Future[object] = Future()
-    worker.set_result(None)
-    service._on_pipeline_done(cast(Any, worker), session_operation_lease=failed_lease)
-    with service._shutdown_events_lock:
-        failed_completion = next(iter(service._lease_completion_futures))
+    peer_lease, peer_authority = await _canonical_execute_lease(service, execution_fixture, session_id=uuid4())
+    peer_error = OSError("peer authority release unavailable")
+    if peer_fails:
+        peer_authority.release_error = peer_error
+    failed_obligation = failed_lease.execution_obligation
+    peer_obligation = peer_lease.execution_obligation
+    assert failed_obligation is not None and peer_obligation is not None
+    failed_watcher = service._create_loss_watcher(failed_lease, threading.Event(), run_id=uuid4())
+    peer_watcher = service._create_loss_watcher(peer_lease, threading.Event(), run_id=uuid4())
+    failed_physical = executor.future
+    service._submit_owned_pipeline(failed_obligation, failed_lease, failed_watcher, partial(lambda: None))
+    executor.future = PhysicalPipelineCompletionControl(execution_fixture)
+    peer_physical = executor.future
+    service._submit_owned_pipeline(peer_obligation, peer_lease, peer_watcher, partial(lambda: None))
+    failed_physical.set_result(None)
+    for _ in range(200):
+        if failed_obligation.completion is not None:
+            break
+        await asyncio.sleep(0.01)
+    failed_completion = failed_obligation.completion
+    assert failed_completion is not None
     with pytest.raises(error_type) as completed_failure:
         await asyncio.wait_for(asyncio.wrap_future(failed_completion), timeout=2)
     assert completed_failure.value is cleanup_error
 
-    peer_lease, peer_authority = await _real_lease(_context(uuid4()))
-    peer_error = OSError("peer authority release unavailable")
-    if peer_fails:
-        peer_authority.release_error = peer_error
-    service._on_pipeline_done(cast(Any, worker), session_operation_lease=peer_lease)
+    peer_physical.set_result(None)
     await asyncio.wait_for(run_sync_in_worker(peer_authority.release_called.wait, 2), timeout=2)
-    shutdown = asyncio.create_task(service.shutdown())
+    shutdown = asyncio.create_task(execution_fixture.shutdown_service(service))
     try:
         await asyncio.wait_for(run_sync_in_worker(executor.shutdown_started.wait, 2), timeout=2)
         await asyncio.sleep(0)
@@ -3136,8 +3278,7 @@ class _RecordingBroadcaster:
 
 @pytest.mark.asyncio
 async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_any_stale_effect(
-    engine: Engine,
-    tmp_path: Path,
+    engine: Engine, tmp_path: Path, execution_fixture: ExecutionTestCustody
 ) -> None:
     """A queued worker may clean local state after takeover, but may publish nothing."""
     authority = SQLiteLocalSessionOperationAuthority(engine)
@@ -3147,27 +3288,31 @@ async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_an
         authority,
         title="queued worker takeover",
     )
-    stale_context = authority.acquire(
+    service, _mock_sessions, executor_control = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    blocked_authority = execution_fixture.observe_existing_authority(authority, session_id)
+    blocked_authority.renew_allowed.clear()
+    lease = await execution_fixture.acquire(
+        service.execution_lease_release_registry,
+        authority,
         session_id=session_id,
-        operation_kind=SessionOperationKind.EXECUTE,
         owner_instance_id="queued-worker-a",
-        lease_seconds=1,
-    )
-    blocked_authority = _BlockedRenewalAuthority(authority)
-    lease = await SessionOperationLease.adopt(
-        cast(Any, blocked_authority),
-        stale_context,
         lease_seconds=1,
         renew_interval_seconds=0.05,
     )
-
-    service, _mock_sessions, _executor_double = _execution_service(asyncio.get_running_loop())
     service._session_service = real_sessions
     broadcaster = _RecordingBroadcaster()
     service._broadcaster = cast(Any, broadcaster)
     worker_release = threading.Event()
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stale-execute-worker")
-    service._executor = pool
+    execution_fixture.gates.append(worker_release)
+    pool = service._executor
+    assert pool is executor_control.pool
+    # This actor runs the original production stale-fence worker, unlike the
+    # endpoint-only completion controls. Keep the original registered pool and
+    # its real submit; release/join the control's initial queued blockers first.
+    executor_control.future.queue_allowed.set()
+    await asyncio.gather(*(asyncio.to_thread(blocker.result, 5) for blocker in executor_control.blockers))
+    pool.submit = executor_control._submit
+    pool.shutdown = executor_control._shutdown
     blocker = pool.submit(worker_release.wait, 5)
     prepared = execution_service_module._PreparedPipelineExecution(
         run_id=run_id,
@@ -3193,7 +3338,7 @@ async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_an
                 session_operation_lease=lease,
             )
             assert returned_run_id == run_id
-            assert await asyncio.to_thread(blocked_authority.renew_started.wait, 2)
+            assert await asyncio.to_thread(blocked_authority.renew_called.wait, 2)
 
             deadline = asyncio.get_running_loop().time() + 4
             while successor is None:

@@ -43,6 +43,7 @@ indifferent to the database session timezone by construction.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -51,15 +52,18 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Final, Literal, TypedDict
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web.sessions.schemas import ComposerOperationStatusResponse, SendMessageRequest
 
 from .errors import AcceptanceCheckError, AcceptanceInputError
 from .http_client import AcceptanceHttpClient
 
 Probe = Literal["P1", "P2", "P3", "P4a", "P4b"]
+FenceConflictTrialKind = Literal["same_operation", "distinct_operations"]
+P1_OPERATION_POLL_GRACE_SECONDS: Final = 30.0
 ProbeOutcome = Literal["pass", "fail", "cannot_pass", "unreachable"]
 Mechanism = Literal[
     "session_operation_fence",
@@ -193,6 +197,8 @@ class ReplicaResponse:
     instance_id: str | None
     detail: str | None = None
     run_id: str | None = None
+    operation_id: str | None = None
+    error_type: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -201,6 +207,10 @@ class ReplicaResponse:
     @property
     def refused_by_fence(self) -> bool:
         return self.status == 409 and self.detail == SESSION_OPERATION_CONFLICT_DETAIL
+
+    @property
+    def refused_as_active(self) -> bool:
+        return self.status == 409 and self.error_type == "composer_operation_active"
 
 
 @dataclass(frozen=True)
@@ -213,6 +223,10 @@ class FenceConflictTrial:
     fence_owner_after: str | None
     message_ingress_receipt_rows: int
     dispatch_spread_ms: float
+    kind: FenceConflictTrialKind = "same_operation"
+    operation_ids: tuple[str, str] = ("", "")
+    composer_operation_rows: int = 0
+    terminal_status: Literal["completed", "failed"] | None = None
 
 
 @dataclass(frozen=True)
@@ -291,7 +305,7 @@ def decide_fence_conflict(
     required_trials: int = DEFAULT_TRIALS,
     max_dispatch_spread_ms: float = DEFAULT_MAX_DISPATCH_SPREAD_MS,
 ) -> ProbeResult:
-    """P1: every trial is exactly one success and one fence refusal from two distinct replicas."""
+    """P1: both admission trial kinds produce one terminal job and one fenced ingress."""
 
     require_contention_trials(required_trials)
     reasons: list[str] = []
@@ -299,26 +313,38 @@ def decide_fence_conflict(
         reasons.append(f"trial_count:{len(trials)}!={required_trials}")
     winners: set[str] = set()
     for index, trial in enumerate(trials):
-        successes = [response for response in trial.responses if response.succeeded]
-        refusals = [response for response in trial.responses if response.refused_by_fence]
-        if len(successes) != 1 or len(refusals) != 1:
-            reasons.append(f"trial[{index}]:not_one_success_and_one_fence_refusal")
-            continue
+        successes = [response for response in trial.responses if response.status == 202]
+        refusals = [response for response in trial.responses if response.refused_as_active]
+        valid_pair = (
+            len(successes) == 2 and trial.operation_ids[0] == trial.operation_ids[1]
+            if trial.kind == "same_operation"
+            else len(successes) == 1 and len(refusals) == 1 and trial.operation_ids[0] != trial.operation_ids[1]
+        )
+        if not valid_pair:
+            reasons.append(f"trial[{index}]:invalid_operation_admission_pair")
         if not _distinct_instances(trial.responses):
             reasons.append(f"trial[{index}]:instances_not_distinct")
-        winner = successes[0].instance_id
+        winner = trial.fence_owner_after
         if winner is not None:
             winners.add(winner)
         if trial.fence_epoch_after != trial.fence_epoch_before + 1:
             reasons.append(f"trial[{index}]:fence_epoch_not_advanced_by_one")
-        if trial.fence_owner_after != winner:
-            reasons.append(f"trial[{index}]:fence_owner_is_not_the_winner")
+        if winner is None or winner not in {response.instance_id for response in trial.responses}:
+            reasons.append(f"trial[{index}]:claim_owner_not_observed_replica")
+        if trial.composer_operation_rows != 1:
+            reasons.append(f"trial[{index}]:composer_operation_rows_not_one")
+        if trial.terminal_status not in ("completed", "failed"):
+            reasons.append(f"trial[{index}]:operation_not_terminal")
+        if any(response.operation_id not in trial.operation_ids for response in successes):
+            reasons.append(f"trial[{index}]:accepted_operation_identity_mismatch")
         if trial.message_ingress_receipt_rows != 1:
             reasons.append(f"trial[{index}]:message_ingress_receipt_rows:{trial.message_ingress_receipt_rows}!=1")
         if trial.dispatch_spread_ms > max_dispatch_spread_ms:
             reasons.append(f"trial[{index}]:dispatch_spread_ms:{trial.dispatch_spread_ms:.3f}>{max_dispatch_spread_ms}")
     if trials and len(winners) < 2:
         reasons.append("winners_not_distinct_across_run")
+    if {trial.kind for trial in trials} != {"same_operation", "distinct_operations"}:
+        reasons.append("both_operation_trial_kinds_required")
     return ProbeResult(
         probe="P1",
         outcome="pass" if not reasons else "fail",
@@ -522,7 +548,13 @@ class EvidenceObserver(ABC):
     def fence_owner(self, session_id: str) -> str | None: ...
 
     @abstractmethod
-    def message_ingress_receipt_rows(self, session_id: str, *, client_request_id: str) -> int: ...
+    def message_ingress_receipt_rows(self, session_id: str, *, operation_id: str) -> int: ...
+
+    @abstractmethod
+    def composer_operation_rows(self, session_id: str, *, operation_id: str) -> int: ...
+
+    @abstractmethod
+    def composer_operation_claim_owner(self, session_id: str, *, operation_id: str) -> str | None: ...
 
     @abstractmethod
     def runs_row_ids(self, session_id: str) -> tuple[str, ...]: ...
@@ -547,8 +579,8 @@ class ProbeRequest:
     source_param="body",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns an owned ReplicaResponse whose detail and run_id are bounded strings taken only from a dict body's "
-        "'detail' and 'run_id' members and are None otherwise; never raises on the body's shape and never coerces "
+        "returns an owned ReplicaResponse with bounded detail, run_id and error_type, plus a canonical operation_id, "
+        "taken only from a dict body's named members and None otherwise; never raises on the body's shape and never coerces "
         "external values"
     ),
     non_raising=True,
@@ -556,6 +588,8 @@ class ProbeRequest:
 def replica_response_from_envelope(*, addressed_to: str, status: int, instance_id: str | None, body: object) -> ReplicaResponse:
     detail: str | None = None
     run_id: str | None = None
+    operation_id: str | None = None
+    error_type: str | None = None
     if isinstance(body, dict):
         candidate_detail = body.get("detail")
         if type(candidate_detail) is str and 0 < len(candidate_detail) <= 256:
@@ -563,7 +597,25 @@ def replica_response_from_envelope(*, addressed_to: str, status: int, instance_i
         candidate_run_id = body.get("run_id")
         if type(candidate_run_id) is str and 0 < len(candidate_run_id) <= 128:
             run_id = candidate_run_id
-    return ReplicaResponse(addressed_to=addressed_to, status=status, instance_id=instance_id, detail=detail, run_id=run_id)
+        candidate_operation = body.get("operation_id")
+        if type(candidate_operation) is str:
+            try:
+                if str(UUID(candidate_operation)) == candidate_operation:
+                    operation_id = candidate_operation
+            except ValueError:
+                pass
+        candidate_error = body.get("error_type")
+        if type(candidate_error) is str and 0 < len(candidate_error) <= 128:
+            error_type = candidate_error
+    return ReplicaResponse(
+        addressed_to=addressed_to,
+        status=status,
+        instance_id=instance_id,
+        detail=detail,
+        run_id=run_id,
+        operation_id=operation_id,
+        error_type=error_type,
+    )
 
 
 class ReplicaProbeDriver:
@@ -590,7 +642,9 @@ class ReplicaProbeDriver:
             ):
                 raise AcceptanceInputError("pinned clients must be distinct and match ordered replica origins")
 
-    def fire_pair(self, request: ProbeRequest, *, expected_statuses: set[int]) -> tuple[tuple[ReplicaResponse, ReplicaResponse], float]:
+    def fire_pair(
+        self, request: ProbeRequest, *, expected_statuses: set[int], second_request: ProbeRequest | None = None
+    ) -> tuple[tuple[ReplicaResponse, ReplicaResponse], float]:
         """Send ``request`` to both replicas, released together; return the responses and the dispatch spread in ms."""
 
         first, second = self._controller.replicas()
@@ -599,23 +653,24 @@ class ReplicaProbeDriver:
         barrier = threading.Barrier(2, timeout=30.0)
         sent_at: dict[str, float] = {}
 
-        def send(address: ReplicaAddress, client: AcceptanceHttpClient) -> ReplicaResponse:
+        def send(address: ReplicaAddress, client: AcceptanceHttpClient, selected: ProbeRequest) -> ReplicaResponse:
             barrier.wait()
             sent_at[address.name] = self._clock()
             status, instance_id, body = client.request_json_with_instance(
-                request.method,
-                request.path,
+                selected.method,
+                selected.path,
                 expected_statuses=expected_statuses,
-                json_body=request.json_body,
+                json_body=selected.json_body,
             )
             return replica_response_from_envelope(addressed_to=address.name, status=status, instance_id=instance_id, body=body)
 
         def fire(address: ReplicaAddress, index: int) -> ReplicaResponse:
+            selected = second_request if index == 1 and second_request is not None else request
             if self._pinned_clients is not None:
-                return send(address, self._pinned_clients[index])
+                return send(address, self._pinned_clients[index], selected)
             with self._client_factory(address.origin) as client:
                 client.authenticate(register=False)
-                return send(address, client)
+                return send(address, client, selected)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             futures = (pool.submit(fire, first, 0), pool.submit(fire, second, 1))
@@ -623,30 +678,62 @@ class ReplicaProbeDriver:
         spread_ms = abs(sent_at[first.name] - sent_at[second.name]) * 1000.0
         return responses, spread_ms
 
-    def fence_conflict_trial(self, session_id: str, request: ProbeRequest) -> FenceConflictTrial:
+    def fence_conflict_trial(
+        self, session_id: str, request: ProbeRequest, *, kind: FenceConflictTrialKind = "same_operation"
+    ) -> FenceConflictTrial:
         """One P1 trial: fire one freeform request on both replicas and read its receipt."""
 
-        body = request.json_body
-        if type(body) is not dict or type(body.get("client_request_id")) is not str:
-            raise AcceptanceInputError("P1 requires a client_request_id in the freeform message body")
-        request_id = body["client_request_id"]
-        try:
-            parsed_request_id = UUID(request_id)
-        except ValueError as exc:
-            raise AcceptanceInputError("P1 client_request_id must be a canonical UUID") from exc
-        if str(parsed_request_id) != request_id:
-            raise AcceptanceInputError("P1 client_request_id must be a canonical UUID")
-
+        if kind not in ("same_operation", "distinct_operations"):
+            raise AcceptanceInputError("P1 requires an owned trial kind")
+        body = SendMessageRequest.model_validate(request.json_body)
+        second_body = body if kind == "same_operation" else body.model_copy(update={"operation_id": str(uuid4())})
+        second_request = ProbeRequest(request.method, request.path, second_body.model_dump(mode="json"))
         epoch_before = self._observer.fence_epoch(session_id)
-        responses, spread_ms = self.fire_pair(request, expected_statuses={200, 202, 409})
+        responses, spread_ms = self.fire_pair(request, expected_statuses={202, 409}, second_request=second_request)
+        accepted = [response for response in responses if response.status == 202 and response.operation_id is not None]
+        if not accepted:
+            raise AcceptanceCheckError("probe_operation_not_admitted")
+        if any(response.operation_id not in (body.operation_id, second_body.operation_id) for response in accepted):
+            raise AcceptanceCheckError("probe_operation_identity")
+        operation_id = accepted[0].operation_id
+        assert operation_id is not None
+        terminal = self._poll_composer_operation(session_id, operation_id)
+        ids = (body.operation_id, second_body.operation_id)
         return FenceConflictTrial(
             responses=responses,
             fence_epoch_before=epoch_before,
             fence_epoch_after=self._observer.fence_epoch(session_id),
-            fence_owner_after=self._observer.fence_owner(session_id),
-            message_ingress_receipt_rows=self._observer.message_ingress_receipt_rows(session_id, client_request_id=request_id),
+            fence_owner_after=self._observer.composer_operation_claim_owner(session_id, operation_id=operation_id),
+            message_ingress_receipt_rows=self._observer.message_ingress_receipt_rows(session_id, operation_id=operation_id),
             dispatch_spread_ms=spread_ms,
+            kind=kind,
+            operation_ids=ids,
+            composer_operation_rows=sum(self._observer.composer_operation_rows(session_id, operation_id=item) for item in set(ids)),
+            terminal_status="completed" if terminal.status == "completed" else "failed",
         )
+
+    def _poll_composer_operation(self, session_id: str, operation_id: str) -> ComposerOperationStatusResponse:
+        def poll(client: AcceptanceHttpClient) -> ComposerOperationStatusResponse:
+            deadline: float | None = None
+            while True:
+                body = client.request_json("GET", f"/api/sessions/{session_id}/operations/{operation_id}", expected_statuses={200})
+                status = ComposerOperationStatusResponse.model_validate_json(json.dumps(body))
+                if status.operation_id != operation_id:
+                    raise AcceptanceCheckError("probe_operation_identity")
+                remaining = self._clock() + status.deadline_remaining_ms / 1000 + P1_OPERATION_POLL_GRACE_SECONDS
+                deadline = remaining if deadline is None else min(deadline, remaining)
+                if status.status in ("completed", "failed"):
+                    return status
+                if self._clock() >= deadline:
+                    raise AcceptanceCheckError("probe_operation_terminal_timeout")
+                time.sleep(min(status.poll_after_ms / 1000, max(0, deadline - self._clock())))
+
+        if self._pinned_clients is not None:
+            return poll(self._pinned_clients[0])
+        first, _second = self._controller.replicas()
+        with self._client_factory(first.origin) as client:
+            client.authenticate(register=False)
+            return poll(client)
 
     def run_start_trial(self, session_id: str, request: ProbeRequest, *, observation_timeout_seconds: float = 30.0) -> RunStartTrial:
         """One P2 trial against a fresh prepared session; historical runs invalidate isolation."""

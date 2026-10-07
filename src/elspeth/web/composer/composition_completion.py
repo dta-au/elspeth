@@ -108,6 +108,7 @@ from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
     ComposerResult,
 )
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import (
     _sync_list_blobs,
@@ -1286,6 +1287,7 @@ class CompositionCompletion:
         # Durable advisor gate fact from the prior state row (ruling
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> _TerminateOutcome:
         """Phase P2 of the compose loop — handle the no-tool-calls branch.
 
@@ -1504,6 +1506,7 @@ class CompositionCompletion:
                 advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                 deadline=deadline,
                 completion_gates=completion_gates,
+                provider_owner=provider_owner,
             )
         except _AdvisorCheckpointComposeDeadlineExpired:
             # The model had already replied; the timeout envelope carries no
@@ -1933,6 +1936,7 @@ class CompositionCompletion:
         # Durable advisor gate fact from the prior state row (ruling
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
         """Run the shared terminal no-tool END advisor gate for P2 and P5.
 
@@ -2025,6 +2029,7 @@ class CompositionCompletion:
                 advisor_review_state=review_state,
                 deadline=deadline,
                 session_operation_context=session_operation_context,
+                provider_owner=provider_owner,
             )
             passes_delta += 1
             review_state = _advance_advisor_review_state(

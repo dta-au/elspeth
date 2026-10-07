@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, cast
@@ -26,6 +27,7 @@ from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.execution.accounting import load_run_accounting_from_db
 from elspeth.web.execution.schemas import CancelledData, CompletedData, FailedData, RunAccounting
+from elspeth.web.execution.service import close_execute_lease_before_transfer
 from elspeth.web.sessions.protocol import (
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     RunRecord,
@@ -234,6 +236,13 @@ class RunRecoveryCoordinator:
                 repositories.run_coordination.release_seat(token=token)
 
     async def _recover_candidate(self, candidate: RunRecord) -> None:
+        registry = self._execution.execution_lease_release_registry
+        obligation = registry.admit(
+            self._sessions.session_operation_authority,
+            session_id=candidate.session_id,
+            owner_instance_id=self._sessions.session_operation_owner_instance_id,
+            lease_seconds=self._sessions.session_operation_lease_seconds,
+        )
         try:
             lease = await SessionOperationLease.acquire(
                 self._sessions.session_operation_authority,
@@ -241,6 +250,7 @@ class RunRecoveryCoordinator:
                 operation_kind=SessionOperationKind.EXECUTE,
                 owner_instance_id=self._sessions.session_operation_owner_instance_id,
                 lease_seconds=self._sessions.session_operation_lease_seconds,
+                execution_obligation=obligation,
             )
         except SessionOperationConflictError:
             return
@@ -252,6 +262,7 @@ class RunRecoveryCoordinator:
             raise
         transferred = False
         try:
+            obligation.assert_business_dispatch(lease.context)
             run = await self._sessions.get_run(candidate.id)
             observation = await run_sync_in_worker(
                 observe_run,
@@ -297,5 +308,5 @@ class RunRecoveryCoordinator:
                 return
             transferred = await self._execution.recover_run(run, lease, resume_existing=observation.status is not None)
         finally:
-            if not transferred:
-                await lease.close()
+            if not transferred and not obligation.completion_required:
+                await close_execute_lease_before_transfer(lease, primary=sys.exception())

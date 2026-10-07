@@ -73,7 +73,6 @@ import {
   OPEN_CATALOG_EVENT,
 } from "./lib/composer-events";
 import type { SystemStatus } from "./types/index";
-import { applyServerComposerTimeout } from "./config/composer";
 
 // Health check interval in milliseconds (30 seconds)
 const HEALTH_CHECK_INTERVAL = 30_000;
@@ -378,49 +377,6 @@ function App() {
       useSessionStore
         .getState()
         .setComposerAdvisorModel(status.composer_advisor_model);
-      // Derive the compose abort ceiling from the deployment's configured
-      // wall clock — a hard-coded client cap only satisfies the
-      // client-outlives-server invariant for the checked-in defaults.
-      // Latch the store readiness gate (the single source of truth) true once
-      // a known-good ceiling is applied: chat Send and side-rail Apply ungate
-      // only then, closing the bootstrap race
-      // where a send started before this fetch would schedule an abort from
-      // the stale default. Only ever set true — the backend wall clock does
-      // not change mid-session, so a later partial health response must not
-      // un-ready a composer that already knows its ceiling.
-      if (
-        status.composer_timeout_seconds !== undefined &&
-        applyServerComposerTimeout(status.composer_timeout_seconds)
-      ) {
-        // Latch the reactive readiness gate — the single source of truth the
-        // Send affordances subscribe to — now that a known-good ceiling is
-        // applied. Only ever set true: the backend wall clock does not change
-        // mid-session, so a later partial poll must not un-ready a composer that
-        // already knows its ceiling (the else-guard below enforces that).
-        useSessionStore.getState().setComposeTimeoutReady(true);
-        useSessionStore.getState().setComposerTimeoutUnavailable(false);
-      } else if (!useSessionStore.getState().composeTimeoutReady) {
-        // Backend reachable but no usable composer_timeout_seconds AND no good
-        // ceiling was ever latched this session — genuinely stuck. The gate must
-        // stay closed (a send would schedule an abort from the stale default
-        // ceiling), so latch a distinct diagnostic: the Send affordance stops
-        // saying "Connecting…" and the misconfiguration is visible. Log once on
-        // the false→true transition, not every poll.
-        //
-        // The `!composeTimeoutReady` guard is load-bearing: a partial or absent
-        // response that arrives AFTER a good ceiling was latched is a transient
-        // (readiness holds), so we must not flag unavailable or spam a false "no
-        // usable timeout" error on a genuinely healthy composer.
-        const sessionState = useSessionStore.getState();
-        if (!sessionState.composerTimeoutUnavailable) {
-          console.error(
-            "[health-check] system status reported no usable " +
-              "composer_timeout_seconds:",
-            status.composer_timeout_seconds,
-          );
-        }
-        sessionState.setComposerTimeoutUnavailable(true);
-      }
       // Deploy beacon: debounce across consecutive polls so a mid-deploy
       // status flap never flashes the banner; latch once stable.
       staleBuildStreakRef.current = nextStaleBuildStreak(
@@ -444,7 +400,6 @@ function App() {
       // Backend unreachable: the "Backend unavailable" banner is the signal
       // now, not the composer-specific diagnostic. Clear it so a later
       // recovery does not surface a stale "composer unavailable".
-      useSessionStore.getState().setComposerTimeoutUnavailable(false);
       setLastHealthCheckAt(new Date().toLocaleTimeString());
     } finally {
       setHealthChecking(false);
@@ -587,13 +542,7 @@ function App() {
     };
   }, [checkHealth]);
 
-  // Re-establish the compose-timeout gate on RE-authentication. App stays
-  // mounted across auth changes (AuthGuard gates only its children), so the
-  // mount effect above does not re-run on login; meanwhile logout's store reset
-  // dropped composeTimeoutReady to false (and reset the module ceiling in
-  // lockstep). Without this, a fresh login would sit behind a disabled Send
-  // until the next 30s poll re-latched the backend ceiling. Fire only on the
-  // false→true transition so the initial mount does not double-fetch.
+  // Refresh deployment health on a new authenticated session.
   const wasAuthenticatedRef = useRef(isAuthenticated);
   useEffect(() => {
     if (isAuthenticated && !wasAuthenticatedRef.current) {

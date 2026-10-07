@@ -18,7 +18,6 @@ import elspeth.web.azure_container_apps_single_revision as single_revision
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceInputError
 from elspeth.web._acceptance_common.http_client import AcceptanceCredentials
 from elspeth.web._acceptance_common.replica_probes import (
-    SESSION_OPERATION_CONFLICT_DETAIL,
     EvidenceObserver,
     FenceConflictTrial,
     MembershipRow,
@@ -28,6 +27,7 @@ from elspeth.web._acceptance_common.replica_probes import (
 )
 from elspeth.web._azure_container_apps_acceptance.receipt_contracts import ReplicaBinding, extract_exec_receipt
 from elspeth.web.azure_container_apps_single_revision import AffinityClient, SingleTopology, discover_pair, main, run_fence_trials
+from tests.helpers.composer_probe_operations import operation_document
 
 APP_ID = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/test/providers/Microsoft.App/containerApps/web"
 REVISION = "web--production"
@@ -89,6 +89,7 @@ class Routing:
         self.identity_fault: str | None = None
         self.uploaded = b""
         self.message_content = ""
+        self.visibility_operation = ""
         self.paths: list[tuple[str, str]] = []
         self.observer = Observer()
         self.lock = threading.Lock()
@@ -110,11 +111,17 @@ class Routing:
             if request.url.path.endswith("/blobs"):
                 self.uploaded = request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0]
                 return httpx.Response(201, json={"id": str(uuid4())}, headers=headers)
+            if request.url.path.endswith("/state"):
+                return httpx.Response(200, content=b"null", headers=headers)
+            if "/operations/" in request.url.path:
+                session = request.url.path.split("/")[3]
+                operation_id = request.url.path.rsplit("/", 1)[1]
+                return httpx.Response(200, json=operation_document(operation_id, session, message_id=INSTANCES[0]), headers=headers)
             if request.url.path.endswith("/messages"):
                 assistant = {"id": INSTANCES[0], "role": "assistant", "content": "Acknowledged"}
                 if request.method == "POST":
                     body = json.loads(request.content)
-                    assert str(UUID(body["client_request_id"])) == body["client_request_id"]
+                    assert str(UUID(body["operation_id"])) == body["operation_id"]
                     self.message_content = body["content"]
                     if body["content"].startswith("P1 "):
                         session = request.url.path.split("/")[3]
@@ -123,11 +130,14 @@ class Routing:
                         if assigned not in body["content"]:
                             assert event.wait(2)
                         with self.lock:
-                            if session in self.observer.owners:
-                                return httpx.Response(409, json={"detail": SESSION_OPERATION_CONFLICT_DETAIL}, headers=headers)
-                            self.observer.owners[session] = instance
+                            if session in self.observer.owners and self.observer.operations[session] != body["operation_id"]:
+                                return httpx.Response(409, json={"error_type": "composer_operation_active"}, headers=headers)
+                            if session not in self.observer.owners:
+                                self.observer.owners[session] = instance
+                                self.observer.operations[session] = body["operation_id"]
                             event.set()
-                    return httpx.Response(200, json={"message": assistant}, headers=headers)
+                    self.visibility_operation = body["operation_id"]
+                    return httpx.Response(202, json={"operation_id": body["operation_id"]}, headers=headers)
                 return httpx.Response(
                     200, json=[{"id": "new-user", "role": "user", "content": self.message_content}, assistant], headers=headers
                 )
@@ -162,6 +172,7 @@ class Routing:
 class Observer(EvidenceObserver):
     def __init__(self) -> None:
         self.owners: dict[str, str] = {}
+        self.operations: dict[str, str] = {}
 
     def fence_epoch(self, session_id: str) -> int:
         return 1 if session_id in self.owners else 0
@@ -169,8 +180,14 @@ class Observer(EvidenceObserver):
     def fence_owner(self, session_id: str) -> str | None:
         return self.owners[session_id] if session_id in self.owners else None
 
-    def message_ingress_receipt_rows(self, session_id: str, *, client_request_id: str) -> int:
+    def message_ingress_receipt_rows(self, session_id: str, *, operation_id: str) -> int:
         return 1 if session_id in self.owners else 0
+
+    def composer_operation_rows(self, session_id: str, *, operation_id: str) -> int:
+        return int(self.operations.get(session_id) == operation_id)
+
+    def composer_operation_claim_owner(self, session_id: str, *, operation_id: str) -> str | None:
+        return self.owners.get(session_id)
 
     def runs_row_ids(self, session_id: str) -> tuple[str, ...]:
         return ()
@@ -199,7 +216,8 @@ def recorded_dispatch_clock(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_discovery_discards_duplicate_routes_and_retains_cookie_jars_for_all_twenty_trials(recorded_dispatch_clock: None) -> None:
     routing = Routing((REPLICAS[0], REPLICAS[0], REPLICAS[1]))
     requests = tuple(
-        (str(uuid4()), {"content": f"P1 Build a pipeline for {REPLICAS[i % 2]}", "client_request_id": str(uuid4())}) for i in range(20)
+        (str(uuid4()), {"content": f"P1 Build a pipeline for {REPLICAS[i % 2]}", "operation_id": str(uuid4()), "state_id": None})
+        for i in range(20)
     )
     with discover_pair(TOPOLOGY, routing.factory, attempts=3) as clients:
         assert clients[0].instance_id == INSTANCES[0]
@@ -216,7 +234,8 @@ def test_fence_trials_enforce_five_millisecond_dispatch_limit(
 ) -> None:
     routing = Routing()
     requests = tuple(
-        (str(uuid4()), {"content": f"P1 Build a pipeline for {REPLICAS[i % 2]}", "client_request_id": str(uuid4())}) for i in range(20)
+        (str(uuid4()), {"content": f"P1 Build a pipeline for {REPLICAS[i % 2]}", "operation_id": str(uuid4()), "state_id": None})
+        for i in range(20)
     )
 
     def score_recorded_dispatch(trials: list[FenceConflictTrial], *, required_trials: int) -> ProbeResult:
@@ -306,7 +325,7 @@ def test_cli_emits_distinct_single_receipt_and_topology_after_real_cookie_reques
             [
                 {
                     "session_id": str(uuid4()),
-                    "body": {"content": f"P1 Build a pipeline for {REPLICAS[i % 2]}", "client_request_id": str(uuid4())},
+                    "body": {"content": f"P1 Build a pipeline for {REPLICAS[i % 2]}", "operation_id": str(uuid4()), "state_id": None},
                 }
                 for i in range(20)
             ]

@@ -6,7 +6,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchRecoveryTranscript, parseResponse, recompose, sendMessage } from "./client";
+import { fetchRecoveryTranscript, parseResponse, submitComposerOperation } from "./client";
 import type { ApiError, CompositionState } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
@@ -35,29 +35,30 @@ describe("api/client recovery contracts", () => {
     fetchSpy.mockRestore();
   });
 
-  it("sends an exact ingress identity and parses the canonical acceptance receipt", async () => {
-    fetchSpy.mockResolvedValueOnce({
-      ok: false, status: 409, statusText: "Conflict",
-      json: async () => ({detail: {
-        error_type: "message_already_accepted", detail: "Message already accepted",
-        client_request_id: clientRequestId, user_message_id: "canonical-user",
-      }}),
-    } as Response);
-    await expect(sendMessage("session-1", "hello", clientRequestId, null)).rejects.toMatchObject({
-      status: 409, error_type: "message_already_accepted",
-      client_request_id: clientRequestId, user_message_id: "canonical-user",
-    });
+  it("sends immutable operation identity and parses a canonical active-operation refusal", async () => {
+    const activeId = "9c86f912-eaef-4873-8a53-575844ae5e66";
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ detail: {
+      error_type: "composer_operation_active", detail: "A composer operation is active",
+      operation_id: activeId, kind: "compose_message",
+    } }), { status: 409 }));
+    await expect(submitComposerOperation({
+      mode: "submitted", scope: { principalId: "alice", authProvider: "local" },
+      sessionId: "session-1", operationId: clientRequestId, kind: "compose_message", createdAt: Date.now(),
+      body: { operation_id: clientRequestId, content: "hello", state_id: null },
+    })).rejects.toMatchObject({ status: 409, error_type: "composer_operation_active", operation_id: activeId, kind: "compose_message" });
     const request = fetchSpy.mock.calls[0][1] as RequestInit;
-    expect(JSON.parse(request.body as string)).toEqual({
-      content: "hello", client_request_id: clientRequestId, state_id: null,
-    });
+    expect(JSON.parse(request.body as string)).toEqual({ content: "hello", operation_id: clientRequestId, state_id: null });
   });
 
-  it("binds recompose to the expected last conversational user", async () => {
-    fetchSpy.mockResolvedValueOnce({ok: true, json: async () => ({message: null, state: null, proposals: []})} as Response);
-    await recompose("session-1", "canonical-user");
+  it("binds recompose admission to the expected last conversational user and state", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ operation_id: clientRequestId, kind: "compose_recompose", status: "queued", poll_after_ms: 1000 }), { status: 202 }));
+    await submitComposerOperation({
+      mode: "submitted", scope: { principalId: "alice", authProvider: "local" },
+      sessionId: "session-1", operationId: clientRequestId, kind: "compose_recompose", createdAt: Date.now(),
+      body: { operation_id: clientRequestId, expected_user_message_id: "canonical-user", state_id: null },
+    });
     const request = fetchSpy.mock.calls[0][1] as RequestInit;
-    expect(JSON.parse(request.body as string)).toEqual({expected_user_message_id: "canonical-user"});
+    expect(JSON.parse(request.body as string)).toEqual({ operation_id: clientRequestId, expected_user_message_id: "canonical-user", state_id: null });
   });
 
   it("preserves static Composer retry guidance from a nested provider error", async () => {
@@ -129,7 +130,7 @@ describe("api/client recovery contracts", () => {
 
     let error: ApiError | undefined;
     try {
-      await sendMessage("session-1", "recover please", clientRequestId);
+      await parseResponse(await globalThis.fetch("/controlled-terminal-error"));
     } catch (err) {
       error = err as ApiError;
     }
@@ -175,7 +176,7 @@ describe("api/client recovery contracts", () => {
 
     let error: ApiError | undefined;
     try {
-      await sendMessage("session-2", "recover please", clientRequestId);
+      await parseResponse(await globalThis.fetch("/controlled-terminal-error"));
     } catch (err) {
       error = err as ApiError;
     }
@@ -223,7 +224,7 @@ describe("api/client recovery contracts", () => {
 
     let error: ApiError | undefined;
     try {
-      await sendMessage("session-timeout", "build me a pipeline", clientRequestId);
+      await parseResponse(await globalThis.fetch("/controlled-terminal-error"));
     } catch (err) {
       error = err as ApiError;
     }
@@ -257,7 +258,7 @@ describe("api/client recovery contracts", () => {
 
     let error: ApiError | undefined;
     try {
-      await sendMessage("session-timeout-bad", "build me a pipeline", clientRequestId);
+      await parseResponse(await globalThis.fetch("/controlled-terminal-error"));
     } catch (err) {
       error = err as ApiError;
     }
@@ -297,7 +298,7 @@ describe("api/client recovery contracts", () => {
 
     let error: ApiError | undefined;
     try {
-      await sendMessage("session-3", "not recovery", clientRequestId);
+      await parseResponse(await globalThis.fetch("/controlled-terminal-error"));
     } catch (err) {
       error = err as ApiError;
     }

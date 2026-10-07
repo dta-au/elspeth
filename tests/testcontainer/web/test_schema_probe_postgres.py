@@ -631,6 +631,8 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
             )
         }
     assert names == {
+        "trg_composer_async_operations_transition_guard",
+        "trg_composer_async_operations_no_delete_live",
         "trg_interpretation_events_immutable_resolved",
         "trg_interpretation_events_no_delete_resolved",
         "trg_composer_completion_events_no_update",
@@ -774,6 +776,10 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
 @pytest.mark.parametrize(
     "trigger_mutation",
     [
+        "DROP TRIGGER trg_composer_async_operations_transition_guard ON composer_async_operations",
+        "ALTER TABLE composer_async_operations DISABLE TRIGGER trg_composer_async_operations_transition_guard",
+        "DROP TRIGGER trg_composer_async_operations_no_delete_live ON composer_async_operations",
+        "ALTER TABLE composer_async_operations DISABLE TRIGGER trg_composer_async_operations_no_delete_live",
         "DROP TRIGGER trg_chat_messages_no_delete ON chat_messages",
         "ALTER TABLE chat_messages DISABLE TRIGGER trg_chat_messages_no_delete",
         "DROP TRIGGER trg_message_ingress_receipts_no_update ON message_ingress_receipts",

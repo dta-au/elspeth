@@ -1,0 +1,54 @@
+<!-- Durable copy: machine-specific prefixes normalized; private original retained. -->
+
+# Actual Astra shared source assembly review 1
+
+**Verdict: bounded source GO for `combined-core4-observer5-v7-1`.** The frozen worker/lifecycle assembly faithfully combines the reviewed core4, observer5 and V7 finish-once layers. No blocking composition defect was found. This clears only these shared source bytes for root's next integration step. Coherent app/consumer review, controls, canonical admission, application/runtime verification and merge remain HOLD.
+
+This is actual internal Astra, not Daybreak. No candidate definition/import, production execution, collection, SQL, provider/network action, repository edit, application, merge or deployment occurred. Only reviewer-owned standard-library source instruments were executed in the authorized workspace. Earlier reviews, source packages and failed runs remain preserved; the denied external Daybreak action remains stopped.
+
+## Exact scope and source provenance
+
+I read the full final-layer assembly report, combined README/manifest/parity claims, complete assembled `async_workers.py` and `coordination/lifecycle.py`, complete core4 and observer5 review reports, and the complete async delta against core4. I also read the actual observer reader and core4 finalizer implementations and relevant dependency import boundaries. The prior V7 CODE7 review remains applicable through its exact function overlay. The evidence records the preceding report/evidence hashes and fresh replacement guards for core4 and observer5 dependencies. Unrelated sibling app, consumer, test-successor and scanner packages are not approved by this assembly review.
+
+Independent live guards and full patch reconstruction passed at held HEAD `d2b73990d137e9725200c897544eebc5b958fdf4`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Combined manifest | `cb057296f147ca89c776ec85bcb320b53343903d955d9e90f7a5fdaf032af664` |
+| Complete patch | `d6c09957cfb68b63e29570abb6735698f3685d8acf7ec53dceeec9ee0ac556c5` |
+| Worker live preimage | `f8cddc9cf9a40a29e30cad478d082247a165ad6a1b6f254e65c42079d444f6ad` |
+| Worker replacement | `4ba4114d208517255750712a0036b5a082315de8951e8997c9d1aefa7bf8f517` |
+| Lifecycle live preimage | `ea886eb34723985206b2076ec8e24f51af5ddb72440a3d2c13df055fd822038e` |
+| Lifecycle replacement | `b20314c1ab30c2bf9bb858a7680753d2d65b490d9018484dfd5cbc2495f4d1a3` |
+
+The complete package inventory matches the two full preimages/replacements, manifest, patch, README and parity JSON. The author's parity JSON is a claim, not a substitute for executable guard provenance; the reviewer-owned script independently reconstructs and controls those checks. No candidate definitions are executed to do so.
+
+## Complete reversal and retained boundaries
+
+The combined `_submit_shared` differs from core4 only by the exact observer5 parameter and five scoped body additions. Those additions enforce the canonical bound read method, exclude simultaneous ticket/finalizer authority, pin the actual generation, use observer admission/refusal custody, recheck actual generation/cutoff under its submission lock, and retain the exact physical submission/setup failure for private-cancellation discrimination. Every inserted block matches observer5's actual submit source.
+
+Removing only those explicit blocks returns the full submit function exactly to core4 bytes. Removing the observer import and exact two appended helpers, and restoring only the finish-once function, then reproduces the **entire core4 worker file byte-for-byte**, as well as its full module AST. This proves complete preservation of imports, constants, classes, all other functions and module statements, not merely a filtered list of named methods. No stale observer or rejection whole-worker replacement supplied the result.
+
+The two observer helpers match their reviewed source exactly. The shared `_finish_joined_shared_future` also matches observer5/core4 and appears once. The only rejection overlay is `run_required_sql_finish_once`, exact SHA `02b9bba33892a00b7484d2ed6f24e712b3b7ac1690b02c03ef3b2f80d89d460f`; its complete preimage matches the V7 descriptor. Known returned and raised outcomes retain their actual handoff identity on the ticket. The incomplete-ticket exception path still raises without inventing a handoff. No other rejection worker body is copied over the shared implementation.
+
+Lifecycle is exactly core4 bytes. Its actual Event-wait cancellation observation method is byte-identical to observer5, and the required `_retain_cancellation` import occurs once. Thus the standalone observer lifecycle's missing-import limitation is resolved by retaining the reviewed core lifecycle, with one Event seam. The lease's exact acquired context, EXECUTE obligation, lifecycle Task entry/outcome retention, independent owned-child joins, renewal join and release failure handling remain unchanged. This does not change the ordinary non-EXECUTE/archive failure policy into the stricter EXECUTE policy or broaden any authority.
+
+The observer import does not introduce a direct import-time lifecycle cycle in the reviewed dependency sources: the reader keeps lifecycle/worker types behind `TYPE_CHECKING` or local method imports. Actual import-order and merged-tree lint/type compatibility still require root checks. The source retains the layers' unsorted import layout; no Ruff result is claimed here, and eventual sorting must retain exact scoped import/body semantics and refresh byte guards.
+
+## Actual custody remains strict
+
+Observer dispatch cannot use finalizer or required-ticket authority because it rejects either combination before executor acquisition. It retains its actual executor/generation and revalidates identity/current state, draining state, lease loss and original deadline before no-submission refusal issuance and before submitted work. Its refusal still requires an unheld, unregistered reservation with no Future or entered invocation. Only the owned refusal can authorize retry; ordinary SQL timeout and physical failures remain originals. The real SQL outcome is excluded from the delivered-private-cancellation channel.
+
+The finalizer path retains core4's canonical bound method check and claimed owner. Its release wrapper calls the actual admission decrement before publishing the counter-return receipt. Callback failure retains the actual original and records a distinct failed-callback receipt. `physical_failure_completion_known` still requires the exact claimed capability, bound reservation/Future, actual counter return, retained failure, completed/exited invocation and that reservation's registering generation join. An early `released` flag or a generation join cannot replace a missing counter return. Failed submit/setup has its corresponding strict actual-generation proof. No observer insertion lies on these finalizer branches or changes these predicates.
+
+The worker continues waiting for successful completion or physically known failed closure, retrieves the actual Future result, and projects every retained cancellation and actual failure. The latter path grants neither success nor owner retirement/COMPLETE. The shared EXECUTE bridge, its canonical invocation validation, exact context and generation checks, WAITING-only abort, actual callback observation and retained setup/SQL originals are preserved exactly. Registering-generation joins are not replaced by a newly current or unrelated generation.
+
+The app's independently owned failed-handoff getter and consumer joins are outside this package. Their reported repair is not inferred from faithful shared source composition. Source51/52 admission, category/rank changes, writer-map changes, provider bypasses, server-authored graphs and tutorial-specific paths are absent from this assembly delta; none is authorized by this verdict.
+
+## Controlled evidence and remaining HOLD
+
+`astra-combined-source-evidence.py` completed with native exit 0. Companion `astra-combined-core4-observer5-v7-code-review-1-evidence.json` records all package hashes, fresh live/dependency guards, complete patch reconstruction, full module member hashes and the exact reversal results. Its positive accepts the frozen assembly; independent negative mutations reject a changed finalizer failure wait, altered observer authority exclusivity, extra module binding and missing finish-once handoff observation. Every full-file guard rejects changed bytes. These are source instrument controls, not executed behavioral mutation results.
+
+The final-layer report's newer companion control assertions are not cleared here. The preserved observer5 review identifies the old entry-failure control's non-independent timeout and its first-result identity limitation. Any separate repaired controls require their own review/native results. Root must still run actual registrations, bounded positive and causal negative controls, cancellation ordering, failed counter and registering-generation joins, SQLite/private serial PostgreSQL obligations, app/consumer integration and merged-tree checks on the eventual coherent candidate. The old saturated32 TLS terminal cause remains UNPROVED.
+
+The original **102 obligations, four collections and two UNKNOWNs** remain unchanged. Canonical/global/storage/supplier closure, maps, signing, final frozen gates and John's manual Daybreak/local testing/merge decision remain held. This report grants no runtime, PostgreSQL draining-release, source51/52, final merge-readiness, paid/provider-test, production or deployment clearance.

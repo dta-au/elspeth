@@ -7,6 +7,7 @@ import type {
   InlineSourceSummary,
 } from "@/types/api";
 import { Button } from "@/components/ui";
+import { isComposePermanentRefusal, isComposeRefreshOnlyFailureCode } from "@/config/composer";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ToolCallCard } from "./ToolCallCard";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
@@ -280,7 +281,7 @@ export function MessageBubble({
             {/* S1: ``policy_blocked`` is permanent by construction — a
                 deployment policy refused the pipeline, so keep the failed text but
                 never render a retry invitation for it. */}
-            {message.local_failure_code !== "policy_blocked" && message.local_failure_code !== "admission_refused" && message.local_failure_code !== "token_accounting_unavailable" && message.local_failure_code !== "message_idempotency_conflict" && message.local_failure_code !== "recompose_user_message_mismatch" && (
+            {!isComposePermanentRefusal(message.local_failure_code) && (
               <Button
                 variant="bare"
                 onClick={() => onRetry(message.id)}
@@ -290,7 +291,7 @@ export function MessageBubble({
                 // in flight, and the affordance must say so.
                 disabled={isComposing}
               >
-                Retry
+                {isComposeRefreshOnlyFailureCode(message.local_failure_code) ? "Refresh" : "Retry"}
               </Button>
             )}
           </div>

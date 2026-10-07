@@ -11,8 +11,9 @@ its own insert regardless — the non-vacuous post-fix contract.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,11 +23,13 @@ from sqlalchemy import Engine, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.postgres_target import postgres_test_target
+from tests.testcontainer.web.test_session_operation_fence_postgres import _register_instance
+from tests.unit.web.sessions.test_service import _admit_durable_ingress, _durable_ingress
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, message_ingress_receipts_table, sessions_table
-from elspeth.web.sessions.protocol import MessageIngressAccepted, MessageIngressFresh
+from elspeth.web.sessions.protocol import MessageIngressFresh
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -36,9 +39,10 @@ pytestmark = pytest.mark.testcontainer
 
 @pytest.fixture(scope="module")
 def postgres_engine() -> Iterator[Engine]:
-    with postgres_test_target(driver="psycopg") as postgres_url:
+    with postgres_test_target(driver="psycopg", mem_limit="256m", nano_cpus=500_000_000) as postgres_url:
         engine = create_session_engine(postgres_url)
         initialize_session_schema(engine)
+        _register_instance(engine, instance_id="ingress-pg-owner", lease_delta=timedelta(minutes=10))
         try:
             yield engine
         finally:
@@ -52,6 +56,7 @@ def postgres_service(postgres_engine: Engine, tmp_path: Path) -> SessionServiceI
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.add-message-transcript.postgres"),
+        owner_instance_id="ingress-pg-owner",
     )
 
 
@@ -94,14 +99,15 @@ async def test_postgres_combined_read_sees_its_own_write_despite_repeatable_read
         # seed row — the pooled-stale-reader condition from production.
         assert _count(stale_reader) == 1
 
-        result = await postgres_service.add_message_with_transcript(
+        postgres_service.session_operation_authority.release(context)
+        result = await _durable_ingress(
+            postgres_service,
             session.id,
             "user",
             "hello",
-            client_request_id=uuid4(),
+            operation_id=uuid4(),
             requested_state_id=None,
             writer_principal="route_user_message",
-            session_operation_context=context,
         )
         assert isinstance(result, MessageIngressFresh)
         record, transcript = result.message, result.transcript
@@ -118,7 +124,6 @@ async def test_postgres_combined_read_sees_its_own_write_despite_repeatable_read
     finally:
         stale_reader.rollback()
         stale_reader.close()
-        postgres_service.session_operation_authority.release(context)
 
     # After the pinned transaction ends, a fresh read converges.
     assert [message.content for message in await postgres_service.get_messages(session.id, limit=None)] == ["seed", "hello"]
@@ -141,38 +146,34 @@ async def test_postgres_two_service_instances_accept_one_receipt_for_same_key_an
         session_operation_authority=postgres_service.session_operation_authority,
         owner_instance_id=postgres_service.session_operation_owner_instance_id,
     )
-    context = postgres_service.session_operation_authority.acquire(
-        session_id=session.id,
-        operation_kind=SessionOperationKind.COMPOSE,
-        owner_instance_id=postgres_service.session_operation_owner_instance_id,
-        lease_seconds=postgres_service.session_operation_lease_seconds,
-    )
     request_id = uuid4()
+
+    def admit_one(service):
+        return _admit_durable_ingress(service, session.id, operation_id=request_id, content="one admission", requested_state_id=None)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        admissions = list(pool.map(admit_one, (postgres_service, second)))
+    assert sorted(item[2] for item in admissions) == [False, True]
+    assert admissions[0][1].operation_id == admissions[1][1].operation_id
+    authority = admissions[0][0]
+    (claim,) = authority.claim_next(limit=1)
+    context = postgres_service.session_operation_authority.start_composer_async_operation(
+        claim, owner_instance_id=postgres_service.session_operation_owner_instance_id, lease_seconds=30, auth_provider_type="local"
+    )
+    from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+
     try:
-        results = await asyncio.gather(
-            postgres_service.add_message_with_transcript(
-                session.id,
-                "user",
-                "one admission",
-                client_request_id=request_id,
-                requested_state_id=None,
-                writer_principal="route_user_message",
-                session_operation_context=context,
-            ),
-            second.add_message_with_transcript(
-                session.id,
-                "user",
-                "one admission",
-                client_request_id=request_id,
-                requested_state_id=None,
-                writer_principal="route_user_message",
-                session_operation_context=context,
-            ),
+        fresh = await postgres_service.add_message_with_transcript(
+            session.id,
+            "user",
+            "one admission",
+            operation_id=request_id,
+            requested_state_id=None,
+            writer_principal="route_user_message",
+            session_operation_context=context,
+            running=ComposerOperationRunning(claim=claim, session_operation_context=context),
         )
-        assert sorted(type(result).__name__ for result in results) == ["MessageIngressAccepted", "MessageIngressFresh"]
-        fresh = next(result for result in results if isinstance(result, MessageIngressFresh))
-        accepted = next(result for result in results if isinstance(result, MessageIngressAccepted))
-        assert accepted.user_message_id == fresh.message.id
+        assert isinstance(fresh, MessageIngressFresh)
         with postgres_engine.connect() as conn:
             assert (
                 conn.scalar(

@@ -113,7 +113,7 @@ def test_freeform_trial_inventory_requires_distinct_sessions_and_valid_message_b
     requests = [
         {
             "session_id": f"session-{index}",
-            "body": {"content": "Build a pipeline", "client_request_id": f"00000000-0000-4000-8000-{index:012x}"},
+            "body": {"content": "Build a pipeline", "operation_id": f"00000000-0000-4000-8000-{index:012x}", "state_id": None},
         }
         for index in range(20)
     ]
@@ -123,9 +123,9 @@ def test_freeform_trial_inventory_requires_distinct_sessions_and_valid_message_b
     _protected(Path(path), requests)
     with pytest.raises(AcceptanceInputError, match="distinct sessions"):
         facade._fence_trial_requests(path, trials=20)
-    requests[1] = {"session_id": "session-1", "body": {"content": "Build a pipeline", "client_request_id": "not-a-uuid"}}
+    requests[1] = {"session_id": "session-1", "body": {"content": "Build a pipeline", "operation_id": "not-a-uuid", "state_id": None}}
     _protected(Path(path), requests)
-    with pytest.raises(AcceptanceInputError, match="client_request_id"):
+    with pytest.raises(AcceptanceInputError, match="operation_id"):
         facade._fence_trial_requests(path, trials=20)
 
 

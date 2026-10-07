@@ -54,8 +54,7 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { applySuggestionPrompt, askAboutBlockerDraft, repairGraphPrompt } from "@/lib/suggestionPrompts";
 import { dispatchArtifactViewIntent } from "@/lib/composer-events";
 import {
-  COMPOSE_CONNECTING_MESSAGE,
-  COMPOSE_UNAVAILABLE_MESSAGE,
+  COMPOSE_LOADING_SESSION_MESSAGE,
 } from "@/config/composer";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
 import { InlineSourceFallbackPrompt } from "./InlineSourceFallbackPrompt";
@@ -367,13 +366,7 @@ export function ChatPanelContent({
     lastComposeChangedPipeline ?? true,
   );
   // Bootstrap-race gate shared with composer sends.
-  const composeTimeoutReady = useSessionStore((s) => s.composeTimeoutReady);
-  // Stuck state (backend up but reported no compose timeout): drives the
-  // Explain button's disabled reason so it matches the main Send instead of
-  // saying "Connecting…" forever.
-  const composerTimeoutUnavailable = useSessionStore(
-    (s) => s.composerTimeoutUnavailable,
-  );
+  const composeTimeoutReady = useSessionStore((s) => s.compositionStateLoaded);
   // The same pending cards rendered by AcknowledgementStack feed the decision panel.
   const pendingAcknowledgementEvents = usePendingAcknowledgements(
     activeSessionId ?? "",
@@ -1006,15 +999,8 @@ export function ChatPanelContent({
       stepLabelForNodeId(compositionState, componentId),
     [compositionState],
   );
-  // Same gate as the side rail's SuggestionList: a send started before the
-  // backend compose wall clock lands at boot could be aborted before the
-  // backend's 422 (bootstrap race), so Apply stays closed until
-  // composeTimeoutReady, and reads as connecting (or the stuck unavailable
-  // state) rather than as a dead click.
   const decisionApplyDisabled = isComposing || !composeTimeoutReady;
-  const decisionApplyDisabledReason = composerTimeoutUnavailable
-    ? COMPOSE_UNAVAILABLE_MESSAGE
-    : COMPOSE_CONNECTING_MESSAGE;
+  const decisionApplyDisabledReason = COMPOSE_LOADING_SESSION_MESSAGE;
   const handleApplySuggestion = useCallback(
     (suggestion: ValidationEntryDTO) => {
       void sendMessage(applySuggestionPrompt(suggestion));

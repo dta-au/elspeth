@@ -30,7 +30,6 @@ driven by the REAL operator-profile lowering (``validate_plugin_policy``).
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -51,7 +50,11 @@ from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, prompt_review_anchor_hash_from_options
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.integration.web.composer.parity.conftest import PARITY_FIXTURES
+
+execution_fixture = execution_custody.execution_fixture
 
 
 def _structured_llm_fixture() -> dict[str, Any]:
@@ -124,7 +127,9 @@ def _valid_validation_result() -> ValidationResult:
 
 
 @pytest.mark.asyncio
-async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(parity_env: Any) -> None:
+async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(
+    parity_env: Any, execution_fixture: ExecutionTestCustody
+) -> None:
     fixture = _structured_llm_fixture()
     committed = parity_env.reference_state(fixture)
 
@@ -176,23 +181,23 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
         )
 
     loop = asyncio.get_running_loop()
-    service = ExecutionServiceImpl(
-        loop=loop,
-        broadcaster=MagicMock(spec=ProgressBroadcaster),
-        settings=app_state.settings,
-        session_service=session_service,
-        yaml_generator=real_yaml_generator,
-        telemetry=build_sessions_telemetry(),
-        blob_service=None,
-        secret_service=None,
-        plugin_snapshot_factory=lambda user_id: app_state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
-        operator_profile_registry=app_state.operator_profile_registry,
-        web_plugin_policy=app_state.web_plugin_policy,
-        catalog=app_state.catalog_service,
+    service = execution_fixture.bind(
+        ExecutionServiceImpl(
+            loop=loop,
+            broadcaster=MagicMock(spec=ProgressBroadcaster),
+            settings=app_state.settings,
+            session_service=session_service,
+            yaml_generator=real_yaml_generator,
+            telemetry=build_sessions_telemetry(),
+            blob_service=None,
+            secret_service=None,
+            plugin_snapshot_factory=lambda user_id: app_state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
+            operator_profile_registry=app_state.operator_profile_registry,
+            web_plugin_policy=app_state.web_plugin_policy,
+            catalog=app_state.catalog_service,
+            execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+        )
     )
-
-    completed: Future[None] = Future()
-    completed.set_result(None)
 
     # Stub validate_pipeline VALID to isolate the execution-service preflight
     # gate (and avoid instantiating the profile's bedrock provider). The
@@ -201,7 +206,7 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
     try:
         with (
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=_valid_validation_result()),
-            patch.object(service._executor, "submit", return_value=completed),
+            patch.object(service, "_run_pipeline", return_value=None),
         ):
             # The profiled multi-query node must clear the retry-budget readiness
             # gate. Were the gate still evaluated on the un-lowered options it would
@@ -214,6 +219,12 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
                 operation_kind=SessionOperationKind.EXECUTE,
                 owner_instance_id=parity_env.sessions.session_operation_owner_instance_id,
                 lease_seconds=parity_env.sessions.session_operation_lease_seconds,
+                execution_obligation=service.execution_lease_release_registry.admit(
+                    parity_env.sessions.session_operation_authority,
+                    session_id=session_id,
+                    owner_instance_id=parity_env.sessions.session_operation_owner_instance_id,
+                    lease_seconds=parity_env.sessions.session_operation_lease_seconds,
+                ),
             )
             async with fanout_lease:
                 with pytest.raises(ExecutionFanoutGuardRequired) as fanout_excinfo:
@@ -232,6 +243,12 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
                 operation_kind=SessionOperationKind.EXECUTE,
                 owner_instance_id=parity_env.sessions.session_operation_owner_instance_id,
                 lease_seconds=parity_env.sessions.session_operation_lease_seconds,
+                execution_obligation=service.execution_lease_release_registry.admit(
+                    parity_env.sessions.session_operation_authority,
+                    session_id=session_id,
+                    owner_instance_id=parity_env.sessions.session_operation_owner_instance_id,
+                    lease_seconds=parity_env.sessions.session_operation_lease_seconds,
+                ),
             )
             transferred = False
             try:
@@ -246,7 +263,7 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
                 if not transferred:
                     await execute_lease.close()
     finally:
-        await service.shutdown()
+        await execution_fixture.shutdown_service(service)
 
     assert isinstance(run_id, UUID)
     admitted_run = await session_service.get_run(run_id)

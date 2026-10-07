@@ -1,0 +1,71 @@
+<!-- Durable copy: machine-specific prefixes normalized; private original retained. -->
+
+# Astra canonical execution fixture review 2
+
+**Bounded source GO for the selected C1–C3 fixture/control repairs; NO-GO for running the new P2a diagnostic controller until D1/D2 below are repaired. Overall canonical, combined-source, application and runtime acceptance remain HOLD.** This does not approve the deliberately unchanged incompatible route assertions or any cancellation, logging, exception-group or failed-RELEASE semantic migration.
+
+Package: `frontend-execute-constructor-fixture-migration-1/canonical-execution-fixture-package-2`. Complete patch SHA-256: `1a6fb2ef61cd184dc1ae3e0c451e2ce384004d94676bda6b694973d7f3ae4d2f`. Evidence: `astra-canonical-execution-fixture-code-review-2-evidence.json`; independent source instrument: `astra-canonical-execution-fixture-code-review-2-source-check.py`.
+
+## Scope and provenance
+
+I reread canonical1's complete C1–C4 review, the successor report, complete canonical1 delta, full new helper/control/child, full P2a observer/controller, changed route fixture and original bodies, complete affected PostgreSQL handoff module, proposal, guards and control evidence. All thirteen existing old/new modules and alternative preimages were read for independent byte/AST comparison. The semantic review continues the preceding review and focuses on the changed scopes and their actual consumer/registry dependencies; it is not a fresh manual audit of every unrelated test in the large service/runtime-agreement files.
+
+The independent stdlib source instrument completed with exit 0: all 83 declared manifest entries match; all thirteen live original preimages match; the full patch and both alternative deltas reconstruct exactly; all 17 declared outstanding source base-node bodies/decorators match their current replacements. These are artifact/AST measurements, not collected test counts. The unchanged constructor6 atomic control remains required. Exact original test names/decorators, Mock assertion calls and exception expectations are preserved in each original test scope. Assertion removals exactly match the already reviewed canonical1 removals; no additional original assertion was removed. Positive AST controls and deliberate assertion/Mock/exception mutations exercise the comparison predicates.
+
+The separate three-body route proposal matches its exact canonical2 preimage and reconstructs exactly. Its bytes are absent from the selected patch. The original P2a class and original normal-shutdown cancellation body are byte-identical to canonical1. No candidate or project module was imported, no candidate function or authored control was executed, and no pytest, collection, SQL, process/signal control, provider, network or repository edit ran in this review. Reading the author's completed source/Ruff logs does not transfer their execution to this reviewer or supply native fixture proof.
+
+## C1 closure: failed-RELEASE process owner
+
+The new `_reap_owned_child` separately observes poll, terminate, first wait, kill and final wait. Unknown poll state still leads to signal/wait attempts. Unexpected signal errors are retained and do not bypass the exact child's bounded waits. A first wait error triggers the remaining kill/wait attempts; unsuccessful final observation remains an error. The parent preserves the primary assertion first, retains exit-file publication errors, and explicitly rejects an unresolved returncode. The unmodified child shares its outer owner's process group; this helper signals its exact Popen child rather than a foreign group.
+
+The authored five-mode instrument checks exit race, terminate fault, kill fault after timeout, final wait fault and poll fault. Its expected error list uses actual object identity and checks wait actions; it does not manufacture production receipts. The author reports an isolated helper control and skip-wait mutant rejection. I read that evidence but did not run it. The source now closes C1's skipped-wait defect. Actual signal/join behavior still requires the root-owned finite native execution.
+
+The failed-RELEASE child continues to witness the actual canonical authority/context, failed SQL Future and exact original, invocation finished/exited state, actual reservation/counter/callback return and captured generation. It requires successful independent peer release/retirement and actual private executor join while failed release success/retirement remain false, custody remains pending, strict COMPLETE refuses and watchdog completion remains unsent. Atomic checkpoint publication and strict parent parsing remain intact. Process death bounds the deliberately pending child; it is not a successful lifecycle receipt.
+
+## C2 closure within fixture preparation: actual route admission
+
+Both route builders now install the actual selected registry. `_RouteSessionService` uses a real SQLite authority, with public authority acquire/release bound identities left canonical. `_install_acquire` observes the lifecycle classmethod and delegates to the previously captured canonical method with the actual admitted obligation. It returns the actual nominal lease, not the control driver. The driver gates the private SQL release and observes real lifecycle Task/outcome state.
+
+The new private fixture list checks actual lease/obligation/registry ownership. During teardown its untransferred leases receive independently declared close owners before registry joins. Gate opening, sealing, selected recovery draining, pre-allocation owner retention, independent service/registry issuance, caller-original retention and Unknown handling from F1/F2 remain intact. No successful retirement or failure acknowledgement is fabricated.
+
+This repairs the foreign-authority/missing-registry pre-admission problem identified in C2. It does **not** make the old positive bodies pass: the exact acquisition dictionary still omits `execution_obligation`, and three service-call assertions still compare the actual lease with the driver. Those incompatibilities are explicitly retained in the outstanding account. The separate proposal changes only those ABI observations, adds an actual-lease presence witness, and leaves error/logging/cancellation expectations alone. It remains unselected. The route execution-service double is an endpoint-call instrument; it is not proof of physical pipeline execution or completion.
+
+Failed real RELEASE still leaves registry custody pending, and actual pretransfer cleanup no longer contains the old logger seam. The original private-log/redaction/error/cancellation/group assertions are not waived by this source assessment. Their bounded native observation and any subsequent concrete migration remain parent decisions.
+
+## C3 closure within source ABI: physical PostgreSQL crash hook
+
+The admission hook now accepts the one actual partial passed by `_submit_owned_pipeline`. Its checks match the selected consumer's source: bound `_run_pipeline` owner, six positional values, actual shutdown Event, frozen settings, actor/provider, exact lease/durable-admission keywords and already declared completion-required obligation without a fabricated Future. It extracts the actual run ID before the original send/`os._exit(75)`.
+
+The producer writes a complete same-directory staged crash-phase document and replaces the final path before the existing handoff and exit. The three parent base nodes check that receipt after their existing expected-exit75 child operation. Run/session/owner/seam/phase/requested exit are exact; PID is checked as a positive exact integer, not independently compared to the process's PID. The unique run/session/owner handoff and test directory provide the remaining binding in this source protocol. This limitation is not an assertion of a replay.
+
+The old two-positional hook mismatch is repaired. Original five-field handoff, actor phases, deadlines and database/retained-input/output/audit assertions remain. An arbitrary TypeError, child nonzero or timeout cannot satisfy expected exit75 plus the phase receipt. No PostgreSQL process-death or recovery behavior was executed or cleared.
+
+## C4 posture: preserved originals and separate diagnostic
+
+C4 is explicitly unresolved as runtime semantics. Both P2a originals remain unchanged. The package correctly documents that completion_required is set before literal submit, a no-return original enters registry custody, the old immediate status-cleanup branch is skipped, and the physically observed private-join handoff uses `_finish_execution_authority(..., None)`. A broad RuntimeError expectation cannot prove that the distinct cleanup RuntimeError escaped.
+
+The observer records the test's planned cleanup original separately from the actual installed submit producer's original. It delegates each observed method once in the actual producer Task and preserves strong references to observed errors/obligations. The original private submit is restored in a finally block; service wrappers are restored after fixture teardown. Its state snapshot reads actual registry/completion/SQL/callback/generation fields rather than writing them. It calls no acknowledgement, observe-ready, release, shutdown or retirement action of its own. Publication failure in `emit_original` groups the actual source original with the observer failure.
+
+The external runner uses separate sanitized environments, exact single registration/XML checks and distinct setup/protected-entry/cardinality/timeout classifications. Its result says native adjudication is still required; it does not label generic nonzero as the desired causal RED or adopt a golden. These are appropriate limits. Two controller defects prevent executing it as currently frozen.
+
+## D1 — unresolved process custody does not stop the next diagnostic
+
+In `diagnostics/run_p2a_originals.py`, `_reap_group` correctly attempts a bounded exact-child wait even after unexpected TERM/KILL errors. However, if its final wait fails and the child remains unobserved, `run_one` raises the retained failures and `main` catches them, then continues to the next case unless an interrupt is present. The first child's unresolved physical ownership is therefore compatible with starting the second child. This contradicts the runner's promise that each child is physically reaped before the next starts.
+
+Required successor: distinguish known child join from attempted/failed reaping. Preserve all errors, but stop issuing subsequent runs while prior child custody remains unresolved. It is reasonable to continue after a parsing or adjudication error only once actual child wait is known. Add a source instrument where final wait fails and returncode stays None; assert that no second process is issued and every original survives. Include a joined-with-signal-error case to distinguish custody from mere presence of an error. Do not claim a join from a timeout or assumed process absence.
+
+## D2 — controller publication can replace the retained causal and cleanup errors
+
+After retaining `primary` and `cleanup`, `run_one` writes `native.exit`, then (on failure) `inconclusive.json`, before `_project(primary, cleanup)`. Neither write is protected by a collector that retains those originals. A filesystem/publication exception at either point escapes alone, replacing the original timeout/interruption/signal/wait errors. The outer loop consequently receives only the publication exception and can also hit D1.
+
+Required successor: retain publication errors alongside the existing primary/cleanup originals and project the complete set after attempted evidence publication. Publication success must not be a prerequisite to retaining custody failures. Add exact error-identity controls for native.exit and inconclusive.json write failures with an existing causal and cleanup error. The repository failed-RELEASE parent already demonstrates the relevant retention pattern; this finding concerns the separate external diagnostic controller.
+
+## Remaining gates
+
+The expanded 17-node account is an explicit source inventory, not an exhaustive collected suite inventory. It now includes the route, P2a and affected PostgreSQL families omitted from canonical1. Its original bodies are intact. The four standalone Future/adopt probes remain internal/negative fixtures and gain no business authority.
+
+I read completed author logs `canonical2-finalize-3`, `canonical2-ruff-3`, and `canonical2-final-bytes-1`, each with explicit exit 0. The isolated stdlib reaper/XML/crash-receipt controls and static preservation checks remain author source evidence. They do not cover D1/D2 end-to-end controller orchestration, supply actual native receipts, or clear whole-tree/mypy/contracts/trust-tier/PostgreSQL gates.
+
+Selected fixture source repairs may proceed only within root's coherent assembly and review process. The external diagnostic needs a separately frozen D1/D2 successor. Do not apply full original-tree, constructor6 delta and canonical1 delta sequentially; they are alternative exact-input paths. Do not silently select the route ABI proposal or old cancellation proposal on new guards.
+
+Canonical1 NO-GO remains an accurate historical verdict on its frozen bytes. Constructor5/6 bounded assessments, the TLS lineage1 NO-GO, all original 102 obligations, four collections, two UNKNOWNs, and John’s local testing/manual Daybreak/merge decision remain preserved. No complete fixture-suite GO, production GO, native cause finding, source-based semantic golden migration or Daybreak claim is made.

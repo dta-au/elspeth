@@ -12,6 +12,7 @@ import { SESSION_OPERATION_RETRY_STORAGE_KEY } from "./sessionOperationRetry";
 
 vi.mock("@/api/client", () => ({
   fetchCurrentUser: vi.fn(),
+  fetchAuthConfig: vi.fn().mockResolvedValue({ provider: "local", registration_mode: "closed", sso_start_url: null }),
   login: vi.fn(),
   fetchUserComposerPreferences: vi.fn(),
   updateUserComposerPreferences: vi.fn(),

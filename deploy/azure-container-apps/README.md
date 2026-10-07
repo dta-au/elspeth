@@ -14,7 +14,7 @@ the operator procedures are the three runbooks
 > **Status.** Implemented; desktop acceptance closed `elspeth-5ec3befc1a` on
 > 2026-09-10 under the operator's desktop-analysis ruling. No live cloud
 > acceptance is claimed. A future operator run may produce the sanitized receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.2.json`; that receipt is
+> at `docs/operator/evidence/azure-container-apps/0.8.3.json`; that receipt is
 > no longer a tracker closure or documentation-promotion condition.
 
 The supported operating configuration is `Single` revision mode, `sticky`

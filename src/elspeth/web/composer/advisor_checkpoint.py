@@ -77,7 +77,15 @@ from elspeth.web.composer.provider_gateway import (
     _require_no_credential_material_in_completion_fields,
     advisor_provider_failure_types,
 )
-from elspeth.web.composer.provider_quota import composer_quota_scope, quota_provider_calls
+from elspeth.web.composer.provider_quota import (
+    ProviderCallCustody,
+    ProviderInvocationFamily,
+    ProviderInvocationOwner,
+    composer_quota_scope,
+    provider_call_scope,
+    quota_provider_calls,
+    required_provider_audit_scope,
+)
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
@@ -273,6 +281,7 @@ class AdvisorCheckpointOwner:
         *,
         recorder: BufferingRecorder | None,
         timeout: float | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> _AdvisorCallOutcome:
         """Classify an advisor call without suppressing controlled-code faults.
 
@@ -288,6 +297,7 @@ class AdvisorCheckpointOwner:
                 arguments.to_internal_request(),
                 recorder=recorder,
                 timeout=timeout,
+                provider_owner=provider_owner,
             )
         except TimeoutError:
             raise
@@ -297,8 +307,7 @@ class AdvisorCheckpointOwner:
             return _AdvisorFirstPartyFailure(original_exc=exc)
         return _AdvisorCallSuccess(guidance=guidance, metadata=metadata)
 
-    @quota_provider_calls
-    async def _call_advisor_with_audit(
+    async def _call_advisor_with_audit_body(
         self,
         arguments: Mapping[str, Any],
         *,
@@ -306,6 +315,7 @@ class AdvisorCheckpointOwner:
         timeout: float | None = None,
         structured_output: bool = False,
         on_provider_dispatch: Callable[[], None] | None = None,
+        provider_custody: ProviderCallCustody | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Phone the configured advisor (frontier) model for a hint.
 
@@ -361,7 +371,7 @@ class AdvisorCheckpointOwner:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
-        kwargs = build_advisor_request_options(
+        kwargs: dict[str, Any] = build_advisor_request_options(
             model=advisor_model,
             temperature=self._settings.composer_temperature,
             seed=self._settings.composer_seed,
@@ -374,7 +384,11 @@ class AdvisorCheckpointOwner:
         kwargs["messages"] = messages
         try:
             response = await asyncio.wait_for(
-                provider_gateway._litellm_acompletion(on_provider_dispatch=on_provider_dispatch, **kwargs),
+                provider_gateway._litellm_acompletion(
+                    provider_custody=provider_custody, on_provider_dispatch=on_provider_dispatch, **kwargs
+                )
+                if provider_custody is not None
+                else provider_gateway._litellm_acompletion(on_provider_dispatch=on_provider_dispatch, **kwargs),
                 timeout=effective_timeout,
             )
             message, tool_calls, response_metadata = _capture_composer_llm_completion_fields(
@@ -476,28 +490,81 @@ class AdvisorCheckpointOwner:
             error_message = type(exc).__name__
             raise
         finally:
-            if recorder is not None and status is not None:
-                recorder.record_llm_call(
-                    build_llm_call_record(
-                        model_requested=advisor_model,
-                        pricing_model=self._settings.composer_advisor_pricing_model,
-                        messages=messages,
-                        tools=None,
-                        status=status,
-                        started_at=started_at,
-                        started_ns=started_ns,
-                        temperature=self._settings.composer_temperature,
-                        seed=self._settings.composer_seed,
-                        response=response,
-                        response_metadata=response_metadata,
-                        error_class=error_class,
-                        error_message=error_message,
-                        credential_surface="composer_advisor_response",
-                    )
-                )
-                current_exc = sys.exc_info()[1]
-                if current_exc is not None:
-                    attach_llm_calls(current_exc, recorder)
+            with required_provider_audit_scope(provider_custody):
+                if status is not None and (recorder is not None or provider_custody is not None):
+                    if provider_custody is None or provider_custody.needs_terminal_audit():
+                        call = build_llm_call_record(
+                            model_requested=advisor_model,
+                            pricing_model=self._settings.composer_advisor_pricing_model,
+                            messages=messages,
+                            tools=None,
+                            status=status,
+                            started_at=started_at,
+                            started_ns=started_ns,
+                            temperature=self._settings.composer_temperature,
+                            seed=self._settings.composer_seed,
+                            response=response,
+                            response_metadata=response_metadata,
+                            error_class=error_class,
+                            error_message=error_message,
+                            credential_surface="composer_advisor_response",
+                            provider_custody=provider_custody,
+                        )
+                        if provider_custody is not None:
+                            provider_custody.retain_audit(call)
+                        if recorder is not None:
+                            recorder.record_llm_call(call, provider_custody=provider_custody)
+                    current_exc = sys.exc_info()[1]
+                    if current_exc is not None:
+                        attach_llm_calls(current_exc, recorder)
+
+    def _new_advisor_custody(self, provider_owner: ProviderInvocationOwner) -> ProviderCallCustody:
+        if type(provider_owner) is not ProviderInvocationOwner or provider_owner.service is not self._require_sessions_service():
+            raise AuditIntegrityError("Advisor invocation owner belongs to another exact service")
+        return provider_owner.mint(ProviderInvocationFamily.ADVISOR)
+
+    @quota_provider_calls
+    async def _call_advisor_with_audit_legacy(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        recorder: BufferingRecorder | None,
+        timeout: float | None = None,
+        structured_output: bool = False,
+        on_provider_dispatch: Callable[[], None] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        return await self._call_advisor_with_audit_body(
+            arguments, recorder=recorder, timeout=timeout, structured_output=structured_output, on_provider_dispatch=on_provider_dispatch
+        )
+
+    async def _call_advisor_with_audit(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        recorder: BufferingRecorder | None,
+        timeout: float | None = None,
+        structured_output: bool = False,
+        on_provider_dispatch: Callable[[], None] | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        if provider_owner is None:
+            return await self._call_advisor_with_audit_legacy(
+                arguments,
+                recorder=recorder,
+                timeout=timeout,
+                structured_output=structured_output,
+                on_provider_dispatch=on_provider_dispatch,
+            )
+        provider_custody = self._new_advisor_custody(provider_owner)
+        async with provider_call_scope(provider_custody):
+            return await self._call_advisor_with_audit_body(
+                arguments,
+                recorder=recorder,
+                timeout=timeout,
+                structured_output=structured_output,
+                on_provider_dispatch=on_provider_dispatch,
+                provider_custody=provider_custody,
+            )
 
     def _build_checkpoint_arguments(
         self,
@@ -877,6 +944,7 @@ class AdvisorCheckpointOwner:
         progress: ComposerProgressSink | None = None,
         user_message: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> AdvisorCheckpointVerdict:
         """Public END evidence-scoped completion advisory checkpoint (P5).
 
@@ -894,6 +962,18 @@ class AdvisorCheckpointOwner:
         if session_operation_context is not None and session_id != session_operation_context.fence.session_id:
             raise AuditIntegrityError("Composer signoff authority targets a different session")
         await self._chargeable_admission.require(session_operation_context)
+        if provider_owner is not None:
+            provider_owner.required_work.validate_context(session_operation_context)
+            return await self._run_advisor_checkpoint(
+                phase="end",
+                state=state,
+                session_id=session_id,
+                recorder=recorder,
+                progress=progress,
+                user_message=user_message,
+                session_operation_context=session_operation_context,
+                provider_owner=provider_owner,
+            )
         with composer_quota_scope(self._require_sessions_service(), session_operation_context):
             return await self._run_advisor_checkpoint(
                 phase="end",
@@ -903,6 +983,7 @@ class AdvisorCheckpointOwner:
                 progress=progress,
                 user_message=user_message,
                 session_operation_context=session_operation_context,
+                provider_owner=provider_owner,
             )
 
     async def _run_advisor_checkpoint(
@@ -918,6 +999,7 @@ class AdvisorCheckpointOwner:
         advisor_review_state: _AdvisorReviewState | None = None,
         deadline: float | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> AdvisorCheckpointVerdict:
         """Backend-initiated deterministic advisor checkpoint (early|end).
 
@@ -1041,6 +1123,7 @@ class AdvisorCheckpointOwner:
                         recorder=recorder,
                         structured_output=True,
                         on_provider_dispatch=provider_dispatched,
+                        provider_owner=provider_owner,
                     )
                 else:
                     guidance, _meta = await self._call_advisor_with_audit(
@@ -1049,6 +1132,7 @@ class AdvisorCheckpointOwner:
                         timeout=remaining,
                         structured_output=True,
                         on_provider_dispatch=provider_dispatched,
+                        provider_owner=provider_owner,
                     )
             except _MalformedLLMResponseError as exc:
                 last_exc = exc
@@ -1169,6 +1253,7 @@ class AdvisorCheckpointOwner:
         progress: ComposerProgressSink | None = None,
         deadline: float | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> bool:
         """Run the EARLY advisory checkpoint on the empty->non-empty pipeline
         TRANSITION (structurally <= once per session). Advisory only: inject the
@@ -1186,6 +1271,7 @@ class AdvisorCheckpointOwner:
             progress=progress,
             deadline=deadline,
             session_operation_context=session_operation_context,
+            provider_owner=provider_owner,
         )
         if verdict.ok and verdict.blocking:
             # ok and blocking => free advisor text (or the backend pre-scan

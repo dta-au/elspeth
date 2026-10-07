@@ -1,23 +1,65 @@
-# Interface contract — composer async operations (re-based 2026-09-28)
+# Readiness interface contract — composer async operations and HTTPS delivery (2026-10-06)
 
-This contract is what every task file builds against. It fixes the names, signatures, columns, wire shapes and module
-homes. It folds in:
+Current scoped review HOLD: proposed required rejection SQL source51/projection52 has no actual Daybreak review or implementation. Automatic approval review rejected the 17-file private technical plan/source submission to Daybreak/OpenAI before process creation, and rejected one identical retry after retained authorization was cited as untrusted assistant-generated evidence. No native review process, response, exit or verdict exists. The exact two rejection reasons and payload/destination are retained separately from the unresolved archive-payload denial and historical authorization-conversation denial in [the rejection approval blocker](proposal-rejection-plan-approval-blocker-2026-10-06.md). No third attempt, indirect invocation or reviewer substitution occurred. Trusted approval for this exact payload/destination is needed before this required review can resume; unaffected previously approved work continues. Final source/frozen/full gates and John LOCAL-testing HOLD remain.
+
+Current implementation readiness (2026-10-06): actual broader [revision-4 PLAN GO](atomic-pipeline-daybreak-plan-go-2026-10-06.md) and renewed narrow [provider PLAN GO](explicit-provider-daybreak-plan-go-2026-10-06.md), [telemetry PLAN GO](telemetry-cleanup-daybreak-plan-go-2026-10-06.md) and [generation POLICY GO](generation-unavailable-daybreak-policy-go-2026-10-06.md) remain design decisions. Existing authorized Sol implementation is partial and ongoing; their verdicts supply no final source clearance. Current HEAD incorporates independently landed PR276 at `d2b73990d137e9725200c897544eebc5b958fdf4`; original baseline `23822a7477624d6264c60fade0905c19e8c552d7`, prior NO-GOs/denials, all 102 obligations and both missing-report unknowns remain retained. The shared candidate is uncommitted, unfrozen and NO-GO for final handoff. John's LOCAL-testing HOLD remains. No merge, deployment, new UX remediation or new lane is authorized.
+
+Coordinated existing ownership: Sol storage owns B1–B5 atomic service/proposal/pending-interpretation/DB authority; Sol turn owns R1, the required-work coordinator, common turn/settlement and ProcessRecovery/watchdog lifecycle; Sol transport owns R2 shared async_workers generation custody and app/factory/readiness/admission, coordinated with storage's database authority and turn's typed lifecycle callback. Acceptance retains the distinct durable-Stop/local-cancel and real subprocess/TLS proofs. Root retains global reconciliation, canonical/full/frozen gates and final independent reviews. These assignments use the existing workers and N tasks.
+
+This contract records the existing held streaming implementation against incorporated baseline `d2b73990d137e9725200c897544eebc5b958fdf4` (prior baseline `23822a7477624d6264c60fade0905c19e8c552d7` retained) and its remaining verification obligations. John selected LIVE PROGRESS FOLLOWED BY THE COMPLETED ANSWER and authorized the original actual Daybreak plan review/implementation through the existing scoped channel. The earlier GO remains valid for that earlier work. The controlling revision-4 amendment and exact selected lifecycle contract are now accepted by the later actual narrower PLAN GO after the retained Round4 NO-GO. Coordinated implementation may resume; the new amendment implementation is partial at this checkpoint and final frozen source/proof clearance remains open. Interface examples are proposed shapes where not yet implemented; observed current code and executed proof are distinguished in the obligation ledger. No answer-token/provider-delta streaming, archive-diff transmission, merge or deployment is authorized.
+
+The original actual Daybreak Blue final plan review completed CLI exit 0, closed its B1–B5 and assessed the unavailable original reports as an evidentiary limit. Its scoped private-source review authorization excludes secrets/credentials. This original plan approval is not code approval; consume independently landed dependency work and revalidate affected source before final implementation review. The original reports remain unavailable and must be reconciled if recovered.
+
+It retains the durable jobs, admission, idempotency, COMPOSE leases, cancellation, atomic terminal and reaper design from:
 
 - the 09-25 decisions;
 - the 09-25 multi-lens review;
 - the 09-28 storage panel (B′);
 - owner rulings 1–7 (`panel-2026-09-28/RULINGS.md`).
 
-There are no override tables. An executor who finds a clause impossible against the tree records a `CONTRACT DEVIATION:`
+The controlling adoption section below states specific normative precedence over contrary historical templates; their behavioral safety requirements remain retained. An executor who finds a clause impossible against the tree records a `CONTRACT DEVIATION:`
 block in their task file, with the measured reason and the smallest change. They do not rename silently.
 
-- **Tree:** `release/0.8.1`, pinned at `1effedab2` (surveyed; HEAD `6cb338f2f` differs only in `gateway/`).
-- **Spec:** `docs/specs/2026-09-16-composer-async-operations-design.md` (second amendment 2026-09-28).
+- **Tree:** current `main`, fetched and isolated branch fast-forwarded to `23822a7477624d6264c60fade0905c19e8c552d7` on 2026-10-06. All `edc844…` inventories, Appendix A and prior measurements are historical evidence, not current-main outputs. The isolated held branch and both import roots are verified in the readiness report; dependency PRs remain independent and must be consumed from main. Re-fetch before implementation.
+- **Spec:** `docs/specs/2026-09-16-composer-async-operations-design.md` is the historical durable-operation design input. Its streaming deferral and release-base instructions do not authorize execution against current main.
 - **Evidence:** `findings-2026-09-28/` (`routes.md`, `persistence.md`, `composer.md`, `frontend.md`, `platform.md`,
   `plan-impact.md`, `critique.md`). The 09-25 plan, findings and review are kept in `history/2026-09-25/` for
-  provenance only; none of their anchors is current.
+  provenance only; none of their anchors is current. Historical line numbers in retained interface examples are orientation only: resolve the named live symbols and current registrations in N00 before implementation.
 
-## Glossary (binding)
+### Controlling atomic pipeline overlay — revision 4
+
+The [atomic pipeline amendment](atomic-pipeline-review-amendment-2026-10-06.md), [R1 canonical collision reducer](collision-reducer-design-2026-10-06.md), [R2 underlying Future custody](required-future-custody-design-2026-10-06.md), and the [selected hung-drain lifecycle contract](hung-drain-lifecycle-design-2026-10-06.md) are controlling normative parts of this existing streaming plan. R1’s exact canonical authority/key/source table controls R2 observations; no independent stage vocabulary or post-failure mapping survives. The original plan’s terminal/unknown-commit, no-provider-replay and separate physical/logical/DB custody requirements remain binding.
+
+These overlay clauses supersede contrary earlier code templates or proposals only in their stated domains: candidate-bound atomic interpretation-review cohorts; closed created/accepted/revocation payloads and exact read-only replay; Stop/database-deadline positive publication authority; narrowly sealed exact-operation trust revocation; total deterministic collision selection preserving original evidence; and gated shared-executor submission, no-return quarantine, old-generation completion and sequential recovery. They authorize no generic audit-only business bypass, arbitrary SDK cause promotion, second provider authoring path, parallel executor pool or new tutorial path.
+
+Preserve earlier B1–B5/R1/R2 proposals and verdicts under history, every original labelled/semantic obligation and all supplementary requirements. An obsolete implementation example does not delete its behavioral safety obligation. Design-resolved is not implemented, tested or approved source. The amendment now has actual required PLAN GO for coordinated implementation; final frozen checks/reviews and John’s LOCAL hold remain separate afterward.
+
+### Existing task and owner allocation
+
+These are assignments within the existing task structure, not new parallel lanes. The selected supervisor wording is the existing turn owner’s plan-only lifecycle contract linked below.
+
+| Existing tasks | Existing owner | Required amendment responsibility and future proof |
+|---|---|---|
+| N03 / N05 / N07 | Storage/contracts, coordinated with turn | Closed versioned payload/decoder and exact authority/nullability; candidate-bound policy, explicit derived-state identities and same-transaction cohort/publication/revocation; business-fence Stop/database-deadline checks; strict tamper/rollback/readonly replay controls. |
+| N09 / N10 / N11a / N11b | Turn/contracts, coordinated with storage | Canonical R1 authority/key/source mapping and total collision reduction, per-job coordinator threading, pure preparation/canonical route/result wiring, original cause/group identity, read-only postcommit verification and exact terminal recovery. |
+| N08 / N12 | Existing turn lifecycle owner, coordinated with shared executor owner/root | Turn owns coordinator/receipt integration, renewal/terminal/last-release barriers and exact supported ProcessRecovery/watchdog lifecycle; transport owns R2 actual gated Future/witness and release-once generation quarantine/drain with storage authority coordination. Preserve process-exit-before-readiness controls. Adopt the exact selected lifecycle contract below; implementation now has actual PLAN GO; source/proof completion remains open. |
+| N13 / N14 | Transport/caller owners | Preserve public projection/auth/202/canonical DTO integration and ordinary callers; no new submission/provider authority. Transport also owns R2 shared async_workers generation custody and factory/readiness/admission wiring, including immediate pre/post-cache draining and generation-unavailable checks, coordinated with storage authority and turn lifecycle. Complete live caller/handler inventory and exact public-envelope controls. |
+| N16 / N17 / N19 | Existing acceptance + turn/storage/transport; root final gates/reviews | Actual generation-drain/no-overlap/hung-process-exit/restart proof, SQLite/serial PostgreSQL Stop/deadline/commit/replay controls, reversed collisions, resource census, retained three durable Stop cases, canonical gates and final frozen TLS/browser/independent review. Acceptance uses the exact selected lifecycle contract’s subprocess/kernel exit and readiness witnesses, never a signal-send result. |
+| N00 / N18 | Root documentation/provenance integration | Reconcile master/contract/tasks/current statuses and retain exact original evidence. Do not mislabel the earlier GO, actual Round4 NO-GO or any scoped pass as final clearance. |
+| N15 | Existing frontend owner; remediation held | Preserve current common observer/custody and completed bounded evidence. No new UX-report finding or UX remediation is authorized by this amendment adoption. |
+
+### Selected supported hung-drain lifecycle scope — plan only
+
+The [hung-drain lifecycle design](hung-drain-lifecycle-design-2026-10-06.md) is a controlling normative part of the repaired amendment package. It selects an application-factory-prestarted private Linux process-pidfd watchdog, exact bounded startup/recovery acknowledgement, application-owned proposed WEB_PROCESS_RECOVERY_GRACE_SECONDS=30.0, immediate draining/admission/readiness controls and actual old-process last-thread-exit witnesses. Adopt its complete codec/ABI/FD-cleanup/failure/normal-disarm and supported-runtime contract by reference; these are planned changes and future proofs, not implemented guarantees.
+
+The selected R2 quarantine observation budget is exactly min(startup-captured composer_async_drain_seconds,30.0) seconds (default 10; configured 120 becomes 30). Quarantine immediately sets a separate required_generation_unavailable latch checked before/after cached readiness and by admission. Its immutable deadline observer runs outside the hung shared pool, through a typed ProcessRecovery callback registered before first submission; unresolved custody at expiry permanently sets instance_draining, obtains the recovery ACK within 1 second and arms the helper's independent 30-second grace. Same-process replacement is permitted only after complete R2 drain before process escalation; after escalation neither latch clears. SIGKILL request is not actual exit proof. The complete linked contract controls this proposed policy and its outstanding acceptance proofs.
+
+This work is within existing N08/N12/N13/N17 tasks and owners: turn owns ProcessRecovery/watchdog, transport owns factory/readiness/admission and shared generation custody coordinated with storage DB recovery, acceptance owns real subprocess/local TLS exit/readiness proofs and root owns final package/gates/reviews. CLI launch topology, Docker/ACA arguments and deployment are not changed by this mechanism. Existing authorized timeout-template work remains separately scoped evidence. ACA host-stop grace is not a self-SIGTERM timer; no helper respawn, arbitrary untriggered GIL-hang or global replica-no-overlap guarantee is introduced. Exact supported limits and actual exit-before-local-slot readiness are defined in the linked design.
+
+All B1–B5/R1/R2 were design-resolved in actual Round4, which nevertheless returned NO-GO on master adoption and the exact supervisor boundary. The later actual PLAN GO accepts the selected lifecycle and controlling adoption and permits coordinated amendment implementation; final frozen implementation proofs/reviews and John’s local-testing hold remain required. No new UX remediation or parallel work lane is added.
+
+
+## Glossary (proposed interface vocabulary)
 
 | Term | Meaning |
 |---|---|
@@ -33,7 +75,7 @@ block in their task file, with the measured reason and the smallest change. They
 | # | Ruling |
 |---|---|
 | Scope | Freeform is the only composer. The cutover set is `POST /{sid}/messages` (`compose_message`) and `POST /{sid}/recompose` (`compose_recompose`). The first-run tutorial's Build uses `/messages`, so the cutover covers it with no tutorial branch (composer invariant 2). |
-| R0 | Ship 202 + poll now. A later streaming UI consumes the same durable job row. |
+| R0 | Current task: 202 acceptance, authenticated operation-scoped incremental HTTPS status/provider-safe progress and polling fallback use the same durable job and progress sources. John selected live provider-safe progress followed by the completed answer from durable GET; provider answer-token streaming is outside scope. |
 | R2 | The terminal is committed in one composite transaction with the final publication. |
 | R3 | The job's running state is bound to the COMPOSE SOL. One composite transaction mints the SOL context and marks the job `running`, and the worker `adopt`s it. Job liveness == SOL liveness. |
 | 1 | One id per send. The `operation_id` IS the ingress key. Ingress stays the immutable acceptance record, written by the worker in the user-row transaction. The ingress→job composite FK makes them agree. The ingress 409 arms and the SPA transcript-matching recovery are deleted. |
@@ -52,8 +94,8 @@ block in their task file, with the measured reason and the smallest change. They
 | E1 | **CRL kept.** The worker opens a CRL per running job through the extracted lifecycle (N08). Progress publishing, `inflight_requests` and PG identity/ownership revocation keep working. The SPA never uses `inflight_requests` as settlement. | Drop the CRL (loses the mid-turn revocation cancel). |
 | E2 | **Admission order:** auth → body decode → ownership → strict DTO → PK lookup (same id and binding → replay 202, no charge; mismatch → 409) → per-user rate limit (new ids only) → capacity (soft) → insert. The D8 partial unique index enforces one nonterminal job per session (409 `composer_operation_active`). No ingress lookup happens pre-202. | Charge on replays; a racy read-then-insert active check. |
 | E3 | **Capacity** is a soft cluster cap. The count and the insert run under one session lock, so concurrent admissions for different sessions can overshoot by at most the number of concurrent admitters. Worker concurrency is ≤ 16 (the shared `run_sync_in_worker` pool is 16 + 16). | A global counter row serialising every admission. |
-| E4 | **Error identity.** The POST's `request_id` is persisted on the job. A dict-detail terminal body gets it inside `detail`, exactly as `handle_http_exception` does. A **string**-detail body (the ownership 404, the `State not found` 404, recompose's 400 and "last row not user" 409, the settlement 504) gets **no** request id, because `handle_http_exception` injects none into a string today; the stored body is byte-identical to today's. A flat handler body (`stale_compose_state`, the app handlers) gets it top-level, as those handlers do. The generic `operation_failed` body carries a `diagnostic_id` (uuid4), which is logged server-side with the exception class. | The poll GET's request id. |
-| E5 | **Ruling 5 check site: the start composite (N06).** In the same locked transaction as the fence advance, and before the `running` CAS, the precondition gate checks, in order: ownership (session `user_id` against the job's `actor_user_id`, and `auth_provider_type` against the instance's `settings.auth_provider`, passed in) → a foreign or unknown base (`base_state_id` not NULL and not a state of this session → the byte-identical 404 `"State not found"`, ruling 5's "foreign stays 404") → the moved base (current head vs `base_state_id`, id-only; `None` requires no head) → for recompose, the transcript (the three existing refusals with their exact bodies). A refusal rolls the composite back, and the worker settles it through `settle_unstarted` with `settled_by='settle_unstarted'`. No user row, no provider call, no started quad. | Checking in the preamble after `running`, or inside the send `_sync` transaction (which misses recompose). |
+| E4 | **Error identity.** The POST's `request_id` is persisted on the job. A dict-detail terminal body gets it inside `detail`, exactly as `handle_http_exception` does. A **string**-detail body (the ownership 404, the `State not found` 404, recompose's no-user 400, the settlement 504) gets **no** request id, because `handle_http_exception` injects none into a string today; the stored body is byte-identical to today's. A flat handler body (`stale_compose_state`, the app handlers) gets it top-level, as those handlers do. The generic `operation_failed` body carries a `diagnostic_id` (uuid4), which is logged server-side with the exception class. | The poll GET's request id. |
+| E5 | **Ruling 5 check site: the start composite (N06).** In the same locked transaction as the fence advance, and before the `running` CAS, the precondition gate checks, in order: ownership (session `user_id` against the job's `actor_user_id`, and `auth_provider_type` against the instance's `settings.auth_provider`, passed in) → a foreign or unknown base (`base_state_id` not NULL and not a state of this session → the byte-identical 404 `"State not found"`, ruling 5's "foreign stays 404") → the moved base (current head vs `base_state_id`, id-only; `None` requires no head) → for recompose, the complete transcript and exact same-user proposals (latest-user identity plus the four recovered retry refusal envelopes; see the admission/recompose clause below). A refusal rolls the composite back, and the worker settles it through `settle_unstarted` with `settled_by='settle_unstarted'`. No user row, no provider call, no started quad. | Checking in the preamble after `running`, or inside the send `_sync` transaction (which misses recompose). |
 | E6 | **Moved-base body.** `http_error` 409, flat: `{"error_type":"stale_compose_state","detail":"The session changed before this request started. Review the current pipeline and send again.","request_id":…}`. The error type matches today's handler; the detail is true for a pre-turn refusal. | Reusing "…while the compose turn was running" (false before the turn). |
 | E7 | **In-turn seeding stays at the head.** Under ruling 5 the head equals the bound base at start, so `compose_base_state_id` is the head, as today. `elspeth-e08063c3a5`'s lag case cannot recur: a lagging client is refused at start, never mid-turn. | Seeding from the client id. |
 | E8 | **Ingress write path.** The worker calls `add_message_with_transcript` (the existing single ingress writer path, so the writer pins hold). From N11a it takes `running: ComposerOperationRunning | None = None`; `None` is the still-synchronous route's path, which keeps today's behaviour exactly until N14, and N14 makes `running` required and deletes the `None` path. When `running` is given, inside its `_sync`, in this order: user row → `bind_composer_operation_user_message_on_connection(conn, running, user_message_id=…)` (a connection-taking helper in the authority module) → `_insert_message_ingress_receipt` keyed by the operation id, with `requested_state_id` equal to the job's `base_state_id` (the receipt and the hash bind the same base). A non-fresh outcome is a Tier-1 `AuditIntegrityError`. `lookup_message_ingress`, `MessageIngressAccepted/Conflict`, the route 409 arms and `_ingress_receipt_conflict` are deleted at cutover (N14). | A new ingress writer in the compose composite (moves 5 pins). |
@@ -61,14 +103,14 @@ block in their task file, with the measured reason and the smallest change. They
 | E10 | **Positive predicate sites.** (a) **Family S:** `_require_session_operation_context_on_connection` gains `audit_only: bool = False`, threaded through `_session_composer_mutation_transaction` → `_require_session_write_authority_on_connection` → `_insert_chat_message`, and `_SessionComposerMutationState._require_exact`. (b) **Family R:** `_SessionOperationAuthorityRepository.mutate` applies the same predicate for COMPOSE contexts (the blob tools). `_exact_active_predicates` is **not** changed, because `renew`, `release`, `adopt`'s CAS and `archive_delete` share it and must keep working after the terminal. The lookup keys on the full fence triple via the `(session_id, session_operation_epoch)` unique index. Refused writes raise `ComposerOperationCancelledDuringTurn` (marker set) or `ComposerOperationFenceLost` (job terminal). | The predicate in `_exact_active_predicates`. |
 | E11 | **`audit_only` classification.** Audit-only writers: `_persist_llm_calls`, `_persist_turn_audit_cohort`, the planner audit writer (`planning_application.py:371`), `finish_provider_attempt`, `settle_provider_attempt`, `cancel_undispatched_provider_attempt`, and the cohort's own `record_token_usage_on_connection` + `mark_session_updated`. `begin_provider_attempt` is **fenced** (it is an admission: a cancel-marked turn must not dispatch). `update_session_title` is fenced. N07 measures this list before landing the predicate. | Treating ledger admission as audit. |
 | E12 | **Auto-title.** The worker joins auto-title **before** the terminal composite, with the same 2 s bound as today. On timeout it cancels the task and joins that cancellation (its cancel arm settles the charge `audit_only`) before the terminal. So no non-audit write follows the terminal, and a completed response is never replaced. | Joining after the terminal (refused by ruling 2). |
-| E13 | **SOL close after the terminal.** A close or renewal failure, including an `ExceptionGroup` from `__aexit__`, never relabels a committed terminal. It is logged as `composer_operation.lease_close_failed_after_settle`. Before the terminal, the worker unwraps a body-plus-close group: any lease-loss member (renewal error, `SessionOperationFenceLost`, the settlement-child cancel from `_freeform_child_result`) → `worker_lost`; otherwise it projects the body exception. | Letting the group escape as a bare 500. |
+| E13 | **SOL close after the terminal.** A close or renewal failure, including an `ExceptionGroup` from `__aexit__`, never relabels a committed terminal. It is logged as `composer_operation.lease_close_failed_after_settle`. Before the terminal, flatten owned body-plus-close groups by nominal failure type and use the closed terminal-priority table below; lease loss cannot mask an integrity/accounting failure. A settlement child that self-cancels without known durable outcome is an accounting failure, not automatic ordinary worker loss. | Letting the group escape as a bare 500. |
 | E14 | **Budgets.** The job deadline is set at admission from `composer_timeout_seconds`. At `running` the worker records `ComposerBudgetAnchor`, and `compose(budget_seconds=…)` gets the time remaining immediately before the call. The planner gets the time remaining at the branch. Auto-commit settlement (`pipeline_settlement` `commit_timeout_seconds`) gets the remaining job budget. The synchronous Accept route gets `composer_sync_timeout_seconds`. D10: the convergence body's `timeout_seconds` reports the budget the turn received. | A fresh full budget per stage. |
 | E15 | **Sync cap.** `WebSettings.composer_sync_timeout_seconds = min(composer_timeout_seconds, ceiling − headroom)` has these consumers: `explain_run_diagnostics`, proposal Accept settlement, and the tutorial run wait (which already uses `ceiling − headroom`). `ComposerSettings` gains the property. **No** new status key: no client reads one after cutover. | Publishing an unread key. |
-| E16 | **SPA timers.** `runComposeWithTimeout`, `applyServerComposerTimeout` and the `composeTimeoutReady` latch lose their last caller at cutover and are deleted. The freeform deadline is the poll loop's monotonic `performance.now()` deadline from `deadline_remaining_ms + COMPOSE_CLIENT_GRACE_MS`, which only tightens across bodies. `/api/system/status` keeps `composer_timeout_seconds` (an existing public field, now informational). | Keeping dead timer plumbing. |
-| E17 | **Drain.** `stop()` stops claiming, releases any claim that returns after the stop, cancels owned jobs with the `shutdown` marker, and joins each for up to `composer_async_drain_seconds` (default 10.0). A job still unsettled is left for a peer's reaper (`worker_lost`). Every deploy/drain therefore settles in-flight turns as 503 `composer_operation_worker_lost`; this is a documented behaviour (CHANGELOG + runbook). | An unbounded join. |
+| E16 | **SPA timers.** Delete obsolete socket-turn timer plumbing at complete cutover. Read database-clock remaining duration into a monotonic observation timer that only tightens. Stream watchdog/subscription expiry closes that reader and falls back to the same operation GET; it neither cancels the worker nor clears custody. Only a durable terminal settles the turn. `/api/system/status` retains its informational composer timeout. | Treating a client timer or lost stream as durable settlement. |
+| E17 | **Drain.** `stop()` stops claiming, releases any claim that returns after the stop, cancels owned jobs with the `shutdown` marker, and joins each for up to `composer_async_drain_seconds` (default 10.0). A job still unsettled is left for a peer's reaper (`worker_lost`). Unsettled shutdown loss projects 503 `composer_operation_worker_lost` only when no committed terminal or higher-priority failure/cancel/deadline wins. The shutdown marker is task-local and never writes the user Stop marker. Document the final behavior in current runtime/local workflow docs; no unconfirmed release-note target or deployment is part of this task. | An unbounded join. |
 | E18 | **Run and diagnostics while a job exists.** No server change. A queued job holds no SOL, so Run/diagnostics proceed, and a start that then conflicts requeues (claim discovery skips live-fenced sessions). A running job makes them answer today's 409 `Session operation is already active`. The tutorial's Build/Run gating is the SPA reading the operation state (N15). | A new Run admission rule. |
-| E19 | **FK actions.** job→`sessions` CASCADE; job→`identities` (actor) RESTRICT; job→`chat_messages(user_message_id, session_id)` **NO ACTION** (checked at statement end, so cascade order cannot fail a D7 delete on PG); job→`composition_states(base_state_id, session_id)` NO ACTION; ingress→job `(session_id, operation_id, user_message_id)` → job `(session_id, operation_id, user_message_id)` **CASCADE**. N00 measures a PG cascade with a RESTRICT sibling; N17 proves the final set. | RESTRICT on the job's own references. |
-| E20 | **Progress.** The progress `request_id` is the persisted user-message id (send: the row the worker inserts; recompose: `expected_user_message_id`), never the operation id. Progress failures are advisory: they are logged and never decide the terminal. | — |
+| E19 | **FK actions.** job→`sessions` CASCADE; job→`identities` (actor) RESTRICT; job→`chat_messages(user_message_id, session_id)` **NO ACTION** (proposed statement-end semantics; final composite/trigger deletion behavior must be proved, not inferred from action names); job→`composition_states(base_state_id, session_id)` NO ACTION; ingress→job `(session_id, operation_id, user_message_id)` → job `(session_id, operation_id, user_message_id)` **CASCADE**. N00 records identical sibling variants for RESTRICT and NO ACTION with raw DDL/reflection/results and a real restrictive-FK control; N17 repeats the controlled comparison and separately proves the actual final composite set. The minimal probe is not reproduction of the prior defect. | RESTRICT on the job's own references. |
+| E20 | **Progress.** User-message `request_id` remains separate correlation. Each publication/read also carries exact operation or worker-lease custody, retained by the progress authority. Repeated recomposes of the same user message cannot share progress custody. Never relabel session-latest progress as an operation. Progress remains advisory and cannot decide the terminal. | Message-id-only operation correlation; memory-only cross-instance replay. |
 | E21 | **Failure codes** (a closed CHECK + Literal): `http_error`, `operation_failed`, `worker_lost`, `request_cancelled`, `deadline_expired`. **`settled_by`** (a closed CHECK + Literal): `owner_terminal`, `settle_unstarted`, `request_cancel`, `settle_lost`, `settle_own_lapsed`, `settle_lost_inactive_session`. | — |
 | E22 | **Fixed bodies** (all get the request id per E4): deadline 504 `{"error_type":"composer_operation_deadline_expired","detail":"The composer request waited too long to start. Please resubmit.","timeout_seconds":<configured>}`; worker lost 503 `{"error_type":"composer_operation_worker_lost","detail":"The server stopped while composing this request. Reload to see what was saved, then resubmit."}`; cancel 499 `{"error_type":"request_cancelled","detail":"The composer request was stopped."}`. An **unmarked** `CancelledError` out of a detached turn is `worker_lost`. Only the cancel endpoint's marker is a user Stop. | — |
 | E23 | **Test harness.** Tests drive the worker inline (`await worker.run_until_idle()`). Route tests use one `httpx.AsyncClient(ASGITransport)` per test via `tests/helpers/composer_operations.py`; legacy sync sites use `settle_sync` (one `anyio.run`). The worker resolves `app.state.composer_service` **per job** (tests swap it after build). The event-held composer fakes move to `tests/fixtures/composer_fakes.py`. | Running the real lifespan in route tests. |
@@ -122,8 +164,9 @@ ComposerOperationSettledBy = Literal["owner_terminal", "settle_unstarted", "requ
 COMPOSER_OPERATION_REQUEST_SCHEMA: Final = "composer-operation-request.v1"
 COMPOSER_OPERATION_RESULT_SCHEMA_SUCCESS: Final = "message_with_state.v1"
 COMPOSER_OPERATION_RESULT_SCHEMA_ERROR: Final = "composer_operation_error.v1"
-COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH: Final[int]   # measured in N03 for both strict DTOs at their field caps
-                                                          # with worst-case escaping, plus framing
+COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH: Final[int]   # encoded UTF-8 bytes, measured in N03 for both strict DTOs
+                                                          # at their field caps, worst-case escaping and framing;
+                                                          # name/unit must stay explicit at app + dialect CHECK seams
 
 def composer_operation_request_hash(*, session_id: UUID, kind: ComposerOperationKind,
                                     request: SendMessageRequest | RecomposeRequest) -> str
@@ -191,7 +234,9 @@ class ComposerOperationStatusResponse(_StrictResponse):      # poll body and can
     error: ComposerOperationError | None = None
 # ChatMessageResponse.client_request_id → operation_id: str | None = None (N14; ruling 6)
 ```
-Absent and explicit-null `state_id` hash identically (measured). Both mean "no state" (ruling 7).
+The LegacySendMessageRequest/LegacyRecomposeRequest declarations above describe the completed transition, not current mounted types. Both obsolete declarations are removed within the measured cutover; DTO83 supplies bounded canonical parser/model/mounted-202 response proof. Manual parsing exposes no advertised OpenAPI requestBody. Final global caller/wire inventory remains required.
+
+Absent and explicit-null `state_id` must hash identically; N02 proves that on the unmodified codec and proposed strict DTOs. Both mean "no state" (ruling 7).
 
 ## Table — `composer_async_operations` in `sessions/models.py` (N04)
 
@@ -215,7 +260,7 @@ Absent and explicit-null `state_id` hash identically (measured). Both mean "no s
   - closed `kind`, `status`, `failure_code` and `settled_by`;
   - lower-hex-64 on `request_hash` and `result_sha256` (`_lower_sha256_constraints`);
   - length 36 on `operation_id`;
-  - `length(request_json) <= COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH`;
+  - encoded request byte length <= the measured composer request cap: application UTF-8 validation plus dialect-correct byte CHECK (`octet_length(request_json)` for PostgreSQL, `length(CAST(request_json AS BLOB))` for SQLite); ordinary text `length()` counts characters and is insufficient for a byte guarantee. Final SQL/caps are N03/N04 review targets;
   - `attempt >= 0`;
   - time ordering.
 
@@ -231,7 +276,7 @@ Absent and explicit-null `state_id` hash identically (measured). Both mean "no s
 The fence triple is **load-bearing on terminal rows**. If a terminal settle nulled it, the positive predicate (E10)
 could not find the row and would fail open.
 
-**Triggers.** Both dialects, all 5 inventory places; `_REQUIRED_AUDIT_TRIGGERS` goes from 11 to 13.
+**Triggers.** Both dialects and every live required-trigger inventory. N00 measures the current registry; add these two named guards and update the real inventories without copying historical totals.
 
 - `trg_composer_async_operations_transition_guard` (UPDATE) forbids:
   - running→queued;
@@ -329,7 +374,7 @@ running row to queued; the trigger and the Python CAS both enforce this, each wi
 ## Composite start (R3 + E5) — `coordination/repository.py` (N06)
 
 ```python
-# _SessionOperationAuthorityRepository + the SessionOperationAuthority Protocol (+ every Protocol fake, measured):
+# _SessionOperationAuthorityRepository + the SessionOperationAuthority Protocol (+ every Protocol fake identified by the current live inventory):
 def start_composer_async_operation(self, claim: ComposerOperationClaim, *, owner_instance_id: str,
                                    lease_seconds: int, auth_provider_type: str) -> SessionOperationContext
     # ONE _locked_transaction:
@@ -346,18 +391,17 @@ def start_composer_async_operation(self, claim: ComposerOperationClaim, *, owner
 lives in `sessions/composer_operation_preconditions.py`. It depends only on `sessions/models.py` tables, SQL and the
 owned types, never on `coordination/`; N06 verifies there is no import cycle, since `coordination/repository.py` calls
 it. It reads the session row, `base_state_id`'s membership in the session, the head (`ORDER BY version DESC LIMIT 1`)
-and, for recompose, the last conversational row.
+and, for recompose, the full ordered conversational history, latest conversational user and exact same-user proposals.
 N06 measures what `_composer_conversation_messages` filters and pins parity with a test. Refusal bodies:
 
 - ownership → the byte-identical 404 `{"detail":"Session not found"}` (the `_verify_session_ownership` shape);
 - foreign or unknown base → the byte-identical 404 `{"detail":"State not found"}` (today's `messages.py:199/:201`);
 - moved base → E6;
-- recompose: no conversation → 400 `"No messages to recompose from"`; last row not user → today's 409 string; mismatch
-  → 409 `recompose_user_message_mismatch` (dict detail, request id injected).
+- recompose follows this exact connection-taking algorithm under the start transaction: load full ordered history; apply the existing conversational filter; find the latest conversational user; no such user → the candidate's no-user 400; require exact `expected_user_message_id` → otherwise `recompose_user_message_mismatch` 409; later assistant with no tool calls → `recompose_already_completed` 409; exact same-user pending/committed pipeline proposal → `recompose_saved_proposal` 409; rejected proposals do not block an explicit new attempt. An eligible persisted partial assistant prefix has **nonempty tool_calls**, with empty or nonempty narration content. A bare assistant row without tool calls is a saved reply and is refused; no narration-only exception or new durable discriminator is introduced. Build provider history with the originating user before the safe prefix, without another user insert or stored tool execution/result replay. Preserve all four candidate envelopes through the real handler projection. **No tail-role refusal survives.** Frontend recovery still reads full authenticated 500-row pages and refuses failed/nonadvancing traversal. N06/N10/N11b/N14/N15 prove all these cases.
 
 The worker adopts the returned context:
 `await SessionOperationLease.adopt(service.session_operation_authority, context, lease_seconds=…)`.
-This is `adopt`'s first production caller.
+N00 measures existing production `adopt` callers; preserve their behavior while adding the worker.
 
 ## Composite terminal (R2) — `sessions/service.py` (N07)
 
@@ -374,7 +418,8 @@ async def complete_composer_async_operation(self, running: ComposerOperationRunn
     # The post-commit telemetry projection is kept (_run_sync_with_post_commit_projection).
 async def fail_composer_async_operation(self, running: ComposerOperationRunning, *,
                                         failure: ComposerOperationError) -> ComposerOperationRecord
-    # one tx; audit_only=(failure.failure_code == "request_cancelled")
+    # one tx under exact running/fence terminal authority; any failed terminal may pass a cancel marker
+    # only through this sealed audit/terminal-only path, never ordinary business mutation/admission/title
 @final @dataclass(frozen=True, slots=True)
 class ComposerOperationAssistantWrite:
     message_id: UUID; content: str; raw_content: str | None; composition_state_id: UUID | None
@@ -383,6 +428,36 @@ A cancel that wins the CAS rolls back the assistant row, but never an audit coho
 `audit_only` (E10/E11). N07 starts by measuring the post-terminal write inventory (ruling 2's precondition) and ships
 two controls: a non-audit write under a lingering SOL after the terminal fails, and fork/revert writes under their
 own SOL are unaffected.
+
+### Closed terminal priority and commit-unknown reconciliation (N07/N09/N10/N11b/N12/N17)
+
+Evaluate this table after joining owned work, and re-read the current job/cancel/deadline/fence inside the terminal transaction. Earlier row wins. No exception-message matching or arbitrary ExceptionGroup ordering chooses an outcome.
+
+| Priority | Evidence / outcome | Required disposition |
+|---|---|---|
+| 0 | A committed strict/hash-valid terminal already exists | Replay it exactly. It wins later cancel/deadline, provider/child errors, shutdown, renewal/close failure and telemetry projection failure. Never write another terminal or replace its result. Corruption is `AuditIntegrityError`, not permission to repair/replace. |
+| 1 | Authoritative audit/integrity/storage failure, including uncertain required evidence/accounting | Persist its declared safe N10 error projection or diagnostic `operation_failed` if the exact fence and database permit; never downgrade to ordinary cancel/weather or publish completed. If storage cannot settle, preserve evidence/ownership and leave nonterminal for recovery; do not claim cancellation/accounting completed. |
+| 2 | Provider-attempt/quota/token-usage/owned-child settlement failure not already priority 1 | Same safe failed-terminal rule. SDK weather is an ordinary body outcome, not a settlement failure. A self-cancelled settlement child without proven durable outcome fails closed. |
+| 3 | Explicit durable user Stop marker for this action | `request_cancelled`; join required audit/accounting first. A subscription disconnect is never this evidence. |
+| 4 | Absolute job deadline expired | `deadline_expired`; never reset budgets, invent zero usage or replay provider work. A convergence failure before that deadline retains its existing public N10 shape. |
+| 5 | Actual lease loss, unmarked task cancellation or shutdown | `worker_lost`; stale owner cannot terminalize under a lost fence. The reaper settles only through its own measured dead/lost predicate, with no provider call. |
+| 6 | Ordinary safe typed body failure / generic defect | Existing N10 public envelope (`http_error`) or redacted diagnostic `operation_failed`. Successful body proceeds only if no higher arm applies and all evidence/children are settled. |
+
+Flatten ExceptionGroups into these owned categories while retaining the primary exception/cause for class-only diagnostic logging. Re-read a committed terminal before interpreting lease-close failure. The failed-terminal composite is a **sealed audit/terminal-only write**, authorized by the exact running job/fence triple even when the user cancel marker is set; that permits priority 1/2 to win. It cannot perform user, title, provider admission, tool/business or proposal/state mutations. Do not expose that exception as a general caller-controlled bypass of the positive fence predicate. Ordinary non-audit writes still require running/unmarked authority.
+
+Before any terminal, join provider attempt admission/dispatch outcome custody, quota/token usage settlement, LLM/turn audit cohort, proposal/response projection child, auto-title (including its cancellation/accounting child), and every shielded/freeform settlement child. Wait for actual underlying SQL/thread completion, not merely cancellation of its awaiter. If that cannot finish under the owned lifecycle, leave authoritative recovery evidence and do not manufacture a success/ordinary cancel terminal. N07 records the concrete writer/child call sites; N09/N11b own their joins. Release/renewal machinery retains its existing separate authority after the terminal.
+
+After **any ambiguous terminal commit acknowledgment or post-commit projection exception**, preserve the exact immutable attempted terminal bundle. Perform an independent short committed read using bounded driver/worker admission, not the failed transaction/connection:
+
+1. Strict/hash-valid terminal: return it unchanged, regardless of which outcome was attempted.
+2. **Exact-bundle retry arm:** original SQL/transaction has actually finished; an independent committed read from the writer database (new transaction/connection, no replica/stale snapshot) proves nonterminal/running; exact live fence remains owned; terminal-driving cancel/deadline/evidence state is unchanged. Retry that immutable composite/bundle **at most once**. The locked transaction rechecks those predicates before writing. If they changed, roll back without writing and leave this arm. Idempotent exact message/audit identities prevent duplication; no provider redispatch.
+3. **Changed-state failure reconciliation arm, distinct from retry:** retain the original attempted bundle as evidence. Only after original SQL (and any attempted exact retry) has actually finished, a fresh committed writer-database read proves no terminal, and the exact live fence is still owned, evaluate the closed priority table with captured original integrity/accounting evidence and newly committed cancel/deadline state. Create a separate immutable **failure-only** bundle and attempt the sealed failed-terminal CAS once, checking the same proof and priority under the session/job lock. This is not a same-bundle retry and cannot manufacture success, hide a higher original failure or write while an old commit is possible. If its acknowledgment is ambiguous, independently re-read: valid terminal wins; otherwise retain evidence and leave recovery with no further competing attempt. Total owned recovery is bounded to one exact retry and one separately authorized failure attempt.
+4. Lost fence, unreadable/unknown nonterminal state, or uncertainty whether any earlier SQL/transaction can still commit: no competing failure/success write. Retain all attempted bundles and actual task/connection custody, stop ordinary writes and leave authoritative reaper/recovery. Missing/failed/stale read is not rollback proof; no new action until original completion and a fresh committed read resolve it.
+5. Corrupt/foreign/malformed terminal: `AuditIntegrityError`; never replace it. A failed database read does not imply corruption.
+
+Terminal atomicity covers the final assistant insert/reused exact assistant record, terminal audit cohort/ledger when written there, strict same-transaction state/proposal response snapshot and result/hash/job CAS. Tool-time proposal/state mutations may commit earlier, as current behavior does. They are crash-visible partial state and remain discoverable through authoritative session/proposal reads; they are not retrospectively included in the terminal transaction or erased on failure. Recompose saved-outcome/partial-prefix guards must account for that state. Never claim all tool-time state is rolled back by terminal failure.
+
+Fault proofs cover before commit, during commit, after server commit/before acknowledgment, delayed SQL completion, independent-read failure, no second terminal, and explicit Stop against each priority arm. Include provider quota/token faults, title success/timeout/cancel/charge failure, terminal versus late lease-close ExceptionGroup and shutdown. No post-terminal non-audit write or provider replay is permitted.
 
 ## Request lifecycle (E1) — `sessions/routes/_helpers.py` (N08)
 
@@ -438,7 +513,7 @@ raise each case, and compare `(status, json)` modulo the request-id value. The r
 - `ComposerAdmissionRefused`;
 - `ComposerServiceError`;
 - `server_invariant_violated`;
-- the recompose 400/409/409;
+- the recompose no-user 400 and latest-user mismatch/saved-response/saved-proposal 409s from the exact recovered candidate;
 - settlement 409/422/504;
 - the app handlers (`AuditIntegrityError`, `StaleComposeStateError` flat, `SessionOperationFenceLost`,
   `SessionOperationConflictError`, `FingerprintKeyMissingError`, `SecretDecryptionError`, `OperationalError`,
@@ -555,7 +630,7 @@ class ComposerAsyncWorker:
 - a dead loop escalates via `process_recovery.request_shutdown()`;
 - the worker is published as `app.state.composer_async_worker`.
 
-## HTTP (N13 poll/cancel; N14 cutover)
+## HTTP (N13 poll/cancel/HTTPS stream; N14 complete cutover)
 
 - **`GET /api/sessions/{session_id}/operations/{operation_id}`** → 200 `ComposerOperationStatusResponse`.
   - `Cache-Control: no-store`.
@@ -581,6 +656,82 @@ class ComposerAsyncWorker:
   - deletes the ingress 409 arms, `lookup_message_ingress` and the legacy DTOs;
   - renames `ChatMessageResponse.client_request_id` → `operation_id`.
 
+
+## Admission boundaries retained at the async cutover (N00, N06, N10, N14)
+
+Before the durable queue insert, preserve the current send credential-material refusal and compartment ingress policy alongside strict DTO/ownership/idempotency checks. Strict shape validation alone is not proof that request_json is safe to persist. Keep existing ingress refusal envelopes and rate-limit behavior within the reviewed admission ordering.
+
+For recompose, read the complete ordered transcript through the existing conversational filter. Find the latest conversational user, require its exact `expected_user_message_id`, refuse a later assistant row with no tool calls as `recompose_already_completed`, and refuse an exact same-user pending/committed pipeline proposal as `recompose_saved_proposal`. Rejected proposals do not block an explicit new attempt. A persisted assistant tool-call prefix (nonempty tool_calls, with optional narration) is eligible; a bare assistant without tool calls is refused as a saved reply; retain the original user before that prefix in provider-visible history. Never replay stored tool calls or add a duplicate user row. These predicates come from the exact recovered retry candidate, not an inferred patch. Apply them under the atomic start authority before user/provider side effects. Preserve the candidate's four public refusal envelopes through the real handler parity instrument.
+
+The exact recovered retry artifact was integrated and its twelve supplied snapshots verified before later changes. Preserve its latest-user/exact-ID/saved-outcome algorithm and all original controls against current source; the historical tail-role predicate is superseded. N00 must finish the registered-handler/error-ladder inventory; the live router inventory and bounded baseline do not establish full error parity.
+
+## HTTPS observer contract (N03, N08, N13, N15, N17, N19)
+
+### Wire and source
+- Add `GET /api/sessions/{sid}/operations/{operation_id}/stream` beside the existing proposed authoritative operation GET and cancel POST.
+- Use the existing bearer authentication/role/ownership policy through `fetch` with Authorization headers. Do not put tokens in URLs, add credentials, new grants or browser EventSource-specific ticket infrastructure.
+- Proposed response is UTF-8 `text/event-stream`, `Cache-Control: no-store` and appropriate anti-buffering headers. Frames carry a closed event discriminator, schema version, session/operation identity and a bounded owned payload.
+- Events: `status` (queued/running/cancel marker and remaining duration), `progress` (existing provider-safe progress fields with exact job/lease binding), `heartbeat` (no request/provider content) and `terminal` (durable terminal notification). This is the selected progress wire. Only provider-safe progress is delivered incrementally; the completed answer arrives through the authoritative terminal GET. No provider token/delta stream or interim answer text is introduced.
+- Terminal notification triggers the same authenticated durable GET; that GET returns the exact former final response/public error after strict hash/DTO validation. Do not duplicate an unbounded composition/result graph into a bounded progress frame.
+- No events table is required for advisory snapshot delivery. Reconnect may skip progress snapshots; final result replay is durable. Do not claim a lossless token/event log.
+- User-message `request_id`, transport correlation `request_id` and action `operation_id` are distinct. Bind progress in the authority by the exact operation/lease, not by the message ID alone. Queued status comes only from the requested job.
+- Read role/identity, session ownership/archive state, job and matching progress through short committed snapshots. PostgreSQL cross-instance subscriptions read durable job/progress sources. SQLite keeps the shipped single-process progress registry: restart may lose advisory progress, but job status and terminal replay remain durable. Do not introduce or imply SQLite multi-instance progress support. A terminal must be committed before the notification; no send can decide settlement.
+
+### Authorization and redaction
+- Before response headers, authenticate bearer and live role, validate deployment/provider scope, ownership and the requested job, using opaque ordinary refusals.
+- Recheck live authorization at a bounded cadence and immediately before each data frame; do not initiate another send after failed authorization (the executable guarantee below defines an already-initiated in-flight race). Token expiry closes the reader. Use verified owned token claims or provider reauthentication, never the unverified convenience claims from request state as an authorization proof.
+- The executable guarantee below defines reader authorization; prove the worker's retained CRL live-role/identity/ownership revocation behavior with Daybreak. Preserve CRL renewal and the worker's cancel/lease semantics; the subscriber is not a new authorization grant or the job owner.
+- After headers, only bounded redacted control information or clean closure is allowed. The client recovers through an authorized GET. No provider prompts, reasoning, tool arguments, credential/secret values, raw exceptions or diagnostic internals in frames/logs.
+- Disconnect, authentication expiry or read/write failure ends a subscription. Explicit cancel POST alone marks user Stop; late cancel cannot relabel a committed terminal.
+
+### Executable authorization-to-send guarantee (backend N13; contracts N03; frontend N15; validation N16/N17/N19)
+
+**N13 owns backend implementation and app-factory wiring.** Add an owned immutable `ComposerStreamAuthServices` containing the existing authenticated provider and a narrow `Callable[[str], SessionTokenClaims]` bound to the existing deployment issuer `decode`. Build it in the selected local/SSO factory branch where that issuer/provider are already constructed, expose the owned facet through app state, and pass it explicitly into the operations route/bounded response. No key copying, new credential, runtime Protocol-based provider detection or direct access to unverified request claims. N13 targets `web/app.py`, auth provider/issuer wiring, `sessions/routes/composer/operations.py` and the bounded ASGI response; N15 owns frontend headers/custody only.
+
+For every supported local/SSO application bearer, use the existing `auth_provider.authenticate` path at entry and every live recheck (local credentials + active identity; SSO application session issuer + active identity). This validates the deployment's application session token; it does not contact the external IdP or create a new grant. Expose the existing deployment-owned `SessionTokenIssuer.decode` as a narrow factory-wired verifier facet to return owned `SessionTokenClaims` for signature/provider/audience/expiry. Require its principal/provider to agree with the authenticated identity and original reader scope. Never use the middleware's unverified `request.state.auth_claims` for expiry/authorization. No widening/runtime-checkable Protocol dispatch or new signing credential is needed.
+
+A subscription owns one serial authorization/read loop and at most one send. Attempt live checks at least every 1 s while waiting for progress/heartbeat, with a total auth/read deadline of 2 s (including worker admission). The check uses committed active identity/role, provider scope, session owner/archive and requested job/progress custody. Do not overlap retries when a SQL thread is still running. A timeout/unavailable/malformed check fails closed, discards pending frames and closes the reader; the actual worker slot stays occupied until its thread finishes. Healthy no-send revocation detection is at the next scheduled check (<=1 s) plus its bounded read completion (<=2 s); the next frame/heartbeat attempts an earlier immediate check. These are starting values to prove under N17 contention; reduce caps or budgets if the supported driver cannot meet them.
+
+Build/coalesce a frame from committed matching state, then reauthorize immediately before its timed ASGI send, without reusing authorization across frames. If denied, discard the frame. Check expiry again at the actual send invocation against the later of server wall clock and the last database-clock observation advanced by monotonic elapsed time; initiate no send at or after the verified `expires_at`. Keep raw bearer only in request-owned memory and never in persistence, frames, diagnostic/log text or URLs.
+
+Authorization and socket delivery are **not globally atomic**. Revocation after the final successful check can race one already-authorized bounded frame/send. While a send is in flight, the next check waits for that send's <=5 s bound; worst-case subsequent detection is send wait (<=5 s) + cadence (<=1 s) + check deadline (<=2 s). No promise of zero bytes after revocation commit or a bound on client receipt of already buffered bytes is made. After a failed check, initiate no further data/heartbeat send; discard every pending frame and use clean EOF (no post-denial control data). A previously initiated frame may already be partially accepted by the transport and cannot be unsent.
+
+Wrap the actual ASGI send call/task in the 5 s boundary, not the producer alone. Cancel/close and join owned send/read tasks on timeout/disconnect; retain permits and worker accounting until actual underlying completion. Supported ASGI/driver cancellation compliance is an acceptance gate; a cancellation-resistant send/thread negative control must not falsely free resources or certify the 5 s guarantee. No unbounded detached send tasks or retries. If the supported server cannot enforce/clean this bound, transport acceptance is NO-GO until corrected within authorized application/local harness scope.
+
+Tests revoke before construction, between construction and final check, and during blocked send; distinguish suppressing an uninitiated frame from the honest in-flight race. Prove expiry boundary, principal/provider replacement, missing/archived/ownership-changed session, lost role, timeout/failed read, no reused checks, no additional sends after denial, redacted content/logs, effective send timeout and actual permit/SQL-thread cleanup. The durable worker still uses the existing CRL renewal/identity/ownership cancellation rules and the closed terminal-priority contract; reader failure alone never owns/cancels it.
+
+### Bounded resources — proposed starting values, pending ordinary local measurement and Daybreak review
+- Heartbeat every 10 seconds, snapshot read cadence no faster than 1 second, subscription lifetime at most 120 seconds and an ASGI send wait at most 5 seconds.
+- Maximum encoded frame 64 KiB; oversized snapshots are not emitted. Final result stays on the durable GET.
+- Per-process caps: two readers per operation, four per principal, eight total. State that these are process caps, not a promised global cluster limit.
+- Coalesce stale progress instead of queuing all updates. Use no worker-coupled subscriber queue and no unbounded retained frame/body buffer.
+- Release permits and join subscription tasks on every exit, including repeated cancellation and ASGI send failure.
+- Hold no database transaction, row lock or pooled connection across socket writes, heartbeat waits or client backpressure.
+- Enforce send deadlines at the ASGI send boundary; a timer only inside the producer generator does not bound a blocked transport write.
+- Bound subscription admission/read wait and reconnect backoff. Prove the worker/ordinary sync pool remains usable under the subscriber cap. Reduce limits if measured contention demands it.
+- Subscription renew/reconnect does not extend the admission deadline, worker lease, quota or provider retry budget.
+- Preserve async_workers.py's worker-lifetime accounting: 16 threads plus 16 queued admissions, with a one-second wait to acquire capacity. The helper cancels queued work when its caller is cancelled, while a running thread remains admitted until completion. Do not assume an async timeout stopped SQL or freed that capacity. Prove bounded driver/read behavior, late commit, admitted-queue cancellation and shared-pool contention without modifying global infrastructure.
+
+### Frontend custody and fallback
+- One operation observer and terminal reducer serve stream and poll. Preserve the immutable operation ID/body and auth/session generations. Body-bearing sessionStorage custody is scoped to authenticated principal/provider, bounded to the proposed 512 KiB per submitted body / 1 MiB aggregate / 24-hour lifetime, and purged on logout/principal replacement through the existing authStore reset seam. Same-principal token refresh may resume; cross-principal restore is refused.
+- Incremental decoder accepts split UTF-8 codepoints, split line endings, complete SSE frames and multiple frames per chunk; reject invalid/oversized/truncated frames at the external boundary.
+- Validate requested session/operation and closed event shape before applying data. Duplicate/late frames and a previous auth/session generation cannot apply a terminal or overwrite current state.
+- Stream EOF/watchdog/error/proxy buffering falls back to GET for the same job. A missing-operation snapshot never proves an earlier SQL admission cannot commit. Retain unresolved submitted custody; any replay permitted by the reviewed admission policy uses only its exact id/body; session missing/archive stops recovery without resubmission.
+- A client deadline is an observation budget, not cancellation proof. Stop calls explicit cancel and continues observing to durable terminal.
+- Custody is a strict sum type: submitted custody holds the exact action ID/body and may reconcile/resubmit that same action after an ambiguous admission; observation-only custody holds a server-reported active action ID/kind and has no replay body. A 409 active-job attachment cannot re-key the losing unsent body to the accepted operation. Preserve that unsent content as a draft, reload authoritative rows and never resubmit observation-only custody. Any earlier still-ambiguous submitted action retains its own reconciliation custody until resolved; a later active-job refusal does not establish that an earlier in-flight admission cannot commit. Test that race explicitly.
+- Reload, two tabs and session switching preserve custody without duplicate provider work. Ordinary tutorial UI uses the same observer and admission path.
+
+### Real HTTPS and fault acceptance
+- Use ordinary local fake providers and isolated SQLite/PostgreSQL databases, never paid-provider/production tests.
+- A real TLS client/browser through the intended local proxy must receive an early frame/heartbeat before delayed fake work terminalizes. ASGI tests and `proxy_buffering off` source text alone are insufficient.
+- Exercise a deliberately buffering proxy and a short idle cutoff; polling recovers the same job with one provider dispatch.
+- Prove slow-reader/send failure, subscription churn, bounded memory/tasks/pool use, token/role/ownership revocation and zero data after denial.
+- Do not change deployed Caddy/nginx/cloud infrastructure in this task. Installed development Caddy configuration is operator-local; record any unavailable local TLS prerequisite as a completion blocker.
+
+### Selected completed-answer delivery
+The shipped gateway `ChatRequest` rejects `stream`; `_litellm_acompletion` returns a complete response to owned admission. Preserve that behavior for the selected scope: safe operation progress through SSE, then the completed answer through durable terminal GET. No provider streaming, token/delta replay or server-authored answer/graph fallback is needed or authorized.
+
+
 ## Test helpers — `tests/helpers/composer_operations.py` (N13)
 
 `submit_and_settle(client, app, *, path, body, max_rounds=50) -> SettledComposerOperation`,
@@ -591,6 +742,8 @@ works on `_make_app` and `_route_client` apps; `_route_client` gains any stub th
 
 ## Frontend — `src/elspeth/web/frontend/src` (N15)
 
+The operation observer tries the authenticated fetch stream and uses polling after EOF, fragmentation/protocol error, idle timeout, unsupported transport or buffering. Both feed one operation-bound reducer/custody path. Existing poll-only examples below are historical starting shapes; implement the complete observer defined in the HTTPS contract, not a separate stream store.
+
 - **`api/client.ts`:**
   - `apiErrorFromBody(status, body)` (no 401 logout), used by `parseResponse`;
   - `submitComposerOperation`, `fetchComposerOperation` and `cancelComposerOperation`, each bounded by
@@ -599,8 +752,8 @@ works on `_make_app` and `_route_client` apps; `_route_client` gains any stub th
 - **`api/composerOperationDecoder.ts`:** exact-record decoders.
 - **`stores/composerOperationCustody.ts`:**
   - sessionStorage key `elspeth_composer_operations_v1`, schema `composer-operations.v1`;
-  - one descriptor per session: `{sessionId, operationId, kind, body, createdAt}`;
-  - 256 KiB, 24 h, a memory fallback, and no orphan sweep in `selectSession`;
+  - one foreground `SubmittedCustody | ObserverCustody` per principal/provider/session, plus a separate map of unresolved prior submissions keyed by their own operation IDs; the type definitions below govern both;
+  - proposed 512 KiB per submitted body and 1 MiB aggregate per principal/provider, 24 h, memory fallback and no orphan sweep in `selectSession`; never evict unresolved custody merely to admit another action;
   - it deliberately stores the body, reversing `sessionOperationRetry`'s fingerprint-only invariant
     (`sessionOperationRetry.ts:34-43`, `:181-198`) for this kind only.
 - **`stores/sessionStore.ts`:**
@@ -608,9 +761,9 @@ works on `_make_app` and `_route_client` apps; `_route_client` gains any stub th
     the operation is missing → poll loop (`poll_after_ms`; backoff 1→2→4→8 s on transient errors, which never fail
     the turn) → the existing reducers;
   - reducers get the `result`, or `apiErrorFromBody(error.http_status, error.body)`;
-  - pollers stop only on terminal; `isComposing` holds from custody acquire until terminal;
+  - stream readers and fallback pollers share exact session/operation/auth-generation custody and stop settlement only on a durable terminal; `isComposing` holds from custody acquire until terminal;
   - `resumeComposerOperation(sessionId)` runs on `selectSession`/boot before render;
-  - 409 `composer_operation_active` → attach to that id;
+  - 409 `composer_operation_active` → attach observation-only custody to that id, preserve the losing draft, and retain any earlier unresolved submission in the separate reconciliation map;
   - a 404 `session_missing` → today's session-not-found path, clears custody, never resubmits;
   - after every non-success terminal → reload the authoritative state;
   - deletes: `reconcileAcceptedSend`, the ingress 409 arms, `local_accepted_user_message_id`, and
@@ -636,12 +789,11 @@ works on `_make_app` and `_route_client` apps; `_route_client` gains any stub th
 
 ## Task list (order = commit order; every task ends green on its own tests)
 
-**Before N00, one docs commit:** this contract + the second spec amendment + the plan index. There is no interim
-merge from N03 to N15.
+**Readiness precedes implementation:** no docs-commit prerequisite or release-base instruction overrides the current gate. Complete the concrete plan, authorized real Daybreak Blue review and blockers before code work. No merge is authorized at any stage.
 
 | # | Task | Replaces | Depends on |
 |---|---|---|---|
-| N00 | Worktree; baseline measurements M0–M12 (below); gate-2 baseline test; **Appendix A**: every exit of both routes from the live ladder, plus the ruling 1/2/5 exits, each with its owning task | T00 | docs commit |
+| N00 | Worktree; baseline measurements M0–M12 (below); gate-2 baseline test; **Appendix A**: every exit of both routes from the live ladder, plus the ruling 1/2/5 exits, each with its owning task | T00 | none |
 | N01 | Settings (6 knobs + the sync cap and its three consumers); behaviour-neutral | T01 | N00 |
 | N02 | Shared normaliser + response hash; receipts delegate; golden vectors first. **Go/no-go → C** | T02 part | N00 |
 | N03 | Owned types; strict + legacy DTOs; wire DTOs; request-JSON bound measured | T02 part + T10 1b | N02 |
@@ -649,19 +801,19 @@ merge from N03 to N15.
 | N05 | Authority + connection-taking helpers; queued-only CAS negative controls; D8 index mapping; manifest | T04 | N04 |
 | N06 | Composite start + acquire extraction + precondition gate (E5) + receipts regression | T05 | N05 |
 | N07 | Post-terminal inventory → positive predicate (E10/E11) → composite terminal | T06 | N06 |
-| N08 | Request lifecycle + durable carrier + app-keyed lock registry; routes behaviour-unchanged | T07 | N00 |
+| N08 | Request lifecycle + durable carrier + app-keyed lock registry; routes behaviour-unchanged | T07 | N00, N03 |
 | N09 | Budget threading (compose, planner, settlement) + D10 | T08 | N01 |
 | N10 | Error projection + parity | T09 | N03 |
 | N11a | `ComposerAppServices` + D6 settlement signatures + the ingress/job binding in `add_message_with_transcript` | T10 part | N07, N08, N09, N10 |
 | N11b | `run_composer_turn` + observation + retargeted structural pins | T10 part | N11a |
 | N12 | Worker + reaper + lifespan + watcher (gate 4) | T11 | N11b |
-| N13 | Poll/cancel routes + test helpers + shared fakes | T12 | N12 |
+| N13 | Poll/cancel/operation-scoped HTTPS stream routes, snapshot authorization/resource limits + test helpers + shared fakes | T12 | N12 |
 | N14 | Cutover: 202, ingress DDL + rename, deletions (409 arms, lookup, legacy DTOs, `_track_compose_inflight`), caller migration incl. `state_id`, ACA P1 redefinition + probes + `acceptance.sh`, eval battery, gate 2 | T13 + T03 part | N13 |
-| N15 | SPA cutover (above) + e2e + transition-ledger boundary | T14 | N14 |
+| N15 | Fetch stream decoder/observer, polling fallback, custody/resume/Stop + e2e + transition-ledger terminal boundary | T14 | N14 |
 | N16 | Budget decoupling + deployment mirrors | T15 | N14 |
-| N17 | PG crash windows + cross-instance + the new PG proofs (cascade, starvation, stale base, post-terminal write, `settled_by`, delete guard) | T16 | N14 |
-| N18 | Epoch 72 (re-read first) + doc/website/CHANGELOG sweep | T17 | all |
-| N19 | Full gates (all stages) + lints set diff + local short-idle-proxy browser acceptance | T18 | N18 |
+| N17 | SQLite/PG crash and race proofs, cross-instance reconnect, revocation, backpressure/resource faults and retained cascade/fence/terminal proofs | T16 | N14, N15 |
+| N18 | Re-read current epoch pair before the necessary coherent schema cut; current contract/API/local test docs only; leave PR 275 release metadata separate | T17 | all |
+| N19 | Required gates, Astra correctness/design + real Daybreak transport/security review, real local TLS chunk/proxy/browser acceptance and exact-HEAD LOCAL test branch hold | T18 | N18 |
 
 **N00 measurements:**
 
@@ -678,3 +830,49 @@ merge from N03 to N15.
 - **M10** golden vectors from the unmodified receipts codec.
 - **M11** a PG session cascade with a RESTRICT sibling and an ingress row.
 - **M12** auto-title timing under a real or stub provider.
+
+## Reconciled frontend custody interface (N03/N15)
+
+These are proposed owned interfaces, not deployed types. `SendMessageRequest` and `RecomposeRequest` name the proposed strict frontend wire DTOs from N03/N14, including immutable operation_id, state_id and expected_user_message_id for recompose. Their discriminant and body are paired below; persisted hydration also proves the body operation_id equals the custody operationId. Scope is obtained from authenticated current-user/provider context, never unverified convenience token claims. Resolve its actual producer in N00 before writing code.
+
+```typescript
+type PrincipalScope = { principalId: string; authProvider: string };
+type OperationKind = "compose_message" | "compose_recompose";
+type SubmittedCustody = {
+  mode: "submitted";
+  scope: PrincipalScope;
+  sessionId: string;
+  operationId: string;
+  createdAt: number;
+} & (
+  | { kind: "compose_message"; body: SendMessageRequest }
+  | { kind: "compose_recompose"; body: RecomposeRequest }
+);
+type ObserverCustody = {
+  mode: "observer";
+  scope: PrincipalScope;
+  sessionId: string;
+  operationId: string;
+  kind: OperationKind;
+  createdAt: number;
+};
+type SessionCustody = {
+  foreground: SubmittedCustody | ObserverCustody | null;
+  unresolvedSubmissions: ReadonlyMap<string, SubmittedCustody>;
+};
+```
+
+Only submitted custody may supply a replay body. Unknown/failed GETs, a later active-job refusal, progress, client deadlines and subscription failure cannot clear earlier submitted custody. An earlier SQL worker may still commit after its caller times out. Same-ID admission must remain idempotent if such a commit races a retry. A later observer's terminal is not evidence about the earlier submitted ID. Refuse further submission before aggregate storage bounds would discard unresolved bodies; retain drafts and offer read-only reconciliation. Clear a particular submission only on its authoritative terminal/session disappearance or a reviewed definitive refusal for that exact action. Logout/principal replacement purges this scope through the existing reset barrier; same-principal refresh reauthenticates before restore. Persisted hydration validates the complete discriminant/body/ID/scope shape and size; observer hydration with a replay body is rejected.
+
+Explicit new retry of a settled partial result is fresh computation with a new ID/current head. It may repeat non-idempotent external effects. No exactly-once tool-effect claim is made. Preserve refresh-only UI for saved replies/proposals and unknown outcome. Preserve complete authenticated paginated history, failed traversal/non-advancing-page refusals, transient GET retry, stale-generation snapshot protection and Stop-before-POST controls from the recovered candidate.
+
+## Evidence and implementation gates
+
+The [reconciliation report](reconciliation-2026-10-06.md) owns current measured disposition. All code-shaped examples above are proposed names/signatures to verify against live symbols, not measured inventories or runnable implementations. Historical numeric anchors, fixed writer lists, result sizes and handler classifications carry no live completeness claim. N00/Appendix A and N07 must rederive them through production registrations and the canonical writer authority. Record omissions explicitly; do not shrink safety requirements to match a successful scoped test.
+
+Resource defaults (10 s heartbeat, >=1 s read cadence, 120 s subscription, 5 s actual ASGI send, 64 KiB encoded frame, per-process 2/operation, 4/principal, 32 total, browser 512 KiB per submitted body / 1 MiB aggregate per principal/provider / 24 h) remain unapproved proposals. Current N00 wire fixtures reject the former 256 KiB proposal (393,300 serialized bytes); future DTO/storage overhead and all transport limits still need implementation measurements. Review byte escaping, partial decoder buffers, both dialect drivers, worker-pool occupancy, authentication read/write races and cancellation cleanup before treating them as viable. A failed authorization check suppresses every not-yet-initiated frame and further sends; the executable authorization section defines the one-frame in-flight race, check/send deadlines and expiry boundary honestly. Source snapshots and socket delivery are not globally atomic with revocation.
+
+The user selected progress plus the completed answer. Use the common observer without provider streaming. Retain provider authorship and the ordinary tutorial path. Answer-token streaming, delta retention and provisional answer publication are outside this implementation scope.
+
+
+Implementation resource decision (2026-10-06): the historical 32-reader total above remains the original unapproved proposal. The implementation reduces only the total process reader cap to eight, retaining two per operation and four per principal. `test_composer_stream_pool_capacity.py` parks eight actual same-pool reader SQL tasks, proves the ninth refusal and retained permits through the two-second response cutoff, and completes ordinary local-auth GET plus a real durable worker turn using the remaining shared 16-thread pool capacity. Its separate saturation control occupies 16 running and 16 queued actual futures, rejects additional admission, and proves running cancellation does not release custody before actual completion. This is controlled local resource evidence, not a cluster-global limit or a claim of eight real TLS readers. Job/provider budgets are unchanged.

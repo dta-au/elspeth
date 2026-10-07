@@ -24,7 +24,7 @@ Operational procedures for ELSPETH pipeline management.
 | [AWS ECS Bedrock Opus and Sonnet](aws-ecs-bedrock-opus-sonnet.md) | Configure and validate operator-approved Bedrock Opus and Sonnet profiles on ECS |
 | [Azure Container Apps Cold Install](azure-container-apps-cold-install.md) | Install a new environment using the Bicep bundle, external PostgreSQL and NFS Azure Files |
 | [Azure Container Apps Existing-Service Redeploy](azure-container-apps-existing-service-redeploy.md) | Roll a digest-pinned image onto an existing ACA service |
-| [Azure Container Apps Full Disposable Acceptance](azure-container-apps-deployment.md) | Run the 0.8.2 replica test, fix failures and retain measured evidence |
+| [Azure Container Apps Full Disposable Acceptance](azure-container-apps-deployment.md) | Run the 0.8.3 replica test, fix failures and retain measured evidence |
 | [Audit Tier-1 Violation](audit-tier1-violation.md) | Compose-loop audit counters or audit-grade transcript logging fail |
 
 ---

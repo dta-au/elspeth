@@ -13,17 +13,20 @@ import pytest
 import structlog
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Engine
+from tests.helpers.composer_operations import SettledComposerOperation, message_body, running_operation_async, submit_and_settle
 from tests.helpers.postgres_target import postgres_test_target
 from tests.integration.web.conftest import _ensure_released_session_operation_fence, _make_session
 from tests.unit.web.sessions.test_routes import _make_app
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.protocol import ComposerResult
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import execute_tool
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.required_work import RequiredWorkBinding
 from elspeth.web.sessions._persist_payload import RedactedToolRow, StatePayload
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
@@ -168,6 +171,9 @@ class _BlockingSpliceComposer:
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
         completion_gates: Any = None,
+        budget_seconds: float | None = None,
+        required_work: RequiredWorkBinding | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> ComposerResult:
         del (
             message,
@@ -179,6 +185,9 @@ class _BlockingSpliceComposer:
             user_message_id,
             session_operation_context,
             completion_gates,
+            budget_seconds,
+            required_work,
+            provider_owner,
         )
         result = execute_tool(
             "splice_transform",
@@ -209,42 +218,53 @@ async def test_concurrent_http_splices_serialize_reload_and_apply_once(tmp_path:
     app.state.composer_service = composer
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        created = await client.post(
-            "/api/sessions",
-            json={"title": "Splice concurrency proof"},
-        )
+        created = await client.post("/api/sessions", json={"title": "Splice concurrency proof"})
         assert created.status_code == 201
         session_id = uuid.UUID(created.json()["id"])
-        initial_record = await _save_seed_state(
-            service,
-            session_id,
-            _state_data(_initial_state()),
+        initial_record = await _save_seed_state(service, session_id, _state_data(_initial_state()))
+        path = f"/api/sessions/{session_id}/messages"
+        first_body = message_body("Insert the transform", state_id=initial_record.id)
+        async with running_operation_async(client, app, path=path, body=first_body) as operation:
+            try:
+                await asyncio.wait_for(composer.first_call_started.wait(), timeout=2.0)
+                refused = await client.post(path, json=message_body("Insert the same transform", state_id=initial_record.id))
+                assert refused.status_code == 409, refused.text
+                assert refused.json()["detail"]["error_type"] == "composer_operation_active"
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(composer.second_call_started.wait(), timeout=0.3)
+                assert composer.input_versions == [initial_record.version]
+                assert composer.already_applied == [False]
+            finally:
+                composer.release_first_call.set()
+            await operation.drive
+            terminal = await client.get(operation.poll_path)
+            assert terminal.status_code == 200, terminal.text
+            assert terminal.json()["operation_id"] == first_body["operation_id"]
+            assert terminal.json()["status"] == "completed", terminal.text
+            first_settled = SettledComposerOperation(operation.accepted, terminal)
+        head = await service.get_current_state(session_id)
+        assert head is not None
+        second_settled = await submit_and_settle(
+            client,
+            app,
+            path=path,
+            body=message_body("Insert the same transform", state_id=head.id),
         )
+        assert second_settled.final.json()["status"] == "completed", second_settled.final.text
+        # Read the actual immutable result mappings after authoritative terminal GET.
+        first_result = first_settled.result()
+        second_result = second_settled.result()
 
-        async def send(content: str):
-            return await client.post(
-                f"/api/sessions/{session_id}/messages",
-                json={"content": content, "client_request_id": str(uuid.uuid4())},
-            )
-
-        first_task = asyncio.create_task(send("Insert the transform"))
-        await asyncio.wait_for(composer.first_call_started.wait(), timeout=2.0)
-        second_task = asyncio.create_task(send("Insert the same transform"))
-
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(composer.second_call_started.wait(), timeout=0.3)
-
-        composer.release_first_call.set()
-        first_response, second_response = await asyncio.gather(first_task, second_task)
-
-    assert first_response.status_code == 200, first_response.text
-    assert second_response.status_code == 200, second_response.text
+    assert first_settled.accepted.status_code == 202, first_settled.accepted.text
+    assert second_settled.accepted.status_code == 202, second_settled.accepted.text
+    assert first_settled.final.status_code == 200, first_settled.final.text
+    assert second_settled.final.status_code == 200, second_settled.final.text
     assert composer.input_versions == [initial_record.version, initial_record.version + 1]
     assert composer.already_applied == [False, True]
-    assert first_response.json()["message"]["content"] == "already_applied=false"
-    assert second_response.json()["message"]["content"] == "already_applied=true"
-    assert first_response.json()["state"]["version"] == initial_record.version + 1
-    assert second_response.json()["state"] is None
+    assert first_result["message"]["content"] == "already_applied=false"
+    assert second_result["message"]["content"] == "already_applied=true"
+    assert first_result["state"]["version"] == initial_record.version + 1
+    assert second_result["state"] is None
 
     current = await service.get_current_state(session_id)
     versions = await service.get_state_versions(session_id)

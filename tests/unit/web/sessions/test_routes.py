@@ -69,7 +69,6 @@ from elspeth.web.coordination.approval_lifecycle_authority import RepositoryAppr
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
-from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.accounting import RunAccountingBatch
@@ -91,27 +90,35 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginI
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
-from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identity_roles_table
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
-    ChatMessageRole,
     CompositionProposalRecord,
     CompositionStateData,
     CompositionStateProvenance,
     CompositionStateRecord,
     CompositionValidationError,
     MessageIngressFresh,
-    SessionRecord,
-    TransitionResponseSettlement,
 )
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.composer_fakes import StaticPluginSnapshotFactory
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.composer_operations import (
+    SettledComposerOperation,
+    current_head_state_id,
+    current_head_state_id_sync,
+    install_composer_async_worker,
+    message_body,
+    recompose_body,
+    running_operation_async,
+    settle_sync,
+    submit_and_settle,
+)
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -172,11 +179,162 @@ def _async_return(value: Any):
     return _return_value
 
 
-def _recompose_request(service: SessionServiceImpl, session_id: str | uuid.UUID) -> dict[str, str]:
+def _recompose_request(service: SessionServiceImpl, session_id: str | uuid.UUID) -> dict[str, object]:
     """Bind a retry to the actual last conversational user turn."""
     messages = asyncio.run(service.get_messages(uuid.UUID(str(session_id)), limit=None))
     user_message = next(message for message in reversed(messages) if message.role == "user")
-    return {"expected_user_message_id": str(user_message.id)}
+    state = asyncio.run(service.get_current_state(uuid.UUID(str(session_id))))
+    return recompose_body(user_message.id, state_id=state.id if state is not None else None)
+
+
+def _settled_composer_response(client: TestClient, app: FastAPI, *, path: str, body: dict[str, object]):
+    """Project only an admitted operation's authoritative terminal for public goldens."""
+    from httpx import Response
+
+    settled = settle_sync(client, app, path=path, body=body)
+    assert settled.accepted.status_code == 202
+    snapshot = settled.final.json()
+    if snapshot["status"] == "completed":
+        return Response(200, json=settled.result())
+    status, error = settled.error()
+    return Response(status, json=error)
+
+
+def _settled_with_recovery_sql_fault(client: TestClient, app: FastAPI, *, path: str, body: dict[str, object], fault):
+    """Raise at the registered physical recovery SQL invocation, retaining its Future."""
+    from elspeth.web.required_work import RequiredWorkSource
+    from elspeth.web.sessions import service as service_module
+
+    original_sql = service_module.run_required_sql_in_worker
+
+    async def run_with_fault(ticket, func, *args, **kwargs):
+        if ticket.key.source is RequiredWorkSource.RECOVERY_PARTIAL_STATE_SQL:
+            return await original_sql(ticket, fault, *args, **kwargs)
+        return await original_sql(ticket, func, *args, **kwargs)
+
+    with patch.object(service_module, "run_required_sql_in_worker", side_effect=run_with_fault):
+        return _settled_composer_response(client, app, path=path, body=body)
+
+
+def _install_publication_sql_fault(monkeypatch: pytest.MonkeyPatch, fault):
+    """Keep a selected publication fault inside its real registered SQL Future."""
+    from elspeth.web.required_work import RequiredWorkSource
+    from elspeth.web.sessions import service as service_module
+
+    original_sql = service_module.run_required_sql_finish_once
+
+    async def run_with_fault(ticket, func, *args, **kwargs):
+        if ticket.key.source is RequiredWorkSource.PIPELINE_PUBLICATION_SQL:
+            return await original_sql(ticket, fault, *args, **kwargs)
+        return await original_sql(ticket, func, *args, **kwargs)
+
+    monkeypatch.setattr(service_module, "run_required_sql_finish_once", run_with_fault)
+    return original_sql
+
+
+async def _settled_composer_response_async(client: AsyncClient, app: FastAPI, *, path: str, body: dict[str, object]):
+    from httpx import Response
+
+    settled = await submit_and_settle(client, app, path=path, body=body)
+    assert settled.accepted.status_code == 202
+    if settled.final.json()["status"] == "completed":
+        return Response(200, json=settled.result())
+    status, error = settled.error()
+    return Response(status, json=error)
+
+
+class _CancellableComposer:
+    """Park until the real cancel route causes the detached worker to unwind."""
+
+    def __init__(self, error: asyncio.CancelledError | None = None) -> None:
+        self.entered = asyncio.Event()
+        self.error = error
+        self.cancelled = False
+        self.owner: asyncio.Task | None = None
+
+    async def compose(self, *args: object, **kwargs: object) -> ComposerResult:
+        del args, kwargs
+        self.owner = asyncio.current_task()
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            if self.error is not None:
+                raise self.error from None
+            raise
+        raise AssertionError("Parked composer returned without cancellation")
+
+
+def _assert_required_recovery_failure(
+    client: TestClient,
+    service: SessionServiceImpl,
+    session_id: str | uuid.UUID,
+    *,
+    response: Any,
+    path: str,
+    body: dict[str, object],
+    composer: Any,
+) -> None:
+    """Required worker recovery seals exact503 and cannot invent a saved head."""
+    assert response.status_code == 503
+    payload = response.json()
+    assert uuid.UUID(payload["request_id"])
+    assert payload == {
+        "detail": "Database is currently unavailable. Please retry in a moment.",
+        "error_type": "database_unavailable",
+        "request_id": payload["request_id"],
+    }
+    assert asyncio.run(service.get_current_state(uuid.UUID(str(session_id)))) is None
+    replay = client.post(path, json=body)
+    assert replay.status_code == 202
+    assert replay.json()["operation_id"] == body["operation_id"]
+    snapshot = client.get(f"/api/sessions/{session_id}/operations/{body['operation_id']}")
+    assert snapshot.status_code == 200
+    assert snapshot.json()["status"] == "failed"
+    error = snapshot.json()["error"]
+    assert error["http_status"] == 503
+    assert error["failure_code"] == "http_error"
+    assert error["error_type"] == "database_unavailable"
+    assert error["body"] == payload
+    composer.compose.assert_awaited_once()
+    messages = asyncio.run(service.get_messages(uuid.UUID(str(session_id)), limit=None))
+    assert [message.role for message in messages if message.role in ("user", "assistant")] == ["user"]
+
+
+def _capture_turn_exception(monkeypatch: pytest.MonkeyPatch) -> list[BaseException]:
+    from elspeth.web.sessions import composer_async_worker
+
+    captured: list[BaseException] = []
+    real_turn = composer_async_worker.run_composer_turn
+
+    async def capture(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await real_turn(*args, **kwargs)
+        except BaseException as exc:
+            captured.append(exc)
+            raise
+
+    monkeypatch.setattr(composer_async_worker, "run_composer_turn", capture)
+    return captured
+
+
+async def _cancel_registered_composer(
+    client: AsyncClient, app: FastAPI, *, path: str, body: dict[str, object], composer: _CancellableComposer
+):
+    from httpx import Response
+
+    async with running_operation_async(client, app, path=path, body=body) as operation:
+        await asyncio.wait_for(composer.entered.wait(), timeout=3)
+        cancelled = await client.post(f"{operation.poll_path}/cancel")
+        assert cancelled.status_code in (200, 202), cancelled.text
+        await operation.drive
+        final = await client.get(operation.poll_path)
+        assert final.status_code == 200
+        settled = SettledComposerOperation(operation.accepted, final)
+        status, error = settled.error()
+        assert composer.cancelled
+        return Response(status, json=error)
 
 
 @asynccontextmanager
@@ -451,9 +609,12 @@ class _BlockingRecordingComposer:
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
         completion_gates=None,
+        budget_seconds: float | None = None,
+        required_work=None,
+        provider_owner=None,
     ) -> ComposerResult:
         del state, session_id, current_state_id, user_id, progress, user_message_id
-        del session_operation_context, completion_gates
+        del session_operation_context, completion_gates, budget_seconds, required_work, provider_owner
 
         self.calls.append(
             {
@@ -493,8 +654,12 @@ class _ProgressAwareComposer:
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
         completion_gates=None,
+        budget_seconds: float | None = None,
+        required_work=None,
+        provider_owner=None,
     ) -> ComposerResult:
-        del message, chat_messages, session_id, current_state_id, user_id, user_message_id, completion_gates
+        del message, chat_messages, session_id, current_state_id, user_id, user_message_id, completion_gates, budget_seconds
+        del required_work, provider_owner
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
@@ -517,278 +682,25 @@ class _ProgressAwareComposer:
         return ComposerResult(message=self.response_text, state=updated_state)
 
 
-class _ProgressRouteSessionService:
-    """Minimal async session service for progress route tests."""
+class _ProgressRouteSessionService(FencedSessionServiceHarness):
+    """Real isolated service with a pre-created session for progress proofs."""
 
-    def __init__(self, *, user_id: str = "alice", auth_provider_type: str = "local") -> None:
-        operation_engine = create_session_engine(
-            "sqlite:///:memory:",
-            poolclass=StaticPool,
-            connect_args={"check_same_thread": False},
-        )
-        initialize_session_schema(operation_engine)
-        with operation_engine.begin() as conn:
-            ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
-        self._engine = operation_engine
-        self.session_operation_authority = SQLiteLocalSessionOperationAuthority(operation_engine)
-        self.session_operation_owner_instance_id = f"progress-route-{uuid.uuid4()}"
-        self.session_operation_lease_seconds = 30
+    def __init__(self, engine: Engine, *, user_id: str, telemetry) -> None:
+        super().__init__(engine, telemetry=telemetry, log=structlog.get_logger("test"))
         self.session = self.session_operation_authority.create_session_with_initial_fence(
             user_id=user_id,
-            auth_provider_type=auth_provider_type,
+            auth_provider_type="local",
             title="Pipeline",
             owner_instance_id=self.session_operation_owner_instance_id,
             lease_seconds=self.session_operation_lease_seconds,
         )
-        self.messages: list[ChatMessageRecord] = []
-        self.current_state: CompositionStateRecord | None = None
-
-    async def get_session(self, session_id: uuid.UUID) -> SessionRecord:
-        if session_id != self.session.id:
-            raise ValueError("Session not found")
-        return self.session
-
-    async def get_current_state(self, session_id: uuid.UUID) -> CompositionStateRecord | None:
-        if session_id != self.session.id:
-            raise ValueError("Session not found")
-        return self.current_state
-
-    async def lookup_message_ingress(
-        self,
-        session_id: uuid.UUID,
-        *,
-        client_request_id: uuid.UUID,
-        content: str,
-        requested_state_id: uuid.UUID | None,
-        session_operation_context: SessionOperationContext,
-    ) -> None:
-        # The progress-route double accepts only fresh requests; this query
-        # remains empty so the route exercises its normal admission path.
-        assert session_id == self.session.id
-        assert session_operation_context.fence.session_id == str(session_id)
-        del client_request_id, content, requested_state_id
-        return None
-
-    async def add_message(
-        self,
-        session_id: uuid.UUID,
-        role: ChatMessageRole,
-        content: str,
-        *,
-        writer_principal: str,
-        tool_calls=None,
-        composition_state_id: uuid.UUID | None = None,
-        raw_content: str | None = None,
-        tool_call_id: str | None = None,
-        parent_assistant_id: uuid.UUID | None = None,
-        session_operation_context: SessionOperationContext | None = None,
-        session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
-    ) -> ChatMessageRecord:
-        del session_operation_context
-        del session_operation_kind
-        if session_id != self.session.id:
-            raise ValueError("Session not found")
-        message = ChatMessageRecord(
-            id=uuid.uuid4(),
-            session_id=session_id,
-            role=role,
-            content=content,
-            raw_content=raw_content,
-            tool_calls=tool_calls,
-            created_at=datetime.now(UTC),
-            composition_state_id=composition_state_id,
-            writer_principal=writer_principal,
-            tool_call_id=tool_call_id,
-            parent_assistant_id=parent_assistant_id,
-        )
-        self.messages.append(message)
-        return message
-
-    async def add_messages_atomic(
-        self,
-        session_id: uuid.UUID,
-        drafts: Sequence[AuditMessageDraft],
-        *,
-        writer_principal: str,
-        composition_state_id: uuid.UUID | None = None,
-        **_fenced_kwargs: object,
-    ) -> None:
-        # In-memory double: appending the cohort draft-by-draft is
-        # trivially atomic, mirroring the production single-transaction
-        # contract.
-        for draft in drafts:
-            await self.add_message(
-                session_id,
-                draft.role,
-                draft.content,
-                writer_principal=writer_principal,
-                tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
-                composition_state_id=composition_state_id,
-                tool_call_id=draft.tool_call_id,
-                parent_assistant_id=uuid.UUID(draft.parent_assistant_id) if draft.parent_assistant_id else None,
-            )
-
-    async def add_message_with_transcript(
-        self,
-        session_id: uuid.UUID,
-        role: ChatMessageRole,
-        content: str,
-        *,
-        client_request_id: uuid.UUID,
-        requested_state_id: uuid.UUID | None,
-        writer_principal: str,
-        tool_calls=None,
-        composition_state_id: uuid.UUID | None = None,
-        raw_content: str | None = None,
-        tool_call_id: str | None = None,
-        parent_assistant_id: uuid.UUID | None = None,
-        session_operation_context: SessionOperationContext,
-    ) -> MessageIngressFresh:
-        # In-memory double: append + snapshot are trivially one atomic
-        # step, mirroring the production single-transaction contract
-        # (transcript ends at the inserted record by construction).
-        del requested_state_id
-        record = await self.add_message(
-            session_id,
-            role,
-            content,
-            writer_principal=writer_principal,
-            tool_calls=tool_calls,
-            composition_state_id=composition_state_id,
-            raw_content=raw_content,
-            tool_call_id=tool_call_id,
-            parent_assistant_id=parent_assistant_id,
-            session_operation_context=session_operation_context,
-        )
-        record = replace(record, client_request_id=client_request_id)
-        self.messages[-1] = record
-        return MessageIngressFresh(client_request_id=client_request_id, message=record, transcript=tuple(self.messages))
-
-    async def get_messages(
-        self,
-        session_id: uuid.UUID,
-        limit: int | None = 100,
-        offset: int = 0,
-    ) -> list[ChatMessageRecord]:
-        if session_id != self.session.id:
-            raise ValueError("Session not found")
-        del offset
-        if limit is None:
-            return list(self.messages)
-        return list(self.messages[:limit])
-
-    async def save_composition_state(
-        self,
-        session_id: uuid.UUID,
-        data: CompositionStateData,
-        *,
-        provenance: CompositionStateProvenance,
-        session_operation_context: SessionOperationContext,
-    ) -> CompositionStateRecord:
-        assert session_operation_context.fence.session_id == str(session_id)
-        assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
-        if session_id != self.session.id:
-            raise ValueError("Session not found")
-        version = 1 if self.current_state is None else self.current_state.version + 1
-        # Stub records the provenance label so handler tests can assert on it
-        # (the production INSERT writes it to the ``provenance`` column under
-        # the ``ck_composition_states_provenance`` CHECK; the stub mirrors the
-        # contract through the ``last_save_provenance`` attribute).
-        self.last_save_provenance = provenance
-        record = CompositionStateRecord(
-            id=uuid.uuid4(),
-            session_id=session_id,
-            version=version,
-            source=None,
-            nodes=data.nodes,
-            edges=data.edges,
-            outputs=data.outputs,
-            metadata_=data.metadata_,
-            is_valid=data.is_valid,
-            validation_errors=data.validation_errors,
-            created_at=datetime.now(UTC),
-            derived_from_state_id=self.current_state.id if self.current_state is not None else None,
-            composer_meta=data.composer_meta,
-            sources=data.sources,
-        )
-        self.current_state = record
-        return record
-
-    async def commit_composition_response(
-        self,
-        *,
-        session_id: uuid.UUID,
-        expected_current_state_id: uuid.UUID | None,
-        state: CompositionStateData,
-        assistant_content: str,
-        raw_content: str | None,
-        session_operation_context: SessionOperationContext,
-    ) -> TransitionResponseSettlement:
-        current_id = self.current_state.id if self.current_state is not None else None
-        if current_id != expected_current_state_id:
-            raise AssertionError("progress-route stub received stale transition state")
-        record = await self.save_composition_state(
-            session_id,
-            state,
-            provenance="post_compose",
-            session_operation_context=session_operation_context,
-        )
-        message = await self.add_message(
-            session_id,
-            "assistant",
-            assistant_content,
-            raw_content=raw_content,
-            composition_state_id=record.id,
-            writer_principal="compose_loop",
-            session_operation_context=session_operation_context,
-        )
-        return TransitionResponseSettlement(state=record, message=message)
-
-    async def list_composition_proposals(
-        self,
-        session_id: uuid.UUID,
-        status: str | None = None,
-    ) -> list[Any]:
-        if session_id != self.session.id:
-            raise ValueError("Session not found")
-        del status
-        return []
 
 
-def _make_progress_route_app(
-    tmp_path: Path,
-    *,
-    user_id: str = "alice",
-) -> tuple[FastAPI, _ProgressRouteSessionService]:
-    app = FastAPI()
-    service = _ProgressRouteSessionService(user_id=user_id)
-    identity = UserIdentity(user_id=user_id, username=user_id)
-
-    async def mock_user():
-        return identity
-
-    app.dependency_overrides[get_current_user] = mock_user
-    wire_test_pipeline_user_authority(app, identity_id=user_id)
+def _make_progress_route_app(tmp_path: Path, *, user_id: str = "alice") -> tuple[FastAPI, _ProgressRouteSessionService]:
+    app, _ = _make_app(tmp_path, user_id=user_id)
+    service = _ProgressRouteSessionService(app.state.session_engine, user_id=user_id, telemetry=app.state.sessions_telemetry)
     app.state.session_service = service
-    app.state.settings = WebSettings(
-        data_dir=tmp_path,
-        composer_max_composition_turns=15,
-        composer_max_discovery_turns=10,
-        composer_timeout_seconds=85.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
-    app.state.payload_store = FilesystemPayloadStore(app.state.settings.get_payload_store_path())
-    app.state.composer_service = None
-    app.state.interpretation_surfacing = SimpleNamespace(
-        surface_pending_interpretation_reviews=AsyncMock(spec=InterpretationSurfacing.surface_pending_interpretation_reviews)
-    )
-    app.state.rate_limiter = ComposerRateLimiter(limit=100)
-    app.state.execution_service = _ExecutionServiceStub()
-    app.state.composer_progress_registry = ComposerProgressRegistry()
-    app.state.scoped_secret_resolver = None
-    _install_restricted_plugin_policy(app)
-    app.include_router(create_session_router())
+    install_composer_async_worker(app)
     return app, service
 
 
@@ -800,11 +712,9 @@ def _make_app(
     quota_enabled: bool = False,
 ) -> tuple[FastAPI, SessionServiceImpl]:
     """Create a test app with session routes and a mock auth user."""
-    engine = create_session_engine(
-        "sqlite:///:memory:",
-        poolclass=StaticPool,
-        connect_args={"check_same_thread": False},
-    )
+    # Detached workers and lease renewals use independent connections.
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    engine = create_session_engine(f"sqlite:///{tmp_path / 'route-sessions.db'}")
     _APP_SESSION_ENGINES.append(engine)
     initialize_session_schema(engine)
     with engine.begin() as conn:
@@ -879,11 +789,14 @@ def _make_app(
     # composer_service is set to None here; tests that POST messages
     # must replace it with a mock before sending requests.
     app.state.composer_service = None
-    app.state.interpretation_surfacing = SimpleNamespace(
-        surface_pending_interpretation_reviews=AsyncMock(spec=InterpretationSurfacing.surface_pending_interpretation_reviews)
+    app.state.interpretation_surfacing = InterpretationSurfacing(
+        sessions_service=service,
+        per_term_cap=app.state.settings.composer_interpretation_rate_limit_per_term,
+        per_session_day_cap=app.state.settings.composer_interpretation_rate_limit_per_session_day,
+        model_identifier="planner-model",
+        provider="test",
+        composer_skill_hash=stable_hash("planner-skill"),
     )
-
-    from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.composer_progress_registry = ComposerProgressRegistry()
@@ -914,6 +827,7 @@ def _make_app(
 
     router = create_session_router()
     app.include_router(router)
+    install_composer_async_worker(app)
 
     return app, service
 
@@ -936,7 +850,7 @@ def _install_restricted_plugin_policy(app: FastAPI, *hidden: PluginId) -> Plugin
     profile_registry = MagicMock(spec=OperatorProfileRegistry)
     profile_registry.public_schema.side_effect = lambda _plugin_id, full_schema, *, available_aliases: full_schema
     app.state.operator_profile_registry = profile_registry
-    app.state.plugin_snapshot_factory = lambda _user: snapshot
+    app.state.plugin_snapshot_factory = StaticPluginSnapshotFactory(snapshot)
     return snapshot
 
 
@@ -979,18 +893,44 @@ def test_list_proposals_is_session_scoped(test_client) -> None:
 
 def test_send_message_response_includes_empty_proposals_array(tmp_path) -> None:
     mock_composer = _make_composer_mock(response_text="Got it!")
-    app, _service = _make_app(tmp_path)
+    from sqlalchemy import select
+
+    from elspeth.web.sessions.models import token_usage_ledger_table
+
+    app, service = _make_app(tmp_path)
+    phases: list[tuple[bool, int]] = []
+    original_cohort = service._write_audit_cohort_on_connection
+
+    def observed_cohort(conn: Any, **kwargs: Any):
+        phases.append((kwargs["audit_only"], len(kwargs["drafts"])))
+        return original_cohort(conn, **kwargs)
+
+    service._write_audit_cohort_on_connection = observed_cohort
     app.state.composer_service = mock_composer
     client = TestClient(app)
     session = client.post("/api/sessions", json={"title": "Chat"}).json()
 
-    response = client.post(
-        f"/api/sessions/{session['id']}/messages",
-        json={"content": "Hello", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session['id']}/messages",
+        body=message_body("Hello"),
     )
 
     assert response.status_code == 200
     assert response.json()["proposals"] == []
+    mock_composer.compose.assert_awaited_once()
+    assert phases == [(False, 0)]
+    messages = asyncio.run(service.get_messages(uuid.UUID(session["id"]), limit=None))
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert _llm_call_audit_rows(messages) == []
+    with service._engine.connect() as connection:
+        ledger = connection.execute(
+            select(token_usage_ledger_table.c.entry_id).where(
+                token_usage_ledger_table.c.session_id == session["id"],
+            )
+        ).all()
+    assert ledger == []
 
 
 def test_send_message_keeps_assistant_reply_when_auto_title_transport_fails(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1013,16 +953,19 @@ def test_send_message_keeps_assistant_reply_when_auto_title_transport_fails(tmp_
         log=structlog.get_logger("test"),
     )
     app.state.session_engine = engine
+    install_composer_async_worker(app)
     app.state.composer_service = _make_composer_mock(response_text="Here is your answer.")
     client = TestClient(app)
     session = client.post("/api/sessions", json={}).json()
 
-    response = client.post(
-        f"/api/sessions/{session['id']}/messages",
-        json={"content": "Build a CSV pipeline", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session['id']}/messages",
+        body=message_body("Build a CSV pipeline"),
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.json()
     assert response.json()["message"]["content"] == "Here is your answer."
     assert "private upstream response body" not in response.text
     messages = client.get(f"/api/sessions/{session['id']}/messages")
@@ -1057,12 +1000,14 @@ def test_send_message_response_includes_pending_proposals_created_during_compose
     client = TestClient(app)
     session = client.post("/api/sessions", json={"title": "Atomic proposals"}).json()
 
-    response = client.post(
-        f"/api/sessions/{session['id']}/messages",
-        json={"content": "Build a csv pipeline", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session['id']}/messages",
+        body=message_body("Build a csv pipeline"),
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.json()
     body = response.json()
     assert body["message"]["content"] == "Needs approval."
     assert body["proposals"][0]["tool_call_id"] == "call_set_pipeline"
@@ -1287,7 +1232,7 @@ def test_accept_failed_proposal_uses_only_the_rejection_detail(tmp_path, monkeyp
     assert persisted.status == "rejected"
 
 
-async def _create_canonical_pipeline_route_proposal(
+async def _prepare_canonical_pipeline_route_proposal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1381,10 +1326,9 @@ async def _create_canonical_pipeline_route_proposal(
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
     )
-    row = await _create_test_pipeline_composition_proposal(
-        service,
-        session_id=session_id,
-        plan=PipelinePlanResult(
+    creation = {
+        "session_id": session_id,
+        "plan": PipelinePlanResult(
             proposal=proposal,
             tool_call_id=tool_call_id,
             custody_result="not_required",
@@ -1392,22 +1336,75 @@ async def _create_canonical_pipeline_route_proposal(
             model_version="planner-model-v1",
             provider="test",
         ),
-        summary="Replace the pipeline.",
-        rationale="Requested by the operator.",
-        affects=("graph", "validation"),
-        arguments_redacted_json=redact_tool_call_arguments(
+        "summary": "Replace the pipeline.",
+        "rationale": "Requested by the operator.",
+        "affects": ("graph", "validation"),
+        "arguments_redacted_json": redact_tool_call_arguments(
             "set_pipeline",
             pipeline,
             telemetry=NoopRedactionTelemetry(),
         ),
-        actor="composer-web:user:alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-        user_message_id=origin_message.id if origin_message is not None else None,
+        "actor": "composer-web:user:alice",
+        "composer_model_identifier": "planner-model",
+        "composer_model_version": "planner-model-v1",
+        "composer_provider": "provider",
+        "user_message_id": origin_message.id if origin_message is not None else None,
+    }
+    return app, service, pipeline, session_id, creation, ""
+
+
+async def _create_canonical_pipeline_route_proposal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tool_call_id: str,
+    origin_text: str | None = None,
+    prior_text: str | None = None,
+    with_review_site: bool = False,
+) -> tuple[FastAPI, SessionServiceImpl, dict[str, Any], uuid.UUID, Any, str]:
+    prepared = await _prepare_canonical_pipeline_route_proposal(
+        tmp_path,
+        monkeypatch,
+        tool_call_id=tool_call_id,
+        origin_text=origin_text,
+        prior_text=prior_text,
+        with_review_site=with_review_site,
     )
-    endpoint = f"/api/sessions/{session.id}/proposals/{row.id}/accept"
-    return app, service, pipeline, session_id, row, endpoint
+    app, service, pipeline, session_id, creation, _ = prepared
+    row = await _create_test_pipeline_composition_proposal(service, **creation)
+    return app, service, pipeline, session_id, row, f"/api/sessions/{session_id}/proposals/{row.id}/accept"
+
+
+async def _create_running_pipeline_route_proposal(service: SessionServiceImpl, creation: dict[str, Any], compose_arguments: dict[str, Any]):
+    from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
+    from elspeth.web.sessions.protocol import CompositionProposalRecord
+
+    binding = compose_arguments["required_work"]
+    assert type(binding) is RequiredWorkBinding
+    context = compose_arguments["session_operation_context"]
+    binding.validate_context(context)
+    sql, projection = binding.reserve_pair(RequiredWorkSource.PROPOSAL_CREATION_SQL, RequiredWorkSource.PROPOSAL_CREATION_PROJECTION)
+    try:
+        row = await service.create_pipeline_composition_proposal(
+            **{**creation, "user_message_id": uuid.UUID(compose_arguments["user_message_id"])},
+            session_operation_context=context,
+            required_work=sql,
+        )
+    except BaseException:
+        if sql.complete:
+            projection.complete_without_submission()
+        raise
+    projection.begin_projection()
+    try:
+        assert type(row) is CompositionProposalRecord
+        assert row.session_id == creation["session_id"]
+        assert row.tool_call_id == creation["plan"].tool_call_id
+        assert str(row.user_message_id) == compose_arguments["user_message_id"]
+    except BaseException as error:
+        projection.complete_owned(error)
+        raise
+    projection.complete_owned()
+    return row
 
 
 @pytest.mark.asyncio
@@ -1611,21 +1608,23 @@ async def test_cancel_after_pipeline_commit_still_surfaces_durable_review_eviden
     monkeypatch: pytest.MonkeyPatch,
     automatic: bool,
     cancel_during_surface: bool,
+    durable_stop: bool = False,
 ) -> None:
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-    from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
     from elspeth.web.composer.protocol import ComposerResult, PipelineCommitIntent
     from elspeth.web.plugin_policy.availability import build_plugin_snapshot
     from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
     from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
 
-    app, service, _pipeline, session_id, proposal, accept_endpoint = await _create_canonical_pipeline_route_proposal(
+    app, service, _pipeline, session_id, creation, _ = await _prepare_canonical_pipeline_route_proposal(
         tmp_path,
         monkeypatch,
         tool_call_id="review-site-postcommit-cancel",
         with_review_site=True,
     )
-    assert proposal.pipeline_metadata is not None
+    proposals_created = []
+    if not automatic:
+        proposals_created.append(await _create_test_pipeline_composition_proposal(service, **creation))
     app.state.settings = WebSettings.model_validate(
         {
             **app.state.settings.model_dump(mode="python"),
@@ -1668,98 +1667,157 @@ async def test_cancel_after_pipeline_commit_still_surfaces_durable_review_eviden
         generation_key=b"proposal-review-custody-test-key",
     )
     app.state.operator_profile_registry = profile_registry
-    app.state.plugin_snapshot_factory = lambda _user: snapshot
-    surfaced = asyncio.Event()
-    surface_started = asyncio.Event()
-    release_surface = asyncio.Event()
-
-    async def surface_reviews(
-        state: CompositionState,
-        *,
-        session_id: str,
-        current_state_id: str,
-        session_operation_context: SessionOperationContext,
-    ) -> None:
-        if cancel_during_surface:
-            surface_started.set()
-            await release_surface.wait()
-        await surface_pending_interpretation_reviews_for_state(
-            state,
-            sessions_service=service,
-            session_id=session_id,
-            current_state_id=current_state_id,
-            surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
-            model_identifier="planner-model",
-            model_version="planner-model-v1",
-            provider="test",
-            composer_skill_hash=stable_hash("planner-skill"),
-            session_operation_context=session_operation_context,
-        )
-        surfaced.set()
-
-    composer = SimpleNamespace(surface_pending_interpretation_reviews=surface_reviews)
-    app.state.interpretation_surfacing = composer
+    app.state.plugin_snapshot_factory = StaticPluginSnapshotFactory(snapshot)
+    composer = SimpleNamespace()
     if automatic:
-        composer.compose = AsyncMock(
-            spec=ComposerService.compose,
-            return_value=ComposerResult(
+
+        async def compose_pipeline(*args: Any, **kwargs: Any) -> ComposerResult:
+            proposal = await _create_running_pipeline_route_proposal(service, creation, kwargs)
+            proposals_created.append(proposal)
+            assert proposal.pipeline_metadata is not None
+            return ComposerResult(
                 message="Pipeline prepared.",
                 state=_EMPTY_STATE,
                 repair_turns_used=2,
-                pipeline_commit_intent=PipelineCommitIntent(
-                    proposal_id=proposal.id,
-                    draft_hash=proposal.pipeline_metadata.draft_hash,
-                ),
-            ),
+                pipeline_commit_intent=PipelineCommitIntent(proposal_id=proposal.id, draft_hash=proposal.pipeline_metadata.draft_hash),
+            )
+
+        composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=compose_pipeline,
         )
     app.state.composer_service = composer
-    original_settle = service.settle_pipeline_composition_proposal
+    from elspeth.web.sessions import composer_async_worker
+    from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED, COMPOSER_SHUTDOWN, ComposerOperationCancelledDuringTurn
+
+    owners: list[asyncio.Task] = []
+    escaped: list[BaseException] = []
+    real_turn = composer_async_worker.run_composer_turn
+
+    async def capture_owner(*args: Any, **kwargs: Any) -> Any:
+        owner = asyncio.current_task()
+        assert owner is not None
+        owners.append(owner)
+        try:
+            return await real_turn(*args, **kwargs)
+        except BaseException as exc:
+            escaped.append(exc)
+            raise
+
+    monkeypatch.setattr(composer_async_worker, "run_composer_turn", capture_owner)
+    from elspeth.web.required_work import RequiredWorkSource
+    from elspeth.web.sessions import service as service_module
+
+    original_settle = service.settle_pipeline_composition_proposal_finish_once
+    original_sql = service_module.run_required_sql_finish_once
     committed = asyncio.Event()
     release_result = asyncio.Event()
+    sql_finished = threading.Event()
+    release_sql = threading.Event()
+
+    async def pause_finished_sql(ticket: Any, func: Any, *args: Any, **kwargs: Any):
+        if ticket.key.source is not RequiredWorkSource.PIPELINE_PUBLICATION_SQL or not cancel_during_surface:
+            return await original_sql(ticket, func, *args, **kwargs)
+
+        def finish_then_pause():
+            result = func(*args, **kwargs)
+            sql_finished.set()
+            if not release_sql.wait(10):
+                raise TimeoutError("test did not release committed publication SQL")
+            return result
+
+        return await original_sql(ticket, finish_then_pause)
 
     async def settle_then_pause(**kwargs: Any):
         result = await original_settle(**kwargs)
+        from elspeth.web.sessions.pipeline_finish_once import ComposerPipelineBusinessReturned
+
+        if isinstance(result, ComposerPipelineBusinessReturned):
+            print(
+                "publication_fixture_witness",
+                {
+                    "proposal_id": str(result.result.proposal.id),
+                    "proposal_session": str(result.result.proposal.session_id),
+                    "status": result.result.proposal.status,
+                    "committed_state": str(result.result.proposal.committed_state_id),
+                    "state_id": str(result.result.state.id),
+                    "accepted_state_present": result.result.accepted_state is not None,
+                    "transition_message_present": result.result.transition_message is not None,
+                    "assistant_requested": "transition_assistant" in kwargs and kwargs["transition_assistant"] is not None,
+                },
+            )
         committed.set()
         if not cancel_during_surface:
             await release_result.wait()
         return result
 
-    monkeypatch.setattr(service, "settle_pipeline_composition_proposal", settle_then_pause)
+    monkeypatch.setattr(service_module, "run_required_sql_finish_once", pause_finished_sql)
+    monkeypatch.setattr(service, "settle_pipeline_composition_proposal_finish_once", settle_then_pause)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         if automatic:
-            request_task = asyncio.create_task(
-                client.post(
-                    f"/api/sessions/{session_id}/messages",
-                    json={"content": "Build the pipeline.", "client_request_id": str(uuid.uuid4())},
-                )
+            admitted = await client.post(
+                f"/api/sessions/{session_id}/messages",
+                json=message_body(
+                    "Build the pipeline.",
+                    state_id=await current_head_state_id(client, str(session_id)),
+                ),
             )
+            assert admitted.status_code == 202
+            poll_path = f"/api/sessions/{session_id}/operations/{admitted.json()['operation_id']}"
+            request_task = asyncio.create_task(app.state.composer_async_worker.run_until_idle())
         else:
+            (proposal,) = proposals_created
+            assert proposal.pipeline_metadata is not None
+            accept_endpoint = f"/api/sessions/{session_id}/proposals/{proposal.id}/accept"
             request_task = asyncio.create_task(client.post(accept_endpoint, json={"draft_hash": proposal.pipeline_metadata.draft_hash}))
-        gate = surface_started if cancel_during_surface else committed
-        gate_waiter = asyncio.create_task(gate.wait())
+        gate_waiter = asyncio.create_task(run_sync_in_worker(sql_finished.wait, 10) if cancel_during_surface else committed.wait())
         done, _ = await asyncio.wait({gate_waiter, request_task}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
         assert gate_waiter in done, (
-            f"pipeline did not reach cancellation gate: {request_task.result().text if request_task.done() else 'pending'}"
+            f"pipeline did not reach cancellation gate: {request_task.exception() if request_task.done() else 'pending'}"
         )
         gate_waiter.cancel()
-        request_task.cancel()
-        request_task.cancel()
-        if cancel_during_surface:
-            release_surface.set()
+        if automatic:
+            if durable_stop:
+                cancellation = await client.post(f"{poll_path}/cancel")
+                assert cancellation.status_code in (200, 202)
+            assert len(owners) == 1
+            marker = COMPOSER_CANCEL_REQUESTED if durable_stop else COMPOSER_SHUTDOWN
+            owners[0].cancel(marker)
+            owners[0].cancel(marker)
         else:
-            release_result.set()
-        with pytest.raises(asyncio.CancelledError):
+            request_task.cancel()
+            request_task.cancel()
+        release_sql.set()
+        release_result.set()
+        if automatic:
             await asyncio.wait_for(request_task, timeout=10)
+            final = await client.get(poll_path)
+            assert final.status_code == 200
+            assert len(escaped) == 1
+            if durable_stop:
+                assert final.json()["status"] == "failed"
+                assert SettledComposerOperation(admitted, final).error()[0] == 499
+                assert isinstance(escaped[0], ComposerOperationCancelledDuringTurn)
+            else:
+                assert final.json()["status"] == "completed"
+                assert isinstance(escaped[0], asyncio.CancelledError)
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request_task, timeout=10)
         if not automatic:
             replay = await client.post(accept_endpoint, json={"draft_hash": proposal.pipeline_metadata.draft_hash})
             assert replay.status_code == 200, replay.text
 
+    (proposal,) = proposals_created
     persisted = await service.get_authoritative_composition_proposal(
         session_id=session_id,
         proposal_id=proposal.id,
     )
     assert persisted.row.status == "committed"
-    assert surfaced.is_set()
+    assert committed.is_set()
+    assert len(await service.list_composition_proposals(session_id)) == 1
+    if automatic:
+        composer.compose.assert_awaited_once()
     events = await service.list_interpretation_events(session_id, status="pending")
     assert len(events) == 1
     assert events[0].kind is InterpretationKind.LLM_PROMPT_TEMPLATE
@@ -1777,12 +1835,6 @@ def test_manual_canonical_pipeline_accept_records_origin_chat_ingress(tmp_path, 
         )
     )
     app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
-    app.state.interpretation_surfacing = SimpleNamespace(
-        surface_pending_interpretation_reviews=AsyncMock(
-            spec=InterpretationSurfacing.surface_pending_interpretation_reviews,
-            return_value=None,
-        )
-    )
     assert row.pipeline_metadata is not None
 
     response = TestClient(app).post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
@@ -1808,12 +1860,6 @@ def test_manual_pipeline_accept_retains_prior_chat_paste(tmp_path, monkeypatch: 
         )
     )
     app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
-    app.state.interpretation_surfacing = SimpleNamespace(
-        surface_pending_interpretation_reviews=AsyncMock(
-            spec=InterpretationSurfacing.surface_pending_interpretation_reviews,
-            return_value=None,
-        )
-    )
     assert row.pipeline_metadata is not None
 
     response = TestClient(app).post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
@@ -1828,17 +1874,20 @@ def test_manual_pipeline_accept_retains_prior_chat_paste(tmp_path, monkeypatch: 
 
 
 def test_send_message_auto_commit_settles_exact_pipeline_intent(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    app, service, _pipeline, session_id, row, _endpoint = asyncio.run(
-        _create_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="send-auto-pipeline")
+    app, service, _pipeline, session_id, creation, _endpoint = asyncio.run(
+        _prepare_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="send-auto-pipeline")
     )
-    assert row.pipeline_metadata is not None
+    created_proposals = []
     composer = SimpleNamespace()
     app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
         spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
     )
-    composer.compose = AsyncMock(
-        spec=ComposerService.compose,
-        return_value=ComposerResult(
+
+    async def compose_pipeline(*_args, **kwargs):
+        row = await _create_running_pipeline_route_proposal(service, creation, kwargs)
+        created_proposals.append(row)
+        assert row.pipeline_metadata is not None
+        return ComposerResult(
             message="Pipeline prepared.",
             state=_EMPTY_STATE,
             repair_turns_used=2,
@@ -1846,22 +1895,28 @@ def test_send_message_auto_commit_settles_exact_pipeline_intent(tmp_path, monkey
                 proposal_id=row.id,
                 draft_hash=row.pipeline_metadata.draft_hash,
             ),
-        ),
-    )
+        )
+
+    composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=compose_pipeline)
     app.state.composer_service = composer
     client = TestClient(app)
 
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": "Build the pipeline.", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Build the pipeline.", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
     )
 
     assert response.status_code == 200
+    (row,) = created_proposals
+    composer.compose.assert_awaited_once()
     body = response.json()
     assert body["state"] is not None
     assert body["proposals"] == []
     settled = asyncio.run(service.list_composition_proposals(session_id))
     assert len(settled) == 1
+    assert settled[0].id == row.id
     assert settled[0].status == "committed"
     assert settled[0].committed_state_id == uuid.UUID(body["state"]["id"])
     current_state = asyncio.run(service.get_current_state(session_id))
@@ -1894,16 +1949,18 @@ def test_send_message_auto_commit_lands_on_review_when_trust_revoked_before_sett
     """
     from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
 
-    app, service, _pipeline, session_id, row, _endpoint = asyncio.run(
-        _create_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="send-auto-revoked-pipeline")
+    app, service, _pipeline, session_id, creation, _endpoint = asyncio.run(
+        _prepare_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="send-auto-revoked-pipeline")
     )
-    assert row.pipeline_metadata is not None
+    created_proposals = []
     composer = SimpleNamespace()
     app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
         spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
     )
 
     async def _compose_then_downgrade(*_args, **_kwargs) -> ComposerResult:
+        row = await _create_running_pipeline_route_proposal(service, creation, _kwargs)
+        created_proposals.append(row)
         # The user's downgrade becomes durable while the compose turn is
         # still in flight — after intent minting, before settlement.
         await service.update_composer_preferences(
@@ -1927,12 +1984,16 @@ def test_send_message_auto_commit_lands_on_review_when_trust_revoked_before_sett
     app.state.composer_service = composer
     client = TestClient(app)
 
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": "Build the pipeline.", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Build the pipeline.", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
     )
 
     assert response.status_code == 200
+    (row,) = created_proposals
+    composer.compose.assert_awaited_once()
     body = response.json()
     assert body["state"] is None
     assert len(body["proposals"]) == 1
@@ -1949,41 +2010,63 @@ def test_send_message_auto_commit_lands_on_review_when_trust_revoked_before_sett
 async def test_cancelled_auto_commit_persists_concurrent_trust_revocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    durable_stop: bool = False,
 ) -> None:
     """Cancellation cannot erase a revocation detected by settlement."""
-    app, service, _pipeline, session_id, row, _endpoint = await _create_canonical_pipeline_route_proposal(
+    app, service, _pipeline, session_id, creation, _ = await _prepare_canonical_pipeline_route_proposal(
         tmp_path,
         monkeypatch,
         tool_call_id="send-auto-cancelled-revocation",
     )
-    assert row.pipeline_metadata is not None
+    proposals_created = []
     composer = SimpleNamespace()
-    app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
-        spec=InterpretationSurfacing.surface_pending_interpretation_reviews,
-        return_value=None,
-    )
-    composer.compose = AsyncMock(
-        spec=ComposerService.compose,
-        return_value=ComposerResult(
+
+    async def compose_pipeline(*args: Any, **kwargs: Any) -> ComposerResult:
+        row = await _create_running_pipeline_route_proposal(service, creation, kwargs)
+        proposals_created.append(row)
+        assert row.pipeline_metadata is not None
+        return ComposerResult(
             message="Pipeline prepared.",
             state=_EMPTY_STATE,
             repair_turns_used=0,
-            pipeline_commit_intent=PipelineCommitIntent(
-                proposal_id=row.id,
-                draft_hash=row.pipeline_metadata.draft_hash,
-            ),
-        ),
+            pipeline_commit_intent=PipelineCommitIntent(proposal_id=row.id, draft_hash=row.pipeline_metadata.draft_hash),
+        )
+
+    composer.compose = AsyncMock(
+        spec=ComposerService.compose,
+        side_effect=compose_pipeline,
     )
     app.state.composer_service = composer
 
+    from elspeth.web.sessions import composer_async_worker
+    from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED, COMPOSER_SHUTDOWN, ComposerOperationCancelledDuringTurn
+
+    owners: list[asyncio.Task] = []
+    escaped: list[BaseException] = []
+    real_turn = composer_async_worker.run_composer_turn
+
+    async def capture_owner(*args: Any, **kwargs: Any) -> Any:
+        owner = asyncio.current_task()
+        assert owner is not None
+        owners.append(owner)
+        try:
+            return await real_turn(*args, **kwargs)
+        except BaseException as exc:
+            escaped.append(exc)
+            raise
+
+    monkeypatch.setattr(composer_async_worker, "run_composer_turn", capture_owner)
     settlement_worker_started = threading.Event()
     release_settlement_worker = threading.Event()
     settlement_worker_finished = threading.Event()
-    original_run_sync = service._run_sync  # type: ignore[attr-defined]
+    from elspeth.web.required_work import RequiredWorkSource
+    from elspeth.web.sessions import service as service_module
 
-    async def pause_settlement_worker(func: Any, *args: Any, **kwargs: Any) -> Any:
-        if "settle_pipeline_composition_proposal.<locals>._sync" not in func.__qualname__:
-            return await original_run_sync(func, *args, **kwargs)
+    original_sql = service_module.run_required_sql_finish_once
+
+    async def pause_settlement_worker(ticket: Any, func: Any, *args: Any, **kwargs: Any) -> Any:
+        if ticket.key.source is not RequiredWorkSource.PIPELINE_PUBLICATION_SQL:
+            return await original_sql(ticket, func, *args, **kwargs)
 
         def paused_settlement() -> Any:
             settlement_worker_started.set()
@@ -1994,16 +2077,20 @@ async def test_cancelled_auto_commit_persists_concurrent_trust_revocation(
             finally:
                 settlement_worker_finished.set()
 
-        return await original_run_sync(paused_settlement)
+        return await original_sql(ticket, paused_settlement)
 
-    monkeypatch.setattr(service, "_run_sync", pause_settlement_worker)
+    monkeypatch.setattr(service_module, "run_required_sql_finish_once", pause_settlement_worker)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        request_task = asyncio.create_task(
-            client.post(
-                f"/api/sessions/{session_id}/messages",
-                json={"content": "Build the pipeline.", "client_request_id": str(uuid.uuid4())},
-            )
+        admitted = await client.post(
+            f"/api/sessions/{session_id}/messages",
+            json=message_body(
+                "Build the pipeline.",
+                state_id=await current_head_state_id(client, str(session_id)),
+            ),
         )
+        assert admitted.status_code == 202
+        poll_path = f"/api/sessions/{session_id}/operations/{admitted.json()['operation_id']}"
+        request_task = asyncio.create_task(app.state.composer_async_worker.run_until_idle())
         assert await run_sync_in_worker(settlement_worker_started.wait, 5.0), "settlement worker did not start"
         await service.update_composer_preferences(
             session_id,
@@ -2011,16 +2098,31 @@ async def test_cancelled_auto_commit_persists_concurrent_trust_revocation(
             density_default="high",
             actor="user:alice",
         )
-        request_task.cancel()
+        if durable_stop:
+            cancellation = await client.post(f"{poll_path}/cancel")
+            assert cancellation.status_code in (200, 202)
+        assert len(owners) == 1
+        owners[0].cancel(COMPOSER_CANCEL_REQUESTED if durable_stop else COMPOSER_SHUTDOWN)
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        cancellation_escaped_before_worker = request_task.done()
+        cancellation_escaped_before_worker = owners[0].done()
         release_settlement_worker.set()
         assert await run_sync_in_worker(settlement_worker_finished.wait, 5.0), "settlement worker did not finish"
 
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(request_task, timeout=5.0)
+        await asyncio.wait_for(request_task, timeout=5.0)
+        final = await client.get(poll_path)
+        assert final.status_code == 200
+        assert len(escaped) == 1
+        if durable_stop:
+            assert final.json()["status"] == "failed"
+            assert SettledComposerOperation(admitted, final).error()[0] == 499
+            assert isinstance(escaped[0], ComposerOperationCancelledDuringTurn)
+        else:
+            assert final.json()["status"] == "completed"
+            assert isinstance(escaped[0], asyncio.CancelledError)
 
+    (row,) = proposals_created
+    composer.compose.assert_awaited_once()
     assert not cancellation_escaped_before_worker, "request cancellation escaped while settlement was still in flight"
     assert await service.get_current_state(session_id) is None
     proposals = await service.list_composition_proposals(session_id)
@@ -2035,10 +2137,21 @@ async def test_cancelled_auto_commit_persists_concurrent_trust_revocation(
     assert recovery.binding.status is ComposerToolStatus.SUCCESS
     events = [event for event in await service.list_proposal_events(session_id) if event.proposal_id == row.id]
     assert [event.event_type for event in events] == ["proposal.created", "auto_commit.revoked"]
-    assert dict(events[-1].payload) == {
-        "required_trust_mode": "auto_commit",
-        "current_trust_mode": "explicit_approve",
-    }
+    from elspeth.web.sessions.pipeline_settlement_payloads import ComposerRevocationEvidence, PipelineDispatchEvidence
+
+    assert authority.composer_operation is not None
+    assert row.user_message_id is not None
+    expected_revocation = ComposerRevocationEvidence(
+        schema="auto_commit.revoked.v2",
+        required_trust_mode="auto_commit",
+        current_trust_mode="explicit_approve",
+        composer_operation=authority.composer_operation,
+        proposal_id=str(row.id),
+        user_message_id=str(row.user_message_id),
+        tool_call_id=row.tool_call_id,
+        dispatch=PipelineDispatchEvidence.model_validate(recovery.binding.to_dict()),
+    )
+    assert ComposerRevocationEvidence.model_validate(deep_thaw(events[-1].payload)) == expected_revocation
 
 
 def test_send_message_explicit_approval_leaves_canonical_pipeline_pending(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2065,9 +2178,11 @@ def test_send_message_explicit_approval_leaves_canonical_pipeline_pending(tmp_pa
     app.state.composer_service = composer
     client = TestClient(app)
 
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": "Build the pipeline.", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Build the pipeline.", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
     )
 
     assert response.status_code == 200
@@ -2080,8 +2195,8 @@ def test_send_message_explicit_approval_leaves_canonical_pipeline_pending(tmp_pa
 
 
 def test_recompose_auto_commit_uses_shared_pipeline_settlement(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    app, service, _pipeline, session_id, row, _endpoint = asyncio.run(
-        _create_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="recompose-auto-pipeline")
+    app, service, _pipeline, session_id, creation, _endpoint = asyncio.run(
+        _prepare_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="recompose-auto-pipeline")
     )
     asyncio.run(
         service.add_message(
@@ -2091,14 +2206,17 @@ def test_recompose_auto_commit_uses_shared_pipeline_settlement(tmp_path, monkeyp
             writer_principal="route_user_message",
         )
     )
-    assert row.pipeline_metadata is not None
+    created_proposals = []
     composer = SimpleNamespace()
     app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
         spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
     )
-    composer.compose = AsyncMock(
-        spec=ComposerService.compose,
-        return_value=ComposerResult(
+
+    async def compose_pipeline(*_args, **kwargs):
+        row = await _create_running_pipeline_route_proposal(service, creation, kwargs)
+        created_proposals.append(row)
+        assert row.pipeline_metadata is not None
+        return ComposerResult(
             message="Pipeline prepared.",
             state=_EMPTY_STATE,
             repair_turns_used=1,
@@ -2106,18 +2224,25 @@ def test_recompose_auto_commit_uses_shared_pipeline_settlement(tmp_path, monkeyp
                 proposal_id=row.id,
                 draft_hash=row.pipeline_metadata.draft_hash,
             ),
-        ),
-    )
+        )
+
+    composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=compose_pipeline)
     app.state.composer_service = composer
     client = TestClient(app)
 
-    response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+    response = _settled_composer_response(
+        client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+    )
 
     assert response.status_code == 200
+    (row,) = created_proposals
+    composer.compose.assert_awaited_once()
     body = response.json()
     assert body["state"] is not None
     assert body["proposals"] == []
     settled = asyncio.run(service.list_composition_proposals(session_id))
+    assert len(settled) == 1
+    assert settled[0].id == row.id
     assert settled[0].status == "committed"
     current_state = asyncio.run(service.get_current_state(session_id))
     assert current_state is not None
@@ -2444,29 +2569,91 @@ async def test_canonical_pipeline_cancel_then_settlement_failure_preserves_cance
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from elspeth.web.required_sql_outcomes import RequiredSQLRaised
+    from elspeth.web.required_work import PublicationProjectionDisposition, RequiredWorkSource
+    from elspeth.web.sessions.pipeline_finish_once import ComposerPipelineRaised
+    from elspeth.web.sessions.routes.composer import pipeline_settlement
+    from elspeth.web.sessions.routes.composer import proposals as proposal_routes
+
     app, service, _pipeline, session_id, row, endpoint = await _create_canonical_pipeline_route_proposal(
         tmp_path,
         monkeypatch,
         tool_call_id="canonical-cancel-settlement-call",
     )
-    settle_started = asyncio.Event()
-    settle_release = asyncio.Event()
+    settle_started = threading.Event()
+    settle_release = threading.Event()
+    original_failure = RuntimeError("settlement failed")
+    delivered_cancellations = []
+    handoffs = []
+    projection_tickets = []
+    observed_order = []
+    original_retain = pipeline_settlement._DeferredCancellationState.retain
+    original_settle = service.settle_pipeline_composition_proposal_finish_once
+    original_close = proposal_routes._close_proposal_lease_before_commit
 
-    async def fail_settlement(**_kwargs: Any):
+    def observe_cancellation(state, error):
+        if all(error is not retained for retained in delivered_cancellations):
+            delivered_cancellations.append(error)
+        original_retain(state, error)
+
+    async def observe_settlement(**kwargs):
+        handoff = await original_settle(**kwargs)
+        handoffs.append(handoff)
+        projection_tickets.append(kwargs["publication_projection_work"])
+        observed_order.append("service_handoff")
+        return handoff
+
+    async def observe_close(lease, *, primary):
+        assert len(handoffs) == 1
+        assert projection_tickets[0].complete
+        assert type(primary) is BaseExceptionGroup
+        observed_order.append("lease_close")
+        return await original_close(lease, primary=primary)
+
+    monkeypatch.setattr(pipeline_settlement._DeferredCancellationState, "retain", observe_cancellation)
+    monkeypatch.setattr(service, "settle_pipeline_composition_proposal_finish_once", observe_settlement)
+    monkeypatch.setattr(proposal_routes, "_close_proposal_lease_before_commit", observe_close)
+
+    def fail_settlement(**_kwargs: Any):
         settle_started.set()
-        await settle_release.wait()
-        raise RuntimeError("settlement failed")
+        if not settle_release.wait(5):
+            raise TimeoutError("test did not release actual publication SQL")
+        observed_order.append("physical_sql_failure")
+        raise original_failure
 
-    monkeypatch.setattr(service, "settle_pipeline_composition_proposal", fail_settlement)
+    _install_publication_sql_fault(monkeypatch, fail_settlement)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         request_task = asyncio.create_task(client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash}))
-        await settle_started.wait()
-        request_task.cancel()
+        assert await run_sync_in_worker(settle_started.wait, 5), "actual publication SQL did not start"
+        request_task.cancel("publication-caller-cancel")
         settle_release.set()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(BaseExceptionGroup) as caught:
             await request_task
 
+    assert len(delivered_cancellations) == 1
+    assert type(delivered_cancellations[0]) is asyncio.CancelledError
+    assert delivered_cancellations[0].args == ("publication-caller-cancel",)
+    assert type(caught.value) is BaseExceptionGroup
+    assert caught.value.message == "Pipeline publication and cancellation"
+    assert caught.value.exceptions == (original_failure, delivered_cancellations[0])
+    assert caught.value.exceptions[0] is original_failure
+    assert caught.value.exceptions[1] is delivered_cancellations[0]
+    assert observed_order == ["physical_sql_failure", "service_handoff", "lease_close"]
+    (handoff,) = handoffs
+    assert type(handoff) is ComposerPipelineRaised
+    assert handoff.error is original_failure
+    assert handoff.publication_projection_disposition is PublicationProjectionDisposition.PUBLICATION_FAILED
+    unused = handoff.publication_projection_unused
+    assert unused.disposition is PublicationProjectionDisposition.PUBLICATION_FAILED
+    assert unused.publication_ticket.key.source is RequiredWorkSource.PIPELINE_PUBLICATION_SQL
+    assert unused.publication_ticket.complete
+    assert unused.publication_ticket.errors == (original_failure,)
+    assert type(unused.actual_outcome) is RequiredSQLRaised
+    assert unused.actual_outcome.error is original_failure
+    assert unused.projection_key23 == projection_tickets[0].key
+
     proposals = await service.list_composition_proposals(session_id)
+    assert len(proposals) == 1
     assert proposals[0].status == "pending"
     assert await service.get_current_state(session_id) is None
     audit_messages = [message for message in await service.get_messages(session_id, limit=None) if message.role == "audit"]
@@ -2557,13 +2744,13 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
     assert client.post(endpoint).status_code == 422
     assert client.post(endpoint, json={"draft_hash": "0" * 64}).status_code == 409
 
-    settle = service.settle_pipeline_composition_proposal
+    from elspeth.web.sessions import service as service_module
 
-    async def interrupt_before_settlement(**kwargs: Any):
+    def interrupt_before_settlement(**kwargs: Any):
         del kwargs
         raise RuntimeError("interrupted before atomic settlement")
 
-    monkeypatch.setattr(service, "settle_pipeline_composition_proposal", interrupt_before_settlement)
+    original_sql = _install_publication_sql_fault(monkeypatch, interrupt_before_settlement)
     with pytest.raises(RuntimeError, match="interrupted before atomic settlement"):
         client.post(endpoint, json={"draft_hash": proposal_envelope.draft_hash})
     assert asyncio.run(service.get_current_state(session_id)) is None
@@ -2571,7 +2758,29 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
         message for message in asyncio.run(service.get_messages(session_id, limit=None)) if message.role == "audit" and message.tool_calls
     ]
     assert len(audit_rows_before_retry) == 1
-    monkeypatch.setattr(service, "settle_pipeline_composition_proposal", settle)
+    monkeypatch.setattr(service_module, "run_required_sql_finish_once", original_sql)
+    prepared_states = []
+    publication_contexts = []
+    replay_authorities = []
+    original_prepare = app.state.interpretation_surfacing.prepare_pending_interpretation_reviews
+    original_publication = service.settle_pipeline_composition_proposal_finish_once
+    original_replay = service.replay_pipeline_composition_proposal
+
+    def prepare_reviews(state):
+        prepared_states.append(state)
+        return original_prepare(state)
+
+    async def witness_publication(**kwargs):
+        publication_contexts.append(kwargs["session_operation_context"])
+        return await original_publication(**kwargs)
+
+    async def witness_replay(**kwargs):
+        replay_authorities.append(kwargs["authority"])
+        return await original_replay(**kwargs)
+
+    monkeypatch.setattr(app.state.interpretation_surfacing, "prepare_pending_interpretation_reviews", prepare_reviews)
+    monkeypatch.setattr(service, "settle_pipeline_composition_proposal_finish_once", witness_publication)
+    monkeypatch.setattr(service, "replay_pipeline_composition_proposal", witness_replay)
     accepted = client.post(endpoint, json={"draft_hash": proposal_envelope.draft_hash})
 
     assert accepted.status_code == 200, accepted.text
@@ -2591,28 +2800,30 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
         message for message in asyncio.run(service.get_messages(session_id, limit=None)) if message.role == "audit" and message.tool_calls
     ]
     assert len(audit_rows_after_retry) == 1
-    # An exact-committed retry must still run the post-commit surfacing pass.
-    # It is documented idempotent, and the first attempt can die between the
-    # settling commit and the surfacing call; if the retry short-circuits
-    # before it, the committed state keeps pending interpretation
-    # requirements with no event row and /execute fails closed on
-    # interpretation_placeholder_unresolved with nothing for the user to
-    # resolve.
-    surfaced_state_ids = [
-        call.kwargs["current_state_id"] for call in app.state.interpretation_surfacing.surface_pending_interpretation_reviews.call_args_list
-    ]
-    assert surfaced_state_ids == [str(committed_state.id), str(committed_state.id)], (
-        f"expected the accept and its exact-committed retry to each surface against the committed state, got {surfaced_state_ids!r}"
+    # Publication prepares real review drafts atomically; exact replay prepares
+    # the same candidate and validates its stored cohort without another write.
+    assert len(prepared_states) == 2
+    assert (
+        prepared_states[0].sources,
+        prepared_states[0].nodes,
+        prepared_states[0].edges,
+        prepared_states[0].outputs,
+        prepared_states[0].metadata,
+    ) == (
+        prepared_states[1].sources,
+        prepared_states[1].nodes,
+        prepared_states[1].edges,
+        prepared_states[1].outputs,
+        prepared_states[1].metadata,
     )
-    surfaced_contexts = [
-        call.kwargs.get("session_operation_context")
-        for call in app.state.interpretation_surfacing.surface_pending_interpretation_reviews.call_args_list
-    ]
-    assert all(type(context) is SessionOperationContext for context in surfaced_contexts)
-    assert all(context.fence.session_id == str(session_id) for context in surfaced_contexts if type(context) is SessionOperationContext)
-    assert all(
-        context.operation_kind is SessionOperationKind.PROPOSAL for context in surfaced_contexts if type(context) is SessionOperationContext
-    )
+    assert prepared_states[1].version == committed_state.version
+    assert len(publication_contexts) == 1
+    assert type(publication_contexts[0]) is SessionOperationContext
+    assert publication_contexts[0].fence.session_id == str(session_id)
+    assert publication_contexts[0].operation_kind is SessionOperationKind.PROPOSAL
+    assert len(replay_authorities) == 1
+    assert replay_authorities[0].row.id == row.id
+    assert replay_authorities[0].row.committed_state_id == committed_state.id
 
 
 @pytest.mark.asyncio
@@ -2627,13 +2838,13 @@ async def test_canonical_pipeline_recovery_rejects_tampered_bound_content_hash(t
         monkeypatch,
         tool_call_id="canonical-bound-tamper-call",
     )
-    settle = service.settle_pipeline_composition_proposal
+    from elspeth.web.sessions import service as service_module
 
-    async def interrupt_before_settlement(**kwargs: Any):
+    def interrupt_before_settlement(**kwargs: Any):
         del kwargs
         raise RuntimeError("interrupted before atomic settlement")
 
-    monkeypatch.setattr(service, "settle_pipeline_composition_proposal", interrupt_before_settlement)
+    original_sql = _install_publication_sql_fault(monkeypatch, interrupt_before_settlement)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         with pytest.raises(RuntimeError, match="interrupted before atomic settlement"):
             await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
@@ -2648,7 +2859,7 @@ async def test_canonical_pipeline_recovery_rejects_tampered_bound_content_hash(t
             invocation["result_hash"] = stable_hash(result_payload)
             conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit_row.id).values(tool_calls=envelopes))
 
-        monkeypatch.setattr(service, "settle_pipeline_composition_proposal", settle)
+        monkeypatch.setattr(service_module, "run_required_sql_finish_once", original_sql)
         rejected = await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
 
     assert rejected.status_code == 422
@@ -2670,13 +2881,13 @@ async def test_canonical_pipeline_http_readback_rejects_malformed_bound_content_
         monkeypatch,
         tool_call_id="canonical-bound-malformed-call",
     )
-    settle = service.settle_pipeline_composition_proposal
+    from elspeth.web.sessions import service as service_module
 
-    async def interrupt_before_settlement(**kwargs: Any):
+    def interrupt_before_settlement(**kwargs: Any):
         del kwargs
         raise RuntimeError("interrupted before atomic settlement")
 
-    monkeypatch.setattr(service, "settle_pipeline_composition_proposal", interrupt_before_settlement)
+    original_sql = _install_publication_sql_fault(monkeypatch, interrupt_before_settlement)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         with pytest.raises(RuntimeError, match="interrupted before atomic settlement"):
             await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
@@ -2693,7 +2904,7 @@ async def test_canonical_pipeline_http_readback_rejects_malformed_bound_content_
             invocation["result_hash"] = stable_hash(result_payload)
             conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit_row.id).values(tool_calls=envelopes))
 
-        monkeypatch.setattr(service, "settle_pipeline_composition_proposal", settle)
+        monkeypatch.setattr(service_module, "run_required_sql_finish_once", original_sql)
         with pytest.raises(AuditIntegrityError, match="pipeline dispatch result content hash is malformed") as exc_info:
             await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
 
@@ -3987,6 +4198,21 @@ def _collect_ownership_call_site_identities(module: ModuleType, helper_name: str
     return identities
 
 
+def _collect_composer_ownership_paths(source: str) -> set[str]:
+    """Count actual mounted handlers reaching the owned parse/admit/auth seams."""
+    import ast
+
+    tree = ast.parse(source)
+    names = set()
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.AsyncFunctionDef) or not function.decorator_list:
+            continue
+        calls = {ast.unparse(node.func) for node in ast.walk(function) if isinstance(node, ast.Call)}
+        if calls & {"parse_message_body", "parse_recompose_body", "auth.authorize"}:
+            names.add(function.name)
+    return names
+
+
 class TestIDORCoverageDrift:
     """Drift guard: every session-scoped endpoint across all four routers must invoke an ownership check.
 
@@ -4037,6 +4263,9 @@ class TestIDORCoverageDrift:
             "get_messages",
             "send_message",
             "recompose",
+            "get_composer_operation",
+            "cancel_composer_operation",
+            "stream_operation",
             "get_composer_preferences",
             "update_composer_preferences",
             "get_composer_progress",
@@ -4147,19 +4376,50 @@ class TestIDORCoverageDrift:
         )
 
     def test_sessions_routes_ownership_call_sites(self) -> None:
-        """sessions/routes/ — _verify_session_ownership inventory."""
-        from elspeth.web.sessions.routes import interpretation, messages, runs, sessions
-        from elspeth.web.sessions.routes.composer import compose, proposals, state
+        """Direct route checks plus actual owned Composer admission/auth paths."""
+        import inspect
 
+        from elspeth.web.composer_stream_auth import ComposerStreamAuthServices
+        from elspeth.web.sessions.routes import interpretation, messages, runs, sessions
+        from elspeth.web.sessions.routes.composer import compose, operations, proposals, state
+
+        assert "await _verify_session_ownership(session_id, user, request)" in inspect.getsource(operations._owned_json_body)
+        assert "await _owned_json_body(request, session_id, user)" in inspect.getsource(operations.parse_message_body)
+        assert "await _owned_json_body(request, session_id, user)" in inspect.getsource(operations.parse_recompose_body)
+        assert "await _verify_session_ownership(session_id, user, request)" in inspect.getsource(operations.admit)
+        auth_source = inspect.getsource(ComposerStreamAuthServices.authorize)
+        assert "session.user_id == principal.user_id" in auth_source
+        assert "session.auth_provider_type == self.provider_type" in auth_source
+        assert "session.archived_at is None" in auth_source
+        stream_source = inspect.getsource(operations.stream_operation)
+        assert "job.actor_user_id != user.user_id" in stream_source
+        assert "authority.get_with_database_now" in stream_source
         found = set()
         for routes_module in (sessions, state, proposals, compose, messages, runs, interpretation):
             found.update(_collect_ownership_call_site_identities(routes_module, "_verify_session_ownership"))
-        self._assert_inventory(
-            "sessions/routes/",
-            "_verify_session_ownership",
-            self.EXPECTED_SESSIONS_OWNERSHIP_ENDPOINTS,
-            found,
-        )
+        found.update(_collect_ownership_call_site_identities(operations, "_verify_session_ownership") - {"_owned_json_body", "admit"})
+        for module in (messages, compose, operations):
+            found.update(_collect_composer_ownership_paths(inspect.getsource(module)))
+        self._assert_inventory("sessions/routes/", "owned session admission/auth", self.EXPECTED_SESSIONS_OWNERSHIP_ENDPOINTS, found)
+
+    @pytest.mark.parametrize(
+        "before,after,endpoint",
+        [
+            ("parse_message_body(", "unchecked_message_body(", "send_message"),
+            ("parse_recompose_body(", "unchecked_recompose_body(", "recompose"),
+            ("auth.authorize(", "auth.unchecked_authorize(", "stream_operation"),
+        ],
+    )
+    def test_composer_ownership_inventory_detects_removed_boundary(self, before: str, after: str, endpoint: str) -> None:
+        import inspect
+
+        from elspeth.web.sessions.routes import messages
+        from elspeth.web.sessions.routes.composer import compose, operations
+
+        source = "\n".join(inspect.getsource(module) for module in (messages, compose, operations))
+        assert endpoint in _collect_composer_ownership_paths(source)
+        assert before in source
+        assert endpoint not in _collect_composer_ownership_paths(source.replace(before, after))
 
     def test_execution_routes_session_ownership_call_sites(self) -> None:
         """execution/routes.py — verify_session_ownership inventory.
@@ -4314,6 +4574,7 @@ class TestIDORProtection:
             app.dependency_overrides[get_current_user] = mock_user
             wire_test_pipeline_user_authority(app, identity_id=uid, engine=engine)
             app.state.session_service = service
+            app.state.session_engine = engine
             app.state.settings = WebSettings(
                 data_dir=tmp_path,
                 composer_max_composition_turns=15,
@@ -4329,11 +4590,10 @@ class TestIDORProtection:
             )
             app.state.catalog_service = None
 
-            from elspeth.web.middleware.rate_limit import ComposerRateLimiter
-
             app.state.rate_limiter = ComposerRateLimiter(limit=100)
             app.state.composer_progress_registry = ComposerProgressRegistry()
             app.include_router(create_session_router())
+            install_composer_async_worker(app)
             return app
 
         alice_app = make_app_for_user("alice")
@@ -4375,7 +4635,7 @@ class TestIDORProtection:
         # Bob tries to POST a message -- should be 404
         resp = bob_client.post(
             f"/api/sessions/{session_id}/messages",
-            json={"content": "hacked", "client_request_id": str(uuid.uuid4())},
+            json=message_body("hacked"),
         )
         assert resp.status_code == 404
 
@@ -4399,7 +4659,7 @@ class TestIDORProtection:
         # ``recompose`` route handler, so an attacker cannot use this
         # endpoint to probe for session existence through rate-limit
         # timing either.
-        resp = bob_client.post(f"/api/sessions/{session_id}/recompose", json={"expected_user_message_id": str(uuid.uuid4())})
+        resp = bob_client.post(f"/api/sessions/{session_id}/recompose", json=recompose_body(uuid.uuid4()))
         assert resp.status_code == 404
 
         # Bob tries to GET runs -- should be 404.  Without this guard,
@@ -4566,6 +4826,7 @@ class TestSendMessageStateIdValidation:
             app.dependency_overrides[get_current_user] = mock_user
             wire_test_pipeline_user_authority(app, identity_id=uid, engine=engine)
             app.state.session_service = service
+            app.state.session_engine = engine
             app.state.settings = WebSettings(
                 data_dir=tmp_path,
                 composer_max_composition_turns=15,
@@ -4582,11 +4843,10 @@ class TestSendMessageStateIdValidation:
             # succeeding against a mock.
             app.state.composer_service = None
 
-            from elspeth.web.middleware.rate_limit import ComposerRateLimiter
-
             app.state.rate_limiter = ComposerRateLimiter(limit=100)
             app.state.composer_progress_registry = ComposerProgressRegistry()
             app.include_router(create_session_router())
+            install_composer_async_worker(app)
             return app
 
         # Alice creates her own session and a state in it.
@@ -4656,7 +4916,7 @@ class TestSendMessageStateIdValidation:
 
         resp = bob_client.post(
             f"/api/sessions/{bob_session_id}/messages",
-            json={"content": "hello", "state_id": alice_state_id, "client_request_id": str(uuid.uuid4())},
+            json={"content": "hello", "state_id": alice_state_id, "operation_id": str(uuid.uuid4())},
         )
         assert resp.status_code == 404, (
             f"Expected 404 for cross-session state_id, got {resp.status_code}. "
@@ -4699,11 +4959,11 @@ class TestSendMessageStateIdValidation:
 
         unknown_resp = bob_client.post(
             f"/api/sessions/{bob_session_id}/messages",
-            json={"content": "hello", "state_id": unknown_state_id, "client_request_id": str(uuid.uuid4())},
+            json={"content": "hello", "state_id": unknown_state_id, "operation_id": str(uuid.uuid4())},
         )
         cross_session_resp = bob_client.post(
             f"/api/sessions/{bob_session_id}/messages",
-            json={"content": "hello", "state_id": alice_state_id, "client_request_id": str(uuid.uuid4())},
+            json={"content": "hello", "state_id": alice_state_id, "operation_id": str(uuid.uuid4())},
         )
 
         assert unknown_resp.status_code == 404
@@ -4747,9 +5007,13 @@ class TestMessageRoutes:
         resp = client.post("/api/sessions", json={"title": "Chat"})
         session_id = resp.json()["id"]
 
-        msg_resp = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Hello, build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        msg_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Hello, build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
         assert msg_resp.status_code == 200
         body = msg_resp.json()
@@ -4766,7 +5030,12 @@ class TestMessageRoutes:
         client = TestClient(app)
         session_id = client.post("/api/sessions", json={"title": "Chat ingress"}).json()["id"]
 
-        response = client.post(f"/api/sessions/{session_id}/messages", json={"content": submitted, "client_request_id": str(uuid.uuid4())})
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(submitted, state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
+        )
 
         assert response.status_code == 200
         assert response.json()["state"] is not None
@@ -4780,8 +5049,11 @@ class TestMessageRoutes:
         # An advisory reply that creates no state must leave the last
         # state/input association intact.
         app.state.composer_service = _make_composer_mock(state=replace(_EMPTY_STATE, version=state.version))
-        advisory = client.post(
-            f"/api/sessions/{session_id}/messages", json={"content": "Just explain it", "client_request_id": str(uuid.uuid4())}
+        advisory = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Just explain it", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
         assert advisory.status_code == 200
         assert advisory.json()["state"] is None
@@ -4795,15 +5067,23 @@ class TestMessageRoutes:
         client = TestClient(app)
         session_id = client.post("/api/sessions", json={"title": "Deferred chat ingress"}).json()["id"]
 
-        clarification = client.post(
-            f"/api/sessions/{session_id}/messages", json={"content": pasted, "client_request_id": str(uuid.uuid4())}
+        clarification = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(pasted, state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
         assert clarification.status_code == 200
         assert clarification.json()["state"] is None
         assert asyncio.run(service.get_current_state(uuid.UUID(session_id))) is None
 
         app.state.composer_service = _make_composer_mock(state=replace(_EMPTY_STATE, version=2))
-        confirmation = client.post(f"/api/sessions/{session_id}/messages", json={"content": "yes", "client_request_id": str(uuid.uuid4())})
+        confirmation = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("yes", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
+        )
         assert confirmation.status_code == 200
         state = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
         assert state is not None
@@ -4861,9 +5141,11 @@ class TestMessageRoutes:
         state_id = str(state_record.id)
 
         # Send message WITH state_id as UUID string in JSON body
-        msg_resp = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Hello", "state_id": state_id, "client_request_id": str(uuid.uuid4())},
+        msg_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Hello", state_id=state_id, operation_id=str(uuid.uuid4())),
         )
         assert msg_resp.status_code == 200
         body = msg_resp.json()
@@ -4878,24 +5160,11 @@ class TestMessageRoutes:
         assert user_msg["composition_state_id"] == state_id
 
     def test_send_message_with_stale_state_id_composes_against_head(self, tmp_path) -> None:
-        """A stale (but session-owned) client state_id must not poison the
-        compose loop's optimistic-concurrency baseline.
+        """Refuse a stale observed base before user/provider writes, then compose against fresh head.
 
-        Regression test for elspeth-e08063c3a5: after a client-aborted
-        turn, the SPA's ``compositionState.id`` lags the DB head (the
-        aborted turn's response never arrived). The follow-up send
-        carries the stale id. The route must:
-
-        * keep the client-asserted id for USER-MESSAGE provenance
-          (AD-2/AD-7 — it records what the user saw), and
-        * seed ``composer.compose(current_state_id=...)`` — which the
-          compose loop threads into ``persist_compose_turn`` as
-          ``expected_current_state_id`` — from the ACTUAL head loaded
-          under the compose lock, exactly as ``/recompose`` does.
-
-        Seeding the loop from the stale client id made every follow-up
-        send fail with 409 stale_compose_state ("The session changed
-        while the compose turn was running.") until page reload.
+        The stale owned state is durably admitted, then atomically refused at
+        start. After refresh, provider concurrency baseline and user provenance
+        both bind the fresh state the user actually observed.
         """
         head_version_state = CompositionState(
             source=None,
@@ -4945,9 +5214,21 @@ class TestMessageRoutes:
         finally:
             loop.close()
 
-        msg_resp = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "And now add a sink", "state_id": str(stale_record.id), "client_request_id": str(uuid.uuid4())},
+        msg_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("And now add a sink", state_id=str(stale_record.id)),
+        )
+        assert msg_resp.status_code == 409
+        assert msg_resp.json()["error_type"] == "stale_compose_state"
+        mock_composer.compose.assert_not_awaited()
+        assert client.get(f"/api/sessions/{session_id}/messages").json() == []
+        msg_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("And now add a sink", state_id=str(head_record.id)),
         )
         assert msg_resp.status_code == 200
 
@@ -4961,209 +5242,124 @@ class TestMessageRoutes:
 
         msgs_resp = client.get(f"/api/sessions/{session_id}/messages")
         user_msg = next(m for m in msgs_resp.json() if m["role"] == "user")
-        assert user_msg["composition_state_id"] == str(stale_record.id), (
-            "user-message provenance must still record the client-asserted state (AD-2)"
+        assert user_msg["composition_state_id"] == str(head_record.id), (
+            "user-message provenance must record the freshly observed state (AD-2)"
         )
 
     def test_client_disconnect_cancels_compose_turn(self, tmp_path) -> None:
-        """A client disconnect mid-compose must cancel the server-side turn.
+        """Admission connection loss detaches; explicit Stop joins owner cleanup.
 
-        Regression test for elspeth-e08063c3a5 (zombie half): uvicorn's
-        ``connection_lost`` only flags the cycle as disconnected and
-        Starlette's ``request_response`` has no disconnect watcher, so
-        without ``_cancel_on_client_disconnect`` a client abort (Stop
-        button / SPA compose timeout / closed tab) left the compose loop
-        running to completion — burning LLM budget, holding the
-        per-session compose lock for minutes, and advancing composition
-        state the client never sees.
-
-        Drives the ASGI app directly: the request body is delivered,
-        then — once the composer stub signals it has started — the
-        receive channel yields ``http.disconnect``. The watcher must
-        cancel the route task; the route's cancelled-path bookkeeping
-        converts the disconnect-initiated cancel into a quiet 499 (the
-        client is gone; uvicorn discards the bytes — the conversion
-        exists so CancelledError does not escape the app and get logged
-        as an ASGI crash on every Stop click).
+        The historical test ID is retained. Durable jobs outlive the admission
+        connection; cancellation now addresses the operation rather than the
+        HTTP request. This ASGI proof is complemented by the real TLS tests.
         """
-
-        class _HangingComposer:
-            """compose() parks forever; records whether it was cancelled."""
-
-            def __init__(self, started: asyncio.Event) -> None:
-                self.started = started
-                self.cancelled = False
-
-            async def compose(self, *args: Any, **kwargs: Any) -> ComposerResult:
-                del args, kwargs
-                self.started.set()
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    self.cancelled = True
-                    raise
-                raise AssertionError("unreachable — compose never completes")
-
-        app, _service = _make_app(tmp_path)
+        app, service = _make_app(tmp_path)
         client = TestClient(app)
-        resp = client.post("/api/sessions", json={"title": "Chat"})
-        session_id = resp.json()["id"]
+        session_id = client.post("/api/sessions", json={"title": "Chat"}).json()["id"]
 
-        async def drive() -> tuple[list[dict[str, Any]], _HangingComposer]:
-            compose_started = asyncio.Event()
-            composer = _HangingComposer(compose_started)
+        async def drive(http: AsyncClient) -> None:
+            composer = _CancellableComposer()
             app.state.composer_service = composer
-
-            request_messages = [
-                {
-                    "type": "http.request",
-                    "body": json.dumps({"content": "build a pipeline", "client_request_id": str(uuid.uuid4())}).encode(),
-                    "more_body": False,
-                }
-            ]
+            body = message_body("build a pipeline")
+            request_messages = [{"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}]
             sent: list[dict[str, Any]] = []
 
             async def receive() -> dict[str, Any]:
                 if request_messages:
                     return request_messages.pop(0)
-                # Second receive() is the disconnect watcher: report the
-                # client gone as soon as the compose loop is running.
-                await compose_started.wait()
                 return {"type": "http.disconnect"}
 
             async def send(message: dict[str, Any]) -> None:
                 sent.append(message)
 
+            path = f"/api/sessions/{session_id}/messages"
             scope = {
                 "type": "http",
                 "asgi": {"version": "3.0"},
                 "http_version": "1.1",
                 "method": "POST",
                 "scheme": "http",
-                "path": f"/api/sessions/{session_id}/messages",
-                "raw_path": f"/api/sessions/{session_id}/messages".encode(),
+                "path": path,
+                "raw_path": path.encode(),
                 "query_string": b"",
                 "root_path": "",
                 "headers": [(b"content-type", b"application/json")],
                 "client": ("testclient", 50000),
                 "server": ("testserver", 80),
             }
-            # Pre-fix behaviour is an unbounded hang (nothing observes the
-            # disconnect); the wait_for turns that into a bounded failure.
             await asyncio.wait_for(app(scope, receive, send), timeout=5.0)
-            return sent, composer
+            assert next(message["status"] for message in sent if message["type"] == "http.response.start") == 202
+            owner = asyncio.create_task(app.state.composer_async_worker.run_until_idle())
+            try:
+                await asyncio.wait_for(composer.entered.wait(), timeout=5.0)
+                poll_path = f"/api/sessions/{session_id}/operations/{body['operation_id']}"
+                running = await http.get(poll_path)
+                assert running.json()["status"] == "running"
+                assert composer.cancelled is False
+                cancellation = await http.post(f"{poll_path}/cancel")
+                assert cancellation.status_code in (200, 202)
+                await asyncio.wait_for(owner, timeout=10.0)
+                terminal = await http.get(poll_path)
+                assert terminal.json()["status"] == "failed"
+                assert terminal.json()["error"]["http_status"] == 499
+                assert terminal.json()["error"]["failure_code"] == "request_cancelled"
+                assert composer.cancelled is True
+                messages = await service.get_messages(uuid.UUID(session_id), limit=None)
+                assert [message.role for message in messages] == ["user"]
+                app.state.composer_service = _make_composer_mock(response_text="Still alive")
+                follow_up = await submit_and_settle(http, app, path=path, body=message_body("try again"))
+                assert follow_up.result()["message"]["content"] == "Still alive"
+            finally:
+                if not owner.done():
+                    owner.cancel()
+                    await asyncio.gather(owner, return_exceptions=True)
 
-        loop = asyncio.new_event_loop()
-        try:
-            sent, composer = loop.run_until_complete(drive())
-        finally:
-            loop.close()
+        client.run_in_one_loop(drive)
 
-        assert composer.cancelled is True, "compose loop must be cancelled when the client disconnects"
-        status = next(m["status"] for m in sent if m["type"] == "http.response.start")
-        assert status == 499, f"disconnect-cancel must unwind as a quiet 499, got {status}"
+    def test_external_cancel_racing_disconnect_keeps_unwinding(self, tmp_path, monkeypatch) -> None:
+        """A durable Stop cannot turn an already-pending shutdown into user Stop."""
+        from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED, COMPOSER_SHUTDOWN
 
-        # The turn must NOT have produced an assistant message — the user
-        # message persists (it was committed before compose started), the
-        # zombie's would-be reply must not.
-        msgs = client.get(f"/api/sessions/{session_id}/messages").json()
-        assert [m["role"] for m in msgs] == ["user"]
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "Chat"}).json()["id"]
+        captured = _capture_turn_exception(monkeypatch)
 
-        # And the session must not be wedged: a fresh send composes fine.
-        app.state.composer_service = _make_composer_mock(response_text="Still alive")
-        follow_up = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "try again", "client_request_id": str(uuid.uuid4())},
-        )
-        assert follow_up.status_code == 200
-        assert follow_up.json()["message"]["content"] == "Still alive"
+        async def drive(http: AsyncClient) -> None:
+            composer = _CancellableComposer()
+            app.state.composer_service = composer
+            async with running_operation_async(
+                http, app, path=f"/api/sessions/{session_id}/messages", body=message_body("Cancel race")
+            ) as operation:
+                await asyncio.wait_for(composer.entered.wait(), timeout=3)
+                stop = await http.post(f"{operation.poll_path}/cancel")
+                assert stop.status_code in (200, 202)
+                assert composer.owner is not None
+                composer.owner.cancel(COMPOSER_SHUTDOWN)
+                composer.owner.cancel(COMPOSER_CANCEL_REQUESTED)
+                assert composer.owner.cancelling() == 2
+                await asyncio.wait_for(operation.drive, timeout=5)
+                final = await http.get(operation.poll_path)
+                assert final.status_code == 200
+                assert final.json()["status"] == "failed"
+                assert composer.cancelled is True
+            assert len(captured) == 1
+            assert isinstance(captured[0], asyncio.CancelledError)
+            assert captured[0].args == (COMPOSER_SHUTDOWN,)
+            messages = await service.get_messages(uuid.UUID(session_id), limit=None)
+            assert [message.role for message in messages] == ["user"]
+            snapshot = await app.state.composer_progress_registry.get_latest(session_id)
+            assert snapshot.phase == "failed"
 
-    def test_external_cancel_racing_disconnect_keeps_unwinding(self) -> None:
-        """An external cancel racing a client disconnect must keep unwinding.
-
-        ``triggered`` only proves a disconnect happened — not that the caught
-        CancelledError belongs to the watcher alone. When server shutdown or
-        an operator cancel races ``http.disconnect``, the route task carries
-        TWO cancellation requests; consuming one and marking the exception as
-        disconnect-initiated would let the route convert it into a handled
-        499 and swallow the external cancellation. The watcher may consume
-        only its own request: with an external cancel still pending, the
-        exception must stay unmarked so the route keeps unwinding as
-        genuinely cancelled (mirroring the else-branch's ``cancelling()``
-        re-check for the completion race).
-        """
-        from starlette.requests import Request
-
-        from elspeth.web.sessions.routes._helpers import (
-            _cancel_on_client_disconnect,
-            _is_client_disconnect_cancel,
-        )
-
-        async def drive() -> tuple[bool, bool]:
-            started = asyncio.Event()
-            allow_disconnect = asyncio.Event()
-
-            async def receive() -> dict[str, Any]:
-                await allow_disconnect.wait()
-                return {"type": "http.disconnect"}
-
-            request = Request({"type": "http"}, receive)
-            captured: dict[str, bool] = {}
-
-            async def guarded() -> None:
-                try:
-                    async with _cancel_on_client_disconnect(request):
-                        started.set()
-                        await asyncio.Event().wait()
-                except asyncio.CancelledError as exc:
-                    captured["marked"] = _is_client_disconnect_cancel(exc)
-                    raise
-                raise AssertionError("unreachable — the guarded block never completes")
-
-            task = asyncio.get_running_loop().create_task(guarded())
-            await started.wait()
-            allow_disconnect.set()
-            # Let the watcher observe the disconnect and file its cancel...
-            while task.cancelling() == 0:
-                await asyncio.sleep(0)
-            # ...then land the external cancel (server shutdown / operator)
-            # before the parked task has processed the watcher's.
-            task.cancel()
-            assert task.cancelling() == 2
-            with pytest.raises(asyncio.CancelledError):
-                await task
-            return captured["marked"], task.cancelled()
-
-        loop = asyncio.new_event_loop()
-        try:
-            marked, cancelled = loop.run_until_complete(drive())
-        finally:
-            loop.close()
-
-        assert marked is False, (
-            "the CancelledError must NOT be marked disconnect-initiated while "
-            "an external cancellation request is still pending — the mark lets "
-            "the route swallow a server-shutdown/operator cancel as a quiet 499"
-        )
-        assert cancelled is True, "the task must finish as genuinely cancelled"
+        client.run_in_one_loop(drive)
 
     def test_composer_progress_reports_inflight_request_count(self, tmp_path) -> None:
-        """GET /composer-progress carries the live in-flight compose count.
-
-        The count is the SPA's correlated settlement signal after a client
-        abort (elspeth-06a23adfcc): the snapshot phase cannot distinguish
-        "the aborted route is still running but has not published progress
-        yet" (queued on the compose lock, immediate Stop) from "everything
-        settled" — the registry may hold the previous turn's terminal
-        snapshot in both. The count spans the whole request and drops to
-        zero only after the route fully unwinds.
-        """
+        """The durable worker contributes to the live count until settlement."""
         app, _service = _make_app(tmp_path)
         client = TestClient(app)
-        resp = client.post("/api/sessions", json={"title": "Chat"})
-        session_id = resp.json()["id"]
+        session_id = client.post("/api/sessions", json={"title": "Chat"}).json()["id"]
 
-        async def drive() -> None:
+        async def drive(http: AsyncClient) -> None:
             compose_started = asyncio.Event()
             release = asyncio.Event()
             inner = _make_composer_mock(response_text="Done")
@@ -5175,30 +5371,26 @@ class TestMessageRoutes:
                     return await inner.compose(*args, **kwargs)
 
             app.state.composer_service = _ParkedComposer()
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://testserver") as http:
-                send_task = asyncio.create_task(
-                    http.post(
-                        f"/api/sessions/{session_id}/messages",
-                        json={"content": "build a pipeline", "client_request_id": str(uuid.uuid4())},
-                    )
-                )
+            async with running_operation_async(
+                http,
+                app,
+                path=f"/api/sessions/{session_id}/messages",
+                body=message_body("build a pipeline"),
+            ) as operation:
+                assert operation.accepted.status_code == 202
                 await asyncio.wait_for(compose_started.wait(), timeout=5.0)
                 parked = await http.get(f"/api/sessions/{session_id}/composer-progress")
                 assert parked.status_code == 200
                 assert parked.json()["inflight_requests"] == 1
-
                 release.set()
-                send_resp = await asyncio.wait_for(send_task, timeout=10.0)
-                assert send_resp.status_code == 200
+                await asyncio.wait_for(operation.drive, timeout=10.0)
+                terminal = await http.get(operation.poll_path)
+                assert terminal.status_code == 200
+                assert terminal.json()["status"] == "completed"
                 settled = await http.get(f"/api/sessions/{session_id}/composer-progress")
                 assert settled.json()["inflight_requests"] == 0
 
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(drive())
-        finally:
-            loop.close()
+        client.run_in_one_loop(drive)
 
     def test_get_messages(self, tmp_path) -> None:
         mock_composer = _make_composer_mock()
@@ -5210,13 +5402,17 @@ class TestMessageRoutes:
         resp = client.post("/api/sessions", json={"title": "Chat"})
         session_id = resp.json()["id"]
 
-        client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "First", "client_request_id": str(uuid.uuid4())},
+        _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("First", state_id=current_head_state_id_sync(client, session_id)),
         )
-        client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Second", "client_request_id": str(uuid.uuid4())},
+        _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Second", state_id=current_head_state_id_sync(client, session_id)),
         )
 
         msgs_resp = client.get(f"/api/sessions/{session_id}/messages")
@@ -5344,8 +5540,11 @@ class TestMessageRoutes:
         finally:
             loop.close()
 
-        send_resp = client.post(
-            f"/api/sessions/{session_id}/messages", json={"content": "Build it", "client_request_id": str(uuid.uuid4())}
+        send_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Build it", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
 
         assert send_resp.status_code == 200
@@ -5567,12 +5766,14 @@ class TestMessageRoutes:
 
         monkeypatch.setattr("litellm.acompletion", completion)
 
-        sent = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={
-                "content": f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl.",
-                "client_request_id": str(uuid.uuid4()),
-            },
+        sent = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl.",
+                state_id=current_head_state_id_sync(client, session_id),
+            ),
         )
 
         assert sent.status_code == 200, sent.json()
@@ -5799,10 +6000,12 @@ class TestMessageRoutes:
         # commits first, which is the precondition for the Tier-1
         # corruption the helper guards against.
         original_insert = service._insert_chat_message
+        injected_fault = {"fired": False}
 
         def flaky_insert(conn: Any, **kwargs: Any) -> str:
             tool_calls = kwargs.get("tool_calls")
             if tool_calls and isinstance(tool_calls[0], Mapping) and tool_calls[0].get("_kind") == "llm_call_audit":
+                injected_fault["fired"] = True
                 raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))
             return original_insert(conn, **kwargs)
 
@@ -5810,24 +6013,26 @@ class TestMessageRoutes:
 
         resp = client.post("/api/sessions", json={"title": "Chat"})
         session_id = uuid.UUID(resp.json()["id"])
-        send_resp = client.post(
-            f"/api/sessions/{session_id}/messages", json={"content": "Build it", "client_request_id": str(uuid.uuid4())}
+        send_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Build it", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
 
+        assert injected_fault["fired"], "the required-audit row insert fault must fire"
+        messages = asyncio.run(service.get_messages(session_id, limit=None))
+        assert all(message.role != "assistant" for message in messages), "assistant escaped the atomic rollback"
+        assert _llm_call_audit_rows(messages) == [], "partial provider evidence escaped the atomic rollback"
+        assert all(message.role != "tool" for message in messages), "partial tool evidence escaped the atomic rollback"
         assert send_resp.status_code == 500
 
     def test_send_message_llm_sidecar_cohort_settles_atomically(self, tmp_path) -> None:
-        """A mid-cohort sidecar failure must leave ZERO LLM-call sidecars durable.
+        """A failed success cohort rolls back before complete failure evidence commits."""
+        from sqlalchemy import select
 
-        elspeth-90231248dc: per-call sidecar transactions meant a failure
-        after any prefix left the assistant plus a PARTIAL sidecar set
-        durable, with no idempotency identity to complete the missing
-        suffix on retry. The cohort must settle all-or-nothing: when the
-        second of two sidecar inserts fails, the first must roll back with
-        it — the audit trail then honestly shows "no LLM-call evidence
-        persisted" alongside the Tier-1 500, instead of a prefix that
-        reads as a complete record.
-        """
+        from elspeth.web.sessions.models import chat_messages_table, token_usage_ledger_table
+
         app, service = _make_app(tmp_path)
         composer = SimpleNamespace()
         app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
@@ -5862,17 +6067,68 @@ class TestMessageRoutes:
             return original_insert(conn, **kwargs)
 
         service._insert_chat_message = flaky_insert  # type: ignore[method-assign]
+        original_cohort = service._write_audit_cohort_on_connection
+        cohort_phases: list[tuple[bool, int]] = []
+        cohort_contexts: list[SessionOperationContext] = []
+        rollback_witnessed = False
+
+        def witnessed_cohort(conn: Any, **kwargs: Any):
+            nonlocal rollback_witnessed
+            phase = (kwargs["audit_only"], len(kwargs["drafts"]))
+            cohort_phases.append(phase)
+            cohort_contexts.append(kwargs["session_operation_context"])
+            if kwargs["audit_only"]:
+                assert cohort_phases == [(False, 2), (True, 2)]
+                existing_roles = (
+                    conn.execute(
+                        select(chat_messages_table.c.role).where(
+                            chat_messages_table.c.session_id == str(session_id),
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert existing_roles == ["user"], "a success bundle prefix survived before failure evidence"
+                rollback_witnessed = True
+            return original_cohort(conn, **kwargs)
+
+        service._write_audit_cohort_on_connection = witnessed_cohort
 
         resp = client.post("/api/sessions", json={"title": "Chat"})
         session_id = uuid.UUID(resp.json()["id"])
-        send_resp = client.post(
-            f"/api/sessions/{session_id}/messages", json={"content": "Build it", "client_request_id": str(uuid.uuid4())}
+        body = message_body("Build it", state_id=current_head_state_id_sync(client, session_id))
+        send_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=body,
         )
 
-        assert send_resp.status_code == 500
-        assert llm_audit_inserts["count"] == 2, "the injected failure must have fired on the second sidecar"
+        assert llm_audit_inserts["count"] == 4
+        assert cohort_phases == [(False, 2), (True, 2)]
+        assert cohort_contexts[0] == cohort_contexts[1]
+        assert rollback_witnessed
+        composer.compose.assert_awaited_once()
         messages = asyncio.run(service.get_messages(session_id, limit=None))
-        assert _llm_call_audit_rows(messages) == [], "a partial sidecar prefix survived the failed cohort"
+        assert sum(message.role == "user" for message in messages) == 1
+        audit_rows = _llm_call_audit_rows(messages)
+        assert len(audit_rows) == 2
+        assert [envelope["call"]["provider_request_id"] for _row, envelope in audit_rows] == [
+            "chatcmpl-cohort-1",
+            "chatcmpl-cohort-2",
+        ]
+        assert all(row.composition_state_id is None for row, _envelope in audit_rows)
+        assert [envelope["call"]["prompt_tokens"] for _row, envelope in audit_rows] == [13, 13]
+        assert [envelope["call"]["completion_tokens"] for _row, envelope in audit_rows] == [8, 8]
+        with service._engine.connect() as connection:
+            ledger = connection.execute(
+                select(token_usage_ledger_table.c.prompt_tokens, token_usage_ledger_table.c.completion_tokens).where(
+                    token_usage_ledger_table.c.session_id == str(session_id),
+                )
+            ).all()
+        assert ledger == [(13, 8), (13, 8)]
+        assert all(message.role != "assistant" for message in messages), "assistant escaped the atomic rollback"
+        assert send_resp.status_code == 500
 
     def test_send_message_tool_invocation_persistence_failure_raises_on_success_path(self, tmp_path) -> None:
         """Symmetric to the LLM-call audit Tier-1 test.
@@ -5933,10 +6189,12 @@ class TestMessageRoutes:
         # ``add_messages_atomic``, elspeth-90231248dc): the tool
         # breadcrumb is the row carrying an ``_kind="audit"`` envelope.
         original_insert = service._insert_chat_message
+        injected_fault = {"fired": False}
 
         def flaky_insert(conn: Any, **kwargs: Any) -> str:
             tool_calls = kwargs.get("tool_calls")
             if kwargs.get("role") == "tool" and tool_calls and isinstance(tool_calls[0], Mapping) and tool_calls[0].get("_kind") == "audit":
+                injected_fault["fired"] = True
                 raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))
             return original_insert(conn, **kwargs)
 
@@ -5944,56 +6202,66 @@ class TestMessageRoutes:
 
         resp = client.post("/api/sessions", json={"title": "Chat"})
         session_id = uuid.UUID(resp.json()["id"])
-        send_resp = client.post(
-            f"/api/sessions/{session_id}/messages", json={"content": "Build it", "client_request_id": str(uuid.uuid4())}
+        send_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Build it", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
 
+        assert injected_fault["fired"], "the required-audit row insert fault must fire"
+        messages = asyncio.run(service.get_messages(session_id, limit=None))
+        assert all(message.role != "assistant" for message in messages), "assistant escaped the atomic rollback"
+        assert _llm_call_audit_rows(messages) == [], "partial provider evidence escaped the atomic rollback"
+        assert all(message.role != "tool" for message in messages), "partial tool evidence escaped the atomic rollback"
         assert send_resp.status_code == 500
 
     @pytest.mark.asyncio
     async def test_send_message_serializes_concurrent_requests_per_session(self, tmp_path) -> None:
-        """Concurrent sends must not compose against an in-flight partial transcript."""
+        """Active admission prevents partial-history compose and permits exact replay."""
         composer = _BlockingRecordingComposer()
-
         app, session_service = _make_app(tmp_path)
         app.state.composer_service = composer
-
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            create_resp = await client.post("/api/sessions", json={"title": "Chat"})
-            assert create_resp.status_code == 201
-            session_id = create_resp.json()["id"]
-
-            async def send(content: str):
-                return await client.post(
-                    f"/api/sessions/{session_id}/messages",
-                    json={"content": content, "client_request_id": str(uuid.uuid4())},
-                )
-
-            first_task = asyncio.create_task(send("First"))
-            await asyncio.wait_for(composer.first_call_started.wait(), timeout=1.0)
-
-            second_task = asyncio.create_task(send("Second"))
-
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(composer.second_call_started.wait(), timeout=0.3)
-
-            composer.release_first_call.set()
-
-            first_resp, second_resp = await asyncio.gather(first_task, second_task)
-
-        assert first_resp.status_code == 200
-        assert second_resp.status_code == 200
+            created = await client.post("/api/sessions", json={"title": "Chat"})
+            assert created.status_code == 201
+            session_id = created.json()["id"]
+            path = f"/api/sessions/{session_id}/messages"
+            first_body = message_body("First")
+            async with running_operation_async(client, app, path=path, body=first_body) as first:
+                assert first.accepted.status_code == 202
+                await asyncio.wait_for(composer.first_call_started.wait(), timeout=5.0)
+                replay = await client.post(path, json=first_body)
+                assert replay.status_code == 202
+                assert replay.json()["operation_id"] == first.operation_id
+                conflict = await client.post(path, json=message_body("Second"))
+                assert conflict.status_code == 409
+                assert conflict.json()["detail"]["error_type"] == "composer_operation_active"
+                assert [call["message"] for call in composer.calls] == ["First"]
+                assert not composer.second_call_started.is_set()
+                parked_messages = await session_service.get_messages(uuid.UUID(session_id), limit=None)
+                assert [message.content for message in parked_messages if message.role == "user"] == ["First"]
+                composer.release_first_call.set()
+                await asyncio.wait_for(first.drive, timeout=10.0)
+                terminal = await client.get(first.poll_path)
+                assert terminal.json()["status"] == "completed"
+            second = await submit_and_settle(
+                client,
+                app,
+                path=path,
+                body=message_body(
+                    "Second",
+                    state_id=await current_head_state_id(client, session_id),
+                ),
+            )
+            assert second.accepted.status_code == 202
+            assert second.final.json()["status"] == "completed"
         persisted = await session_service.get_messages(uuid.UUID(session_id), limit=None)
         first_user_message = next(message for message in persisted if message.role == "user" and message.content == "First")
         assert [call["message"] for call in composer.calls] == ["First", "Second"]
         assert composer.calls[0]["chat_messages"] == []
         assert composer.calls[1]["chat_messages"] == [
-            {
-                "role": "user",
-                "content": "First",
-                "_elspeth_user_authored": True,
-                "_elspeth_user_message_id": str(first_user_message.id),
-            },
+            {"role": "user", "content": "First", "_elspeth_user_authored": True, "_elspeth_user_message_id": str(first_user_message.id)},
             {"role": "assistant", "content": "Reply to first"},
         ]
 
@@ -6122,10 +6390,15 @@ class TestLiteLLMErrorRedaction:
         session_id = uuid.UUID(created.json()["id"])
         if route == "recompose":
             asyncio.run(service.add_message(session_id, "user", "Hello", writer_principal="route_user_message"))
-            response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+            response = _settled_composer_response(
+                client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+            )
         else:
-            response = client.post(
-                f"/api/sessions/{session_id}/messages", json={"content": "Hello", "client_request_id": str(uuid.uuid4())}
+            response = _settled_composer_response(
+                client,
+                app,
+                path=f"/api/sessions/{session_id}/messages",
+                body=message_body("Hello", state_id=current_head_state_id_sync(client, session_id)),
             )
 
         assert response.status_code == (504 if error_class == "Timeout" else 502)
@@ -6187,10 +6460,15 @@ class TestLiteLLMErrorRedaction:
         session_id = uuid.UUID(created.json()["id"])
         if route == "recompose":
             asyncio.run(service.add_message(session_id, "user", "Hello", writer_principal="route_user_message"))
-            response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+            response = _settled_composer_response(
+                client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+            )
         else:
-            response = client.post(
-                f"/api/sessions/{session_id}/messages", json={"content": "Hello", "client_request_id": str(uuid.uuid4())}
+            response = _settled_composer_response(
+                client,
+                app,
+                path=f"/api/sessions/{session_id}/messages",
+                body=message_body("Hello", state_id=current_head_state_id_sync(client, session_id)),
             )
 
         assert response.status_code == 503
@@ -6243,7 +6521,12 @@ class TestLiteLLMErrorRedaction:
         assert created.status_code == 201
         session_id = uuid.UUID(created.json()["id"])
 
-        response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Hello", "client_request_id": str(uuid.uuid4())})
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Hello", state_id=current_head_state_id_sync(client, session_id)),
+        )
 
         assert response.status_code == 503
         assert response.json()["detail"]["failure_code"] == "token_accounting_unavailable"
@@ -6315,9 +6598,11 @@ class TestLiteLLMErrorRedaction:
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
-        msg_resp = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Hello", "client_request_id": str(uuid.uuid4())},
+        msg_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Hello", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
         self._assert_redacted(msg_resp, "llm_auth_error", "AuthenticationError")
 
@@ -6333,9 +6618,11 @@ class TestLiteLLMErrorRedaction:
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
-        msg_resp = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Hello", "client_request_id": str(uuid.uuid4())},
+        msg_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Hello", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
         self._assert_redacted(msg_resp, "llm_unavailable", "APIError")
 
@@ -6362,9 +6649,11 @@ class TestLiteLLMErrorRedaction:
 
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = uuid.UUID(resp.json()["id"])
-        msg_resp = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Hello", "client_request_id": str(uuid.uuid4())},
+        msg_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Hello", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
 
         assert msg_resp.status_code == 500
@@ -6391,9 +6680,11 @@ class TestLiteLLMErrorRedaction:
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
-        msg_resp = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Hello", "client_request_id": str(uuid.uuid4())},
+        msg_resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Hello", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
 
         assert msg_resp.status_code == 502
@@ -6556,7 +6847,9 @@ class TestLiteLLMErrorRedaction:
         )
         loop.close()
 
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        recompose_resp = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
         self._assert_redacted(recompose_resp, "llm_auth_error", "AuthenticationError")
 
     def test_recompose_api_error_body_carries_class_name_only(self, tmp_path) -> None:
@@ -6579,7 +6872,9 @@ class TestLiteLLMErrorRedaction:
         )
         loop.close()
 
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        recompose_resp = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
         self._assert_redacted(recompose_resp, "llm_unavailable", "APIError")
 
     def test_recompose_unclassified_compose_failure_persists_attached_llm_call(self, tmp_path) -> None:
@@ -6614,7 +6909,9 @@ class TestLiteLLMErrorRedaction:
         finally:
             loop.close()
 
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        recompose_resp = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
 
         assert recompose_resp.status_code == 500
         loop = asyncio.new_event_loop()
@@ -6648,7 +6945,9 @@ class TestLiteLLMErrorRedaction:
         )
         loop.close()
 
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        recompose_resp = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
 
         assert recompose_resp.status_code == 502
         detail = recompose_resp.json()["detail"]
@@ -6704,7 +7003,9 @@ class TestRecomposeConvergencePartialState:
         loop.run_until_complete(service.add_message(uuid.UUID(session_id), "user", submitted, writer_principal="route_user_message"))
         loop.close()
 
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        recompose_resp = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
 
         assert recompose_resp.status_code == 422
         detail = recompose_resp.json()["detail"]
@@ -6750,7 +7051,9 @@ class TestRecomposeConvergencePartialState:
         )
         loop.close()
 
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        recompose_resp = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
 
         assert recompose_resp.status_code == 422
         detail = recompose_resp.json()["detail"]
@@ -6788,9 +7091,13 @@ class TestRecomposeConvergencePartialState:
             assert resp.status_code in (200, 201), resp.text
             session_id = resp.json()["id"]
 
-            response = client.post(
-                f"/api/sessions/{session_id}/messages",
-                json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+            response = _settled_composer_response(
+                client,
+                app,
+                path=f"/api/sessions/{session_id}/messages",
+                body=message_body(
+                    "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+                ),
             )
 
             assert response.status_code == 422, response.text
@@ -6854,9 +7161,13 @@ class TestRecomposeConvergencePartialState:
         client = TestClient(app, raise_server_exceptions=False)
 
         session_id = client.post("/api/sessions", json={"title": "timeout"}).json()["id"]
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
 
         assert response.status_code == 422, response.text
@@ -6864,9 +7175,10 @@ class TestRecomposeConvergencePartialState:
         assert detail["reason"] == "convergence_wall_clock_timeout"
         assert detail["turns_used"] == 4, "the body must report the turns actually spent, not 0"
         assert detail["failed_turn"]["tool_calls_attempted"] == 3
-        # _make_app pins composer_timeout_seconds=85.0; the SPA needs the
-        # server-authoritative budget to name it honestly in the error copy.
-        assert detail["timeout_seconds"] == 85.0
+        # Queue residence reduces the budget actually passed to this job.
+        # The public error must name that exact provider-visible budget.
+        assert detail["timeout_seconds"] == mock_composer.compose.await_args.kwargs["budget_seconds"]
+        assert 0 < detail["timeout_seconds"] <= app.state.settings.composer_timeout_seconds
         assert "partial_state" in detail
 
     def test_budget_convergence_body_omits_the_timeout_budget(self, tmp_path) -> None:
@@ -6888,9 +7200,13 @@ class TestRecomposeConvergencePartialState:
         client = TestClient(app, raise_server_exceptions=False)
 
         session_id = client.post("/api/sessions", json={"title": "budget"}).json()["id"]
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
 
         assert response.status_code == 422, response.text
@@ -6951,7 +7267,9 @@ class TestRecomposeConvergencePartialState:
         )
         loop.close()
 
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        recompose_resp = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
 
         assert recompose_resp.status_code == 422
         detail = recompose_resp.json()["detail"]
@@ -6976,16 +7294,9 @@ class TestRecomposeConvergencePartialState:
         assert db_source_opts["blob_ref"] == "abc123"
 
     def test_recompose_convergence_save_operational_error_preserves_422_body(self, tmp_path) -> None:
-        """Regression (elspeth-303f751204): when save_composition_state
-        raises an ``OperationalError`` (lock timeout / pool disconnect)
-        while persisting partial_state from a convergence error, the
-        handler MUST still return the structured 422 body with
-        ``partial_state_save_failed=True`` rather than upgrading the
-        user-driven 422 to an uncaught 500.
+        """Historical test ID retained: required durable recovery SQL seals503.
 
-        Before the fix, the handler's ``except`` clause caught only
-        ``IntegrityError``; any other ``SQLAlchemyError`` subclass escaped
-        and the user received a generic 500 with no structured diagnostic.
+        Optional helper422/500 recovery flags have separate paired controls.
         """
         import asyncio
 
@@ -7015,14 +7326,12 @@ class TestRecomposeConvergencePartialState:
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
 
-        async def _raise_operational(*_args, **_kwargs):
+        def _raise_operational(*_args, **_kwargs):
             raise OperationalError(
                 "INSERT INTO composition_states ...",
                 {},
                 Exception("server has gone away"),
             )
-
-        service.save_composition_state = _raise_operational  # type: ignore[method-assign]
 
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post("/api/sessions", json={"title": "Test"})
@@ -7034,29 +7343,25 @@ class TestRecomposeConvergencePartialState:
         )
         loop.close()
 
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        body = _recompose_request(service, session_id)
+        recompose_resp = _settled_with_recovery_sql_fault(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=body, fault=_raise_operational
+        )
 
-        # Structured 422 body is preserved despite the secondary save failure.
-        assert recompose_resp.status_code == 422
-        detail = recompose_resp.json()["detail"]
-        assert detail["error_type"] == "convergence"
-        assert detail["partial_state_save_failed"] is True
-        # partial_state is not populated on save failure (no successful row).
-        assert "partial_state" not in detail
+        _assert_required_recovery_failure(
+            client,
+            service,
+            session_id,
+            response=recompose_resp,
+            path=f"/api/sessions/{session_id}/recompose",
+            body=body,
+            composer=mock_composer,
+        )
 
     def test_recompose_convergence_save_failure_redacts_sqlalchemy_internals(self, tmp_path) -> None:
-        """Regression: the 422 body's ``partial_state_save_error`` field must
-        carry only the exception class name — never SQL statements, parameter
-        tuples, or ``__cause__`` text. ``str(SQLAlchemyError)`` includes
-        ``[SQL: ...]`` and ``[parameters: ...]`` which on this code path carry
-        the composition-state JSON payload (potential secret refs); on
-        ``OperationalError`` the ``__cause__`` message can carry DB URLs or
-        credentials. The slog side already redacts
-        (``exc_class=type(save_err).__name__``); the HTTP response body must
-        match that redaction so a 422 cannot become a leak channel.
+        """Historical test ID retained: required durable recovery SQL seals503.
 
-        Paired with the sibling ``_handle_plugin_crash`` contract (same file),
-        which emits no response-body diagnostic at all.
+        Optional helper422/500 recovery flags have separate paired controls.
         """
         import asyncio
 
@@ -7092,14 +7397,12 @@ class TestRecomposeConvergencePartialState:
         params_canary = "__CANARY_PARAM_secret_ref_opaque_token__"
         cause_canary = "__CANARY_CAUSE_postgresql_conn_str_password__"
 
-        async def _raise_operational(*_args, **_kwargs):
+        def _raise_operational(*_args, **_kwargs):
             raise OperationalError(
                 f"INSERT INTO composition_states (id, session_id, source) VALUES (...) -- {sql_canary}",
                 {"source_options": params_canary},
                 Exception(f"connection closed: {cause_canary}"),
             )
-
-        service.save_composition_state = _raise_operational  # type: ignore[method-assign]
 
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post("/api/sessions", json={"title": "Redaction"})
@@ -7111,21 +7414,25 @@ class TestRecomposeConvergencePartialState:
         )
         loop.close()
 
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        body = _recompose_request(service, session_id)
+        recompose_resp = _settled_with_recovery_sql_fault(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=body, fault=_raise_operational
+        )
 
-        assert recompose_resp.status_code == 422
+        _assert_required_recovery_failure(
+            client,
+            service,
+            session_id,
+            response=recompose_resp,
+            path=f"/api/sessions/{session_id}/recompose",
+            body=body,
+            composer=mock_composer,
+        )
         body_text = recompose_resp.text
         # Primary assertion: no canary substring anywhere in the serialised body.
         assert sql_canary not in body_text, "SQL statement leaked into HTTP response body"
         assert params_canary not in body_text, "parameter tuple leaked into HTTP response body"
         assert cause_canary not in body_text, "DBAPI __cause__ text leaked into HTTP response body"
-
-        detail = recompose_resp.json()["detail"]
-        # The boolean signal is preserved so clients can still distinguish
-        # "partial state saved" from "partial state lost to a save failure".
-        assert detail["partial_state_save_failed"] is True
-        # The diagnostic field carries ONLY the exception class name.
-        assert detail.get("partial_state_save_error") == "OperationalError"
 
     def test_convergence_body_does_not_disclose_blob_storage_path(self, tmp_path) -> None:
         """elspeth-b5180a9630 (R2-F11): the 422 body must not carry a blob's
@@ -7195,7 +7502,9 @@ class TestRecomposeConvergencePartialState:
         )
         loop.close()
 
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        recompose_resp = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
 
         assert recompose_resp.status_code == 422, recompose_resp.text
         body_text = json.dumps(recompose_resp.json())
@@ -7276,9 +7585,13 @@ class TestRecomposeConvergencePartialState:
         ):
             resp = client.post("/api/sessions", json={"title": "Convergence + secrets"})
             session_id = resp.json()["id"]
-            convergence_resp = client.post(
-                f"/api/sessions/{session_id}/messages",
-                json={"content": "Build a pipeline with secrets", "client_request_id": str(uuid.uuid4())},
+            convergence_resp = _settled_composer_response(
+                client,
+                app,
+                path=f"/api/sessions/{session_id}/messages",
+                body=message_body(
+                    "Build a pipeline with secrets", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+                ),
             )
 
         assert convergence_resp.status_code == 422
@@ -7353,7 +7666,9 @@ class TestRecomposeConvergencePartialState:
             "elspeth.web.sessions.routes._helpers._state_data_from_composer_state",
             side_effect=capture_user_id,
         ):
-            convergence_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+            convergence_resp = _settled_composer_response(
+                client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+            )
 
         assert convergence_resp.status_code == 422
         assert convergence_resp.json()["detail"]["error_type"] == "convergence"
@@ -8012,8 +8327,6 @@ transforms:
                 composer_rate_limit_per_minute=10,
                 shareable_link_signing_key=b"\x00" * 32,
             )
-
-            from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
             app.state.rate_limiter = ComposerRateLimiter(limit=100)
             app.state.composer_progress_registry = ComposerProgressRegistry()
@@ -10766,7 +11079,7 @@ class TestComposerProgressRoutes:
         wire_test_pipeline_user_authority(
             app,
             identity_id="bob",
-            engine=app.state.pipeline_user_identity_engine,
+            engine=app.state.session_engine,
         )
 
         async def bob_user():
@@ -10834,9 +11147,11 @@ class TestComposerProgressRoutes:
         app.state.composer_service = composer
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post(
-                f"/api/sessions/{service.session.id}/messages",
-                json={"content": "Exploit HTML into JSON", "client_request_id": str(uuid.uuid4())},
+            response = await _settled_composer_response_async(
+                client,
+                app,
+                path=f"/api/sessions/{service.session.id}/messages",
+                body=message_body("Exploit HTML into JSON", state_id=await current_head_state_id(client, service.session.id)),
             )
             messages = (await client.get(f"/api/sessions/{service.session.id}/messages")).json()
             progress = (await client.get(f"/api/sessions/{service.session.id}/composer-progress")).json()
@@ -10925,9 +11240,13 @@ class TestComposerProgressRoutes:
         app.state.composer_service = _FactRecordingComposer()
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post(
-                f"/api/sessions/{service.session.id}/messages",
-                json={"content": "What does this block mean, and what are my options?", "client_request_id": str(uuid.uuid4())},
+            response = await _settled_composer_response_async(
+                client,
+                app,
+                path=f"/api/sessions/{service.session.id}/messages",
+                body=message_body(
+                    "What does this block mean, and what are my options?", state_id=await current_head_state_id(client, service.session.id)
+                ),
             )
 
         assert response.status_code == 200
@@ -10964,8 +11283,11 @@ class TestComposerProgressRoutes:
         app.state.composer_service = _FactRecordingComposer()
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post(
-                f"/api/sessions/{service.session.id}/messages", json={"content": "hello", "client_request_id": str(uuid.uuid4())}
+            response = await _settled_composer_response_async(
+                client,
+                app,
+                path=f"/api/sessions/{service.session.id}/messages",
+                body=message_body("hello", state_id=await current_head_state_id(client, service.session.id)),
             )
 
         assert response.status_code == 200
@@ -10979,8 +11301,11 @@ class TestComposerProgressRoutes:
         user_msg = await service.add_message(service.session.id, "user", "Exploit HTML into JSON", writer_principal="route_user_message")
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post(
-                f"/api/sessions/{service.session.id}/recompose", json={"expected_user_message_id": str(user_msg.id)}
+            response = await _settled_composer_response_async(
+                client,
+                app,
+                path=f"/api/sessions/{service.session.id}/recompose",
+                body=recompose_body(str(user_msg.id), state_id=await current_head_state_id(client, service.session.id)),
             )
             progress = (await client.get(f"/api/sessions/{service.session.id}/composer-progress")).json()
 
@@ -11113,19 +11438,15 @@ class TestComposerCancellationLifecycle:
         """
         app, service = _make_progress_route_app(tmp_path)
 
-        class _CancellingComposer:
-            async def compose(self, *args, **kwargs) -> None:
-                del args, kwargs
-                raise asyncio.CancelledError()
+        composer = _CancellableComposer(None)
 
-        app.state.composer_service = _CancellingComposer()
+        app.state.composer_service = composer
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            with pytest.raises(asyncio.CancelledError):
-                await client.post(
-                    f"/api/sessions/{service.session.id}/messages",
-                    json={"content": "Will be cancelled", "client_request_id": str(uuid.uuid4())},
-                )
+            response = await _cancel_registered_composer(
+                client, app, path=f"/api/sessions/{service.session.id}/messages", body=message_body("Will be cancelled"), composer=composer
+            )
+            assert response.status_code == 499
 
         registry = app.state.composer_progress_registry
         snapshot = await registry.get_latest(str(service.session.id))
@@ -11151,21 +11472,17 @@ class TestComposerCancellationLifecycle:
         )
         cancelled = _cancelled_error_with_llm_call(llm_call)
 
-        class _CancellingComposer:
-            async def compose(self, *args, **kwargs) -> None:
-                del args, kwargs
-                raise cancelled
+        composer = _CancellableComposer(cancelled)
 
-        app.state.composer_service = _CancellingComposer()
+        app.state.composer_service = composer
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            with pytest.raises(asyncio.CancelledError):
-                await client.post(
-                    f"/api/sessions/{service.session.id}/messages",
-                    json={"content": "Will be cancelled", "client_request_id": str(uuid.uuid4())},
-                )
+            response = await _cancel_registered_composer(
+                client, app, path=f"/api/sessions/{service.session.id}/messages", body=message_body("Will be cancelled"), composer=composer
+            )
+            assert response.status_code == 499
 
-        llm_audit_rows = _llm_call_audit_rows(service.messages)
+        llm_audit_rows = _llm_call_audit_rows(await service.get_messages(service.session.id, limit=None))
         assert len(llm_audit_rows) == 1
         _row, tool_call = llm_audit_rows[0]
         assert tool_call["call"]["status"] == "cancelled"
@@ -11189,19 +11506,15 @@ class TestComposerCancellationLifecycle:
 
         app, service = _make_progress_route_app(tmp_path)
 
-        class _CancellingComposer:
-            async def compose(self, *args, **kwargs) -> None:
-                del args, kwargs
-                raise asyncio.CancelledError()
+        composer = _CancellableComposer(None)
 
-        app.state.composer_service = _CancellingComposer()
+        app.state.composer_service = composer
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            with pytest.raises(asyncio.CancelledError):
-                await client.post(
-                    f"/api/sessions/{service.session.id}/messages",
-                    json={"content": "Will be cancelled", "client_request_id": str(uuid.uuid4())},
-                )
+            response = await _cancel_registered_composer(
+                client, app, path=f"/api/sessions/{service.session.id}/messages", body=message_body("Will be cancelled"), composer=composer
+            )
+            assert response.status_code == 499
 
         terminal_events = [(v, attrs) for v, attrs in emitted if attrs.get("endpoint") == "send_message"]
         assert len(terminal_events) == 1, f"expected 1 terminal event, got {terminal_events}"
@@ -11229,9 +11542,11 @@ class TestComposerCancellationLifecycle:
         app.state.composer_service = _ProgressAwareComposer()
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(
-                f"/api/sessions/{service.session.id}/messages",
-                json={"content": "Hello", "client_request_id": str(uuid.uuid4())},
+            resp = await _settled_composer_response_async(
+                client,
+                app,
+                path=f"/api/sessions/{service.session.id}/messages",
+                body=message_body("Hello", state_id=await current_head_state_id(client, service.session.id)),
             )
 
         assert resp.status_code == 200
@@ -11250,16 +11565,15 @@ class TestComposerCancellationLifecycle:
             service.session.id, "user", "Will be cancelled on retry", writer_principal="route_user_message"
         )
 
-        class _CancellingComposer:
-            async def compose(self, *args, **kwargs) -> None:
-                del args, kwargs
-                raise asyncio.CancelledError()
+        composer = _CancellableComposer(None)
 
-        app.state.composer_service = _CancellingComposer()
+        app.state.composer_service = composer
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            with pytest.raises(asyncio.CancelledError):
-                await client.post(f"/api/sessions/{service.session.id}/recompose", json={"expected_user_message_id": str(user_msg.id)})
+            response = await _cancel_registered_composer(
+                client, app, path=f"/api/sessions/{service.session.id}/recompose", body=recompose_body(str(user_msg.id)), composer=composer
+            )
+            assert response.status_code == 499
 
         registry = app.state.composer_progress_registry
         snapshot = await registry.get_latest(str(service.session.id))
@@ -11284,18 +11598,17 @@ class TestComposerCancellationLifecycle:
         )
         cancelled = _cancelled_error_with_llm_call(llm_call)
 
-        class _CancellingComposer:
-            async def compose(self, *args, **kwargs) -> None:
-                del args, kwargs
-                raise cancelled
+        composer = _CancellableComposer(cancelled)
 
-        app.state.composer_service = _CancellingComposer()
+        app.state.composer_service = composer
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            with pytest.raises(asyncio.CancelledError):
-                await client.post(f"/api/sessions/{service.session.id}/recompose", json={"expected_user_message_id": str(user_msg.id)})
+            response = await _cancel_registered_composer(
+                client, app, path=f"/api/sessions/{service.session.id}/recompose", body=recompose_body(str(user_msg.id)), composer=composer
+            )
+            assert response.status_code == 499
 
-        llm_audit_rows = _llm_call_audit_rows(service.messages)
+        llm_audit_rows = _llm_call_audit_rows(await service.get_messages(service.session.id, limit=None))
         assert len(llm_audit_rows) == 1
         _row, tool_call = llm_audit_rows[0]
         assert tool_call["call"]["status"] == "cancelled"
@@ -11322,16 +11635,15 @@ class TestComposerCancellationLifecycle:
             service.session.id, "user", "Will be cancelled on retry", writer_principal="route_user_message"
         )
 
-        class _CancellingComposer:
-            async def compose(self, *args, **kwargs) -> None:
-                del args, kwargs
-                raise asyncio.CancelledError()
+        composer = _CancellableComposer(None)
 
-        app.state.composer_service = _CancellingComposer()
+        app.state.composer_service = composer
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            with pytest.raises(asyncio.CancelledError):
-                await client.post(f"/api/sessions/{service.session.id}/recompose", json={"expected_user_message_id": str(user_msg.id)})
+            response = await _cancel_registered_composer(
+                client, app, path=f"/api/sessions/{service.session.id}/recompose", body=recompose_body(str(user_msg.id)), composer=composer
+            )
+            assert response.status_code == 499
 
         terminal_events = [(v, attrs) for v, attrs in emitted if attrs.get("endpoint") == "recompose"]
         assert terminal_events == [(1, {"endpoint": "recompose", "status": "cancelled"})]
@@ -11346,7 +11658,7 @@ class TestComposerCancellationLifecycle:
         # route handler in messages.py (the /messages route this test drives),
         # which bound the name at import — so the patch must target that
         # calling module, not the defining _helpers module.
-        from elspeth.web.sessions.routes import messages as messages_module
+        from elspeth.web.sessions import composer_turn as messages_module
 
         emitted: list[tuple[int, dict[str, str]]] = []
 
@@ -11360,9 +11672,11 @@ class TestComposerCancellationLifecycle:
         app.state.composer_service = _ProgressAwareComposer()
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(
-                f"/api/sessions/{service.session.id}/messages",
-                json={"content": "Hello", "client_request_id": str(uuid.uuid4())},
+            resp = await _settled_composer_response_async(
+                client,
+                app,
+                path=f"/api/sessions/{service.session.id}/messages",
+                body=message_body("Hello", state_id=await current_head_state_id(client, service.session.id)),
             )
 
         assert resp.status_code == 200
@@ -11536,9 +11850,13 @@ class TestComposePluginCrashResponse:
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
 
         assert response.status_code == 500
@@ -11579,7 +11897,9 @@ class TestComposePluginCrashResponse:
         )
         loop.close()
 
-        response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        response = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
 
         assert response.status_code == 500
         body = response.json()
@@ -11626,9 +11946,13 @@ class TestComposePluginCrashResponse:
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
         assert response.status_code == 500
         body = response.json()
@@ -11668,9 +11992,13 @@ class TestComposePluginCrashResponse:
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
         assert response.status_code == 500
 
@@ -11704,9 +12032,13 @@ class TestComposePluginCrashResponse:
         session_id = resp.json()["id"]
 
         cap_logs = self._capture_route_slogs(monkeypatch)
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
         assert response.status_code == 500
 
@@ -11754,9 +12086,13 @@ class TestComposePluginCrashResponse:
         session_id = resp.json()["id"]
 
         cap_logs = self._capture_route_slogs(monkeypatch)
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
         assert response.status_code == 500
 
@@ -11772,18 +12108,9 @@ class TestComposePluginCrashResponse:
             assert cause_secret not in serialised, event
 
     def test_compose_plugin_crash_save_operational_error_preserves_500_body(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Regression (elspeth-303f751204): when save_composition_state
-        raises an ``OperationalError`` (lock timeout, pool disconnect,
-        deadlock) while persisting partial_state during a plugin crash,
-        the handler MUST still return the structured ``composer_plugin_error``
-        500 body rather than letting the secondary DB failure mask the
-        primary crash.  The save failure is recorded via
-        ``_plugin_crash_partial_state_save_failed`` slog.
+        """Historical test ID retained: required durable recovery SQL seals503.
 
-        Before the fix, the handler's ``except`` clause caught only
-        ``IntegrityError``; any other ``SQLAlchemyError`` subclass escaped,
-        producing a generic (unstructured) 500 and losing the redacted
-        response path entirely.
+        Optional helper422/500 recovery flags have separate paired controls.
         """
         from sqlalchemy.exc import OperationalError
 
@@ -11808,29 +12135,36 @@ class TestComposePluginCrashResponse:
         # Patch save_composition_state to raise a non-IntegrityError
         # SQLAlchemyError subclass — simulates lock timeout / deadlock /
         # pool disconnect / schema drift.
-        async def _raise_operational(*_args, **_kwargs):
+        def _raise_operational(*_args, **_kwargs):
             raise OperationalError(
                 "UPDATE composition_states ...",
                 {},
                 Exception("lock wait timeout exceeded"),
             )
 
-        service.save_composition_state = _raise_operational  # type: ignore[method-assign]
-
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
         cap_logs = self._capture_route_slogs(monkeypatch)
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        body = message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id))
+        response = _settled_with_recovery_sql_fault(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=body,
+            fault=_raise_operational,
         )
 
-        # Structured 500 body is preserved despite the secondary save failure.
-        assert response.status_code == 500
-        body = response.json()
-        assert body["detail"]["error_type"] == "composer_plugin_error"
+        _assert_required_recovery_failure(
+            client,
+            service,
+            session_id,
+            response=response,
+            path=f"/api/sessions/{session_id}/messages",
+            body=body,
+            composer=mock_composer,
+        )
         assert self.SECRET_PATH not in response.text
 
         # The secondary failure is recorded via slog.
@@ -11843,14 +12177,9 @@ class TestComposePluginCrashResponse:
         assert len(crash_events) == 1, cap_logs
 
     def test_compose_plugin_crash_save_failure_sets_partial_state_save_failed_flag(self, tmp_path) -> None:
-        """Regression (P2d): when partial-state persistence fails during a
-        plugin crash, the 500 response body MUST include
-        ``partial_state_save_failed=True`` and ``partial_state_save_error``
-        symmetric with the 422 convergence-error response. The frontend
-        recovery UX branches on this flag to distinguish "state is
-        captured, safe to retry later" from "state is lost, start over."
-        Without the flag, the two plugin-crash outcomes (save success
-        vs save failure) are indistinguishable to the client.
+        """Historical test ID retained: required durable recovery SQL seals503.
+
+        Optional helper422/500 recovery flags have separate paired controls.
         """
         from sqlalchemy.exc import OperationalError
 
@@ -11872,30 +12201,35 @@ class TestComposePluginCrashResponse:
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
 
-        async def _raise_operational(*_args, **_kwargs):
+        def _raise_operational(*_args, **_kwargs):
             raise OperationalError(
                 "UPDATE composition_states ...",
                 {},
                 Exception("lock wait timeout exceeded"),
             )
 
-        service.save_composition_state = _raise_operational  # type: ignore[method-assign]
-
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        body = message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id))
+        response = _settled_with_recovery_sql_fault(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=body,
+            fault=_raise_operational,
         )
 
-        assert response.status_code == 500
-        detail = response.json()["detail"]
-        assert detail["error_type"] == "composer_plugin_error"
-        # The two symmetry fields introduced to match _handle_convergence_error.
-        assert detail.get("partial_state_save_failed") is True
-        assert detail.get("partial_state_save_error") == "OperationalError"
+        _assert_required_recovery_failure(
+            client,
+            service,
+            session_id,
+            response=response,
+            path=f"/api/sessions/{session_id}/messages",
+            body=body,
+            composer=mock_composer,
+        )
 
     def test_compose_plugin_crash_save_successful_omits_partial_state_save_failed_flag(self, tmp_path) -> None:
         """Regression (P2d, negative): when partial-state persistence
@@ -11924,9 +12258,13 @@ class TestComposePluginCrashResponse:
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
 
         assert response.status_code == 500
@@ -11961,22 +12299,25 @@ class TestComposePluginCrashResponse:
             side_effect=ComposerPluginCrashError(original, partial_state=partial),
         )
 
-        app, service = _make_app(tmp_path)
+        app, _service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
 
         # TypeError from our own dataclass path — a Tier 1 bug that must propagate.
-        async def _raise_type_error(*_args, **_kwargs):
+        def _raise_type_error(*_args, **_kwargs):
             raise TypeError("dataclass field contract violated")
-
-        service.save_composition_state = _raise_type_error  # type: ignore[method-assign]
 
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_with_recovery_sql_fault(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
+            fault=_raise_type_error,
         )
 
         # 500 from FastAPI's default handler — NOT the composer_plugin_error
@@ -12006,9 +12347,13 @@ class TestComposePluginCrashResponse:
         resp = client.post("/api/sessions", json={"title": "Test"})
         session_id = resp.json()["id"]
 
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
 
         assert response.status_code == 500
@@ -12901,7 +13246,9 @@ def test_recompose_success_persists_runtime_invalid_state(tmp_path) -> None:
     )
     app.state.composer_service = mock_composer
 
-    recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+    recompose_resp = _settled_composer_response(
+        client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+    )
 
     assert recompose_resp.status_code == 200
     loop = asyncio.new_event_loop()
@@ -12970,7 +13317,9 @@ def test_recompose_convergence_persists_runtime_invalid_partial_state(tmp_path) 
         "elspeth.web.sessions.routes._helpers._runtime_preflight_for_state",
         new=_async_return(runtime_preflight),
     ):
-        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        recompose_resp = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
 
     assert recompose_resp.status_code == 422
     loop = asyncio.new_event_loop()
@@ -13024,9 +13373,13 @@ def test_compose_plugin_crash_persists_runtime_invalid_partial_state(tmp_path) -
         "elspeth.web.sessions.routes._helpers._runtime_preflight_for_state",
         new=_async_return(runtime_preflight),
     ):
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
 
     assert response.status_code == 500
@@ -13113,9 +13466,13 @@ def test_compose_runtime_preflight_persists_partial_state(tmp_path) -> None:
         raise RuntimeError("preflight blew up during state persistence")
 
     with patch("elspeth.web.sessions.routes._helpers._runtime_preflight_for_state", side_effect=boom):
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
 
     assert response.status_code == 500
@@ -13194,9 +13551,13 @@ def test_authoring_validator_crash_persists_invalid_state_and_skips_runtime_pref
         patch("elspeth.web.sessions.routes._helpers.validate_authored_composition_state", side_effect=_validator_boom),
         patch("elspeth.web.sessions.routes._helpers._runtime_preflight_for_state") as preflight,
     ):
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
 
     assert response.status_code == 200
@@ -13246,7 +13607,9 @@ def test_recompose_runtime_preflight_persists_partial_state(tmp_path) -> None:
         raise RuntimeError("preflight blew up on recompose")
 
     with patch("elspeth.web.sessions.routes._helpers._runtime_preflight_for_state", side_effect=boom):
-        response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        response = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
 
     assert response.status_code == 500
     body = response.json()
@@ -13298,9 +13661,11 @@ def test_compose_cached_runtime_preflight_persists_partial_state(tmp_path) -> No
     resp = client.post("/api/sessions", json={"title": "Cached preflight"})
     session_id = uuid.UUID(resp.json()["id"])
 
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
     )
 
     assert response.status_code == 500
@@ -13360,9 +13725,13 @@ def test_runtime_preflight_handler_records_exception_telemetry(tmp_path, monkeyp
         raise RuntimeError("preflight crashed")
 
     with patch("elspeth.web.sessions.routes._helpers._runtime_preflight_for_state", side_effect=boom):
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body(
+                "Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())
+            ),
         )
     assert response.status_code == 500
 
@@ -13465,9 +13834,11 @@ def test_compose_cached_runtime_preflight_no_partial_state_records_telemetry(tmp
     resp = client.post("/api/sessions", json={"title": "Cached preflight no partial"})
     session_id = uuid.UUID(resp.json()["id"])
 
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
     )
 
     assert response.status_code == 500
@@ -13551,7 +13922,9 @@ def test_recompose_cached_runtime_preflight_no_partial_state_records_telemetry(t
     finally:
         loop.close()
 
-    response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+    response = _settled_composer_response(
+        client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+    )
 
     assert response.status_code == 500
     assert response.json()["detail"]["error_type"] == "composer_plugin_error"
@@ -13644,11 +14017,9 @@ async def test_state_data_raise_arm_emits_telemetry_before_propagating() -> None
 def test_runtime_preflight_handler_save_failure_sets_partial_state_save_failed_flag(
     tmp_path,
 ) -> None:
-    """C1: When DB persistence of partial_state fails inside the recovery
-    handler, the 500 response MUST carry partial_state_save_failed=True and
-    partial_state_save_error=<class name>, matching the convergence/plugin-crash
-    contract so the frontend can distinguish "state captured" from
-    "state lost". The save failure MUST NOT mask the primary 500 response.
+    """Historical test ID retained: required durable recovery SQL seals503.
+
+    Optional helper422/500 recovery flags have separate paired controls.
     """
     from sqlalchemy.exc import OperationalError
 
@@ -13672,14 +14043,12 @@ def test_runtime_preflight_handler_save_failure_sets_partial_state_save_failed_f
     params_canary = "__CANARY_PARAM_runtime_preflight_payload__"
     cause_canary = "__CANARY_CAUSE_runtime_preflight_db_url__"
 
-    async def _raise_operational(*_args, **_kwargs):
+    def _raise_operational(*_args, **_kwargs):
         raise OperationalError(
             f"INSERT INTO composition_states (...) -- {sql_canary}",
             {"source_options": params_canary},
             Exception(f"connection closed: {cause_canary}"),
         )
-
-    service.save_composition_state = _raise_operational  # type: ignore[method-assign]
 
     client = TestClient(app, raise_server_exceptions=False)
     resp = client.post("/api/sessions", json={"title": "Save fail"})
@@ -13688,23 +14057,30 @@ def test_runtime_preflight_handler_save_failure_sets_partial_state_save_failed_f
     async def boom(state, *, settings, secret_service, user_id, session_id, **_policy_context):
         raise RuntimeError("preflight crashed before save")
 
+    body = message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id))
     with patch("elspeth.web.sessions.routes._helpers._runtime_preflight_for_state", side_effect=boom):
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+        response = _settled_with_recovery_sql_fault(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=body,
+            fault=_raise_operational,
         )
 
-    assert response.status_code == 500
+    _assert_required_recovery_failure(
+        client,
+        service,
+        session_id,
+        response=response,
+        path=f"/api/sessions/{session_id}/messages",
+        body=body,
+        composer=mock_composer,
+    )
     body_text = response.text
     # Redaction parity: no SQL / parameter / __cause__ leakage in the body.
     assert sql_canary not in body_text, "SQL statement leaked into HTTP response body"
     assert params_canary not in body_text, "parameter tuple leaked into HTTP response body"
     assert cause_canary not in body_text, "DBAPI __cause__ text leaked into HTTP response body"
-
-    detail = response.json()["detail"]
-    assert detail["error_type"] == "composer_plugin_error"
-    assert detail["partial_state_save_failed"] is True
-    assert detail.get("partial_state_save_error") == "OperationalError"
 
 
 def test_assistant_raw_content_is_persisted_but_not_returned(tmp_path) -> None:
@@ -13747,7 +14123,12 @@ def test_assistant_raw_content_is_persisted_but_not_returned(tmp_path) -> None:
     composer.compose = AsyncMock(spec=ComposerService.compose, return_value=composer_result)
     app.state.composer_service = composer
 
-    resp = client.post(f"/api/sessions/{session_id}/messages", json={"content": "build it", "client_request_id": str(uuid.uuid4())})
+    resp = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("build it", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
+    )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -13985,10 +14366,15 @@ def test_persisted_empty_assistant_prose_is_omitted_from_provider_history(
 
     monkeypatch.setattr("litellm.acompletion", rejected_provider)
     if route == "recompose":
-        response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+        response = _settled_composer_response(
+            client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+        )
     else:
-        response = client.post(
-            f"/api/sessions/{session_id}/messages", json={"content": "Try again", "client_request_id": str(uuid.uuid4())}
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Try again", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
 
     assert response.status_code == 502, response.text
@@ -14168,7 +14554,12 @@ def test_send_message_does_not_replay_audit_tool_rows_to_composer(tmp_path) -> N
     finally:
         loop.close()
 
-    resp = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Continue", "client_request_id": str(uuid.uuid4())})
+    resp = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Continue", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
+    )
 
     assert resp.status_code == 200
     history = composer.compose.call_args.args[1]
@@ -14209,7 +14600,9 @@ def test_recompose_uses_last_conversational_user_before_audit_tool_rows(tmp_path
     finally:
         loop.close()
 
-    resp = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+    resp = _settled_composer_response(
+        client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+    )
 
     assert resp.status_code == 200
     composer.compose.assert_awaited_once()
@@ -14263,7 +14656,9 @@ def test_recompose_replays_trailing_control_row_without_ordinary_audit(
     finally:
         loop.close()
 
-    response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+    response = _settled_composer_response(
+        client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+    )
 
     assert response.status_code == 200
     composer.compose.assert_awaited_once()
@@ -14360,9 +14755,11 @@ def test_handle_convergence_error_persists_convergence_persist_provenance(tmp_pa
     client = TestClient(app, raise_server_exceptions=False)
 
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
     )
     assert response.status_code == 422
     assert response.json()["detail"]["partial_state"] is not None
@@ -14400,9 +14797,11 @@ def test_handle_plugin_crash_persists_plugin_crash_persist_provenance(tmp_path: 
     client = TestClient(app, raise_server_exceptions=False)
 
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
     )
     assert response.status_code == 500
 
@@ -14468,9 +14867,11 @@ def test_handle_runtime_preflight_failure_persists_preflight_persist_provenance(
     client = TestClient(app, raise_server_exceptions=False)
 
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
     )
     assert response.status_code == 500
 
@@ -14505,9 +14906,11 @@ def test_send_message_post_compose_state_advance_persists_post_compose_provenanc
     client = TestClient(app)
 
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
     )
 
     assert response.status_code == 200
@@ -14551,7 +14954,12 @@ def test_send_message_state_advance_preserves_existing_composer_meta(tmp_path: P
         )
     )
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Update it", "client_request_id": str(uuid.uuid4())})
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Update it", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
+    )
 
     assert response.status_code == 200
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
@@ -14589,7 +14997,9 @@ def test_recompose_post_compose_state_advance_persists_post_compose_provenance(t
     finally:
         loop.close()
 
-    response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+    response = _settled_composer_response(
+        client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+    )
 
     assert response.status_code == 200
     assert _read_persisted_provenance(service, session_id) == "post_compose"
@@ -14640,7 +15050,9 @@ def test_recompose_state_advance_preserves_existing_composer_meta(tmp_path: Path
         )
     )
 
-    response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+    response = _settled_composer_response(
+        client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+    )
 
     assert response.status_code == 200
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
@@ -14701,7 +15113,7 @@ class TestSendMessageTranscriptSnapshot:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post(
                 f"/api/sessions/{session.id}/messages",
-                json={"content": f"Please use {candidate}", "client_request_id": str(uuid.uuid4())},
+                json=message_body(f"Please use {candidate}"),
             )
 
         assert response.status_code == 422
@@ -14712,13 +15124,10 @@ class TestSendMessageTranscriptSnapshot:
 
     @pytest.mark.asyncio
     async def test_competing_compose_lease_returns_409_without_persisting_user_message(self, tmp_path) -> None:
+        """A held external lease leaves admitted work queued with no side effects."""
         app, service = _make_app(tmp_path)
-        app.state.composer_service = _make_composer_mock(response_text="must not run")
-
-        @app.exception_handler(SessionOperationConflictError)
-        async def handle_conflict(_request: object, _exc: SessionOperationConflictError) -> JSONResponse:
-            return JSONResponse(status_code=409, content={"detail": "Session operation is already active"})
-
+        composer = _make_composer_mock(response_text="must not run")
+        app.state.composer_service = composer
         session = await service.create_session("alice", "Replica conflict", "local")
         blocking_context = service.session_operation_authority.acquire(
             session_id=session.id,
@@ -14728,15 +15137,28 @@ class TestSendMessageTranscriptSnapshot:
         )
         try:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-                response = await client.post(
-                    f"/api/sessions/{session.id}/messages",
-                    json={"content": "must remain uncommitted", "client_request_id": str(uuid.uuid4())},
-                )
+                body = message_body("must remain uncommitted")
+                admitted = await client.post(f"/api/sessions/{session.id}/messages", json=body)
+                assert admitted.status_code == 202
+                await asyncio.wait_for(app.state.composer_async_worker.run_until_idle(), timeout=5.0)
+                poll_path = f"/api/sessions/{session.id}/operations/{body['operation_id']}"
+                queued = await client.get(poll_path)
+                assert queued.status_code == 200
+                assert queued.json()["status"] == "queued"
+                assert await service.get_messages(session.id, limit=None) == []
+                composer.compose.assert_not_awaited()
+                cancelled = await client.post(f"{poll_path}/cancel")
+                assert cancelled.status_code in (200, 202)
+                await asyncio.wait_for(app.state.composer_async_worker.run_until_idle(), timeout=5.0)
+                final = await client.get(poll_path)
+                assert final.status_code == 200
+                status, _body = SettledComposerOperation(admitted, final).error()
+                assert status == 499
         finally:
             service.session_operation_authority.release(blocking_context)
-
-        assert response.status_code == 409
+        await asyncio.wait_for(app.state.composer_async_worker.run_until_idle(), timeout=5.0)
         assert await service.get_messages(session.id, limit=None) == []
+        composer.compose.assert_not_awaited()
 
     def test_send_message_proceeds_when_get_messages_returns_stale_pre_insert_snapshot(self, tmp_path) -> None:
         """T2 (structural): a stale get_messages cannot 500 the send path.
@@ -14776,9 +15198,11 @@ class TestSendMessageTranscriptSnapshot:
         client = TestClient(app)
         session_id = client.post("/api/sessions", json={"title": "Stale snapshot"}).json()["id"]
 
-        resp = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "hello", "client_request_id": str(uuid.uuid4())},
+        resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("hello", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
 
         assert resp.status_code == 200, (
@@ -14839,9 +15263,11 @@ class TestSendMessageTranscriptSnapshot:
         client = TestClient(app)
         session_id = client.post("/api/sessions", json={"title": "Trailing audit"}).json()["id"]
 
-        resp = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "hello", "client_request_id": str(uuid.uuid4())},
+        resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("hello", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
 
         assert resp.status_code == 200, (
@@ -14862,10 +15288,18 @@ class TestSendMessageTranscriptSnapshot:
         client = TestClient(app)
         session_id = client.post("/api/sessions", json={"title": "History"}).json()["id"]
 
-        first = client.post(f"/api/sessions/{session_id}/messages", json={"content": "first turn", "client_request_id": str(uuid.uuid4())})
+        first = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("first turn", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
+        )
         assert first.status_code == 200
-        second = client.post(
-            f"/api/sessions/{session_id}/messages", json={"content": "second turn", "client_request_id": str(uuid.uuid4())}
+        second = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("second turn", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
         assert second.status_code == 200
 
@@ -14896,9 +15330,15 @@ def test_compose_that_authors_nothing_returns_200_with_null_state(tmp_path: Path
     client = TestClient(app)
     session = client.post("/api/sessions", json={"title": "g05 characterisation"}).json()
 
-    compose = client.post(
-        f"/api/sessions/{session['id']}/messages",
-        json={"content": "Tidy each headline into title case.", "client_request_id": str(uuid.uuid4())},
+    compose = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session['id']}/messages",
+        body=message_body(
+            "Tidy each headline into title case.",
+            state_id=current_head_state_id_sync(client, session["id"]),
+            operation_id=str(uuid.uuid4()),
+        ),
     )
 
     assert compose.status_code == 200
@@ -14977,8 +15417,11 @@ def test_send_message_does_not_re_emit_the_already_persisted_turn_prose(tmp_path
     composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=_compose_with_midloop_persist)
     app.state.composer_service = composer
 
-    response = client.post(
-        f"/api/sessions/{session_id}/messages", json={"content": "Build the pipeline.", "client_request_id": str(uuid.uuid4())}
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Build the pipeline.", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
     )
     assert response.status_code == 200
 
@@ -15016,8 +15459,8 @@ def test_recompose_auto_commit_revoked_persists_the_post_rebind_message(tmp_path
     """
     from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
 
-    app, service, _pipeline, session_id, row, _endpoint = asyncio.run(
-        _create_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="recompose-auto-revoked")
+    app, service, _pipeline, session_id, creation, _endpoint = asyncio.run(
+        _prepare_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="recompose-auto-revoked")
     )
     asyncio.run(
         service.add_message(
@@ -15027,9 +15470,11 @@ def test_recompose_auto_commit_revoked_persists_the_post_rebind_message(tmp_path
             writer_principal="route_user_message",
         )
     )
-    assert row.pipeline_metadata is not None
+    created_proposals = []
 
     async def _compose_then_downgrade(*_args, **_kwargs) -> ComposerResult:
+        row = await _create_running_pipeline_route_proposal(service, creation, _kwargs)
+        created_proposals.append(row)
         # The downgrade becomes durable while the compose turn is in flight —
         # after intent minting, before settlement.
         await service.update_composer_preferences(
@@ -15056,11 +15501,16 @@ def test_recompose_auto_commit_revoked_persists_the_post_rebind_message(tmp_path
     app.state.composer_service = composer
     client = TestClient(app)
 
-    response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+    response = _settled_composer_response(
+        client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
+    )
 
     assert response.status_code == 200
+    (row,) = created_proposals
+    composer.compose.assert_awaited_once()
     body = response.json()
     assert len(body["proposals"]) == 1
+    assert body["proposals"][0]["id"] == str(row.id)
     assert body["proposals"][0]["status"] == "pending"
     # The superseded "Pipeline prepared." must not reach the transcript.
     assert body["message"]["content"] == PIPELINE_STAGED_REVIEW_MESSAGE
@@ -15155,7 +15605,7 @@ async def test_send_message_shielded_llm_call_persist_completes_under_a_real_out
     cancel chain is restored: the handler's own terminal ``raise`` re-raises the
     original ``CancelledError``, so the request still finishes as cancelled.
     """
-    from elspeth.web.sessions.routes import messages as messages_module
+    from elspeth.web.sessions import composer_turn as messages_module
 
     app, service = _make_progress_route_app(tmp_path)
     llm_call = _llm_call(
@@ -15170,12 +15620,12 @@ async def test_send_message_shielded_llm_call_persist_completes_under_a_real_out
     )
     cancelled = _cancelled_error_with_llm_call(llm_call)
 
-    class _CancellingComposer:
-        async def compose(self, *args, **kwargs) -> None:
-            del args, kwargs
-            raise cancelled
+    from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED
 
-    app.state.composer_service = _CancellingComposer()
+    cancelled.args = (COMPOSER_CANCEL_REQUESTED,)
+    composer = _CancellableComposer(cancelled)
+    app.state.composer_service = composer
+    captured = _capture_turn_exception(monkeypatch)
 
     entered_persist = asyncio.Event()
     release_persist = asyncio.Event()
@@ -15191,23 +15641,31 @@ async def test_send_message_shielded_llm_call_persist_completes_under_a_real_out
 
     monkeypatch.setattr(messages_module, "_persist_llm_calls", _paused_persist)
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        request_task = asyncio.create_task(
-            client.post(
-                f"/api/sessions/{service.session.id}/messages",
-                json={"content": "Will be cancelled inside the shielded persist", "client_request_id": str(uuid.uuid4())},
-            )
-        )
+    async with (
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
+        running_operation_async(
+            client,
+            app,
+            path=f"/api/sessions/{service.session.id}/messages",
+            body=message_body("Will be cancelled inside the shielded persist"),
+        ) as operation,
+    ):
+        await asyncio.wait_for(composer.entered.wait(), timeout=3)
+        cancellation = await client.post(f"{operation.poll_path}/cancel")
+        assert cancellation.status_code in (200, 202)
         await asyncio.wait_for(entered_persist.wait(), timeout=3)
-        request_task.cancel()
+        assert composer.owner is not None
+        composer.owner.cancel(COMPOSER_CANCEL_REQUESTED)
         await asyncio.sleep(0)
+        assert not composer.owner.done()
         release_persist.set()
-        with pytest.raises(asyncio.CancelledError):
-            await request_task
-        # The shielded child was never cancelled: it finished its write.
+        await asyncio.wait_for(operation.drive, timeout=5)
         await asyncio.wait_for(persist_completed.wait(), timeout=3)
+        terminal = await client.get(operation.poll_path)
+        assert SettledComposerOperation(operation.accepted, terminal).error()[0] == 499
+    assert captured == [cancelled]
 
-    llm_audit_rows = _llm_call_audit_rows(service.messages)
+    llm_audit_rows = _llm_call_audit_rows(await service.get_messages(service.session.id, limit=None))
     assert len(llm_audit_rows) == 1
     _row, tool_call = llm_audit_rows[0]
     assert tool_call["call"]["status"] == "cancelled"
@@ -15227,8 +15685,8 @@ async def test_send_message_shielded_llm_call_persist_completes_under_a_real_out
 async def test_recompose_repeat_cancel_joins_cleanup_before_releasing_lease(tmp_path, monkeypatch, blocked_write: str) -> None:
     from sqlalchemy import select
 
+    from elspeth.web.sessions import composer_turn as compose_module
     from elspeth.web.sessions.models import session_operation_fences_table
-    from elspeth.web.sessions.routes.composer import compose as compose_module
 
     app, service = _make_progress_route_app(tmp_path)
     user_msg = await service.add_message(service.session.id, "user", "Retry", writer_principal="route_user_message")
@@ -15245,12 +15703,12 @@ async def test_recompose_repeat_cancel_joins_cleanup_before_releasing_lease(tmp_
     cancelled = _cancelled_error_with_llm_call(llm_call)
     cancelled.args = ("original composer cancellation",)
 
-    class _CancellingComposer:
-        async def compose(self, *args, **kwargs) -> None:
-            del args, kwargs
-            raise cancelled
+    from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED
 
-    app.state.composer_service = _CancellingComposer()
+    cancelled.args = (COMPOSER_CANCEL_REQUESTED,)
+    composer = _CancellableComposer(cancelled)
+    app.state.composer_service = composer
+    captured = _capture_turn_exception(monkeypatch)
     entered = asyncio.Event()
     release = asyncio.Event()
     completed = asyncio.Event()
@@ -15281,16 +15739,22 @@ async def test_recompose_repeat_cancel_joins_cleanup_before_releasing_lease(tmp_
 
         monkeypatch.setattr(compose_module, "_publish_progress", paused_publish)
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        request_task = asyncio.create_task(
-            client.post(f"/api/sessions/{service.session.id}/recompose", json={"expected_user_message_id": str(user_msg.id)})
-        )
+    async with (
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
+        running_operation_async(
+            client, app, path=f"/api/sessions/{service.session.id}/recompose", body=recompose_body(str(user_msg.id))
+        ) as operation,
+    ):
+        await asyncio.wait_for(composer.entered.wait(), timeout=3)
+        cancellation = await client.post(f"{operation.poll_path}/cancel")
+        assert cancellation.status_code in (200, 202)
         try:
             await asyncio.wait_for(entered.wait(), timeout=3)
-            request_task.cancel("repeated shutdown cancellation")
+            assert composer.owner is not None
+            composer.owner.cancel(COMPOSER_CANCEL_REQUESTED)
             with pytest.raises(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(request_task), timeout=0.05)
-            assert not request_task.done()
+                await asyncio.wait_for(asyncio.shield(composer.owner), timeout=0.05)
+            assert not composer.owner.done()
             with service._engine.connect() as connection:
                 fence = connection.execute(
                     select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(service.session.id))
@@ -15298,11 +15762,13 @@ async def test_recompose_repeat_cancel_joins_cleanup_before_releasing_lease(tmp_
             assert fence.released_at is None
         finally:
             release.set()
-        with pytest.raises(asyncio.CancelledError, match="original composer cancellation"):
-            await request_task
+        await asyncio.wait_for(operation.drive, timeout=5)
+        terminal = await client.get(operation.poll_path)
+        assert SettledComposerOperation(operation.accepted, terminal).error()[0] == 499
+    assert captured == [cancelled]
 
     assert completed.is_set()
-    assert len(_llm_call_audit_rows(service.messages)) == 1
+    assert len(_llm_call_audit_rows(await service.get_messages(service.session.id, limit=None))) == 1
     snapshot = await app.state.composer_progress_registry.get_latest(str(service.session.id))
     assert snapshot.phase == "cancelled"
 
@@ -15311,8 +15777,8 @@ async def test_recompose_repeat_cancel_joins_cleanup_before_releasing_lease(tmp_
 @pytest.mark.parametrize("route", ("messages", "recompose"))
 @pytest.mark.parametrize("secondary", ("runtime_error", "self_cancel"))
 async def test_compose_cancel_preserves_original_when_cleanup_child_fails(tmp_path, monkeypatch, route: str, secondary: str) -> None:
-    from elspeth.web.sessions.routes import messages as messages_module
-    from elspeth.web.sessions.routes.composer import compose as compose_module
+    from elspeth.web.sessions import composer_turn as compose_module
+    from elspeth.web.sessions import composer_turn as messages_module
 
     app, service = _make_progress_route_app(tmp_path)
     if route == "recompose":
@@ -15331,10 +15797,11 @@ async def test_compose_cancel_preserves_original_when_cleanup_child_fails(tmp_pa
     )
     original.args = ("original composer cancellation",)
 
-    class _CancellingComposer:
-        async def compose(self, *args, **kwargs) -> None:
-            del args, kwargs
-            raise original
+    from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED
+
+    original.args = (COMPOSER_CANCEL_REQUESTED,)
+    composer = _CancellableComposer(original)
+    captured = _capture_turn_exception(monkeypatch)
 
     async def failing_persist(*args, **kwargs) -> None:
         del args, kwargs
@@ -15342,20 +15809,80 @@ async def test_compose_cancel_preserves_original_when_cleanup_child_fails(tmp_pa
             raise asyncio.CancelledError("cleanup self-cancelled")
         raise RuntimeError("cleanup failed")
 
-    app.state.composer_service = _CancellingComposer()
+    app.state.composer_service = composer
     monkeypatch.setattr(messages_module if route == "messages" else compose_module, "_persist_llm_calls", failing_persist)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        request = (
-            client.post(f"/api/sessions/{service.session.id}/messages", json={"content": "Hello", "client_request_id": str(uuid.uuid4())})
-            if route == "messages"
-            else client.post(f"/api/sessions/{service.session.id}/recompose", json={"expected_user_message_id": str(user_msg.id)})
-        )
-        if secondary == "self_cancel":
-            with pytest.raises(AuditIntegrityError) as caught_integrity:
-                await request
-            assert caught_integrity.value.__cause__ is original
-        else:
-            with pytest.raises(asyncio.CancelledError, match="original composer cancellation") as caught:
-                await request
-            assert caught.value is original
-            assert isinstance(original.__cause__, RuntimeError)
+        body = message_body("Hello") if route == "messages" else recompose_body(str(user_msg.id))
+        async with running_operation_async(client, app, path=f"/api/sessions/{service.session.id}/{route}", body=body) as operation:
+            await asyncio.wait_for(composer.entered.wait(), timeout=3)
+            cancellation = await client.post(f"{operation.poll_path}/cancel")
+            assert cancellation.status_code in (200, 202)
+            await asyncio.wait_for(operation.drive, timeout=5)
+            terminal = await client.get(operation.poll_path)
+            assert terminal.status_code == 200
+            assert terminal.json()["status"] == "failed"
+    assert len(captured) == 1
+    if secondary == "self_cancel":
+        assert isinstance(captured[0], AuditIntegrityError)
+        assert captured[0].__cause__ is original
+    else:
+        assert captured[0] is original
+        assert isinstance(original.__cause__, RuntimeError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during_surface", (False, True))
+async def test_durable_stop_after_pipeline_commit_preserves_required_review_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_during_surface: bool,
+) -> None:
+    await test_cancel_after_pipeline_commit_still_surfaces_durable_review_evidence(
+        tmp_path,
+        monkeypatch,
+        automatic=True,
+        cancel_during_surface=cancel_during_surface,
+        durable_stop=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_stop_preserves_concurrent_trust_revocation_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await test_cancelled_auto_commit_persists_concurrent_trust_revocation(tmp_path, monkeypatch, durable_stop=True)
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "http_status", "error_type"),
+    (("integrity", 500, "audit_integrity_error"), ("ordinary_sql", 503, "database_unavailable")),
+)
+def test_durable_worker_preserves_integrity_and_ordinary_sql_categories(
+    tmp_path: Path,
+    failure_kind: str,
+    http_status: int,
+    error_type: str,
+) -> None:
+    app, service = _make_app(tmp_path)
+    composer = _make_composer_mock(response_text="must not be saved")
+    diagnostic = "private-diagnostic-must-not-escape"
+    if failure_kind == "integrity":
+        composer.compose.side_effect = AuditIntegrityError(diagnostic)
+    else:
+        composer.compose.side_effect = OperationalError("SELECT fake_read", {}, Exception(diagnostic))
+    app.state.composer_service = composer
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"title": "Error categories"}).json()["id"]
+    response = _settled_composer_response(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body=message_body("Hello"),
+    )
+    assert response.status_code == http_status
+    assert response.json()["error_type"] == error_type
+    assert diagnostic not in response.text
+    composer.compose.assert_awaited_once()
+    messages = asyncio.run(service.get_messages(uuid.UUID(session_id), limit=None))
+    assert [message.role for message in messages] == ["user"]

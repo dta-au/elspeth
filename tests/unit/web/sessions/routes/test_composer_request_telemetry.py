@@ -1,4 +1,9 @@
-"""Composer request lifecycle telemetry integration."""
+"""Detached worker lifecycle: metrics, lease renewal and durable observation.
+
+Legacy test identifiers remain stable; scopes are worker-owned, and HTTP
+admission/GET never owns provider cancellation. Scripted clocks control retry
+headroom; real-file SQLite cases exercise202→worker→GET and explicit Stop.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +19,6 @@ from fastapi import APIRouter, HTTPException
 from fastapi.routing import APIRoute
 from starlette.requests import Request
 
-from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.progress import ComposerRequestLease
 from elspeth.web.sessions.routes import _helpers
 from elspeth.web.sessions.routes.messages import register_message_routes
@@ -46,7 +50,6 @@ async def _settle_dependency(
     failure: BaseException | None = None,
 ) -> tuple[list[tuple[Any, ...]], _Registry]:
     registry = _Registry()
-    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership))
     lifecycle: list[tuple[Any, ...]] = []
     token = object()
 
@@ -62,7 +65,6 @@ async def _settle_dependency(
     ) -> None:
         lifecycle.append(("finish", observed_token, status, primary_error))
 
-    monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
     monkeypatch.setattr(
         _helpers,
         "begin_composer_request_metrics",
@@ -77,7 +79,7 @@ async def _settle_dependency(
     )
     dependency = cast(
         "AsyncGenerator[None, None]",
-        _helpers._track_compose_inflight(uuid4(), _request(path), UserIdentity(user_id="user", username="user")),
+        _owned_lifecycle(registry),
     )
     await anext(dependency)
     if failure is None:
@@ -119,7 +121,8 @@ def test_message_route_mounts_request_lifecycle_dependency_exactly_once() -> Non
 
     assert len(routes) == 1
     dependencies = [dependency.call for dependency in routes[0].dependant.dependencies]
-    assert dependencies.count(_helpers._track_compose_inflight) == 1
+    assert _helpers.composer_request_lifecycle not in dependencies
+    assert all(dependency.__name__ != "_track_compose_inflight" for dependency in dependencies)
 
 
 @pytest.mark.asyncio
@@ -159,9 +162,6 @@ async def test_metrics_token_pairing_failure_does_not_replace_request_failure(
     from elspeth.web.composer import provider_telemetry
 
     registry = _Registry()
-    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership))
-
-    monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
 
     def begin_with_spent_token(*, surface: str) -> object:
         token = provider_telemetry.begin_composer_request_metrics(surface=surface)
@@ -180,7 +180,7 @@ async def test_metrics_token_pairing_failure_does_not_replace_request_failure(
     )
     dependency = cast(
         "AsyncGenerator[None, None]",
-        _helpers._track_compose_inflight(uuid4(), _request("/api/sessions/1/messages"), UserIdentity(user_id="user", username="user")),
+        _owned_lifecycle(registry),
     )
     await anext(dependency)
 
@@ -209,12 +209,10 @@ def test_existing_terminal_counter_also_marks_request_aggregate(monkeypatch: pyt
 @pytest.mark.asyncio
 async def test_request_renews_while_provider_waits_and_stops_after_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
     registry = _Registry()
-    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership))
-    monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
     monkeypatch.setattr(_helpers, "_COMPOSER_HEARTBEAT_SECONDS", 0.001)
     dependency = cast(
         "AsyncGenerator[None, None]",
-        _helpers._track_compose_inflight(uuid4(), _request("/api/sessions/1/messages"), UserIdentity(user_id="user", username="user")),
+        _owned_lifecycle(registry),
     )
     await anext(dependency)
     await asyncio.sleep(0.02)
@@ -227,18 +225,22 @@ async def test_request_renews_while_provider_waits_and_stops_after_teardown(monk
 
 
 @pytest.mark.asyncio
-async def test_unauthorized_request_never_enters_cluster_inflight(monkeypatch: pytest.MonkeyPatch) -> None:
-    registry = _Registry()
-    monkeypatch.setattr(
-        _helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership, side_effect=HTTPException(404))
-    )
-    monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
-    dependency = _helpers._track_compose_inflight(
-        uuid4(), _request("/api/sessions/1/messages"), UserIdentity(user_id="user", username="user")
-    )
-    with pytest.raises(HTTPException):
-        await anext(dependency)
-    assert registry.events == []
+async def test_unauthorized_request_never_enters_cluster_inflight(tmp_path, monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+
+    from tests.helpers.composer_operations import build_composer_operation_app, install_composer_async_worker, message_body
+
+    harness = await build_composer_operation_app(tmp_path)
+    install_composer_async_worker(harness.app)
+    registry = harness.app.state.composer_progress_registry
+    start = AsyncMock(wraps=registry.start_request)
+    monkeypatch.setattr(registry, "start_request", start)
+    async with AsyncClient(transport=ASGITransport(app=harness.app), base_url="http://test") as client:
+        response = await client.post(f"/api/sessions/{harness.session_id}/messages", json=message_body("Unauthorized"))
+    assert response.status_code == 401
+    await harness.app.state.composer_async_worker.run_until_idle()
+    assert start.await_count == 0
+    assert harness.composer.calls == 0
 
 
 @pytest.mark.asyncio
@@ -248,15 +250,24 @@ async def test_failed_durable_admission_never_opens_metrics_scope(
     failure: BaseException,
 ) -> None:
     registry = _Registry()
-    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership))
-    monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
     monkeypatch.setattr(registry, "start_request", AsyncMock(spec=_Registry.start_request, side_effect=failure))
     begun: list[str] = []
     monkeypatch.setattr(_helpers, "begin_composer_request_metrics", lambda *, surface: begun.append(surface))
-    dependency = _helpers._track_compose_inflight(
-        uuid4(), _request("/api/sessions/1/messages"), UserIdentity(user_id="user", username="user")
-    )
+    dependency = _owned_lifecycle(registry)
     with pytest.raises(type(failure)):
         await anext(dependency)
     assert begun == []
     assert registry.events == []
+
+
+async def _owned_lifecycle(registry):
+    """Drive the owned worker scope without an HTTP dependency or Request."""
+    owner = asyncio.current_task()
+    assert owner is not None
+    async with _helpers.composer_request_lifecycle(
+        registry,
+        session_id=str(uuid4()),
+        user_id="user",
+        owner_task=owner,
+    ):
+        yield None

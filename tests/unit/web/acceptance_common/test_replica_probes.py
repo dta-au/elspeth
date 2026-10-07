@@ -11,6 +11,7 @@ cannot record ``pass``.
 from __future__ import annotations
 
 import dataclasses
+import json
 import threading
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -43,6 +44,7 @@ from elspeth.web._acceptance_common.replica_probes import (
     record_owner_affine_progress,
     replica_response_from_envelope,
 )
+from tests.helpers.composer_probe_operations import operation_document
 
 RA = "web-aaaaaaaa-0000-4000-8000-000000000001"
 RB = "web-bbbbbbbb-0000-4000-8000-000000000002"
@@ -58,13 +60,24 @@ def _conflict(replica: str, instance: str) -> ReplicaResponse:
 
 def _fence_trial(index: int, **overrides: object) -> FenceConflictTrial:
     winner, loser = (RA, RB) if index % 2 == 0 else (RB, RA)
+    first = "00000000-0000-4000-8000-000000000001"
+    second = first if index % 2 == 0 else "00000000-0000-4000-8000-000000000002"
     trial = FenceConflictTrial(
-        responses=(_ok("rA", winner), _conflict("rB", loser)),
+        responses=(
+            ReplicaResponse("rA", 202, winner, operation_id=first),
+            ReplicaResponse("rB", 202, loser, operation_id=second)
+            if index % 2 == 0
+            else ReplicaResponse("rB", 409, loser, error_type="composer_operation_active"),
+        ),
         fence_epoch_before=index,
         fence_epoch_after=index + 1,
         fence_owner_after=winner,
         message_ingress_receipt_rows=1,
         dispatch_spread_ms=1.5,
+        kind="same_operation" if index % 2 == 0 else "distinct_operations",
+        operation_ids=(first, second),
+        composer_operation_rows=1,
+        terminal_status="completed",
     )
     return dataclasses.replace(trial, **overrides)  # type: ignore[arg-type]
 
@@ -120,6 +133,24 @@ class TestVocabulary:
 
 
 class TestFenceConflict:
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"composer_operation_rows": 2},
+            {"terminal_status": None},
+            {"message_ingress_receipt_rows": 2},
+        ],
+    )
+    def test_duplicate_or_unsettled_durable_evidence_cannot_pass(self, change: dict[str, object]) -> None:
+        trials = [_fence_trial(index) for index in range(20)]
+        trials[0] = dataclasses.replace(trials[0], **change)
+        assert decide_fence_conflict(trials).outcome == "fail"
+
+    def test_admission_replica_does_not_bind_worker_claim_owner(self) -> None:
+        trials = [_fence_trial(index) for index in range(20)]
+        trials[2] = dataclasses.replace(trials[2], fence_owner_after=RB)
+        assert decide_fence_conflict(trials).outcome == "pass"
+
     def test_twenty_clean_trials_pass(self) -> None:
         result = decide_fence_conflict([_fence_trial(index) for index in range(20)])
         assert result.outcome == "pass"
@@ -136,13 +167,13 @@ class TestFenceConflict:
         trials[3] = dataclasses.replace(trials[3], responses=(_ok("rA", RA), _ok("rB", RB)))
         result = decide_fence_conflict(trials)
         assert result.outcome == "fail"
-        assert "trial[3]:not_one_success_and_one_fence_refusal" in result.reasons
+        assert "trial[3]:invalid_operation_admission_pair" in result.reasons
 
     def test_a_409_without_the_fence_body_is_not_a_fence_refusal(self) -> None:
         trials = [_fence_trial(index) for index in range(20)]
         other_409 = ReplicaResponse(addressed_to="rB", status=409, instance_id=RB, detail="Blob already exists")
         trials[0] = dataclasses.replace(trials[0], responses=(_ok("rA", RA), other_409))
-        assert "trial[0]:not_one_success_and_one_fence_refusal" in decide_fence_conflict(trials).reasons
+        assert "trial[0]:invalid_operation_admission_pair" in decide_fence_conflict(trials).reasons
 
     def test_same_instance_answering_both_fails(self) -> None:
         trials = [_fence_trial(index) for index in range(20)]
@@ -159,10 +190,10 @@ class TestFenceConflict:
         trials[7] = dataclasses.replace(trials[7], fence_epoch_after=trials[7].fence_epoch_before + 2)
         assert "trial[7]:fence_epoch_not_advanced_by_one" in decide_fence_conflict(trials).reasons
 
-    def test_fence_owner_must_be_the_winner(self) -> None:
+    def test_claim_owner_must_be_an_observed_worker_replica(self) -> None:
         trials = [_fence_trial(index) for index in range(20)]
-        trials[2] = dataclasses.replace(trials[2], fence_owner_after=RB)  # trial 2's winner is RA
-        assert "trial[2]:fence_owner_is_not_the_winner" in decide_fence_conflict(trials).reasons
+        trials[2] = dataclasses.replace(trials[2], fence_owner_after="unobserved-worker")
+        assert "trial[2]:claim_owner_not_observed_replica" in decide_fence_conflict(trials).reasons
 
     def test_exactly_one_message_ingress_receipt_row(self) -> None:
         trials = [_fence_trial(index) for index in range(20)]
@@ -412,6 +443,7 @@ class _FakeObserver(EvidenceObserver):
     def __init__(self) -> None:
         self.epoch = 3
         self.owner: str | None = None
+        self.operation_id = ""
 
     def fence_epoch(self, session_id: str) -> int:
         return self.epoch
@@ -419,8 +451,14 @@ class _FakeObserver(EvidenceObserver):
     def fence_owner(self, session_id: str) -> str | None:
         return self.owner
 
-    def message_ingress_receipt_rows(self, session_id: str, *, client_request_id: str) -> int:
+    def message_ingress_receipt_rows(self, session_id: str, *, operation_id: str) -> int:
         return 1
+
+    def composer_operation_rows(self, session_id: str, *, operation_id: str) -> int:
+        return 1 if operation_id == self.operation_id else 0
+
+    def composer_operation_claim_owner(self, session_id: str, *, operation_id: str) -> str | None:
+        return self.owner
 
     def runs_row_ids(self, session_id: str) -> tuple[str, ...]:
         return ("run-1",) if self.owner is not None else ()
@@ -445,6 +483,21 @@ class _RecordedReplicas:
         origin = f"{request.url.scheme}://{request.url.host}"
         instance = self.instances[origin]
         with self._lock:
+            if request.url.path.endswith("/messages"):
+                body = json.loads(request.content)
+                operation_id = body["operation_id"]
+                if self._winner is None:
+                    self._winner = instance
+                    self._observer.epoch += 1
+                    self._observer.owner = instance
+                    self._observer.operation_id = operation_id
+                if self._observer.operation_id == operation_id:
+                    return httpx.Response(202, json={"operation_id": operation_id}, headers={"X-Elspeth-Instance": instance})
+                return httpx.Response(409, json={"error_type": "composer_operation_active"}, headers={"X-Elspeth-Instance": instance})
+            if "/operations/" in request.url.path:
+                return httpx.Response(
+                    200, json=operation_document(self._observer.operation_id, "session-1"), headers={"X-Elspeth-Instance": instance}
+                )
             if self._winner is None:
                 self._winner = instance
                 self._observer.epoch += 1
@@ -509,14 +562,14 @@ class TestDriver:
             ProbeRequest(
                 "POST",
                 "/api/sessions/session-1/messages",
-                {"content": "Build a pipeline", "client_request_id": "00000000-0000-4000-8000-000000000001"},
+                {"content": "Build a pipeline", "operation_id": "00000000-0000-4000-8000-000000000001", "state_id": None},
             ),
         )
         statuses = sorted(response.status for response in trial.responses)
-        assert statuses == [202, 409]
+        assert statuses == [202, 202]
         assert {response.instance_id for response in trial.responses} == {RA, RB}
         assert trial.fence_epoch_after == trial.fence_epoch_before + 1
-        assert trial.fence_owner_after == next(response.instance_id for response in trial.responses if response.status == 202)
+        assert trial.fence_owner_after in {RA, RB}
         assert trial.message_ingress_receipt_rows == 1
         assert trial.dispatch_spread_ms >= 0
 

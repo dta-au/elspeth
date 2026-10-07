@@ -312,17 +312,27 @@ def _fence_trial_requests(path: str, *, trials: int) -> tuple[tuple[str, object]
         ):
             raise AcceptanceInputError("--trial-requests contains an invalid session identifier")
         body = item["body"]
-        if set(body) != {"content", "client_request_id"} or type(body["content"]) is not str or not body["content"].strip():
+        if set(body) != {"content", "operation_id", "state_id"} or type(body["content"]) is not str or not body["content"].strip():
             raise AcceptanceInputError("--trial-requests requires a nonempty freeform content body")
-        request_id = body["client_request_id"]
+        request_id = body["operation_id"]
         if type(request_id) is not str:
-            raise AcceptanceInputError("--trial-requests client_request_id must be a canonical UUID")
+            raise AcceptanceInputError("--trial-requests operation_id must be a canonical UUID")
         try:
             parsed_id = UUID(request_id)
         except ValueError as exc:
-            raise AcceptanceInputError("--trial-requests client_request_id must be a canonical UUID") from exc
+            raise AcceptanceInputError("--trial-requests operation_id must be a canonical UUID") from exc
         if str(parsed_id) != request_id:
-            raise AcceptanceInputError("--trial-requests client_request_id must be a canonical UUID")
+            raise AcceptanceInputError("--trial-requests operation_id must be a canonical UUID")
+        state_id = body["state_id"]
+        if state_id is not None:
+            if type(state_id) is not str:
+                raise AcceptanceInputError("--trial-requests state_id must be a canonical UUID or null")
+            try:
+                parsed_state_id = UUID(state_id)
+            except ValueError as exc:
+                raise AcceptanceInputError("--trial-requests state_id must be a canonical UUID or null") from exc
+            if str(parsed_state_id) != state_id:
+                raise AcceptanceInputError("--trial-requests state_id must be a canonical UUID or null")
         requests.append((session, body))
     if len({session for session, _ in requests}) != trials:
         raise AcceptanceInputError("freeform contention trials require distinct sessions")
@@ -574,8 +584,12 @@ def _run_probe(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[str, P
         driver = ReplicaProbeDriver(controller=controller, observer=_observer(env), client_factory=client_factory)
         if args.probe == "fence-conflict":
             trials = [
-                driver.fence_conflict_trial(session_id, ProbeRequest("POST", f"/api/sessions/{session_id}/messages", body))
-                for session_id, body in fence_requests
+                driver.fence_conflict_trial(
+                    session_id,
+                    ProbeRequest("POST", f"/api/sessions/{session_id}/messages", body),
+                    kind="same_operation" if index % 2 == 0 else "distinct_operations",
+                )
+                for index, (session_id, body) in enumerate(fence_requests)
             ]
             result = decide_fence_conflict(trials, required_trials=args.trials)
             return "replica-fence-conflict", result, result.to_receipt_details()

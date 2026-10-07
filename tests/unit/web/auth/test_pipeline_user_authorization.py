@@ -40,6 +40,9 @@ _PIPELINE_USER_ROUTES: dict[str, frozenset[str]] = {
         {"resolve_interpretation", "list_interpretations", "opt_out_of_interpretations", "opt_out_summary"}
     ),
     "src/elspeth/web/sessions/routes/composer/compose.py": frozenset({"recompose"}),
+    "src/elspeth/web/sessions/routes/composer/operations.py": frozenset(
+        {"get_composer_operation", "cancel_composer_operation", "stream_operation"}
+    ),
     "src/elspeth/web/sessions/routes/composer/state.py": frozenset(
         {
             "get_composer_progress",
@@ -324,3 +327,17 @@ async def test_pipeline_user_expiry_is_checked_after_role_retrieval(engine, tmp_
         event.remove(engine, "before_cursor_execute", pause_before_role_retrieval)
 
     assert role_reads == 2
+
+
+@pytest.mark.parametrize("function_name", ["get_composer_operation", "cancel_composer_operation", "stream_operation"])
+def test_operation_route_live_user_inventory_rejects_dependency_removal(function_name: str) -> None:
+    root = Path(__file__).resolve().parents[4]
+    path = "src/elspeth/web/sessions/routes/composer/operations.py"
+    functions = _decorated_route_functions(ast.parse((root / path).read_text()))
+    function = functions[function_name]
+    assert "Depends(require_pipeline_user)" in _user_dependency(function)
+    for argument in (*function.args.args, *function.args.kwonlyargs):
+        if argument.arg in {"user", "_user"}:
+            argument.annotation = ast.Name(id="UserIdentity", ctx=ast.Load())
+    with pytest.raises(AssertionError):
+        assert "Depends(require_pipeline_user)" in _user_dependency(function)

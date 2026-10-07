@@ -293,6 +293,7 @@ export function DecisionPanel({
                   proposal={proposal}
                   isStale={staleProposalIds.includes(proposal.id)}
                   isBusy={proposalActionPendingIds.includes(proposal.id)}
+                  acceptDisabled={isComposing}
                   onAccept={onAcceptProposal}
                   onReject={setRejectConfirmId}
                 />
@@ -331,10 +332,11 @@ export function DecisionPanel({
   );
 }
 
-function ProposalItem({ proposal, isBusy, isStale, onAccept, onReject }: {
+function ProposalItem({ proposal, isBusy, isStale, acceptDisabled, onAccept, onReject }: {
   proposal: CompositionProposal;
   isBusy: boolean;
   isStale: boolean;
+  acceptDisabled: boolean;
   onAccept: (id: string) => void;
   onReject: (id: string) => void;
 }): JSX.Element {
@@ -346,7 +348,7 @@ function ProposalItem({ proposal, isBusy, isStale, onAccept, onReject }: {
         {proposal.affects.length > 0 && <p>Affects: {proposal.affects.map(proposalEffectLabel).join(", ")}</p>}
       </div>
       <div className="decision-panel-proposal-actions">
-        <Button variant="primary" disabled={isBusy || isStale} aria-label={`Accept proposal: ${proposal.summary}`} onClick={() => onAccept(proposal.id)}>Accept</Button>
+        <Button variant="primary" disabled={isBusy || isStale || acceptDisabled} aria-label={`Accept proposal: ${proposal.summary}`} onClick={() => onAccept(proposal.id)}>Accept</Button>
         <Button variant="danger" disabled={isBusy} aria-label={`Reject proposal: ${proposal.summary}`} onClick={() => onReject(proposal.id)}>Reject</Button>
       </div>
     </>

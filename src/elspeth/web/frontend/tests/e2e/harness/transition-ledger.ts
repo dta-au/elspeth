@@ -26,7 +26,7 @@ export const TRANSITION_LEDGER_SCHEMA = "transition-ledger/2";
 /** The HTTP boundaries that constitute a tutorial transition. */
 export type TransitionEndpoint = "freeform/compose" | "tutorial/run";
 
-const FREEFORM_ENDPOINT = /\/api\/sessions\/([0-9a-f-]{36})\/messages(?:[?#]|$)/i;
+const FREEFORM_ENDPOINT = /\/api\/sessions\/([0-9a-f-]{36})\/(?:messages|recompose)(?:[?#]|$)/i;
 const TUTORIAL_RUN_ENDPOINT = /\/api\/tutorial\/run(?:[?#]|$)/i;
 
 /** Classify a browser request as a transition boundary, or null. POST only. */
@@ -40,6 +40,22 @@ export function classifyTransitionRequest(url: string, method: string): Transiti
 export function sessionIdFromTransitionUrl(url: string): string | null {
   const freeform = FREEFORM_ENDPOINT.exec(url);
   return freeform === null ? null : freeform[1].toLowerCase();
+}
+
+const OPERATION_ENDPOINT = /\/api\/sessions\/([0-9a-f-]{36})\/operations\/([0-9a-f-]{36})(?:[?#]|$)/i;
+export function composerOperationLocator(url: string): { sessionId: string; operationId: string } | null {
+  const match = OPERATION_ENDPOINT.exec(url);
+  return match === null ? null : { sessionId: match[1].toLowerCase(), operationId: match[2].toLowerCase() };
+}
+/** Only a durable terminal GET settles a compose transition; 202 never does. */
+export function composerOperationTerminal(value: unknown, operationId: string): { status: "completed" | "failed"; result: unknown; error: unknown } | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.operation_id !== operationId) return null;
+  if (record.status !== "completed" && record.status !== "failed") return null;
+  if (record.status === "completed" && (typeof record.result !== "object" || record.result === null || record.error !== null)) throw new Error("Malformed completed operation");
+  if (record.status === "failed" && (typeof record.error !== "object" || record.error === null || record.result !== null)) throw new Error("Malformed failed operation");
+  return { status: record.status, result: record.result, error: record.error };
 }
 
 // ── Durable audit rows ────────────────────────────────────────────────────────

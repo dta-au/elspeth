@@ -481,7 +481,7 @@ prepare_freeform_trials() {
     session=$(prepare_session "${prefix}-${index}")
     request_key=$(cat /proc/sys/kernel/random/uuid)
     jq -c --arg session "$session" --arg request_key "$request_key" \
-      '{session_id:$session,body:(. + {client_request_id:$request_key})}' "$P1_BODY" >>"$EVIDENCE_DIR/${prefix}-trial-requests.jsonl"
+      '{session_id:$session,body:(. + {operation_id:$request_key,state_id:null})}' "$P1_BODY" >>"$EVIDENCE_DIR/${prefix}-trial-requests.jsonl"
   done
   jq -s '.' "$EVIDENCE_DIR/${prefix}-trial-requests.jsonl" >"$EVIDENCE_DIR/${prefix}-trial-requests.json"
 }

@@ -36,6 +36,7 @@ import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 describe("ChatInput — controlled-mode prefill listener", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });
@@ -225,6 +226,7 @@ describe("ChatInput empty-state placeholder", () => {
 
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });
@@ -266,6 +268,7 @@ describe("ChatInput empty-state placeholder", () => {
 describe("ChatInput composing cancel", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });
@@ -293,6 +296,7 @@ describe("ChatInput composing cancel", () => {
 describe("ChatInput upload identity", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });
@@ -469,6 +473,7 @@ describe("ChatInput upload identity", () => {
 describe("ChatInput max length", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });
@@ -616,6 +621,7 @@ describe("ChatInput pending-interpretation placeholder cue", () => {
 
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });
@@ -873,6 +879,7 @@ describe("ChatInput pending-interpretation placeholder cue", () => {
 describe("ChatInput — compose timeout readiness gate (bootstrap race)", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });
@@ -882,10 +889,10 @@ describe("ChatInput — compose timeout readiness gate (bootstrap race)", () => 
     render(<ChatInput onSend={onSend} disabled={false} inputRef={inputRef} />);
   }
 
-  it("gates Send behind a visible connecting reason until the timeout is ready", async () => {
-    // composeTimeoutReady defaults false (boot). No send may schedule a
-    // compose-abort timer from the stale default ceiling; the disabled Send
-    // is not a dead button — a visible status says why (dead-button doctrine).
+  it("gates Send behind a visible loading reason until session state is ready", async () => {
+    // A session has not loaded its authoritative base yet. Explain the
+    // disabled action while preserving the draft text.
+    useSessionStore.setState({ compositionStateLoaded: false });
     const onSend = vi.fn();
     renderInput(onSend);
     const user = userEvent.setup();
@@ -893,37 +900,34 @@ describe("ChatInput — compose timeout readiness gate (bootstrap race)", () => 
 
     expect(screen.getByLabelText(/send message/i)).toBeDisabled();
     expect(
-      screen.getByText(/connecting to the composer/i),
+      screen.getByText(/loading this session/i),
     ).toBeInTheDocument();
 
     await user.keyboard("{Enter}");
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("enables Send once the backend wall clock has landed", async () => {
-    useSessionStore.setState({ composeTimeoutReady: true });
+  it("enables Send once authoritative session state has loaded", async () => {
+    useSessionStore.setState({ compositionStateLoaded: true });
     const onSend = vi.fn();
     renderInput(onSend);
     const user = userEvent.setup();
     await user.type(screen.getByLabelText(/message input/i), "build a pipeline");
 
     expect(screen.getByLabelText(/send message/i)).toBeEnabled();
-    expect(screen.queryByText(/connecting to the composer/i)).toBeNull();
+    expect(screen.queryByText(/loading this session/i)).toBeNull();
 
     await user.keyboard("{Enter}");
     expect(onSend).toHaveBeenCalledWith("build a pipeline");
   });
 
-  it("shows a distinct unavailable alert (not 'Connecting…') when the backend reports no compose timeout", () => {
-    // Backend up but no usable timeout: readiness never latches, so surface a
-    // stuck-state diagnostic instead of a perpetual soft "Connecting…".
-    useSessionStore.setState({ composerTimeoutUnavailable: true });
+  it("keeps session loading visible until authoritative hydration finishes", () => {
+    useSessionStore.setState({ compositionStateLoaded: false });
     renderInput(vi.fn());
 
     expect(
-      screen.getByText(/server did not report a compose timeout/i),
+      screen.getByText(/loading this session/i),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/connecting to the composer/i)).toBeNull();
     expect(screen.getByLabelText(/send message/i)).toBeDisabled();
   });
 });
@@ -935,6 +939,7 @@ describe("ChatInput — rare-action overflow (elspeth-8fa71e6d15)", () => {
   // your data" action.
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });
@@ -1034,6 +1039,7 @@ describe("ChatInput — rare-action overflow (elspeth-8fa71e6d15)", () => {
 describe("ChatInput placeholder legibility (elspeth-244b8ba932)", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });
@@ -1069,6 +1075,7 @@ describe("ChatInput placeholder legibility (elspeth-244b8ba932)", () => {
 describe("ChatInput keyboard hint in the composition row (elspeth-1b7227936c)", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });
@@ -1248,6 +1255,7 @@ describe("chat-input controls consume the motion tokens (elspeth-616a236fc3)", (
 describe("ChatInput overflow glyph (elspeth-b720e0b932)", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     resetStore(useInterpretationEventsStore);
   });

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Awaitable
 from dataclasses import replace
 from typing import Annotated
+from uuid import uuid4
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.errors import AuditIntegrityError
@@ -17,6 +18,22 @@ from elspeth.web.composer.required_controls import (
 )
 from elspeth.web.composer.tools import is_approval_required_blob_store_only_mutation_tool
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
+from elspeth.web.sessions.composer_app_services import composer_app_services
+from elspeth.web.sessions.pipeline_rejection import PipelineRejectionExpected
+from elspeth.web.sessions.pipeline_rejection_custody import (
+    close_required_proposal_lease,
+    original_outcome_group,
+    raise_required_proposal_failure,
+    read_composition_rejection_authority,
+    reject_pipeline_with_required_custody,
+)
 from elspeth.web.sessions.protocol import ProposalStateConflictError, StaleComposeStateError
 
 from .._helpers import (
@@ -304,35 +321,60 @@ async def accept_composition_proposal(
         proposal = proposal_authority.row
         pipeline_authority = proposal_authority.pipeline
         if pipeline_authority is not None:
+            required_work = RequiredWorkCoordinator(
+                RequiredWorkAuthority(
+                    RequiredAuthorityKind.MANUAL_PROPOSAL,
+                    lease.context,
+                    proposal_id=str(proposal.id),
+                    invocation_id=str(uuid4()),
+                    tool_call_id=proposal.tool_call_id,
+                )
+            )
+            lease.bind_required_work(required_work)
             if body is None or body.draft_hash is None:
                 request_error = HTTPException(
                     status_code=422,
                     detail="Canonical pipeline proposal acceptance requires draft_hash.",
                 )
-                await _close_proposal_lease_before_commit(lease, primary=request_error)
+                cleanup = await close_required_proposal_lease(lease, coordinator=required_work)
+                if cleanup:
+                    raise original_outcome_group("Manual acceptance refusal and exact close originals", request_error, *cleanup)
                 raise request_error
             try:
                 route_settlement = await settle_pipeline_proposal_under_compose_lock(
-                    request=request,
-                    user=user,
+                    services=composer_app_services(request.app),
+                    user_id=user.user_id,
+                    commit_timeout_seconds=request.app.state.settings.composer_sync_timeout_seconds,
                     authority=pipeline_authority,
                     draft_hash=body.draft_hash,
                     session_operation_context=lease.context,
+                    required_work=required_work,
+                    required_binding=RequiredWorkBinding(required_work, 0, 0, RequiredWorkRole.TURN),
                 )
             except ComposerRuntimePreflightError as preflight_error:
                 preflight_failure = _accept_runtime_preflight_failure(proposal)
-                await _close_proposal_lease_before_commit(lease, primary=preflight_failure)
+                cleanup = await close_required_proposal_lease(lease, coordinator=required_work)
+                if cleanup:
+                    raise original_outcome_group(
+                        "Manual acceptance preflight and exact close originals", preflight_error, preflight_failure, *cleanup
+                    ) from preflight_error
                 raise preflight_failure from preflight_error
             except BaseException as primary:
-                await _close_proposal_lease_before_commit(lease, primary=primary)
-                raise
-            cleanup_cancelled = await _close_proposal_lease_after_commit(
-                lease,
-                session_id=session.id,
-                event="composer_pipeline_proposal_accept_postcommit_cleanup_failed",
-            )
-            if cleanup_cancelled:
-                raise asyncio.CancelledError
+                cleanup = await close_required_proposal_lease(lease, coordinator=required_work)
+                if cleanup:
+                    raise_required_proposal_failure(
+                        required_work,
+                        original_outcome_group("Manual acceptance original and required lease close", primary, *cleanup),
+                        lease=lease,
+                    )
+                raise_required_proposal_failure(required_work, primary, lease=lease)
+            cleanup = await close_required_proposal_lease(lease, coordinator=required_work)
+            if cleanup:
+                raise_required_proposal_failure(
+                    required_work,
+                    original_outcome_group("Manual accepted publication and exact lease close originals", *cleanup),
+                    lease=lease,
+                )
             return _composition_proposal_response(route_settlement.settlement.proposal)
 
         durable_transition = False
@@ -697,17 +739,38 @@ async def reject_composition_proposal(
             owner_instance_id=service.session_operation_owner_instance_id,
             lease_seconds=service.session_operation_lease_seconds,
         )
+        required_work = RequiredWorkCoordinator(
+            RequiredWorkAuthority(
+                RequiredAuthorityKind.MANUAL_PROPOSAL,
+                lease.context,
+                proposal_id=str(proposal_id),
+                invocation_id=str(uuid4()),
+            )
+        )
+        lease.bind_required_work(required_work)
+        binding = RequiredWorkBinding(required_work, 0, 0, RequiredWorkRole.TURN)
+        preparation_failure: BaseException | None = None
         try:
-            authority = await service.get_authoritative_composition_proposal(
+            authority, preparation_cancellations = await read_composition_rejection_authority(
+                service,
+                binding=binding,
                 session_id=session.id,
                 proposal_id=proposal_id,
             )
-        except KeyError as primary:
-            await _close_proposal_lease_before_commit(lease, primary=primary)
-            raise HTTPException(status_code=404, detail="Proposal not found") from None
-        except BaseException as primary:
-            await _close_proposal_lease_before_commit(lease, primary=primary)
-            raise
+        except BaseException as preparation_error:
+            cleanup = await close_required_proposal_lease(lease, coordinator=required_work)
+            if cleanup:
+                preparation_failure = original_outcome_group(
+                    "Manual rejection preparation and required close originals", preparation_error, *cleanup
+                )
+                if isinstance(preparation_failure, BaseExceptionGroup):
+                    raise preparation_failure from preparation_error
+            else:
+                if isinstance(preparation_error, KeyError):
+                    raise HTTPException(status_code=404, detail="Proposal not found") from preparation_error
+                raise
+        if preparation_failure is not None:
+            raise preparation_failure
         if authority.pipeline is None:
             try:
                 proposal, was_cancelled = await _await_with_deferred_cancellation(
@@ -718,11 +781,11 @@ async def reject_composition_proposal(
                         session_operation_context=lease.context,
                     )
                 )
-            except ValueError as primary:
-                await _close_proposal_lease_before_commit(lease, primary=primary)
-                raise HTTPException(status_code=409, detail=str(primary)) from primary
-            except BaseException as primary:
-                await _close_proposal_lease_before_commit(lease, primary=primary)
+            except ValueError as legacy_error:
+                await _close_proposal_lease_before_commit(lease, primary=legacy_error)
+                raise HTTPException(status_code=409, detail=str(legacy_error)) from legacy_error
+            except BaseException as legacy_error:
+                await _close_proposal_lease_before_commit(lease, primary=legacy_error)
                 raise
             _ = body
             response = _composition_proposal_response(proposal)
@@ -730,35 +793,71 @@ async def reject_composition_proposal(
                 lease,
                 session_id=session.id,
             )
+            if preparation_cancellations:
+                raise original_outcome_group("Manual nonpipeline preparation original cancellations", *preparation_cancellations)
             if was_cancelled or cleanup_cancelled:
                 raise asyncio.CancelledError
             return response
 
+        primary: BaseException | None = None
+        pipeline_proposal: CompositionProposalRecord | None = None
         try:
-            proposal, was_cancelled = await _await_with_deferred_cancellation(
-                service.reject_pipeline_composition_proposal(
-                    session_id=session.id,
-                    proposal_id=proposal_id,
-                    draft_hash=authority.pipeline.proposal.draft_hash,
-                    reason="operator_rejected",
-                    dispatch=None,
-                    actor=f"user:{user.user_id}",
-                    session_operation_context=lease.context,
-                )
+            child, producer = required_work.begin_proposal_child(
+                str(authority.row.id),
+                authority.row.tool_call_id,
+                transition_ordinal=0,
+                semantic_ordinal=0,
             )
-        except ValueError as primary:
-            await _close_proposal_lease_before_commit(lease, primary=primary)
-            raise HTTPException(status_code=409, detail=str(primary)) from primary
-        except BaseException as primary:
-            await _close_proposal_lease_before_commit(lease, primary=primary)
-            raise
+            child_binding = RequiredWorkBinding(child, 0, 0, RequiredWorkRole.TURN)
+            try:
+                pipeline_proposal = await reject_pipeline_with_required_custody(
+                    service,
+                    expected=PipelineRejectionExpected(
+                        authority.pipeline,
+                        "operator_rejected",
+                        None,
+                        f"user:{user.user_id}",
+                        user.user_id,
+                        lease.context,
+                        None,
+                    ),
+                    binding=child_binding,
+                )
+                if preparation_cancellations:
+                    raise original_outcome_group("Manual rejection preparation original cancellations", *preparation_cancellations)
+            except BaseException as original:
+                retained = original_outcome_group(
+                    "Manual rejection failure and preparation original cancellations",
+                    original,
+                    *preparation_cancellations,
+                )
+                primary = retained
+                try:
+                    child.assert_completed()
+                except BaseException as incomplete:
+                    primary = original_outcome_group("Manual original and unresolved rejection child", retained, incomplete)
+                else:
+                    required_work.complete_proposal_child(child, producer, retained)
+            else:
+                required_work.complete_proposal_child(child, producer)
+        except BaseException as scope_failure:
+            primary = original_outcome_group("Manual rejection scope and retained originals", scope_failure, *preparation_cancellations)
+        cleanup = await close_required_proposal_lease(lease, coordinator=required_work)
+        if primary is not None:
+            if cleanup:
+                raise_required_proposal_failure(
+                    required_work,
+                    original_outcome_group("Manual rejection original and actual lease close", primary, *cleanup),
+                    lease=lease,
+                )
+            if isinstance(primary, ValueError):
+                raise HTTPException(status_code=409, detail=str(primary)) from primary
+            raise_required_proposal_failure(required_work, primary, lease=lease)
+        if cleanup:
+            raise_required_proposal_failure(
+                required_work, original_outcome_group("Manual rejection actual close originals", *cleanup), lease=lease
+            )
+        if pipeline_proposal is None:
+            raise AuditIntegrityError("Manual rejection lost its validated actual row")
         _ = body
-        response = _composition_proposal_response(proposal)
-        cleanup_cancelled = await _close_proposal_lease_after_commit(
-            lease,
-            session_id=session.id,
-            event="composer_pipeline_proposal_reject_postcommit_cleanup_failed",
-        )
-        if was_cancelled or cleanup_cancelled:
-            raise asyncio.CancelledError
-        return response
+        return _composition_proposal_response(pipeline_proposal)

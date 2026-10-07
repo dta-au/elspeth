@@ -30,7 +30,13 @@ from elspeth.web.composer.llm_response_parsing import (
 )
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_errors import classify_provider_failure
-from elspeth.web.composer.provider_quota import admit_provider_attempt, quota_provider_calls
+from elspeth.web.composer.provider_quota import (
+    ProviderCallCustody,
+    admit_provider_attempt,
+    provider_call_scope,
+    quota_provider_calls,
+    required_provider_audit_scope,
+)
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
 from elspeth.web.credential_guard import (
@@ -418,7 +424,9 @@ def build_composer_loop_request_kwargs(
     return kwargs
 
 
-async def _litellm_acompletion(*, on_provider_dispatch: Callable[[], None] | None = None, **kwargs: Any) -> Any:
+async def _litellm_acompletion(
+    *, provider_custody: ProviderCallCustody | None = None, on_provider_dispatch: Callable[[], None] | None = None, **kwargs: Any
+) -> Any:
     """Call LiteLLM lazily so app startup never imports provider machinery.
 
     Brands OpenRouter-routed calls with ELSPETH's app-attribution headers (see
@@ -428,6 +436,8 @@ async def _litellm_acompletion(*, on_provider_dispatch: Callable[[], None] | Non
     :func:`_apply_openrouter_usage_accounting`) so provider cost and cache
     detail arrive in-band for the call audit.
     """
+    if provider_custody is not None and type(provider_custody) is not ProviderCallCustody:
+        raise AuditIntegrityError("Physical provider requires exact explicit custody")
     import litellm
 
     # Endpoint credentials are purpose-specific transport configuration and
@@ -436,9 +446,29 @@ async def _litellm_acompletion(*, on_provider_dispatch: Callable[[], None] | Non
     require_no_credential_material(kwargs["messages"], surface="composer_provider_request")
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
-    await admit_provider_attempt(model=kwargs["model"])
+    if provider_custody is None:
+        await admit_provider_attempt(model=kwargs["model"])
+    else:
+        await provider_custody.admit(model=kwargs["model"])
     if on_provider_dispatch is not None:
-        on_provider_dispatch()
+        try:
+            on_provider_dispatch()
+        except BaseException as callback_failure:
+            if provider_custody is None:
+                raise
+            try:
+                cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
+            except BaseException as disposition_failure:
+                raise BaseExceptionGroup(
+                    "Provider pre-dispatch callback and required disposition outcomes", [callback_failure, disposition_failure]
+                ) from None
+            if cancellations:
+                raise BaseExceptionGroup(
+                    "Provider pre-dispatch callback and original cancellations", [callback_failure, *cancellations]
+                ) from None
+            raise
+    if provider_custody is not None:
+        provider_custody.mark_sdk_entered()
     return await litellm.acompletion(**kwargs)
 
 
@@ -466,6 +496,8 @@ class ProviderGateway:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        *,
+        provider_custody: ProviderCallCustody | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call LiteLLM and return only the admitted, owned completion."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
@@ -479,7 +511,11 @@ class ProviderGateway:
                 api_base=self._endpoint_base_url,
                 api_key=self._endpoint_api_key,
             )
-            response = await _litellm_acompletion(**kwargs)
+            response = (
+                await _litellm_acompletion(provider_custody=provider_custody, **kwargs)
+                if provider_custody is not None
+                else await _litellm_acompletion(**kwargs)
+            )
         except LiteLLMBadRequestError as exc:
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
@@ -502,7 +538,7 @@ class ProviderGateway:
         )
         return completion
 
-    async def _call_text_llm(self, messages: list[dict[str, str]]) -> Any:
+    async def _call_text_llm(self, messages: list[dict[str, str]], *, provider_custody: ProviderCallCustody | None = None) -> Any:
         """Call the LLM for non-tool text generation."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
@@ -515,7 +551,11 @@ class ProviderGateway:
                 api_base=self._endpoint_base_url,
                 api_key=self._endpoint_api_key,
             )
-            response = await _litellm_acompletion(**kwargs)
+            response = (
+                await _litellm_acompletion(provider_custody=provider_custody, **kwargs)
+                if provider_custody is not None
+                else await _litellm_acompletion(**kwargs)
+            )
         except LiteLLMBadRequestError as exc:
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
@@ -573,19 +613,21 @@ class ProviderGateway:
             )
         return response
 
-    @quota_provider_calls
-    async def _call_llm_with_audit(
+    async def _call_llm_with_audit_body(
         self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
         *,
         timeout: float,
         recorder: BufferingRecorder | None,
+        provider_custody: ProviderCallCustody | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call the primary model once and record the exact marked request."""
+        wire_messages = [dict(message) for message in messages]
+        wire_tools = [dict(tool) for tool in tools]
         if supports_anthropic_prompt_cache_markers(self._model):
-            messages, tools_or_none = apply_anthropic_cache_markers(messages, tools, mark_history_tail=True)
-            tools = tools_or_none if tools_or_none is not None else tools
+            wire_messages, tools_or_none = apply_anthropic_cache_markers(wire_messages, wire_tools, mark_history_tail=True)
+            wire_tools = tools_or_none if tools_or_none is not None else wire_tools
 
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
@@ -594,13 +636,18 @@ class ProviderGateway:
         error_class: str | None = None
         error_message: str | None = None
         try:
-            completion = await asyncio.wait_for(self._call_llm(messages, tools), timeout=timeout)
+            completion = await asyncio.wait_for(
+                self._call_llm(wire_messages, wire_tools, provider_custody=provider_custody)
+                if provider_custody is not None
+                else self._call_llm(wire_messages, wire_tools),
+                timeout=timeout,
+            )
             _require_no_credential_material_in_completion(
                 completion,
                 surface="composer_provider_response",
             )
             response_metadata = completion.provider_metadata
-            if not tools and (completion.tool_batch.calls or not (completion.message.content or "").strip()):
+            if not wire_tools and (completion.tool_batch.calls or not (completion.message.content or "").strip()):
                 raise _MalformedLLMResponseError(
                     "Reply-only completion must contain text and no tool calls",
                     provider_metadata=completion.provider_metadata,
@@ -652,34 +699,43 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         finally:
-            if recorder is not None and status is not None:
-                recorder.record_llm_call(
-                    build_llm_call_record(
-                        model_requested=self._model,
-                        pricing_model=self._settings.composer_pricing_model,
-                        messages=messages,
-                        tools=tools or None,
-                        status=status,
-                        started_at=started_at,
-                        started_ns=started_ns,
-                        temperature=self._settings.composer_temperature,
-                        seed=self._settings.composer_seed,
-                        response_metadata=response_metadata,
-                        error_class=error_class,
-                        error_message=error_message,
-                    )
-                )
-                current_exc = sys.exc_info()[1]
-                if current_exc is not None:
-                    attach_llm_calls(current_exc, recorder)
+            with required_provider_audit_scope(provider_custody):
+                if status is not None and (recorder is not None or provider_custody is not None):
+                    if provider_custody is not None and not provider_custody.needs_terminal_audit():
+                        return_to_audit = False
+                    else:
+                        return_to_audit = True
+                    if return_to_audit:
+                        call = build_llm_call_record(
+                            model_requested=self._model,
+                            pricing_model=self._settings.composer_pricing_model,
+                            messages=wire_messages,
+                            tools=wire_tools or None,
+                            status=status,
+                            started_at=started_at,
+                            started_ns=started_ns,
+                            temperature=self._settings.composer_temperature,
+                            seed=self._settings.composer_seed,
+                            response_metadata=response_metadata,
+                            error_class=error_class,
+                            error_message=error_message,
+                            provider_custody=provider_custody,
+                        )
+                        if provider_custody is not None:
+                            provider_custody.retain_audit(call)
+                        if recorder is not None:
+                            recorder.record_llm_call(call, provider_custody=provider_custody)
+                    current_exc = sys.exc_info()[1]
+                    if current_exc is not None:
+                        attach_llm_calls(current_exc, recorder)
 
-    @quota_provider_calls
-    async def _call_text_llm_with_audit(
+    async def _call_text_llm_with_audit_body(
         self,
         messages: list[dict[str, str]],
         *,
         timeout: float,
         recorder: BufferingRecorder | None,
+        provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Call the diagnostics text model and record one redacted audit row."""
         started_at = datetime.now(UTC)
@@ -689,7 +745,12 @@ class ProviderGateway:
         error_class: str | None = None
         error_message: str | None = None
         try:
-            provider_response = await asyncio.wait_for(self._call_text_llm(messages), timeout=timeout)
+            provider_response = await asyncio.wait_for(
+                self._call_text_llm(messages, provider_custody=provider_custody)
+                if provider_custody is not None
+                else self._call_text_llm(messages),
+                timeout=timeout,
+            )
             choice = provider_response.choices[0] if provider_response.choices else None
             message = choice.message if choice is not None else None
             admitted_metadata = admit_llm_provider_metadata(
@@ -764,23 +825,80 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         finally:
-            if recorder is not None and status is not None:
-                recorder.record_llm_call(
-                    build_llm_call_record(
-                        model_requested=self._model,
-                        pricing_model=self._settings.composer_pricing_model,
-                        messages=cast(list[dict[str, Any]], messages),
-                        tools=None,
-                        status=status,
-                        started_at=started_at,
-                        started_ns=started_ns,
-                        temperature=self._settings.composer_temperature,
-                        seed=self._settings.composer_seed,
-                        response_metadata=response_metadata,
-                        error_class=error_class,
-                        error_message=error_message,
-                    )
-                )
-                current_exc = sys.exc_info()[1]
-                if current_exc is not None:
-                    attach_llm_calls(current_exc, recorder)
+            with required_provider_audit_scope(provider_custody):
+                if status is not None and (recorder is not None or provider_custody is not None):
+                    if provider_custody is not None and not provider_custody.needs_terminal_audit():
+                        return_to_audit = False
+                    else:
+                        return_to_audit = True
+                    if return_to_audit:
+                        call = build_llm_call_record(
+                            model_requested=self._model,
+                            pricing_model=self._settings.composer_pricing_model,
+                            messages=cast(list[dict[str, Any]], messages),
+                            tools=None,
+                            status=status,
+                            started_at=started_at,
+                            started_ns=started_ns,
+                            temperature=self._settings.composer_temperature,
+                            seed=self._settings.composer_seed,
+                            response_metadata=response_metadata,
+                            error_class=error_class,
+                            error_message=error_message,
+                            provider_custody=provider_custody,
+                        )
+                        if provider_custody is not None:
+                            provider_custody.retain_audit(call)
+                        if recorder is not None:
+                            recorder.record_llm_call(call, provider_custody=provider_custody)
+                    current_exc = sys.exc_info()[1]
+                    if current_exc is not None:
+                        attach_llm_calls(current_exc, recorder)
+
+    @quota_provider_calls
+    async def _call_llm_with_audit_legacy(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+        *,
+        timeout: float,
+        recorder: BufferingRecorder | None,
+    ) -> _AdmittedLLMCompletion:
+        return await self._call_llm_with_audit_body(messages, tools, timeout=timeout, recorder=recorder)
+
+    async def _call_llm_with_audit(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        timeout: float,
+        recorder: BufferingRecorder | None,
+        provider_custody: ProviderCallCustody | None = None,
+    ) -> _AdmittedLLMCompletion:
+        if provider_custody is None:
+            return await self._call_llm_with_audit_legacy(messages, tools, timeout=timeout, recorder=recorder)
+        async with provider_call_scope(provider_custody):
+            return await self._call_llm_with_audit_body(
+                messages, tools, timeout=timeout, recorder=recorder, provider_custody=provider_custody
+            )
+
+    @quota_provider_calls
+    async def _call_text_llm_with_audit_legacy(
+        self, messages: list[dict[str, str]], *, timeout: float, recorder: BufferingRecorder | None
+    ) -> str:
+        return await self._call_text_llm_with_audit_body(messages, timeout=timeout, recorder=recorder)
+
+    async def _call_text_llm_with_audit(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        timeout: float,
+        recorder: BufferingRecorder | None,
+        provider_custody: ProviderCallCustody | None = None,
+    ) -> str:
+        if provider_custody is None:
+            return await self._call_text_llm_with_audit_legacy(messages, timeout=timeout, recorder=recorder)
+        async with provider_call_scope(provider_custody):
+            return await self._call_text_llm_with_audit_body(
+                messages, timeout=timeout, recorder=recorder, provider_custody=provider_custody
+            )

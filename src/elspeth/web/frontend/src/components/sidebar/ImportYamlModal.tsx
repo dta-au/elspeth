@@ -14,7 +14,7 @@ import {
   unavailablePluginDisplayName,
 } from "@/components/catalog/UnavailableComponentRow";
 import { useExecutionStore } from "@/stores/executionStore";
-import { useSessionStore } from "@/stores/sessionStore";
+import { captureSessionPublicationGuard, useSessionStore } from "@/stores/sessionStore";
 import type { BlobMetadata } from "@/types/api";
 import type { ApiError, PluginPolicyFinding } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
@@ -665,6 +665,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const compositionState = useSessionStore((s) => s.compositionState);
   const compositionStateLoaded = useSessionStore((s) => s.compositionStateLoaded);
+  const isComposing = useSessionStore((s) => s.isComposing);
   const selectSession = useSessionStore((s) => s.selectSession);
 
   const [yamlText, setYamlText] = useState("");
@@ -906,7 +907,10 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
   }
 
   async function doImport(): Promise<void> {
+    if (useSessionStore.getState().isComposing) return;
     if (!activeSessionId) return;
+    const isCurrent = captureSessionPublicationGuard(activeSessionId);
+    if (!isCurrent()) return;
     setError(null);
     setPhase("submitting");
     try {
@@ -939,6 +943,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
       const result = Object.keys(importSourceBlobIds).length > 0
         ? await api.importCompositionYaml(activeSessionId, yamlText, importSourceBlobIds)
         : await api.importCompositionYaml(activeSessionId, yamlText);
+      if (!isCurrent()) return;
       setSuccessInfo({
         version: result.version,
         isValid: result.is_valid,
@@ -959,6 +964,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
       // refetch.
       void useExecutionStore.getState().validate(activeSessionId);
     } catch (err) {
+      if (!isCurrent()) return;
       setError(describeImportError(err as ApiError));
       setPhase("draft");
     }
@@ -1088,7 +1094,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                 </Button>
                 <Button
                   variant="primary"
-                  disabled={!canSubmitYaml || isSubmitting || hasPendingSourceUpload}
+                  disabled={isComposing || !canSubmitYaml || isSubmitting || hasPendingSourceUpload}
                   onClick={handleSubmitClick}
                 >
                   {isSubmitting ? "Importing…" : "Import"}
@@ -1207,9 +1213,7 @@ export function ImportYamlModalHost(): JSX.Element | null {
   }, []);
 
   useEffect(() => {
-    if (!activeSessionId) {
-      setIsOpen(false);
-    }
+    setIsOpen(false);
   }, [activeSessionId]);
 
   if (!activeSessionId || !isOpen) return null;

@@ -15,7 +15,7 @@ Every platform literal below is measured in the
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This is an executable operator procedure; steps marked
 > **LIVE** require measurements during execution. A future acceptance receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.2.json` is no longer a tracker
+> `docs/operator/evidence/azure-container-apps/0.8.3.json` is no longer a tracker
 > closure or documentation-promotion condition.
 
 The supported configuration retains `Single` revision mode, `sticky` session
@@ -295,9 +295,10 @@ status; health alone does not prove LLM or login setup.
 
 An epoch-crossing candidate needs the database owner to drain the old
 revision, export the stopped Sessions store's identity/grant/edge cohort,
-archive and recreate both stores, and rerun the schema Job from the
-[cold-install runbook](azure-container-apps-cold-install.md). Then apply the
-candidate revision and complete the
+archive and recreate each stale store, and rerun the schema Job from the
+[cold-install runbook](azure-container-apps-cold-install.md). For 0.8.1 or
+0.8.2 to 0.8.3, only the session store changes from epoch 71 to 72; preserve
+a Landscape store already at epoch 49. Then apply the candidate revision and complete the
 [identity workflow cutover handoff](identity-workflow-cutover.md): bootstrap,
 re-admit, check authenticated behavior, and send the notice before ordinary
 traffic resumes. This image-only path assumes already-current schemas and

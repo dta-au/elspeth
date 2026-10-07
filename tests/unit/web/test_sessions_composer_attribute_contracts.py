@@ -6,16 +6,15 @@ import ast
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 
 import pytest
-from starlette.requests import Request
 
 from elspeth.web.composer import discovery_cache, llm_response_parsing
 from elspeth.web.composer.implicit_decisions import _is_auto_wired_control
 from elspeth.web.composer.state import NodeSpec
 from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
-from elspeth.web.sessions.routes._helpers import _failure_log_request_id, _is_client_disconnect_cancel
+from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED, ComposerOperationCancelReason
+from elspeth.web.sessions.composer_turn import _composer_operation_cancel_of
 from tests.helpers.tree_gate import iter_gate_sources
 
 
@@ -162,16 +161,11 @@ def test_auto_wired_disclosure_rejects_malformed_owned_requirements() -> None:
         _is_auto_wired_control(node)
 
 
-def test_failure_log_request_id_parses_only_the_middleware_owned_state_dict() -> None:
-    assert _failure_log_request_id(Request({"type": "http"})) is None
-    assert _failure_log_request_id(Request({"type": "http", "state": MappingProxyType({"request_id": "forged"})})) is None
-    assert _failure_log_request_id(Request({"type": "http", "state": {"request_id": 7}})) is None
-    assert _failure_log_request_id(Request({"type": "http", "state": {"request_id": "request-1"}})) == "request-1"
-
-
-def test_disconnect_marker_requires_the_private_token_by_identity() -> None:
+def test_worker_marker_requires_the_owned_nominal_cancel_type() -> None:
     class MasqueradingMessage:
         def __eq__(self, _other: object) -> bool:
             return True
 
-    assert _is_client_disconnect_cancel(asyncio.CancelledError(MasqueradingMessage())) is False
+    assert _composer_operation_cancel_of(asyncio.CancelledError(MasqueradingMessage())) is None
+    actual = _composer_operation_cancel_of(asyncio.CancelledError(COMPOSER_CANCEL_REQUESTED))
+    assert actual is COMPOSER_CANCEL_REQUESTED and actual.reason is ComposerOperationCancelReason.CANCEL_REQUESTED

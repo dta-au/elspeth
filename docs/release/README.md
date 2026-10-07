@@ -1,6 +1,6 @@
 # `docs/release/` — Release Histories and Snapshots
 
-**Last reviewed:** 2026-10-05 (0.8.2)
+**Last reviewed:** 2026-10-07 (0.8.3)
 **Audience:** Anyone navigating to release-level documentation
 **Register:** Lightly technical / directory-index
 
@@ -8,7 +8,7 @@ This directory holds the current evaluator guides and the long-lived assurance
 narrative.
 
 The directory is intentionally small. **Current** documents are the maintained
-tier for the release currently being prepared (0.8.2). Superseded point-in-time
+tier for the release currently being prepared (0.8.3). Superseded point-in-time
 release docs and frozen historical snapshots are no longer part of the active
 public docs tree; use git history or maintainer-local archives when historical
 provenance is needed. New readers should start with the current tier below.
@@ -39,7 +39,7 @@ Before diving into the documents below, know which sources they aggregate. **If 
 
 ---
 
-## Current documents (0.8.2, October 2026)
+## Current documents (0.8.3, October 2026)
 
 | Document | What it answers | Intended reader |
 |----------|-----------------|-----------------|

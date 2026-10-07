@@ -1,0 +1,80 @@
+<!-- Durable copy: machine paths normalized; exact private original retained. -->
+
+# Actual Astra finite-selector successor 3 source review
+
+**NO-GO for the frozen scanner delta. Two blocking proof defects remain: imported/closed operator aliases can bypass relevance checking, and decorated lexical helpers are incorrectly treated as closed to explicit callers.** Final canonical/application clearance also remains held independently because the ordinary public positive is refused by stale transitive recipes. No successor-4 bytes are approved here.
+
+This is internal Astra review of scanner source and source-analysis instruments only. No candidate/project module was imported, no pytest/collection, SQL, provider or production runtime was executed, and no repository or candidate file was edited. Exact selected source-analysis functions were extracted from AST and executed against synthetic parsed sources with their actual resolver; those bounded instruments are described separately from complete checker/public-gate execution.
+
+## Binding and reviewed scope
+
+Selected artifact: `contracts-reserve-proof/finite-selector-successor-3/canonical-scanner-package/scanner-only.patch`, SHA-256 `02998f2f2bd3da30dc1f7576bc83463eace7951738c78191903f5a4158fc1567`.
+
+Canonical replacement: `80c3dbc461606b45a009d64fab6c21ab3fb7938bbd2400ec9df402a8c241c470`. Canonical preimage: `a859af6dcdadbe5fff6a07ccb656e1f19c0e865d0a5eb3fc99156e2fac0e6654`. Standalone candidate: `87f907c55d78773dcf60386b5e686062e8693f4fa553f4c5985452a766440b9b`.
+
+I read the two prior selector design adjudications, successor REVIEW/SUPPORTED-FORMS, complete standalone candidate, package preparation/integration code, exact finite-selector/operator/helper logic in the canonical replacement, the actual resolver and lexical-owner dependencies, authored scoped/preference controls, final raw logs and completed-exit records. The large preexisting canonical scanner is not newly certified as a whole. Its selected patch is an insertion/integration into the unchanged preimage, not a claim that every historical scanner branch was reaudited.
+
+Independent byte/AST checks verified all 18 frozen-source guards and reconstructed the selected scanner-only patch exactly. The live canonical scanner still matches the complete declared preimage. Historical `complete.patch` recipe additions are explicitly unselected. The selected scanner imports the recipe helper and reads its JSON contracts; its application readiness cannot be established without the separately reviewed dependency package.
+
+## F1 — reflection relevance drops actual imported and enclosing aliases
+
+Canonical locations: `reflection_forms` at line 6230, `possible_reflection` at line 6265, and the relevance decision at line 6293. Standalone locations: lines 420–480.
+
+The operator recognizer can resolve this actual imported builtin correctly:
+
+```python
+from builtins import getattr as lookup
+
+def exercise(foreign, name):
+    namespace = lookup(foreign, name)
+    namespace.update(_source_for_ordinal=foreign)
+```
+
+Nevertheless, `possible_reflection(Name('lookup'))` considers only the literal name `getattr` and assignments in the immediate lexical scope. An import lives in the resolver's import table, not that assignment table. With an unknown selector, the argument finite values contain only UNKNOWN and no sensitive literal. Consequently `relevant` is false even though `reflection_forms` has already returned `{'getattr'}`. The UNKNOWN check is never reached.
+
+I independently measured this using exact AST-extracted canonical functions and the actual `_Resolver`, without importing the candidate module. Both module and local `from builtins import getattr as lookup` resolve to `builtins.getattr`, produce known builtin form, and yield `possible_reflection=False`, `relevant=False` for unknown selectors. Direct `getattr(..., name)` engages the check; the imported alias with literal `__globals__` also engages it. These positive controls distinguish the omission from a broken instrument. An enclosing lexical `lookup=getattr` used by an inner function similarly yields UNKNOWN form but false relevance, so fixing only the known-form branch is not enough to cover that supported provenance boundary.
+
+The contracts worker independently ran the complete scoped checker on the exact frozen replacement. I read its complete `imported-builtin-alias-diagnostic-1/diagnostic.log` and completed-exit JSON: the ordinary independent positive has no failures, while the imported-getattr negative also has no failures and fails the intended assertion, exit 1, chunk `1953c1`. This is an attributable false-clear result of the scoped checker, not a full public-gate pass. The stale public recipe refusal does not repair this scanner defect.
+
+Required repair: use conservative actual operator provenance when deciding relevance, including imported names, aliases through enclosing scopes and alternatives; do not discard possible reflection because its spelling or immediate-scope assignment table differs. Unsupported or mixed operator/selector states must still refuse. Add individually attributable negatives for module/local imports, enclosing aliases, unknown selectors and relevant rebinding/conditional variants, with an ordinary complete positive.
+
+## F2 — decorator application implicitly exports a supposedly closed helper
+
+Canonical location: `finite_closed_parameter` at line 6136. Standalone lines 349–378.
+
+The helper checks explicit Name references, binding events, definition-before-call, argument shape, defaults/variadics and selected namespace introspection. It never rejects or proves `function.decorator_list`. Applying a decorator passes the actual newly created function to that decorator without an AST Name reference to the function. The explicit-reference census therefore does not establish all callers or prevent export.
+
+```python
+def outer(obj, foreign, unknown):
+    @foreign
+    def _read(name):
+        return getattr(obj, name)
+    return _read("ordinary")
+```
+
+The foreign decorator may invoke the received original function with `"__globals__"` or export it for later arbitrary calls. The sole explicit `_read("ordinary")` cannot constrain those inputs. This is an implicit callable escape, not a request to execute arbitrary Python while scanning.
+
+The exact canonical finite-domain helpers and actual resolver incorrectly return `{'ordinary'}` for the `getattr` selector in this decorated example. The otherwise identical undecorated helper is the finite positive; supplying an unknown explicit argument produces UNKNOWN as the negative. Full results are in `astra-finite-selector-code-review-3-decorator-evidence.json`. This instrument measures the domain proof defect; I did not run a production decorator or claim a complete public-gate result for this case.
+
+Required repair: conservatively refuse decorated helpers for this narrow recognizer unless a separately explicit exact decorator-effect/escape proof exists. The current preferences helper needs no decorator exception. Add this implicit escape as its own domain and scoped-checker negative, preserving the undecorated positive. Do not replace the missing proof with a private-name or whole-reader recipe waiver.
+
+## What the existing controls do establish
+
+UNKNOWN is now represented explicitly and preserved by literal concatenation and IfExp unions. Supported local assignment analysis includes complete named binding events and a dominating assignment; unsupported stores retain UNKNOWN. Proved builtin getattr selects positional argument 1 with admitted arity two/three; proved native unbound getattribute selects argument 1 with arity two. Unproved bound methods, stars, keywords and operator alternatives refuse when they reach the relevant check. F1 concerns reaching that check at all.
+
+The conditional-operator repair ensures its known getattr arm makes the existing conditional case relevant; unresolved form is refused. Its previously failed diagnostic is retained. Source builtin/import shadow and wildcard checks address the authored cases, but their results do not close missing imported aliases.
+
+The local tuple proof requires literal native strings, one binding, assignment before closure creation, matching binding identity and confined iteration/membership uses. The lexical helper proof rejects explicit alias exports, replacement binding, defaults/variadics and the authored locals exposure. The actual preferences control resolves its two getter selectors to the four existing progress names; unknown tuple element, mixed tuple, tuple/helper rebind, locals exposure and explicit helper alias each retain UNKNOWN. F2 shows the explicit-use confinement is incomplete for decorated definitions.
+
+I read the complete final scoped log: 19 instrument cases include one ordinary/copied-dictionary positive with no own failure and 18 negatives with attributable own-path failures. These are checker-case records, not collected tests or full-global closure. The preference controls prove finite selector provenance only; they do not prove receiver descriptors, getter effects, output normalization or complete protected-supplier closure.
+
+The public-positive final log explicitly has `certificate=false`, its own unknown `.reserve` violation and `transitive non-DML recipe or imported bindings changed`. Its exit-0 diagnostic merely reports that failing positive. It is neither a valid negative kill nor canonical GO. Actual eleven-field dependency admission, source51/52, SDK/method/facade/counter families and complete independent public controls remain separate unresolved obligations. No production identifier restriction, serializer/Jinja rewrite, policy/rank/map/suppression or signature change is selected.
+
+## Evidence and disposition
+
+- `astra-finite-selector-code-review-3-evidence.json`: frozen guards, exact patch/live preimage, authored controls and failing public-positive result.
+- `astra-finite-selector-code-review-3-alias-evidence.json`: independent exact-helper/operator/resolver measurements for direct, imported and enclosing aliases.
+- `astra-finite-selector-code-review-3-decorator-evidence.json`: independent closed-helper positive, unknown-input negative and decorator escape false-finite result.
+- Worker-supplied complete scoped alias diagnostic: `contracts-reserve-proof/imported-builtin-alias-diagnostic-1/diagnostic.log` and `completed-exit.json`, read as author execution, not reviewer execution.
+
+Both F1 and F2 block bounded implementation GO for these bytes. Preserve successor 3 and prepare any repair separately; no mutable or future successor approval follows. Original 102 obligations, four collection obligations, two UNKNOWNs, final canonical/global recipes, application/runtime/SQL/PG gates and John's local/manual Daybreak/merge decisions remain held.

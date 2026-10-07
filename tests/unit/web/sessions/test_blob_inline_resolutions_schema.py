@@ -70,9 +70,9 @@ def test_blob_inline_resolutions_schema_epoch_is_71(engine) -> None:
     # Epoch 69 binds freeform message ingress receipts.
     # Epoch 70 renames the persisted tutorial Build stage to build.
     # Epoch 71 adds mode-neutral fork/revert receipts.
-    assert SESSION_SCHEMA_EPOCH == 71
+    assert SESSION_SCHEMA_EPOCH == 72
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 71
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 72
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

@@ -19,8 +19,7 @@ import {
 } from "@/components/chat/acknowledgementLabels";
 import type { InterpretationEvent } from "@/types/interpretation";
 import {
-  COMPOSE_CONNECTING_MESSAGE,
-  COMPOSE_UNAVAILABLE_MESSAGE,
+  COMPOSE_LOADING_SESSION_MESSAGE,
 } from "@/config/composer";
 import type { BlobMetadata } from "@/types/api";
 
@@ -231,14 +230,7 @@ export function ChatInput({
   const setTextRef = useRef(setText);
   setTextRef.current = setText;
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
-  const composeTimeoutReady = useSessionStore((s) => s.composeTimeoutReady);
-  // Set when the backend is reachable but reported no usable compose timeout,
-  // so readiness can never latch. Distinguishes "up but misconfigured" (show a
-  // distinct, alerting diagnostic) from the transient boot window (show the
-  // soft "Connecting…").
-  const composerTimeoutUnavailable = useSessionStore(
-    (s) => s.composerTimeoutUnavailable,
-  );
+  const composeTimeoutReady = useSessionStore((s) => s.compositionStateLoaded);
   const awaitingComposeTimeout = !composeTimeoutReady;
   // Phase 5a Task 1 — empty-state placeholder primes the user to type data
   // directly into chat (URL / a few rows / a short brief).  Reads two
@@ -404,28 +396,9 @@ export function ChatInput({
             during the (usually sub-second) wait for GET /api/system/status.
           - backend up but no usable compose timeout: role=alert, a distinct
             stuck-state diagnostic so it never reads as a perpetual connect. */}
-      {awaitingComposeTimeout &&
-        !disabled &&
-        (composerTimeoutUnavailable ? (
-          // Distinct `key` per branch: force React to unmount the polite status
-          // and mount a fresh assertive alert on the Connecting→Unavailable
-          // flip, rather than mutate role in place (which SRs may not re-announce).
-          <div
-            key="unavailable"
-            role="alert"
-            className="chat-input-composer-unavailable"
-          >
-            {COMPOSE_UNAVAILABLE_MESSAGE}
-          </div>
-        ) : (
-          <div
-            key="connecting"
-            role="status"
-            className="chat-input-bootstrapping"
-          >
-            {COMPOSE_CONNECTING_MESSAGE}
-          </div>
-        ))}
+      {awaitingComposeTimeout && !disabled && (
+        <div role="status" className="chat-input-bootstrapping">{COMPOSE_LOADING_SESSION_MESSAGE}</div>
+      )}
       <div className="chat-input-row" role="group" aria-label="Message composition">
         <textarea
           ref={inputRef}

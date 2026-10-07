@@ -59,6 +59,10 @@ class ComposerProgressSnapshot(ComposerProgressEvent):
 
     session_id: str
     request_id: str | None
+    operation_id: str | None = None
+    session_operation_id: str | None = None
+    session_operation_epoch: int | None = None
+    request_token: str | None = None
     updated_at: datetime
     # Live count of compose requests (send_message / recompose) currently
     # inside the route for this session — including time spent queued on
@@ -122,11 +126,22 @@ class ComposerProgressRegistry:
         request_id: str | None,
         user_id: str,
         lease: ComposerRequestLease,
+        operation_id: str | None = None,
+        session_operation_id: str | None = None,
+        session_operation_epoch: int | None = None,
     ) -> ComposerProgressSink:
         if lease.session_id != session_id or lease.user_id != user_id:
             raise RuntimeError("Composer request lease ownership mismatch")
         await self.renew_request(lease)
-        return self.bind_request(session_id=session_id, request_id=request_id, user_id=user_id)
+        return self.bind_request(
+            session_id=session_id,
+            request_id=request_id,
+            user_id=user_id,
+            operation_id=operation_id,
+            lease=lease,
+            session_operation_id=session_operation_id,
+            session_operation_epoch=session_operation_epoch,
+        )
 
     def begin_request(self, session_id: str) -> None:
         """Count one compose request as in flight for ``session_id``.
@@ -206,6 +221,10 @@ class ComposerProgressRegistry:
         session_id: str,
         request_id: str | None,
         user_id: str,
+        operation_id: str | None = None,
+        session_operation_id: str | None = None,
+        session_operation_epoch: int | None = None,
+        lease: ComposerRequestLease | None = None,
     ) -> ComposerProgressSink:
         """Claim latest-request progress custody and return its guarded sink.
 
@@ -223,6 +242,8 @@ class ComposerProgressRegistry:
 
         async def _publish(event: ComposerProgressEvent) -> None:
             with self._lock:
+                if lease is not None and self._leases.get(lease.request_token) != lease:
+                    return
                 if session_id not in self._request_generations or self._request_generations[session_id] != generation:
                     return
                 self._publish_locked(
@@ -230,6 +251,10 @@ class ComposerProgressRegistry:
                     request_id=request_id,
                     user_id=user_id,
                     event=event,
+                    operation_id=operation_id,
+                    session_operation_id=session_operation_id,
+                    session_operation_epoch=session_operation_epoch,
+                    request_token=lease.request_token if lease is not None else None,
                 )
 
         return _publish
@@ -241,12 +266,20 @@ class ComposerProgressRegistry:
         request_id: str | None,
         user_id: str,
         event: ComposerProgressEvent,
+        operation_id: str | None = None,
+        session_operation_id: str | None = None,
+        session_operation_epoch: int | None = None,
+        request_token: str | None = None,
     ) -> ComposerProgressSnapshot:
         """Store one snapshot while ``self._lock`` is held."""
         updated_at = self._next_timestamp(session_id)
         snapshot = ComposerProgressSnapshot(
             session_id=session_id,
             request_id=request_id,
+            operation_id=operation_id,
+            session_operation_id=session_operation_id,
+            session_operation_epoch=session_operation_epoch,
+            request_token=request_token,
             phase=event.phase,
             headline=event.headline,
             evidence=event.evidence,
@@ -281,6 +314,28 @@ class ComposerProgressRegistry:
         if snapshot.inflight_requests == inflight:
             return snapshot
         return snapshot.model_copy(update={"inflight_requests": inflight})
+
+    async def get_for_operation(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        operation_id: str,
+        session_operation_id: str | None,
+        session_operation_epoch: int | None,
+    ) -> ComposerProgressSnapshot | None:
+        """Read only progress published under this exact durable action fence."""
+        with self._lock:
+            if self._user_index.get(session_id) != user_id:
+                return None
+        snapshot = await self.get_latest(session_id, user_id)
+        if (
+            snapshot.operation_id != operation_id
+            or snapshot.session_operation_id != session_operation_id
+            or snapshot.session_operation_epoch != session_operation_epoch
+        ):
+            return None
+        return snapshot
 
     async def list_active(self, *, user_id: str) -> tuple[ComposerProgressSnapshot, ...]:
         """Return working snapshots and queued requests for one user's sessions.

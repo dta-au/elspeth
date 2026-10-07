@@ -30,6 +30,7 @@ from elspeth.web.azure_container_apps_observations import (
     main,
     observation_document,
 )
+from tests.helpers.composer_probe_operations import operation_document
 
 SESSION = "11111111-1111-4111-8111-111111111111"
 RUN = "33333333-3333-4333-8333-333333333333"
@@ -65,15 +66,20 @@ def test_progress_collects_real_http_surfaces_and_uploaded_bytes(tmp_path: Path,
     uploaded = b""
     calls: list[tuple[str, str]] = []
     message_content = ""
+    operation_id = ""
 
     def respond(request: httpx.Request) -> httpx.Response:
-        nonlocal uploaded, message_content
+        nonlocal uploaded, message_content, operation_id
         label = request.url.host.split(".")[0]
         path = request.url.path
         calls.append((label, path))
         headers = {"X-Elspeth-Instance": label}
         if path == "/api/system/status":
             return httpx.Response(200, json={}, headers=headers)
+        if path.endswith("/state"):
+            return httpx.Response(200, content=b"null", headers=headers)
+        if "/operations/" in path:
+            return httpx.Response(200, json=operation_document(operation_id, SESSION), headers=headers)
         if path.endswith("/blobs"):
             uploaded = request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0]
             return httpx.Response(201, json={"id": BLOB}, headers=headers)
@@ -86,8 +92,10 @@ def test_progress_collects_real_http_surfaces_and_uploaded_bytes(tmp_path: Path,
         if path.endswith("/messages"):
             assistant = {"id": "55555555-5555-4555-8555-555555555555", "role": "assistant", "content": "Acknowledged"}
             if request.method == "POST":
-                message_content = json.loads(request.content)["content"]
-                return httpx.Response(200, json={"message": assistant}, headers=headers)
+                body = json.loads(request.content)
+                message_content = body["content"]
+                operation_id = body["operation_id"]
+                return httpx.Response(202, json={"operation_id": operation_id}, headers=headers)
             return httpx.Response(200, json=[{"id": "new-user", "role": "user", "content": message_content}, assistant], headers=headers)
         if path.endswith("/content"):
             return httpx.Response(200, content=b"wrong" if mismatch and label == "b" else uploaded, headers=headers)
@@ -113,18 +121,25 @@ def test_progress_collects_real_http_surfaces_and_uploaded_bytes(tmp_path: Path,
 
 def test_progress_refuses_history_that_does_not_contain_the_acknowledged_write(tmp_path: Path) -> None:
     clock = _Clock()
+    operation_id = ""
 
     def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal operation_id
         headers = {"X-Elspeth-Instance": request.url.host}
         if request.url.path == "/api/system/status":
             return httpx.Response(200, json={}, headers=headers)
+        if request.url.path.endswith("/state"):
+            return httpx.Response(200, content=b"null", headers=headers)
+        if "/operations/" in request.url.path:
+            return httpx.Response(200, json=operation_document(operation_id, SESSION), headers=headers)
         if request.url.path.endswith("/blobs"):
             return httpx.Response(201, json={"id": BLOB}, headers=headers)
         if request.url.path.endswith("/messages"):
             if request.method == "POST":
+                operation_id = json.loads(request.content)["operation_id"]
                 return httpx.Response(
-                    200,
-                    json={"message": {"id": "55555555-5555-4555-8555-555555555555", "role": "assistant", "content": "Acknowledged"}},
+                    202,
+                    json={"operation_id": operation_id},
                     headers=headers,
                 )
             return httpx.Response(200, json=[{"id": "yesterday", "role": "user", "content": "old message"}], headers=headers)
@@ -157,6 +172,7 @@ def test_progress_refuses_history_that_does_not_contain_the_acknowledged_write(t
 def test_progress_keeps_visibility_delays_that_precede_slow_run_completion(tmp_path: Path, delayed_surface: str) -> None:
     uploaded = b""
     user_content = ""
+    operation_id = ""
     message_ack = run_ack = 0.0
     output_reads: list[float] = []
     interval = 0.02
@@ -165,21 +181,27 @@ def test_progress_keeps_visibility_delays_that_precede_slow_run_completion(tmp_p
     assistant = {"id": "55555555-5555-4555-8555-555555555555", "role": "assistant", "content": "Acknowledged"}
 
     def respond(request: httpx.Request) -> httpx.Response:
-        nonlocal uploaded, user_content, message_ack, run_ack
+        nonlocal uploaded, user_content, message_ack, run_ack, operation_id
         label = request.url.host.split(".")[0]
         path = request.url.path
         headers = {"X-Elspeth-Instance": label}
         now = time.monotonic()
         if path == "/api/system/status":
             return httpx.Response(200, json={}, headers=headers)
+        if path.endswith("/state"):
+            return httpx.Response(200, content=b"null", headers=headers)
+        if "/operations/" in path:
+            return httpx.Response(200, json=operation_document(operation_id, SESSION), headers=headers)
         if path.endswith("/blobs"):
             uploaded = request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0]
             return httpx.Response(201, json={"id": BLOB}, headers=headers)
         if path.endswith("/messages"):
             if request.method == "POST":
-                user_content = json.loads(request.content)["content"]
+                body = json.loads(request.content)
+                user_content = body["content"]
+                operation_id = body["operation_id"]
                 message_ack = now
-                return httpx.Response(200, json={"message": assistant}, headers=headers)
+                return httpx.Response(202, json={"operation_id": operation_id}, headers=headers)
             messages = [{"id": "yesterday", "role": "user", "content": "old history"}]
             if delayed_surface != "messages" or now - message_ack >= delay:
                 messages.extend([{"id": "new-user", "role": "user", "content": user_content}, assistant])

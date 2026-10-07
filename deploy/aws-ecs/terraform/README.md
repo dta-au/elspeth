@@ -992,52 +992,28 @@ the matching bucket-level resource.
 
 ### Composer wall-clock budget
 
-The composer envelope is a coupled three-leg chain driven by one variable,
-`var.alb_idle_timeout_seconds` (default `900`):
+The ALB idle timeout and the application's declared transport ceiling both use
+`var.alb_idle_timeout_seconds` (default `900`). Synchronous requests retain
+30 seconds of transport headroom. `var.composer_timeout_seconds` (default
+`840`) is a positive durable job budget, independent of that socket ceiling.
+A disconnected observer reattaches or polls the same admitted operation; it
+never starts another provider turn. The shipped defaults remain unchanged. Use package and image from the same commit:
+older images reject a job budget above the socket-safe cap.
 
-- the ALB's `idle_timeout` (`modules/scenario/network.tf`) reads it directly;
-- `ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS`
-  (`modules/scenario/locals.tf`) is wired to the same value, so the
-  application's boot guard
-  (`WebSettings._validate_composer_timeout_transport_headroom`) validates the
-  wall clock against the real proxy limit rather than the WebSettings default;
-- `var.composer_timeout_seconds` (default `840`) carries a plan-time
-  validation capping it at `alb_idle_timeout_seconds − 30` (the 30 mirrors
-  `composer_transport_headroom_seconds`), so a wall clock inside the
-  transport headroom fails `terraform plan` instead of the service roll.
+Composer shows safe live progress and then the completed durable answer, independent of the transport idle ceiling.
 
-The coupling exists because the legs used to be independent literals that had
-to agree by discipline, and their history is a history of the envelope lying:
+In Scenario C every composer provider call uses the gateway sidecar. Its
+`ELSPETH_LLM_GATEWAY_REQUEST_TIMEOUT_SECONDS` is unset by this module, so the
+loader default of 300 seconds bounds each connect, write and read wait.
+Each wait is also limited by the durable job's remaining budget; increasing
+that job budget does not increase the sidecar bound. OAuth token requests use
+the separate `ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_TIMEOUT_SECONDS` default of
+60 seconds. These are per-call bounds, independent of observer sockets.
 
-- `120` funded roughly 6 of the authorised 12+8 turns at the measured ~20s
-  per turn — a configured budget the clock could never fund
-  (`elspeth-f159d2394b`).
-- `240` (under the ALB's then-default `300`) was the most that infrastructure
-  could honestly offer, and it could not fund the shipped corpus: in battery
-  round 5, the g03 fork/coalesce graph's first authoring call landed at
-  t=413s and its full compose settled at ~490–514s — structurally unreachable
-  at any observed per-turn pace, because the work is legitimate (an 8-node
-  pipeline with a discovered type-coercion chain), not a stall
-  (`elspeth-09c91778f5`). g09 settled 4.3s inside 270.
-- `900/840` is the battery round-5 arm-B proven configuration: all three
-  wall-death graphs composed under it, and it funds 56 turns at the app's
-  15s/turn planning floor.
-
-When the budget elapses the composer returns a discriminated `422`
-(`reason: convergence_wall_clock_timeout`); the pipeline built so far is saved
-as a new composition-state version and the next turn resumes from it, so
-nothing is lost — but the author pays a wasted turn.
-
-The SPA derives its client abort ceiling from whatever value is set (via
-`GET /api/system/status`), so no frontend change is needed when the envelope
-moves. `tests/unit/deployment/test_aws_ecs_terraform_package.py` enforces the
-chain — the ceiling env var must be wired to the ALB variable verbatim, the
-plan-time cap must mirror the app headroom, and the default wall must stay at
-or above the 840s corpus-proven floor — so an unaccompanied change to any leg
-fails CI rather than in production.
-
-Note that the turn budget is a ceiling on turns, not a quota the wall clock
-promises to fund; the composer is expected to converge well inside both.
+The job's own wall-clock deadline still limits provider work. Client observation
+uses the operation's server deadline and preserves custody when observation
+ends. Deployment tests pin the ALB/environment mirror and verify that positive
+job budgets may exceed the socket ceiling while synchronous headroom remains.
 
 ### Composer reasoning effort
 

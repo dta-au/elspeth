@@ -9,6 +9,7 @@ import pytest
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.protocol import ComposerResult, ComposerService
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from tests.helpers.composer_operations import settle_sync
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.test_routes import (
     ValidationResult,
@@ -154,16 +155,21 @@ def test_lazy_freeform_composition_passes_empty_state(tmp_path, endpoint) -> Non
     app.state.composer_service = composer
     if endpoint == "recompose":
         user_message = asyncio.run(service.add_message(session_id, "user", "Summarize my CSV", writer_principal="route_user_message"))
-        response = client.post(
-            f"/api/sessions/{session_id}/recompose",
-            json={"expected_user_message_id": str(user_message.id)},
+        settled = settle_sync(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/recompose",
+            body={"expected_user_message_id": str(user_message.id), "operation_id": str(uuid.uuid4()), "state_id": None},
         )
     else:
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Summarize my CSV", "client_request_id": str(uuid.uuid4())},
+        settled = settle_sync(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body={"content": "Summarize my CSV", "operation_id": str(uuid.uuid4()), "state_id": None},
         )
-    assert response.status_code == 200, response.json()
+    assert settled.final.status_code == 200, settled.final.text
+    settled.result()
     composer.compose.assert_awaited_once()
     supplied_state = composer.compose.call_args.args[2]
     assert isinstance(supplied_state, CompositionState)

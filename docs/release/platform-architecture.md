@@ -1,7 +1,7 @@
 # ELSPETH Platform Architecture
 
 **Document date:** 5 October 2026
-**Release covered:** 0.8.2
+**Release covered:** 0.8.3 candidate
 **Audience:** Evaluators, technical leaders, architects, and assurance reviewers
 **Register:** Public-facing / technical
 **Status:** Current architecture overview

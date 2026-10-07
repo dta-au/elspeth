@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
@@ -12,7 +13,10 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import Engine, select, update
 from sqlalchemy.exc import OperationalError
+from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 
+from elspeth.web import async_workers
+from elspeth.web.application_finalizers import ApplicationFinalizerOwner
 from elspeth.web.async_workers import run_sync_in_worker as real_run_sync_in_worker
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination import membership_lifecycle as lifecycle_module
@@ -32,6 +36,7 @@ from elspeth.web.coordination.membership_lifecycle import (
     SingleProcessWebInstanceMembership,
     heartbeat_interval_seconds,
 )
+from elspeth.web.process_recovery import ProcessRecovery
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import web_instances_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -411,10 +416,37 @@ class TestHeartbeatInterval:
             heartbeat_interval_seconds(lease_seconds)  # type: ignore[arg-type]
 
 
+@pytest.fixture()
+def membership_factory(monkeypatch: pytest.MonkeyPatch):
+    def create(authority, identity, *, lease_seconds, interval_seconds=None):
+        draining = threading.Event()
+        watchdog = OwnedTestProcessWatchdog(draining)
+        recovery = ProcessRecovery(watchdog=watchdog, instance_draining=draining)
+        owner = ApplicationFinalizerOwner()
+        membership = RegisteredWebInstanceMembership(
+            authority,
+            identity,
+            lease_seconds=lease_seconds,
+            interval_seconds=interval_seconds,
+            process_recovery=recovery,
+            instance_draining=draining,
+            finalizer_owner=owner,
+        )
+        owner.seal()
+        monkeypatch.setattr(async_workers, "_APPLICATION_FINALIZER_OWNER", owner)
+        monkeypatch.setattr(async_workers, "_INSTANCE_DRAINING", draining)
+        assert async_workers._INSTANCE_DRAINING is membership.draining is draining
+        return membership
+
+    return create
+
+
 class TestSingleProcessMembership:
     @pytest.mark.asyncio
     async def test_owns_only_the_draining_signal(self, engine: Engine) -> None:
-        membership = SingleProcessWebInstanceMembership()
+        draining = threading.Event()
+        membership = SingleProcessWebInstanceMembership(instance_draining=draining)
+        assert membership.draining is draining
         await membership.start()
         assert not membership.draining.is_set()
         assert await membership.begin_drain() is MembershipShutdownOutcome.NO_MEMBERSHIP
@@ -424,20 +456,20 @@ class TestSingleProcessMembership:
 
 
 class TestRegisteredMembership:
-    def test_requires_the_owned_authority_and_identity_types(self, engine: Engine) -> None:
+    def test_requires_the_owned_authority_and_identity_types(self, engine: Engine, membership_factory) -> None:
         authority = RepositoryWebInstanceMembershipAuthority(engine)
         with pytest.raises(TypeError):
-            RegisteredWebInstanceMembership(object(), _identity(), lease_seconds=30)  # type: ignore[arg-type]
+            membership_factory(object(), _identity(), lease_seconds=30)
         with pytest.raises(TypeError):
-            RegisteredWebInstanceMembership(authority, object(), lease_seconds=30)  # type: ignore[arg-type]
+            membership_factory(authority, object(), lease_seconds=30)
         with pytest.raises(ValueError, match="interval_seconds"):
-            RegisteredWebInstanceMembership(authority, _identity(), lease_seconds=30, interval_seconds=31)
+            membership_factory(authority, _identity(), lease_seconds=30, interval_seconds=31)
 
     @pytest.mark.asyncio
-    async def test_start_registers_and_the_heartbeat_renews_the_lease(self, engine: Engine) -> None:
+    async def test_start_registers_and_the_heartbeat_renews_the_lease(self, engine: Engine, membership_factory) -> None:
         authority = RepositoryWebInstanceMembershipAuthority(engine)
         identity = _identity()
-        membership = RegisteredWebInstanceMembership(authority, identity, lease_seconds=30, interval_seconds=1)
+        membership = membership_factory(authority, identity, lease_seconds=30, interval_seconds=1)
 
         await membership.start()
         try:
@@ -455,25 +487,27 @@ class TestRegisteredMembership:
             assert row.lease_expires_at - row.last_heartbeat_at == timedelta(seconds=30)
             assert not membership.draining.is_set()
         finally:
+            assert await membership.begin_drain() is MembershipShutdownOutcome.RECORDED
+            assert membership.draining.is_set()
             await membership.stop()
         assert _row(engine, identity.instance_id).state == "stopped"
 
     @pytest.mark.asyncio
-    async def test_start_twice_is_refused_and_registration_failure_fails_start(self, engine: Engine) -> None:
+    async def test_start_twice_is_refused_and_registration_failure_fails_start(self, engine: Engine, membership_factory) -> None:
         authority = RepositoryWebInstanceMembershipAuthority(engine)
         identity = _identity()
         authority.register(identity, lease_seconds=300)
-        membership = RegisteredWebInstanceMembership(authority, identity, lease_seconds=30, interval_seconds=1)
+        membership = membership_factory(authority, identity, lease_seconds=30, interval_seconds=1)
 
         with pytest.raises(WebInstanceRegistrationConflict):
             await membership.start()
         assert membership._heartbeat_task is None
 
     @pytest.mark.asyncio
-    async def test_drain_sets_the_signal_before_the_row_and_stop_records_stopped(self, engine: Engine) -> None:
+    async def test_drain_sets_the_signal_before_the_row_and_stop_records_stopped(self, engine: Engine, membership_factory) -> None:
         authority = RepositoryWebInstanceMembershipAuthority(engine)
         identity = _identity()
-        membership = RegisteredWebInstanceMembership(authority, identity, lease_seconds=30, interval_seconds=1)
+        membership = membership_factory(authority, identity, lease_seconds=30, interval_seconds=1)
         await membership.start()
 
         assert await membership.begin_drain() is MembershipShutdownOutcome.RECORDED
@@ -487,10 +521,10 @@ class TestRegisteredMembership:
         assert membership._heartbeat_task is None
 
     @pytest.mark.asyncio
-    async def test_drain_and_stop_survive_a_lost_row(self, engine: Engine) -> None:
+    async def test_drain_and_stop_survive_a_lost_row(self, engine: Engine, membership_factory) -> None:
         authority = RepositoryWebInstanceMembershipAuthority(engine)
         identity = _identity()
-        membership = RegisteredWebInstanceMembership(authority, identity, lease_seconds=30, interval_seconds=1)
+        membership = membership_factory(authority, identity, lease_seconds=30, interval_seconds=1)
         await membership.start()
         with engine.begin() as conn:
             conn.execute(web_instances_table.delete().where(web_instances_table.c.instance_id == identity.instance_id))
@@ -503,7 +537,7 @@ class TestRegisteredMembership:
 
     @pytest.mark.asyncio
     async def test_bounded_transient_heartbeat_failures_request_process_recovery(
-        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, membership_factory
     ) -> None:
         authority = RepositoryWebInstanceMembershipAuthority(engine)
         identity = _identity()
@@ -518,9 +552,16 @@ class TestRegisteredMembership:
 
         monkeypatch.setattr(lifecycle_module, "run_sync_in_worker", contended_worker)
         monkeypatch.setattr(lifecycle_module, "_HEARTBEAT_MAX_CONSECUTIVE_FAILURES", 3)
-        membership = RegisteredWebInstanceMembership(authority, identity, lease_seconds=30, interval_seconds=1)
+        membership = membership_factory(authority, identity, lease_seconds=30, interval_seconds=1)
         recovery_requested = asyncio.Event()
-        monkeypatch.setattr("elspeth.web.process_recovery.os.kill", lambda _pid, _signal: recovery_requested.set())
+        watchdog = membership._process_recovery.watchdog
+        original_signal = watchdog.request_signal
+
+        def record_recovery_signal(requested_signal):
+            original_signal(requested_signal)
+            recovery_requested.set()
+
+        monkeypatch.setattr(watchdog, "request_signal", record_recovery_signal)
         await membership.start()
         await asyncio.wait_for(recovery_requested.wait(), timeout=20)
         assert calls == 3
@@ -529,13 +570,22 @@ class TestRegisteredMembership:
             await membership.stop()
 
     @pytest.mark.asyncio
-    async def test_a_non_transient_heartbeat_failure_escalates_at_once(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_a_non_transient_heartbeat_failure_escalates_at_once(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, membership_factory
+    ) -> None:
         authority = RepositoryWebInstanceMembershipAuthority(engine)
         identity = _identity()
-        membership = RegisteredWebInstanceMembership(authority, identity, lease_seconds=30, interval_seconds=1)
+        membership = membership_factory(authority, identity, lease_seconds=30, interval_seconds=1)
 
         recovery_requested = asyncio.Event()
-        monkeypatch.setattr("elspeth.web.process_recovery.os.kill", lambda _pid, _signal: recovery_requested.set())
+        watchdog = membership._process_recovery.watchdog
+        original_signal = watchdog.request_signal
+
+        def record_recovery_signal(requested_signal):
+            original_signal(requested_signal)
+            recovery_requested.set()
+
+        monkeypatch.setattr(watchdog, "request_signal", record_recovery_signal)
         await membership.start()
         with engine.begin() as conn:
             conn.execute(web_instances_table.delete().where(web_instances_table.c.instance_id == identity.instance_id))

@@ -112,7 +112,16 @@ from elspeth.web.composer.provider_discovery_response import (
     schema_projection_failure,
 )
 from elspeth.web.composer.provider_errors import classify_provider_failure
-from elspeth.web.composer.provider_quota import provider_attempt_needs_terminal_audit, quota_provider_calls
+from elspeth.web.composer.provider_gateway import _litellm_acompletion
+from elspeth.web.composer.provider_quota import (
+    ProviderCallCustody,
+    ProviderInvocationFamily,
+    ProviderInvocationOwner,
+    provider_attempt_needs_terminal_audit,
+    provider_call_scope,
+    quota_provider_calls,
+    required_provider_audit_scope,
+)
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.response_contracts import AdmittedResponse
@@ -158,7 +167,7 @@ from elspeth.web.credential_guard import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
-from elspeth.web.sessions.protocol import SessionOperationAuthority
+from elspeth.web.sessions.protocol import SessionOperationAuthority, SessionServiceProtocol
 
 _PLANNER_DISCOVERY_TOOL_NAME_SET: Final[frozenset[str]] = frozenset(PLANNER_DISCOVERY_TOOL_NAMES)
 _TERMINAL_TOOL_NAME: Final[str] = PLANNER_TERMINAL_TOOL_NAME
@@ -3041,6 +3050,16 @@ async def _build_valid_pipeline_plan(
     )
 
 
+def _new_planner_custody(provider_owner: ProviderInvocationOwner) -> ProviderCallCustody:
+    if type(provider_owner) is not ProviderInvocationOwner:
+        raise AuditIntegrityError("Planner invocation needs exact explicit provider ownership")
+    return provider_owner.mint(ProviderInvocationFamily.PLANNER)
+
+
+async def _complete_planner_provider(*, provider_custody: ProviderCallCustody, request: Mapping[str, Any]) -> Any:
+    return await _litellm_acompletion(provider_custody=provider_custody, **dict(request))
+
+
 async def plan_pipeline(
     *,
     intent: str,
@@ -3061,8 +3080,16 @@ async def plan_pipeline(
     lifecycle: PlannerRequestLifecycle,
     recorder: BufferingRecorder,
     candidate_finalizer: PipelineCandidateFinalizer,
+    provider_service: SessionServiceProtocol | None = None,
+    provider_owner: ProviderInvocationOwner | None = None,
 ) -> PipelinePlanResult:
     """Plan and validate one proposal without publishing state or DB rows."""
+    if (provider_service is None) != (provider_owner is None):
+        raise AuditIntegrityError("Planner provider authority must be an explicit paired owner and service")
+    if provider_owner is not None:
+        if type(provider_owner) is not ProviderInvocationOwner or provider_owner.service is not provider_service:
+            raise AuditIntegrityError("Planner provider owner belongs to another service")
+        provider_owner.required_work.validate_context(custody_config.session_operation_context)
     if type(intent) is not str or not intent.strip():
         raise ValueError("intent must be a non-empty exact string")
     if type(rendered_skill) is not str or not rendered_skill.strip():
@@ -3116,6 +3143,8 @@ async def plan_pipeline(
                 lifecycle=lifecycle,
                 recorder=recorder,
                 candidate_finalizer=candidate_finalizer,
+                provider_service=provider_service,
+                provider_owner=provider_owner,
             )
         outcome = "complete"
         trail.log_summary("accepted")
@@ -3181,6 +3210,8 @@ async def _plan_pipeline_inner(
     lifecycle: PlannerRequestLifecycle,
     recorder: BufferingRecorder,
     candidate_finalizer: PipelineCandidateFinalizer,
+    provider_service: SessionServiceProtocol | None = None,
+    provider_owner: ProviderInvocationOwner | None = None,
 ) -> PipelinePlanResult:
     skill_hash = hashlib.sha256(rendered_skill.encode("utf-8")).hexdigest()
     deadline = _planner_deadline_time() + model_config.timeout_seconds
@@ -3329,8 +3360,7 @@ async def _plan_pipeline_inner(
         selected_schema_contracts.append(contract_payload)
         return contract_payload
 
-    @quota_provider_calls
-    async def call_model(
+    async def call_model_body(
         *,
         model_override: str | None = None,
         tools_override: list[dict[str, Any]] | None = None,
@@ -3338,6 +3368,7 @@ async def _plan_pipeline_inner(
         text_reply_marker: str | None = None,
         reasoning_effort: str | None = None,
         attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
+        provider_custody: ProviderCallCustody | None = None,
     ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
         nonlocal total_calls, total_cost
         effective_model = model_override or model_config.model_identifier
@@ -3412,9 +3443,10 @@ async def _plan_pipeline_inner(
                 planner_policy_hash=budget_policy.audit_hash,
                 planner_call_ordinal=ordinal,
                 credential_surface="composer_planner_response",
+                provider_custody=provider_custody,
             )
             _assert_planner_call_matches_manifest(failed_call, manifest, recorder)
-            recorder.record_llm_call(failed_call)
+            recorder.record_llm_call(failed_call, provider_custody=provider_custody)
 
         def begin_response_attempt(
             call_to_bind: ComposerLLMCall,
@@ -3472,64 +3504,80 @@ async def _plan_pipeline_inner(
             )
 
             try:
-                response = await asyncio.wait_for(model_config.completion(**kwargs), timeout=remaining)
-            except asyncio.CancelledError as exc:
-                if not provider_attempt_needs_terminal_audit():
-                    raise
-                cancelled_call = build_llm_call_record(
-                    model_requested=effective_model,
-                    pricing_model=effective_pricing_model,
-                    messages=marked_messages,
-                    tools=marked_tools,
-                    status=ComposerLLMCallStatus.CANCELLED,
-                    started_at=started_at,
-                    started_ns=started_ns,
-                    temperature=model_config.temperature,
-                    seed=model_config.seed,
-                    error_class=type(exc).__name__,
-                    error_message=type(exc).__name__,
-                    max_completion_tokens_requested=budget_policy.max_completion_tokens,
-                    planner_policy_hash=budget_policy.audit_hash,
-                    planner_call_ordinal=ordinal,
-                    credential_surface="composer_planner_response",
+                response = await asyncio.wait_for(
+                    _complete_planner_provider(provider_custody=provider_custody, request=kwargs)
+                    if provider_custody is not None
+                    else model_config.completion(**kwargs),
+                    timeout=remaining,
                 )
-                _assert_planner_call_matches_manifest(cancelled_call, manifest, recorder)
-                recorder.record_llm_call(cancelled_call)
+            except asyncio.CancelledError as exc:
+                if not (
+                    provider_custody.needs_terminal_audit() if provider_custody is not None else provider_attempt_needs_terminal_audit()
+                ):
+                    raise
+                with required_provider_audit_scope(provider_custody):
+                    cancelled_call = build_llm_call_record(
+                        model_requested=effective_model,
+                        pricing_model=effective_pricing_model,
+                        messages=marked_messages,
+                        tools=marked_tools,
+                        status=ComposerLLMCallStatus.CANCELLED,
+                        started_at=started_at,
+                        started_ns=started_ns,
+                        temperature=model_config.temperature,
+                        seed=model_config.seed,
+                        error_class=type(exc).__name__,
+                        error_message=type(exc).__name__,
+                        max_completion_tokens_requested=budget_policy.max_completion_tokens,
+                        planner_policy_hash=budget_policy.audit_hash,
+                        planner_call_ordinal=ordinal,
+                        credential_surface="composer_planner_response",
+                        provider_custody=provider_custody,
+                    )
+                    _assert_planner_call_matches_manifest(cancelled_call, manifest, recorder)
+                    recorder.record_llm_call(cancelled_call, provider_custody=provider_custody)
                 raise
             except TimeoutError as exc:
-                if not provider_attempt_needs_terminal_audit():
+                if not (
+                    provider_custody.needs_terminal_audit() if provider_custody is not None else provider_attempt_needs_terminal_audit()
+                ):
                     raise
-                timed_out_call = build_llm_call_record(
-                    model_requested=effective_model,
-                    pricing_model=effective_pricing_model,
-                    messages=marked_messages,
-                    tools=marked_tools,
-                    status=ComposerLLMCallStatus.TIMEOUT,
-                    started_at=started_at,
-                    started_ns=started_ns,
-                    temperature=model_config.temperature,
-                    seed=model_config.seed,
-                    error_class=type(exc).__name__,
-                    error_message=type(exc).__name__,
-                    max_completion_tokens_requested=budget_policy.max_completion_tokens,
-                    planner_policy_hash=budget_policy.audit_hash,
-                    planner_call_ordinal=ordinal,
-                    credential_surface="composer_planner_response",
-                )
-                _assert_planner_call_matches_manifest(timed_out_call, manifest, recorder)
-                recorder.record_llm_call(timed_out_call)
+                with required_provider_audit_scope(provider_custody):
+                    timed_out_call = build_llm_call_record(
+                        model_requested=effective_model,
+                        pricing_model=effective_pricing_model,
+                        messages=marked_messages,
+                        tools=marked_tools,
+                        status=ComposerLLMCallStatus.TIMEOUT,
+                        started_at=started_at,
+                        started_ns=started_ns,
+                        temperature=model_config.temperature,
+                        seed=model_config.seed,
+                        error_class=type(exc).__name__,
+                        error_message=type(exc).__name__,
+                        max_completion_tokens_requested=budget_policy.max_completion_tokens,
+                        planner_policy_hash=budget_policy.audit_hash,
+                        planner_call_ordinal=ordinal,
+                        credential_surface="composer_planner_response",
+                        provider_custody=provider_custody,
+                    )
+                    _assert_planner_call_matches_manifest(timed_out_call, manifest, recorder)
+                    recorder.record_llm_call(timed_out_call, provider_custody=provider_custody)
                 raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT") from exc
             except Exception as exc:
-                if not provider_attempt_needs_terminal_audit():
+                if not (
+                    provider_custody.needs_terminal_audit() if provider_custody is not None else provider_attempt_needs_terminal_audit()
+                ):
                     raise
                 provider_failure = classify_provider_failure(exc)
-                record_provider_failure(
-                    exc,
-                    provider_failure.audit_status if provider_failure is not None else ComposerLLMCallStatus.API_ERROR,
-                    started_at=started_at,
-                    started_ns=started_ns,
-                    ordinal=ordinal,
-                )
+                with required_provider_audit_scope(provider_custody):
+                    record_provider_failure(
+                        exc,
+                        provider_failure.audit_status if provider_failure is not None else ComposerLLMCallStatus.API_ERROR,
+                        started_at=started_at,
+                        started_ns=started_ns,
+                        ordinal=ordinal,
+                    )
                 if provider_failure is None:
                     # An admitted dispatch still needs terminal evidence, but
                     # a first-party fault must retain its original type.
@@ -3562,27 +3610,30 @@ async def _plan_pipeline_inner(
                     planner_policy_hash=budget_policy.audit_hash,
                     planner_call_ordinal=ordinal,
                     credential_surface="composer_planner_response",
+                    provider_custody=provider_custody,
                 )
             except CredentialMaterialRefused as exc:
-                refused_call = build_llm_call_record(
-                    model_requested=effective_model,
-                    pricing_model=effective_pricing_model,
-                    messages=marked_messages,
-                    tools=marked_tools,
-                    status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
-                    started_at=started_at,
-                    started_ns=started_ns,
-                    temperature=model_config.temperature,
-                    seed=model_config.seed,
-                    error_class=type(exc).__name__,
-                    error_message="credential_material_rejected",
-                    max_completion_tokens_requested=budget_policy.max_completion_tokens,
-                    planner_policy_hash=budget_policy.audit_hash,
-                    planner_call_ordinal=ordinal,
-                    credential_surface="composer_planner_response",
-                )
-                _assert_planner_call_matches_manifest(refused_call, manifest, recorder)
-                recorder.record_llm_call(refused_call)
+                with required_provider_audit_scope(provider_custody):
+                    refused_call = build_llm_call_record(
+                        model_requested=effective_model,
+                        pricing_model=effective_pricing_model,
+                        messages=marked_messages,
+                        tools=marked_tools,
+                        status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
+                        started_at=started_at,
+                        started_ns=started_ns,
+                        temperature=model_config.temperature,
+                        seed=model_config.seed,
+                        error_class=type(exc).__name__,
+                        error_message="credential_material_rejected",
+                        max_completion_tokens_requested=budget_policy.max_completion_tokens,
+                        planner_policy_hash=budget_policy.audit_hash,
+                        planner_call_ordinal=ordinal,
+                        credential_surface="composer_planner_response",
+                        provider_custody=provider_custody,
+                    )
+                    _assert_planner_call_matches_manifest(refused_call, manifest, recorder)
+                    recorder.record_llm_call(refused_call, provider_custody=provider_custody)
                 begin_response_attempt(refused_call)
                 raise
             try:
@@ -3593,7 +3644,7 @@ async def _plan_pipeline_inner(
             # Cost enforcement is intentionally post-call and pre-parse.  Do
             # not inspect provider content or dispatch tools before it passes.
             if call.provider_cost is None:
-                recorder.record_llm_call(call)
+                recorder.record_llm_call(call, provider_custody=provider_custody)
                 begin_response_attempt(call)
                 raise PipelinePlannerError("planner provider cost metadata is missing or malformed", code="COST_UNAVAILABLE")
             if call.completion_tokens is None:
@@ -3607,12 +3658,13 @@ async def _plan_pipeline_inner(
                         status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
                         error_class=type(malformed_usage).__name__,
                         error_message=malformed_usage.code,
-                    )
+                    ),
+                    provider_custody=provider_custody,
                 )
                 begin_response_attempt(call)
                 raise malformed_usage
             if call.completion_tokens > budget_policy.max_completion_tokens:
-                recorder.record_llm_call(call)
+                recorder.record_llm_call(call, provider_custody=provider_custody)
                 begin_response_attempt(call)
                 raise PipelinePlannerError(
                     "planner provider reported a completion token limit overage",
@@ -3620,7 +3672,7 @@ async def _plan_pipeline_inner(
                 )
             total_cost += Decimal(str(call.provider_cost))
             if total_cost > budget_policy.max_cumulative_provider_cost:
-                recorder.record_llm_call(call)
+                recorder.record_llm_call(call, provider_custody=provider_custody)
                 begin_response_attempt(call)
                 raise PipelinePlannerError("planner provider cost continuation cap exceeded", code="COST_CAP_EXCEEDED")
             try:
@@ -3642,7 +3694,7 @@ async def _plan_pipeline_inner(
                     error_class=type(exc).__name__,
                     error_message="credential_material_rejected",
                 )
-                recorder.record_llm_call(refused_call)
+                recorder.record_llm_call(refused_call, provider_custody=provider_custody)
                 begin_response_attempt(refused_call)
                 raise
             except PipelinePlannerError as exc:
@@ -3650,7 +3702,7 @@ async def _plan_pipeline_inner(
                     # The provider call completed and is audited like the
                     # other post-call budget refusals above; the semantic
                     # attempt settles as budget_exhausted when it propagates.
-                    recorder.record_llm_call(call)
+                    recorder.record_llm_call(call, provider_custody=provider_custody)
                     begin_response_attempt(call)
                     raise
                 if exc.code not in ("MALFORMED_RESPONSE", "PROSE_REPLY"):
@@ -3670,7 +3722,8 @@ async def _plan_pipeline_inner(
                         status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
                         error_class=type(exc).__name__,
                         error_message="RESPONSE_TRUNCATED" if truncated else exc.code,
-                    )
+                    ),
+                    provider_custody=provider_custody,
                 )
                 begin_response_attempt(call)
                 if exc.code == "PROSE_REPLY":
@@ -3684,11 +3737,61 @@ async def _plan_pipeline_inner(
                         code="RESPONSE_TRUNCATED",
                     ) from exc
                 raise
-            recorder.record_llm_call(call)
+            recorder.record_llm_call(call, provider_custody=provider_custody)
             message, calls = parsed_response
             begin_response_attempt(call, calls)
             return message, calls, call
         raise AssertionError("provider attempt loop exited without return or exception")
+
+    @quota_provider_calls
+    async def call_model_legacy(
+        *,
+        model_override: str | None = None,
+        tools_override: list[dict[str, Any]] | None = None,
+        allow_text_reply: bool = False,
+        text_reply_marker: str | None = None,
+        reasoning_effort: str | None = None,
+        attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
+    ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
+        return await call_model_body(
+            model_override=model_override,
+            tools_override=tools_override,
+            allow_text_reply=allow_text_reply,
+            text_reply_marker=text_reply_marker,
+            reasoning_effort=reasoning_effort,
+            attempt_phase_hint=attempt_phase_hint,
+        )
+
+    async def call_model(
+        *,
+        model_override: str | None = None,
+        tools_override: list[dict[str, Any]] | None = None,
+        allow_text_reply: bool = False,
+        text_reply_marker: str | None = None,
+        reasoning_effort: str | None = None,
+        attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
+    ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
+        if provider_owner is None:
+            return await call_model_legacy(
+                model_override=model_override,
+                tools_override=tools_override,
+                allow_text_reply=allow_text_reply,
+                text_reply_marker=text_reply_marker,
+                reasoning_effort=reasoning_effort,
+                attempt_phase_hint=attempt_phase_hint,
+            )
+        provider_custody = _new_planner_custody(provider_owner)
+        async with provider_call_scope(provider_custody):
+            with required_provider_audit_scope(provider_custody):
+                return await call_model_body(
+                    model_override=model_override,
+                    tools_override=tools_override,
+                    allow_text_reply=allow_text_reply,
+                    text_reply_marker=text_reply_marker,
+                    reasoning_effort=reasoning_effort,
+                    attempt_phase_hint=attempt_phase_hint,
+                    provider_custody=provider_custody,
+                )
 
     # ── Escape-hatch state ────────────────────────────────────────────────
     # On budget exhaustion, instead of failing immediately, one overtime turn

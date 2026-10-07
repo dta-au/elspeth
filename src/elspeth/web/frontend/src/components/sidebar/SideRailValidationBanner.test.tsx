@@ -25,6 +25,7 @@ const BLOCKED_READINESS = {
 describe("SideRailValidationBanner", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     useExecutionStore.getState().reset();
   });
 
@@ -298,7 +299,7 @@ describe("SideRailValidationBanner", () => {
         isComposing: false,
         // Post-boot: the backend wall clock has landed, so the readiness gate
         // is open and Apply reflects only the composing state.
-        composeTimeoutReady: true,
+        compositionStateLoaded: true,
       } as never);
 
       const { unmount } = render(<SideRailValidationBanner />);
@@ -317,7 +318,7 @@ describe("SideRailValidationBanner", () => {
           validation_suggestions: [SUGGESTION],
         }),
         isComposing: true,
-        composeTimeoutReady: true,
+        compositionStateLoaded: true,
       } as never);
 
       render(<SideRailValidationBanner />);
@@ -340,7 +341,7 @@ describe("SideRailValidationBanner", () => {
         }),
         sendMessage,
         isComposing: false,
-        composeTimeoutReady: true,
+        compositionStateLoaded: true,
       } as never);
 
       render(<SideRailValidationBanner />);
@@ -364,7 +365,7 @@ describe("SideRailValidationBanner", () => {
         }),
         sendMessage,
         isComposing: false,
-        composeTimeoutReady: true,
+        compositionStateLoaded: true,
       } as never);
 
       render(<SideRailValidationBanner />);
@@ -375,7 +376,8 @@ describe("SideRailValidationBanner", () => {
       expect(sendMessage).toHaveBeenCalledTimes(1);
     });
 
-    it("holds Apply closed until the compose timeout is ready (bootstrap race)", async () => {
+    it("holds Apply closed until authoritative session state loads", async () => {
+      useSessionStore.setState({ compositionStateLoaded: false });
       // composeTimeoutReady defaults false via resetStore — the boot window.
       // The side-rail Apply is a programmatic freeform sender; it must not
       // start a compose against the stale default ceiling any more than the
@@ -397,7 +399,8 @@ describe("SideRailValidationBanner", () => {
       expect(sendMessage).not.toHaveBeenCalled();
     });
 
-    it("surfaces a visible, announced connecting reason while the compose timeout is not ready (a11y)", () => {
+    it("announces the session-loading reason while Apply is unavailable", () => {
+      useSessionStore.setState({ compositionStateLoaded: false });
       // The disabled reason must be perceivable to assistive tech, not conveyed
       // by the button's title attribute alone (which SRs do not reliably read).
       useSessionStore.setState({
@@ -409,7 +412,7 @@ describe("SideRailValidationBanner", () => {
       } as never);
 
       render(<SideRailValidationBanner />);
-      const reason = screen.getByText(/connecting to the composer/i);
+      const reason = screen.getByText(/loading this session/i);
       expect(reason).toHaveAttribute("role", "status");
     });
 
@@ -420,28 +423,28 @@ describe("SideRailValidationBanner", () => {
         }),
         sendMessage: vi.fn(),
         isComposing: false,
-        composeTimeoutReady: true,
+        compositionStateLoaded: true,
       } as never);
 
       render(<SideRailValidationBanner />);
-      expect(screen.queryByText(/connecting to the composer/i)).toBeNull();
+      expect(screen.queryByText(/loading this session/i)).toBeNull();
     });
 
-    it("shows the stuck 'unavailable' reason (assertive) instead of 'Connecting…' when the backend reported no compose timeout", () => {
+    it("keeps loading status independent of informational timeout availability", () => {
       useSessionStore.setState({
         compositionState: makeComposition(1, {
           validation_suggestions: [SUGGESTION],
         }),
         sendMessage: vi.fn(),
         isComposing: false,
-        composeTimeoutReady: false,
+        compositionStateLoaded: false,
         composerTimeoutUnavailable: true,
       } as never);
 
       render(<SideRailValidationBanner />);
-      const reason = screen.getByText(/server did not report a compose timeout/i);
-      expect(reason).toHaveAttribute("role", "alert");
-      expect(screen.queryByText(/connecting to the composer/i)).toBeNull();
+      const reason = screen.getByText(/loading this session/i);
+      expect(reason).toHaveAttribute("role", "status");
+      expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
     });
 
     it("collapses by default when more than 2 suggestions are present, expands on header click", async () => {

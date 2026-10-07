@@ -12,6 +12,7 @@ clean ``stop`` makes takeover immediate.
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
@@ -22,7 +23,12 @@ import structlog
 from sqlalchemy import Engine, select
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web import async_workers
+from elspeth.web.application_finalizers import ApplicationFinalizerOwner
+from elspeth.web.async_workers import run_application_finalizer_in_worker
 from elspeth.web.coordination.contracts import InstanceState, SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.membership_authority import (
     RepositoryWebInstanceMembershipAuthority,
@@ -32,6 +38,7 @@ from elspeth.web.coordination.membership_authority import (
 from elspeth.web.coordination.membership_lifecycle import RegisteredWebInstanceMembership
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
+from elspeth.web.process_recovery import ProcessRecovery
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import session_operation_fences_table, web_instances_table
 from elspeth.web.sessions.protocol import CompositionStateData, RunRecord
@@ -258,35 +265,56 @@ async def test_partitioned_owner_is_taken_over_only_after_both_leases_expire(dep
 
 
 @pytest.mark.asyncio
-async def test_heartbeating_owner_is_unstealable_until_it_stops(deployment) -> None:
+async def test_heartbeating_owner_is_unstealable_until_it_stops(deployment, monkeypatch: pytest.MonkeyPatch) -> None:
     first_engine, _second_engine, first, second = deployment
     owner_id = first.session_operation_owner_instance_id
-    membership = RegisteredWebInstanceMembership(
-        RepositoryWebInstanceMembershipAuthority(first_engine),
-        _identity(owner_id),
-        lease_seconds=_SHORT_LEASE_SECONDS,
-        interval_seconds=1,
-    )
-    await membership.start()
-    try:
-        run, _context = await _create_running_run(first, first_engine)
+    with monkeypatch.context() as owned_process:
+        draining = threading.Event()
+        watchdog = OwnedTestProcessWatchdog(draining)
+        recovery = ProcessRecovery(watchdog=watchdog, instance_draining=draining)
+        owner = ApplicationFinalizerOwner()
+        membership = RegisteredWebInstanceMembership(
+            RepositoryWebInstanceMembershipAuthority(first_engine),
+            _identity(owner_id),
+            lease_seconds=_SHORT_LEASE_SECONDS,
+            interval_seconds=1,
+            process_recovery=recovery,
+            instance_draining=draining,
+            finalizer_owner=owner,
+        )
+        with pytest.raises(AuditIntegrityError, match="Application finalizer unavailable"):
+            owner.claim(membership._drain_capability)
+        with pytest.raises(AuditIntegrityError, match="Foreign application finalizer owner"):
+            ApplicationFinalizerOwner().claim(membership._drain_capability)
+        owner.seal()
+        owned_process.setattr(async_workers, "_APPLICATION_FINALIZER_OWNER", owner)
+        owned_process.setattr(async_workers, "_INSTANCE_DRAINING", draining)
+        assert async_workers._INSTANCE_DRAINING is membership.draining is recovery.instance_draining
+        with pytest.raises(AuditIntegrityError, match="lifecycle not draining"):
+            await run_application_finalizer_in_worker(membership._drain_capability)
+        assert not membership._drain_capability.claimed
+        await membership.start()
+        try:
+            run, _context = await _create_running_run(first, first_engine)
 
-        # The fence lease lapses (the owner is busy, not dead); the membership
-        # lease is renewed every second, so the survivor must keep refusing.
-        await asyncio.sleep(_PAST_BOTH_LEASES_SECONDS)
-        assert await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered") == []
-        with pytest.raises(SessionOperationConflictError):
-            await asyncio.to_thread(_acquire_as, second, run.session_id)
-        assert (await second.get_run(run.id)).status == "running"
-        row, now = _membership_row(first_engine, owner_id)
-        assert row.state == InstanceState.ACTIVE.value
-        assert row.lease_expires_at > now
+            # The fence lease lapses (the owner is busy, not dead); the membership
+            # lease is renewed every second, so the survivor must keep refusing.
+            await asyncio.sleep(_PAST_BOTH_LEASES_SECONDS)
+            assert await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered") == []
+            with pytest.raises(SessionOperationConflictError):
+                await asyncio.to_thread(_acquire_as, second, run.session_id)
+            assert (await second.get_run(run.id)).status == "running"
+            row, now = _membership_row(first_engine, owner_id)
+            assert row.state == InstanceState.ACTIVE.value
+            assert row.lease_expires_at > now
 
-        await membership.begin_drain()
-        assert membership.draining.is_set()
-        assert _membership_row(first_engine, owner_id)[0].state == InstanceState.DRAINING.value
-    finally:
-        await membership.stop()
+            await membership.begin_drain()
+            assert membership.draining.is_set()
+            assert _membership_row(first_engine, owner_id)[0].state == InstanceState.DRAINING.value
+        finally:
+            if not membership.draining.is_set():
+                await membership.begin_drain()
+            await membership.stop()
 
     # A clean stop expires the lease at once: no waiting out the lease.
     row, now = _membership_row(first_engine, owner_id)

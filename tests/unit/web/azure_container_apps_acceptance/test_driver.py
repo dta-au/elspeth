@@ -328,7 +328,8 @@ def test_complete_driver_orders_jobs_probes_receipts_and_cleanup(driver: DriverR
     assert p2[p2.index("--trials") + 1] == "20"
     p1_requests = json.loads((driver.evidence / "p1-trial-requests.json").read_text())
     assert len(p1_requests) == len({trial["session_id"] for trial in p1_requests}) == 20
-    assert len({trial["body"]["client_request_id"] for trial in p1_requests}) == 20
+    assert len({trial["body"]["operation_id"] for trial in p1_requests}) == 20
+    assert all(trial["body"]["state_id"] is None for trial in p1_requests)
     assert all(trial["body"]["content"] == "Inspect the acceptance fixture" for trial in p1_requests)
     single_requests = json.loads((driver.evidence / "single-p1-trial-requests.json").read_text())
     single_sessions = {trial["session_id"] for trial in single_requests}

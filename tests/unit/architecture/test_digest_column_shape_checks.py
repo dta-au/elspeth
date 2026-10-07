@@ -110,6 +110,7 @@ _INVENTORY: dict[tuple[str, str], dict[str, str]] = {
         "permit_subject_hash": "hex64",
         "admission_decision_hash": "hex64",
     },
+    ("sessions", "composer_async_operations"): {"request_hash": "hex64", "result_sha256": "hex64"},
     ("sessions", "session_operation_receipt_events"): {"request_hash": "hex64", "terminal_hash": "hex64"},
     ("sessions", "session_operation_receipts"): {"request_hash": "hex64", "response_hash": "hex64"},
     ("sessions", "skill_markdown_history"): {"hash": "hex64"},

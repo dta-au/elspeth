@@ -1,3 +1,5 @@
+import { authenticateComposerCustody, composerCustodyScope, purgeComposerCustody, samePrincipal } from "./composerOperationCustody";
+import { detachComposerObservers } from "@/api/composerOperationObserver";
 import { create } from "zustand";
 import type { UserProfile, ApiError } from "../types/index";
 import * as api from "../api/client";
@@ -49,8 +51,24 @@ export const useAuthStore = create<AuthState>((set) => ({
 
       const user = await api.fetchCurrentUser({ logoutOnUnauthorized: false });
       if (!isCurrentAuthGeneration(generation)) return false;
+      const config = await api.fetchAuthConfig();
+      if (!isCurrentAuthGeneration(generation)) return false;
+      const nextScope = { principalId: user.user_id, authProvider: config.provider };
+      const previousScope = composerCustodyScope();
+      if (previousScope !== null && !samePrincipal(previousScope, nextScope)) {
+        detachComposerObservers();
+        const { useSessionStore } = await import("./sessionStore");
+        useSessionStore.getState().reset();
+      }
+      authenticateComposerCustody(nextScope);
+      if (!isCurrentAuthGeneration(generation)) return false;
       usePluginCatalogStore.getState().clear();
       set({ user, isLoading: false });
+      const { useSessionStore } = await import("./sessionStore");
+      if (!isCurrentAuthGeneration(generation)) return false;
+      const activeSessionId = useSessionStore.getState().activeSessionId;
+      if (activeSessionId !== null) void useSessionStore.getState().resumeComposerOperation(activeSessionId);
+      void useSessionStore.getState().reconcileInactiveComposerCustody();
       return true;
     } catch (err) {
       if (!isCurrentAuthGeneration(generation)) return false;
@@ -76,7 +94,23 @@ export const useAuthStore = create<AuthState>((set) => ({
     try {
       const user = await api.fetchCurrentUser({ logoutOnUnauthorized: false });
       if (!isCurrentAuthGeneration(generation)) return;
+      const config = await api.fetchAuthConfig();
+      if (!isCurrentAuthGeneration(generation)) return;
+      const nextScope = { principalId: user.user_id, authProvider: config.provider };
+      const previousScope = composerCustodyScope();
+      if (previousScope !== null && !samePrincipal(previousScope, nextScope)) {
+        detachComposerObservers();
+        const { useSessionStore } = await import("./sessionStore");
+        useSessionStore.getState().reset();
+      }
+      authenticateComposerCustody(nextScope);
+      if (!isCurrentAuthGeneration(generation)) return;
       set({ user, isLoading: false });
+      const { useSessionStore } = await import("./sessionStore");
+      if (!isCurrentAuthGeneration(generation)) return;
+      const activeSessionId = useSessionStore.getState().activeSessionId;
+      if (activeSessionId !== null) void useSessionStore.getState().resumeComposerOperation(activeSessionId);
+      void useSessionStore.getState().reconcileInactiveComposerCustody();
     } catch {
       if (!isCurrentAuthGeneration(generation)) return;
       set({
@@ -91,6 +125,8 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   async logout() {
     advanceAuthGeneration();
+    detachComposerObservers();
+    purgeComposerCustody();
     // New logins await this barrier before publishing their credentials. The
     // old principal's caches must be cleared, not abandoned on replacement.
     const cleanup = pendingLogoutCleanup ?? Promise.all([
@@ -140,7 +176,23 @@ export const useAuthStore = create<AuthState>((set) => ({
     try {
       const user = await api.fetchCurrentUser({ logoutOnUnauthorized: false });
       if (!isCurrentAuthGeneration(generation)) return;
+      const config = await api.fetchAuthConfig();
+      if (!isCurrentAuthGeneration(generation)) return;
+      const nextScope = { principalId: user.user_id, authProvider: config.provider };
+      const previousScope = composerCustodyScope();
+      if (previousScope !== null && !samePrincipal(previousScope, nextScope)) {
+        detachComposerObservers();
+        const { useSessionStore } = await import("./sessionStore");
+        useSessionStore.getState().reset();
+      }
+      authenticateComposerCustody(nextScope);
+      if (!isCurrentAuthGeneration(generation)) return;
       set({ user, isLoading: false });
+      const { useSessionStore } = await import("./sessionStore");
+      if (!isCurrentAuthGeneration(generation)) return;
+      const activeSessionId = useSessionStore.getState().activeSessionId;
+      if (activeSessionId !== null) void useSessionStore.getState().resumeComposerOperation(activeSessionId);
+      void useSessionStore.getState().reconcileInactiveComposerCustody();
     } catch {
       if (!isCurrentAuthGeneration(generation)) return;
       // Token invalid or expired -- clear it

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from dataclasses import replace as _replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Final, Literal, cast, overload
+from typing import Any, Final, Literal, cast, overload
 from uuid import UUID, uuid4
 from weakref import WeakValueDictionary
 
@@ -29,6 +29,7 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import insert
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeoutError
+from starlette.applications import Starlette
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionRefused
@@ -121,11 +122,13 @@ from elspeth.web.middleware.rate_limit import WebRateLimiter, get_rate_limiter
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_authored_composition_state
+from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkSource
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions._auto_title import maybe_auto_title_session
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.audit_story_models import RunAuditStoryResponse
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryService
+from elspeth.web.sessions.composer_operations import ComposerRequiredRecoveryFailure
 from elspeth.web.sessions.converters import state_from_record as _state_from_record
 from elspeth.web.sessions.models import composer_completion_events_table
 from elspeth.web.sessions.proposal_projection import project_composition_proposal
@@ -268,9 +271,14 @@ def _get_session_compose_lock_registry(request: Request) -> _SessionComposeLockR
     condition, and once the key is present a direct attribute read crashes if
     it is somehow the wrong type — no default papers over a contract bug.
     """
-    if "session_compose_lock_registry" not in request.app.state:
-        request.app.state.session_compose_lock_registry = _SessionComposeLockRegistry()
-    return cast(_SessionComposeLockRegistry, request.app.state.session_compose_lock_registry)
+    return composer_session_lock_registry(request.app)
+
+
+def composer_session_lock_registry(app: Starlette) -> _SessionComposeLockRegistry:
+    """Return app-owned lock custody without an HTTP request."""
+    if "session_compose_lock_registry" not in app.state:
+        app.state.session_compose_lock_registry = _SessionComposeLockRegistry()
+    return cast(_SessionComposeLockRegistry, app.state.session_compose_lock_registry)
 
 
 def _get_composer_progress_registry(request: Request) -> ComposerProgressRegistry | DatabaseComposerProgressRegistry:
@@ -628,7 +636,7 @@ def _message_response(
     return ChatMessageResponse(
         id=str(msg.id),
         session_id=str(msg.session_id),
-        client_request_id=str(msg.client_request_id) if msg.client_request_id is not None else None,
+        operation_id=str(msg.operation_id) if msg.operation_id is not None else None,
         role=msg.role,
         content=msg.content,
         raw_content=msg.raw_content if include_raw_content else None,
@@ -762,6 +770,8 @@ async def _handle_composer_provider_failure(
     progress_sink: ComposerProgressSink | None,
     session_operation_context: SessionOperationContext,
     expose_provider_error: bool,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
 ) -> HTTPException:
     """Publish one safe provider disposition for either Composer HTTP route."""
     from litellm.exceptions import BadGatewayError, ServiceUnavailableError
@@ -822,6 +832,8 @@ async def _handle_composer_provider_failure(
             llm_calls,
             composition_state_id,
             plugin_crash_pending=True,
+            required_audit=required_audit,
+            required_work=required_work,
             session_operation_context=session_operation_context,
         )
     # Gateway 502/503 text may contain an upstream response body. The staging
@@ -845,6 +857,8 @@ async def _handle_composer_chargeable_refusal(
     composition_state_id: UUID | None,
     progress_sink: ComposerProgressSink | None,
     session_operation_context: SessionOperationContext,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
 ) -> HTTPException:
     """Keep unknown token usage distinct from a failed provider dispatch."""
     llm_calls = _llm_calls_from_exception(exc)
@@ -855,6 +869,8 @@ async def _handle_composer_chargeable_refusal(
             llm_calls,
             composition_state_id,
             plugin_crash_pending=True,
+            required_audit=required_audit,
+            required_work=required_work,
             session_operation_context=session_operation_context,
         )
     if exc.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE:
@@ -1463,7 +1479,9 @@ async def _join_shielded_task_after_cancellation[T](
         return None
 
 
-async def _join_freeform_owned_task[T](task: asyncio.Task[T]) -> tuple[T, asyncio.CancelledError | None]:
+async def _join_freeform_owned_task[T](
+    task: asyncio.Task[T], *, cancellation_observations: list[asyncio.CancelledError] | None = None
+) -> tuple[T, asyncio.CancelledError | None]:
     """Join one required continuation through repeated caller cancellation.
 
     The caller retains its operation lease and compose lock while joining.
@@ -1480,6 +1498,8 @@ async def _join_freeform_owned_task[T](task: asyncio.Task[T]) -> tuple[T, asynci
         except asyncio.CancelledError as exc:
             if owner.cancelling():
                 owner.uncancel()
+                if cancellation_observations is not None and all(exc is not original for original in cancellation_observations):
+                    cancellation_observations.append(exc)
                 if first_cancellation is None:
                     first_cancellation = exc
             if task.done():
@@ -1918,6 +1938,8 @@ async def _persist_tool_invocations(
     *,
     parent_assistant_id: UUID | None = None,
     plugin_crash_pending: bool,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
     session_operation_context: SessionOperationContext,
     session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
 ) -> tuple[PipelineDispatchAuditBinding, ...]:
@@ -1983,37 +2005,71 @@ async def _persist_tool_invocations(
     """
     if not tool_invocations:
         return ()
-    role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
-    drafts: list[AuditMessageDraft] = []
-    pipeline_bindings: list[PipelineDispatchAuditBinding] = []
-    for invocation in tool_invocations:
-        content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
-        drafts.append(
-            AuditMessageDraft(
-                role=role,
-                content=content,
-                tool_calls=(envelope,),
-                tool_call_id=invocation.tool_call_id if role == "tool" else None,
-                parent_assistant_id=str(parent_assistant_id) if role == "tool" and parent_assistant_id is not None else None,
-            )
+    producer = sql = projection = None
+    if required_work is not None:
+        if required_work.authority.context != session_operation_context:
+            raise AuditIntegrityError("Required audit work belongs to another exact fence")
+        producer, sql, projection = required_work.reserve_audit_work(
+            RequiredWorkSource.DISPATCH_AUDIT_SQL,
+            RequiredWorkSource.DISPATCH_AUDIT_PROJECTION,
+            transition_ordinal=0,
+            semantic_ordinal=0,
         )
-        if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
-            pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
+    try:
+        role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
+        drafts: list[AuditMessageDraft] = []
+        pipeline_bindings: list[PipelineDispatchAuditBinding] = []
+        for invocation in tool_invocations:
+            content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            drafts.append(
+                AuditMessageDraft(
+                    role=role,
+                    content=content,
+                    tool_calls=(envelope,),
+                    tool_call_id=invocation.tool_call_id if role == "tool" else None,
+                    parent_assistant_id=str(parent_assistant_id) if role == "tool" and parent_assistant_id is not None else None,
+                )
+            )
+            if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
+                pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
+    except BaseException as error:
+        if producer is not None and sql is not None and projection is not None:
+            producer.complete_owned(error)
+            sql.complete_without_submission()
+            projection.complete_without_submission()
+        raise
+    if producer is not None:
+        producer.complete_owned()
     try:
         # One transaction for the whole invocation cohort
         # (elspeth-90231248dc): a mid-cohort failure durably persists
         # nothing, so a later drain of the same buffer can never
         # duplicate an already-committed prefix.
-        await service.add_messages_atomic(
-            session_id,
-            tuple(drafts),
-            composition_state_id=composition_state_id,
-            writer_principal="compose_loop",
-            session_operation_context=session_operation_context,
-            session_operation_kind=session_operation_kind,
-        )
+        if sql is None:
+            await service.add_messages_atomic(
+                session_id,
+                tuple(drafts),
+                composition_state_id=composition_state_id,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                session_operation_kind=session_operation_kind,
+                audit_only=plugin_crash_pending,
+            )
+        else:
+            await service.add_messages_atomic(
+                session_id,
+                tuple(drafts),
+                composition_state_id=composition_state_id,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                session_operation_kind=session_operation_kind,
+                audit_only=plugin_crash_pending,
+                required_work=sql,
+            )
     except SQLAlchemyError as save_err:
-        if plugin_crash_pending:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        if plugin_crash_pending and not required_audit:
             # Unwind path: a primary failure is already in flight.
             # Counting + slog preserves audibility without masking
             # the original exception. The counter unit is ROWS lost,
@@ -2048,6 +2104,13 @@ async def _persist_tool_invocations(
             f"failed for session_id={session_id!r} after assistant row "
             f"was persisted — Tier-1 audit corruption (no recovery)"
         ) from save_err
+    except BaseException:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        raise
+    if projection is not None:
+        projection.begin_projection()
+        projection.complete_owned()
     return tuple(pipeline_bindings)
 
 
@@ -2070,6 +2133,8 @@ async def _persist_llm_calls(
     composition_state_id: UUID | None,
     *,
     plugin_crash_pending: bool,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
     session_operation_context: SessionOperationContext,
 ) -> None:
     """Persist per-LLM-call audit records as audit-only ``role=audit`` rows.
@@ -2092,24 +2157,57 @@ async def _persist_llm_calls(
     """
     if not llm_calls:
         return
-    drafts = tuple(
-        AuditMessageDraft(
-            role="audit",
-            content=llm_call_audit_summary(call),
-            tool_calls=(llm_call_audit_envelope(call),),
+    producer = sql = projection = None
+    if required_work is not None:
+        if required_work.authority.context != session_operation_context:
+            raise AuditIntegrityError("Required audit work belongs to another exact fence")
+        producer, sql, projection = required_work.reserve_audit_work(
+            RequiredWorkSource.REQUIRED_UNWIND_AUDIT_SQL,
+            RequiredWorkSource.REQUIRED_UNWIND_AUDIT_PROJECTION,
+            transition_ordinal=0,
+            semantic_ordinal=0,
         )
-        for call in llm_calls
-    )
     try:
-        await service.add_messages_atomic(
-            session_id,
-            drafts,
-            composition_state_id=composition_state_id,
-            writer_principal="compose_loop",
-            session_operation_context=session_operation_context,
+        drafts = tuple(
+            AuditMessageDraft(
+                role="audit",
+                content=llm_call_audit_summary(call),
+                tool_calls=(llm_call_audit_envelope(call),),
+            )
+            for call in llm_calls
         )
+    except BaseException as error:
+        if producer is not None and sql is not None and projection is not None:
+            producer.complete_owned(error)
+            sql.complete_without_submission()
+            projection.complete_without_submission()
+        raise
+    if producer is not None:
+        producer.complete_owned()
+    try:
+        if sql is None:
+            await service.add_messages_atomic(
+                session_id,
+                drafts,
+                composition_state_id=composition_state_id,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                audit_only=True,
+            )
+        else:
+            await service.add_messages_atomic(
+                session_id,
+                drafts,
+                composition_state_id=composition_state_id,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                audit_only=True,
+                required_work=sql,
+            )
     except SQLAlchemyError as save_err:
-        if plugin_crash_pending:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        if plugin_crash_pending and not required_audit:
             # Counter unit is ROWS lost (see _persist_tool_invocations);
             # the log lists the full cohort so a 12-call loss stays
             # forensically distinct from a 1-call loss.
@@ -2135,6 +2233,13 @@ async def _persist_llm_calls(
             f"session_id={session_id!r} on success path — Tier-1 audit "
             f"corruption (no recovery)"
         ) from save_err
+    except BaseException:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        raise
+    if projection is not None:
+        projection.begin_projection()
+        projection.complete_owned()
 
 
 async def _persist_turn_audit_cohort(
@@ -2147,6 +2252,8 @@ async def _persist_turn_audit_cohort(
     llm_composition_state_id: UUID | None,
     parent_assistant_id: UUID | None = None,
     plugin_crash_pending: bool,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
     session_operation_context: SessionOperationContext,
 ) -> tuple[PipelineDispatchAuditBinding, ...]:
     """Settle one turn's tool AND LLM audit rows as a single atomic cohort.
@@ -2181,44 +2288,77 @@ async def _persist_turn_audit_cohort(
     """
     if not tool_invocations and not llm_calls:
         return ()
-    role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
-    tool_csid = str(tool_composition_state_id) if tool_composition_state_id else None
-    llm_csid = str(llm_composition_state_id) if llm_composition_state_id else None
-    drafts: list[AuditMessageDraft] = []
-    pipeline_bindings: list[PipelineDispatchAuditBinding] = []
-    for invocation in tool_invocations:
-        content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
-        drafts.append(
-            AuditMessageDraft(
-                role=role,
-                content=content,
-                tool_calls=(envelope,),
-                tool_call_id=invocation.tool_call_id if role == "tool" else None,
-                parent_assistant_id=str(parent_assistant_id) if role == "tool" and parent_assistant_id is not None else None,
-                composition_state_id=tool_csid,
-            )
-        )
-        if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
-            pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
-    for call in llm_calls:
-        drafts.append(
-            AuditMessageDraft(
-                role="audit",
-                content=llm_call_audit_summary(call),
-                tool_calls=(llm_call_audit_envelope(call),),
-                composition_state_id=llm_csid,
-            )
+    producer = sql = projection = None
+    if required_work is not None:
+        if required_work.authority.context != session_operation_context:
+            raise AuditIntegrityError("Required audit work belongs to another exact fence")
+        producer, sql, projection = required_work.reserve_audit_work(
+            RequiredWorkSource.REQUIRED_UNWIND_AUDIT_SQL,
+            RequiredWorkSource.REQUIRED_UNWIND_AUDIT_PROJECTION,
+            transition_ordinal=0,
+            semantic_ordinal=0,
         )
     try:
-        await service.add_messages_atomic(
-            session_id,
-            tuple(drafts),
-            composition_state_id=None,
-            writer_principal="compose_loop",
-            session_operation_context=session_operation_context,
-        )
+        role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
+        tool_csid = str(tool_composition_state_id) if tool_composition_state_id else None
+        llm_csid = str(llm_composition_state_id) if llm_composition_state_id else None
+        drafts: list[AuditMessageDraft] = []
+        pipeline_bindings: list[PipelineDispatchAuditBinding] = []
+        for invocation in tool_invocations:
+            content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            drafts.append(
+                AuditMessageDraft(
+                    role=role,
+                    content=content,
+                    tool_calls=(envelope,),
+                    tool_call_id=invocation.tool_call_id if role == "tool" else None,
+                    parent_assistant_id=str(parent_assistant_id) if role == "tool" and parent_assistant_id is not None else None,
+                    composition_state_id=tool_csid,
+                )
+            )
+            if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
+                pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
+        for call in llm_calls:
+            drafts.append(
+                AuditMessageDraft(
+                    role="audit",
+                    content=llm_call_audit_summary(call),
+                    tool_calls=(llm_call_audit_envelope(call),),
+                    composition_state_id=llm_csid,
+                )
+            )
+    except BaseException as error:
+        if producer is not None and sql is not None and projection is not None:
+            producer.complete_owned(error)
+            sql.complete_without_submission()
+            projection.complete_without_submission()
+        raise
+    if producer is not None:
+        producer.complete_owned()
+    try:
+        if sql is None:
+            await service.add_messages_atomic(
+                session_id,
+                tuple(drafts),
+                composition_state_id=None,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                audit_only=True,
+            )
+        else:
+            await service.add_messages_atomic(
+                session_id,
+                tuple(drafts),
+                composition_state_id=None,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                audit_only=True,
+                required_work=sql,
+            )
     except SQLAlchemyError as save_err:
-        if plugin_crash_pending:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        if plugin_crash_pending and not required_audit:
             # Counter unit is ROWS lost (see _persist_tool_invocations):
             # the whole turn — tool rows AND LLM sidecars — failed to
             # become durable together.
@@ -2246,6 +2386,13 @@ async def _persist_turn_audit_cohort(
             f"failed for session_id={session_id!r} after assistant row "
             f"was persisted — Tier-1 audit corruption (no recovery)"
         ) from save_err
+    except BaseException:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        raise
+    if projection is not None:
+        projection.begin_projection()
+        projection.complete_owned()
     return tuple(pipeline_bindings)
 
 
@@ -2333,160 +2480,6 @@ async def _persist_run_diagnostics_llm_calls(
         ) from save_err
 
 
-_CLIENT_DISCONNECT_CANCEL_MARKER = object()
-
-
-def _is_client_disconnect_cancel(exc: asyncio.CancelledError) -> bool:
-    """True when ``exc`` was delivered by :func:`_cancel_on_client_disconnect`.
-
-    The private token is passed through ``Task.cancel(message)`` and therefore
-    arrives in the concrete ``CancelledError.args`` contract. Absence is the
-    ordinary external-cancel case.
-    """
-    return len(exc.args) == 1 and exc.args[0] is _CLIENT_DISCONNECT_CANCEL_MARKER
-
-
-def _failure_log_request_id(request: Request) -> str | None:
-    """Read an optional request id without probing Starlette's dynamic State."""
-    scope = request.scope
-    if "state" not in scope:
-        return None
-    state = scope["state"]
-    if type(state) is not dict or "request_id" not in state:
-        return None
-    request_id = state["request_id"]
-    return request_id if type(request_id) is str else None
-
-
-@contextlib.asynccontextmanager
-async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
-    """Cancel the enclosing route task when the HTTP client disconnects.
-
-    The server stack does not do this on its own: uvicorn's
-    ``connection_lost`` only flags the request cycle as disconnected (it
-    never cancels the ASGI task), and Starlette's ``request_response``
-    has no disconnect watcher, so a client abort (Stop button, SPA
-    compose timeout, closed tab) leaves the route running to completion
-    as a zombie — burning the LLM budget, holding the per-session
-    compose lock for minutes, and mutating composition state the client
-    will never see (elspeth-e08063c3a5). The composer stack is already
-    built for cancellation (``attach_llm_calls`` rides on the
-    CancelledError instance; the routes have cancelled-path
-    bookkeeping); this watcher supplies the missing trigger.
-
-    Semantics:
-
-    * The guarded block MUST be awaited inline in the route task —
-      running it in a child task would launder the CancelledError
-      instance at the task boundary and drop the attached llm_calls
-      audit records.
-    * On disconnect, the route task is cancelled; the CancelledError is
-      marked (see :func:`_is_client_disconnect_cancel`) and the task's
-      cancellation count is restored via ``uncancel()`` so the route can
-      convert it into a quiet HTTP response after its cancelled-path
-      bookkeeping (uvicorn discards writes on a disconnected connection,
-      but a CancelledError escaping the app is logged as "Exception in
-      ASGI application").
-    * If the disconnect races the guarded block's completion, the
-      pending watcher cancellation is flushed here. Freeform routes keep
-      their owned post-provider continuation inside this guard and join it
-      before watcher teardown.
-    * Both test transports (Starlette TestClient, httpx ASGITransport)
-      block their ``receive()`` until the response completes, so the
-      watcher stays dormant under tests unless a disconnect is
-      explicitly simulated.
-    """
-    task = asyncio.current_task()
-    if task is None:  # pure-sync dispatch (unit-test seams); nothing to watch
-        yield
-        return
-    triggered = False
-
-    async def _watch_disconnect() -> None:
-        nonlocal triggered
-        while True:
-            try:
-                message = await request.receive()
-            except Exception as receive_exc:
-                # A broken receive channel means we cannot observe the
-                # client any more — stop watching rather than risk
-                # cancelling a healthy compose on a transport quirk. This is
-                # a third-party ASGI transport boundary, and the degradation
-                # is recorded rather than silent: a dead watcher re-opens
-                # the zombie-compose window this watcher exists to close
-                # (elspeth-e08063c3a5), so "watcher stopped" must not look
-                # identical to "no disconnect ever arrived".
-                _log_last_resort_diagnostic(
-                    slog.warning,
-                    "compose.disconnect_watcher_receive_failed",
-                    exc_class=type(receive_exc).__name__,
-                )
-                return
-            if message["type"] == "http.disconnect":
-                triggered = True
-                task.cancel(_CLIENT_DISCONNECT_CANCEL_MARKER)
-                return
-
-    watcher = asyncio.create_task(_watch_disconnect())
-    try:
-        yield
-    except asyncio.CancelledError as exc:
-        # Consume ONLY the watcher's own cancellation request.
-        # ``triggered`` proves a disconnect happened, not that the
-        # delivered CancelledError belongs to the watcher alone: an
-        # external cancel (server shutdown, operator) can race the
-        # disconnect, leaving two requests on the task. Mark the
-        # exception as disconnect-initiated — licensing the route to
-        # convert it into a quiet 499 — only when no other request
-        # remains after ours is uncancelled (short-circuit keeps the
-        # uncancel from running for a purely external cancel); otherwise
-        # leave it unmarked so the route's cancelled-path re-raises and
-        # the task keeps unwinding as genuinely cancelled (the mirror of
-        # the else-branch's ``cancelling()`` re-check below).
-        if triggered:
-            remaining_cancellations = task.uncancel()
-            if remaining_cancellations == 0:
-                exc.args = (_CLIENT_DISCONNECT_CANCEL_MARKER,)
-            elif len(exc.args) == 1 and exc.args[0] is _CLIENT_DISCONNECT_CANCEL_MARKER:
-                exc.args = ()
-        raise
-    else:
-        # Normal exit: resolve completion races before the route resumes
-        # after its guarded operation. Freeform routes have already joined
-        # their post-provider continuation at this point.
-        if not watcher.done():
-            watcher.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            # A pending EXTERNAL cancel can also deliver at this await;
-            # it is re-raised below via the cancelling() re-check rather
-            # than silently swallowed by the suppress.
-            await watcher
-        if task.cancelling() > 0:
-            if triggered:
-                # task.cancel() was called but the CancelledError has
-                # not been delivered yet (awaiting a done future does
-                # not yield to the loop). Flush it at a controlled
-                # suspension point and absorb it — the compose finished,
-                # its results persist normally, and the response is
-                # simply discarded by the disconnected transport.
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.sleep(0)
-                task.uncancel()
-            if task.cancelling() > 0:
-                # An external cancel (e.g. server shutdown) raced the
-                # guarded block's completion — keep unwinding exactly as
-                # if it had landed inside the block.
-                raise asyncio.CancelledError()
-    finally:
-        # Exception paths (compose errors, cancellation) reach here
-        # without the else-branch teardown: detach the watcher without
-        # awaiting it — awaiting would add a suspension point on the
-        # unwind path. A cancelled task is collected by the loop without
-        # "exception was never retrieved" noise.
-        if not watcher.done():
-            watcher.cancel()
-
-
 _COMPOSER_HEARTBEAT_SECONDS = 15.0
 
 _COMPOSER_REQUEST_LEASE_SECONDS = 60
@@ -2521,9 +2514,8 @@ class _ComposerHeartbeatCancel:
 
     Only the three module singletons below exist. One is passed through
     ``Task.cancel(message)``, so it arrives as the sole ``CancelledError.args``
-    entry and is recognised by identity, exactly like
-    ``_CLIENT_DISCONNECT_CANCEL_MARKER``. Unlike that marker it names why, so a
-    route can record a server fault instead of a client Stop.
+    entry and is recognised by identity. It names the renewal fault so
+    the owning turn records a server fault.
     """
 
     kind: Literal["transient_exhausted", "lease_lost", "renewal_defect"]
@@ -2591,64 +2583,35 @@ def _composer_heartbeat_http_error(cancel: _ComposerHeartbeatCancel) -> HTTPExce
     )
 
 
-async def _track_compose_inflight(
-    session_id: UUID,
-    request: Request,
-    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
-) -> AsyncIterator[None]:
-    """Count this request in the session's in-flight compose tally.
+@dataclass(slots=True)
+class ComposerRequestLifecycle:
+    """Exact app-owned progress lease and its durable completion carrier."""
 
-    FastAPI yield-dependency wired into ``send_message`` and ``/recompose``.
-    The count spans the ENTIRE request — including the wait on the
-    per-session compose lock, before any progress snapshot is published —
-    and is decremented only when the request's exit stack closes, i.e.
-    after the route has fully unwound (success, HTTP error, or the
-    disconnect-cancel path).
+    lease: ComposerRequestLease
+    durable_completed: bool = False
+    durable_terminal_status: _ComposerRequestTerminalStatus | None = None
 
-    The SPA's post-abort reconciliation treats a zero count on the
-    ``/composer-progress`` snapshot as its ONLY settlement signal
-    (elspeth-06a23adfcc): phase-based inference races requests that have
-    not yet published progress (queued on the lock, immediate Stop), where
-    the registry still holds the previous turn's terminal snapshot.
 
-    Admission follows authenticated session ownership verification. Each request
-    owns an exact server token, renewed until teardown, including long provider
-    calls and lock waits.
-
-    Renewal failures (finding #28): a transient database failure
-    (``OperationalError``, pool ``TimeoutError``) is retried only while the
-    next attempt would still start inside the lease. Headroom is measured in
-    time since the last good renewal, not in failures, because a pool checkout
-    that times out takes 30 s to fail; a renewal still unresolved when the
-    lease runs out is abandoned. A lost lease (``ComposerRequestLeaseLost``,
-    ``PermissionError``) or any other renewal failure cancels the owning
-    request at once. The cancel carries a
-    :class:`_ComposerHeartbeatCancel` marker, so it is recorded as ``failed``
-    rather than a client ``cancelled``, and it leaves this dependency as a
-    structured 503 (or, for a renewal defect, as the defect itself) instead of
-    a bare cancellation. Teardown never re-raises the heartbeat's stored
-    renewal failure over the request's own outcome.
-    """
-    await _verify_session_ownership(session_id, user, request)
-    registry = _get_composer_progress_registry(request)
-    sid = str(session_id)
-    # This dependency is mounted only on Composer endpoints. Collapse the
-    # Route family uses a closed surface label; never export the raw path.
+@contextlib.asynccontextmanager
+async def composer_request_lifecycle(
+    registry: ComposerProgressRegistry | DatabaseComposerProgressRegistry,
+    *,
+    session_id: str,
+    user_id: str,
+    owner_task: asyncio.Task[object],
+    timer: _ComposerHeartbeatTimer | None = None,
+) -> AsyncIterator[ComposerRequestLifecycle]:
+    """Renew exact work custody independently of any HTTP subscription."""
     surface: Literal["freeform"] = "freeform"
-    timer = _COMPOSER_HEARTBEAT_TIMER
+    timer = timer if timer is not None else _COMPOSER_HEARTBEAT_TIMER
     # Read before the call that creates the lease: the database stamps its
     # expiry during that call, so the lease lasts at least
     # _COMPOSER_REQUEST_LEASE_SECONDS from this reading.
     lease_started_at = timer.now()
-    lease = await registry.start_request(sid, user.user_id)
-    request.state.composer_request_lease = lease
-    request.state.composer_durable_completed = False
+    lease = await registry.start_request(session_id, user_id)
+    lifecycle = ComposerRequestLifecycle(lease=lease)
     metrics_token = begin_composer_request_metrics(surface=surface)
     terminal_status: _ComposerRequestTerminalStatus = "completed"
-
-    owner_task = asyncio.current_task()
-    if owner_task is None:
-        raise RuntimeError("Composer lifecycle requires an owning task")
 
     async def renew() -> None:
         # Every exit except a transient retry cancels the owner and re-raises,
@@ -2739,11 +2702,11 @@ async def _track_compose_inflight(
 
     heartbeat = asyncio.create_task(renew())
     try:
-        yield
+        yield lifecycle
     except asyncio.CancelledError as exc:
         heartbeat_cancel = _composer_heartbeat_cancel_of(exc)
         if heartbeat_cancel is None:
-            terminal_status = "completed" if request.state.composer_durable_completed else "cancelled"
+            terminal_status = "completed" if lifecycle.durable_completed else "cancelled"
             raise
         # The heartbeat re-raised in the same step that cancelled this task,
         # so it is done and holds the renewal failure; retrieving it here is
@@ -2753,9 +2716,9 @@ async def _track_compose_inflight(
         # request (the disconnect watcher's rule): an external cancel (server
         # shutdown) racing it keeps unwinding as genuinely cancelled.
         if owner_task.uncancel() > 0:
-            terminal_status = "completed" if request.state.composer_durable_completed else "cancelled"
+            terminal_status = "completed" if lifecycle.durable_completed else "cancelled"
             raise
-        terminal_status = "completed" if request.state.composer_durable_completed else "failed"
+        terminal_status = "completed" if lifecycle.durable_completed else "failed"
         if renewal_failure is None:
             raise RuntimeError("Composer heartbeat cancelled its request without a renewal failure") from exc
         if heartbeat_cancel is _COMPOSER_HEARTBEAT_RENEWAL_DEFECT:
@@ -2764,10 +2727,10 @@ async def _track_compose_inflight(
             raise renewal_failure from renewal_failure.__cause__
         raise _composer_heartbeat_http_error(heartbeat_cancel) from exc
     except TimeoutError:
-        terminal_status = "completed" if request.state.composer_durable_completed else "timed_out"
+        terminal_status = "completed" if lifecycle.durable_completed else "timed_out"
         raise
     except HTTPException as exc:
-        if request.state.composer_durable_completed:
+        if lifecycle.durable_completed:
             terminal_status = "completed"
         elif exc.status_code in {408, 504}:
             terminal_status = "timed_out"
@@ -2777,7 +2740,7 @@ async def _track_compose_inflight(
             terminal_status = "failed"
         raise
     except Exception:
-        terminal_status = "completed" if request.state.composer_durable_completed else "failed"
+        terminal_status = "completed" if lifecycle.durable_completed else "failed"
         raise
     finally:
         primary_error = sys.exception()
@@ -2790,14 +2753,42 @@ async def _track_compose_inflight(
                     heartbeat.cancel()
                     with suppress(asyncio.CancelledError):
                         await heartbeat
+                elif not heartbeat.cancelled():
+                    # The detached worker may have consumed cancellation and
+                    # committed its failed terminal before leaving this scope.
+                    # Retrieve the owned renewal outcome in that arm too.
+                    heartbeat.exception()
             finally:
                 await registry.finish_request(lease)
         finally:
             finish_composer_request_metrics(
                 metrics_token,
-                status=terminal_status,
+                status=lifecycle.durable_terminal_status or terminal_status,
                 primary_error=primary_error,
             )
+
+
+async def composer_progress_sink_for_lease(
+    registry: ComposerProgressRegistry | DatabaseComposerProgressRegistry,
+    *,
+    lease: ComposerRequestLease,
+    session_id: str,
+    request_id: str | None,
+    user_id: str,
+    operation_id: str | None = None,
+    session_operation_id: str | None = None,
+    session_operation_epoch: int | None = None,
+) -> ComposerProgressSink:
+    """Bind a safe progress sink to the exact action and lifecycle token."""
+    return await registry.claim_request(
+        session_id=session_id,
+        request_id=request_id,
+        user_id=user_id,
+        lease=lease,
+        operation_id=operation_id,
+        session_operation_id=session_operation_id,
+        session_operation_epoch=session_operation_epoch,
+    )
 
 
 async def _state_data_from_composer_state(
@@ -3119,6 +3110,8 @@ async def _handle_planner_failure(
     llm_composition_state_id: UUID | None,
     *,
     session_operation_context: SessionOperationContext,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Translate a freeform ``PipelinePlannerError`` into a safe HTTP outcome.
 
@@ -3194,6 +3187,9 @@ async def _handle_convergence_error(
     session_operation_context: SessionOperationContext,
     ingress: CompositionIngressRecord | None = None,
     chat_ingress_inputs: list[ChatIngressInput] | None = None,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
+    budget_seconds: float | None = None,
 ) -> dict[str, object]:
     """Build 422 response body and persist partial state for convergence errors.
 
@@ -3226,6 +3222,8 @@ async def _handle_convergence_error(
     Returns:
         Response body dict for HTTPException(status_code=422).
     """
+    if required_work is not None and type(required_work) is not RequiredWorkCoordinator:
+        raise AuditIntegrityError("Composer recovery requires an owned required-work coordinator")
     # Build the discriminated progress event ONCE so the 422 body and the
     # /composer-progress snapshot share a single canonical taxonomy. Without
     # this parity, the chat-side error UX (driven by detail + recovery_text)
@@ -3258,9 +3256,10 @@ async def _handle_convergence_error(
         # boot /api/system/status fetch has not landed. Carried ONLY on the
         # timeout reason: the two turn-budget causes did not exhaust a clock,
         # so the field would be noise there.
-        response_body["timeout_seconds"] = settings.composer_timeout_seconds
+        response_body["timeout_seconds"] = settings.composer_timeout_seconds if budget_seconds is None else budget_seconds
     if exc.failed_turn is not None:
         response_body["failed_turn"] = await _failed_turn_response_body(service, session_id, exc.failed_turn)
+    required_state_failure: SQLAlchemyError | None = None
     persisted_state_id: UUID | None = None
     if exc.partial_state is not None:
         # Persistence guard: DB write failure should not upgrade the
@@ -3299,15 +3298,27 @@ async def _handle_convergence_error(
                 if ingress is not None or chat_ingress_inputs is not None
                 else None,
             )
-            partial_record = await service.save_composition_state(
-                session_id,
-                state_data,
-                provenance="convergence_persist",
-                session_operation_context=session_operation_context,
-            )
+            if required_work is None:
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="convergence_persist",
+                    session_operation_context=session_operation_context,
+                )
+            else:
+                partial_sql = required_work.reserve(RequiredWorkSource.RECOVERY_PARTIAL_STATE_SQL)
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="convergence_persist",
+                    session_operation_context=session_operation_context,
+                    required_work=partial_sql,
+                )
             persisted_state_id = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
         except SQLAlchemyError as save_err:
+            if required_audit:
+                required_state_failure = save_err
             # Full SQLAlchemyError family — ``IntegrityError`` alone would
             # let ``OperationalError`` (lock timeout / pool disconnect /
             # deadlock), ``ProgrammingError`` (schema drift), and siblings
@@ -3340,16 +3351,25 @@ async def _handle_convergence_error(
     # persist_compose_turn_async; only pre-cutover/non-loop carriers drain here.
     # Tool rows and LLM sidecars settle as ONE cohort in a single
     # transaction (elspeth-90231248dc) despite their differing state ids.
-    await _persist_turn_audit_cohort(
-        service,
-        session_id,
-        exc.tool_invocations if exc.failed_turn is None else (),
-        exc.llm_calls,
-        tool_composition_state_id=persisted_state_id,
-        llm_composition_state_id=llm_composition_state_id,
-        plugin_crash_pending=True,
-        session_operation_context=session_operation_context,
-    )
+    try:
+        await _persist_turn_audit_cohort(
+            service,
+            session_id,
+            exc.tool_invocations if exc.failed_turn is None else (),
+            exc.llm_calls,
+            tool_composition_state_id=persisted_state_id,
+            llm_composition_state_id=llm_composition_state_id,
+            plugin_crash_pending=True,
+            required_audit=required_audit,
+            required_work=required_work,
+            session_operation_context=session_operation_context,
+        )
+    except BaseException as audit_failure:
+        if required_state_failure is not None:
+            raise BaseExceptionGroup("Composer recovery and required audit failed", [required_state_failure, audit_failure]) from None
+        raise
+    if required_state_failure is not None:
+        raise ComposerRequiredRecoveryFailure(required_state_failure)
     return response_body
 
 
@@ -3368,6 +3388,8 @@ async def _handle_plugin_crash(
     session_operation_context: SessionOperationContext,
     ingress: CompositionIngressRecord | None = None,
     chat_ingress_inputs: list[ChatIngressInput] | None = None,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
 ) -> dict[str, object]:
     """Build 500 response body and persist partial state for plugin crashes.
 
@@ -3389,6 +3411,8 @@ async def _handle_plugin_crash(
     Returns:
         Response body dict for ``HTTPException(status_code=500, ...)``.
     """
+    if required_work is not None and type(required_work) is not RequiredWorkCoordinator:
+        raise AuditIntegrityError("Composer recovery requires an owned required-work coordinator")
     response_body: dict[str, object] = {
         "error_type": "composer_plugin_error",
         # Honest detail (elspeth-2c3d63037c): the prior wording promised
@@ -3421,6 +3445,7 @@ async def _handle_plugin_crash(
     if exc.failed_turn is not None:
         response_body["failed_turn"] = await _failed_turn_response_body(service, session_id, exc.failed_turn)
 
+    required_state_failure: SQLAlchemyError | None = None
     persisted_state_id_pc: UUID | None = None
     if exc.partial_state is not None:
         # Persistence guard: DB write failure MUST NOT mask the original
@@ -3457,15 +3482,27 @@ async def _handle_plugin_crash(
                 if ingress is not None or chat_ingress_inputs is not None
                 else None,
             )
-            partial_record = await service.save_composition_state(
-                session_id,
-                state_data,
-                provenance="plugin_crash_persist",
-                session_operation_context=session_operation_context,
-            )
+            if required_work is None:
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="plugin_crash_persist",
+                    session_operation_context=session_operation_context,
+                )
+            else:
+                partial_sql = required_work.reserve(RequiredWorkSource.RECOVERY_PARTIAL_STATE_SQL)
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="plugin_crash_persist",
+                    session_operation_context=session_operation_context,
+                    required_work=partial_sql,
+                )
             persisted_state_id_pc = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
         except SQLAlchemyError as save_err:
+            if required_audit:
+                required_state_failure = save_err
             # Full SQLAlchemyError family — a narrow ``IntegrityError``
             # catch would let ``OperationalError`` / ``ProgrammingError`` /
             # siblings escape and mask the primary plugin-crash response.
@@ -3510,16 +3547,25 @@ async def _handle_plugin_crash(
     # Retain this drain only for older/non-loop carriers with no failed_turn.
     # Tool rows and LLM sidecars settle as ONE cohort in a single
     # transaction (elspeth-90231248dc) despite their differing state ids.
-    await _persist_turn_audit_cohort(
-        service,
-        session_id,
-        exc.tool_invocations if exc.failed_turn is None else (),
-        exc.llm_calls,
-        tool_composition_state_id=persisted_state_id_pc,
-        llm_composition_state_id=llm_composition_state_id,
-        plugin_crash_pending=True,
-        session_operation_context=session_operation_context,
-    )
+    try:
+        await _persist_turn_audit_cohort(
+            service,
+            session_id,
+            exc.tool_invocations if exc.failed_turn is None else (),
+            exc.llm_calls,
+            tool_composition_state_id=persisted_state_id_pc,
+            llm_composition_state_id=llm_composition_state_id,
+            plugin_crash_pending=True,
+            required_audit=required_audit,
+            required_work=required_work,
+            session_operation_context=session_operation_context,
+        )
+    except BaseException as audit_failure:
+        if required_state_failure is not None:
+            raise BaseExceptionGroup("Composer recovery and required audit failed", [required_state_failure, audit_failure]) from None
+        raise
+    if required_state_failure is not None:
+        raise ComposerRequiredRecoveryFailure(required_state_failure)
     return response_body
 
 
@@ -3538,6 +3584,8 @@ async def _handle_runtime_preflight_failure(
     session_operation_context: SessionOperationContext,
     ingress: CompositionIngressRecord | None = None,
     chat_ingress_inputs: list[ChatIngressInput] | None = None,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
 ) -> dict[str, object]:
     """Build 500 response body and persist partial state for runtime-preflight failures.
 
@@ -3647,6 +3695,8 @@ async def _handle_runtime_preflight_failure(
     Returns:
         Response body dict for ``HTTPException(status_code=500, ...)``.
     """
+    if required_work is not None and type(required_work) is not RequiredWorkCoordinator:
+        raise AuditIntegrityError("Composer recovery requires an owned required-work coordinator")
     response_body: dict[str, object] = {
         "error_type": "composer_plugin_error",
         # Honest detail (elspeth-2c3d63037c): the prior wording promised
@@ -3670,6 +3720,7 @@ async def _handle_runtime_preflight_failure(
     if exc.failed_turn is not None:
         response_body["failed_turn"] = await _failed_turn_response_body(service, session_id, exc.failed_turn)
 
+    required_state_failure: SQLAlchemyError | None = None
     persisted_state_id_rpf: UUID | None = None
     if exc.partial_state is not None:
         # Persistence guard: DB write failure MUST NOT mask the original
@@ -3706,15 +3757,27 @@ async def _handle_runtime_preflight_failure(
                 if ingress is not None or chat_ingress_inputs is not None
                 else None,
             )
-            partial_record = await service.save_composition_state(
-                session_id,
-                state_data,
-                provenance="preflight_persist",
-                session_operation_context=session_operation_context,
-            )
+            if required_work is None:
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="preflight_persist",
+                    session_operation_context=session_operation_context,
+                )
+            else:
+                partial_sql = required_work.reserve(RequiredWorkSource.RECOVERY_PARTIAL_STATE_SQL)
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="preflight_persist",
+                    session_operation_context=session_operation_context,
+                    required_work=partial_sql,
+                )
             persisted_state_id_rpf = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
         except SQLAlchemyError as save_err:
+            if required_audit:
+                required_state_failure = save_err
             # See sibling helpers for redaction rationale (exc_info
             # omitted; class name only on the response body).
             slog.error(
@@ -3753,16 +3816,25 @@ async def _handle_runtime_preflight_failure(
     # failed_turn row; post-compose/non-loop carriers still drain here.
     # Tool rows and LLM sidecars settle as ONE cohort in a single
     # transaction (elspeth-90231248dc) despite their differing state ids.
-    await _persist_turn_audit_cohort(
-        service,
-        session_id,
-        exc.tool_invocations if exc.failed_turn is None else (),
-        exc.llm_calls,
-        tool_composition_state_id=persisted_state_id_rpf,
-        llm_composition_state_id=llm_composition_state_id,
-        plugin_crash_pending=True,
-        session_operation_context=session_operation_context,
-    )
+    try:
+        await _persist_turn_audit_cohort(
+            service,
+            session_id,
+            exc.tool_invocations if exc.failed_turn is None else (),
+            exc.llm_calls,
+            tool_composition_state_id=persisted_state_id_rpf,
+            llm_composition_state_id=llm_composition_state_id,
+            plugin_crash_pending=True,
+            required_audit=required_audit,
+            required_work=required_work,
+            session_operation_context=session_operation_context,
+        )
+    except BaseException as audit_failure:
+        if required_state_failure is not None:
+            raise BaseExceptionGroup("Composer recovery and required audit failed", [required_state_failure, audit_failure]) from None
+        raise
+    if required_state_failure is not None:
+        raise ComposerRequiredRecoveryFailure(required_state_failure)
     return response_body
 
 
@@ -3901,7 +3973,6 @@ __all__ = [
     "_RuntimePreflightOutcome",
     "_SessionComposeLockRegistry",
     "_bounded_composer_exception_class",
-    "_cancel_on_client_disconnect",
     "_capture_runtime_preflight_failure",
     "_composer_chat_history",
     "_composer_conversation_messages",
@@ -3917,7 +3988,6 @@ __all__ = [
     "_composition_proposal_response",
     "_extract_runtime_model_snapshot",
     "_failed_turn_response_body",
-    "_failure_log_request_id",
     "_first_message_line",
     "_get_composer_progress_registry",
     "_get_session_compose_lock_registry",
@@ -3929,7 +3999,6 @@ __all__ = [
     "_handle_runtime_preflight_failure",
     "_initial_composition_state",
     "_interpretation_event_response",
-    "_is_client_disconnect_cancel",
     "_is_composer_audit_tool_message",
     "_is_composer_llm_audit_tool_message",
     "_litellm_error_detail",
@@ -3955,7 +4024,6 @@ __all__ = [
     "_state_data_from_composer_state",
     "_state_from_record",
     "_state_response",
-    "_track_compose_inflight",
     "_validate_run_status_accounting_for_list",
     "_verify_session_ownership",
     "annotations",

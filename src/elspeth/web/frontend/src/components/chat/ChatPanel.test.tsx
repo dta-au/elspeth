@@ -35,7 +35,7 @@ import type {
   CompositionProposal,
   Session,
 } from "@/types/api";
-import { COMPOSE_CONNECTING_MESSAGE, COMPOSE_UNAVAILABLE_MESSAGE } from "@/config/composer";
+import { COMPOSE_LOADING_SESSION_MESSAGE } from "@/config/composer";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX } from "@/types/interpretation";
 
@@ -268,6 +268,7 @@ describe("ChatPanel", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
@@ -402,7 +403,7 @@ describe("ChatPanel", () => {
     const scaffold = makeComposition(2, { nodes: [] });
     useSessionStore.setState({
       activeSessionId: "session-1",
-      composeTimeoutReady: true,
+      compositionStateLoaded: true,
       compositionState: scaffold,
       messages: [{
         id: "cancelled-request", session_id: "session-1", role: "user",
@@ -457,16 +458,16 @@ describe("ChatPanel", () => {
   });
 
   it.each([
-    [false, COMPOSE_CONNECTING_MESSAGE],
-    [true, COMPOSE_UNAVAILABLE_MESSAGE],
-  ])("explains unavailable recovery while timeout readiness is missing (unavailable=%s)", (unavailable, explanation) => {
+    [false, COMPOSE_LOADING_SESSION_MESSAGE],
+    [true, COMPOSE_LOADING_SESSION_MESSAGE],
+  ])("explains unavailable recovery before hydration even with a saved state (saved=%s)", (hasState, explanation) => {
     const retryMessage = vi.fn();
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(), retryMessage, isComposing: false, error: null,
     });
     useSessionStore.setState({
-      activeSessionId: "session-1", composeTimeoutReady: false,
-      composerTimeoutUnavailable: unavailable,
+      activeSessionId: "session-1", compositionStateLoaded: false,
+      compositionState: hasState ? makeComposition(1) : null,
       messages: [{
         id: "cancelled-request", session_id: "session-1", role: "user",
         content: "Assess the case studies", tool_calls: null,
@@ -1167,6 +1168,7 @@ describe("ChatPanel inline-source projection", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useInlineSourceStore);
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
@@ -1654,6 +1656,7 @@ describe("ChatPanel generic inline-source proposal review", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useInlineSourceStore);
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
@@ -1871,6 +1874,7 @@ describe("ChatPanel inline-source fallback prompt", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useInlineSourceStore);
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
@@ -2087,6 +2091,7 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useInlineSourceStore);
     resetStore(useInterpretationEventsStore);
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
@@ -2349,7 +2354,7 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
     });
     useSessionStore.setState({
       activeSessionId: sessionFixture.id, sessions: [sessionFixture], messages: [],
-      compositionState: makeComposition(7), composeTimeoutReady: true,
+      compositionState: makeComposition(7), compositionStateLoaded: true,
     });
     useInterpretationEventsStore.getState().addPendingEvent(sessionFixture.id, event);
     render(<ChatPanel />);
@@ -3137,6 +3142,7 @@ describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
       retryMessage: vi.fn(),
@@ -3221,6 +3227,7 @@ describe("freeform upload session fence (elspeth-341a3e2fc4)", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
@@ -3450,6 +3457,7 @@ describe("ChatPanel live tool log (elspeth-3c2caf56a7)", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     mockComposer(true);
   });
@@ -3587,6 +3595,7 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useBlobStore);
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
@@ -3852,6 +3861,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     resetStore(useInlineSourceStore);
     resetStore(useExecutionStore);
     resetStore(useInterpretationEventsStore);
@@ -3866,8 +3876,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
       activeSessionId: "session-1",
       messages: [],
       compositionState: makeComposition(7, { validation_suggestions: [S1] }),
-      composeTimeoutReady: true,
-      composerTimeoutUnavailable: false,
+      compositionStateLoaded: true,
     });
   });
 
@@ -3939,13 +3948,13 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     expect(seen).toEqual([{ tab: "checks", focusMode: false, sessionId: "session-1" }]);
   });
 
-  it("holds Apply closed until the compose wall clock lands", () => {
+  it("holds Apply closed until authoritative session state loads", () => {
     useExecutionStore.setState({ validationResult: withheldValidation() });
-    useSessionStore.setState({ composeTimeoutReady: false });
+    useSessionStore.setState({ compositionStateLoaded: false });
     render(<ChatPanel />);
     const panel = screen.getByRole("region", { name: "Awaiting your decision (2)" });
     expect(within(panel).getByRole("button", { name: /^Apply optional suggestion/ })).toBeDisabled();
-    expect(within(panel).getByRole("status")).toHaveTextContent(COMPOSE_CONNECTING_MESSAGE);
+    expect(within(panel).getByRole("status")).toHaveTextContent(COMPOSE_LOADING_SESSION_MESSAGE);
   });
 
 

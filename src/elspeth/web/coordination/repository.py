@@ -14,13 +14,15 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final, get_args
 from uuid import UUID, uuid4
 
+from pydantic import JsonValue
 from sqlalchemy import ColumnElement, Connection, Engine, Row, and_, delete, func, insert, select, update
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError
 
+from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.blobs import (
     BLOB_CREATORS,
     BLOB_RUN_LINK_DIRECTIONS,
@@ -68,6 +70,11 @@ from elspeth.web.coordination.approval_authority import (
     supersede_open_approvals,
 )
 from elspeth.web.coordination.chargeable_admission_authority import RepositoryChargeableAdmissionAuthority
+from elspeth.web.coordination.composer_operation_authority import (
+    get_composer_operation_for_start_on_connection,
+    require_composer_operation_mutation_on_connection,
+    start_composer_operation_on_connection,
+)
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
     ArchiveManifestRelation,
@@ -86,6 +93,13 @@ from elspeth.web.coordination.mutation_connection_registry import (
 )
 from elspeth.web.coordination.quota_authority import QuotaExceeded, RepositoryQuotaAuthority, refuse_unrecorded_quota_exceeded
 from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
+from elspeth.web.sessions.composer_operation_preconditions import check_composer_operation_preconditions_on_connection
+from elspeth.web.sessions.composer_operations import (
+    ComposerOperationClaim,
+    ComposerOperationError,
+    ComposerOperationFenceLost,
+    ComposerOperationPreconditionRefused,
+)
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
 from elspeth.web.sessions.models import (
@@ -128,6 +142,8 @@ from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     IllegalRunTransitionError,
     OperationReceiptFence,
+    PendingInterpretationCreationResult,
+    PendingInterpretationPolicy,
     RunAlreadyActiveError,
     RunEventRecord,
     RunRecord,
@@ -167,7 +183,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from contextlib import AbstractContextManager
 
-    from elspeth.contracts.auth import AuthProviderType
     from elspeth.web.execution.envelope import RunExecutionInput
 
 _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
@@ -1001,6 +1016,22 @@ class _RepositoryInterpretationMutations:
         command: SessionPendingInterpretationCommand,
         validator: SessionPendingInterpretationValidator,
     ) -> InterpretationEventRecord:
+        return self._create_pending(command, validator, policy=PendingInterpretationPolicy.RECONCILE).event
+
+    def create_pipeline_candidate_pending(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+    ) -> PendingInterpretationCreationResult:
+        return self._create_pending(command, validator, policy=PendingInterpretationPolicy.PIPELINE_CANDIDATE)
+
+    def _create_pending(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+        *,
+        policy: PendingInterpretationPolicy,
+    ) -> PendingInterpretationCreationResult:
         """Apply the canonical pending-review decision inside the exact live fence."""
         self._require_pending_creation_authority()
         if type(command) is not SessionPendingInterpretationCommand:
@@ -1101,7 +1132,22 @@ class _RepositoryInterpretationMutations:
         inline_blob_snapshot = validator.inline_blob_snapshot
         if inline_blob_snapshot is not None:
             inline_blob_snapshot.assert_current_rows(connection, session_id=UUID(state._session_id))
-        decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, validator)
+        if policy is PendingInterpretationPolicy.PIPELINE_CANDIDATE:
+            candidate_terms = (
+                connection.execute(
+                    select(interpretation_events_table.c.user_term).where(
+                        interpretation_events_table.c.session_id == state._session_id,
+                        interpretation_events_table.c.composition_state_id == state_id,
+                        interpretation_events_table.c.affected_node_id == command.affected_node_id,
+                        interpretation_events_table.c.kind == command.kind.value,
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if any(term.strip() == command.user_term.strip() for term in candidate_terms):
+                raise AuditIntegrityError("pipeline candidate review site already has immutable evidence")
+        decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, validator, policy=policy)
         if type(decision) is not SessionPendingInterpretationDecision:
             raise TypeError("pending interpretation planner must return an exact decision")
         matching_term_ids = {
@@ -1147,7 +1193,7 @@ class _RepositoryInterpretationMutations:
                     interpretation_events_table.c.session_id == state._session_id,
                 )
             ).one()
-            return self._event_record(row)
+            return PendingInterpretationCreationResult(event=self._event_record(row), produced_state=None)
 
         if decision.result_event_id != command.event_id:
             raise SessionDerivedCustodyError
@@ -1253,6 +1299,7 @@ class _RepositoryInterpretationMutations:
                 surface_origin=command.surface_origin.value,
             )
         )
+        appended_record = None
         if appended_state is not None:
             predecessor = connection.execute(
                 select(composition_states_table.c.id).where(
@@ -1323,7 +1370,7 @@ class _RepositoryInterpretationMutations:
                 record=state._approval_supersession_recorder,
             )
         row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(command.event_id))).one()
-        return self._event_record(row)
+        return PendingInterpretationCreationResult(event=self._event_record(row), produced_state=appended_record)
 
     def record_session_opt_out(
         self,
@@ -4673,55 +4720,71 @@ class _SessionOperationAuthorityRepository:
             )
 
         with self._locked_transaction(session_id_text) as conn:
-            session_row = conn.execute(
-                select(sessions_table.c.archived_at).where(sessions_table.c.id == session_id_text).with_for_update()
-            ).one_or_none()
-            if session_row is None:
-                raise SessionOperationFenceLost(FenceLossReason.MISSING)
-            row = self._select_fence(conn, session_id=session_id_text)
-            if row is None:
-                raise SessionOperationFenceLost(FenceLossReason.MISSING)
-            database_now = self._database_now(conn)
-            released_at = row.released_at
-            lease_expires_at = _ensure_utc(row.lease_expires_at)
-            if session_row.archived_at is not None:
-                if released_at is None and lease_expires_at > database_now:
-                    raise SessionOperationConflictError
-                raise SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
-            if released_at is None:
-                if lease_expires_at > database_now:
-                    raise SessionOperationConflictError
-                if not self._expired_owner_allows_takeover(
-                    conn,
-                    owner_instance_id=row.owner_instance_id,
-                    database_now=database_now,
-                ):
-                    raise SessionOperationConflictError
-
-            operation_id = _new_operation_id()
-            lease_token = _new_lease_token(owner_instance_id=owner_instance_id)
-            operation_epoch = row.operation_epoch + 1
-            result = conn.execute(
-                update(session_operation_fences_table)
-                .where(
-                    session_operation_fences_table.c.session_id == session_id_text,
-                    session_operation_fences_table.c.operation_id == row.operation_id,
-                    session_operation_fences_table.c.lease_token == row.lease_token,
-                    session_operation_fences_table.c.operation_epoch == row.operation_epoch,
-                )
-                .values(
-                    operation_id=operation_id,
-                    lease_token=lease_token,
-                    operation_kind=operation_kind.value,
-                    owner_instance_id=owner_instance_id,
-                    operation_epoch=operation_epoch,
-                    lease_expires_at=database_now + timedelta(seconds=lease_seconds),
-                    released_at=None,
-                )
+            return self._advance_exclusive_fence_on_connection(
+                conn,
+                session_id_text=session_id_text,
+                operation_kind=operation_kind,
+                owner_instance_id=owner_instance_id,
+                lease_seconds=lease_seconds,
             )
-            if result.rowcount != 1:
-                raise SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
 
+    def _advance_exclusive_fence_on_connection(
+        self,
+        conn: Connection,
+        *,
+        session_id_text: str,
+        operation_kind: SessionOperationKind,
+        owner_instance_id: str,
+        lease_seconds: int,
+    ) -> SessionOperationContext:
+        session_row = conn.execute(
+            select(sessions_table.c.archived_at).where(sessions_table.c.id == session_id_text).with_for_update()
+        ).one_or_none()
+        if session_row is None:
+            raise SessionOperationFenceLost(FenceLossReason.MISSING)
+        row = self._select_fence(conn, session_id=session_id_text)
+        if row is None:
+            raise SessionOperationFenceLost(FenceLossReason.MISSING)
+        database_now = self._database_now(conn)
+        released_at = row.released_at
+        lease_expires_at = _ensure_utc(row.lease_expires_at)
+        if session_row.archived_at is not None:
+            if released_at is None and lease_expires_at > database_now:
+                raise SessionOperationConflictError
+            raise SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+        if released_at is None:
+            if lease_expires_at > database_now:
+                raise SessionOperationConflictError
+            if not self._expired_owner_allows_takeover(
+                conn,
+                owner_instance_id=row.owner_instance_id,
+                database_now=database_now,
+            ):
+                raise SessionOperationConflictError
+
+        operation_id = _new_operation_id()
+        lease_token = _new_lease_token(owner_instance_id=owner_instance_id)
+        operation_epoch = row.operation_epoch + 1
+        result = conn.execute(
+            update(session_operation_fences_table)
+            .where(
+                session_operation_fences_table.c.session_id == session_id_text,
+                session_operation_fences_table.c.operation_id == row.operation_id,
+                session_operation_fences_table.c.lease_token == row.lease_token,
+                session_operation_fences_table.c.operation_epoch == row.operation_epoch,
+            )
+            .values(
+                operation_id=operation_id,
+                lease_token=lease_token,
+                operation_kind=operation_kind.value,
+                owner_instance_id=owner_instance_id,
+                operation_epoch=operation_epoch,
+                lease_expires_at=database_now + timedelta(seconds=lease_seconds),
+                released_at=None,
+            )
+        )
+        if result.rowcount != 1:
+            raise SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
         return SessionOperationContext(
             fence=SessionOperationFence(
                 session_id=session_id_text,
@@ -4731,6 +4794,51 @@ class _SessionOperationAuthorityRepository:
             ),
             operation_kind=operation_kind,
         )
+
+    def start_composer_async_operation(
+        self,
+        claim: ComposerOperationClaim,
+        *,
+        owner_instance_id: str,
+        lease_seconds: int,
+        auth_provider_type: str,
+    ) -> SessionOperationContext:
+        if type(claim) is not ComposerOperationClaim:
+            raise TypeError("claim must be ComposerOperationClaim")
+        if type(auth_provider_type) is not str or auth_provider_type not in get_args(AuthProviderType):
+            raise ValueError("auth_provider_type must name a browser authentication provider")
+        _validate_owner(owner_instance_id)
+        _validate_lease_seconds(lease_seconds)
+        with self._locked_transaction(str(claim.session_id)) as conn:
+            job = get_composer_operation_for_start_on_connection(conn, claim)
+            if job.claim_owner_instance_id != owner_instance_id:
+                raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
+            if job.deadline_at <= self._database_now(conn):
+                body: dict[str, JsonValue] = {
+                    "error_type": "composer_operation_deadline_expired",
+                    "detail": "The composer request waited too long to start. Please resubmit.",
+                    "timeout_seconds": (job.deadline_at - job.created_at).total_seconds(),
+                }
+                body["request_id"] = job.request_id
+                raise ComposerOperationPreconditionRefused(
+                    error=ComposerOperationError(
+                        http_status=504,
+                        failure_code="deadline_expired",
+                        error_type="composer_operation_deadline_expired",
+                        body=body,
+                        diagnostic_id=None,
+                    )
+                )
+            context = self._advance_exclusive_fence_on_connection(
+                conn,
+                session_id_text=str(claim.session_id),
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=owner_instance_id,
+                lease_seconds=lease_seconds,
+            )
+            user_message_id = check_composer_operation_preconditions_on_connection(conn, job, auth_provider_type=auth_provider_type)
+            start_composer_operation_on_connection(conn, claim, context=context, user_message_id=user_message_id)
+            return context
 
     def _admit_blob_read(
         self,
@@ -4991,7 +5099,7 @@ class _SessionOperationAuthorityRepository:
         return context
 
     def compare_and_swap(self, context: SessionOperationContext) -> None:
-        self.mutate(context, lambda _transaction: None)
+        self.mutate(context, _composer_liveness_proof)
 
     def _validate_fork_child_lease_locked(
         self,
@@ -5159,6 +5267,8 @@ class _SessionOperationAuthorityRepository:
         with self._locked_transaction(fence.session_id) as conn:
             database_now = self._lock_fence_and_read_database_time(conn, context)
             self._compare_and_swap_on_connection(conn, context, database_now=database_now)
+            if mutation is not _composer_liveness_proof:
+                require_composer_operation_mutation_on_connection(conn, context)
             transaction = _RepositoryMutationTransaction(
                 conn,
                 session_id=fence.session_id,
@@ -5805,3 +5915,7 @@ class _RepositoryComposerCompletionMutations:
                 expires_at=None,
             )
         )
+
+
+def _composer_liveness_proof(_transaction: SessionOperationMutationTransaction) -> None:
+    """Prove lease liveness without authorizing a business mutation."""

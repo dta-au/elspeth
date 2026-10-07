@@ -1089,7 +1089,7 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
     ),
     ReviewedWriter(
         path="src/elspeth/web/coordination/repository.py",
-        enclosing_symbol="_RepositoryInterpretationMutations.create_or_reconcile_pending",
+        enclosing_symbol="_RepositoryInterpretationMutations._create_pending",
         table="composition_states",
         operation="sqlalchemy_insert_call",
         purpose=(

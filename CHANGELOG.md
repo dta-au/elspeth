@@ -4,6 +4,55 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.3 - Unreleased (Archive recovery and Composer HTTPS progress candidate)
+
+- **Session archive and cleanup recover on filesystems without no-replace rename.**
+  The merged EFS repair supports an in-place, identity-bound archive path and
+  recovery after interrupted cleanup. It retains collision checks and durable
+  database custody rather than assuming the filesystem has atomic no-replace
+  rename. This is merged source from PR #276.
+- **The proposed Web Composer transport delivers live progress over authenticated
+  HTTPS.** An operation-scoped server-sent event subscription follows the same
+  durable operation and progress authority as the authenticated status GET.
+  The browser receives bounded, redacted status and progress, then retrieves
+  the completed answer through GET; it reconciles interrupted subscriptions
+  against that operation. Live role, identity, ownership and token checks,
+  disconnect cleanup and bounded readers protect the stream. The provider and
+  gateway still return complete answers: generated answer-token streaming and
+  interim answer text are outside this release candidate. These changes are
+  held on the streaming branch and remain subject to final integration and
+  acceptance, so this entry does not claim a landed release.
+- **Durable Composer failure paths retain the original outcome and required-work
+  custody.** The held candidate reconciles cancellation, worker failure,
+  pending review, terminal publication and physical cleanup against their
+  committed authorities. These changes are likewise awaiting final frozen
+  default, serial PostgreSQL, TLS and browser acceptance gates.
+- **Container and dependency maintenance advances.** Merged main updates the
+  distroless runtime base for patched OpenSSL, the gateway FastAPI and
+  Hatchling locks, root Playwright tooling, and pinned GitHub Actions. The
+  Chroma advisory identifies the registered `rag_retrieval` provider and
+  continues to prohibit Chroma use pending an upstream fix and verification.
+  The image Dockerfile also requires Node 24.18.0 for the build; that
+  image has not been qualified or published.
+
+**Upgrade and publication notes.** Session epoch 72 adds durable Composer jobs
+and ingress bindings; it advances from epoch 71 in the 0.8.2 candidate. The
+Landscape epoch 49 remains unchanged. Upgrading a 0.8.1/0.8.2 session store requires a
+stopped service, archive/export of needed session evidence, and recreation of
+the session database and its sidecars; there is no in-place migration. A
+Landscape database already at epoch 49 remains usable and must not be reset
+solely for this session-only change. Installations still on 0.8.0 have session
+epoch 53 and Landscape epoch 38 and must recreate both stale databases in the
+same service-stop window, as described in the
+[0.8.1 notes](#081---2026-09-10-replica-recovery-and-deployment-hardening) and
+[cutover runbook](docs/runbooks/staging-session-db-recreation.md). This is an
+unreleased source candidate. No 0.8.3 tag, image digest, registry publication,
+live cloud qualification or production readiness is established here. The
+streaming work retains all 102 original obligations and four supplemental
+collections; two original reports remain unavailable. Final default Python,
+PostgreSQL, real HTTPS and browser acceptance are still required before a
+release claim. Use only a separately verified published image tag or digest.
+
 ## 0.8.2 - Unreleased (Bounded validation and release-check hardening)
 
 - **Azurite test tooling uses an owned, bounded diagnostic formatter.** Replace

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import sys
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +36,11 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
+
+execution_fixture = execution_custody.execution_fixture
+
 
 VALID_HASH = "a" * 64
 BLOB_ID = UUID("5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b")
@@ -282,6 +288,35 @@ async def _acquire_blob_read_lease() -> tuple[UUID, SessionOperationLease, Engin
     return session.id, lease, engine
 
 
+async def _close_blob_read_test_resources(
+    operation_lease: SessionOperationLease,
+    service: ExecutionServiceImpl | None,
+    execution_fixture: ExecutionTestCustody,
+    engine: Engine,
+    primary: BaseException | None,
+) -> None:
+    # Non-EXECUTE release must finish before selected global draining begins.
+    cleanup_errors: list[BaseException] = []
+    try:
+        await operation_lease.close()
+    except BaseException as original:
+        cleanup_errors.append(original)
+    try:
+        if service is not None:
+            await execution_fixture.shutdown_service(service)
+    except BaseException as original:
+        cleanup_errors.append(original)
+    try:
+        engine.dispose()
+    except BaseException as original:
+        cleanup_errors.append(original)
+    if cleanup_errors:
+        originals = ([primary] if primary is not None else []) + cleanup_errors
+        if len(originals) == 1:
+            raise originals[0]
+        raise BaseExceptionGroup("Inline blob test cleanup failed", originals)
+
+
 def test_validate_returns_structured_violation_for_missing_inline_blob(tmp_path: Path) -> None:
     session_id = uuid4()
     result = validate_pipeline_for_trained_operator(
@@ -387,27 +422,32 @@ def test_validate_substitutes_ready_inline_blob_marker_before_settings_load(
 
 
 @pytest.mark.asyncio
-async def test_execution_service_validate_state_passes_blob_metadata_bridge(tmp_path: Path) -> None:
+async def test_execution_service_validate_state_passes_blob_metadata_bridge(
+    tmp_path: Path, execution_fixture: ExecutionTestCustody
+) -> None:
     session_id, operation_lease, engine = await _acquire_blob_read_lease()
     service: ExecutionServiceImpl | None = None
     try:
         blob_service = _BlobMetadataService(record=None)
         loop = asyncio.get_running_loop()
-        service = ExecutionServiceImpl.for_trained_operator(
-            loop=loop,
-            broadcaster=ProgressBroadcaster(loop),
-            settings=WebSettings(
-                data_dir=tmp_path,
-                composer_max_composition_turns=10,
-                composer_max_discovery_turns=5,
-                composer_timeout_seconds=30.0,
-                composer_rate_limit_per_minute=60,
-                shareable_link_signing_key=SecretBytes(b"\x00" * 32),
-            ),
-            session_service=cast(Any, _UnusedSessionService()),
-            yaml_generator=composer_yaml_generator,
-            telemetry=build_sessions_telemetry(),
-            blob_service=cast(Any, blob_service),
+        service = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=loop,
+                broadcaster=ProgressBroadcaster(loop),
+                settings=WebSettings(
+                    data_dir=tmp_path,
+                    composer_max_composition_turns=10,
+                    composer_max_discovery_turns=5,
+                    composer_timeout_seconds=30.0,
+                    composer_rate_limit_per_minute=60,
+                    shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+                ),
+                session_service=cast(Any, _UnusedSessionService()),
+                yaml_generator=composer_yaml_generator,
+                telemetry=build_sessions_telemetry(),
+                blob_service=cast(Any, blob_service),
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
         result = await service.validate_state(
             _state_with_inline_prompt(tmp_path, session_id=session_id),
@@ -416,14 +456,7 @@ async def test_execution_service_validate_state_passes_blob_metadata_bridge(tmp_
             session_id=session_id,
         )
     finally:
-        try:
-            try:
-                if service is not None:
-                    await service.shutdown()
-            finally:
-                await operation_lease.close()
-        finally:
-            engine.dispose()
+        await _close_blob_read_test_resources(operation_lease, service, execution_fixture, engine, sys.exception())
 
     assert result.is_valid is False
     assert any(error.error_code == "missing_inline_blob_content" for error in result.errors)
@@ -435,28 +468,33 @@ async def test_execution_service_validate_state_passes_blob_metadata_bridge(tmp_
 
 
 @pytest.mark.asyncio
-async def test_execution_service_validate_state_treats_cross_session_inline_blob_as_missing(tmp_path: Path) -> None:
+async def test_execution_service_validate_state_treats_cross_session_inline_blob_as_missing(
+    tmp_path: Path, execution_fixture: ExecutionTestCustody
+) -> None:
     requested_session_id, operation_lease, engine = await _acquire_blob_read_lease()
     service: ExecutionServiceImpl | None = None
     try:
         other_session_id = uuid4()
         blob_service = _BlobMetadataService(record=_ready_blob_record(session_id=other_session_id))
         loop = asyncio.get_running_loop()
-        service = ExecutionServiceImpl.for_trained_operator(
-            loop=loop,
-            broadcaster=ProgressBroadcaster(loop),
-            settings=WebSettings(
-                data_dir=tmp_path,
-                composer_max_composition_turns=10,
-                composer_max_discovery_turns=5,
-                composer_timeout_seconds=30.0,
-                composer_rate_limit_per_minute=60,
-                shareable_link_signing_key=SecretBytes(b"\x00" * 32),
-            ),
-            session_service=cast(Any, _UnusedSessionService()),
-            yaml_generator=composer_yaml_generator,
-            telemetry=build_sessions_telemetry(),
-            blob_service=cast(Any, blob_service),
+        service = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=loop,
+                broadcaster=ProgressBroadcaster(loop),
+                settings=WebSettings(
+                    data_dir=tmp_path,
+                    composer_max_composition_turns=10,
+                    composer_max_discovery_turns=5,
+                    composer_timeout_seconds=30.0,
+                    composer_rate_limit_per_minute=60,
+                    shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+                ),
+                session_service=cast(Any, _UnusedSessionService()),
+                yaml_generator=composer_yaml_generator,
+                telemetry=build_sessions_telemetry(),
+                blob_service=cast(Any, blob_service),
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
         result = await service.validate_state(
             _state_with_inline_prompt(tmp_path, session_id=requested_session_id),
@@ -465,14 +503,7 @@ async def test_execution_service_validate_state_treats_cross_session_inline_blob
             session_id=requested_session_id,
         )
     finally:
-        try:
-            try:
-                if service is not None:
-                    await service.shutdown()
-            finally:
-                await operation_lease.close()
-        finally:
-            engine.dispose()
+        await _close_blob_read_test_resources(operation_lease, service, execution_fixture, engine, sys.exception())
 
     assert result.is_valid is False
     assert any(error.error_code == "missing_inline_blob_content" for error in result.errors)
@@ -484,7 +515,9 @@ async def test_execution_service_validate_state_treats_cross_session_inline_blob
 
 
 @pytest.mark.asyncio
-async def test_execution_service_preflight_reads_uploaded_reference_table_under_its_fence(tmp_path: Path) -> None:
+async def test_execution_service_preflight_reads_uploaded_reference_table_under_its_fence(
+    tmp_path: Path, execution_fixture: ExecutionTestCustody
+) -> None:
     session_id, operation_lease, engine = await _acquire_blob_read_lease()
     service: ExecutionServiceImpl | None = None
     try:
@@ -504,21 +537,24 @@ async def test_execution_service_preflight_reads_uploaded_reference_table_under_
             content={"blob_ref": str(BLOB_ID), "mode": "inline_content", "sha256": digest},
         )
         loop = asyncio.get_running_loop()
-        service = ExecutionServiceImpl.for_trained_operator(
-            loop=loop,
-            broadcaster=ProgressBroadcaster(loop),
-            settings=WebSettings(
-                data_dir=tmp_path,
-                composer_max_composition_turns=10,
-                composer_max_discovery_turns=5,
-                composer_timeout_seconds=30.0,
-                composer_rate_limit_per_minute=60,
-                shareable_link_signing_key=SecretBytes(b"\x00" * 32),
-            ),
-            session_service=cast(Any, _UnusedSessionService()),
-            yaml_generator=composer_yaml_generator,
-            telemetry=build_sessions_telemetry(),
-            blob_service=cast(Any, blob_service),
+        service = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=loop,
+                broadcaster=ProgressBroadcaster(loop),
+                settings=WebSettings(
+                    data_dir=tmp_path,
+                    composer_max_composition_turns=10,
+                    composer_max_discovery_turns=5,
+                    composer_timeout_seconds=30.0,
+                    composer_rate_limit_per_minute=60,
+                    shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+                ),
+                session_service=cast(Any, _UnusedSessionService()),
+                yaml_generator=composer_yaml_generator,
+                telemetry=build_sessions_telemetry(),
+                blob_service=cast(Any, blob_service),
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
         result = await service.validate_state(
             state,
@@ -527,14 +563,7 @@ async def test_execution_service_preflight_reads_uploaded_reference_table_under_
             session_id=session_id,
         )
     finally:
-        try:
-            try:
-                if service is not None:
-                    await service.shutdown()
-            finally:
-                await operation_lease.close()
-        finally:
-            engine.dispose()
+        await _close_blob_read_test_resources(operation_lease, service, execution_fixture, engine, sys.exception())
 
     assert result.is_valid is True, result.errors
     assert blob_service.read_blob_ids == [BLOB_ID]

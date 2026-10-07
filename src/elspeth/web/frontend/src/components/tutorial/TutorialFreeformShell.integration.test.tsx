@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/api/client";
@@ -33,8 +33,8 @@ beforeEach(() => {
   useSessionStore.setState({
     activeSessionId: "session-1",
     compositionStateLoaded: true,
-    composeTimeoutReady: true,
   });
+  vi.mocked(api.listInterpretationEvents).mockResolvedValue([]);
   vi.mocked(api.getTutorialSample).mockResolvedValue({
     sample_urls: ["https://example.gov.au/project-1.html"],
   });
@@ -64,13 +64,19 @@ describe("tutorial with the ordinary chat controls", () => {
     }
   });
 
-  it("waits for the compose timeout configuration before enabling the brief", async () => {
-    useSessionStore.setState({ composeTimeoutReady: false });
+  it("waits for authoritative session state before enabling the brief", async () => {
+    let settleState!: (value: null) => void;
+    vi.mocked(api.fetchMessages).mockResolvedValue([]);
+    vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+    vi.mocked(api.fetchComposerPreferences).mockResolvedValue({ session_id: "session-1", trust_mode: "auto_commit", density_default: "high", interpretation_review_disabled: false, updated_at: "2026-10-06T00:00:00Z" });
+    vi.mocked(api.fetchCompositionState).mockImplementationOnce(() => new Promise((resolve) => { settleState = resolve; }));
+    useSessionStore.setState({ compositionStateLoaded: false });
     render(<TutorialFreeformShell sessionId="session-1" onCompleted={vi.fn()} />);
-    const send = await screen.findByRole("button", { name: "Send tutorial brief" });
-    expect(send).toBeDisabled();
-    act(() => useSessionStore.setState({ composeTimeoutReady: true }));
-    expect(send).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Send tutorial brief" })).toBeNull();
+    expect(api.submitComposerOperation).not.toHaveBeenCalled();
+    await waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
+    await act(async () => { settleState(null); });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send tutorial brief" })).toBeEnabled());
   });
 
   it("keeps the tutorial bound to its session by hiding the fork action", async () => {

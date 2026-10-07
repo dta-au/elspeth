@@ -20,6 +20,8 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
+from pydantic import JsonValue
+
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
@@ -60,7 +62,12 @@ from elspeth.web.composer.audit import (
     rebind_dispatch_arguments,
 )
 from elspeth.web.composer.authority_hashing import composer_authority_hash
-from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads
+from elspeth.web.composer.bounded_json import (
+    JsonBoundaryError,
+    _validate_decoded_json,
+    _validate_json_structure,
+    bounded_json_loads,
+)
 from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
@@ -153,7 +160,7 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools._common import _failure_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
-from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, canonicalize_authored_node_review_requirements
+from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.credential_guard import (
     require_no_credential_material,
@@ -161,7 +168,11 @@ from elspeth.web.credential_guard import (
     require_no_credential_material_in_tool_wire,
 )
 from elspeth.web.execution.schemas import ValidationResult
-from elspeth.web.interpretation_state import interpretation_sites
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    ServerStagedRequiredControlUserTerm,
+    interpretation_sites,
+)
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 if TYPE_CHECKING:
@@ -171,6 +182,7 @@ if TYPE_CHECKING:
 
     from elspeth.contracts.secrets import WebSecretResolver
     from elspeth.web.composer.pipeline_custody import PipelineCustodyPreparation
+    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
     from elspeth.web.composer.session_tool import SessionToolOwner
     from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
@@ -548,6 +560,103 @@ class _SetPipelineFinalization:
     changed: bool
 
 
+def _parse_review_json_object(value: object) -> dict[str, JsonValue]:
+    """Admit bounded, finite JSON without detaching authored container identity."""
+    if type(value) is not dict:
+        raise AuditIntegrityError("Accepted review arguments must contain exact JSON objects")
+    _validate_decoded_json(value, label="accepted review arguments")
+    return cast(dict[str, JsonValue], value)
+
+
+def _parse_server_staged_review_json_object(value: object) -> dict[str, JsonValue]:
+    """Retain exact owned disclosure authority before compact admission.
+
+    Only required-control finalization and accepted candidate review copying
+    use this boundary. Public provider decoding and canonical review rows use
+    the strict JSON parser; an ordinary reserved string gains no authority.
+    """
+    if type(value) is not dict:
+        raise AuditIntegrityError("Accepted review arguments must contain exact JSON objects")
+    _validate_json_structure(
+        value,
+        label="server-staged review arguments",
+        owned_string_type=ServerStagedRequiredControlUserTerm,
+    )
+    return cast(dict[str, JsonValue], value)
+
+
+@dataclass(slots=True)
+class _ValidatedReviewComponent:
+    authored: dict[str, JsonValue]
+    options: dict[str, JsonValue]
+
+    @classmethod
+    def parse(cls, value: object) -> _ValidatedReviewComponent:
+        authored = _parse_server_staged_review_json_object(value)
+        options = _parse_server_staged_review_json_object(authored["options"]) if "options" in authored else {}
+        return cls(authored, options)
+
+
+def _preserve_candidate_review_requirements(
+    arguments: object,
+    candidate_state: CompositionState,
+) -> dict[str, JsonValue]:
+    """Keep validated backend review rows without rewriting authored graph data.
+
+    Called only after an acceptable public candidate. Its component identities
+    must match the supplied graph; only canonical review roots are copied from
+    that owned candidate. Provider input never grants internal authority.
+    """
+    authored = _parse_server_staged_review_json_object(arguments)
+
+    def with_reviews(component: _ValidatedReviewComponent, canonical_options: object) -> dict[str, JsonValue]:
+        options = _parse_review_json_object(deep_thaw(canonical_options))
+        if INTERPRETATION_REQUIREMENTS_KEY not in options:
+            return component.authored
+        requirements = options[INTERPRETATION_REQUIREMENTS_KEY]
+        if INTERPRETATION_REQUIREMENTS_KEY in component.options and component.options[INTERPRETATION_REQUIREMENTS_KEY] == requirements:
+            return component.authored
+        return {**component.authored, "options": {**component.options, INTERPRETATION_REQUIREMENTS_KEY: requirements}}
+
+    normalized = dict(authored)
+    changed = False
+    argument_nodes = authored["nodes"] if "nodes" in authored else []
+    if type(argument_nodes) is not list:
+        raise AuditIntegrityError("Accepted candidate nodes must be an exact JSON array")
+    components = tuple(_ValidatedReviewComponent.parse(node) for node in argument_nodes)
+    candidate_nodes = {node.id: node for node in candidate_state.nodes}
+    node_ids = tuple(component.authored["id"] for component in components)
+    if any(type(node_id) is not str for node_id in node_ids):
+        raise AuditIntegrityError("Accepted candidate node identities must be exact strings")
+    if len(components) != len(candidate_nodes) or set(cast(tuple[str, ...], node_ids)) != set(candidate_nodes):
+        raise AuditIntegrityError("Accepted candidate node identities differ from the authored graph")
+    normalized_nodes = [with_reviews(component, candidate_nodes[cast(str, component.authored["id"])].options) for component in components]
+    if any(normalized_node is not component.authored for normalized_node, component in zip(normalized_nodes, components, strict=True)):
+        normalized["nodes"] = list(normalized_nodes)
+        changed = True
+
+    if "source" in authored and authored["source"] is not None:
+        if set(candidate_state.sources) != {"source"}:
+            raise AuditIntegrityError("Accepted candidate source identities differ from the authored graph")
+        source = _ValidatedReviewComponent.parse(authored["source"])
+        normalized_source = with_reviews(source, candidate_state.sources["source"].options)
+        if normalized_source is not source.authored:
+            normalized["source"] = normalized_source
+            changed = True
+    if "sources" in authored and authored["sources"] is not None:
+        sources = _parse_review_json_object(authored["sources"])
+        if set(sources) != set(candidate_state.sources):
+            raise AuditIntegrityError("Accepted candidate source identities differ from the authored graph")
+        normalized_sources: dict[str, JsonValue] = {
+            name: with_reviews(_ValidatedReviewComponent.parse(source), candidate_state.sources[name].options)
+            for name, source in sources.items()
+        }
+        if any(normalized_sources[name] is not sources[name] for name in sources):
+            normalized["sources"] = normalized_sources
+            changed = True
+    return normalized if changed else authored
+
+
 async def _finalize_complete_set_pipeline_candidate(
     arguments: Mapping[str, Any],
     state: CompositionState,
@@ -556,7 +665,7 @@ async def _finalize_complete_set_pipeline_candidate(
     plugin_snapshot: PluginAvailabilitySnapshot,
     policy_catalog: PolicyCatalogView,
 ) -> _SetPipelineFinalization:
-    """Auto-wire only an already-acceptable atomic set_pipeline draft."""
+    """Validate public input, wire required controls, and retain review authority."""
     candidate = await run_sync_in_worker(
         build_set_pipeline_candidate,
         arguments,
@@ -572,30 +681,35 @@ async def _finalize_complete_set_pipeline_candidate(
         plugin_snapshot,
         policy_catalog,
     )
-    if finalized is arguments:
+    controls_changed = finalized is not arguments
+    compact_arguments: Mapping[str, JsonValue]
+    if controls_changed:
+        detached = deep_thaw(finalized)
+        if type(detached) is not dict:
+            raise AuditIntegrityError("Required-control finalization must return an exact argument mapping")
+        compact_arguments = _parse_server_staged_review_json_object(detached)
+
+        # Admit nominal server-staged control disclosure before copying any
+        # canonical rows. A provider-authored reserved string remains refused.
+        compact_candidate = await run_sync_in_worker(
+            build_set_pipeline_candidate,
+            compact_arguments,
+            state,
+            context,
+        )
+        if not compact_candidate.acceptable:
+            raise AuditIntegrityError("Required-control finalization produced an unacceptable compact candidate")
+    else:
+        compact_arguments = arguments
+        compact_candidate = candidate
+
+    canonical_arguments = _preserve_candidate_review_requirements(
+        compact_arguments,
+        compact_candidate.result.updated_state,
+    )
+    if not controls_changed and canonical_arguments is arguments:
         return _SetPipelineFinalization(arguments, context, candidate, False)
 
-    detached = deep_thaw(finalized)
-    if type(detached) is not dict:
-        raise AuditIntegrityError("Required-control finalization must return an exact argument mapping")
-    compact_arguments = cast(dict[str, Any], detached)
-
-    # First admit the nominal server-staged compact disclosure. This preserves
-    # the public-boundary rejection of a provider-authored plain-string copy of
-    # the reserved term.
-    compact_candidate = await run_sync_in_worker(
-        build_set_pipeline_candidate,
-        compact_arguments,
-        state,
-        context,
-    )
-    if not compact_candidate.acceptable:
-        raise AuditIntegrityError("Required-control finalization produced an unacceptable compact candidate")
-
-    canonical_arguments = canonicalize_authored_node_review_requirements(
-        compact_arguments,
-        current_state=state,
-    )
     audit_arguments = inline_custody_audit_projection(canonical_arguments)
     internal_context = replace(
         context,
@@ -609,7 +723,7 @@ async def _finalize_complete_set_pipeline_candidate(
         internal_context,
     )
     if not canonical_candidate.acceptable:
-        raise AuditIntegrityError("Required-control finalization produced an unacceptable set_pipeline candidate")
+        raise AuditIntegrityError("Review finalization produced an unacceptable set_pipeline candidate")
     return _SetPipelineFinalization(
         canonical_arguments,
         internal_context,
@@ -727,6 +841,7 @@ class ToolBatchContext:
     # from the same value, so decode always reads the W that was sent.
     tool_contract_dialect: ToolContractDialect
     session_operation_authority: SessionOperationAuthority | None = None
+    provider_owner: ProviderInvocationOwner | None = None
     # Driver turn counters and last persisted tool-call turn, read only when
     # the batch raises a ComposerConvergenceError (``turns_used`` and
     # ``failed_turn`` on the 422 body), exactly as ``_enforce_tool_call_cap``
@@ -2097,6 +2212,7 @@ async def run_tool_batch(
                     advisor_arg_error,
                     recorder=recorder,
                     timeout=effective_advisor_timeout,
+                    provider_owner=ctx.provider_owner,
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 # Lifecycle exceptions: do not absorb. Propagate so

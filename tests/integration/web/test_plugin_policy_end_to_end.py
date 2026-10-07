@@ -62,7 +62,12 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.helpers.tree_gate import iter_gate_files, iter_gate_sources
+
+execution_fixture = execution_custody.execution_fixture
+
 
 _ROOT = Path(__file__).resolve().parents[3]
 _MATRIX_FIXTURE = _ROOT / "src/elspeth/web/frontend/src/stores/__fixtures__/pluginPolicyMatrix.json"
@@ -731,7 +736,7 @@ def test_web_services_and_validation_require_explicit_policy_context() -> None:
     assert validation["profile_registry"].default is inspect.Parameter.empty
 
 
-def test_web_services_reject_explicit_none_policy_context() -> None:
+def test_web_services_reject_explicit_none_policy_context(execution_fixture: ExecutionTestCustody) -> None:
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.execution.service import ExecutionServiceImpl
 
@@ -755,43 +760,52 @@ def test_web_services_reject_explicit_none_policy_context() -> None:
             operator_profile_registry=None,
         )
     with pytest.raises(TypeError, match="plugin_snapshot_factory"):
-        ExecutionServiceImpl(
-            loop=unused_dependency,
-            broadcaster=unused_dependency,
-            settings=unused_dependency,
-            session_service=unused_dependency,
-            yaml_generator=unused_dependency,
-            telemetry=unused_dependency,
-            plugin_snapshot_factory=None,
-            operator_profile_registry=unused_dependency,
-            web_plugin_policy=unused_dependency,
-            catalog=unused_dependency,
+        execution_fixture.bind(
+            ExecutionServiceImpl(
+                loop=unused_dependency,
+                broadcaster=unused_dependency,
+                settings=unused_dependency,
+                session_service=unused_dependency,
+                yaml_generator=unused_dependency,
+                telemetry=unused_dependency,
+                plugin_snapshot_factory=None,
+                operator_profile_registry=unused_dependency,
+                web_plugin_policy=unused_dependency,
+                catalog=unused_dependency,
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
     with pytest.raises(TypeError, match="operator_profile_registry"):
-        ExecutionServiceImpl(
-            loop=unused_dependency,
-            broadcaster=unused_dependency,
-            settings=unused_dependency,
-            session_service=unused_dependency,
-            yaml_generator=unused_dependency,
-            telemetry=unused_dependency,
-            plugin_snapshot_factory=unexpected_snapshot_request,
-            operator_profile_registry=None,
-            web_plugin_policy=unused_dependency,
-            catalog=unused_dependency,
+        execution_fixture.bind(
+            ExecutionServiceImpl(
+                loop=unused_dependency,
+                broadcaster=unused_dependency,
+                settings=unused_dependency,
+                session_service=unused_dependency,
+                yaml_generator=unused_dependency,
+                telemetry=unused_dependency,
+                plugin_snapshot_factory=unexpected_snapshot_request,
+                operator_profile_registry=None,
+                web_plugin_policy=unused_dependency,
+                catalog=unused_dependency,
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
     with pytest.raises(TypeError, match="web_plugin_policy"):
-        ExecutionServiceImpl(
-            loop=unused_dependency,
-            broadcaster=unused_dependency,
-            settings=unused_dependency,
-            session_service=unused_dependency,
-            yaml_generator=unused_dependency,
-            telemetry=unused_dependency,
-            plugin_snapshot_factory=unexpected_snapshot_request,
-            operator_profile_registry=unused_dependency,
-            web_plugin_policy=None,
-            catalog=unused_dependency,
+        execution_fixture.bind(
+            ExecutionServiceImpl(
+                loop=unused_dependency,
+                broadcaster=unused_dependency,
+                settings=unused_dependency,
+                session_service=unused_dependency,
+                yaml_generator=unused_dependency,
+                telemetry=unused_dependency,
+                plugin_snapshot_factory=unexpected_snapshot_request,
+                operator_profile_registry=unused_dependency,
+                web_plugin_policy=None,
+                catalog=unused_dependency,
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
 
 

@@ -1,0 +1,40 @@
+"""Run actual rejection atomicity and immutable binding on private PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_pipeline_rejection_causal_custody import (
+    test_real_manual_lease_close_failure_keeps_actual_sql_original as test_real_manual_lease_close_failure_keeps_actual_sql_original,
+)
+from tests.unit.web.sessions.test_pipeline_rejection_causal_custody import (
+    test_rejection_requires_actual_running_claim_not_a_reconstructed_binding as test_rejection_requires_actual_running_claim_not_a_reconstructed_binding,
+)
+from tests.unit.web.sessions.test_pipeline_rejection_required import (
+    test_creation_finish_once_preserves_actual_row_and_all_cancellations as test_creation_finish_once_preserves_actual_row_and_all_cancellations,
+)
+from tests.unit.web.sessions.test_pipeline_rejection_required import (
+    test_foreign_rejection_pair_does_not_complete_foreign_work as test_foreign_rejection_pair_does_not_complete_foreign_work,
+)
+from tests.unit.web.sessions.test_pipeline_rejection_required import (
+    test_rejection_actual_event_and_authorized_immutable_reuse as test_rejection_actual_event_and_authorized_immutable_reuse,
+)
+from tests.unit.web.sessions.test_pipeline_rejection_required import (
+    test_rejection_business_cannot_cross_durable_stop_or_database_deadline as test_rejection_business_cannot_cross_durable_stop_or_database_deadline,
+)
+from tests.unit.web.sessions.test_pipeline_rejection_required import (
+    test_rejection_foreign_independent_principal_is_a_known_physical_refusal as test_rejection_foreign_independent_principal_is_a_known_physical_refusal,
+)
+from tests.unit.web.sessions.test_pipeline_rejection_required import (
+    test_rejection_physical_failure_rolls_back_and_issues_only_failure_unused as test_rejection_physical_failure_rolls_back_and_issues_only_failure_unused,
+)
+from tests.unit.web.sessions.test_pipeline_rejection_required import (
+    test_rejection_pure_projection_rejects_corrupt_actual_material as test_rejection_pure_projection_rejects_corrupt_actual_material,
+)
+from tests.unit.web.sessions.test_pipeline_rejection_required import (
+    test_rejection_result_survives_repeated_outer_cancellation_until_pure_projection as test_rejection_result_survives_repeated_outer_cancellation_until_pure_projection,
+)
+from tests.unit.web.sessions.test_pipeline_rejection_required import (
+    test_rejection_success_plus_telemetry_failure_still_requires_actual_projection as test_rejection_success_plus_telemetry_failure_still_requires_actual_projection,
+)
+
+pytestmark = pytest.mark.testcontainer

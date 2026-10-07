@@ -29,12 +29,21 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
     InterpretationSurfaceOrigin,
 )
+from elspeth.contracts.composer_progress import ComposerProgressPhase, ComposerProgressReason
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.web.execution.schemas import (
     DiscardSummary,
     RunAccounting,
     RunAccountingCorruption,
     check_discard_summary_reconciliation,
+)
+from elspeth.web.sessions.composer_operations import (
+    ComposerOperationError as ComposerOperationError,
+)
+from elspeth.web.sessions.composer_operations import (
+    ComposerOperationKind,
+    ComposerOperationStatus,
+    require_canonical_operation_id,
 )
 from elspeth.web.sessions.protocol import (
     ComposerDensityDefault,
@@ -140,18 +149,27 @@ class SessionResponse(_StrictResponse):
     forked_from_message_id: str | None = None
 
 
-class SendMessageRequest(_RequestModel):
-    """Request body for POST /api/sessions/{id}/messages."""
+def _canonical_request_uuid(value: object) -> UUID | None:
+    if value is None or type(value) is UUID:
+        return value
+    if type(value) is not str:
+        raise ValueError("Expected a canonical UUID")
+    parsed = UUID(value)
+    if str(parsed) != value:
+        raise ValueError("Expected a canonical UUID")
+    return parsed
 
-    # max_length=65536 (64 KiB) caps message content at the schema boundary.
-    # Phase 5b.0.5 (F-3): defense against unbounded payload allocation
-    # before interpretation-event code paths can be exercised.  64 KiB
-    # accommodates multi-paragraph user messages and long paste content
-    # while preventing trivial-cost large-string attacks.  Mirrors the
-    # _InlineBlobModel.content 256 KiB cap (web/composer/redaction.py).
-    content: str = pydantic.Field(min_length=1, max_length=65536)
+
+class SendMessageRequest(_SessionOperationRequest):
+    """Immutable strict body for durable message admission."""
+
+    content: str = Field(min_length=1, max_length=65536)
     state_id: UUID | None = None
-    client_request_id: UUID
+
+    @field_validator("state_id", mode="before")
+    @classmethod
+    def _validate_state_id(cls, value: object) -> UUID | None:
+        return _canonical_request_uuid(value)
 
     @field_validator("content")
     @classmethod
@@ -159,10 +177,16 @@ class SendMessageRequest(_RequestModel):
         return _require_visible_content(value, field_label="Message content")
 
 
-class RecomposeRequest(_RequestModel):
-    """Only retry the conversational user row the client actually selected."""
+class RecomposeRequest(_SessionOperationRequest):
+    """Immutable retry target and the exact head seen at the retry click."""
 
     expected_user_message_id: UUID
+    state_id: UUID | None = None
+
+    @field_validator("expected_user_message_id", "state_id", mode="before")
+    @classmethod
+    def _validate_uuid(cls, value: object) -> UUID | None:
+        return _canonical_request_uuid(value)
 
 
 type ToolCallObject = dict[str, JsonValue]
@@ -213,7 +237,7 @@ class ChatMessageResponse(_StrictResponse):
     """
 
     id: str
-    client_request_id: str | None = None
+    operation_id: str | None = None
     session_id: str
     role: str
     content: str
@@ -702,3 +726,125 @@ class OptOutSummaryResponse(_StrictResponse):
 MessageWithStateResponse.model_rebuild()
 ForkSessionResponse.model_rebuild()
 InterpretationResolveResponse.model_rebuild()
+
+
+class ComposerOperationAcceptedResponse(_StrictResponse):
+    """Idempotent admission acknowledgement; the durable GET owns the answer."""
+
+    operation_id: str = Field(min_length=36, max_length=36)
+    kind: ComposerOperationKind
+    status: ComposerOperationStatus
+    poll_after_ms: int = Field(ge=100, le=60_000)
+
+    @field_validator("operation_id")
+    @classmethod
+    def _validate_operation_id(cls, value: str) -> str:
+        return require_canonical_operation_id(value)
+
+
+class ComposerOperationStatusResponse(ComposerOperationAcceptedResponse):
+    cancel_requested: bool
+    deadline_at: datetime
+    deadline_remaining_ms: int = Field(ge=0)
+    result: MessageWithStateResponse | None = None
+    error: ComposerOperationError | None = None
+
+    @model_validator(mode="after")
+    def _validate_status_bundle(self) -> ComposerOperationStatusResponse:
+        if self.status in ("queued", "running"):
+            if self.result is not None or self.error is not None:
+                raise ValueError("Live operation cannot carry terminal result")
+        elif self.status == "completed":
+            if self.result is None or self.error is not None or self.cancel_requested or self.deadline_remaining_ms != 0:
+                raise ValueError("Invalid completed operation response")
+        elif self.error is None or self.result is not None or self.deadline_remaining_ms != 0:
+            raise ValueError("Invalid failed operation response")
+        return self
+
+
+class ComposerOperationStreamStatusPayload(_StrictResponse):
+    status: Literal["queued", "running"]
+    cancel_requested: bool
+    deadline_remaining_ms: int = Field(ge=0)
+
+
+class ComposerOperationStreamTerminalPayload(_StrictResponse):
+    status: Literal["completed", "failed"]
+
+
+class ComposerOperationStreamProgressPayload(_StrictResponse):
+    """Existing provider-safe vocabulary, bound to exactly one worker lease."""
+
+    session_operation_id: str = Field(min_length=1, max_length=128)
+    session_operation_epoch: int = Field(ge=1)
+    request_token: str = Field(min_length=1, max_length=128)
+    request_id: str | None = Field(default=None, max_length=128)
+    phase: ComposerProgressPhase
+    headline: str = Field(min_length=1, max_length=180)
+    evidence: tuple[str, ...] = Field(default=(), max_length=4)
+    likely_next: str | None = Field(default=None, min_length=1, max_length=180)
+    reason: ComposerProgressReason | None = None
+    updated_at: datetime
+
+    @field_validator("evidence")
+    @classmethod
+    def _validate_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not 1 <= len(item) <= 180 for item in value):
+            raise ValueError("Progress evidence must be bounded")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_reason(self) -> ComposerOperationStreamProgressPayload:
+        if self.phase in ("failed", "cancelled") and self.reason is None:
+            raise ValueError("Failed/cancelled progress requires a reason")
+        return self
+
+
+class _ComposerOperationStreamFrame(_StrictResponse):
+    schema_version: Literal["composer-operation-stream.v1"] = "composer-operation-stream.v1"
+    session_id: str = Field(min_length=36, max_length=36)
+    operation_id: str = Field(min_length=36, max_length=36)
+    sequence: int = Field(ge=0)
+
+    @field_validator("session_id", "operation_id")
+    @classmethod
+    def _validate_identity(cls, value: str) -> str:
+        return require_canonical_operation_id(value)
+
+
+class ComposerOperationStreamStatusFrame(_ComposerOperationStreamFrame):
+    event: Literal["status"] = "status"
+    payload: ComposerOperationStreamStatusPayload
+
+
+class ComposerOperationStreamProgressFrame(_ComposerOperationStreamFrame):
+    event: Literal["progress"] = "progress"
+    payload: ComposerOperationStreamProgressPayload
+
+
+class ComposerOperationStreamHeartbeatFrame(_ComposerOperationStreamFrame):
+    event: Literal["heartbeat"] = "heartbeat"
+
+
+class ComposerOperationStreamTerminalFrame(_ComposerOperationStreamFrame):
+    event: Literal["terminal"] = "terminal"
+    payload: ComposerOperationStreamTerminalPayload
+
+
+type ComposerOperationStreamFrame = (
+    ComposerOperationStreamStatusFrame
+    | ComposerOperationStreamProgressFrame
+    | ComposerOperationStreamHeartbeatFrame
+    | ComposerOperationStreamTerminalFrame
+)
+
+COMPOSER_OPERATION_STREAM_FRAME_MAX_BYTES = 64 * 1024
+
+
+def encode_composer_operation_stream_frame(frame: ComposerOperationStreamFrame) -> bytes:
+    """Bound the actual UTF-8 SSE bytes, including framing."""
+    exact = type(frame).model_validate(frame.model_dump(mode="python"), strict=True)
+    encoded = f"event: {exact.event}\ndata: {exact.model_dump_json()}\n\n".encode()
+    if len(encoded) > COMPOSER_OPERATION_STREAM_FRAME_MAX_BYTES:
+        raise ValueError("Composer operation stream frame exceeds encoded byte bound")
+    return encoded
