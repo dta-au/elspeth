@@ -119,7 +119,10 @@ async def test_owned_child_failure_outranks_persisted_stop_in_actual_failure_tra
                     )
             else:
                 await composer_turn._join_auto_title(
-                    asyncio.create_task(fail_child()), session_id=session.id, operation_id=job.turn.operation_id
+                    asyncio.create_task(fail_child()),
+                    session_id=session.id,
+                    operation_id=job.turn.operation_id,
+                    cancellation_observations=[],
                 )
         worker = _worker(app, job.authority)
         terminal = await worker._settle_failure(composer_app_services(app), job.running, captured.value)

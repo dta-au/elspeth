@@ -446,7 +446,13 @@ def _message_with_state_response(
     )
 
 
-async def _join_auto_title(task: asyncio.Task[None], *, session_id: UUID, operation_id: str) -> None:
+async def _join_auto_title(
+    task: asyncio.Task[None],
+    *,
+    session_id: UUID,
+    operation_id: str,
+    cancellation_observations: list[asyncio.CancelledError],
+) -> None:
     """Bounded, cancellation-safe join of the first-message auto-title child (E12; review m3).
 
     The child is lease-owned and writes the title under the COMPOSE fence, so it
@@ -468,8 +474,10 @@ async def _join_auto_title(task: asyncio.Task[None], *, session_id: UUID, operat
     try:
         done, _pending = await asyncio.wait({task}, timeout=_AUTO_TITLE_JOIN_SECONDS)
     except asyncio.CancelledError as cancellation:
+        if all(cancellation is not earlier for earlier in cancellation_observations):
+            cancellation_observations.append(cancellation)
         task.cancel()
-        await _join_cancelled_auto_title(task)
+        await _join_cancelled_auto_title(task, cancellation_observations=cancellation_observations)
         slog.warning(
             "composer_operation.auto_title_join_cancelled",
             session_id=str(session_id),
@@ -479,7 +487,15 @@ async def _join_auto_title(task: asyncio.Task[None], *, session_id: UUID, operat
         raise cancellation
     if task not in done:
         task.cancel()
-        await _join_cancelled_auto_title(task)
+        await _join_cancelled_auto_title(task, cancellation_observations=cancellation_observations)
+        if cancellation_observations:
+            slog.warning(
+                "composer_operation.auto_title_join_cancelled",
+                session_id=str(session_id),
+                operation_id=operation_id,
+                child_settled=task.done(),
+            )
+            raise cancellation_observations[0]
         slog.warning(
             "composer_operation.auto_title_join_timed_out",
             session_id=str(session_id),
@@ -502,18 +518,31 @@ def _required_title_result(task: asyncio.Task[None]) -> None:
         raise ComposerOwnedSettlementFailure() from exc
 
 
-async def _join_cancelled_auto_title(task: asyncio.Task[None]) -> None:
-    """An intentionally cancelled title child settles accounting before exiting."""
+async def _join_cancelled_auto_title(task: asyncio.Task[None], *, cancellation_observations: list[asyncio.CancelledError]) -> None:
+    """Join the physical child, retaining only cancellations delivered to this caller."""
+    owner = asyncio.current_task()
     while not task.done():
+        cancelling_before = owner.cancelling() if owner is not None else 0
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            if (not task.cancelled() or (owner is not None and owner.cancelling() > cancelling_before)) and all(
+                cancellation is not earlier for earlier in cancellation_observations
+            ):
+                cancellation_observations.append(cancellation)
             continue
-        except Exception:
+        except BaseException:
             if not task.done():
                 raise
-    if not task.cancelled():
-        _required_title_result(task)
+    try:
+        if not task.cancelled():
+            _required_title_result(task)
+    except BaseException as child_failure:
+        if cancellation_observations:
+            raise BaseExceptionGroup(
+                "Auto-title join retained child failure and caller cancellations", [child_failure, *cancellation_observations]
+            ) from child_failure
+        raise
 
 
 async def _required_audit[T](observation: ComposerTurnObservation, work: Coroutine[object, object, T]) -> T:
@@ -670,6 +699,7 @@ async def _run_composer_turn(
     """Run one freeform send or recompose turn to its settled success; see the module docstring."""
     deferred_cancellation: asyncio.CancelledError | None = None
     continuation_cancellations: list[asyncio.CancelledError] = []
+    auto_title_cancellations: list[asyncio.CancelledError] = []
     if running.claim.session_id != turn.session_id or running.claim.operation_id != turn.operation_id:
         raise AuditIntegrityError("composer turn input does not match its running operation")
     if lease.context != running.session_operation_context:
@@ -1139,7 +1169,12 @@ async def _run_composer_turn(
                 # only once the join finished by any route (m3), so the outer finally
                 # never joins it twice and a cancel here never orphans the child.
                 try:
-                    await _join_auto_title(auto_title_task, session_id=turn.session_id, operation_id=turn.operation_id)
+                    await _join_auto_title(
+                        auto_title_task,
+                        session_id=turn.session_id,
+                        operation_id=turn.operation_id,
+                        cancellation_observations=auto_title_cancellations,
+                    )
                 finally:
                     auto_title_task = None
             continuation = lease.create_task(
@@ -1525,6 +1560,8 @@ async def _run_composer_turn(
     except asyncio.CancelledError as exc:
         if request_lifecycle.durable_completed:
             terminal_status = "completed"
+            if len(auto_title_cancellations) > 1:
+                raise BaseExceptionGroup("Auto-title join retained caller cancellations", auto_title_cancellations) from exc
             raise
         # messages.py:953-1017, both kinds: each write runs as its own task joined
         # through the shielded join, so it is durable before the re-raise and
@@ -1532,43 +1569,68 @@ async def _run_composer_turn(
         # compose()'s own CancelledError, when there is no compose result.
         llm_calls = _llm_calls_from_exception(exc)
         observation.pending_exception_llm_calls = llm_calls
-        if llm_calls:
+        try:
+            if llm_calls:
+                await _join_shielded_task_after_cancellation(
+                    asyncio.create_task(
+                        _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                            session_operation_context=lease.context,
+                            required_audit=True,
+                            required_work=observation.required_work,
+                        ),
+                        name=labels.cancelled_llm_task_name,
+                    ),
+                    primary_cancellation=exc,
+                )
+                observation.audit_cohort_durable = True
+            user_stop = _cancel_is_user_stop(exc)
             await _join_shielded_task_after_cancellation(
                 asyncio.create_task(
-                    _persist_llm_calls(
-                        service,
-                        session.id,
-                        llm_calls,
-                        compose_base_state_id,
-                        plugin_crash_pending=True,
-                        session_operation_context=lease.context,
-                        required_audit=True,
-                        required_work=observation.required_work,
+                    _publish_progress(
+                        progress_sink,
+                        event=client_cancelled_progress_event() if user_stop else _composer_heartbeat_failed_progress_event(),
                     ),
-                    name=labels.cancelled_llm_task_name,
+                    name=labels.cancelled_progress_task_name,
                 ),
                 primary_cancellation=exc,
             )
-            observation.audit_cohort_durable = True
-        user_stop = _cancel_is_user_stop(exc)
-        await _join_shielded_task_after_cancellation(
-            asyncio.create_task(
-                _publish_progress(
-                    progress_sink,
-                    event=client_cancelled_progress_event() if user_stop else _composer_heartbeat_failed_progress_event(),
-                ),
-                name=labels.cancelled_progress_task_name,
-            ),
-            primary_cancellation=exc,
-        )
+        except BaseException as cleanup_failure:
+            if len(auto_title_cancellations) > 1:
+                raise BaseExceptionGroup(
+                    "Composer cancellation cleanup retained auto-title caller cancellations",
+                    [cleanup_failure, *auto_title_cancellations],
+                ) from cleanup_failure
+            raise
         terminal_status = "cancelled" if user_stop else "failed"
+        if len(auto_title_cancellations) > 1:
+            raise BaseExceptionGroup("Auto-title join retained caller cancellations", auto_title_cancellations) from exc
         raise
     finally:
         _COMPOSER_REQUESTS_INFLIGHT.add(-1, {"endpoint": labels.endpoint})
         _record_composer_request_terminal(terminal_status, endpoint=labels.endpoint)
         if auto_title_task is not None:
             # Every exit that did not reach the pre-terminal join (m3).
-            await _join_auto_title(auto_title_task, session_id=turn.session_id, operation_id=turn.operation_id)
+            original = sys.exception()
+            try:
+                await _join_auto_title(
+                    auto_title_task,
+                    session_id=turn.session_id,
+                    operation_id=turn.operation_id,
+                    cancellation_observations=auto_title_cancellations,
+                )
+            except BaseException as title_failure:
+                retained: list[BaseException] = []
+                for retained_error in (original, title_failure, *auto_title_cancellations):
+                    if retained_error is not None and all(retained_error is not earlier for earlier in retained):
+                        retained.append(retained_error)
+                if len(retained) > 1:
+                    raise BaseExceptionGroup("Composer turn retained original and auto-title join failures", retained) from title_failure
+                raise
 
 
 async def run_composer_turn(

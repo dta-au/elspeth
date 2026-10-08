@@ -922,9 +922,11 @@ async def test_cancel_during_the_auto_title_join_settles_the_child_and_keeps_the
             assert job.observation.compose_result is composer.compose.return_value
             await asyncio.sleep(0.05)
             assert not task.done()
-            task.cancel(composer_turn._COMPOSER_OPERATION_CANCEL_REQUESTED)
-            with pytest.raises(asyncio.CancelledError):
+            marker = composer_turn._COMPOSER_OPERATION_CANCEL_REQUESTED
+            task.cancel(marker)
+            with pytest.raises(asyncio.CancelledError) as caught:
                 await task
+            assert caught.value.args[0] is marker
         assert title_cancelled.is_set()
         assert job.observation.audit_cohort_durable is False
         assert job.lifecycle.durable_completed is False
@@ -1226,6 +1228,8 @@ async def test_detached_retry_preserves_partial_tool_prefix_without_replaying_to
 async def test_cancelled_turn_required_audit_failure_outranks_cancellation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from sqlalchemy.exc import SQLAlchemyError
 
+    from elspeth.web.required_work import RequiredWorkSource, RequiredWorkSubphase
+
     app, service = _make_app(tmp_path)
     call = _llm_call()
 
@@ -1233,18 +1237,49 @@ async def test_cancelled_turn_required_audit_failure_outranks_cancellation(tmp_p
         async def compose(self, *args: Any, **kwargs: Any) -> ComposerResult:
             raise _cancelled_error_with_llm_call(call)
 
-    async def fail_insert(*args: Any, **kwargs: Any) -> Any:
-        raise SQLAlchemyError("required audit insert failed")
+    original_insert = service._insert_chat_message
+    insert_failure = SQLAlchemyError("required audit insert failed")
+    audit_insert_hits = 0
+
+    def fail_insert(conn: Any, **kwargs: Any) -> str:
+        nonlocal audit_insert_hits
+        if kwargs["role"] == "audit" and kwargs["audit_only"] is True:
+            assert kwargs["writer_principal"] == "compose_loop"
+            assert kwargs["tool_calls"][0]["_kind"] == "llm_call_audit"
+            audit_insert_hits += 1
+            raise insert_failure
+        return original_insert(conn, **kwargs)
 
     app.state.composer_service = CancelledComposer()
     session = await service.create_session("alice", "Required evidence", "local")
     async with _running_job(app, service, session.id, kind="compose_message", content="Go.") as job:
-        monkeypatch.setattr(service, "add_messages_atomic", fail_insert)
+        monkeypatch.setattr(service, "_insert_chat_message", fail_insert)
         with pytest.raises(AuditIntegrityError, match="composer_llm_call_persist_failed"):
             await _run(app, job)
+        assert audit_insert_hits == 1
         assert job.observation.pending_exception_llm_calls == (call,)
         assert job.observation.audit_cohort_durable is False
         assert (await _row(job)).status == "running"
+        required_work = job.observation.required_work
+        assert required_work is not None
+        audit_sql_tickets = tuple(
+            ticket for ticket in required_work.tickets if ticket.key.source is RequiredWorkSource.REQUIRED_UNWIND_AUDIT_SQL
+        )
+        assert len(audit_sql_tickets) == 2
+        (audit_producer,) = tuple(ticket for ticket in audit_sql_tickets if ticket.key.subphase is RequiredWorkSubphase.PRODUCER)
+        (audit_sql_ticket,) = tuple(ticket for ticket in audit_sql_tickets if ticket.key.subphase is RequiredWorkSubphase.SQL_INITIAL)
+        assert audit_producer.key.invocation_ordinal == audit_sql_ticket.key.invocation_ordinal
+        assert audit_producer.complete and audit_producer.errors == () and audit_producer.receipts() == ()
+        assert audit_sql_ticket.complete
+        assert audit_sql_ticket.errors == (insert_failure,)
+        (receipt,) = audit_sql_ticket.receipts()
+        assert receipt.original_root is insert_failure
+        (audit_projection,) = tuple(
+            ticket for ticket in required_work.tickets if ticket.key.source is RequiredWorkSource.REQUIRED_UNWIND_AUDIT_PROJECTION
+        )
+        assert audit_projection.key.subphase is RequiredWorkSubphase.PROJECTION
+        assert audit_projection.complete and audit_projection.errors == () and audit_projection.receipts() == ()
+    assert required_work.all_completed
 
 
 @pytest.mark.asyncio
@@ -1256,7 +1291,7 @@ async def test_owned_title_failure_has_nominal_priority_marker() -> None:
 
     title = asyncio.create_task(fail_title())
     with pytest.raises(ComposerOwnedSettlementFailure, match="owned settlement did not complete") as raised:
-        await composer_turn._join_auto_title(title, session_id=uuid.uuid4(), operation_id=str(uuid.uuid4()))
+        await composer_turn._join_auto_title(title, session_id=uuid.uuid4(), operation_id=str(uuid.uuid4()), cancellation_observations=[])
     assert isinstance(raised.value.__cause__, RuntimeError)
     assert "private" not in str(raised.value)
 
@@ -1317,15 +1352,170 @@ async def test_cancellation_resistant_title_must_actually_finish_before_join_ret
     monkeypatch.setattr(composer_turn, "_AUTO_TITLE_JOIN_SECONDS", 0.01)
     child = asyncio.create_task(title_accounting())
     await entered.wait()
-    join = asyncio.create_task(composer_turn._join_auto_title(child, session_id=uuid.uuid4(), operation_id=str(uuid.uuid4())))
+    observed: list[asyncio.CancelledError] = []
+    join = asyncio.create_task(
+        composer_turn._join_auto_title(child, session_id=uuid.uuid4(), operation_id=str(uuid.uuid4()), cancellation_observations=observed)
+    )
     await cancelled.wait()
     assert not join.done()
     assert not finished.is_set()
-    join.cancel("repeated caller cancellation")
+    marker = object()
+    join.cancel(marker)
+    for _ in range(100):
+        if observed:
+            break
+        await asyncio.sleep(0.01)
+    assert len(observed) == 1 and observed[0].args[0] is marker and not finished.is_set()
     release.set()
-    await join
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await join
+    assert len(observed) == 1 and caught.value is observed[0] and caught.value.args[0] is marker
     assert child.done()
     assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_initial_auto_title_join_caller_cancellation_keeps_exact_original_and_settles_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    observed: list[asyncio.CancelledError] = []
+
+    async def title_accounting() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(composer_turn, "_AUTO_TITLE_JOIN_SECONDS", 30.0)
+    child = asyncio.create_task(title_accounting())
+    await entered.wait()
+    join = asyncio.create_task(
+        composer_turn._join_auto_title(child, session_id=uuid.uuid4(), operation_id=str(uuid.uuid4()), cancellation_observations=observed)
+    )
+    await asyncio.sleep(0)
+    assert not join.done()
+    marker = object()
+    join.cancel(marker)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await join
+    assert len(observed) == 1 and caught.value is observed[0] and caught.value.args[0] is marker
+    assert cancelled.is_set() and child.done()
+
+
+@pytest.mark.asyncio
+async def test_auto_title_timeout_retains_repeated_late_caller_cancellations_after_physical_child_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, service = _make_app(tmp_path)
+    composer = _make_composer_mock("Never published after cancellation.")
+    app.state.composer_service = composer
+    session = await service.create_session("alice", "New session", "local")
+    entered, child_cancelled, release, child_finished = (asyncio.Event() for _ in range(4))
+    observations: list[asyncio.CancelledError] | None = None
+    original_join = composer_turn._join_cancelled_auto_title
+
+    async def resistant_title(**kwargs: Any) -> None:
+        del kwargs
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            child_cancelled.set()
+            await release.wait()
+        child_finished.set()
+
+    async def observe_join(task: asyncio.Task[None], *, cancellation_observations: list[asyncio.CancelledError]) -> None:
+        nonlocal observations
+        assert observations is None
+        observations = cancellation_observations
+        await original_join(task, cancellation_observations=cancellation_observations)
+
+    monkeypatch.setattr(composer_turn, "maybe_auto_title_session", resistant_title)
+    monkeypatch.setattr(composer_turn, "_join_cancelled_auto_title", observe_join)
+    monkeypatch.setattr(composer_turn, "_AUTO_TITLE_JOIN_SECONDS", 0.01)
+    async with _running_job(app, service, session.id, kind="compose_message", content="Title me.") as job:
+        task = asyncio.create_task(_run(app, job))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            await asyncio.wait_for(child_cancelled.wait(), timeout=5)
+            assert job.observation.compose_result is composer.compose.return_value
+            assert not task.done() and not child_finished.is_set()
+            first_marker = composer_turn._COMPOSER_OPERATION_CANCEL_REQUESTED
+            second_marker = object()
+            task.cancel(first_marker)
+            for _ in range(100):
+                if observations is not None and len(observations) == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert observations is not None and len(observations) == 1 and observations[0].args[0] is first_marker
+            task.cancel(second_marker)
+            for _ in range(100):
+                if len(observations) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(observations) == 2 and observations[1].args[0] is second_marker
+            assert observations[0] is not observations[1] and not task.done() and not child_finished.is_set()
+            assert (await _row(job)).status == "running"
+            release.set()
+            with pytest.raises(BaseExceptionGroup) as raised:
+                await task
+            assert len(raised.value.exceptions) == 2
+            assert all(actual is retained for actual, retained in zip(raised.value.exceptions, observations, strict=True))
+            assert child_finished.is_set()
+            assert job.lifecycle.durable_completed is False
+            assert (await _row(job)).status == "running"
+        finally:
+            release.set()
+            if not task.done():
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(task, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_auto_title_late_caller_cancellation_keeps_physical_child_failure_priority(monkeypatch: pytest.MonkeyPatch) -> None:
+    entered, child_cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    observed: list[asyncio.CancelledError] = []
+    child_failure = AuditIntegrityError("Title accounting did not settle")
+
+    async def failing_title() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            child_cancelled.set()
+            await release.wait()
+        raise child_failure
+
+    monkeypatch.setattr(composer_turn, "_AUTO_TITLE_JOIN_SECONDS", 0.01)
+    child = asyncio.create_task(failing_title())
+    await entered.wait()
+    join = asyncio.create_task(
+        composer_turn._join_auto_title(child, session_id=uuid.uuid4(), operation_id=str(uuid.uuid4()), cancellation_observations=observed)
+    )
+    try:
+        await asyncio.wait_for(child_cancelled.wait(), timeout=5)
+        marker = object()
+        join.cancel(marker)
+        for _ in range(100):
+            if observed:
+                break
+            await asyncio.sleep(0.01)
+        assert len(observed) == 1 and observed[0].args[0] is marker and not child.done()
+        release.set()
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await join
+        assert len(raised.value.exceptions) == 2
+        assert raised.value.exceptions[0] is child_failure
+        assert raised.value.exceptions[1] is observed[0]
+        assert child.done()
+    finally:
+        release.set()
+        if not join.done():
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(join, timeout=5)
 
 
 @pytest.mark.asyncio
