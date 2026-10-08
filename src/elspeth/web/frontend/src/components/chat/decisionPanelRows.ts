@@ -51,7 +51,6 @@ export const INTERPRETATION_REVIEW_PENDING_CODE = "interpretation_review_pending
 export type BlockedVerb = "run" | "save_for_review";
 
 export type DecisionRow =
-  | { kind: "inline_source_fallback"; id: string; candidateText: string }
   | {
       kind: "blocker";
       id: string;
@@ -89,7 +88,6 @@ export type DecisionRow =
     };
 
 export interface DecisionRowsInput {
-  inlineSourceCandidate?: string | null;
   validationResult: ValidationResult | null;
   compositionState: CompositionState | null;
   pendingInterpretations: readonly InterpretationEvent[];
@@ -185,11 +183,6 @@ export function projectDecisionRows(input: DecisionRowsInput): DecisionRows {
     proposalId: proposal.id,
   }));
 
-  const fallbackRows: DecisionRow[] = input.inlineSourceCandidate == null ? [] : [{
-    kind: "inline_source_fallback",
-    id: `inline-source:${input.inlineSourceCandidate}`,
-    candidateText: input.inlineSourceCandidate,
-  }];
-  const rows = [...blockerRows, ...suggestionRows, ...pointerRows, ...proposalRows, ...fallbackRows];
+  const rows = [...blockerRows, ...suggestionRows, ...pointerRows, ...proposalRows];
   return { rows, blockedVerbs, count: rows.length };
 }

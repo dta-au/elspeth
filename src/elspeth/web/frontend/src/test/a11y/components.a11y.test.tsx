@@ -43,7 +43,6 @@ const AUDITED_COMPONENTS = [
   "HeaderVersionSelector",
   "GraphMiniView",
   "InlineSourceCreatedTurn",
-  "InlineSourceFallbackPrompt",
   "CompletionBar",
   "PluginCard",
   "FilterChipStrip",
@@ -101,7 +100,6 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "HeaderVersionSelector",
   "HelloWorldTutorial",
   "InlineSourceCreatedTurn",
-  "InlineSourceFallbackPrompt",
   "LoginPage",
   "PipelineGloss",
   "PipelineValidationSummary",
@@ -266,7 +264,6 @@ import { HeaderSessionSwitcher } from "@/components/sessions/HeaderSessionSwitch
 import { HeaderVersionSelector } from "@/components/header/HeaderVersionSelector";
 import { GraphMiniView } from "@/components/sidebar/GraphMiniView";
 import { InlineSourceCreatedTurn } from "@/components/chat/InlineSourceCreatedTurn";
-import { InlineSourceFallbackPrompt } from "@/components/chat/InlineSourceFallbackPrompt";
 import { CompletionBar } from "@/components/composer/CompletionBar";
 import { PluginCard } from "@/components/catalog/PluginCard";
 import { FilterChipStrip, type CatalogFilters } from "@/components/catalog/FilterChipStrip";
@@ -655,20 +652,6 @@ describe("InlineSourceCreatedTurn", () => {
     };
     const { container } = render(
       <InlineSourceCreatedTurn summary={summary} onEdit={() => {}} />,
-    );
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("InlineSourceFallbackPrompt", () => {
-  it("has no axe violations", async () => {
-    const { container } = render(
-      <InlineSourceFallbackPrompt
-        shouldRender={true}
-        candidateText="https://example.com"
-        onAccept={() => {}}
-        onDismiss={() => {}}
-      />,
     );
     expect(await axe(container)).toHaveNoViolations();
   });

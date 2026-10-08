@@ -5,7 +5,7 @@
    .message-failed-*, .message-retry-btn, .message-pending, .message-tools*,
    .message-sources-created*, .inline-source-created-turn*,
    .message-group-separator, .tool-call-*,
-   .inline-source-fallback-prompt*, .pending-overlay-pill, .spec-pending-proposal,
+   .pending-overlay-pill, .spec-pending-proposal,
    .yaml-pending-summary, .runs-pending-proposal, .composing-*,
    .freeform-introduction, .proposal-diff*.
    Tenants (execution- or composer-named but chat-mounted — they render
@@ -2139,67 +2139,6 @@
 
 .decision-panel-checks-btn {
   min-height: var(--size-control-compact);
-}
-
-/* Inline-source fallback prompt. This sits beside the chat input rather than
-   inside the message log, so it owns its own input-aligned margins. */
-.inline-source-fallback-prompt {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-md);
-  margin: 0 var(--space-lg) var(--space-sm);
-  padding: var(--space-sm) var(--space-md);
-  border: 1px solid var(--color-border-strong);
-  /* Settled transcript accent width — see .tool-call-card. */
-  border-left: 3px solid var(--color-accent);
-  border-radius: var(--radius-md);
-  background: var(--color-surface-elevated);
-  color: var(--color-text);
-}
-
-.inline-source-fallback-prompt-copy {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.inline-source-fallback-prompt-title,
-.inline-source-fallback-prompt-detail {
-  margin: 0;
-  line-height: 1.35;
-}
-
-.inline-source-fallback-prompt-title {
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-}
-
-.inline-source-fallback-prompt-detail {
-  margin-top: var(--space-2xs);
-  color: var(--color-text-muted);
-  font-size: var(--font-size-sm);
-}
-
-.inline-source-fallback-prompt-actions {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: var(--space-sm);
-}
-
-.inline-source-fallback-prompt-dismiss {
-  background: transparent;
-}
-
-@media (max-width: 760px) {
-  .inline-source-fallback-prompt {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .inline-source-fallback-prompt-actions {
-    flex-wrap: wrap;
-  }
 }
 
 .pending-overlay-pill {
