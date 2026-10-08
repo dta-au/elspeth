@@ -1,0 +1,28 @@
+control empty: status=text lines=0
+control unterminated: status=text lines=1
+control lf: status=text lines=2
+control crlf: status=text lines=2
+control cr_only: status=text lines=1
+control unicode_separator: status=text lines=1
+control binary_nul: status=nul lines=None
+control binary_invalid_utf8: status=non_utf8 lines=None
+control boundary_5000: status=text lines=5000
+control boundary_5001: status=text lines=5001
+control boundary_10000: status=text lines=10000
+control boundary_10001: status=text lines=10001
+mutation threshold=5000: before=5000 selected=False after=5001 selected=True
+mutation threshold=10000: before=10000 selected=False after=10001 selected=True
+git-tree control: entries=6 selected=['positive.txt'] binary_excluded=True symlink_excluded=True
+compact reconstruction main: rows=6133 equality_with_git_blob_inventory=True
+compact reconstruction published-pr281: rows=6393 equality_with_git_blob_inventory=True
+compact reconstruction streaming-local: rows=6135 equality_with_git_blob_inventory=True
+compact reconstruction repair-integrated: rows=6395 equality_with_git_blob_inventory=True
+self-test and inventory process exit=0
+ruff check --no-cache: All checks passed!
+excluded path/status sets equal across five observations=True; symlink=12 nul=11 non_utf8=1 total=24
+
+LF artifact packaging verification:
+LF producer inventory.csv: retained_data_rows=6133 reproduced_fixed_data_rows=6133 reviewed_parsed_rows_equal=True fresh_fixed_parsed_rows_equal=True LF_only=True
+LF producer snapshot-deltas.csv: retained_data_rows=1726 reproduced_fixed_data_rows=1166 reviewed_parsed_rows_equal=True fresh_fixed_parsed_rows_equal=True LF_only=True
+LF producer changed-overlap.csv: retained_data_rows=1726 reproduced_fixed_data_rows=1166 reviewed_parsed_rows_equal=True fresh_fixed_parsed_rows_equal=True LF_only=True
+final standalone self-test exit=0; fixed snapshot reproduction exit=0; ruff check passed; ruff format completed
