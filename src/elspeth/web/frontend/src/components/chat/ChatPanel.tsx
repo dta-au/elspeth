@@ -32,7 +32,6 @@ import {
 import { MessageBubble } from "./MessageBubble";
 import { groupIntoTurns, turnRepresentativeMessage, type ChatTurn } from "./turns";
 import { ComposingIndicator } from "./ComposingIndicator";
-import { AuthorityChip } from "./AuthorityChip";
 import {
   ChatInput,
   uploadedBlobPromptSentence,
@@ -1043,20 +1042,12 @@ export function ChatPanelContent({
       data-composing={isComposing ? "true" : undefined}
     >
       {decisionLiveRegion}
-      {/* Persistent composer authority. Mode preferences live in Preferences. */}
-      <div className="chat-panel-header">
-        {/* Layout lives in chat.css, NOT in a style prop (elspeth-0b70269ccc).
-            As an inline style this row was `inline-flex` with no wrap and no
-            min-width, which no stylesheet rule and therefore no breakpoint
-            could override — the row stayed one line at every width and the
-            ModeSwitchButton clipped to "Sw" at 390px. */}
-        <div className="chat-panel-header-actions">
-          {/* Persistent composer authority (elspeth-f5e6723133): whether
-              this session auto-applies mutations or gates them behind
-              proposals — named in the chrome. */}
-          <AuthorityChip />
-        </div>
-      </div>
+      {/* No header row: the conversation starts at the top of the pane. The
+          row used to hold only the composer-authority chip, which could only
+          ever read "Auto-apply on" — no UI sets another trust mode
+          (updateComposerPreferences has no caller) and auto_commit is the
+          default — so it was 53px of chrome stating a constant. The
+          transcript already labels each change the composer applies. */}
 
       {/* Error banner. Renders the primary error message plus, when
           present, a bulleted list of structured `errorDetails` (currently

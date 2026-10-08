@@ -153,12 +153,11 @@
   gap: var(--space-sm);
   align-items: center;
   justify-content: space-between;
-  /* Shared band-height contract: this toolbar and .chat-panel-header
-     meet across the pane seam and must end on one line,
-     so every band derives its height from --size-workspace-band and centers
-     its content (no vertical padding — asymmetric or per-band padding is how
-     the bands drifted apart; see tokens.css). The short-screen density
-     regime below shrinks the token, and with it every band at once. */
+  /* Band height from --size-workspace-band, content centred (no vertical
+     padding). The short-screen density regime below shrinks the token. The
+     authoring pane has no matching band any more — the chat column's
+     header row held only a constant "Auto-apply on" chip and was removed
+     (2026-10-08), so the conversation starts at the top of its pane. */
   min-height: var(--size-workspace-band);
   padding: 0 var(--artifact-gutter);
   border-bottom: 1px solid var(--color-border, currentcolor);
@@ -936,12 +935,9 @@
 }
 
 @media (min-width: 961px) and (max-height: 800px) {
-  /* Short-screen density: drop the shared band token so ALL header bands
-     (toolbar and chat-panel header) compress together and the
-     cross-pane seam stays on one line. 45px = the regime's historic toolbar
-     height (4px + 36px compact control + 4px + 1px seam). Before the token,
-     only the toolbar compressed here — leaving it 8px shorter than the
-     freeform header on every ≤800px-tall viewport. */
+  /* Short-screen density: drop the band token so the artifact toolbar
+     compresses. 45px = the regime's historic toolbar height (4px + 36px
+     compact control + 4px + 1px seam). */
   .composer-workspace {
     --size-workspace-band: 45px;
 

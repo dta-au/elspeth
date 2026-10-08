@@ -2956,13 +2956,13 @@ describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {
     expect(status?.querySelector("button")).toBeNull();
   });
 
-  it("keeps the freeform header to compose-state chrome — authority chip stays, model chip and title do not (elspeth-8fa71e6d15)", () => {
-    // The model chip (elspeth-e9f7678de8) relocated to AppHeader; the
-    // AuthorityChip is the fact that must stay visible at a glance in the
-    // authoring chrome and must NOT ride along in any such move. Load
-    // preferences so the chip has an authority to name (it renders nothing
-    // until trust_mode is known — absence of chrome, never a fabricated
-    // authority claim).
+  it("starts the conversation at the top of the pane — no header row, no authority or model chip (2026-10-08)", () => {
+    // The header row held only the composer-authority chip, and the chip
+    // could only ever read "Auto-apply on": no UI sets another trust mode and
+    // auto_commit is the default. The model chip had already moved to
+    // AppHeader (elspeth-8fa71e6d15). Preferences are loaded here so a chip
+    // that still existed WOULD render — the absence is the ruling, not an
+    // unloaded store.
     useSessionStore.setState({
       composerPreferences: {
         session_id: "session-1",
@@ -2974,11 +2974,10 @@ describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {
     });
     const { container } = render(<ChatPanel />);
 
-    const header = container.querySelector(".chat-panel-header");
-    expect(header).not.toBeNull();
-    expect(header?.querySelector(".chat-model-chip")).toBeNull();
-    expect(header?.querySelector(".chat-panel-header-title")).toBeNull();
-    expect(header?.querySelector(".chat-authority-chip")).not.toBeNull();
+    expect(container.querySelector(".chat-panel-header")).toBeNull();
+    expect(container.querySelector(".chat-model-chip")).toBeNull();
+    expect(screen.queryByText("Auto-apply on")).toBeNull();
+    expect(screen.queryByLabelText(/composer authority/i)).toBeNull();
   });
 });
 
@@ -3451,7 +3450,7 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
     // scrollbar. All three freeform call sites used to fire it at a sentinel
     // inside the transcript, and whenever the docked chrome pushed
     // .chat-panel's content past its own box the call scrolled the PANEL:
-    // measured in Chrome at scrollTop 0 -> 130, .chat-panel-header carried to
+    // measured in Chrome at scrollTop 0 -> 130, the panel's header row carried to
     // -49, the composer left floating above a void that no re-render could
     // clear because a scroll offset is not React state. Only a reload fixed it.
     //
