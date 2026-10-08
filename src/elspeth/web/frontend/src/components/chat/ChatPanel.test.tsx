@@ -11,10 +11,7 @@ import {
   within,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  ChatPanel,
-  looksLikeData,
-} from "./ChatPanel";
+import { ChatPanel } from "./ChatPanel";
 import {
   _resetSubscriptionsForTesting,
 } from "@/stores/subscriptions";
@@ -1762,110 +1759,21 @@ describe("ChatPanel generic inline-source proposal review", () => {
   });
 });
 
-// ── looksLikeData unit tests (Phase 5a Task 5) ────────────────────────────────
+// ── No "Create source" offer for typed input (ruling 2026-10-08) ─────────────
 //
-// Source-shaped-text detector. The fallback prompt fires only when the
-// predicate is true; false positives produce a disruptive affordance on
-// every conversational turn, so the predicate is intentionally narrow.
-// CLOSED LIST tests pin the two recognised shapes (URL, comma-separated
-// list 2..10 tokens). Spec clause 3 ("short typed phrase under 200 chars
-// containing no ?") was OMITTED — see the comment on `looksLikeData` in
-// ChatPanel.tsx for the rationale.
-describe("looksLikeData", () => {
-  it("returns true for a single http(s) URL", () => {
-    expect(looksLikeData("https://example.com")).toBe(true);
-    expect(looksLikeData("http://example.com/path")).toBe(true);
-  });
-
-  it("returns true for a URL embedded in prose", () => {
-    expect(looksLikeData("check this https://example.com")).toBe(true);
-  });
-
-  it("returns true for a comma-separated list of 2..10 items", () => {
-    expect(looksLikeData("alice, bob, carol")).toBe(true);
-    expect(looksLikeData("a, b")).toBe(true);
-    expect(looksLikeData("one, two, three, four, five, six, seven, eight, nine, ten")).toBe(true);
-  });
-
-  it("returns false for an empty string", () => {
-    expect(looksLikeData("")).toBe(false);
-    expect(looksLikeData("   ")).toBe(false);
-  });
-
-  it("returns false for prose with one or two embedded commas (anchored regex)", () => {
-    // Anchored regex requires the entire trimmed content to consist of
-    // comma-separated tokens. A sentence like "hello, world how are you"
-    // contains a comma but is not a list.
-    expect(looksLikeData("hello, world how are you doing today")).toBe(false);
-  });
-
-  it("returns false for a typical question turn", () => {
-    expect(looksLikeData("what's the best way to do this?")).toBe(false);
-    expect(looksLikeData("how do I add a transform?")).toBe(false);
-  });
-
-  it("returns false for a casual short message (no URL, no list)", () => {
-    // Clause 3 from the spec ("short typed phrase under 200 chars
-    // without ?") was deliberately omitted — see the looksLikeData
-    // comment in ChatPanel.tsx. This test pins that omission so a
-    // future "spec-tightening" pull request doesn't quietly re-add
-    // the over-broad clause and dominate the predicate.
-    expect(looksLikeData("ok")).toBe(false);
-    expect(looksLikeData("Yes please go ahead")).toBe(false);
-  });
-
-  it("returns false for a comma-separated list with > 10 items", () => {
-    // Eleven items — the {1,9} repeater caps at 10 total tokens.
-    expect(
-      looksLikeData("a, b, c, d, e, f, g, h, i, j, k"),
-    ).toBe(false);
-  });
-});
-
-// ── ChatPanel inline-source fallback wiring (Phase 5a Task 5) ─────────────────
-//
-// Integration of the LLM-skip safety-net prompt: ChatPanel computes the
-// predicate (looksLikeData + source-not-bound + no inflight tool-call +
-// not-dismissed) and renders <InlineSourceFallbackPrompt> above the chat
-// input when all four hold. Predicate components are unit-tested directly
-// above; here we check the wiring — predicate-true => render, each
-// suppressor => no-render, accept => natural-language sendMessage,
-// dismiss => markDismissed.
-describe("ChatPanel inline-source fallback prompt", () => {
+// The chat used to offer any recent user message containing a URL (or a short
+// comma list) back as source data, and its "Create source" button resent the
+// WHOLE message prefixed "Use this as my source data:". The first-run tutorial
+// brief carries three URLs, so a learner who reloaded mid-compose was offered
+// their own instructions as data and sent the brief twice. Creating a source
+// from typed input is the composer's job; the chat makes no such offer.
+describe("ChatPanel makes no inline-source offer for typed input", () => {
   const sessionFixture: Session = {
-    id: "session-fallback",
-    title: "Fallback session",
-    created_at: "2026-05-18T10:00:00Z",
-    updated_at: "2026-05-18T10:00:00Z",
+    id: "session-no-source-offer",
+    title: "No source offer",
+    created_at: "2026-10-08T03:04:34Z",
+    updated_at: "2026-10-08T03:04:34Z",
   };
-
-  function makeUserMessage(content: string, idSuffix = "1"): ChatMessage {
-    return {
-      id: `user-fallback-${idSuffix}`,
-      session_id: sessionFixture.id,
-      role: "user",
-      content,
-      tool_calls: null,
-      created_at: "2026-05-18T10:00:00Z",
-    };
-  }
-
-  function makeAssistantWithToolCall(name: string): ChatMessage {
-    return {
-      id: "asst-fallback-1",
-      session_id: sessionFixture.id,
-      role: "assistant",
-      content: "Working on it.",
-      tool_calls: [
-        {
-          id: "tc-fallback-1",
-          type: "function",
-          function: { name, arguments: "{}" },
-        },
-      ],
-      created_at: "2026-05-18T10:00:02Z",
-    };
-  }
 
   beforeEach(() => {
     vi.resetAllMocks();
@@ -1881,165 +1789,28 @@ describe("ChatPanel inline-source fallback prompt", () => {
     });
   });
 
-  it("renders the fallback prompt when a recent user message looks like a URL and no source is bound", () => {
+  it("offers nothing for an idle, source-less session whose instruction contains URLs", () => {
     useSessionStore.setState({
       activeSessionId: sessionFixture.id,
       sessions: [sessionFixture],
-      messages: [makeUserMessage("https://example.com")],
-    });
-
-    render(<ChatPanel />);
-
-    expect(
-      screen.getByRole("region", { name: /inline source fallback prompt/i }),
-    ).toBeInTheDocument();
-  });
-
-  it("does NOT render while the composer is still responding to the user message", () => {
-    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
-      sendMessage: vi.fn(),
-      retryMessage: vi.fn(),
-      isComposing: true,
+      messages: [{
+        id: "user-brief",
+        session_id: sessionFixture.id,
+        role: "user",
+        content:
+          "Build a pipeline to scrape and summarize these project briefs.\n\n" +
+          "https://example.gov.au/project-1.html\nhttps://example.gov.au/project-2.html",
+        tool_calls: null,
+        created_at: "2026-10-08T03:04:36Z",
+      }],
       compositionState: null,
-      error: null,
-    });
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [makeUserMessage("https://example.com")],
     });
 
     render(<ChatPanel />);
 
-    expect(
-      screen.queryByRole("region", { name: /inline source fallback prompt/i }),
-    ).toBeNull();
-  });
-
-  it("does NOT render the prompt when there are no user messages", () => {
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [],
-    });
-
-    render(<ChatPanel />);
-
-    expect(
-      screen.queryByRole("region", { name: /inline source fallback prompt/i }),
-    ).toBeNull();
-  });
-
-  it("does NOT render when the latest user message does not look like data", () => {
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [makeUserMessage("how do I create a pipeline?")],
-    });
-
-    render(<ChatPanel />);
-
-    expect(
-      screen.queryByRole("region", { name: /inline source fallback prompt/i }),
-    ).toBeNull();
-  });
-
-  it("does NOT render when the composition already has a source", () => {
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [makeUserMessage("https://example.com")],
-      // makeComposition's default source is csv_file (plugin !== ""),
-      // which is exactly the source-bound state we want to suppress on.
-      compositionState: makeComposition(1),
-    });
-
-    render(<ChatPanel />);
-
-    expect(
-      screen.queryByRole("region", { name: /inline source fallback prompt/i }),
-    ).toBeNull();
-  });
-
-  it("does NOT render when an in-flight source-related tool call is present", () => {
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [
-        makeUserMessage("https://example.com"),
-        makeAssistantWithToolCall("set_pipeline"),
-      ],
-    });
-
-    render(<ChatPanel />);
-
-    expect(
-      screen.queryByRole("region", { name: /inline source fallback prompt/i }),
-    ).toBeNull();
-  });
-
-  it("does NOT render after the user dismisses (F-20 session-scoped)", () => {
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [makeUserMessage("https://example.com")],
-    });
-    act(() => {
-      useInlineSourceStore.getState().markDismissed(sessionFixture.id);
-    });
-
-    render(<ChatPanel />);
-
-    expect(
-      screen.queryByRole("region", { name: /inline source fallback prompt/i }),
-    ).toBeNull();
-  });
-
-  it("accept dispatches a natural-language chat turn (F-3: no API jargon)", () => {
-    const sendMessage = vi.fn();
-    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
-      sendMessage,
-      retryMessage: vi.fn(),
-      isComposing: false,
-      compositionState: null,
-      error: null,
-    });
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [makeUserMessage("https://example.com")],
-    });
-
-    render(<ChatPanel />);
-
-    fireEvent.click(
-      screen.getByRole("button", { name: /create source/i }),
-    );
-
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    const dispatched = sendMessage.mock.calls[0][0] as string;
-    // F-3 — natural-language framing. Must NOT contain API tokens
-    // ("set_pipeline", "inline_blob", "tool_call"); MUST embed the
-    // candidate text verbatim.
-    expect(dispatched).toMatch(/use this as my source data/i);
-    expect(dispatched).toContain("https://example.com");
-    expect(dispatched).not.toMatch(/set_pipeline|inline_blob|tool_call/i);
-  });
-
-  it("dismiss calls markDismissed on inlineSourceStore for the active session", () => {
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [makeUserMessage("https://example.com")],
-    });
-
-    render(<ChatPanel />);
-
-    fireEvent.click(screen.getByRole("button", { name: /dismiss/i }));
-
-    expect(
-      useInlineSourceStore.getState().isDismissed(sessionFixture.id),
-    ).toBe(true);
+    expect(screen.queryByRole("button", { name: /create source/i })).toBeNull();
+    expect(screen.queryByText(/looks like source data/i)).toBeNull();
+    expect(screen.queryByRole("region", { name: /awaiting your decision/i })).toBeNull();
   });
 });
 
@@ -3185,13 +2956,13 @@ describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {
     expect(status?.querySelector("button")).toBeNull();
   });
 
-  it("keeps the freeform header to compose-state chrome — authority chip stays, model chip and title do not (elspeth-8fa71e6d15)", () => {
-    // The model chip (elspeth-e9f7678de8) relocated to AppHeader; the
-    // AuthorityChip is the fact that must stay visible at a glance in the
-    // authoring chrome and must NOT ride along in any such move. Load
-    // preferences so the chip has an authority to name (it renders nothing
-    // until trust_mode is known — absence of chrome, never a fabricated
-    // authority claim).
+  it("starts the conversation at the top of the pane — no header row, no authority or model chip (2026-10-08)", () => {
+    // The header row held only the composer-authority chip, and the chip
+    // could only ever read "Auto-apply on": no UI sets another trust mode and
+    // auto_commit is the default. The model chip had already moved to
+    // AppHeader (elspeth-8fa71e6d15). Preferences are loaded here so a chip
+    // that still existed WOULD render — the absence is the ruling, not an
+    // unloaded store.
     useSessionStore.setState({
       composerPreferences: {
         session_id: "session-1",
@@ -3203,11 +2974,10 @@ describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {
     });
     const { container } = render(<ChatPanel />);
 
-    const header = container.querySelector(".chat-panel-header");
-    expect(header).not.toBeNull();
-    expect(header?.querySelector(".chat-model-chip")).toBeNull();
-    expect(header?.querySelector(".chat-panel-header-title")).toBeNull();
-    expect(header?.querySelector(".chat-authority-chip")).not.toBeNull();
+    expect(container.querySelector(".chat-panel-header")).toBeNull();
+    expect(container.querySelector(".chat-model-chip")).toBeNull();
+    expect(screen.queryByText("Auto-apply on")).toBeNull();
+    expect(screen.queryByLabelText(/composer authority/i)).toBeNull();
   });
 });
 
@@ -3680,7 +3450,7 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
     // scrollbar. All three freeform call sites used to fire it at a sentinel
     // inside the transcript, and whenever the docked chrome pushed
     // .chat-panel's content past its own box the call scrolled the PANEL:
-    // measured in Chrome at scrollTop 0 -> 130, .chat-panel-header carried to
+    // measured in Chrome at scrollTop 0 -> 130, the panel's header row carried to
     // -49, the composer left floating above a void that no re-render could
     // clear because a scroll offset is not React state. Only a reload fixed it.
     //

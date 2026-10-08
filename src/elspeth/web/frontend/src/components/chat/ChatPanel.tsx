@@ -32,7 +32,6 @@ import {
 import { MessageBubble } from "./MessageBubble";
 import { groupIntoTurns, turnRepresentativeMessage, type ChatTurn } from "./turns";
 import { ComposingIndicator } from "./ComposingIndicator";
-import { AuthorityChip } from "./AuthorityChip";
 import {
   ChatInput,
   uploadedBlobPromptSentence,
@@ -58,7 +57,6 @@ import {
   COMPOSE_UNAVAILABLE_MESSAGE,
 } from "@/config/composer";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
-import { InlineSourceFallbackPrompt } from "./InlineSourceFallbackPrompt";
 import { sortedSourceEntries } from "@/utils/compositionState";
 import { preferredScrollBehavior } from "@/utils/motion";
 import type {
@@ -192,83 +190,6 @@ function InterpretationConfirmation({
 
 
 
-
-// ── Inline-source fallback heuristic (Phase 5a Task 5) ───────────────────────
-//
-// `looksLikeData` is the safety-net predicate the chat panel runs against
-// recent user messages to decide whether to surface the
-// InlineSourceFallbackPrompt. The widget is the floor for the
-// inline-source-from-chat path: if the composer LLM ignores Task 8's
-// prompt nudge and never proposes a `set_pipeline` with an inline_blob
-// source for source-shaped typed input, this predicate triggers the
-// fallback affordance so the user is not stuck.
-//
-// CLOSED LIST — two recognised shapes. Both are HIGH-SPECIFICITY signals.
-// The Phase 5a Task 5 spec also lists a third clause ("single short typed
-// phrase under 200 chars containing no ?"), but that clause matches almost
-// every chat message the user could type and would dominate the predicate
-// — biasing toward FALSE POSITIVES (a disruptive affordance surfacing on
-// every conversational turn), which is the opposite of the spec's
-// "bias toward false negatives" framing. Surfacing the fallback on a
-// missed URL is recoverable (the user re-types or accepts the fallback);
-// surfacing it on every casual message is a UX bug. We deliberately omit
-// clause 3; cf. the InlineSourceFallbackPrompt self-review in the
-// commit message.
-//
-//   1. URL — http(s) prefix anywhere in the content.
-//   2. Comma-separated list — 2..10 comma-separated tokens (matches a
-//      typed list like "alice, bob, carol" but not a normal English
-//      sentence with one or two embedded commas because we require the
-//      entire trimmed content to consist of comma-separated tokens).
-//
-/** Min items in a typed list to qualify (2 items = at least one comma). */
-const LIST_TOKEN_MIN_COUNT = 2;
-/** Max items in a typed list to qualify (spec §Task 5 detection §3). */
-const LIST_TOKEN_MAX_COUNT = 10;
-/**
- * Per-token max word count.  A typed-source list token is almost always
- * 1..3 words — names ("Alice Smith"), slugs ("government-data"), URLs
- * ("a.com"), or short identifiers.  English prose with an embedded
- * comma ("hello, world how are you doing today") has multi-word tokens
- * (6+ words after the first split).
- *
- * Bias toward false negatives: a list of multi-word phrases longer
- * than 3 words (e.g. "5 government web pages, the local council site,
- * the open-data portal") would fail this check.  That's deliberate
- * — the predicate is the SAFETY NET; missing a phrase-shaped list is
- * recoverable (user re-types more concisely, or the LLM proposes a
- * source on the next turn).  Over-firing on every English sentence
- * with one comma is the worse failure mode.
- */
-const LIST_TOKEN_MAX_WORDS = 3;
-
-// Exported for the ChatPanel test seam — unit-tested directly so the
-// predicate's shape is pinned without going through the widget render.
-export function looksLikeData(content: string): boolean {
-  const trimmed = content.trim();
-  if (trimmed === "") return false;
-  if (/https?:\/\//.test(trimmed)) return true;
-  // Comma-separated list of 2..10 short tokens.  We split (not regex-
-  // match) so we can apply the per-token word-count cap structurally.
-  // The earlier regex-only `^[^,]+(?:, [^,]+){1,9}$` approach matched
-  // any prose containing a comma because `[^,]+` is greedy on
-  // whitespace; a structural check is clearer and easier to evolve.
-  const parts = trimmed.split(",").map((p) => p.trim());
-  if (parts.length < LIST_TOKEN_MIN_COUNT) return false;
-  if (parts.length > LIST_TOKEN_MAX_COUNT) return false;
-  // Every token must be non-empty (rejects trailing-comma artefacts
-  // like "a, b,") AND ≤ LIST_TOKEN_MAX_WORDS words (rejects prose
-  // with one or two embedded commas).
-  for (const part of parts) {
-    if (part === "") return false;
-    // Split on any whitespace run; filter empties from the leading
-    // or trailing edge already handled by trim, but defensive against
-    // double-spaces.
-    const words = part.split(/\s+/).filter((w) => w.length > 0);
-    if (words.length > LIST_TOKEN_MAX_WORDS) return false;
-  }
-  return true;
-}
 
 /** Narrow `source.options["blob_ref"]` (which is `unknown`) to a string. */
 function readSourceBlobRef(source: { options: Record<string, unknown> } | null): string | null {
@@ -817,15 +738,6 @@ export function ChatPanelContent({
     return tail;
   }, [approvedInterpretations, renderedTurns]);
 
-  const markFallbackDismissed = useInlineSourceStore((s) => s.markDismissed);
-  // Subscribe through the dismissedAt Map so the predicate re-evaluates
-  // when a dismissal lands. Calling `isDismissed(sessionId)` inside the
-  // selector body itself would not trigger a re-render on store change
-  // (the selector returns a primitive boolean derived from the Map but
-  // doesn't subscribe to the Map's identity change unless we read the
-  // Map directly).
-  const fallbackDismissedAt = useInlineSourceStore((s) => s.dismissedAt);
-
   useEffect(() => {
     if (activeSessionId === null) return;
     retainInlineSourceSummaries(activeSessionId, blobRefs);
@@ -894,89 +806,20 @@ export function ChatPanelContent({
     revealActionableProposalsRef.current(true);
   }, []);
 
-  // ── Inline-source fallback predicate (Phase 5a Task 5) ───────────────────
-  //
-  // The fallback prompt fires when ALL of:
-  //   1. User has sent ≥1 user message in the session.
-  //   2. No source is bound on the composition state.
-  //   3. The most recent user message that survives `looksLikeData` is
-  //      the actual candidate (we walk the last few user messages so a
-  //      transient question turn doesn't suppress the affordance when a
-  //      prior URL is still the unresolved input).
-  //   4. The composer is not currently responding to that user message.
-  //      The fallback is a post-turn safety net, not a mid-compose
-  //      competing offer.
-  //   5. No source-related tool call is in flight on the latest
-  //      assistant message (set_pipeline, set_source_from_blob,
-  //      set_source). If one is in flight the LLM is mid-response and
-  //      we must not race the affordance against the proposal pipeline.
-  //   6. The fallback has not been dismissed for this session (F-20).
-  //
-  // The candidate is the most recent looksLikeData-positive user message
-  // text, walking backwards through the LAST 3 user messages (a 3-turn
-  // window — wider than 1 lets a "what does it cost?" follow-up question
-  // not suppress the affordance for a still-unresolved URL above it; the
-  // spec mentions N=2 turns, we use 3 for the same reason). Older
-  // unresolved candidates fade out naturally as the chat scrolls.
-  const fallbackCandidate = useMemo(() => {
-    const userMessages = messages.filter((m) => m.role === "user");
-    if (userMessages.length === 0) return null;
-    const recent = userMessages.slice(-3).reverse();
-    for (const m of recent) {
-      if (looksLikeData(m.content)) return m.content;
-    }
-    return null;
-  }, [messages]);
-
-  // Inflight source-tool-call check — gate on the LATEST assistant
-  // message's tool_calls. The ToolCall wire shape carries the function
-  // name at `tc.function.name` (LiteLLM convention; see types/index.ts).
-  //
-  // CLOSED LIST — the three source-mutating tool names. Adding a fourth
-  // source-mutating tool to the composer means widening this set; the
-  // CLOSED-LIST framing prevents quiet drift.
-  const inflightSourceToolNames: ReadonlySet<string> = useMemo(
-    () => new Set(["set_pipeline", "set_source_from_blob", "set_source"]),
-    [],
-  );
-  const hasInflightSourceCall = useMemo(() => {
-    const lastAssistant = [...messages]
-      .reverse()
-      .find((m) => m.role === "assistant");
-    if (!lastAssistant) return false;
-    const calls = lastAssistant.tool_calls ?? [];
-    return calls.some((tc) => inflightSourceToolNames.has(tc.function.name));
-  }, [messages, inflightSourceToolNames]);
-
-  // Source-bound predicate. The shape mirrors the spec: either no
-  // composition state OR no named source OR every source plugin slot is the
-  // empty string (the composer's pre-source-bound representation).
-  const compositionHasSource =
-    compositionState !== null &&
-    Object.values(compositionState.sources).some((source) => source.plugin !== "");
-
-  // F-20 session-scoped dismissal. The store action `markDismissed`
-  // populates `dismissedAt[sessionId]`; we read via the Map identity
-  // we subscribed to above so the predicate re-evaluates on flip.
-  const sessionDismissed =
-    activeSessionId !== null && fallbackDismissedAt.has(activeSessionId);
-
-
-  const shouldRenderFallback =
-    fallbackCandidate !== null &&
-    !isComposing &&
-    !hasInflightSourceCall &&
-    !compositionHasSource &&
-    !sessionDismissed;
-
   // ── Decision panel (elspeth-cb0d4b8dba) ──────────────────────────────────
   // The one "Awaiting your decision" surface above the input. Every input is
   // an existing store fact: the durable readiness gate the server re-emits on
   // each validate, the composition's validator suggestions, the pending
   // review cards, and the proposals the banner already showed here. The
   // projection is pure (decisionPanelRows.ts); the panel is a dumb render;
-  // suggestion/fallback handlers send provider chat; proposal and
-  // interpretation decisions use their existing approval APIs.
+  // suggestion handlers send provider chat; proposal and interpretation
+  // decisions use their existing approval APIs.
+  //
+  // There is no inline-source "Create source" row: offering a user message
+  // back as source data resent whole instructions whenever they contained a
+  // URL (the tutorial brief did, 2026-10-08). Creating a source from typed
+  // input is the composer's job (set_pipeline with an inline_blob source,
+  // surfaced through InlineSourceCreatedTurn).
   const validationResult = useExecutionStore((s) => s.validationResult);
   const pendingApproval = useExecutionStore((s) => s.pendingApproval);
   const decisionRows = useMemo(
@@ -986,15 +829,12 @@ export function ChatPanelContent({
         compositionState,
         pendingInterpretations: pendingAcknowledgementEvents,
         proposals: compositionProposals,
-        inlineSourceCandidate: shouldRenderFallback ? fallbackCandidate : null,
       }),
     [
       validationResult,
       compositionState,
       pendingAcknowledgementEvents,
       compositionProposals,
-      shouldRenderFallback,
-      fallbackCandidate,
     ],
   );
   const decisionPhraseFor = useMemo(
@@ -1042,24 +882,6 @@ export function ChatPanelContent({
       sessionId: activeSessionId,
     });
   }, [activeSessionId]);
-  // F-3 — no API jargon in the user-visible chat message. The dispatched
-  // chat turn reads as natural language; the composer prompt (Task 8)
-  // teaches the LLM to recognise this framing and call set_pipeline
-  // with an inline_blob source. The fallback path goes through the
-  // SAME tool-use loop as the LLM-initiated path, which is what
-  // preserves audit-trail equivalence.
-  const handleFallbackAccept = useCallback(
-    (text: string) => {
-      sendMessage(`Use this as my source data:\n\n${text}`);
-    },
-    [sendMessage],
-  );
-
-  const handleFallbackDismiss = useCallback(() => {
-    if (activeSessionId !== null) {
-      markFallbackDismissed(activeSessionId);
-    }
-  }, [activeSessionId, markFallbackDismissed]);
 
   /**
    * "Edit the list" handler (Phase 5a Task 3 v1).
@@ -1191,14 +1013,6 @@ export function ChatPanelContent({
             onResolved={createInterpretationResolutionHandler(activeSessionId)}
           />
         }
-        renderSourceFallback={(candidateText) => (
-          <InlineSourceFallbackPrompt
-            shouldRender
-            candidateText={candidateText}
-            onAccept={handleFallbackAccept}
-            onDismiss={handleFallbackDismiss}
-          />
-        )}
       />
     </>
   );
@@ -1228,20 +1042,12 @@ export function ChatPanelContent({
       data-composing={isComposing ? "true" : undefined}
     >
       {decisionLiveRegion}
-      {/* Persistent composer authority. Mode preferences live in Preferences. */}
-      <div className="chat-panel-header">
-        {/* Layout lives in chat.css, NOT in a style prop (elspeth-0b70269ccc).
-            As an inline style this row was `inline-flex` with no wrap and no
-            min-width, which no stylesheet rule and therefore no breakpoint
-            could override — the row stayed one line at every width and the
-            ModeSwitchButton clipped to "Sw" at 390px. */}
-        <div className="chat-panel-header-actions">
-          {/* Persistent composer authority (elspeth-f5e6723133): whether
-              this session auto-applies mutations or gates them behind
-              proposals — named in the chrome. */}
-          <AuthorityChip />
-        </div>
-      </div>
+      {/* No header row: the conversation starts at the top of the pane. The
+          row used to hold only the composer-authority chip, which could only
+          ever read "Auto-apply on" — no UI sets another trust mode
+          (updateComposerPreferences has no caller) and auto_commit is the
+          default — so it was 53px of chrome stating a constant. The
+          transcript already labels each change the composer applies. */}
 
       {/* Error banner. Renders the primary error message plus, when
           present, a bulleted list of structured `errorDetails` (currently

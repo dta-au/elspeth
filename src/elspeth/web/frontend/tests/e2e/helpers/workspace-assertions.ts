@@ -372,16 +372,24 @@ export async function expectComposerFrameContract(page: Page): Promise<void> {
       }
       const panel = workspace.querySelector<HTMLElement>("#chat-main");
       if (panel === null || panel.hidden) return { latched, edges: null };
-      const header = panel.querySelector<HTMLElement>(".chat-panel-header");
+      // The panel's first rendered block (the transcript region, or an
+      // error banner above it) is what a latched scroll carries off the top
+      // edge. Visually-hidden live regions are 1px boxes and are skipped.
+      const firstBlock = Array.from(panel.children).find(
+        (child): child is HTMLElement =>
+          child instanceof HTMLElement &&
+          child.getBoundingClientRect().height > 1 &&
+          getComputedStyle(child).position !== "absolute",
+      );
       const input = panel.querySelector<HTMLElement>(".chat-input");
       const panelBox = panel.getBoundingClientRect();
       return {
         latched,
         edges: {
-          headerOffset:
-            header === null
+          firstBlockOffset:
+            firstBlock === undefined
               ? null
-              : header.getBoundingClientRect().top - panelBox.top,
+              : firstBlock.getBoundingClientRect().top - panelBox.top,
           inputOffset:
             input === null
               ? null
@@ -399,10 +407,10 @@ export async function expectComposerFrameContract(page: Page): Promise<void> {
 
   if (frame.edges === null) return;
   // Sub-pixel layout rounding is real; a latch is tens of pixels.
-  if (frame.edges.headerOffset !== null) {
+  if (frame.edges.firstBlockOffset !== null) {
     expect(
-      Math.abs(frame.edges.headerOffset),
-      "the chat panel header must sit on the panel's top edge",
+      Math.abs(frame.edges.firstBlockOffset),
+      "the chat panel's first block must sit on the panel's top edge",
     ).toBeLessThanOrEqual(1);
   }
   if (frame.edges.inputOffset !== null) {

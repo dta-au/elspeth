@@ -186,9 +186,6 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
   "ack-card-submit-btn":
     "Button variant=primary hook — .btn/.btn-primary carry the chrome; the " +
     "token adds no treatment.",
-  "inline-source-fallback-prompt-accept":
-    "Compact primary Button composing .btn-compact + .btn-primary (documented " +
-    "in-file); the token is a per-instance hook.",
   "inline-source-created-turn-edit":
     "Bare Button styled by the defined .link-button co-class; the bespoke " +
     "token is an identity hook.",

@@ -268,13 +268,6 @@ describe("projectDecisionRows", () => {
   });
 });
 
-// Source fallback is a pending decision even before validation exists.
-it("projects the eligible inline source candidate into the decision count", () => {
-  const result = projectDecisionRows({ ...empty, validationResult: null, inlineSourceCandidate: "red, blue" });
-  expect(result.rows).toEqual([{ kind: "inline_source_fallback", id: "inline-source:red, blue", candidateText: "red, blue" }]);
-  expect(result.count).toBe(1);
-});
-
 it("tracks changed remedies and preserves identities under reorder", () => {
   const validationResult = makeValidationResult({readiness: {
     authoring_valid: true, execution_ready: true, completion_ready: false, blockers: [],

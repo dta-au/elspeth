@@ -304,8 +304,8 @@ describe("the workspace steps keep tutorial chrome out of the panes (2026-10-08 
   // Continue inside the authoring pane. That pane is one half of a two-pane
   // row: the chrome shrank the conversation's min(160px, 30%) floor with the
   // chat panel (measured 143px at 1894x894, 49px at 1280x560, 32px at
-  // 390x700), pushed .chat-panel-header 97px below the .artifact-workspace-
-  // toolbar it shares a row with, and sat on a 0px gutter beside a 16px one.
+  // 390x700), pushed the chat column's header row 97px below the artifact
+  // toolbar it shared a row with, and sat on a 0px gutter beside a 16px one.
   const shorthand = (selector: string, property: string): string[] =>
     declaredValue(selector, property).split(/\s+/);
 
@@ -328,7 +328,7 @@ describe("the workspace steps keep tutorial chrome out of the panes (2026-10-08 
 
   it("puts Build's pre-send content on the conversation's gutter", () => {
     expect(shorthand(".tutorial-build-intro", "padding")[1]).toBe(
-      shorthand(".chat-panel-header", "padding")[1],
+      shorthand(".message-row", "padding")[1],
     );
   });
 

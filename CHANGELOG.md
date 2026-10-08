@@ -67,6 +67,14 @@ All notable changes to ELSPETH are documented here.
   instruction naming what it waits for, and stays visible in the narrow Compose
   view. Run results wrap inside the pane instead of cutting off the summary
   column.
+- **The Composer chat no longer offers to turn a message into source data,
+  and drops its authority chip.** The "This looks like source data — Create
+  source" offer resent the whole message, instructions included, whenever it
+  contained a URL; the composer creates sources from the conversation itself.
+  The "Auto-apply on" chip and the header row it sat in are gone: nothing in
+  the interface changes the composer's authority, so the chip always said the
+  same thing, and the transcript already labels each change the composer
+  applies. The conversation now starts at the top of the chat pane.
 
 **Upgrade and publication notes.** Session epoch 71 and Landscape epoch 49
 are unchanged from 0.8.1; this release adds no schema-epoch cutover. Installations
