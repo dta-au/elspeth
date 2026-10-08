@@ -1982,6 +1982,13 @@ class SessionOperationInterpretationMutations(Protocol):
         validator: SessionPendingInterpretationValidator,
     ) -> InterpretationEventRecord: ...
 
+    # Settlement creates fresh candidate-bound evidence and returns any opt-out-produced state.
+    def create_pipeline_candidate_pending(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+    ) -> PendingInterpretationCreationResult: ...
+
     def record_session_opt_out(
         self,
         *,

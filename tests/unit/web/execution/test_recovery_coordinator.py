@@ -118,7 +118,7 @@ async def test_live_seat_defers_and_dispatch_transfers_only_on_acceptance(
     sessions.session_operation_owner_instance_id = "recoverer"
     sessions.session_operation_lease_seconds = 30
     execution, _, _ = _execution_service(asyncio.get_running_loop(), execution_fixture)
-    recover_run = AsyncMock()
+    recover_run = AsyncMock(spec=execution.recover_run)
     monkeypatch.setattr(execution, "recover_run", recover_run)
     original_acquire = SessionOperationLease.acquire
     acquired = []
@@ -365,7 +365,7 @@ async def test_archived_terminal_session_does_not_block_other_recovery(
     with LandscapeDB.from_url(landscape_url):
         pass
     execution, _, _ = _execution_service(asyncio.get_running_loop(), execution_fixture)
-    recover_run = AsyncMock(return_value=False)
+    recover_run = AsyncMock(spec=execution.recover_run, return_value=False)
     monkeypatch.setattr(execution, "recover_run", recover_run)
     coordinator = RunRecoveryCoordinator(
         sessions, execution, BlobServiceImpl(engine, tmp_path), landscape_url=landscape_url, create_tables=False
@@ -418,7 +418,7 @@ async def test_recovery_acquisition_propagates_missing_fence_integrity_failure(
 
     monkeypatch.setattr(sessions, "list_recoverable_run_records", discover_then_corrupt)
     execution, _, _ = _execution_service(asyncio.get_running_loop(), execution_fixture)
-    recover_run = AsyncMock(return_value=False)
+    recover_run = AsyncMock(spec=execution.recover_run, return_value=False)
     monkeypatch.setattr(execution, "recover_run", recover_run)
     coordinator = RunRecoveryCoordinator(
         sessions, execution, BlobServiceImpl(engine, tmp_path), landscape_url="sqlite://", create_tables=False

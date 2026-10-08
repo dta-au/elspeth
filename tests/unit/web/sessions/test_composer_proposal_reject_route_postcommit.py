@@ -196,11 +196,11 @@ def test_committed_reject_propagates_cleanup_integrity_failure(test_client: Test
         await original_close(lease)
         raise failure
 
-    monkeypatch.setattr(SessionOperationLease, "close", close_then_fail)
-    with pytest.raises(AuditIntegrityError) as caught:
-        test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
+    with monkeypatch.context() as fault:
+        fault.setattr(SessionOperationLease, "close", close_then_fail)
+        with pytest.raises(AuditIntegrityError) as caught:
+            test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
     assert caught.value is failure
-    monkeypatch.undo()
     replay = test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
     assert replay.status_code == 200
 

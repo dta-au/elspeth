@@ -1497,7 +1497,7 @@ class TestExecutionFlow:
                 execution_fixture=execution_fixture,
             )
 
-        frozen = submit.call_args.args[0].args[4]
+        frozen = submit.call_args.args[0].args[3]
         executable = json.dumps(frozen.executable_config, default=dict)
         audit_safe = json.dumps(frozen.audit_safe_config, default=dict)
         assert private_model in executable

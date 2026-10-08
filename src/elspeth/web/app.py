@@ -640,14 +640,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if registry is not None:
             registry.seal()
         primary_error = exc
-        if serving_started:
-            app.state.process_recovery.request_shutdown()
-        else:
-            app.state.process_recovery.request_startup_failure()
         try:
+            if serving_started:
+                app.state.process_recovery.request_shutdown()
+            else:
+                app.state.process_recovery.request_startup_failure()
             await app.state.process_recovery.join_escalation()
         except BaseException as supervision_failure:
-            raise BaseExceptionGroup("Application lifespan and supervision failed", [exc, supervision_failure]) from None
+            primary_error = BaseExceptionGroup("Application lifespan and supervision failed", [exc, supervision_failure])
+            raise primary_error from None
         raise
     finally:
         if registry is not None:

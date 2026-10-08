@@ -174,6 +174,10 @@ def local_composer_tls(
     is checked by TLS handshake, so an occupied/misconfigured port fails loudly.
     ``flush_interval`` is explicit so controls can deliberately buffer delivery.
     """
+    # Fail before acquiring physical owners when the CI prerequisite is absent.
+    # A failure after the Popen attempt still retains unresolved custody.
+    if not Path("/usr/bin/caddy").is_file():
+        raise FileNotFoundError("local TLS requires /usr/bin/caddy")
     directory.mkdir(parents=True, exist_ok=True)
     certificate = directory / "localhost.crt"
     private_key = directory / "localhost.key"

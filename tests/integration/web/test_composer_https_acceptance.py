@@ -422,9 +422,7 @@ try {
             )
             assert observed.returncode == 0, observed.stderr
             evidence = json.loads(observed.stdout)
-            evidence_path = (
-                Path(".claude/lanes/composer-https-streaming-20261006") / f"acceptance-browser-{proxy_mode}-{uuid4()}-evidence.json"
-            )
+            evidence_path = tmp_path / f"acceptance-browser-{proxy_mode}-{uuid4()}-evidence.json"
             evidence_path.write_text(json.dumps(evidence, sort_keys=True), encoding="utf-8")
             proxy_evidence = evidence_path.with_suffix(".proxy.log")
             proxy_evidence.write_text(tls.proxy_log.read_text(), encoding="utf-8")
@@ -1069,7 +1067,7 @@ try {
 } catch (error) { console.error(JSON.stringify(evidence)); throw error; }
 finally { clearTimeout(browserDeadline); await browser.close(); }
 """
-    lane = Path(".claude/lanes/composer-https-streaming-20261006/frontend-playwright-validation")
+    lane = tmp_path
     evidence_path = lane / f"h102-browser-{scenario}-{uuid4()}"
     with local_composer_tls(harness.app, tmp_path / "proxy") as tls:
         try:

@@ -631,8 +631,10 @@ contract does; never synthesize a remote location, identifier, or placeholder.
 The bound artifact controls this review. Supplying the input values, such as
 URLs, does not waive review of a new CSV or other generated source artifact.
 After a blob bind, keep the backend-staged `invented_source` row and its exact
-draft; do not remove or rewrite it during option edits. A changed blob binding
-needs a fresh review even when the content looks similar.
+draft; do not remove or rewrite it during option edits. A pending review stays
+bound to that exact blob and path. Once a review is resolved, binding different
+blob bytes requires a fresh review; binding a new blob with the identical
+content hash to the same named source and plugin preserves the accepted proof.
 
 Preview or inspect the bound artifact. If its bytes, parsed fields, row shape,
 or options disagree, use the plugin's diagnostics and live authority to align

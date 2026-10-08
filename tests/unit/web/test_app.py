@@ -1595,6 +1595,205 @@ class TestLifespanShutdown:
     """Shutdown must await the execution-service drain path."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("supervision_source", "auth_fails", "engine_fails"),
+        [
+            (None, False, False),
+            ("join", False, False),
+            (None, True, False),
+            ("join", True, False),
+            ("join", False, True),
+            ("join", True, True),
+            ("request", True, True),
+        ],
+    )
+    async def test_lifespan_preserves_each_original_when_supervision_and_finalizers_fail(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        supervision_source: str | None,
+        auth_fails: bool,
+        engine_fails: bool,
+    ) -> None:
+        calls: list[str] = []
+        primary = ValueError("primary")
+        supervision = RuntimeError("supervision")
+        auth = OSError("auth")
+        engine = AssertionError("engine")
+
+        class Registry:
+            def __init__(self, *, owner: object, recovery: object, loop: object) -> None:
+                calls.append("registry")
+
+            def seal(self) -> None:
+                calls.append("seal")
+
+        class Recovery:
+            def start_monitor(self) -> None:
+                calls.append("start_monitor")
+
+            def request_shutdown(self) -> None:
+                calls.append("request_shutdown")
+                if supervision_source == "request":
+                    raise supervision
+
+            async def join_escalation(self) -> None:
+                calls.append("join_escalation")
+                if supervision_source == "join":
+                    raise supervision
+
+        class Watchdog:
+            def assert_watching(self) -> None:
+                calls.append("watching")
+
+        class Audit:
+            def start(self) -> None:
+                calls.append("audit_start")
+
+        @contextlib.asynccontextmanager
+        async def service(_app: FastAPI):
+            yield
+
+        def finalize_auth() -> None:
+            calls.append("auth")
+            if auth_fails:
+                raise auth
+
+        def finalize_engine() -> None:
+            calls.append("engine")
+            if engine_fails:
+                raise engine
+
+        app = FastAPI()
+        app.state.application_finalizer_owner = object()
+        app.state.process_recovery = Recovery()
+        app.state.process_watchdog = Watchdog()
+        app.state.auth_audit_recorder = Audit()
+        app.state._auth_audit_finalizer = finalize_auth
+        app.state._session_engine_finalizer = finalize_engine
+        monkeypatch.setattr(app_module, "ExecutionLeaseReleaseRegistry", Registry)
+        monkeypatch.setattr(app_module, "_service_lifespan", service)
+
+        with pytest.raises(BaseException) as captured:
+            async with lifespan(app):
+                raise primary
+
+        def leaves(error: BaseException) -> list[BaseException]:
+            if isinstance(error, BaseExceptionGroup):
+                return [leaf for child in error.exceptions for leaf in leaves(child)]
+            return [error]
+
+        expected = [primary]
+        if supervision_source is not None:
+            expected.append(supervision)
+        if auth_fails:
+            expected.append(auth)
+        if engine_fails:
+            expected.append(engine)
+        actual = leaves(captured.value)
+        assert len(actual) == len(expected)
+        assert all(found is original for found, original in zip(actual, expected, strict=True))
+        if supervision_source is None and not auth_fails and not engine_fails:
+            assert captured.value is primary
+        if supervision_source is not None and (auth_fails or engine_fails):
+            assert isinstance(captured.value, BaseExceptionGroup)
+            assert isinstance(captured.value.exceptions[0], BaseExceptionGroup)
+            assert captured.value.exceptions[0].exceptions[0] is primary
+            assert captured.value.exceptions[0].exceptions[1] is supervision
+        assert calls[-2:] == ["auth", "engine"]
+        assert calls.count("seal") == 2
+        assert calls.count("request_shutdown") == 1
+        assert calls.count("join_escalation") == (0 if supervision_source == "request" else 1)
+
+    @pytest.mark.asyncio
+    async def test_lifespan_retains_both_actual_cancellations_through_failed_finalizers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serving = asyncio.Event()
+        joining = asyncio.Event()
+        observed: list[asyncio.CancelledError] = []
+        finalizers: list[str] = []
+        auth = OSError("auth finalizer")
+        engine = RuntimeError("engine finalizer")
+
+        class Registry:
+            def __init__(self, *, owner: object, recovery: object, loop: object) -> None:
+                pass
+
+            def seal(self) -> None:
+                pass
+
+        class Recovery:
+            def start_monitor(self) -> None:
+                pass
+
+            def request_shutdown(self) -> None:
+                pass
+
+            async def join_escalation(self) -> None:
+                joining.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as original:
+                    observed.append(original)
+                    raise
+
+        class Watchdog:
+            def assert_watching(self) -> None:
+                pass
+
+        class Audit:
+            def start(self) -> None:
+                pass
+
+        @contextlib.asynccontextmanager
+        async def service(_app: FastAPI):
+            yield
+
+        def finalize_auth() -> None:
+            finalizers.append("auth")
+            raise auth
+
+        def finalize_engine() -> None:
+            finalizers.append("engine")
+            raise engine
+
+        app = FastAPI()
+        app.state.application_finalizer_owner = object()
+        app.state.process_recovery = Recovery()
+        app.state.process_watchdog = Watchdog()
+        app.state.auth_audit_recorder = Audit()
+        app.state._auth_audit_finalizer = finalize_auth
+        app.state._session_engine_finalizer = finalize_engine
+        monkeypatch.setattr(app_module, "ExecutionLeaseReleaseRegistry", Registry)
+        monkeypatch.setattr(app_module, "_service_lifespan", service)
+
+        async def run() -> None:
+            async with lifespan(app):
+                serving.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as original:
+                    observed.append(original)
+                    raise
+
+        task = asyncio.create_task(run())
+        await asyncio.wait_for(serving.wait(), timeout=5.0)
+        task.cancel("first")
+        await asyncio.wait_for(joining.wait(), timeout=5.0)
+        task.cancel("second")
+        with pytest.raises(BaseExceptionGroup) as captured:
+            await task
+        assert len(observed) == 2
+        assert observed[0] is not observed[1]
+        assert finalizers == ["auth", "engine"]
+        outer = captured.value
+        assert len(outer.exceptions) == 3
+        inner = outer.exceptions[0]
+        assert isinstance(inner, BaseExceptionGroup)
+        assert inner.exceptions[0] is observed[0]
+        assert inner.exceptions[1] is observed[1]
+        assert outer.exceptions[1] is auth
+        assert outer.exceptions[2] is engine
+
+    @pytest.mark.asyncio
     async def test_lifespan_aborts_when_inline_custody_reconciliation_fails(self, monkeypatch, tmp_path) -> None:
         """The server must not serve while a custody journal is unresolved."""
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))

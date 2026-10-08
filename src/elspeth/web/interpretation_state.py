@@ -3329,16 +3329,20 @@ def _reconcile_source_options(
             "Rebind a different user-uploaded blob through set_source_from_blob or set_source_from_blobs, "
             "or remove the source if that graph edit is intended."
         )
-    same_artifact_binding = (
+    same_reviewed_content = (
         previous is not None
         and previous.plugin == proposed.plugin
-        and type(previous_blob_ref) is str
-        and previous_blob_ref == proposed_blob_ref
-        and previous.options.get("path") == proposed.options.get("path")
         and previous_authoring is not None
         and proposed_authoring is not None
         and previous_authoring["modality"] == proposed_authoring["modality"]
         and previous_authoring["content_hash"] == proposed_authoring["content_hash"]
+    )
+    same_artifact_binding = (
+        same_reviewed_content
+        and previous is not None
+        and type(previous_blob_ref) is str
+        and previous_blob_ref == proposed_blob_ref
+        and previous.options.get("path") == proposed.options.get("path")
     )
     if (
         proposed_authoring is not None
@@ -3416,7 +3420,10 @@ def _reconcile_source_options(
                 component_type="source",
                 kind=InterpretationKind.INVENTED_SOURCE,
             )
-        if same_artifact_binding:
+        # Accepted invented-source review follows coherent authored bytes for
+        # this named source and plugin. Pending drafts still require the exact
+        # blob/path binding above, because they have no accepted proof to carry.
+        if same_reviewed_content:
             reconciled.append(dict(previous_requirement))
             options[SOURCE_AUTHORING_KEY] = dict(previous_authoring)
         else:

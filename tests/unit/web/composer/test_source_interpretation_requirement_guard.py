@@ -508,7 +508,7 @@ def test_unchanged_binding_preserves_resolved_source_review() -> None:
     assert review["event_id"] == "accepted-event"
 
 
-def test_new_blob_binding_with_same_bytes_requires_fresh_review() -> None:
+def test_new_blob_binding_with_same_bytes_preserves_resolved_review() -> None:
     requirement = _generated_requirement(status="resolved", event_id="accepted-event")
     source = _generated_source(requirement=requirement)
     state = _empty_state().with_source(source)
@@ -517,9 +517,25 @@ def test_new_blob_binding_with_same_bytes_requires_fresh_review() -> None:
 
     reconciled = reconcile_authoritative_reviews(state, proposed)
 
+    source_options = reconciled.sources["source"].options
+    assert source_options[INTERPRETATION_REQUIREMENTS_KEY][0] == requirement
+    assert source_options["source_authoring"] == source.options["source_authoring"]
+    assert source_options["blob_ref"] == "blob-two"
+    assert source_options["path"] == rebound.options["path"]
+
+
+def test_new_blob_binding_with_same_bytes_does_not_carry_pending_event() -> None:
+    requirement = _generated_requirement(event_id="pending-event")
+    source = _generated_source(requirement=requirement)
+    state = _empty_state().with_source(source)
+    rebound = _generated_source(blob_ref="blob-two")
+
+    reconciled = reconcile_authoritative_reviews(state, state.with_source(rebound))
+
     review = reconciled.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert review["status"] == "pending"
     assert review["event_id"] is None
+    assert review["draft"] == _GENERATED_CSV
 
 
 def test_changed_artifact_content_invalidates_accepted_review() -> None:

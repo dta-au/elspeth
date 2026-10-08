@@ -41,6 +41,7 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools import sessions as sessions_tools
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
+from elspeth.web.composer.tools.sources import _options_with_source_blob_review
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
@@ -590,22 +591,26 @@ def _reviewed_source_facts(
             stable_id: {
                 "name": source_name,
                 "plugin": "csv",
-                "options": {
-                    "path": path if path is not None else f"blob:{blob_id}",
-                    "blob_ref": blob_id,
-                    "schema": {"mode": "observed"},
-                    SOURCE_AUTHORING_KEY: {
-                        "modality": "llm_generated",
-                        # The content-identity binding verifies this pin
-                        # against the live blob row, so it must be the real
-                        # hash of the harness blob's bytes.
-                        "content_hash": (
-                            authoring_content_hash if authoring_content_hash is not None else content_hash(_FIRST_REVIEWED_BLOB_CONTENT)
-                        ),
-                        "review_event_id": "review-event",
-                        "resolved_kind": "invented_source",
+                "options": _options_with_source_blob_review(
+                    {
+                        "path": path if path is not None else f"blob:{blob_id}",
+                        "blob_ref": blob_id,
+                        "schema": {"mode": "observed"},
+                        SOURCE_AUTHORING_KEY: {
+                            "modality": "llm_generated",
+                            # The content-identity binding verifies this pin
+                            # against the live blob row, so it must be the real
+                            # hash of the harness blob's bytes.
+                            "content_hash": (
+                                authoring_content_hash if authoring_content_hash is not None else content_hash(_FIRST_REVIEWED_BLOB_CONTENT)
+                            ),
+                            "review_event_id": None,
+                            "resolved_kind": None,
+                        },
                     },
-                },
+                    mime_type="text/csv",
+                    content=_FIRST_REVIEWED_BLOB_CONTENT.decode("utf-8"),
+                ),
                 "observed_columns": ["name", "score"],
                 "sample_rows": [{"name": "Ada", "score": 42}],
                 "on_validation_failure": "discard",
@@ -845,6 +850,9 @@ def test_exact_owned_raw_storage_path_remains_private_executable_authority(tmp_p
     assert authority.verified_blob_paths == {}
     assert candidate.acceptable is True, candidate.result.to_dict()
     assert candidate.result.updated_state.sources["source"].options["path"] == blob.storage_path
+    (review,) = candidate.result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert review["status"] == "pending"
+    assert review["draft"] == _FIRST_REVIEWED_BLOB_CONTENT.decode("utf-8")
 
 
 def test_exact_reviewed_source_authority_allows_private_blob_resolution(tmp_path: Path) -> None:

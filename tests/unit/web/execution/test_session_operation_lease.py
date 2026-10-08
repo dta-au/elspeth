@@ -1211,7 +1211,7 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
 
 
 @pytest.mark.asyncio
-async def test_submit_failure_after_run_creation_terminalizes_before_return(execution_fixture: ExecutionTestCustody) -> None:
+async def test_submit_failure_after_run_creation_retains_unknown_until_executor_join(execution_fixture: ExecutionTestCustody) -> None:
     service, session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
     session_id = session_service.get_current_state.return_value.session_id
     lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=session_id)
@@ -1229,7 +1229,8 @@ async def test_submit_failure_after_run_creation_terminalizes_before_return(exec
     session_service.create_run.side_effect = create_run
     session_service.update_run_status.side_effect = update_run_status
     executor.trace = trace
-    executor.submit_error = RuntimeError("executor unavailable")
+    submission_error = RuntimeError("executor unavailable")
+    executor.submit_error = submission_error
     validation = ValidationResult(
         is_valid=True,
         checks=[],
@@ -1244,17 +1245,27 @@ async def test_submit_failure_after_run_creation_terminalizes_before_return(exec
 
     with (
         patch("elspeth.web.execution.validation.validate_pipeline", return_value=validation),
-        pytest.raises(RuntimeError, match="executor unavailable"),
+        pytest.raises(RuntimeError, match="executor unavailable") as caught,
     ):
         await service.execute(session_id, session_operation_lease=lease)
 
-    assert trace == ["create_run", "submit", "terminalize"]
-    terminal = session_service.update_run_status.await_args
-    assert terminal.args == (run.id,)
-    assert terminal.kwargs["status"] == "failed"
-    assert terminal.kwargs["session_operation_context"] is lease.context
-    assert authority.release_calls == [], "route still owns a failed pre-transfer lease"
-    await lease.close()
+    assert caught.value is submission_error
+    assert trace == ["create_run", "submit"]
+    session_service.update_run_status.assert_not_awaited()
+    obligation = lease.execution_obligation
+    assert obligation is not None and obligation.lease is lease
+    assert obligation.completion_required
+    assert obligation.pipeline_submission_unknown is submission_error
+    assert obligation.pipeline is None and obligation.completion is None
+    assert not obligation.unknown_pipeline_cleanup_declared
+    assert not lease.closed and authority.release_calls == []
+    assert service.execution_lease_release_registry.has_pending_physical_owners()
+    with pytest.raises(BaseExceptionGroup) as refused:
+        service.execution_lease_release_registry.assert_completed()
+    assert any(leaf is submission_error for leaf in _original_leaves(refused.value))
+    # The failed submit has no Future receipt. Only the actual executor join
+    # permits cleanup; the fixture will join it and the retained original.
+    execution_fixture.witness_cleanup_original(submission_error)
 
 
 @pytest.mark.asyncio
@@ -2383,6 +2394,19 @@ class _ExecutionEffectFindings:
     escaped_class_helpers: tuple[str, ...]
 
 
+def _stable_ast_bytes(node: ast.AST) -> bytes:
+    """Serialize every AST field, including empty ones, across Python 3.12/3.13."""
+
+    def encode(value: object) -> object:
+        if isinstance(value, ast.AST):
+            return [type(value).__name__, [[name, encode(child)] for name, child in ast.iter_fields(value)]]
+        if isinstance(value, list):
+            return [encode(child) for child in value]
+        return value
+
+    return json.dumps(encode(node), ensure_ascii=False, separators=(",", ":")).encode()
+
+
 def _exact_recovery_lease_owner_edges(member: _FunctionNode) -> frozenset[int]:
     """Prove recover_run's bound submit and awaited no-completion cleanup."""
     if member.name != "recover_run":
@@ -3061,8 +3085,8 @@ def _exact_recovery_lease_owner_edges(member: _FunctionNode) -> frozenset[int]:
             node.id = alpha_roles[node.id]
         elif isinstance(node, ast.ExceptHandler) and node.name in alpha_roles:
             node.name = alpha_roles[node.name]
-    reviewed_shape = "1520d733a3b0e819d7d529f549f7569b3892869a83c47326c62693879829015b"
-    if hashlib.sha256(ast.dump(canonical, include_attributes=False).encode()).hexdigest() != reviewed_shape:
+    reviewed_shape = "4bc769cd586408eead0c595fa8225cca0f0013bd981e8c1dd52b50cc6a9e73ea"
+    if hashlib.sha256(_stable_ast_bytes(canonical)).hexdigest() != reviewed_shape:
         return frozenset()
     return frozenset(
         id(node)
@@ -4078,23 +4102,150 @@ def test_submit_failure_terminalizes_under_same_context_before_authority_returns
     assert all(_exact_context_keyword(call) for call in terminal_calls)
 
 
+def _assert_shutdown_join_graph(method_sources: dict[str, str] | None = None) -> None:
+    import hashlib
+
+    def owner_node(name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+        if method_sources is None:
+            return _function_node(ExecutionServiceImpl, name)
+        tree = ast.parse(textwrap.dedent(method_sources[name]))
+        return next(node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name)
+
+    node = owner_node("shutdown")
+    calls = [call for call in ast.walk(node) if isinstance(call, ast.Call)]
+    executor_joins = [call for call in calls if ast.unparse(call.func) == "self._join_executor_owner"]
+    registry_joins = [call for call in calls if ast.unparse(call.func) == "self._join_registry_owner"]
+    assert len(executor_joins) == len(registry_joins) == 1
+    for join in (*executor_joins, *registry_joins):
+        assert any(
+            isinstance(parent, ast.Call) and ast.unparse(parent.func) == "asyncio.create_task" and join in ast.walk(parent)
+            for parent in calls
+        )
+    assert any(ast.unparse(call.func) == "registry.observe_ready" for call in calls)
+    completed_guards = [
+        guard
+        for guard in ast.walk(node)
+        if isinstance(guard, ast.If)
+        and isinstance(guard.test, ast.BoolOp)
+        and isinstance(guard.test.op, ast.And)
+        and {"executor_task in observed", "registry_task in observed"} <= {ast.unparse(term) for term in guard.test.values}
+        and any(isinstance(statement, ast.Break) for statement in guard.body)
+    ]
+    assert len(completed_guards) == 1
+    assert sum(isinstance(candidate, ast.Break) for candidate in ast.walk(node)) == 1
+    executor_task_owner = owner_node("_join_executor_owner")
+    executor_owner_tries = [statement for statement in executor_task_owner.body if isinstance(statement, ast.Try)]
+    assert len(executor_owner_tries) == 1
+    assert len(executor_owner_tries[0].body) == 1
+    executor_edge = executor_owner_tries[0].body[0]
+    assert isinstance(executor_edge, ast.Expr)
+    assert isinstance(executor_edge.value, ast.Await)
+    assert isinstance(executor_edge.value.value, ast.Call)
+    assert ast.unparse(executor_edge.value.value.func) == "self._finish_executor_join"
+    executor_owner = owner_node("_finish_executor_join")
+    finalizer_tries = [statement for statement in executor_owner.body if isinstance(statement, ast.Try)]
+    assert len(finalizer_tries) == 1 and len(finalizer_tries[0].body) == 1
+    finalizer_edge = finalizer_tries[0].body[0]
+    assert isinstance(finalizer_edge, ast.Expr)
+    assert isinstance(finalizer_edge.value, ast.Await)
+    assert isinstance(finalizer_edge.value.value, ast.Call)
+    assert ast.unparse(finalizer_edge.value.value.func) == "run_application_finalizer_in_worker"
+    assert [ast.unparse(arg) for arg in finalizer_edge.value.value.args] == ["self._shutdown_finalizer"]
+    physical_join = owner_node("join_executor_shutdown")
+    assert len(physical_join.body) == 3
+    selected_executor = physical_join.body[1]
+    assert isinstance(selected_executor, ast.If)
+    assert ast.unparse(selected_executor.test) == "executor is not None"
+    assert len(selected_executor.body) == 1 and selected_executor.orelse == []
+    physical_edge = selected_executor.body[0]
+    assert isinstance(physical_edge, ast.Expr) and isinstance(physical_edge.value, ast.Call)
+    assert ast.unparse(physical_edge.value.func) == "executor.shutdown"
+    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in physical_edge.value.keywords] == [("wait", "True")]
+    registry_owner = owner_node("_join_registry_owner")
+    registry_tries = [statement for statement in registry_owner.body if isinstance(statement, ast.Try)]
+    assert len(registry_tries) == 1 and len(registry_tries[0].body) == 1
+    registry_edge = registry_tries[0].body[0]
+    assert isinstance(registry_edge, ast.Expr)
+    assert isinstance(registry_edge.value, ast.Await)
+    assert isinstance(registry_edge.value.value, ast.Call)
+    assert ast.unparse(registry_edge.value.value.func) == "self.execution_lease_release_registry.join_all"
+
+    # The direct edges above give the digest its meaning. Pin these five
+    # reviewed producer bodies so an inserted return or conditional cannot
+    # make a direct-looking edge unreachable without deliberate re-review.
+    reviewed_shapes = {
+        "shutdown": "dd521edd9cea565be1bfa2dd235cbd7fee7aff89d46e4b8dea79878c751fa7ae",
+        "_join_executor_owner": "e585d33cab53810ae0d3ee97aa27c2ae38e4af5e509ae002a121ed9bf6d851d8",
+        "_finish_executor_join": "3bd5602d6adcf3a3ee7b4726bd25f708fcd8a96df58b67292370bf6c35d8b9b1",
+        "_join_registry_owner": "7dbbfa9300fe6712c96bdd5ff1d2dc87e29a2c61b03598137226a2ce607b70a3",
+        "join_executor_shutdown": "427f99347964a622320f3b27643f7ceeca2469a9d382a6a53058f5dea8d145de",
+    }
+    assert {name: hashlib.sha256(_stable_ast_bytes(owner_node(name))).hexdigest() for name in reviewed_shapes} == reviewed_shapes
+
+
 def test_shutdown_drains_executor_then_awaits_all_lease_completions() -> None:
-    node = _function_node(ExecutionServiceImpl, "shutdown")
-    executor_statements = [
-        index
-        for index, statement in enumerate(node.body)
-        if any(isinstance(call, ast.Call) and _call_name(call) == "shutdown" for call in ast.walk(statement))
-        or any(isinstance(attribute, ast.Attribute) and attribute.attr == "shutdown" for attribute in ast.walk(statement))
-    ]
-    completion_statements = [
-        index
-        for index, statement in enumerate(node.body)
-        if any(isinstance(attribute, ast.Attribute) and attribute.attr == "_lease_completion_futures" for attribute in ast.walk(statement))
-    ]
-    assert len(executor_statements) == 1
-    assert completion_statements and min(completion_statements) > executor_statements[0]
-    completion_nodes = node.body[min(completion_statements) :]
-    assert any(isinstance(candidate, ast.Await) for statement in completion_nodes for candidate in ast.walk(statement))
+    _assert_shutdown_join_graph()
+
+
+@pytest.mark.parametrize(
+    "method,before,after",
+    [
+        ("_join_executor_owner", "await self._finish_executor_join()", "pass"),
+        (
+            "_finish_executor_join",
+            "await run_application_finalizer_in_worker(self._shutdown_finalizer)",
+            "run_application_finalizer_in_worker(self._shutdown_finalizer)",
+        ),
+        (
+            "_join_registry_owner",
+            "await self.execution_lease_release_registry.join_all()",
+            "self.execution_lease_release_registry.join_all()",
+        ),
+        ("shutdown", "and registry_task in observed", "or registry_task in observed"),
+        ("join_executor_shutdown", "wait=True", "wait=False"),
+    ],
+)
+def test_shutdown_join_graph_rejects_unjoined_owner_or_early_exit(method: str, before: str, after: str) -> None:
+    sources = {
+        "shutdown": inspect.getsource(ExecutionServiceImpl.shutdown),
+        "_join_executor_owner": inspect.getsource(ExecutionServiceImpl._join_executor_owner),
+        "_finish_executor_join": inspect.getsource(ExecutionServiceImpl._finish_executor_join),
+        "_join_registry_owner": inspect.getsource(ExecutionServiceImpl._join_registry_owner),
+        "join_executor_shutdown": inspect.getsource(ExecutionServiceImpl.join_executor_shutdown),
+    }
+    assert before in sources[method]
+    _assert_shutdown_join_graph(sources)
+    sources[method] = sources[method].replace(before, after)
+    with pytest.raises(AssertionError):
+        _assert_shutdown_join_graph(sources)
+
+
+@pytest.mark.parametrize(
+    "method,required_statement",
+    [
+        ("_join_executor_owner", "await self._finish_executor_join()"),
+        ("_finish_executor_join", "await run_application_finalizer_in_worker(self._shutdown_finalizer)"),
+        ("_join_registry_owner", "await self.execution_lease_release_registry.join_all()"),
+        ("join_executor_shutdown", "executor.shutdown(wait=True)"),
+    ],
+)
+def test_shutdown_join_graph_rejects_unreachable_owner_edge(method: str, required_statement: str) -> None:
+    sources = {
+        "shutdown": inspect.getsource(ExecutionServiceImpl.shutdown),
+        "_join_executor_owner": inspect.getsource(ExecutionServiceImpl._join_executor_owner),
+        "_finish_executor_join": inspect.getsource(ExecutionServiceImpl._finish_executor_join),
+        "_join_registry_owner": inspect.getsource(ExecutionServiceImpl._join_registry_owner),
+        "join_executor_shutdown": inspect.getsource(ExecutionServiceImpl.join_executor_shutdown),
+    }
+    _assert_shutdown_join_graph(sources)
+    original_lines = [line for line in sources[method].splitlines() if line.strip() == required_statement]
+    assert len(original_lines) == 1
+    line = original_lines[0]
+    indent = line[: len(line) - len(line.lstrip())]
+    sources[method] = sources[method].replace(line, indent + "if False:\n" + indent + "    " + required_statement)
+    ast.parse(textwrap.dedent(sources[method]))
+    with pytest.raises(AssertionError):
+        _assert_shutdown_join_graph(sources)
 
 
 def _real_session_service(
