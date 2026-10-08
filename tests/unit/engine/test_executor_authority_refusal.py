@@ -7,9 +7,9 @@ import pytest
 from elspeth.contracts.errors import RunLeadershipLostError, RunMembershipLostError
 from elspeth.engine.executors import TransformExecutor
 from elspeth.engine.executors.sink import SinkExecutor
+from tests.fixtures.executors import _make_factory, _make_span_factory, _make_token, _make_transform
 from tests.fixtures.factories import make_context
 from tests.unit.engine.conftest import make_test_step_resolver
-from tests.unit.engine.test_executors import _make_factory, _make_span_factory, _make_token, _make_transform
 
 
 @pytest.fixture(params=["leader", "member"])
