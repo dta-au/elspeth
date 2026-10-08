@@ -1,20 +1,23 @@
 # Remaining oversized-file backlog
 
-This is the explicit remaining backlog after the two local slices, not a completion claim for the oversized-file goal. It uses the reviewed baseline inventory, a fresh immutable Git-blob count at the first-slice commit, and read-only byte measurements of the frozen executor continuation. Completed collection, parity, focused checks and independent review for that continuation are recorded in [executor-slice.md](executor-slice.md) and [executor-review.md](executor-review.md).
+This is the explicit remaining backlog after the three local slices; it is not a completion claim for the oversized-file goal. The current measurement scope is committed `fb6c7185f90c8e94b0b03452d453e8cc8c0da3e2` plus the frozen DAG overlay. The original inventory and earlier slice observations below remain historical evidence. Completed executor collection, parity, focused checks and independent review are recorded in [executor-slice.md](executor-slice.md) and [executor-review.md](executor-review.md). DAG size evidence is recorded here, with completed validation and independent review in [dag-slice.md](dag-slice.md) and [dag-review.md](dag-review.md).
 
-The first processor extraction leaves `tests/unit/engine/test_processor.py` at **9,731 lines**, so that target remains unfinished. The extracted transform/telemetry module is 1,871 lines at the pinned commit. All 25 original authored targets above 5,000 remain above 5,000 at that commit; the executor continuation reduces the observed residual to **24 original authored targets above 5,000**. Its original module is now 3,317 lines, and all extracted executor modules are below 5,000. The published streaming snapshot adds a 26th prospective authored target: `src/elspeth/web/execution/service.py`, at 5,315 lines. It is 4,853 lines on the main-based refactoring branch, and its streaming size must be retained in the backlog rather than disappearing from scope.
+The first processor extraction leaves `tests/unit/engine/test_processor.py` at **9,731 lines**, so that target remains unfinished. The extracted transform/telemetry module is 1,871 lines at the first-slice commit. All 25 original authored targets above 5,000 remained above 5,000 at that historical commit; the executor slice reduced the residual to 24, and the measured DAG continuation now leaves **23 original authored targets above 5,000**. The original executor module is 3,317 lines and the original DAG module is 2,955; all their extracted modules are below 5,000. **Eight original authored targets remain above 10,000**, all reserved to streaming literal or semantic ownership. The published streaming snapshot adds a 26th prospective authored target: `src/elspeth/web/execution/service.py`, at 5,315 lines. It is 4,853 lines on the main-based refactoring branch, and its streaming size must be retained in the backlog rather than disappearing from scope.
 
 ## Evidence and current-status boundaries
 
 - Main baseline: `9e481bc85a32ee15f808c5e2b16cab7634e57b8e`, from `docs/refactoring/oversized-files-20261009/inventory.csv.gz`; decompressed parsed records exactly matched a fresh main Git-blob inventory.
-- First-slice pinned commit: `794531426a48ed6666bb68a0b690126fe58690d0`. Current observed bytes for the other 24 baseline authored targets exactly matched this commit. The executor row uses the later frozen-source measurement, not its 7,432-line committed input.
-- Executor frozen-source manifest: `executor-slice/frozen-source-files.json`, SHA-256 `6c9f618a229e0d2f549aefec38eb392421e7d8d95093024d2dddfd994900db55`. All six source hashes and line counts matched the implementing lane's manifest. A second byte read of every observed target matched; this is observed stability, not an atomic locked snapshot.
+- Current committed base: `fb6c7185f90c8e94b0b03452d453e8cc8c0da3e2`; freshly enumerated with the controlled Git-blob counting script. Current byte reads of the other 24 original authored targets exactly matched this commit; the DAG target uses the frozen overlay observation.
+- Current DAG frozen-source manifest: `dag-slice/frozen-source-files.json`, SHA-256 `9f1c139d6865a0e5978a913a5a976954fcc44721862fc70523aa4855cbffb95c`. All four line counts and source hashes matched the implementing lane's manifest. A second byte read of every current target matched; this is observed stability, not an atomic locked snapshot. No pre-readiness count was used as final evidence.
+- First-slice historical commit: `794531426a48ed6666bb68a0b690126fe58690d0`. At the earlier executor observation, the other 24 baseline authored targets exactly matched that commit. This is historical byte-parity evidence, not an assertion about every future overlay.
+- Historical executor frozen-source manifest: `executor-slice/frozen-source-files.json`, SHA-256 `6c9f618a229e0d2f549aefec38eb392421e7d8d95093024d2dddfd994900db55`. All six source hashes and line counts matched that lane's manifest. Its second byte reads matched; those observations were not an atomic locked snapshot. The current committed inventory independently records the completed executor sizes.
 - Published PR281 snapshot: `9f26833c8f6a7c56abd2c5b35c80484ebe0c82bc`; published sizes reconstructed from the reviewed baseline plus published snapshot deltas.
-- Exact streaming tracked-file manifest: `streaming-full-changelog-snapshot-20261008-1/tracked-file-manifest.json`, against the same main base, SHA-256 `d7e8e437f730534880586c41e8687057f8bc80a4996e8bdf18605ecb4184dee1`. Measured `files=536`, unique paths `536`.
-- The manifest is an exact historical path-overlap instrument. A `No` membership does **not** release semantically active Composer, Sessions, execution, coordination, or related gate surfaces. Broad streaming ownership still applies; scope needs integration or an explicit bounded release on a remeasured stable tree.
+- Canonical streaming ownership at owner checkpoint 72: `streaming-owned-paths-20261008-538-post-caddy.txt`, SHA-256 `3149d9cf6e2b97e92a3e5002da4d0dc7a3c7430df0c5535eae7f8ad8366afc38`; measured 538 nonempty paths, all unique. Compared with the historical 536-file manifest, the exact additions are `CONTRIBUTING.md` and `tests/unit/helpers/test_composer_https.py`, with no removals.
+- Historical streaming tracked-file manifest: `streaming-full-changelog-snapshot-20261008-1/tracked-file-manifest.json`, against the same main base, SHA-256 `d7e8e437f730534880586c41e8687057f8bc80a4996e8bdf18605ecb4184dee1`; 536 files and unique paths. It remains snapshot evidence; it is superseded by the canonical 538-path list for current literal ownership.
+- A `No` canonical literal membership does **not** release semantically active Composer, Sessions, execution, coordination, or related gate surfaces. Broad streaming ownership still applies; scope needs integration or an explicit bounded release on a remeasured stable tree.
 - Physical-line counting retains the controlled inventory rule: regular strict-UTF-8 non-NUL blobs, LF plus one nonterminated final line. No pytest, source execution, gates, commit, or source/test edit was performed by this backlog lane.
 
-Raw count output:
+Historical original/first-slice count output:
 
 ```text
 snapshot=main commit=9e481bc85a32ee15f808c5e2b16cab7634e57b8e entries=6133 text=6109 excluded=24 gt5000=36 gt10000=13
@@ -27,11 +30,26 @@ original_authored_gt10000=9 first_slice_authored_gt10000=8
 exact_manifest_overlap_among_original_authored_gt5000=10
 ```
 
+Current committed and ownership measurement:
+
+```text
+snapshot=second-slice commit=fb6c7185f90c8e94b0b03452d453e8cc8c0da3e2 entries=6151 text=6126 excluded=25 gt5000=35 gt10000=12
+changed_rows=21 oversized_overlap_rows=2
+canonical_owned_paths=538 unique_paths=538
+canonical_additions=['CONTRIBUTING.md', 'tests/unit/helpers/test_composer_https.py']
+canonical_removals=[]
+committed_authored_gt5000=24 committed_authored_gt10000=8
+observed_after_DAG_authored_gt5000=23 observed_after_DAG_authored_gt10000=8
+huge_literal_owned=6 huge_semantic_only_owned=2
+```
+
+The eight authored targets still above 10,000 are all reserved: six are literal members of the canonical list (`test_tools.py`, the Landscape fencing and Sessions mutation-authority gates, session routes, execution service tests, and Composer/runtime agreement); two remain semantically owned despite unchanged literal paths (`src/elspeth/web/composer/state.py` and `tests/unit/web/composer/test_state.py`). Their table rows retain full repository-relative identities. The ordinary processor test remains open at 9,731, so it is outside this eight-target >10,000 subset but still above the 5,000 target.
+
 ## One status table for every authored target
 
-The baseline and published columns permit later integration to retain growing targets. The current column reflects the observed continuation after the executor-ready signal; all rows except the executor still match the first-slice commit byte-for-byte. “Reserved” indicates coordination status, not missing design. Exact manifest membership is distinct from semantic ownership. Counts are physical lines; the table retains the completed executor target so no original authored target disappears from the accounting.
+The baseline and published columns permit later integration to retain growing targets. The current column records the immutable second-slice commit for byte-identical targets and the measured frozen DAG overlay for the DAG row. “Reserved” indicates coordination status, not missing design. Canonical 538-path literal membership is distinct from semantic ownership. Counts are physical lines; the table retains every original authored target, including completed executor work and the measured DAG size target, plus the published execution-service target.
 
-| Target | Main lines | Current observed lines | Published lines | Exact manifest | Current status / next coherent slice |
+| Target | Main lines | Current lines | Published lines | Canonical 538 literal | Current status / next coherent slice |
 |---|---:|---:|---:|---|---|
 | `tests/unit/web/composer/test_tools.py` | 21212 | 21212 | 21212 | Yes | Reserved to streaming semantic owner / coordinated post-integration split. Mutation tools; canonical pipeline and credential refusals; blob/secret policy; discovery; preview/proof, keeping coherent refusal cases. |
 | `tests/unit/architecture/test_web_landscape_mutation_fencing.py` | 19572 | 19572 | 22439 | Yes | Reserved to streaming semantic owner / coordinated post-integration split. Typed policy inventory; AST/DML support; authority/transaction/escape proof families; retain live pins and adversarial tests. |
@@ -50,7 +68,7 @@ The baseline and published columns permit later integration to retain growing ta
 | `tests/unit/web/execution/test_validation.py` | 6913 | 6913 | 6913 | No | Reserved to streaming semantic owner / coordinated post-integration split. Profile/network/path policy; credential refusals; real runtime materialization; semantic/edge contracts; diagnostics. |
 | `tests/unit/architecture/test_dag_scenario_corpus_contract.py` | 6729 | 6729 | 6729 | Yes | Reserved to streaming semantic owner / coordinated post-integration split. Registry/manifest/schema; semantic projection; recovery evidence; independent case/harness parity. |
 | `tests/unit/web/composer/test_advisor_checkpoint.py` | 6310 | 6310 | 6310 | No | Reserved to streaming semantic owner / coordinated post-integration split. Checkpoint/evidence summaries; termination/repair; disclosure/history replay; telemetry. Preserve per-transition provider calls. |
-| `tests/unit/core/test_dag.py` | 6292 | 6292 | 6292 | No | Proposed engine/core or CLI/lints follow-up; no independent release inferred. Builder/accessors; connections/gates; coalesce/aggregation; schema/guarantees, preserving one fixture authority. |
+| `tests/unit/core/test_dag.py` | 6292 | 2955 | 6292 | No | Completed local decomposition with focused validation and independent review. Validation remains here; construction and routing moved to explicit modules with `tests/fixtures/dag.py` as setup authority. |
 | `tests/unit/web/blobs/test_service.py` | 6246 | 6246 | 6250 | Yes | Reserved to streaming semantic owner / coordinated post-integration split. CRUD/quota; custody/reconciliation; fork rollback; run-output finalization; read/verified streaming. |
 | `elspeth-lints/src/elspeth_lints/core/cli.py` | 6110 | 6110 | 6110 | No | Proposed engine/core or CLI/lints follow-up; no independent release inferred. Parser/dispatch; lint reporting; allowlist/reaudit operations; signing-bundle/rekey diagnostics, preserving exact CLI output. |
 | `tests/unit/core/test_config.py` | 5909 | 5909 | 5909 | No | Proposed engine/core or CLI/lints follow-up; no independent release inferred. Settings/loaders; gates/coalesce; secrets/redaction; env/templates and boundary refusals. |
@@ -60,7 +78,7 @@ The baseline and published columns permit later integration to retain growing ta
 | `src/elspeth/cli.py` | 5278 | 5278 | 5278 | No | Proposed engine/core or CLI/lints follow-up; no independent release inferred. Bootstrap; run/validate/explain; resume/join/abandon; export verification; deployment/web command groups. |
 | `src/elspeth/web/execution/service.py` | 4853 | 4853 | 5315 | Yes | Reserved to streaming semantic owner / coordinated post-integration split. Admission/materialization; worker lifecycle; cancellation/recovery; finalization/diagnostics through explicit leases and accounting. |
 
-## Active executor continuation and next sequencing
+## Completed executor evidence and next sequencing
 
 The executor continuation keeps transforms and the dedicated `TestReRaiseGuardPattern` security gate in the original file, with gate execution, aggregation, node-state guards, and shared setup in explicit modules. The implementing lane reported frozen source; these are the actual resulting names and measured byte counts. Every source hash and line count matched its manifest, and the second reads matched the first:
 
@@ -80,13 +98,27 @@ The executor size target is met in this validated local slice; its linked report
 
 Then continue processor test decomposition until the remaining 9,731-line module and every resulting authored unit are at most 5,000. Move shared setup as one authority with all consumers, retain corpus-pinned classes where coherent, and handle real evidence locators together if they move. Do not turn the original into a wrapper, import discoverable test classes back, hide assertions in a generic loop, or change production behavior to repair a relocation.
 
-Ordinary core/DAG/config tests and CLI seams can follow after dependency ownership is checked. Gate support follows Sessions collector → clock proof support → Landscape support, under one coordinated owner with full live-record and refusal-control parity. Composer and execution/Sessions production movement follows streaming integration and characterization. Keep the LLM/provider authoring path, immutable composition semantics, transaction/cancellation scopes, and PostgreSQL authority proofs intact.
+The authorized DAG continuation retains validation in `tests/unit/core/test_dag.py` and moves construction to `test_dag_construction.py`, routing to `test_dag_routing.py`, and shared setup to `tests/fixtures/dag.py`. These final source names and counts were measured only after the readiness signal; every hash matched the lane's frozen-source manifest:
+
+```text
+tests/fixtures/dag.py: lines=233 bytes=9587 sha256=e7981f29ee261630f80ab5bec41241aeaf3f2ae4f5390854885eec4e53e273b2 frozen_manifest_match=True
+tests/unit/core/test_dag.py: lines=2955 bytes=118026 sha256=dcfa2815bb593a0825dc173b69b2cc29534c79122b1752eedc43cf419ad0a834 frozen_manifest_match=True
+tests/unit/core/test_dag_construction.py: lines=1611 bytes=64469 sha256=82b552bb5e5a330ba596f8103348479f5b191e523f258db9e207a4204ea3f08f frozen_manifest_match=True
+tests/unit/core/test_dag_routing.py: lines=1536 bytes=61362 sha256=e491e6d38743893c07799c0c7d95eb448c9a910b25014b42bcf945c726fef981 frozen_manifest_match=True
+baseline_authored_targets=25 observed_residual_gt5000=23
+observed_residual_gt10000=8 literal_owned=6 semantic_only_owned=2
+other_24_baseline_authored_targets_byte_equal_to_fb6c7185f=True
+observed_target_second_byte_reads_match=True; observations_not_atomic=True
+```
+
+Core/config and CLI seams follow after dependency ownership is checked. Gate support follows Sessions collector → clock proof support → Landscape support, under one coordinated owner with full live-record and refusal-control parity. Composer and execution/Sessions production movement follows streaming integration and characterization. Keep the LLM/provider authoring path, immutable composition semantics, transaction/cancellation scopes, and PostgreSQL authority proofs intact.
 
 The target remains all authored modules at most 5,000 lines and none above 10,000. Locks, generated report data, curated proof/policy artifacts, input data, and frozen baselines retain producer/consumer-specific treatment; no mechanical artifact splitting is proposed. Broad suite and PostgreSQL execution belongs to the integrator’s capacity slot when a later implementation changes the relevant runtime or persistence behavior.
 
 ## Outstanding completion evidence
 
 - Executor final names, source hashes and per-module counts are measured above; local validation and review are complete in the linked report. Publication and integration are not performed.
+- DAG final per-module counts, source hashes and original-target residual accounting are measured above; local validation and independent review are complete in the linked DAG reports. Publication and integration are not performed.
 - Processor first-slice residual 9,731 lines remains scheduled work, despite crossing below 10,000.
 - Streaming integration/release and remeasurement remain prerequisites for reserved semantic surfaces, including unchanged exact-manifest paths.
 - This backlog does not claim whole-project decomposition completion, CI acceptance, or signed allowlist clearance.
