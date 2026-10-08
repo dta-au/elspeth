@@ -1,4 +1,4 @@
-import { type JSX, useEffect, useRef, useState } from "react";
+import { type JSX, useEffect, useId, useRef, useState } from "react";
 import { getTutorialReadiness, getTutorialSample } from "@/api/client";
 import { ChatPanelContent } from "@/components/chat/ChatPanel";
 import { Button } from "@/components/ui";
@@ -42,6 +42,36 @@ function isMissingSession(error: unknown): boolean {
     (error as { status?: unknown }).status === 404;
 }
 
+const BRIEF_INSTRUCTION =
+  "Send this brief to the Composer you'll use after the tutorial. You review what it builds before anything runs.";
+const REVIEW_INSTRUCTION =
+  "Review the graph, YAML, and any pending decisions. Continue only when this pipeline is ready to run.";
+
+interface BuildProgress {
+  sessionReady: boolean;
+  composing: boolean;
+  decisionPending: boolean;
+  decisionApplying: boolean;
+  hasPipeline: boolean;
+}
+
+/**
+ * Once the brief is sent, what still stands between the learner and Run —
+ * phrased as the next thing to do — or null when Continue is available. The
+ * step header shows it as the instruction line, and the Continue button is
+ * described by it, so a disabled Continue always says why.
+ */
+function buildBlocker(progress: BuildProgress): string | null {
+  if (!progress.sessionReady) return "Loading the tutorial session…";
+  if (progress.composing) return "The Composer is working on your pipeline. Its reply appears in the chat.";
+  if (progress.decisionApplying) return "Applying your decision…";
+  if (progress.decisionPending) return "A decision is waiting for you in the chat. Answer it before you continue.";
+  if (!progress.hasPipeline) {
+    return "The Composer hasn't built a pipeline yet. Ask it to continue in the chat.";
+  }
+  return null;
+}
+
 /** Tutorial framing around the ordinary freeform Composer authoring surface. */
 export function TutorialFreeformShell({
   sessionId,
@@ -68,6 +98,7 @@ export function TutorialFreeformShell({
   const [checking, setChecking] = useState(false);
   const sentRef = useRef(false);
   const checkingRef = useRef(false);
+  const instructionId = useId();
   const hasUserMessage = messages.some((message) => message.role === "user");
   const pendingProposal = proposals.some((proposal) => proposal.status === "pending");
 
@@ -140,39 +171,62 @@ export function TutorialFreeformShell({
       });
   };
 
-  const readyToCheck = activeSessionId === sessionId && compositionStateLoaded &&
-    hasUserMessage && compositionState !== null && !isComposing &&
-    !pendingProposal && proposalActionPendingIds.length === 0 && pendingReviewCount === 0;
+  const chatVisible = hasUserMessage || sent;
+  const showBrief = sampleUrls !== null && !chatVisible;
+  const blocker = chatVisible
+    ? buildBlocker({
+        sessionReady: activeSessionId === sessionId && compositionStateLoaded,
+        composing: isComposing || !hasUserMessage,
+        decisionPending: pendingProposal || pendingReviewCount > 0,
+        decisionApplying: proposalActionPendingIds.length > 0,
+        hasPipeline: compositionState !== null,
+      })
+    : null;
+  const readyToCheck = chatVisible && blocker === null;
+  const instruction = !chatVisible ? BRIEF_INSTRUCTION : blocker ?? REVIEW_INSTRUCTION;
 
   return (
-    <TutorialWorkspaceFrame ariaLabel="Tutorial build">
+    <TutorialWorkspaceFrame
+      ariaLabel="Tutorial build"
+      header={{
+        title: "Build with the Composer.",
+        instruction: (
+          <p id={instructionId} className="tutorial-step-instruction">{instruction}</p>
+        ),
+        notice: readinessError !== null
+          ? <p role="alert" className="tutorial-error">{readinessError}</p>
+          : undefined,
+        actions: sampleUrls !== null && chatVisible ? (
+          <Button
+            variant="primary"
+            onClick={onContinue}
+            disabled={!readyToCheck || checking}
+            aria-describedby={instructionId}
+          >
+            {checking ? "Checking pipeline…" : "Continue to Run"}
+          </Button>
+        ) : undefined,
+      }}
+    >
       <div className="tutorial-workspace-authoring">
-        <p className="tutorial-kicker">Build</p>
-        <h2>Build with the Composer.</h2>
-        {loadError !== null && <p role="alert" className="tutorial-error">{loadError}</p>}
-        {loadError !== null && (
-          <Button onClick={() => setSampleRetry((attempt) => attempt + 1)}>Retry loading example</Button>
+        {(loadError !== null || sampleUrls === null || showBrief) && (
+          <div className="tutorial-build-intro">
+            {loadError !== null && <p role="alert" className="tutorial-error">{loadError}</p>}
+            {loadError !== null && (
+              <Button onClick={() => setSampleRetry((attempt) => attempt + 1)}>Retry loading example</Button>
+            )}
+            {sampleUrls === null && loadError === null && <p role="status">Loading your example…</p>}
+            {showBrief && (
+              <>
+                <pre className="tutorial-brief">{tutorialBrief(sampleUrls)}</pre>
+                <Button variant="primary" onClick={onSendBrief} disabled={activeSessionId !== sessionId || isComposing || !composeTimeoutReady}>
+                  Send tutorial brief
+                </Button>
+              </>
+            )}
+          </div>
         )}
-        {sampleUrls === null && loadError === null && <p role="status">Loading your example…</p>}
-        {sampleUrls !== null && !hasUserMessage && !sent && (
-          <>
-            <p>This brief goes through the ordinary freeform Composer. Review its proposal before running anything.</p>
-            <pre className="tutorial-brief">{tutorialBrief(sampleUrls)}</pre>
-            <Button variant="primary" onClick={onSendBrief} disabled={activeSessionId !== sessionId || isComposing || !composeTimeoutReady}>
-              Send tutorial brief
-            </Button>
-          </>
-        )}
-        {(hasUserMessage || sent) && <ChatPanelContent composer={composer} allowFork={false} />}
-        {sampleUrls !== null && (hasUserMessage || sent) && (
-          <>
-            <p>Review the graph, YAML, and any pending decisions. Continue only when this pipeline is ready to run.</p>
-            {readinessError !== null && <p role="alert" className="tutorial-error">{readinessError}</p>}
-            <Button variant="primary" onClick={onContinue} disabled={!readyToCheck || checking}>
-              {checking ? "Checking pipeline…" : "Continue to Run"}
-            </Button>
-          </>
-        )}
+        {chatVisible && <ChatPanelContent composer={composer} allowFork={false} />}
       </div>
     </TutorialWorkspaceFrame>
   );

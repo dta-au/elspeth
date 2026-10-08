@@ -8,6 +8,7 @@ import { resetStore } from "@/test/store-helpers";
 import type { ChatMessage, CompositionProposal, CompositionState } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { TutorialFreeformShell } from "./TutorialFreeformShell";
+import type { TutorialStepHeader } from "./TutorialWorkspaceFrame";
 
 vi.mock("@/api/client", () => ({
   getTutorialSample: vi.fn().mockResolvedValue({
@@ -16,9 +17,26 @@ vi.mock("@/api/client", () => ({
   getTutorialReadiness: vi.fn().mockResolvedValue({ state_id: "state-1" }),
 }));
 vi.mock("@/components/chat/ChatPanel", () => ({ ChatPanelContent: () => <div>Ordinary freeform chat</div> }));
+// The frame's step header is where Build's title, instruction and Continue
+// live, so the stand-in renders it; the workspace panes stay out of scope.
 vi.mock("./TutorialWorkspaceFrame", () => ({
-  TutorialWorkspaceFrame: ({ children }: { children: React.ReactNode }) => <section>{children}</section>,
+  TutorialWorkspaceFrame: ({ children, header }: { children: React.ReactNode; header?: TutorialStepHeader }) => (
+    <section>
+      {header !== undefined && (
+        <header>
+          <h2>{header.title}</h2>
+          {header.instruction}
+          {header.notice}
+          {header.actions}
+        </header>
+      )}
+      <div data-testid="authoring-pane">{children}</div>
+    </section>
+  ),
 }));
+
+const REVIEW_INSTRUCTION =
+  "Review the graph, YAML, and any pending decisions. Continue only when this pipeline is ready to run.";
 
 const userMessage = {
   id: "message-1",
@@ -110,10 +128,14 @@ describe("TutorialFreeformShell", () => {
 
     const continueButton = await screen.findByRole("button", { name: "Continue to Run" });
     expect(continueButton).toBeDisabled();
+    expect(continueButton).toHaveAccessibleDescription(
+      "A decision is waiting for you in the chat. Answer it before you continue.",
+    );
     expect(api.getTutorialReadiness).not.toHaveBeenCalled();
 
     useSessionStore.setState({ compositionProposals: [] });
     await waitFor(() => expect(continueButton).toBeEnabled());
+    expect(continueButton).toHaveAccessibleDescription(REVIEW_INSTRUCTION);
     await user.click(continueButton);
     await waitFor(() => expect(onCompleted).toHaveBeenCalledWith("session-1"));
     expect(api.getTutorialReadiness).toHaveBeenCalledWith("session-1");
@@ -131,8 +153,60 @@ describe("TutorialFreeformShell", () => {
     });
     render(<TutorialFreeformShell sessionId="session-1" onCompleted={vi.fn()} />);
 
-    expect(await screen.findByRole("button", { name: "Continue to Run" })).toBeDisabled();
+    const continueButton = await screen.findByRole("button", { name: "Continue to Run" });
+    expect(continueButton).toBeDisabled();
+    expect(continueButton).toHaveAccessibleDescription(
+      "A decision is waiting for you in the chat. Answer it before you continue.",
+    );
     expect(api.getTutorialReadiness).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      blocker: "the Composer is still working",
+      state: { isComposing: true, compositionState: { id: "state-1" } as CompositionState },
+      instruction: "The Composer is working on your pipeline. Its reply appears in the chat.",
+    },
+    {
+      blocker: "a decision is being applied",
+      state: { proposalActionPendingIds: ["proposal-1"], compositionState: { id: "state-1" } as CompositionState },
+      instruction: "Applying your decision…",
+    },
+    {
+      blocker: "the Composer replied without a pipeline",
+      state: { compositionState: null },
+      instruction: "The Composer hasn't built a pipeline yet. Ask it to continue in the chat.",
+    },
+  ])("says what to do next while $blocker, and describes the disabled Continue with it", async ({ state, instruction }) => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionStateLoaded: true,
+      messages: [userMessage],
+      ...state,
+    });
+    render(<TutorialFreeformShell sessionId="session-1" onCompleted={vi.fn()} />);
+
+    const continueButton = await screen.findByRole("button", { name: "Continue to Run" });
+    expect(continueButton).toBeDisabled();
+    expect(continueButton).toHaveAccessibleDescription(instruction);
+    expect(screen.getByText(instruction)).toBeInTheDocument();
+  });
+
+  it("keeps the step's title, instruction and Continue out of the authoring pane", async () => {
+    const user = userEvent.setup();
+    render(<TutorialFreeformShell sessionId="session-1" onCompleted={vi.fn()} />);
+
+    const pane = screen.getByTestId("authoring-pane");
+    const send = await screen.findByRole("button", { name: "Send tutorial brief" });
+    expect(pane).toContainElement(send);
+    expect(pane).not.toContainElement(screen.getByRole("heading", { name: "Build with the Composer." }));
+    expect(screen.getByText(/^Send this brief to the Composer/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue to Run" })).toBeNull();
+
+    await user.click(send);
+
+    expect(pane).not.toContainElement(await screen.findByRole("button", { name: "Continue to Run" }));
+    expect(pane).toHaveTextContent(/^Ordinary freeform chat$/);
   });
 
   it("rejects a readiness answer for an old committed state", async () => {
