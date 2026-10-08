@@ -3,30 +3,14 @@ import { PipelineValidationSummary } from "@/components/chat/PipelineValidationS
 import { ArtifactWorkspace } from "@/components/workspace/ArtifactWorkspace";
 import { ComposerWorkspace } from "@/components/workspace/ComposerWorkspace";
 import { WorkspaceActionBar } from "@/components/workspace/WorkspaceActionBar";
-
-/**
- * The step header: the step's title, the one instruction that says what the
- * learner should do next, and the step's forward action. It spans BOTH panes
- * above the workspace, so it is visible at every width, in either narrow view,
- * and with the authoring pane collapsed. The workspace's own bottom bar is not
- * an option for the forward action: its artifact cell is hidden in narrow
- * Compose view (ComposerWorkspace `hidden={artifactViewHidden}`).
- */
-export interface TutorialStepHeader {
-  title: string;
-  /** The instruction line; give it an id when an action is described by it. */
-  instruction: ReactNode;
-  /** Alerts tied to the step's action (e.g. a refused readiness check). */
-  notice?: ReactNode;
-  actions?: ReactNode;
-}
+import { TutorialStepHeader, type TutorialStepHeaderProps } from "./TutorialStepHeader";
 
 interface TutorialWorkspaceFrameProps {
   /** Accessible name of the frame's landmark (`section`). */
   ariaLabel: string;
-  /** Step header above both panes. Run keeps its heading in its card. */
-  header?: TutorialStepHeader;
-  /** The authoring pane's content: the freeform ChatPanel, or the run card. */
+  /** The step header, on a band above both panes. */
+  header: TutorialStepHeaderProps;
+  /** The authoring pane's content: the freeform ChatPanel, or the run's body. */
   children: ReactNode;
 }
 
@@ -53,18 +37,7 @@ export function TutorialWorkspaceFrame({
 }: TutorialWorkspaceFrameProps): JSX.Element {
   return (
     <section className="tutorial-workspace-shell" aria-label={ariaLabel}>
-      {header !== undefined && (
-        <header className="tutorial-step-header">
-          <div className="tutorial-step-header-text">
-            <h2>{header.title}</h2>
-            {header.instruction}
-            {header.notice}
-          </div>
-          {header.actions !== undefined && (
-            <div className="tutorial-step-header-actions">{header.actions}</div>
-          )}
-        </header>
-      )}
+      <TutorialStepHeader {...header} />
       <ComposerWorkspace
         authoring={children}
         artifact={

@@ -8,7 +8,6 @@ import { resetStore } from "@/test/store-helpers";
 import type { ChatMessage, CompositionProposal, CompositionState } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { TutorialFreeformShell } from "./TutorialFreeformShell";
-import type { TutorialStepHeader } from "./TutorialWorkspaceFrame";
 
 vi.mock("@/api/client", () => ({
   getTutorialSample: vi.fn().mockResolvedValue({
@@ -17,23 +16,9 @@ vi.mock("@/api/client", () => ({
   getTutorialReadiness: vi.fn().mockResolvedValue({ state_id: "state-1" }),
 }));
 vi.mock("@/components/chat/ChatPanel", () => ({ ChatPanelContent: () => <div>Ordinary freeform chat</div> }));
-// The frame's step header is where Build's title, instruction and Continue
-// live, so the stand-in renders it; the workspace panes stay out of scope.
-vi.mock("./TutorialWorkspaceFrame", () => ({
-  TutorialWorkspaceFrame: ({ children, header }: { children: React.ReactNode; header?: TutorialStepHeader }) => (
-    <section>
-      {header !== undefined && (
-        <header>
-          <h2>{header.title}</h2>
-          {header.instruction}
-          {header.notice}
-          {header.actions}
-        </header>
-      )}
-      <div data-testid="authoring-pane">{children}</div>
-    </section>
-  ),
-}));
+// The real step header (Build's title, instruction and Continue) around the
+// authoring content; the store-bound workspace panes stay out of scope.
+vi.mock("./TutorialWorkspaceFrame", () => import("@/test/tutorialWorkspaceFrameStub"));
 
 const REVIEW_INSTRUCTION =
   "Review the graph, YAML, and any pending decisions. Continue only when this pipeline is ready to run.";

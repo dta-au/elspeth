@@ -4,6 +4,8 @@ import * as api from "@/api/client";
 import { TURN_4_RUN_BUTTON } from "./copy";
 import { TutorialTurn4Run } from "./TutorialTurn4Run";
 
+// The real step header (Run, Cancel, Retry) around the run's body.
+vi.mock("./TutorialWorkspaceFrame", () => import("@/test/tutorialWorkspaceFrameStub"));
 vi.mock("@/api/client", () => ({
   runTutorialPipeline: vi.fn(),
   cancelTutorialRun: vi.fn(),

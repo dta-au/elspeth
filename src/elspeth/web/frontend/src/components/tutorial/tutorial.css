@@ -143,6 +143,9 @@
 /* The tutorial's step title rung (--font-size-xl), stated rather than left to
    the user agent's 1.5em + 0.83em margins, which put it at an off-scale 24px. */
 .tutorial-step-header h2 {
+  /* Hug the text: Run focuses its title on mount and on Run, and a heading
+     stretched across the grid column drew a focus ring the header's width. */
+  justify-self: start;
   margin: 0;
   font-size: var(--font-size-xl);
   line-height: var(--line-height-tight);
@@ -225,23 +228,34 @@
   overflow: hidden;
 }
 
-/* Run step (I-1): the run card lives in the same workspace frame as the
-   freeform Build, so the pipeline pane keeps showing the graph the learner just
-   confirmed beside the Run button. The card has no internal scroll region
-   (the result table can outgrow the frame), so the authoring wrapper owns the
-   scroll — the same escape the completed panel above takes — and the card
-   keeps its intrinsic height inside the flex column instead of being squashed
-   to fit. Named `authoring` under the scroll-owner contract (workspace.css):
-   no ChatPanel is mounted on Run, so the name is uncontested. */
+/* Run step (I-1): the same workspace frame as the freeform Build, so the
+   pipeline pane keeps showing the graph the learner just confirmed while the
+   step header carries Run. The authoring pane holds the run's body — the
+   network disclosure, the prompt-shield note, then the results — with no
+   internal scroll region of its own (the result table can outgrow the frame),
+   so this wrapper owns the scroll and every block keeps its intrinsic height
+   instead of being squashed to fit. Named `authoring` under the scroll-owner
+   contract (workspace.css): no ChatPanel is mounted on Run, so the name is
+   uncontested. */
 .tutorial-shell--workspace .tutorial-run-authoring {
   --scroll-owner: authoring;
 
+  gap: var(--space-md);
   overflow-y: auto;
   padding: var(--space-md) var(--space-lg) var(--space-xl);
 }
 
-.tutorial-shell--workspace .tutorial-run-authoring > .tutorial-turn {
+/* (0,2,0): the column's gap is the only spacing, over the blocks' own
+   card-era margins (.tutorial-callout, .tutorial-run-discarded,
+   .tutorial-result-table-wrap). */
+.tutorial-shell--workspace .tutorial-run-authoring > * {
   flex: 0 0 auto;
+  margin: 0;
+}
+
+/* The run's progress line sits in the step header's instruction slot. */
+.tutorial-step-header .tutorial-running {
+  margin-top: 0;
 }
 
 
@@ -590,15 +604,6 @@
   }
 }
 
-/* Pre-run framing on the run card (I-1): the sentence that tells the learner
-   the graph beside the card is theirs to check and that nothing runs until
-   they click Run. Secondary tone — the primary Run button is the focal point. */
-.tutorial-run-ready {
-  margin-top: var(--space-lg);
-  color: var(--color-text-secondary);
-  line-height: 1.5;
-}
-
 .tutorial-run-summary {
   color: var(--color-state-positive);
   font-weight: 600;
@@ -618,9 +623,12 @@
   margin-top: var(--space-lg);
 }
 
+/* Fits the authoring pane (360–640px) rather than a 640px floor, which cut the
+   summary column off at the pane edge behind a horizontal scroller. Long URLs
+   and summaries wrap inside their cells; the wrapper's overflow-x stays as the
+   escape for a column set wider than the pane. */
 .tutorial-result-table {
   width: 100%;
-  min-width: 640px;
   border-collapse: collapse;
 }
 
@@ -630,6 +638,7 @@
   padding: var(--space-sm);
   text-align: left;
   vertical-align: top;
+  overflow-wrap: anywhere;
 }
 
 .tutorial-cell-note {

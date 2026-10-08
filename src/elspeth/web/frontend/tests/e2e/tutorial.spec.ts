@@ -215,8 +215,9 @@ test("Welcome → freeform Build → explicit Run → Audit → Graduation keeps
   await page.getByRole("button", { name: "Continue to Run" }).click();
   await expect(page.getByRole("heading", { name: "Ready to run." })).toBeVisible();
   expect(fixture.runCount).toBe(0);
-  await page.getByRole("button", { name: "Run", exact: true }).click();
-  await expect(page.getByText("bold")).toBeVisible();
+  // Run's actions live in the step header; its results in the authoring pane.
+  await page.locator(".tutorial-step-header").getByRole("button", { name: "Run", exact: true }).click();
+  await expect(page.locator(".workspace-authoring-pane").getByRole("table")).toContainText("bold");
   await page.getByRole("button", { name: "Continue", exact: true }).click();
   await expect(page.getByText(/This is the audit story/i)).toBeVisible();
   await page.getByRole("button", { name: "Continue", exact: true }).click();

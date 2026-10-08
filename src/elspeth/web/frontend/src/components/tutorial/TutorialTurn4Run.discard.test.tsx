@@ -4,6 +4,8 @@ import * as api from "@/api/client";
 import { TURN_4_RUN_BUTTON } from "./copy";
 import { TutorialTurn4Run } from "./TutorialTurn4Run";
 
+// The real step header around the run's body (results and discard note).
+vi.mock("./TutorialWorkspaceFrame", () => import("@/test/tutorialWorkspaceFrameStub"));
 vi.mock("@/api/client", () => ({
   runTutorialPipeline: vi.fn(),
   fetchPluginPolicy: vi.fn().mockResolvedValue({ data: { selections: [], control_modes: [] }, snapshotFingerprint: "fp" }),

@@ -5,6 +5,8 @@ import * as api from "@/api/client";
 import { TURN_4_RUN_BUTTON } from "./copy";
 import { TutorialTurn4Run } from "./TutorialTurn4Run";
 
+// The real step header (Run, Back, Continue) around the run's body.
+vi.mock("./TutorialWorkspaceFrame", () => import("@/test/tutorialWorkspaceFrameStub"));
 vi.mock("@/api/client", () => ({
   runTutorialPipeline: vi.fn(),
   cancelTutorialRun: vi.fn(),
@@ -150,5 +152,68 @@ describe("TutorialTurn4Run — explicit Run button (I-1: the run never auto-fire
       screen.getByText(/calls the configured LLM and fetches pages/i),
     ).toBeInTheDocument();
     expect(api.runTutorialPipeline).not.toHaveBeenCalled();
+  });
+});
+
+describe("TutorialTurn4Run — the step header carries the run, the pane carries its body", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("keeps the title, instruction and actions out of the authoring pane through every phase", async () => {
+    vi.mocked(api.runTutorialPipeline).mockResolvedValue(okRun("run-header"));
+    const onCompleted = vi.fn();
+    render(
+      <TutorialTurn4Run
+        sessionId="sess-run-header"
+        onCompleted={onCompleted}
+        onCancelled={noop}
+        onBack={noop}
+      />,
+    );
+    const pane = screen.getByTestId("authoring-pane");
+
+    const ready = screen.getByRole("heading", { name: "Ready to run." });
+    expect(ready).toHaveFocus();
+    expect(pane).not.toContainElement(ready);
+    expect(pane).not.toContainElement(screen.getByRole("button", { name: TURN_4_RUN_BUTTON }));
+    expect(pane).not.toContainElement(screen.getByRole("button", { name: "Back" }));
+    expect(pane).toHaveTextContent(/calls the configured LLM and fetches pages/i);
+
+    fireEvent.click(screen.getByRole("button", { name: TURN_4_RUN_BUTTON }));
+    const running = screen.getByRole("heading", { name: "Running your pipeline." });
+    expect(running).toHaveFocus();
+    const status = screen.getByRole("status", { busy: true });
+    expect(pane).not.toContainElement(status);
+
+    expect(await screen.findByRole("heading", { name: "Your pipeline ran." })).toBeInTheDocument();
+    // The same live region now carries the outcome, and is no longer busy.
+    expect(status).toHaveTextContent(/Done\. 1 rows returned\./);
+    expect(status).not.toHaveAttribute("aria-busy");
+    expect(pane).toContainElement(screen.getByRole("table"));
+    const continueButton = screen.getByRole("button", { name: "Continue" });
+    expect(pane).not.toContainElement(continueButton);
+    fireEvent.click(continueButton);
+    expect(onCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it("names a failed run in the title and keeps Retry in the header", async () => {
+    vi.mocked(api.runTutorialPipeline).mockRejectedValue(new Error("The tutorial runner is unavailable."));
+    render(
+      <TutorialTurn4Run
+        sessionId="sess-run-header-error"
+        onCompleted={noop}
+        onCancelled={noop}
+        onBack={noop}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: TURN_4_RUN_BUTTON }));
+
+    expect(await screen.findByRole("heading", { name: "The run did not complete." })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("The tutorial runner is unavailable.");
+    expect(screen.getByText("Retry the run, or go back to Build.")).toBeInTheDocument();
+    expect(screen.getByTestId("authoring-pane")).not.toContainElement(
+      screen.getByRole("button", { name: "Retry" }),
+    );
   });
 });

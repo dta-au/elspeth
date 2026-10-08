@@ -10,26 +10,11 @@ import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore
 import { resetStore } from "@/test/store-helpers";
 import type { ChatMessage } from "@/types/index";
 import { TutorialFreeformShell } from "./TutorialFreeformShell";
-import type { TutorialStepHeader } from "./TutorialWorkspaceFrame";
 
 vi.mock("@/api/client");
-// Renders the step header (Build's title, instruction and Continue); the
-// workspace panes stay out of scope.
-vi.mock("./TutorialWorkspaceFrame", () => ({
-  TutorialWorkspaceFrame: ({ children, header }: { children: React.ReactNode; header?: TutorialStepHeader }) => (
-    <section>
-      {header !== undefined && (
-        <header>
-          <h2>{header.title}</h2>
-          {header.instruction}
-          {header.notice}
-          {header.actions}
-        </header>
-      )}
-      {children}
-    </section>
-  ),
-}));
+// The real step header (Build's title, instruction and Continue) around the
+// authoring content; the store-bound workspace panes stay out of scope.
+vi.mock("./TutorialWorkspaceFrame", () => import("@/test/tutorialWorkspaceFrameStub"));
 
 const userMessage: ChatMessage = {
   id: "message-1",
