@@ -105,6 +105,17 @@ release claim. Use only a separately verified published image tag or digest.
   source, workflow and build run. Missing or conflicting identities refuse
   qualification and release promotion; image scans, signing, signature
   verification and smoke checks remain required.
+- **The first-run tutorial keeps its Build and Run chrome out of the Composer
+  workspace.** Each step's title, one instruction that says what to do next,
+  and its actions (Continue to Run; Run, Retry or Continue) sit in a header
+  above both panes. The tutorial no longer removes the workspace's height
+  floor, so the conversation stays readable on short and narrow screens
+  (measured at 1280×560: 49 px before, 110 px after). The chat header lines up
+  with the pipeline toolbar again, and nothing in the authoring pane sits flush
+  against the window edge. A disabled Continue to Run is described by the
+  instruction naming what it waits for, and stays visible in the narrow Compose
+  view. Run results wrap inside the pane instead of cutting off the summary
+  column.
 
 **Upgrade and publication notes.** Session epoch 71 and Landscape epoch 49
 are unchanged from 0.8.1; this release adds no schema-epoch cutover. Installations

@@ -862,7 +862,22 @@ describe("TutorialTurn4Run", () => {
   // The module-level run cache is keyed by sessionId — each test uses a
   // distinct id so a cached promise never leaks across tests. The run never
   // auto-fires (I-1): the executing/results states are reached by clicking
-  // the Run button on the pre-run card.
+  // the Run button in the step header.
+  //
+  // The run step renders the real workspace frame (step header + panes), and
+  // ComposerWorkspace observes its own width, so each test states the
+  // ResizeObserver it needs rather than inheriting an earlier test's stub.
+  beforeEach(() => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(): void {}
+        unobserve(): void {}
+        disconnect(): void {}
+      },
+    );
+  });
+
   it("has no axe violations on the pre-run card", async () => {
     const { container } = render(
       <TutorialTurn4Run

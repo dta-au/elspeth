@@ -14,7 +14,6 @@ import { TutorialFreeformShell } from "./TutorialFreeformShell";
 import { abandonTutorialRun, TutorialTurn4Run } from "./TutorialTurn4Run";
 import { TutorialTurn5AuditStory } from "./TutorialTurn5AuditStory";
 import { TutorialTurn7Graduation } from "./TutorialTurn7Graduation";
-import { TutorialWorkspaceFrame } from "./TutorialWorkspaceFrame";
 import {
   isAbandonOnPageHide,
   progressForTutorialState,
@@ -469,21 +468,18 @@ export function HelloWorldTutorial({
         />
       )}
       {state.step === "run" && state.sessionId !== null && (
-        // The run card sits in the workspace frame's authoring pane, with the
-        // committed graph in the pipeline pane beside it (I-1). Freeform Build
-        // remains revisitable before the Run begins. A typed
-        // readiness refusal on Run can return to that same session.
-        <TutorialWorkspaceFrame ariaLabel="Tutorial run">
-          <div className="tutorial-workspace-authoring tutorial-run-authoring">
-            <TutorialTurn4Run
-              sessionId={state.sessionId}
-              onResult={(result) => dispatch({ type: "runResultReady", result })}
-              onCompleted={(result) => dispatch({ type: "runCompleted", result })}
-              onCancelled={() => dispatch({ type: "cancelRun" })}
-              onBack={state.runId === null ? goBack : undefined}
-            />
-          </div>
-        </TutorialWorkspaceFrame>
+        // The run step renders its own workspace frame: its step header
+        // carries Run/Back, and the committed graph stays in the pipeline
+        // pane beside it (I-1). Freeform Build remains revisitable before the
+        // Run begins. A typed readiness refusal on Run can return to that
+        // same session.
+        <TutorialTurn4Run
+          sessionId={state.sessionId}
+          onResult={(result) => dispatch({ type: "runResultReady", result })}
+          onCompleted={(result) => dispatch({ type: "runCompleted", result })}
+          onCancelled={() => dispatch({ type: "cancelRun" })}
+          onBack={state.runId === null ? goBack : undefined}
+        />
       )}
       {state.step === "audit" &&
         state.sessionId !== null &&

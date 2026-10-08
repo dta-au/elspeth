@@ -127,22 +127,11 @@ vi.mock("./TutorialFreeformShell", async () => {
 });
 
 // The run stage keeps the workspace frame (pipeline pane with the committed
-// graph) mounted around the run card. The frame's real panes are covered by
-// TutorialFreeformShell.test.tsx / the workspace suites; here it is a labelled
-// passthrough so the run card's own behaviour is what these tests exercise.
-vi.mock("./TutorialWorkspaceFrame", () => ({
-  TutorialWorkspaceFrame: ({
-    ariaLabel,
-    children,
-  }: {
-    ariaLabel: string;
-    children: React.ReactNode;
-  }) => (
-    <section data-testid="tutorial-workspace-frame" aria-label={ariaLabel}>
-      {children}
-    </section>
-  ),
-}));
+// graph) mounted around the run's body. The frame's real panes are covered by
+// the a11y suite and tests/e2e/tutorial.spec.ts; here the stand-in renders the
+// real step header (where Run, Back and Continue live) around the authoring
+// content, so the run step's own behaviour is what these tests exercise.
+vi.mock("./TutorialWorkspaceFrame", () => import("@/test/tutorialWorkspaceFrameStub"));
 
 /** The learner's explicit Run gesture on the run turn (I-1). */
 async function clickRun(user: ReturnType<typeof userEvent.setup>): Promise<void> {

@@ -12,6 +12,7 @@ import {
   TURN_4_RUN_BUTTON,
 } from "./copy";
 import type { RunResultRow, TutorialRunResult } from "./tutorialMachine";
+import { TutorialWorkspaceFrame } from "./TutorialWorkspaceFrame";
 
 interface TutorialTurn4RunProps {
   sessionId: string;
@@ -303,114 +304,105 @@ export function TutorialTurn4Run({
     };
   }, []);
 
-  const phaseText = describePhase(phase);
+  const running = armed && result === null && error === null;
+  const back = (label?: string): JSX.Element | null =>
+    onBack === undefined ? null : (
+      <Button variant="bare" className="tutorial-link-button" onClick={onBack} aria-label={label}>
+        Back
+      </Button>
+    );
+
+  let title: string;
+  let actions: JSX.Element | undefined;
+  if (!armed) {
+    // Pre-run (I-1): the committed graph sits in the pipeline pane beside
+    // this step; the run waits for the learner's explicit click.
+    title = "Ready to run.";
+    actions = (
+      <>
+        <Button variant="primary" onClick={onRunClick}>{TURN_4_RUN_BUTTON}</Button>
+        {back()}
+      </>
+    );
+  } else if (result !== null) {
+    title = "Your pipeline ran.";
+    actions = (
+      <>
+        <Button variant="primary" onClick={() => onCompleted(result)}>{TURN_4_PRIMARY_BUTTON}</Button>
+        {back("Back to the pipeline build")}
+      </>
+    );
+  } else if (error !== null) {
+    title = "The run did not complete.";
+    actions = (
+      <>
+        <Button variant="primary" onClick={onRetryClick}>Retry</Button>
+        {back()}
+      </>
+    );
+  } else {
+    title = "Running your pipeline.";
+    actions = showCancel ? <Button onClick={onCancelClick}>Cancel run</Button> : undefined;
+  }
 
   return (
-    <section className="tutorial-turn" aria-labelledby="tutorial-run-title">
-      <p className="tutorial-kicker">Run</p>
-      <h2 id="tutorial-run-title" ref={headingRef} tabIndex={-1}>
-        {armed ? "Running your pipeline." : "Ready to run."}
-      </h2>
-      <AlertBanner tone="info" className="tutorial-disclosure">
-        {TUTORIAL_RUN_PREAMBLE}
-      </AlertBanner>
-      {shieldNote !== null && (
-        <p className="tutorial-callout">
-          {shieldNote === "wired" ? TUTORIAL_SHIELD_WIRED_NOTE : TUTORIAL_SHIELD_OVERRIDE_CAVEAT}
-        </p>
-      )}
-      {!armed && (
-        // Pre-run card (I-1): the committed graph sits in the pipeline pane
-        // beside this card; the run waits for the learner's explicit click.
-        // No role="status" here — nothing is in progress yet.
-        <>
-          <p className="tutorial-run-ready">{TURN_4_READY_BODY}</p>
-          <div className="tutorial-actions">
-            <Button variant="primary" onClick={onRunClick}>
-              {TURN_4_RUN_BUTTON}
-            </Button>
-            {onBack !== undefined && (
-              <Button
-                variant="bare"
-                className="tutorial-link-button"
-                onClick={onBack}
-              >
-                Back
-              </Button>
-            )}
-          </div>
-        </>
-      )}
-      {armed && result === null && error === null && (
-        <>
+    <TutorialWorkspaceFrame
+      ariaLabel="Tutorial run"
+      header={{
+        title,
+        headingRef,
+        instruction: (
+          // ONE element across the run's phases, so it is already a live
+          // region when the phase text and then the result land in it. Busy
+          // while the run executes; nothing is in progress before Run.
           <div
-            role="status"
-            aria-busy="true"
-            className="tutorial-running"
+            className="tutorial-step-instruction"
+            role={armed ? "status" : undefined}
+            aria-busy={running || undefined}
           >
-            <span className="tutorial-progress-bar" aria-hidden="true" />
-            <span>{phaseText}</span>
-          </div>
-          {showCancel && (
-            <div className="tutorial-actions">
-              <Button onClick={onCancelClick}>Cancel run</Button>
-            </div>
-          )}
-        </>
-      )}
-      {error !== null && (
-        <>
-          <p role="alert" className="tutorial-error">
-            {error}
-          </p>
-          <div className="tutorial-actions">
-            <Button variant="primary" onClick={onRetryClick}>
-              Retry
-            </Button>
-            {onBack !== undefined && (
-              <Button
-                variant="bare"
-                className="tutorial-link-button"
-                onClick={onBack}
-              >
-                Back
-              </Button>
+            {!armed && TURN_4_READY_BODY}
+            {running && (
+              <span className="tutorial-running">
+                <span className="tutorial-progress-bar" aria-hidden="true" />
+                <span>{describePhase(phase)}</span>
+              </span>
             )}
-          </div>
-        </>
-      )}
-      {result !== null && (
-        <>
-          <p className="tutorial-run-summary">
-            Done. {result.rows.length} rows returned.
-          </p>
-          {result.discardedRowCount > 0 && (
-            <p className="tutorial-run-discarded" role="status">
-              {result.discardedRowCount}{" "}
-              {result.discardedRowCount === 1 ? "row was" : "rows were"} discarded at the source
-              because the data could not be parsed. They were recorded in the audit trail but are
-              not shown in the results table.
-            </p>
-          )}
-          <TutorialResultTable rows={result.rows} />
-          <div className="tutorial-actions">
-            <Button variant="primary" onClick={() => onCompleted(result)}>
-              {TURN_4_PRIMARY_BUTTON}
-            </Button>
-            {onBack !== undefined && (
-              <Button
-                variant="bare"
-                className="tutorial-link-button"
-                onClick={onBack}
-                aria-label="Back to the pipeline build"
-              >
-                Back
-              </Button>
+            {result !== null && (
+              <>
+                <span className="tutorial-run-summary">Done. {result.rows.length} rows returned.</span>{" "}
+                Continue to see what the audit trail recorded about this run.
+              </>
             )}
+            {error !== null && (onBack === undefined ? "Retry the run." : "Retry the run, or go back to Build.")}
           </div>
-        </>
-      )}
-    </section>
+        ),
+        notice: error !== null ? <p role="alert" className="tutorial-error">{error}</p> : undefined,
+        actions,
+      }}
+    >
+      <div className="tutorial-workspace-authoring tutorial-run-authoring">
+        <AlertBanner tone="info" className="tutorial-disclosure">
+          {TUTORIAL_RUN_PREAMBLE}
+        </AlertBanner>
+        {shieldNote !== null && (
+          <p className="tutorial-callout">
+            {shieldNote === "wired" ? TUTORIAL_SHIELD_WIRED_NOTE : TUTORIAL_SHIELD_OVERRIDE_CAVEAT}
+          </p>
+        )}
+        {result !== null && result.discardedRowCount > 0 && (
+          <p className="tutorial-run-discarded" role="status">
+            {result.discardedRowCount}{" "}
+            {result.discardedRowCount === 1 ? "row was" : "rows were"} discarded at the source
+            because the data could not be parsed. They were recorded in the audit trail but are
+            not shown in the results table.
+          </p>
+        )}
+        {result !== null && <TutorialResultTable rows={result.rows} />}
+        {result === null && error === null && (
+          <p className="tutorial-muted">Results appear here when the run finishes.</p>
+        )}
+      </div>
+    </TutorialWorkspaceFrame>
   );
 }
 
