@@ -1,5 +1,6 @@
 /* tutorial.css — First-run tutorial chrome and progress UI.
-   Owners: .tutorial-shell, .tutorial-turn, .tutorial-kicker, .tutorial-layer,
+   Owners: .tutorial-shell, .tutorial-step-header*, .tutorial-step-instruction,
+   .tutorial-build-intro, .tutorial-brief, .tutorial-turn, .tutorial-kicker, .tutorial-layer,
    .tutorial-prompt, .tutorial-error, .tutorial-graph*, .tutorial-graph-node,
    .tutorial-running, .tutorial-draft-progress, .tutorial-progress-bar,
    .tutorial-result-table, .tutorial-cancelled-note, .tutorial-mode-fieldset,
@@ -55,11 +56,9 @@
 }
 
 .tutorial-kicker {
-  /* Centre the 64rem block; text stays left-aligned inside it. This centring
-     now only serves the bookend-turn context (where the cap rarely binds) —
-     in Build the whole header band is full-bleed and the
-     .tutorial-shell--workspace override below neutralises the cap so the kicker
-     shares the progress row's and stepper's left edge. */
+  /* Centre the 64rem block; text stays left-aligned inside it. Kickers live
+     only inside .tutorial-turn cards (Build's step header has none — the
+     progress row already names the step), so the cap rarely binds. */
   margin: 0 auto var(--space-sm);
   max-width: 64rem;
   width: 100%;
@@ -79,34 +78,28 @@
 }
 
 .tutorial-shell.tutorial-shell--workspace {
-  /* The fixed frame: no document scroll on Build. */
-  overflow: hidden;
+  /* Not a scroller, and not a clip. On a tall viewport the frame is exactly
+     the main area and nothing scrolls but the panes. On a short one the
+     workspace keeps its OWN usable-canvas floor (420px desktop, 480px narrow,
+     workspace.css) and the overflow becomes the App-owned .app-main scroll
+     path (header.css, WCAG 1.4.10) — the same path the ordinary composer
+     takes. This replaces `overflow: hidden` plus a hand-summed
+     calc(420px + …) floor, which ignored the narrow floor and anything above
+     the workspace, and a `min-height: 0` that erased the workspace floor:
+     measured at 1280x560 the conversation was left 49px, at 390x700 32px. */
+  overflow: visible;
   flex: 1 1 auto;
   height: 100%;
-  min-height: calc(420px + var(--size-control) + var(--space-xl));
   /* Full-bleed workspace: children span the frame; the bands that need an
-     inset (progress row, kicker, stepper) re-add their own inline padding. */
+     inset (progress row, step header) carry their own inline padding. */
   align-items: stretch;
   padding: var(--space-sm) 0 0;
-  /* Header-band tightening (D9): the macro dots, kicker and stepper are three
-     distinct hierarchies — keep all three, close ranks between them. */
   gap: var(--space-sm);
 }
 
 .tutorial-shell--workspace .tutorial-progress {
   flex-shrink: 0;
   padding-inline: var(--space-lg);
-}
-
-.tutorial-shell--workspace .tutorial-kicker {
-  flex-shrink: 0;
-  padding-inline: var(--space-lg);
-  margin-bottom: var(--space-2xs);
-  /* Join the full-bleed band: the base rule's centred 64rem cap would leave
-     this single line indented ~200px between two left-anchored bands (dots
-     row above, stepper below) on wide viewports. */
-  max-width: none;
-  margin-inline: 0;
 }
 
 .tutorial-shell--workspace .tutorial-workspace-shell {
@@ -116,9 +109,66 @@
   flex-direction: column;
 }
 
+/* No min-height override: the workspace's own floor must hold here too. */
 .tutorial-shell--workspace .tutorial-workspace-shell > .composer-workspace {
   flex: 1 1 auto;
-  min-height: 0;
+}
+
+/* Step header (TutorialWorkspaceFrame): the step's title, the one instruction
+   that says what to do next, and the step's forward action, on a band that
+   spans both panes. Tutorial chrome stays OUT of the authoring pane: there it
+   shrank the conversation's min(160px, 30%) floor with the chat panel and
+   pushed .chat-panel-header 97px below the .artifact-workspace-toolbar it
+   shares a row with across the seam. Its inset is the progress row's, so the
+   two bands share one left edge; the rule underneath closes the tutorial's
+   chrome off from the workspace's own bands. */
+.tutorial-step-header {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm) var(--space-lg);
+  padding: 0 var(--space-lg) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.tutorial-step-header-text {
+  display: grid;
+  flex: 1 1 24rem;
+  gap: var(--space-xs);
+  min-width: 0;
+}
+
+/* The tutorial's step title rung (--font-size-xl), stated rather than left to
+   the user agent's 1.5em + 0.83em margins, which put it at an off-scale 24px. */
+.tutorial-step-header h2 {
+  /* Hug the text: Run focuses its title on mount and on Run, and a heading
+     stretched across the grid column drew a focus ring the header's width. */
+  justify-self: start;
+  margin: 0;
+  font-size: var(--font-size-xl);
+  line-height: var(--line-height-tight);
+  letter-spacing: 0;
+}
+
+.tutorial-step-instruction {
+  margin: 0;
+  max-width: 760px;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.tutorial-step-header .tutorial-error {
+  margin: 0;
+  padding: var(--space-sm) var(--space-md);
+}
+
+.tutorial-step-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--space-sm);
 }
 
 .tutorial-shell--workspace .tutorial-workspace-authoring {
@@ -130,9 +180,34 @@
   min-height: 0;
 }
 
+/* Build's non-chat content (the brief before it is sent, the sample-load
+   status and its retry), on the pane's 16px gutter like the transcript. A
+   flex column so the brief is the one box that yields: it shrinks and scrolls
+   while the Send button below it never leaves the pane — the same ordering
+   .chat-panel-dock gives the docked composer (chat.css). */
+.tutorial-build-intro {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-md);
+  min-height: 0;
+  padding: var(--space-md) var(--space-lg);
+}
+
+/* (0,2,0): outranks .tutorial-error's own margin-top, which sits later in
+   this file; the column's gap is the only spacing here. */
+.tutorial-workspace-authoring > .tutorial-build-intro > * {
+  margin: 0;
+}
+
 .tutorial-brief {
-  max-height: 16rem;
-  overflow: auto;
+  --scroll-owner: authoring;
+
+  flex: 0 1 auto;
+  align-self: stretch;
+  min-height: 0;
+  overflow-y: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   border: 1px solid var(--color-border);
@@ -153,20 +228,34 @@
   overflow: hidden;
 }
 
-/* Run step (I-1): the run card lives in the same workspace frame as the
-   freeform Build, so the pipeline pane keeps showing the graph the learner just
-   confirmed beside the Run button. The card has no internal scroll region
-   (the result table can outgrow the frame), so the authoring wrapper owns the
-   scroll — the same escape the completed panel above takes — and the card
-   keeps its intrinsic height inside the flex column instead of being squashed
-   to fit. */
+/* Run step (I-1): the same workspace frame as the freeform Build, so the
+   pipeline pane keeps showing the graph the learner just confirmed while the
+   step header carries Run. The authoring pane holds the run's body — the
+   network disclosure, the prompt-shield note, then the results — with no
+   internal scroll region of its own (the result table can outgrow the frame),
+   so this wrapper owns the scroll and every block keeps its intrinsic height
+   instead of being squashed to fit. Named `authoring` under the scroll-owner
+   contract (workspace.css): no ChatPanel is mounted on Run, so the name is
+   uncontested. */
 .tutorial-shell--workspace .tutorial-run-authoring {
+  --scroll-owner: authoring;
+
+  gap: var(--space-md);
   overflow-y: auto;
   padding: var(--space-md) var(--space-lg) var(--space-xl);
 }
 
-.tutorial-shell--workspace .tutorial-run-authoring > .tutorial-turn {
+/* (0,2,0): the column's gap is the only spacing, over the blocks' own
+   card-era margins (.tutorial-callout, .tutorial-run-discarded,
+   .tutorial-result-table-wrap). */
+.tutorial-shell--workspace .tutorial-run-authoring > * {
   flex: 0 0 auto;
+  margin: 0;
+}
+
+/* The run's progress line sits in the step header's instruction slot. */
+.tutorial-step-header .tutorial-running {
+  margin-top: 0;
 }
 
 
@@ -515,15 +604,6 @@
   }
 }
 
-/* Pre-run framing on the run card (I-1): the sentence that tells the learner
-   the graph beside the card is theirs to check and that nothing runs until
-   they click Run. Secondary tone — the primary Run button is the focal point. */
-.tutorial-run-ready {
-  margin-top: var(--space-lg);
-  color: var(--color-text-secondary);
-  line-height: 1.5;
-}
-
 .tutorial-run-summary {
   color: var(--color-state-positive);
   font-weight: 600;
@@ -543,9 +623,12 @@
   margin-top: var(--space-lg);
 }
 
+/* Fits the authoring pane (360–640px) rather than a 640px floor, which cut the
+   summary column off at the pane edge behind a horizontal scroller. Long URLs
+   and summaries wrap inside their cells; the wrapper's overflow-x stays as the
+   escape for a column set wider than the pane. */
 .tutorial-result-table {
   width: 100%;
-  min-width: 640px;
   border-collapse: collapse;
 }
 
@@ -555,6 +638,7 @@
   padding: var(--space-sm);
   text-align: left;
   vertical-align: top;
+  overflow-wrap: anywhere;
 }
 
 .tutorial-cell-note {

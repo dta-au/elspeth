@@ -12,9 +12,9 @@ import type { ChatMessage } from "@/types/index";
 import { TutorialFreeformShell } from "./TutorialFreeformShell";
 
 vi.mock("@/api/client");
-vi.mock("./TutorialWorkspaceFrame", () => ({
-  TutorialWorkspaceFrame: ({ children }: { children: React.ReactNode }) => <section>{children}</section>,
-}));
+// The real step header (Build's title, instruction and Continue) around the
+// authoring content; the store-bound workspace panes stay out of scope.
+vi.mock("./TutorialWorkspaceFrame", () => import("@/test/tutorialWorkspaceFrameStub"));
 
 const userMessage: ChatMessage = {
   id: "message-1",

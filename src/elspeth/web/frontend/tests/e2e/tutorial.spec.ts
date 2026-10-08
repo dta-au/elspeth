@@ -29,6 +29,8 @@ interface Fixture {
   runCount: number;
   messages: Array<Record<string, unknown>>;
   requests: string[];
+  /** Leave the compose POST unanswered, so Build stays mid-compose. */
+  holdCompose?: boolean;
 }
 
 function chatMessage(role: "user" | "assistant", content: string): Record<string, unknown> {
@@ -115,6 +117,10 @@ async function installRoutes(page: Page, fixture: Fixture): Promise<void> {
         const body = req.postDataJSON() as { content: string };
         expect(body.content).toContain("project-3.html");
         fixture.requests.push("freeform-compose");
+        if (fixture.holdCompose === true) {
+          fixture.messages = [chatMessage("user", body.content)];
+          return;
+        }
         fixture.messages = [
           chatMessage("user", body.content),
           chatMessage("assistant", "I built the pipeline for review."),
@@ -209,8 +215,9 @@ test("Welcome → freeform Build → explicit Run → Audit → Graduation keeps
   await page.getByRole("button", { name: "Continue to Run" }).click();
   await expect(page.getByRole("heading", { name: "Ready to run." })).toBeVisible();
   expect(fixture.runCount).toBe(0);
-  await page.getByRole("button", { name: "Run", exact: true }).click();
-  await expect(page.getByText("bold")).toBeVisible();
+  // Run's actions live in the step header; its results in the authoring pane.
+  await page.locator(".tutorial-step-header").getByRole("button", { name: "Run", exact: true }).click();
+  await expect(page.locator(".workspace-authoring-pane").getByRole("table")).toContainText("bold");
   await page.getByRole("button", { name: "Continue", exact: true }).click();
   await expect(page.getByText(/This is the audit story/i)).toBeVisible();
   await page.getByRole("button", { name: "Continue", exact: true }).click();
@@ -226,4 +233,55 @@ test("Welcome → freeform Build → explicit Run → Audit → Graduation keeps
   expect(fixture.requests).toContain("rename:First-run tutorial");
   expect(fixture.requests.indexOf("readiness")).toBeLessThan(fixture.requests.indexOf("run"));
   expect(fixture.requests).not.toContain("forbidden-guided-request");
+});
+
+// Build's layout as rendered geometry (2026-10-08 review). The tutorial used to
+// stack its own chrome inside the authoring pane: 0px gutter beside the
+// transcript's 16px, the chat header 97px below the artifact toolbar it shares
+// a row with, and the conversation squeezed to 143px (49px at 1280x560).
+test("Build keeps its chrome out of the authoring pane and its Continue reachable at every width", async ({ page }) => {
+  const fixture: Fixture = {
+    created: false, composed: false, completed: false, title: session.title,
+    runCount: 0, messages: [], requests: [], holdCompose: true,
+  };
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await installRoutes(page, fixture);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Let's go" }).click();
+  await page.getByRole("button", { name: "Send tutorial brief" }).click();
+  const continueButton = page.getByRole("button", { name: "Continue to Run" });
+  await expect(continueButton).toBeDisabled();
+  await expect(continueButton).toHaveAccessibleDescription(/Composer is working on your pipeline/);
+  await expect(page.locator(".chat-panel-messages")).toBeVisible();
+
+  const geometry = await page.evaluate(() => {
+    const rect = (selector: string): DOMRect => {
+      const element = document.querySelector(selector);
+      if (element === null) throw new Error(`missing ${selector}`);
+      return element.getBoundingClientRect();
+    };
+    const pane = rect(".workspace-authoring-pane");
+    const insets = Array.from(
+      document.querySelectorAll(".workspace-authoring-pane :is(h2, p, pre, button, textarea)"),
+    )
+      .map((element) => element.getBoundingClientRect())
+      .filter((box) => box.width > 1 && box.height > 1)
+      .map((box) => Math.round(box.left - pane.left));
+    return {
+      minInset: Math.min(...insets),
+      chatHeaderTop: Math.round(rect(".chat-panel-header").top),
+      toolbarTop: Math.round(rect(".artifact-workspace-toolbar").top),
+      transcript: Math.round(rect(".chat-panel-messages").height),
+    };
+  });
+  expect(geometry.minInset, "every authoring control and line keeps the pane's 16px gutter").toBeGreaterThanOrEqual(16);
+  expect(geometry.chatHeaderTop, "the two pane bands are one row across the seam").toBe(geometry.toolbarTop);
+  expect(geometry.transcript, "the conversation keeps its 160px floor").toBeGreaterThanOrEqual(160);
+
+  // Narrow Compose view hides the workspace bar's artifact cell, which is why
+  // Continue lives in the step header: it stays beside the composer here.
+  await page.setViewportSize({ width: 390, height: 700 });
+  await expect(page.getByRole("tab", { name: "Compose" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByLabel("Message input")).toBeVisible();
+  await expect(continueButton).toBeVisible();
 });

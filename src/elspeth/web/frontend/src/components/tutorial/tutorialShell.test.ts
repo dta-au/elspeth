@@ -298,3 +298,55 @@ describe("the layer micro-labels read as labels (elspeth-e2d19ae400)", () => {
     ).not.toBe(declaredValue(".tutorial-layer strong", "color"));
   });
 });
+
+describe("the workspace steps keep tutorial chrome out of the panes (2026-10-08 Build review)", () => {
+  // Build used to stack a kicker, an unstyled h2, a hint and a full-width
+  // Continue inside the authoring pane. That pane is one half of a two-pane
+  // row: the chrome shrank the conversation's min(160px, 30%) floor with the
+  // chat panel (measured 143px at 1894x894, 49px at 1280x560, 32px at
+  // 390x700), pushed .chat-panel-header 97px below the .artifact-workspace-
+  // toolbar it shares a row with, and sat on a 0px gutter beside a 16px one.
+  const shorthand = (selector: string, property: string): string[] =>
+    declaredValue(selector, property).split(/\s+/);
+
+  it("lets the workspace keep its own usable-canvas floor", () => {
+    expect(
+      declaredValues(".tutorial-shell--workspace .tutorial-workspace-shell > .composer-workspace", "min-height"),
+      "a min-height here erases workspace.css's 420/480px floor and the conversation collapses with it",
+    ).toEqual([]);
+    // Neither clip nor scroll: a short viewport takes .app-main's scroll path
+    // (header.css, WCAG 1.4.10), as the ordinary composer does.
+    expect(declaredValue(".tutorial-shell.tutorial-shell--workspace", "overflow")).toBe("visible");
+    expect(declaredValues(".tutorial-shell.tutorial-shell--workspace", "min-height")).toEqual([]);
+  });
+
+  it("puts the step header on the progress row's left edge", () => {
+    expect(shorthand(".tutorial-step-header", "padding")[1]).toBe(
+      declaredValue(".tutorial-shell--workspace .tutorial-progress", "padding-inline"),
+    );
+  });
+
+  it("puts Build's pre-send content on the conversation's gutter", () => {
+    expect(shorthand(".tutorial-build-intro", "padding")[1]).toBe(
+      shorthand(".chat-panel-header", "padding")[1],
+    );
+  });
+
+  it("sets the step title on the tutorial heading rung with explicit margins", () => {
+    expect(declaredValue(".tutorial-step-header h2", "font-size")).toBe(
+      declaredValue(".tutorial-turn h2", "font-size"),
+    );
+    expect(declaredValue(".tutorial-step-header h2", "margin")).toBe("0");
+  });
+
+  it("does not re-inset kickers on workspace steps", () => {
+    // Run's kicker sits inside its padded card; a workspace-scoped inset put it
+    // 16px right of the card's own heading.
+    expect(declaredValues(".tutorial-shell--workspace .tutorial-kicker", "padding-inline")).toEqual([]);
+  });
+
+  it("names the tutorial's authoring scrollers under the scroll-owner contract", () => {
+    expect(declaredValue(".tutorial-brief", "--scroll-owner")).toBe("authoring");
+    expect(declaredValue(".tutorial-shell--workspace .tutorial-run-authoring", "--scroll-owner")).toBe("authoring");
+  });
+});

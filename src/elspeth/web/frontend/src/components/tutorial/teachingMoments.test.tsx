@@ -10,6 +10,8 @@ import {
 import { TutorialTurn4Run } from "./TutorialTurn4Run";
 import { TutorialTurn5AuditStory } from "./TutorialTurn5AuditStory";
 
+// The real step header around the run's body (where the shield notes live).
+vi.mock("./TutorialWorkspaceFrame", () => import("@/test/tutorialWorkspaceFrameStub"));
 vi.mock("@/api/client", () => ({
   runTutorialPipeline: vi.fn(),
   getRunAuditSummary: vi.fn(),
