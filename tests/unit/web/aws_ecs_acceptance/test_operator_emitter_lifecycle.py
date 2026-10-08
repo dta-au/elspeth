@@ -129,7 +129,7 @@ def test_shutdown_fault_retained_no_complete_and_no_retry_of_physical_cleanup() 
     original = KeyboardInterrupt()
 
     class FailingOwner(OperatorTelemetryCleanupOwner):
-        calls = 0
+        __slots__ = ("calls",)
 
         def shutdown_sync(self):
             self.calls += 1
@@ -137,6 +137,7 @@ def test_shutdown_fault_retained_no_complete_and_no_retry_of_physical_cleanup() 
             raise original
 
     custody = FailingOwner(installation=OwnedTestTelemetryInstallation())
+    custody.calls = 0
     watchdog = OwnedTestProcessWatchdog(threading.Event())
     emitter = AWSOperatorMetricEmitter(settings(), cleanup_owner_factory=lambda: custody, process_watchdog_factory=lambda _event: watchdog)
     for _attempt in range(2):
@@ -213,6 +214,8 @@ def test_actual_periodic_thread_is_joined_before_completion() -> None:
 
 def test_replaced_completion_witness_never_disarms_watchdog() -> None:
     class ReplacingOwner(OperatorTelemetryCleanupOwner):
+        __slots__ = ()
+
         def shutdown_sync(self):
             actual = super().shutdown_sync()
             return TelemetryCompletionWitness(self, actual.creator_pid)

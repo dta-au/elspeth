@@ -557,7 +557,7 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
     assert UUID(safe_arguments["source"]["blob_id"]).version == 5
     assert safe_redacted_arguments["source"]["blob_id"] == safe_arguments["source"]["blob_id"]
     assert proposals[0].tool_arguments_hash == stable_hash(safe_arguments)
-    assert builder.call_count == 2
+    assert builder.call_count == 3
     assert result.state is state
     assert _count_rows(harness.engine, blobs_table) == 1
     assert _count_rows(harness.engine, composition_states_table) == 0

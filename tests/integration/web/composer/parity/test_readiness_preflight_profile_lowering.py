@@ -262,10 +262,9 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(
             finally:
                 if not transferred:
                     await execute_lease.close()
+        assert isinstance(run_id, UUID)
+        admitted_run = await session_service.get_run(run_id)
+        assert admitted_run.state_id == record.id
+        assert await session_service.get_run_execution_input(run_id) is not None
     finally:
         await execution_fixture.shutdown_service(service)
-
-    assert isinstance(run_id, UUID)
-    admitted_run = await session_service.get_run(run_id)
-    assert admitted_run.state_id == record.id
-    assert await session_service.get_run_execution_input(run_id) is not None

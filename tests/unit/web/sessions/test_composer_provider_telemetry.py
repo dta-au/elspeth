@@ -234,20 +234,20 @@ async def test_cancelled_atomic_audit_cohort_projects_committed_call_before_rera
         started = threading.Event()
         release = threading.Event()
         worker_done = threading.Event()
-        original_run_sync = service._run_sync
+        original_run_composer_sql = service._run_composer_sql
 
-        async def blocked_run_sync(func, *args, **kwargs):
+        async def blocked_run_composer_sql(func):
             def blocked() -> object:
                 started.set()
                 assert release.wait(timeout=5)
                 try:
-                    return func(*args, **kwargs)
+                    return func()
                 finally:
                     worker_done.set()
 
-            return await original_run_sync(blocked)
+            return await original_run_composer_sql(blocked)
 
-        monkeypatch.setattr(service, "_run_sync", blocked_run_sync)
+        monkeypatch.setattr(service, "_run_composer_sql", blocked_run_composer_sql)
         task = asyncio.create_task(
             service.add_messages_atomic(
                 session_id,

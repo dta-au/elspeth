@@ -1483,7 +1483,15 @@ def _execute_set_source_from_blobs(
         options=merged_options,
         on_validation_failure=on_vf,
     )
-    new_state = state.with_named_source(source_name, source)
+    proposed_state = state.with_named_source(source_name, source)
+    try:
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
     data = {"server_owned_metadata_note": echo_note} if echo_note is not None else {}
     return _mutation_result(

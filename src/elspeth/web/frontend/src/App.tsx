@@ -211,6 +211,10 @@ function App() {
   const pendingSecretGuard = useExecutionStore((s) => s.pendingSecretGuard);
   const bootstrapPrefs = usePreferencesStore((s) => s.bootstrap);
   const preferencesLoaded = usePreferencesStore((s) => s.loaded);
+  const preferencesUnavailableForRole = usePreferencesStore((s) => s.unavailableForRole);
+  useEffect(() => {
+    if (!isAuthenticated || preferencesUnavailableForRole) setShowComposerSettings(false);
+  }, [isAuthenticated, preferencesUnavailableForRole]);
   const tutorialCompleted = usePreferencesStore(selectTutorialCompleted);
   const preferencesError = usePreferencesStore((s) => s.bootstrapError ?? s.writeError);
   const preferencesBootstrapError = usePreferencesStore((s) => s.bootstrapError);
@@ -231,7 +235,7 @@ function App() {
   // preferences to settle before deciding), the shared-inspect route, and
   // hash deep links (checked inside the hook).
   const preferencesSettled =
-    preferencesLoaded || preferencesError !== null;
+    preferencesLoaded || preferencesUnavailableForRole || preferencesError !== null;
   useAutoResumeSession(
     isAuthenticated &&
       sharedToken === null &&
@@ -826,7 +830,7 @@ function App() {
           isOpen={catalogOpen}
           onClose={() => setCatalogOpen(false)}
         />
-        {showComposerSettings && (
+        {showComposerSettings && !preferencesUnavailableForRole && (
           <ComposerPreferencesPanel
             onClose={closeComposerSettings}
             onResetTutorialComplete={handleResetTutorialComplete}

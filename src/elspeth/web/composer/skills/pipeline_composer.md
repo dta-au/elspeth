@@ -64,7 +64,21 @@ Classify the user's latest request before acting.
 | Validation error or unclear rejection | Use `explain_validation_error` or `get_plugin_assistance`; apply the one-shot repair; preview again. |
 | Safety/security concern, unsupported shape, repeated convergence failure | Use the configured escalation path; if none is available, stop with a named gap and ask the operator. |
 
-Opening build turns are action turns. If the latest user message contains any
+Opening build turns are action turns. Resolve material requirements conflicts
+before treating a draft as complete: when attachments disagree on output format
+or layout, or required input scope is unspecified, ask a focused product
+question or choose an explicit, reviewable interpretation only when it preserves
+the requested work. A missing workbook does not authorize inventing its sheets
+or columns; a summary-shaped template does not authorize omitting detailed
+assessment rows. Make row selection explicit when instructions describe a
+selected batch and the user does not select one. Read the supplied artifacts
+through the available tools before deciding what is missing. The LLM must
+author the pipeline and every judgement; code may only serialize or validate
+the resulting judgements. When no faithful reviewable draft is possible, state
+the named blocker and ask the smallest question that resolves it. Do not repeat
+planning calls to guess an absent product decision.
+
+If the latest user message contains any
 concrete artifact, such as a column list, example file path, workflow shape,
 output filename, or target rubric, build a plausible draft pipeline before
 asking for confirmation. Name missing assumptions after the mutation, not
@@ -72,7 +86,8 @@ instead of it. Explain-only responses are reserved for turns where the user
 explicitly asks for explanation, comparison, or design advice. If a required
 file, credential, or connection detail is absent, commit the buildable scaffold
 with a named gap when that is safe; stop with a named gap only when no safe draft
-can be created. A requested LLM step with no discernible task or desired reply
+can be created. Apply the same named-gap rule when conflicting requirements
+prevent a faithful draft. A requested LLM step with no discernible task or desired reply
 has no safe prompt draft: ask what the LLM should do before building it.
 
 For ordinary build/edit turns, the action path is:
@@ -436,8 +451,8 @@ runtime `errors` / `warnings` / `semantic_contracts`.
   to create, choose, draft, generate, or otherwise supply source rows. Bind those
   rows as `source.inline_blob` or an equivalent blob-backed source. Any request
   to choose URLs, records, pages, entities, rows, or source values is delegated
-  source generation: stage an `invented_source` interpretation requirement on
-  the source, then call
+  source generation: bind the source blob, keep its backend-staged
+  `invented_source` interpretation requirement, then call
   `request_interpretation_review(kind="invented_source")`. For source-level
   review calls, use `affected_node_id="source"`; the source is not listed in
   `nodes[]`, and that is expected. A pending source requirement lives under
@@ -612,6 +627,12 @@ through repair. Declare authored fields only through the selected source's
 schema-defined contract mechanism. If assistance says the selected source does
 not accept generated content, choose another policy-visible source whose live
 contract does; never synthesize a remote location, identifier, or placeholder.
+
+The bound artifact controls this review. Supplying the input values, such as
+URLs, does not waive review of a new CSV or other generated source artifact.
+After a blob bind, keep the backend-staged `invented_source` row and its exact
+draft; do not remove or rewrite it during option edits. A changed blob binding
+needs a fresh review even when the content looks similar.
 
 Preview or inspect the bound artifact. If its bytes, parsed fields, row shape,
 or options disagree, use the plugin's diagnostics and live authority to align
@@ -1093,7 +1114,7 @@ tool; opt-out skips the human card, not the audit row.
 | Kind | Requirement row staged by | Review surfaced by | Rule |
 | --- | --- | --- | --- |
 | `vague_term` | YOU | YOU | Wire it into the prompt via a `prompt_template_parts` `interpretation_ref` slot in the same mutation. |
-| `invented_source` | YOU | YOU | Lives on `source.options.interpretation_requirements`; draft is the exact generated artifact. |
+| `invented_source` | backend on generated blob bind | YOU | Lives on `source.options.interpretation_requirements`; draft is the exact bound artifact. Keep the staged row on later edits. |
 | `pipeline_decision` | YOU | YOU | REGISTERED terms only. The closed registry is delivered in the authoring aids (`review_registry`); never mint a term — an unregistered term is unresolvable and poisons the card. A decision outside the registry is recorded in `metadata.description`, not as a review. |
 | `llm_prompt_template` | backend (auto-staged on every LLM node) | backend | Never author the row; never call the review tool for it. |
 | `llm_model_choice` | backend (auto-staged when `options.model` is set) | YOU | Never author the row. A profile-bound node (`options.profile`) has NO model-choice card at all. |
@@ -1180,7 +1201,7 @@ on records you READ back but are owned by the backend.
 | Kind | When to call | Required shape |
 | --- | --- | --- |
 | `kind="vague_term"` | You author operational semantics for a user criterion: scoring scale, rubric, category meaning, threshold, cutoff, ranking rule, or subjective definition. | `affected_node_id`, stable `user_term`; stage the drafted definition as the requirement `draft` and omit `llm_draft` (server-resolved). |
-| `kind="invented_source"` | You create source rows, URLs, or inline source content the user did not provide verbatim. | Bind the source first; the staged requirement `draft` carries the generated content — omit `llm_draft` (server-resolved). |
+| `kind="invented_source"` | You bind a generated source artifact, including a new artifact built from values the user provided. | Bind the source first; the backend-staged requirement `draft` carries the exact content — omit `llm_draft` (server-resolved). |
 | `kind="llm_prompt_template"` | Backend auto-stages and surfaces this row. Do not call the review tool for it. | Backend-owned; no caller-authored shape. |
 | `kind="pipeline_decision"` | You make a row-shaping, retention, cleanup, routing, or filtering choice the user did not spell out mechanically. | Stage `interpretation_requirements` on the node that implements the decision. |
 | `kind="llm_model_choice"` | You author the `model` identifier on an `llm` node (the user did not name the exact slug verbatim). | `user_term="llm_model_choice:<node_id>"`; omit `llm_draft` — the server resolves the current `options.model` string. The mutation pipeline auto-stages this requirement when `options.model` is set; resolve it before stopping. A profile-bound node (`options.profile`) has no model-choice card. |

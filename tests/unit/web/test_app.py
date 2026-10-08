@@ -68,6 +68,7 @@ from elspeth.web.coordination.membership_lifecycle import (
 )
 from elspeth.web.dependencies import get_settings
 from elspeth.web.deployment_contract import DeploymentConfigurationError
+from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
 from elspeth.web.process_watchdog_codec import RecoveryReason
 from elspeth.web.readiness import READINESS_CHECK_NAMES, ReadinessCache, ReadinessCheck, ReadinessProbeRunner, ReadinessReport
@@ -2359,16 +2360,22 @@ class TestLifespanShutdown:
     @pytest.mark.asyncio
     async def test_lifespan_awaits_execution_service_shutdown(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
-        fake_execution_service = _RecordingExecutionService()
         fake_operator_telemetry = _RecordingOperatorTelemetry()
         app.state.operator_telemetry = fake_operator_telemetry
+        original_shutdown = ExecutionServiceImpl.shutdown
+        shutdown_calls = 0
 
-        with patch("elspeth.web.app.ExecutionServiceImpl", return_value=fake_execution_service):
+        async def observe_shutdown(service: ExecutionServiceImpl) -> None:
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+            await original_shutdown(service)
+
+        with patch.object(ExecutionServiceImpl, "shutdown", observe_shutdown):
             async with lifespan(app):
                 pass
 
-        assert fake_execution_service.shutdown_calls == 1
-        assert fake_execution_service.executor_join_calls == 1
+        assert shutdown_calls == 1
+        assert app.state.execution_lease_release_registry.executor_join_succeeded
         assert fake_operator_telemetry.shutdown_calls == 1
 
     @pytest.mark.asyncio
@@ -2384,9 +2391,16 @@ class TestLifespanShutdown:
         )
         watchdog = app.state.process_watchdog
         assert isinstance(watchdog, OwnedTestProcessWatchdog)
-        fake_execution_service = _RecordingExecutionService()
         fake_operator_telemetry = _RecordingOperatorTelemetry()
         app.state.operator_telemetry = fake_operator_telemetry
+        original_shutdown = ExecutionServiceImpl.shutdown
+        shutdown_calls = 0
+
+        async def observe_shutdown(service: ExecutionServiceImpl) -> None:
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+            await original_shutdown(service)
+
         cleanup_failed = asyncio.Event()
 
         async def fatal_cleanup(*_args: object, **_kwargs: object) -> None:
@@ -2395,7 +2409,7 @@ class TestLifespanShutdown:
 
         monkeypatch.setattr(app_module, "_periodic_orphan_cleanup", fatal_cleanup)
         with (
-            patch("elspeth.web.app.ExecutionServiceImpl", return_value=fake_execution_service),
+            patch.object(ExecutionServiceImpl, "shutdown", observe_shutdown),
             pytest.raises(OSError, match="orphan cleanup storage unavailable"),
         ):
             async with lifespan(app):
@@ -2404,9 +2418,9 @@ class TestLifespanShutdown:
                     while RecoveryReason.REQUIRED_WORKER_LOST not in watchdog.reasons:
                         await asyncio.sleep(0.01)
                 assert app.state.instance_draining.is_set()
-                assert fake_execution_service.shutdown_calls == 0
-        assert fake_execution_service.shutdown_calls == 1
-        assert fake_execution_service.executor_join_calls == 1
+                assert shutdown_calls == 0
+        assert shutdown_calls == 1
+        assert app.state.execution_lease_release_registry.executor_join_succeeded
         assert fake_operator_telemetry.shutdown_calls == 1
 
     @pytest.mark.asyncio
@@ -4197,10 +4211,7 @@ class TestDeploymentStateModeStartup:
             pass
         monkeypatch.setattr(app.state.auth_audit_recorder, "landscape_url", audit_url)
 
-        with (
-            patch("elspeth.web.app.ExecutionServiceImpl", return_value=_RecordingExecutionService()),
-            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
-        ):
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
                 pass
 

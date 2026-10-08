@@ -192,8 +192,9 @@ def test_shutdown_does_not_create_a_default_executor() -> None:
 
 def test_shutdown_propagates_worker_failure_without_default_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     class FailedExecutor:
-        def shutdown(self, wait: bool) -> None:
+        def shutdown(self, wait: bool, *, cancel_futures: bool = False) -> None:
             assert wait is True
+            assert cancel_futures is False
             raise RuntimeError("shutdown failed")
 
     async def scenario() -> None:
@@ -212,8 +213,9 @@ def test_cancelled_shutdown_leaves_thread_draining(monkeypatch: pytest.MonkeyPat
     completed = threading.Event()
 
     class HeldExecutor:
-        def shutdown(self, wait: bool) -> None:
+        def shutdown(self, wait: bool, *, cancel_futures: bool = False) -> None:
             assert wait is True
+            assert cancel_futures is False
             started.set()
             assert release.wait(5)
             completed.set()
@@ -225,12 +227,14 @@ def test_cancelled_shutdown_leaves_thread_draining(monkeypatch: pytest.MonkeyPat
             await _wait_until(started.is_set)
             assert not shutdown.done()
             shutdown.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await shutdown
+            await asyncio.sleep(0)
+            assert not shutdown.done()
             assert not completed.is_set()
         finally:
             release.set()
-            await _wait_until(completed.is_set)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(shutdown, timeout=5)
+        assert completed.is_set()
         assert asyncio.get_running_loop()._default_executor is None
 
     asyncio.run(scenario())

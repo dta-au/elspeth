@@ -18,7 +18,7 @@ from elspeth.contracts.chargeable_admission import (
     QuotaDisposition,
 )
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
-from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
@@ -208,8 +208,7 @@ async def test_cancelled_provider_waits_for_settlement_without_losing_error_prio
             with pytest.raises(asyncio.CancelledError) as caught:
                 await task
             assert caught.value.args == ("original provider cancellation",)
-            assert isinstance(caught.value.__cause__, ComposerOwnedSettlementFailure)
-            assert caught.value.__cause__.__cause__ is settlement_failure
+            assert caught.value.__cause__ is settlement_failure
     assert service.pending is not None
     assert service.calls == []
     assert recorder.llm_calls[0].status is ComposerLLMCallStatus.CANCELLED
@@ -249,8 +248,9 @@ async def test_cancellation_during_settlement_observes_child_failure(settlement_
             assert caught.value is settlement_failure
             assert isinstance(caught.value.__cause__, asyncio.CancelledError)
         else:
-            with pytest.raises(ComposerOwnedSettlementFailure) as caught:
+            with pytest.raises(asyncio.CancelledError) as caught:
                 await task
+            assert caught.value.args == ("cancel during settlement",)
             assert caught.value.__cause__ is settlement_failure
     assert service.pending is not None
     assert service.calls == []

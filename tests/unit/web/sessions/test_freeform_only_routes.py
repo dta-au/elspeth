@@ -17,9 +17,9 @@ def test_session_router_registers_freeform_but_no_guided_authoring_routes() -> N
 
 
 def test_freeform_routes_do_not_pass_mode_transition_to_planner() -> None:
-    root = Path(elspeth.__file__).parent / "web" / "sessions" / "routes"
+    root = Path(elspeth.__file__).parent / "web" / "sessions"
     planner_keywords: set[str] = set()
-    for relative in ("messages.py", "composer/compose.py"):
+    for relative in ("routes/messages.py", "routes/composer/compose.py", "composer_turn.py"):
         tree = ast.parse((root / relative).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "compose":

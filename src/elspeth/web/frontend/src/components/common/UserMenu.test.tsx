@@ -3,6 +3,8 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { UserMenu } from "./UserMenu";
 import { useAuthStore } from "@/stores/authStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
 import type { UserProfile } from "@/types/index";
 
 /** Seedable /api/auth/me profile for the identity-header tests. */
@@ -32,6 +34,7 @@ function identityText(element: Element | null): string {
 // pattern demands. See UserMenu.tsx module comment.
 describe("UserMenu", () => {
   beforeEach(() => {
+    resetStore(usePreferencesStore);
     localStorage.clear();
     document.documentElement.removeAttribute("data-theme");
     document.documentElement.style.colorScheme = "";
@@ -58,6 +61,18 @@ describe("UserMenu", () => {
     expect(
       screen.getByRole("button", { name: /sign out/i }),
     ).toBeInTheDocument();
+  });
+
+  it("keeps account controls while hiding the unavailable Composer preferences action", async () => {
+    usePreferencesStore.setState({ unavailableForRole: true });
+    const openSettings = vi.fn();
+    render(<UserMenu onOpenSettings={openSettings} onSignOut={vi.fn()} onOpenPeopleAccess={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    expect(screen.queryByRole("button", { name: /composer preferences/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /switch to light theme/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /people & access/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /sign out/i })).toBeInTheDocument();
+    expect(openSettings).not.toHaveBeenCalled();
   });
 
   // elspeth-66257bfab1: the theme row used to lead with U+2600 / U+263E, the

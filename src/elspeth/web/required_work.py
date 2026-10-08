@@ -1075,6 +1075,12 @@ class RequiredWorkCoordinator:
             self._registered(ticket, expected_source)
             self._verify_sql_outcome(ticket, actual_outcome)
 
+    def validate_recovery_terminal_sql_outcome[T](self, *, ticket: RequiredWorkTicket, actual_outcome: RequiredSQLFinishOnce[T]) -> None:
+        """Verify the fresh-fence recovery writer's exact physical SQL carrier."""
+        with self._lock:
+            self._registered(ticket, RequiredWorkSource.TERMINAL_FAILURE_SQL)
+            self._verify_sql_outcome(ticket, actual_outcome)
+
     def _publication_branch(
         self, publication_ticket: RequiredWorkTicket, outcome: RequiredSQLFinishOnce[PipelinePublicationSQLResult]
     ) -> PublicationProjectionDisposition | None:
@@ -1492,6 +1498,28 @@ class RequiredWorkCoordinator:
                 if ticket.pending_healthy_renewal:
                     continue
                 raise RequiredWorkIncomplete("Settlement cannot outrun required work")
+            receipts.extend(ticket.receipts())
+        return tuple(receipts)
+
+    def recovery_failure_receipts(self, *, projection_ticket: RequiredWorkTicket) -> tuple[ComposerFailureReceipt, ...]:
+        """Select before the first recovery write while its terminal projection stays pending."""
+        with self._lock:
+            self._registered(projection_ticket, RequiredWorkSource.TERMINAL_FAILURE_PROJECTION)
+            with projection_ticket._lock:
+                if projection_ticket._complete or not projection_ticket._projection_started:
+                    raise AuditIntegrityError("Recovery selection requires its unresolved owned terminal projection")
+            children = tuple(self._proposal_children.values())
+            tickets = self.tickets
+        for child in children:
+            child.assert_completed()
+        receipts: list[ComposerFailureReceipt] = []
+        for ticket in tickets:
+            if ticket is projection_ticket:
+                continue
+            if not ticket.complete:
+                if ticket.pending_healthy_renewal:
+                    continue
+                raise RequiredWorkIncomplete("Recovery selection cannot outrun required work")
             receipts.extend(ticket.receipts())
         return tuple(receipts)
 

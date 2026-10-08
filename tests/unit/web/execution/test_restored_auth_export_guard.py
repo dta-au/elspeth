@@ -17,6 +17,7 @@ from elspeth.web.execution.protocol import FrozenRunSettings
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.protocol import RunStartPermitRecord
+from tests.helpers.execution_custody import execution_fixture as execution_fixture
 from tests.unit.web.execution.test_auth_event_export_guard import (
     _execute_lease,
     _ReachedSettingsLoad,

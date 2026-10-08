@@ -17,6 +17,7 @@ from tests.fixtures.landscape import leader_token_for
 from tests.unit.web.execution.test_service import _execute_lease
 from tests.unit.web.execution.test_service import _live_execute_lease as _live_execute_lease
 from tests.unit.web.execution.test_service import broadcaster as broadcaster
+from tests.unit.web.execution.test_service import execution_fixture as execution_fixture
 from tests.unit.web.execution.test_service import mock_loop as mock_loop
 from tests.unit.web.execution.test_service import mock_session_service as mock_session_service
 from tests.unit.web.execution.test_service import mock_settings as mock_settings

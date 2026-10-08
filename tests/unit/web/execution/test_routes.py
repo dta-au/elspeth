@@ -10,6 +10,7 @@ by the route handlers.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -62,7 +63,11 @@ from elspeth.web.sessions.protocol import (
     SessionServiceProtocol,
 )
 from tests.fixtures.identities import wire_test_pipeline_user_authority
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.helpers.session_fences import RecordingSessionOperationAuthority
+
+execution_fixture = execution_custody.execution_fixture
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -200,13 +205,17 @@ def _route_endpoint(app: FastAPI, name: str) -> Callable[..., Awaitable[Any]]:
 def _create_test_app(
     execution_service: Any | None = None,
     broadcaster: Any | None = None,
+    *,
+    execution_fixture: ExecutionTestCustody | None = None,
+    execution_session_id: UUID | None = None,
 ) -> FastAPI:
     """Create a minimal FastAPI app with execution routes wired.
 
     Bypasses the full create_app() to avoid real DB setup, auth provider
     construction, and lifespan side effects. Overrides get_current_user
     to return a fake user for auth. Sets up mock session_service for
-    ownership verification.
+    ownership verification. With ``execution_fixture``, EXECUTE uses
+    a genuine SQLite authority and the selected physical cleanup owner.
     """
     from elspeth.web.auth.middleware import get_current_user
     from elspeth.web.auth.models import UserIdentity
@@ -228,7 +237,22 @@ def _create_test_app(
     # (BLOB_READ / EXECUTE) through these three members before delegating; an
     # autospec property is a NonCallableMagicMock, which the lifecycle's exact
     # lease_seconds check rejects. Model them as the platform does.
-    mock_session_service.session_operation_authority = RecordingSessionOperationAuthority()
+    if execution_fixture is None:
+        mock_session_service.session_operation_authority = RecordingSessionOperationAuthority()
+    else:
+        session_id = execution_session_id if execution_session_id is not None else uuid4()
+        observed = execution_fixture.observe_authority(session_id)
+        mock_session_service.session_operation_authority = observed.authority
+        mock_session_service.get_session.return_value = _session_record(session_id=session_id)
+        app.state.execution_lease_release_registry = execution_fixture.registry(asyncio.get_running_loop())
+        app.state.execute_session_id = session_id
+        original_execute = app.state.execution_service.execute
+
+        async def observed_execute(*args: object, **kwargs: object) -> UUID:
+            execution_fixture.track_route_lease(kwargs["session_operation_lease"])
+            return await original_execute(*args, **kwargs)
+
+        app.state.execution_service.execute = AsyncMock(spec=ExecutionService.execute, side_effect=observed_execute)
     mock_session_service.session_operation_owner_instance_id = "execution-route-test"
     mock_session_service.session_operation_lease_seconds = 30
     # The validate backstop probes the head state; None (no state yet) keeps
@@ -653,13 +677,13 @@ class TestExecuteEndpoint:
     """POST /api/sessions/{session_id}/execute"""
 
     @pytest.mark.asyncio
-    async def test_execute_returns_202_with_run_id(self) -> None:
+    async def test_execute_returns_202_with_run_id(self, execution_fixture: ExecutionTestCustody) -> None:
         expected_run_id = uuid4()
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, return_value=expected_run_id)
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
             assert resp.status_code == 202
             body = resp.json()
             assert body["run_id"] == str(expected_run_id)
@@ -667,12 +691,12 @@ class TestExecuteEndpoint:
         assert svc.execute.await_args.kwargs["auth_provider_type"] == "local"
 
     @pytest.mark.asyncio
-    async def test_execute_with_active_run_returns_409(self) -> None:
+    async def test_execute_with_active_run_returns_409(self, execution_fixture: ExecutionTestCustody) -> None:
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=RunAlreadyActiveError("Already active"))
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
             assert resp.status_code == 409
             body = resp.json()
             # Seam Contract D: flat envelope, not nested
@@ -682,7 +706,7 @@ class TestExecuteEndpoint:
             assert "request_id" in body
 
     @pytest.mark.asyncio
-    async def test_execute_returns_canonical_blob_source_path_error(self) -> None:
+    async def test_execute_returns_canonical_blob_source_path_error(self, execution_fixture: ExecutionTestCustody) -> None:
         from elspeth.web.execution.errors import BlobSourcePathMismatchError
 
         exc = BlobSourcePathMismatchError(
@@ -693,10 +717,10 @@ class TestExecuteEndpoint:
         )
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
 
         assert resp.status_code == 500
         detail = resp.json()["detail"]
@@ -708,15 +732,15 @@ class TestExecuteEndpoint:
         assert "/internal/" not in detail["detail"]
 
     @pytest.mark.asyncio
-    async def test_execute_forwards_fanout_ack_token_to_service(self) -> None:
+    async def test_execute_forwards_fanout_ack_token_to_service(self, execution_fixture: ExecutionTestCustody) -> None:
         expected_run_id = uuid4()
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, return_value=expected_run_id)
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
-                f"/api/sessions/{uuid4()}/execute",
+                f"/api/sessions/{app.state.execute_session_id}/execute",
                 json={"fanout_ack_token": "ack-test-token"},
             )
 
@@ -724,7 +748,7 @@ class TestExecuteEndpoint:
         assert svc.execute.await_args.kwargs["fanout_ack_token"] == "ack-test-token"
 
     @pytest.mark.asyncio
-    async def test_execute_returns_428_with_structured_fanout_guard(self) -> None:
+    async def test_execute_returns_428_with_structured_fanout_guard(self, execution_fixture: ExecutionTestCustody) -> None:
         from elspeth.web.execution.fanout_guard import (
             ExecutionFanoutGuard,
             ExecutionFanoutGuardRequired,
@@ -751,10 +775,10 @@ class TestExecuteEndpoint:
         )
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=ExecutionFanoutGuardRequired(guard))
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
 
         assert resp.status_code == 428
         detail = resp.json()["detail"]
@@ -765,15 +789,15 @@ class TestExecuteEndpoint:
         assert detail["fanout_guard"]["risks"][0]["estimated_provider_calls"] is None
 
     @pytest.mark.asyncio
-    async def test_execute_forwards_secret_ack_token_to_service(self) -> None:
+    async def test_execute_forwards_secret_ack_token_to_service(self, execution_fixture: ExecutionTestCustody) -> None:
         expected_run_id = uuid4()
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, return_value=expected_run_id)
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
-                f"/api/sessions/{uuid4()}/execute",
+                f"/api/sessions/{app.state.execute_session_id}/execute",
                 json={"secret_ack_token": "secret-ack-test-token"},
             )
 
@@ -781,7 +805,7 @@ class TestExecuteEndpoint:
         assert svc.execute.await_args.kwargs["secret_ack_token"] == "secret-ack-test-token"
 
     @pytest.mark.asyncio
-    async def test_execute_returns_428_with_structured_secret_guard(self) -> None:
+    async def test_execute_returns_428_with_structured_secret_guard(self, execution_fixture: ExecutionTestCustody) -> None:
         from elspeth.web.execution.secret_guard import (
             ExecutionSecretApprovalGuard,
             ExecutionSecretApprovalRequired,
@@ -803,10 +827,10 @@ class TestExecuteEndpoint:
         )
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=ExecutionSecretApprovalRequired(guard))
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
 
         assert resp.status_code == 428
         detail = resp.json()["detail"]
@@ -817,7 +841,7 @@ class TestExecuteEndpoint:
         assert detail["secret_guard"]["wirings"][0]["option_key"] == "api_key"
 
     @pytest.mark.asyncio
-    async def test_execute_returns_422_with_structured_semantic_payload(self) -> None:
+    async def test_execute_returns_422_with_structured_semantic_payload(self, execution_fixture: ExecutionTestCustody) -> None:
         """Semantic contract violations surface as 422 with structured payload.
 
         Without the dedicated handler, ``SemanticContractViolationError``
@@ -871,9 +895,9 @@ class TestExecuteEndpoint:
 
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
         assert resp.status_code == 422
         body = resp.json()
         detail = body["detail"]
@@ -888,7 +912,7 @@ class TestExecuteEndpoint:
         assert detail["semantic_contracts"][0]["requirement_code"] == "line_explode.source_field.line_framed_text"
 
     @pytest.mark.asyncio
-    async def test_execute_returns_422_for_pipeline_validation_failure(self) -> None:
+    async def test_execute_returns_422_for_pipeline_validation_failure(self, execution_fixture: ExecutionTestCustody) -> None:
         """Fail-closed pre-run validation (notes/composer-advisor-surface-map-2026-06-08.md):
         an invalid composed pipeline maps to a structured 422 — NOT an opaque
         ``status=failed`` run, NOT the bare-ValueError 404. ``PipelineValidationError``
@@ -931,9 +955,9 @@ class TestExecuteEndpoint:
         )
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
         assert resp.status_code == 422
         detail = resp.json()["detail"]
         assert detail["error_type"] == "pipeline_validation_failure"
@@ -944,7 +968,7 @@ class TestExecuteEndpoint:
         assert detail["errors"][0]["suggestion"] == "Wire an upstream node that emits 'content'."
 
     @pytest.mark.asyncio
-    async def test_execute_returns_structured_422_for_execution_readiness_failure(self) -> None:
+    async def test_execute_returns_structured_422_for_execution_readiness_failure(self, execution_fixture: ExecutionTestCustody) -> None:
         from elspeth.web.execution.errors import ExecutionReadinessError
         from elspeth.web.execution.schemas import ValidationReadinessBlocker
 
@@ -959,10 +983,10 @@ class TestExecuteEndpoint:
         exc = ExecutionReadinessError(blockers=(blocker,))
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
 
         assert resp.status_code == 422
         assert resp.json()["detail"] == {
@@ -982,16 +1006,16 @@ class TestExecuteEndpoint:
         }
 
     @pytest.mark.asyncio
-    async def test_execute_returns_safe_422_for_execution_readiness_without_blockers(self) -> None:
+    async def test_execute_returns_safe_422_for_execution_readiness_without_blockers(self, execution_fixture: ExecutionTestCustody) -> None:
         from elspeth.web.execution.errors import ExecutionReadinessError
 
         exc = ExecutionReadinessError(blockers=())
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
 
         assert resp.status_code == 422
         assert resp.json()["detail"] == {
@@ -1002,7 +1026,7 @@ class TestExecuteEndpoint:
         }
 
     @pytest.mark.asyncio
-    async def test_execute_returns_safe_500_for_completion_gate_integrity_failure(self) -> None:
+    async def test_execute_returns_safe_500_for_completion_gate_integrity_failure(self, execution_fixture: ExecutionTestCustody) -> None:
         from elspeth.web.execution.errors import CompletionGateIntegrityError
 
         session_id = uuid4()
@@ -1010,7 +1034,7 @@ class TestExecuteEndpoint:
         exc = CompletionGateIntegrityError(session_id=str(session_id), state_id=str(state_id))
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture, execution_session_id=session_id)
 
         with patch("elspeth.web.execution.routes.slog.error") as log_error:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -1030,7 +1054,7 @@ class TestExecuteEndpoint:
         )
 
     @pytest.mark.asyncio
-    async def test_execute_returns_422_for_unresolved_interpretation_placeholder(self) -> None:
+    async def test_execute_returns_422_for_unresolved_interpretation_placeholder(self, execution_fixture: ExecutionTestCustody) -> None:
         """F-17 / F-21: unresolved interpretation placeholder maps to 422 with structured payload.
 
         The route handler MUST sit ABOVE the ``except
@@ -1048,9 +1072,9 @@ class TestExecuteEndpoint:
 
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
         assert resp.status_code == 422
         body = resp.json()
         detail = body["detail"]
@@ -2367,7 +2391,7 @@ class TestExecuteIDORAndPathTraversal:
     """
 
     @pytest.mark.asyncio
-    async def test_execute_cross_session_state_id_returns_idor_safe_body(self) -> None:
+    async def test_execute_cross_session_state_id_returns_idor_safe_body(self, execution_fixture: ExecutionTestCustody) -> None:
         """Cross-session state_id surfaces as the fixed "State not found" literal.
 
         The service raises ``StateAccessError``; the route MUST
@@ -2378,17 +2402,17 @@ class TestExecuteIDORAndPathTraversal:
 
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=StateAccessError("any-state-uuid"))
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
-                f"/api/sessions/{uuid4()}/execute",
+                f"/api/sessions/{app.state.execute_session_id}/execute",
                 params={"state_id": str(uuid4())},
             )
             assert resp.status_code == 404
             assert resp.json() == {"detail": "State not found"}
 
     @pytest.mark.asyncio
-    async def test_execute_state_id_idor_branches_are_byte_identical(self) -> None:
+    async def test_execute_state_id_idor_branches_are_byte_identical(self, execution_fixture: ExecutionTestCustody) -> None:
         """Nonexistent state_id and cross-session state_id MUST be indistinguishable.
 
         This is the canonical IDOR-parity check: run both branches
@@ -2402,23 +2426,23 @@ class TestExecuteIDORAndPathTraversal:
         # Branch 1: state UUID does not exist anywhere in the DB.
         svc_a = _execution_service()
         svc_a.execute = AsyncMock(spec=ExecutionService.execute, side_effect=StateAccessError(str(uuid4())))
-        app_a = _create_test_app(execution_service=svc_a)
+        app_a = _create_test_app(execution_service=svc_a, execution_fixture=execution_fixture)
 
         # Branch 2: state UUID exists but belongs to another session.
         svc_b = _execution_service()
         svc_b.execute = AsyncMock(spec=ExecutionService.execute, side_effect=StateAccessError(str(uuid4())))
-        app_b = _create_test_app(execution_service=svc_b)
+        app_b = _create_test_app(execution_service=svc_b, execution_fixture=execution_fixture)
 
         async with (
             AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client_a,
             AsyncClient(transport=ASGITransport(app=app_b), base_url="http://test") as client_b,
         ):
             resp_a = await client_a.post(
-                f"/api/sessions/{uuid4()}/execute",
+                f"/api/sessions/{app_a.state.execute_session_id}/execute",
                 params={"state_id": str(uuid4())},
             )
             resp_b = await client_b.post(
-                f"/api/sessions/{uuid4()}/execute",
+                f"/api/sessions/{app_b.state.execute_session_id}/execute",
                 params={"state_id": str(uuid4())},
             )
 
@@ -2427,7 +2451,7 @@ class TestExecuteIDORAndPathTraversal:
         assert resp_a.json() == {"detail": "State not found"}
 
     @pytest.mark.asyncio
-    async def test_execute_blob_ref_idor_branches_are_byte_identical(self) -> None:
+    async def test_execute_blob_ref_idor_branches_are_byte_identical(self, execution_fixture: ExecutionTestCustody) -> None:
         """Nonexistent blob_ref and cross-session blob_ref MUST be indistinguishable.
 
         Before this fix, nonexistent-blob propagated as an uncaught
@@ -2442,25 +2466,25 @@ class TestExecuteIDORAndPathTraversal:
 
         svc_a = _execution_service()
         svc_a.execute = AsyncMock(spec=ExecutionService.execute, side_effect=BlobNotFoundError(str(uuid4())))
-        app_a = _create_test_app(execution_service=svc_a)
+        app_a = _create_test_app(execution_service=svc_a, execution_fixture=execution_fixture)
 
         svc_b = _execution_service()
         svc_b.execute = AsyncMock(spec=ExecutionService.execute, side_effect=BlobNotFoundError(str(uuid4())))
-        app_b = _create_test_app(execution_service=svc_b)
+        app_b = _create_test_app(execution_service=svc_b, execution_fixture=execution_fixture)
 
         async with (
             AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client_a,
             AsyncClient(transport=ASGITransport(app=app_b), base_url="http://test") as client_b,
         ):
-            resp_a = await client_a.post(f"/api/sessions/{uuid4()}/execute")
-            resp_b = await client_b.post(f"/api/sessions/{uuid4()}/execute")
+            resp_a = await client_a.post(f"/api/sessions/{app_a.state.execute_session_id}/execute")
+            resp_b = await client_b.post(f"/api/sessions/{app_b.state.execute_session_id}/execute")
 
         assert resp_a.status_code == resp_b.status_code == 404
         assert resp_a.content == resp_b.content
         assert resp_a.json() == {"detail": "Blob not found"}
 
     @pytest.mark.asyncio
-    async def test_execute_source_path_traversal_returns_400(self) -> None:
+    async def test_execute_source_path_traversal_returns_400(self, execution_fixture: ExecutionTestCustody) -> None:
         """Source path escaping allowed directories is rejected."""
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
@@ -2469,14 +2493,14 @@ class TestExecuteIDORAndPathTraversal:
             spec=ExecutionService.execute,
             side_effect=PathAllowlistViolationError("Source path='../../etc/passwd' resolves outside allowed directories"),
         )
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
             assert resp.status_code == 400
             assert "resolves outside" in resp.json()["detail"]
 
     @pytest.mark.asyncio
-    async def test_execute_sink_path_traversal_returns_400(self) -> None:
+    async def test_execute_sink_path_traversal_returns_400(self, execution_fixture: ExecutionTestCustody) -> None:
         """Sink path escaping allowed output directories is rejected."""
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
@@ -2485,22 +2509,22 @@ class TestExecuteIDORAndPathTraversal:
             spec=ExecutionService.execute,
             side_effect=PathAllowlistViolationError("Sink 'out' path='../../../tmp/evil' resolves outside allowed output directories"),
         )
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
             assert resp.status_code == 400
             assert "resolves outside" in resp.json()["detail"]
 
     @pytest.mark.asyncio
-    async def test_execute_malformed_blob_ref_returns_400(self) -> None:
+    async def test_execute_malformed_blob_ref_returns_400(self, execution_fixture: ExecutionTestCustody) -> None:
         """Malformed caller-supplied blob_ref is validation, not not-found."""
         from elspeth.web.execution.errors import MalformedBlobRefError
 
         svc = _execution_service()
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=MalformedBlobRefError("blob_ref must be a UUID"))
-        app = _create_test_app(execution_service=svc)
+        app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
             assert resp.status_code == 400
             assert resp.json()["detail"] == "blob_ref must be a UUID"
 

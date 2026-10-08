@@ -6,7 +6,7 @@ import asyncio
 import errno
 import threading
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -29,6 +29,7 @@ from elspeth.web.process_recovery import ProcessRecovery
 from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import (
+    ComposerFailureReceipt,
     RequiredAuthorityKind,
     RequiredWorkAuthority,
     RequiredWorkCoordinator,
@@ -80,6 +81,34 @@ class _StartedSettlement:
     failure_attempted: bool = False
     terminal_receipt: ComposerOperationRecord | None = None
     verified_terminal: ComposerOperationRecord | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AdoptionSettlementHandoff:
+    """Actual finished job result carrying every live adoption observation."""
+
+    terminal: ComposerOperationRecord
+    cancellations: tuple[asyncio.CancelledError, ...]
+
+
+def _owned_deadline_failure(
+    original: BaseException,
+    *,
+    timeout_scope: asyncio.Timeout | None,
+    record: ComposerOperationRecord,
+    anchor: ComposerBudgetAnchor,
+) -> BaseException:
+    """Classify only expiry of this worker's actual owned turn budget."""
+    if type(original) is not TimeoutError or timeout_scope is None or not timeout_scope.expired():
+        return original
+    deadline = ComposerTurnDeadlineExpired(
+        session_id=record.session_id,
+        operation_id=record.operation_id,
+        remaining_seconds=anchor.remaining_seconds(monotonic_now=time.monotonic()),
+        budget_seconds_at_running=anchor.remaining_at_running_seconds,
+    )
+    deadline.__cause__ = original
+    return deadline
 
 
 async def _join_owned[T](task: asyncio.Task[T], *, cancellation_observations: list[asyncio.CancelledError] | None = None) -> T:
@@ -266,10 +295,13 @@ class ComposerAsyncWorker:
         self._process_recovery = process_recovery
         self._instance_draining = instance_draining
         self._required_coordinators: dict[tuple[UUID, str], RequiredWorkCoordinator] = {}
+        self._recovery_coordinators: dict[tuple[UUID, str], list[RequiredWorkCoordinator]] = {}
+        self._adoption_recovery_pending: set[tuple[UUID, str]] = set()
+        self._adoption_recovery_cancellations: dict[tuple[UUID, str], list[asyncio.CancelledError]] = {}
         self._stopping = False
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
-        self._jobs: dict[tuple[UUID, str], asyncio.Task[None]] = {}
+        self._jobs: dict[tuple[UUID, str], asyncio.Task[_AdoptionSettlementHandoff | None]] = {}
         self._local_cancels: dict[tuple[UUID, str], asyncio.Event] = {}
 
     def notify_work(self) -> None:
@@ -316,16 +348,48 @@ class ComposerAsyncWorker:
             task.add_done_callback(partial(self._job_finished, key))
         return len(claims)
 
-    def _job_finished(self, key: tuple[UUID, str], task: asyncio.Task[None]) -> None:
+    def _job_finished(self, key: tuple[UUID, str], task: asyncio.Task[_AdoptionSettlementHandoff | None]) -> None:
         del self._jobs[key]
         del self._local_cancels[key]
+        failure = None if task.cancelled() else task.exception()
+        result = task.result() if failure is None and not task.cancelled() else None
         coordinator = self._required_coordinators.get(key)
-        if coordinator is not None and coordinator.all_completed:
-            del self._required_coordinators[key]
-        if not task.cancelled():
-            failure = task.exception()
-            if failure is not None:
-                slog.error("composer_operation.owner_unsettled", exc_class=type(failure).__name__)
+        recovery = self._recovery_coordinators.get(key)
+        if key in self._adoption_recovery_pending:
+            cancellations = self._adoption_recovery_cancellations.get(key)
+            proved_handoff = (
+                type(result) is _AdoptionSettlementHandoff
+                and type(result.terminal) is ComposerOperationRecord
+                and result.terminal.session_id == key[0]
+                and result.terminal.operation_id == key[1]
+                and result.terminal.status in ("completed", "failed")
+                and cancellations is not None
+                and len(result.cancellations) == len(cancellations)
+                and all(observed is retained for observed, retained in zip(result.cancellations, cancellations, strict=True))
+            )
+            if (
+                proved_handoff
+                and coordinator is not None
+                and coordinator.all_completed
+                and (recovery is None or all(item.all_completed for item in recovery))
+            ):
+                self._adoption_recovery_pending.remove(key)
+                self._adoption_recovery_cancellations.pop(key, None)
+            else:
+                self._process_recovery.request_shutdown()
+        elif not self._adoption_recovery_cancellations.get(key):
+            # A successful adoption installed a temporary empty observation
+            # list before its first await. It never entered recovery custody.
+            self._adoption_recovery_cancellations.pop(key, None)
+        else:
+            self._process_recovery.request_shutdown()
+        if key not in self._adoption_recovery_pending:
+            if coordinator is not None and coordinator.all_completed:
+                del self._required_coordinators[key]
+            if recovery is not None and all(item.all_completed for item in recovery):
+                del self._recovery_coordinators[key]
+        if failure is not None:
+            slog.error("composer_operation.owner_unsettled", exc_class=type(failure).__name__)
         self._wake.set()
 
     async def run_until_idle(self) -> None:
@@ -366,6 +430,9 @@ class ComposerAsyncWorker:
             self._loop_task.exception()
         for coordinator in self._required_coordinators.values():
             coordinator.assert_completed()
+        for recovery in self._recovery_coordinators.values():
+            for coordinator in recovery:
+                coordinator.assert_completed()
 
     async def _queued_outcome(self, claim: ComposerOperationClaim, record: ComposerOperationRecord) -> bool:
         current, now = await _owned(
@@ -390,7 +457,7 @@ class ComposerAsyncWorker:
             return True
         return False
 
-    async def _job(self, claim: ComposerOperationClaim) -> None:
+    async def _job(self, claim: ComposerOperationClaim) -> _AdoptionSettlementHandoff | None:
         services = composer_app_services(self._app)
         lock = await services.compose_locks.get_lock(str(claim.session_id))
         record = await _owned(
@@ -406,10 +473,10 @@ class ComposerAsyncWorker:
             # A claim is renewed while waiting; no provider work has started.
             while not acquired:
                 if await self._queued_outcome(claim, record):
-                    return
+                    return None
                 if self._stopping or self._instance_draining.is_set():
                     await _owned(run_sync_in_worker(self._authority.release_claim, claim))
-                    return
+                    return None
                 try:
                     await asyncio.wait_for(lock.acquire(), timeout=min(0.25, self._claim_lease_seconds / 3))
                     acquired = True
@@ -430,12 +497,15 @@ class ComposerAsyncWorker:
             coordinator = RequiredWorkCoordinator(
                 RequiredWorkAuthority(RequiredAuthorityKind.DURABLE_COMPOSE, context, claim.operation_id, claim.attempt)
             )
-            self._required_coordinators[(claim.session_id, claim.operation_id)] = coordinator
+            adoption_key = (claim.session_id, claim.operation_id)
+            self._required_coordinators[adoption_key] = coordinator
+            adoption_cancellations = self._adoption_recovery_cancellations.setdefault(adoption_key, [])
             lease = await SessionOperationLease.adopt(
                 services.session_service.session_operation_authority,
                 context,
                 lease_seconds=services.session_service.session_operation_lease_seconds,
                 required_work=coordinator,
+                cancellation_observations=adoption_cancellations,
             )
             started_handoff = True
             await self._run_started(services, running, lease)
@@ -461,8 +531,9 @@ class ComposerAsyncWorker:
             if running is None:
                 await _owned(run_sync_in_worker(self._authority.release_claim, claim))
             elif not started_handoff:
-                await self._settle_failure(services, running, exc)
-                return
+                observations = self._begin_adoption_failure_custody(running, exc)
+                terminal = await self._settle_failure(services, running, exc, adoption_failed=True, cancellation_observations=observations)
+                return _AdoptionSettlementHandoff(terminal, tuple(observations))
             raise
         except BaseException as exc:
             if running is None:
@@ -477,12 +548,15 @@ class ComposerAsyncWorker:
                     )
                 )
             elif not started_handoff:
-                await self._settle_failure(services, running, exc)
+                observations = self._begin_adoption_failure_custody(running, exc)
+                terminal = await self._settle_failure(services, running, exc, adoption_failed=True, cancellation_observations=observations)
+                return _AdoptionSettlementHandoff(terminal, tuple(observations))
             else:
                 raise
         finally:
             if acquired:
                 lock.release()
+        return None
 
     async def _run_started(self, services: ComposerAppServices, running: ComposerOperationRunning, lease: SessionOperationLease) -> None:
         if type(lease) is not SessionOperationLease:
@@ -730,10 +804,11 @@ class ComposerAsyncWorker:
                     if coordinator is not None
                     else None
                 )
+                timeout_scope: asyncio.Timeout | None = None
                 try:
                     if self._stopping or self._instance_draining.is_set():
                         raise asyncio.CancelledError(COMPOSER_SHUTDOWN)
-                    async with asyncio.timeout(budget):
+                    async with asyncio.timeout(budget) as timeout_scope:
                         if coordinator is None:
                             raise AuditIntegrityError("Detached composer turn has no owned required-work coordinator")
                         terminal = await run_composer_turn(
@@ -752,7 +827,7 @@ class ComposerAsyncWorker:
                         turn_ticket.complete_owned(exc)
                     if _terminal_completion_unknown(exc):
                         raise
-                    failure = exc
+                    failure = _owned_deadline_failure(exc, timeout_scope=timeout_scope, record=record, anchor=anchor)
                     if watcher is not None:
                         watcher_failures = await _finish_operation_watcher(watcher, watch_observation)
                         watcher = None
@@ -918,6 +993,7 @@ class ComposerAsyncWorker:
         exc: BaseException,
         *,
         cancellation_observations: list[asyncio.CancelledError] | None = None,
+        adoption_failed: bool = False,
     ) -> ComposerOperationRecord:
         coordinator = self._required_coordinators.get((running.claim.session_id, running.claim.operation_id))
         try:
@@ -965,50 +1041,71 @@ class ComposerAsyncWorker:
             )
         except (ComposerOperationFenceLost, SessionOperationFenceLost) as fence_failure:
             if coordinator is not None:
-                raise ComposerTerminalSQLCompletionUnknown(
-                    "Owned failed publication requires separate fresh-authority recovery"
-                ) from fence_failure
-            try:
-                terminal = await _owned(
-                    run_sync_in_worker(
-                        self._authority.settle_own_lapsed,
-                        session_id=current.session_id,
-                        operation_id=current.operation_id,
-                        owner_instance_id=self._owner_instance_id,
-                        failure=failure,
-                        authoritative_failure=_authoritative_failure(exc),
-                    )
-                )
-            except ComposerOperationFenceLost:
-                # A proved pre-write refusal can follow joined adoption
-                # cleanup's exact release. Recover only under a fresh COMPOSE
-                # fence and the existing newer-epoch lost-operation CAS.
-                recovery = await SessionOperationLease.acquire(
-                    services.session_service.session_operation_authority,
-                    session_id=current.session_id,
-                    operation_kind=SessionOperationKind.COMPOSE,
-                    owner_instance_id=self._owner_instance_id,
-                    lease_seconds=services.session_service.session_operation_lease_seconds,
-                )
+                if not adoption_failed:
+                    raise ComposerTerminalSQLCompletionUnknown(
+                        "Owned failed publication requires separate fresh-authority recovery"
+                    ) from fence_failure
+                if failure_projection is None:
+                    raise AuditIntegrityError("Owned failed publication lost its projection handoff") from fence_failure
+                recovery_key = (current.session_id, current.operation_id)
+                self._adoption_recovery_pending.add(recovery_key)
+                self._adoption_recovery_cancellations.setdefault(recovery_key, [])
+                terminal = await self._recover_failed_adoption(services, running, current, coordinator, failure_projection, exc)
+            else:
                 try:
-                    async with recovery:
-                        terminal = await _owned(
-                            run_sync_in_worker(
-                                self._authority.settle_lost,
-                                session_operation_context=recovery.context,
-                                session_id=current.session_id,
-                                operation_id=current.operation_id,
-                                failure=failure,
-                                authoritative_failure=_authoritative_failure(exc),
-                            )
+                    terminal = await _owned(
+                        run_sync_in_worker(
+                            self._authority.settle_own_lapsed,
+                            session_id=current.session_id,
+                            operation_id=current.operation_id,
+                            owner_instance_id=self._owner_instance_id,
+                            failure=failure,
+                            authoritative_failure=_authoritative_failure(exc),
                         )
-                except BaseException:
-                    committed = await _owned(
-                        run_sync_in_worker(self._authority.get, session_id=current.session_id, operation_id=current.operation_id)
                     )
-                    if committed is None or committed.status not in ("completed", "failed"):
-                        raise
-                    terminal = committed
+                except ComposerOperationFenceLost:
+                    # A proved pre-write refusal can follow joined adoption
+                    # cleanup's exact release. Recover only under a fresh COMPOSE
+                    # fence and the existing newer-epoch lost-operation CAS.
+                    recovery = await SessionOperationLease.acquire(
+                        services.session_service.session_operation_authority,
+                        session_id=current.session_id,
+                        operation_kind=SessionOperationKind.COMPOSE,
+                        owner_instance_id=self._owner_instance_id,
+                        lease_seconds=services.session_service.session_operation_lease_seconds,
+                    )
+                    try:
+                        async with recovery:
+                            terminal = await _owned(
+                                run_sync_in_worker(
+                                    self._authority.settle_lost,
+                                    session_operation_context=recovery.context,
+                                    session_id=current.session_id,
+                                    operation_id=current.operation_id,
+                                    failure=failure,
+                                    authoritative_failure=_authoritative_failure(exc),
+                                )
+                            )
+                    except BaseException:
+                        committed = await _owned(
+                            run_sync_in_worker(self._authority.get, session_id=current.session_id, operation_id=current.operation_id)
+                        )
+                        if committed is None or committed.status not in ("completed", "failed"):
+                            raise
+                        terminal = committed
+        except BaseExceptionGroup as grouped_failure:
+            if not adoption_failed or coordinator is None:
+                raise
+            grouped_refusal = self._grouped_prewrite_fence_refusal(grouped_failure)
+            if grouped_refusal is None or failure_projection is None:
+                raise
+            if cancellation_observations is None:
+                raise AuditIntegrityError("Adoption recovery lost its cancellation owner") from grouped_failure
+            self._retain_recovery_cancellations(cancellation_observations, grouped_failure)
+            recovery_key = (current.session_id, current.operation_id)
+            self._adoption_recovery_pending.add(recovery_key)
+            self._adoption_recovery_cancellations.setdefault(recovery_key, cancellation_observations)
+            terminal = await self._recover_failed_adoption(services, running, current, coordinator, failure_projection, exc)
         slog.info(
             "composer_operation.settled",
             status=terminal.status,
@@ -1017,6 +1114,232 @@ class ComposerAsyncWorker:
             diagnostic_id=failure.diagnostic_id,
         )
         return terminal
+
+    async def _recover_failed_adoption(
+        self,
+        services: ComposerAppServices,
+        running: ComposerOperationRunning,
+        current: ComposerOperationRecord,
+        original_work: RequiredWorkCoordinator,
+        original_projection: RequiredWorkTicket,
+        original: BaseException,
+    ) -> ComposerOperationRecord:
+        key = (current.session_id, current.operation_id)
+        cancellations = self._adoption_recovery_cancellations.setdefault(key, [])
+        try:
+            return await self._reconcile_failed_adoption(services, running, current, original_work, original_projection, original)
+        except BaseException as escaping:
+            self._retain_recovery_cancellations(cancellations, escaping)
+            raise
+
+    def _begin_adoption_failure_custody(self, running: ComposerOperationRunning, original: BaseException) -> list[asyncio.CancelledError]:
+        key = (running.claim.session_id, running.claim.operation_id)
+        self._adoption_recovery_pending.add(key)
+        cancellations = self._adoption_recovery_cancellations.setdefault(key, [])
+        self._retain_recovery_cancellations(cancellations, original)
+        return cancellations
+
+    @staticmethod
+    def _grouped_prewrite_fence_refusal(
+        grouped: BaseExceptionGroup,
+    ) -> ComposerOperationFenceLost | SessionOperationFenceLost | None:
+        pending: list[BaseException] = [grouped]
+        fences: list[ComposerOperationFenceLost | SessionOperationFenceLost] = []
+        while pending:
+            original = pending.pop()
+            if isinstance(original, BaseExceptionGroup):
+                pending.extend(original.exceptions)
+            elif isinstance(original, (ComposerOperationFenceLost, SessionOperationFenceLost)):
+                fences.append(original)
+            elif not isinstance(original, asyncio.CancelledError):
+                return None
+        return fences[0] if len(fences) == 1 else None
+
+    @staticmethod
+    def _retain_recovery_cancellations(cancellations: list[asyncio.CancelledError], failure: BaseException) -> None:
+        pending = [failure]
+        visited: set[int] = set()
+        while pending:
+            current = pending.pop()
+            if id(current) in visited:
+                continue
+            visited.add(id(current))
+            if isinstance(current, asyncio.CancelledError) and all(current is not earlier for earlier in cancellations):
+                cancellations.append(current)
+            if isinstance(current, BaseExceptionGroup):
+                pending.extend(current.exceptions)
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+
+    async def _reconcile_failed_adoption(
+        self,
+        services: ComposerAppServices,
+        running: ComposerOperationRunning,
+        current: ComposerOperationRecord,
+        original_work: RequiredWorkCoordinator,
+        original_projection: RequiredWorkTicket,
+        original: BaseException,
+    ) -> ComposerOperationRecord:
+        """Reconcile the actual writer, then recover only a proved running job."""
+        original_work.validate_terminal_failure_work(projection_ticket=original_projection)
+        if (
+            original_work.authority.context != running.session_operation_context
+            or original_work.authority.durable_operation_id != current.operation_id
+            or original_work.authority.claim_attempt != running.claim.attempt
+        ):
+            raise AuditIntegrityError("Adoption recovery changed its original required-work authority")
+        key = (current.session_id, current.operation_id)
+        if self._required_coordinators.get(key) is not original_work:
+            raise AuditIntegrityError("Adoption recovery lost its registered original owner")
+        self._adoption_recovery_pending.add(key)
+        cancellations = self._adoption_recovery_cancellations.setdefault(key, [])
+        original_projection.begin_projection()
+        deadline = asyncio.get_running_loop().time() + min(self._drain_seconds, 30.0)
+        last_failure: BaseException | None = None
+        for attempt in range(3):
+            # A peer may have committed while joined adoption cleanup released
+            # the old fence. Read the authoritative writer before another CAS.
+            witness = original_work.reserve(RequiredWorkSource.TERMINAL_WRITER_READ_SQL, recurrence_ordinal=2 + attempt)
+            observed = await _owned(
+                run_required_sql_finish_once(
+                    witness, self._authority.get_with_database_now, session_id=current.session_id, operation_id=current.operation_id
+                ),
+                cancellation_observations=cancellations,
+            )
+            original_work.validate_joined_lifecycle_sql_outcome(
+                ticket=witness, expected_source=RequiredWorkSource.TERMINAL_WRITER_READ_SQL, actual_outcome=observed
+            )
+            cancellations.extend(observed.deferred_cancellations)
+            if type(observed) is RequiredSQLRaised:
+                last_failure = observed.error
+            elif type(observed) is RequiredSQLReturned:
+                if type(observed.value) is not tuple or len(observed.value) != 2:
+                    raise AuditIntegrityError("Adoption recovery read changed its nominal operation result")
+                seen, database_now = observed.value
+                if type(seen) is not ComposerOperationRecord or type(database_now) is not datetime:
+                    raise AuditIntegrityError("Adoption recovery read changed its nominal operation record")
+                if seen.session_id != current.session_id or seen.operation_id != current.operation_id:
+                    raise AuditIntegrityError("Adoption recovery read crossed its exact job")
+                if seen.status in ("completed", "failed"):
+                    self._complete_reconciled_projection(original_projection, cancellations)
+                    original_work.assert_completed()
+                    return seen
+                if seen.status != "running":
+                    raise AuditIntegrityError("Adoption recovery found an unsupported operation state")
+                receipts = original_work.recovery_failure_receipts(projection_ticket=original_projection)
+                reduction = reduce_composer_failures(receipts) if receipts else None
+                selected_failure = self._failure_for(seen, database_now, original, recovery_receipts=receipts)
+                selected_authoritative = _authoritative_failure(original) or (reduction is not None and reduction.category_rank <= 51)
+                try:
+                    recovery = await _owned(
+                        SessionOperationLease.acquire(
+                            services.session_service.session_operation_authority,
+                            session_id=current.session_id,
+                            operation_kind=SessionOperationKind.COMPOSE,
+                            owner_instance_id=self._owner_instance_id,
+                            lease_seconds=services.session_service.session_operation_lease_seconds,
+                        ),
+                        cancellation_observations=cancellations,
+                    )
+                except (SessionOperationConflictError, asyncio.CancelledError) as acquisition_failure:
+                    last_failure = acquisition_failure
+                    if isinstance(acquisition_failure, asyncio.CancelledError):
+                        self._retain_recovery_cancellations(cancellations, acquisition_failure)
+                else:
+                    body_failure: BaseException | None = None
+                    try:
+                        if recovery.context.fence.operation_epoch <= running.session_operation_context.fence.operation_epoch:
+                            raise AuditIntegrityError("Adoption recovery did not acquire a newer fence")
+                        recovered_work = RequiredWorkCoordinator(
+                            RequiredWorkAuthority(
+                                RequiredAuthorityKind.DURABLE_COMPOSE, recovery.context, current.operation_id, running.claim.attempt
+                            )
+                        )
+                        recovery.bind_required_work(recovered_work)
+                        self._recovery_coordinators.setdefault(key, []).append(recovered_work)
+                        recovered_projection = self._reserve_failed_terminal_projection(recovered_work)
+                        recovered_projection.begin_projection()
+                        sql_ticket = recovered_work.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL)
+                        sql_outcome = await _owned(
+                            run_required_sql_finish_once(
+                                sql_ticket,
+                                self._authority.settle_lost,
+                                session_operation_context=recovery.context,
+                                session_id=current.session_id,
+                                operation_id=current.operation_id,
+                                failure=selected_failure,
+                                authoritative_failure=selected_authoritative,
+                            ),
+                            cancellation_observations=cancellations,
+                        )
+                        recovered_work.validate_recovery_terminal_sql_outcome(ticket=sql_ticket, actual_outcome=sql_outcome)
+                        cancellations.extend(sql_outcome.deferred_cancellations)
+                        read_ticket = recovered_work.reserve(RequiredWorkSource.TERMINAL_WRITER_READ_SQL)
+                        read_outcome = await _owned(
+                            run_required_sql_finish_once(
+                                read_ticket, self._authority.get, session_id=current.session_id, operation_id=current.operation_id
+                            ),
+                            cancellation_observations=cancellations,
+                        )
+                        recovered_work.validate_joined_lifecycle_sql_outcome(
+                            ticket=read_ticket, expected_source=RequiredWorkSource.TERMINAL_WRITER_READ_SQL, actual_outcome=read_outcome
+                        )
+                        cancellations.extend(read_outcome.deferred_cancellations)
+                        if type(read_outcome) is RequiredSQLRaised:
+                            raise ComposerTerminalSQLCompletionUnknown("Adoption recovery readback failed") from read_outcome.error
+                        if type(read_outcome) is RequiredSQLReturned:
+                            terminal = read_outcome.value
+                        else:
+                            raise AuditIntegrityError("Adoption recovery readback returned an unsupported nominal SQL outcome")
+                        if type(terminal) is not ComposerOperationRecord:
+                            raise AuditIntegrityError("Adoption recovery readback changed its nominal record")
+                        if terminal.session_id != current.session_id or terminal.operation_id != current.operation_id:
+                            raise AuditIntegrityError("Adoption recovery readback crossed its exact job")
+                        if type(sql_outcome) is RequiredSQLReturned and sql_outcome.value != terminal:
+                            raise AuditIntegrityError("Adoption recovery SQL result disagreed with its independent readback")
+                        if terminal.status in ("completed", "failed"):
+                            secondary = (sql_outcome.error,) if type(sql_outcome) is RequiredSQLRaised else ()
+                            self._complete_reconciled_projection(recovered_projection, (*secondary, *cancellations))
+                            self._complete_reconciled_projection(original_projection, cancellations)
+                            original_work.assert_completed()
+                            return terminal
+                        if terminal.status != "running" or type(sql_outcome) is not RequiredSQLRaised:
+                            raise ComposerTerminalSQLCompletionUnknown("Adoption recovery has no proved terminal or retry state")
+                        # The attempted bundle is sealed. A running readback
+                        # does not complete publication or authorize release of
+                        # this fresh fence through a replacement coordinator.
+                        raise ComposerTerminalSQLCompletionUnknown("Adoption recovery has no committed terminal") from sql_outcome.error
+                    except BaseException as failure_during_recovery:
+                        body_failure = failure_during_recovery
+                        raise
+                    finally:
+                        try:
+                            # This outer Task owns the physical close. Its
+                            # shielded join observes every caller cancellation
+                            # without cancelling the inner lifecycle join.
+                            await _owned(recovery.close(), cancellation_observations=cancellations)
+                        except BaseException as close_failure:
+                            if body_failure is not None and close_failure is not body_failure:
+                                raise _combine_operation_failures(body_failure, (close_failure,)) from None
+                            raise
+            else:
+                raise AuditIntegrityError("Adoption recovery read returned an unsupported nominal SQL outcome")
+            if attempt < 2 and asyncio.get_running_loop().time() < deadline:
+                await _owned(asyncio.sleep(min(self._scan_interval, 0.05)), cancellation_observations=cancellations)
+        raise ComposerTerminalSQLCompletionUnknown("Adoption recovery exhausted its bounded writer reconciliation") from last_failure
+
+    @staticmethod
+    def _complete_reconciled_projection(ticket: RequiredWorkTicket, errors: Iterable[BaseException]) -> None:
+        unique: list[BaseException] = []
+        for error in errors:
+            if all(error is not earlier for earlier in unique):
+                unique.append(error)
+        if not unique:
+            ticket.complete_owned()
+        elif len(unique) == 1:
+            ticket.complete_owned(unique[0])
+        else:
+            ticket.complete_owned(BaseExceptionGroup("Adoption recovery retained original outcomes", unique))
 
     @staticmethod
     def _reserve_failed_terminal_projection(coordinator: RequiredWorkCoordinator) -> RequiredWorkTicket:
@@ -1037,12 +1360,19 @@ class ComposerAsyncWorker:
         coordinator.validate_terminal_failure_work(projection_ticket=projection)
         return projection
 
-    def _failure_for(self, current: ComposerOperationRecord, now: datetime, exc: BaseException) -> ComposerOperationError:
+    def _failure_for(
+        self,
+        current: ComposerOperationRecord,
+        now: datetime,
+        exc: BaseException,
+        *,
+        recovery_receipts: tuple[ComposerFailureReceipt, ...] | None = None,
+    ) -> ComposerOperationError:
         leaves = _failure_leaves(exc)
         coordinator = self._required_coordinators.get((current.session_id, current.operation_id))
         reduction = None
         if coordinator is not None:
-            receipts = coordinator.settlement_failure_receipts()
+            receipts = coordinator.settlement_failure_receipts() if recovery_receipts is None else recovery_receipts
             if receipts:
                 reduction = reduce_composer_failures(receipts)
         if reduction is not None and reduction.category_rank <= 51:
@@ -1054,7 +1384,7 @@ class ComposerAsyncWorker:
             return project_composer_operation_error(exc, request_id=current.request_id)
         if current.cancel_requested_at is not None:
             return request_cancelled_error(request_id=current.request_id)
-        if restore_utc(current.deadline_at) <= now or isinstance(exc, ComposerTurnDeadlineExpired):
+        if restore_utc(current.deadline_at) <= now or any(isinstance(leaf, ComposerTurnDeadlineExpired) for leaf in leaves):
             return deadline_expired_error(
                 request_id=current.request_id,
                 timeout_seconds=(restore_utc(current.deadline_at) - restore_utc(current.created_at)).total_seconds(),
@@ -1097,6 +1427,9 @@ class ComposerAsyncWorker:
         expired = await _owned(run_sync_in_worker(self._authority.list_expired_running, limit=self._concurrency))
         for record in expired:
             if (record.session_id, record.operation_id) in self._jobs:
+                continue
+            if (record.session_id, record.operation_id) in self._adoption_recovery_pending:
+                self._process_recovery.request_shutdown()
                 continue
             failure = worker_lost_error(request_id=record.request_id)
             try:

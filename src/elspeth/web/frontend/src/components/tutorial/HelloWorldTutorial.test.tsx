@@ -457,6 +457,39 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
     stubBuildSessionId = "sess-new";
   });
 
+  it("does not publish a pending exit after the tutorial unmounts", async () => {
+    const api = await import("@/api/client");
+    const user = userEvent.setup();
+    const { unmount } = render(<HelloWorldTutorial />);
+    await user.click(screen.getByRole("button", { name: "Let's go" }));
+    const exit = await screen.findByRole("button", { name: "Exit tutorial" });
+    await waitFor(() => expect(usePreferencesStore.getState().writing).toBe(false));
+    let settle!: (value: Awaited<ReturnType<typeof api.updateUserComposerPreferences>>) => void;
+    vi.mocked(api.updateUserComposerPreferences).mockReturnValueOnce(
+      new Promise((resolve) => { settle = resolve; }),
+    );
+
+    await user.click(exit);
+    await waitFor(() => expect(api.updateUserComposerPreferences).toHaveBeenCalledWith(
+      expect.objectContaining({ tutorial_completed_via: "exit" }),
+    ));
+    unmount();
+    const stamp = "2026-07-02T00:00:00Z";
+    await act(async () => settle({
+      freeform_intro_dismissed_at: null,
+      show_advanced: false,
+      tutorial_completed_at: stamp,
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+      updated_at: stamp,
+    }));
+
+    expect(usePreferencesStore.getState().tutorialCompletedAt).toBe(stamp);
+    expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
+  });
+
   it("persists the exit opt-out from freeform Build", async () => {
     const api = await import("@/api/client");
     const user = userEvent.setup();

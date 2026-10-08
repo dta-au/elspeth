@@ -414,9 +414,21 @@ async def test_atomic_pipeline_settlement_inserts_state_terminal_event_and_row_t
         "committed_state_content_hash",
         "final_composer_metadata_hash",
         "dispatch",
+        "creation_composer_operation",
+        "settlement_composer_operation",
+        "review_cohort",
+        "final_state_id",
+        "final_state_content_hash",
+        "transition_assistant",
     }
-    assert terminal["schema"] == "pipeline_proposal_accepted.v1"
+    assert terminal["schema"] == "pipeline_proposal_accepted.v2"
     assert terminal["dispatch"] == binding.to_dict()
+    assert terminal["creation_composer_operation"] is None
+    assert terminal["settlement_composer_operation"] is None
+    assert terminal["review_cohort"] == ()
+    assert terminal["final_state_id"] == str(settled.state.id)
+    assert terminal["final_state_content_hash"] == terminal["committed_state_content_hash"]
+    assert terminal["transition_assistant"] is None
 
 
 @pytest.mark.asyncio

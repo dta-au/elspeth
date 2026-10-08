@@ -1,0 +1,44 @@
+# Composer reported bugs — 2026-10-08
+
+This inventory supplements the existing asynchronous operations plan and its
+prior finding ledger for the held 0.8.3 change. It does not replace or close any
+earlier obligation. Emmy remains the authority for acceptance decisions.
+
+Both current root reports were read in full and preserved unchanged:
+`BUGREP.md` and `BUGREP2.md`. The first search checked the literal `bug2`
+basename; live root enumeration identified the second report as `BUGREP2.md`.
+Neither report is part of the implementation commit. Their original private
+evidence and failed test results remain available in the executor workspace.
+The operator's additional admin-preferences report is included below.
+
+| ID | Evidence and distinct issue | Required behavior and regression reach | Current limit |
+| --- | --- | --- | --- |
+| BR01 | `BUGREP.md`: an ordinary source-options edit removes the generated-source review row; read-side validation then finds an orphan that the recovery message cannot restage. | Reject destructive row/provenance removal before publishing a new state; retain coherent evidence for an unchanged artifact. Recover one or multiple historical orphans through the real blob binder, reread the newly staged site, request that exact review and remain blocked until every required review resolves. Cover singular/plural binding and complete source/pipeline replacement. | SOURCE3 repair is applied locally. The earlier 85-case regression had one fixture failure, then the corrected bounded backend selection passed 120/120. Real attachment/browser acceptance and final gates remain open. |
+| BR02 | `BUGREP.md`: a reply-only model answer echoes serialized internal tool-history records as user-facing prose. | Preserve attributed history as evidence and withhold complete unmatched internal protocol echoes in both staged-review and discovery-preview completion. Preserve legitimate user-quoted JSON/logs. Keep the unavailable notice trusted, retain audit/cards/accepted state, and use the same durable result after polling/streaming. | SOURCE3 reply-only repair is applied locally. Bounded fake-adapter/reply/fork/DAG selection passed 247/247 and a later affected subset passed 75/75; the unavailable original source1 payload, genuine model replay and local browser parity remain open. |
+| BR03 | `BUGREP2.md`: a complex attachment-driven authoring request exhausted the configured output allowance and asynchronous deadline before any saved graph. | Forward operator-configured token/deadline settings; test 64,000/900 overrides offline while retaining the separate default policy, synchronous 90-second bound, transport 120-second ceiling, retry and cost controls. Keep physical attempts audited and do not accept a partial graph. | The 64,000-token/900-second mitigation is operator-reported as deployed, without a verified artifact or end-to-end replay. The 247-case bounded fake-provider selection included seven capacity/attachment cases and 18 protocol-rejection cases; neither qualifies paid-provider or deployed behavior. The supplied Terraform patch targets a separate repository. |
+| BR04 | `BUGREP2.md`: started, running operations receive a message saying they waited too long to start. | Use truthful operation-state or stage-neutral deadline wording. Preserve HTTP status, stable error type, request correlation, cancellation/worker-loss distinctions and privacy. Do not infer a saved graph from an expired job. | Truthful deadline wording is applied locally. The earlier 164-case bounded selection and one-case rerun passed, but a subsequent eight-case diagnostic had six failures. After the running-deadline repair, the 382-case required-work/lifecycle selection passed on its recorded epoch. Real incident replay and final gates remain open. |
+| BR05 | `BUGREP2.md`: possible inconsistent treatment of syntactically parseable, length-limited provider output. | Use controlled provider responses to measure malformed and parseable truncation, reasoning-heavy output, candidate rejection and near-deadline repair. Preserve original physical call audit and prevent acceptance of an incomplete proposal. | Offline parseable-truncation source controls and relevant fake-provider cases in the seven-case capacity/attachment and 18-case protocol-rejection modules passed within the 247-case bounded selection. The original rejected payload remains unavailable, so its exact cause and genuine-model recovery are unverified. |
+| BR06 | `BUGREP2.md`: attachment requirements conflict on CSV versus a missing Excel workbook, summary versus detailed assessment rows, and all rows versus a selected batch. | The planner should ask focused questions or produce explicit reviewable interpretations. Do not invent workbook structure, omit detailed findings, author fallback graphs server-side or generate judgments in code. Validate the chosen output layout, required reviews, quoted rationales and exact flag vocabulary before execution. | Reviewed prompt and clarification source is applied locally and covered by bounded fake-adapter checks. The seven original attachments remain unavailable; no genuine isolated attachment/provider replay or final layout acceptance has occurred. |
+| BR07 | Operator report: admin-only accounts see a preference-save error although they intentionally lack the regular-user workload role. | Respect the existing backend role boundary. The exact role refusal should make Composer preferences unavailable without a misleading banner or fabricated saved state. Retain normal-user persistence and admin theme/access controls; unrelated authorization/server failures remain actionable. | The 17-file SOURCE3 admin repair passed independent source review and was applied locally. Focused frontend tests passed 247/247, backend selection 120/120, and dependency/type/lint stages exited 0; physical browser acceptance remains open. |
+| BR08 | Independent review of BR07: stale bootstrap/save responses can overwrite a replacement principal's preference view or restore an error after the panel disappears. | Bind preference publications and deferred work to current principal/request ownership. Test old-user success after admin refusal, old-admin refusal after new-user success, cached identity replacement and late write success/failure. Discarded writes must not trigger success callbacks. | SOURCE3 principal, request and caller-lifetime guards are applied locally. Focused frontend tests passed 247/247; independent inert controls rejected a weakened write-custody guard in 26 cases. Real browser principal-switch and delayed-publication acceptance remain open. |
+
+The shared boundaries are explicit: artifact identity controls review custody;
+admitted provider prose must remain distinct from backend notices and quoted
+history; configured capacity and authoritative lifecycle state control truthful
+completion; and principal ownership controls both access and delayed UI
+publication. Capacity changes alone cannot repair any of the other boundaries.
+
+All new findings remain open until their concrete regressions and applicable
+final gates pass. Existing native failures in adoption-original priority,
+executor/telemetry cleanup, metrics ownership, AST proofs and release oracles
+remain in the original readiness work; they are not waived by this report.
+The prior 102-obligation ledger and four supplemental collections remain in
+scope, with two original reports still UNKNOWN. The additional unrecovered
+original BR02 source1 proposal payload is a separate artifact-custody limit.
+
+No report, private attachment export or raw log should be deleted or staged as
+application source. Final acceptance uses frozen source, independent code
+review, complete required tests and local browser/workflow evidence. The held
+branch may use the authorized normal protected merge only after material bugs
+and required checks clear; this document grants no deployment or provider-test
+authorization.

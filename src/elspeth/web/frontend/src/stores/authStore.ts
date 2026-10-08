@@ -30,6 +30,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   async login(username: string, password: string) {
     const generation = advanceAuthGeneration();
+    usePreferencesStore.getState().reset();
     if (pendingLogoutCleanup) await pendingLogoutCleanup;
     if (!isCurrentAuthGeneration(generation)) return false;
     // Deliberately does NOT touch isLoading: that flag drives AuthGuard's
@@ -63,6 +64,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       authenticateComposerCustody(nextScope);
       if (!isCurrentAuthGeneration(generation)) return false;
       usePluginCatalogStore.getState().clear();
+      usePreferencesStore.getState().bindPrincipal(user.user_id, config.provider);
       set({ user, isLoading: false });
       const { useSessionStore } = await import("./sessionStore");
       if (!isCurrentAuthGeneration(generation)) return false;
@@ -86,6 +88,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   async loginWithToken(token: string) {
     const generation = advanceAuthGeneration();
+    usePreferencesStore.getState().reset();
     if (pendingLogoutCleanup) await pendingLogoutCleanup;
     if (!isCurrentAuthGeneration(generation)) return;
     usePluginCatalogStore.getState().clear();
@@ -105,6 +108,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       }
       authenticateComposerCustody(nextScope);
       if (!isCurrentAuthGeneration(generation)) return;
+      usePreferencesStore.getState().bindPrincipal(user.user_id, config.provider);
       set({ user, isLoading: false });
       const { useSessionStore } = await import("./sessionStore");
       if (!isCurrentAuthGeneration(generation)) return;
@@ -125,6 +129,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   async logout() {
     advanceAuthGeneration();
+    usePreferencesStore.getState().reset();
     detachComposerObservers();
     purgeComposerCustody();
     // New logins await this barrier before publishing their credentials. The
@@ -162,6 +167,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   async loadFromStorage() {
     const generation = advanceAuthGeneration();
+    usePreferencesStore.getState().reset();
     if (pendingLogoutCleanup) await pendingLogoutCleanup;
     if (!isCurrentAuthGeneration(generation)) return;
     const token = localStorage.getItem(TOKEN_KEY);
@@ -187,6 +193,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       }
       authenticateComposerCustody(nextScope);
       if (!isCurrentAuthGeneration(generation)) return;
+      usePreferencesStore.getState().bindPrincipal(user.user_id, config.provider);
       set({ user, isLoading: false });
       const { useSessionStore } = await import("./sessionStore");
       if (!isCurrentAuthGeneration(generation)) return;

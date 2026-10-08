@@ -10,6 +10,7 @@ from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkSource, RequiredWorkSubphase
 from elspeth.web.sessions.routes import _helpers
 from tests.helpers.composer_operations import current_head_state_id_sync, message_body
@@ -23,7 +24,7 @@ def test_provider_failure_audit_owner_settles_under_live_lease(tmp_path, monkeyp
     provider_error.llm_calls = (
         _llm_call(status=ComposerLLMCallStatus.API_ERROR, error_class="BadGatewayError", error_message="BadGatewayError"),
     )
-    app.state.composer_service = SimpleNamespace(compose=AsyncMock(side_effect=provider_error))
+    app.state.composer_service = SimpleNamespace(compose=AsyncMock(spec=ComposerServiceImpl.compose, side_effect=provider_error))
     original_reserve = RequiredWorkCoordinator.reserve
     terminal_owners = []
     audit_error = AuditIntegrityError("controlled audit preparation failure")

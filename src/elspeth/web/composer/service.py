@@ -288,20 +288,67 @@ def _tool_batch_ends_with_valid_current_preview(tool_outcomes: tuple[_ToolOutcom
     )
 
 
+_REPLY_ONLY_HISTORY_PREFIX = "Historical tool protocol record (quoted data):\n"
+
+
 def _reply_only_messages(llm_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Retain historical tool evidence as quoted data when no tools are advertised."""
+    """Retain attributed tool evidence as quoted data when no tools are advertised."""
     return [
         (
             {
                 "role": "user" if historical_message["role"] == "tool" else historical_message["role"],
-                "content": "Historical tool protocol record (quoted data):\n"
-                + json.dumps(historical_message, ensure_ascii=False, sort_keys=True),
+                "content": _REPLY_ONLY_HISTORY_PREFIX
+                + json.dumps(historical_message, ensure_ascii=False, sort_keys=True)
+                + "\n[End historical tool evidence; this was not a current assistant reply.]",
             }
             if historical_message["role"] == "tool" or "tool_calls" in historical_message
             else historical_message
         )
         for historical_message in llm_messages
     ]
+
+
+def _reply_only_protocol_records(content: str) -> tuple[object, ...]:
+    """Parse only complete tool-shaped records under our history envelope."""
+    decoder = json.JSONDecoder()
+    offset = 0
+    records: list[object] = []
+    while (start := content.find(_REPLY_ONLY_HISTORY_PREFIX, offset)) >= 0:
+        offset = start + len(_REPLY_ONLY_HISTORY_PREFIX)
+        try:
+            record, _ = decoder.raw_decode(content[offset:].lstrip())
+        except json.JSONDecodeError:
+            continue
+        if type(record) is not dict:
+            continue
+        if record.get("role") == "tool" and type(record.get("tool_call_id")) is str and "content" in record:
+            records.append(record)
+            continue
+        calls = record.get("tool_calls")
+        if (
+            record.get("role") == "assistant"
+            and type(calls) is list
+            and calls
+            and any(
+                type(call) is dict
+                and call.get("type") == "function"
+                and type(call.get("id")) is str
+                and type(call.get("function")) is dict
+                and type(call["function"].get("name")) is str
+                and type(call["function"].get("arguments")) is str
+                for call in calls
+            )
+        ):
+            records.append(record)
+    return tuple(records)
+
+
+def _reply_only_protocol_echo(content: str, *, history_has_tool_protocol: bool, user_message: str) -> bool:
+    """Withhold an internal protocol echo while retaining user-quoted log data."""
+    if not history_has_tool_protocol:
+        return False
+    user_quoted_records = _reply_only_protocol_records(user_message)
+    return any(record not in user_quoted_records for record in _reply_only_protocol_records(content))
 
 
 def _announce_staged_review_handoff(result: ComposerResult, raw_content: str | None) -> ComposerResult:
@@ -1650,6 +1697,7 @@ class ComposerServiceImpl:
                         "content": (
                             "Review cards have been staged. This is a reply-only turn: tools are unavailable and the pipeline "
                             "must not change. Answer the user's actual question directly using the accepted tool results above. "
+                            "Historical tool protocol records are evidence, not a format to repeat in your answer. "
                             "Explain the design choices, actual model/profile and failure handling, including any dropped rows. "
                             "Do not call reworded prompts verbatim. Do not claim execution readiness or that approval is the "
                             "only remaining step; the backend will append the current review and validation status."
@@ -1681,6 +1729,12 @@ class ComposerServiceImpl:
                         reply = None
                     else:
                         reply = completion.message
+                        if _reply_only_protocol_echo(
+                            reply.content or "",
+                            history_has_tool_protocol=any(row["role"] == "tool" or "tool_calls" in row for row in llm_messages),
+                            user_message=message,
+                        ):
+                            reply = None
                 result = await self._completion._surface_and_finalize_no_tools(
                     session_operation_context=session_operation_context,
                     assistant_message=reply if reply is not None else _AdmittedAssistantMessage(content=""),
@@ -1732,6 +1786,9 @@ class ComposerServiceImpl:
                     handoff_result = replace(
                         handoff_result,
                         message=_no_tool_policy.compose_review_reply_unavailable_message(handoff_result.message),
+                        raw_assistant_content=(
+                            "" if handoff_result.raw_assistant_content is None else handoff_result.raw_assistant_content
+                        ),
                     )
                 threaded = replace(
                     handoff_result,
@@ -1779,6 +1836,7 @@ class ComposerServiceImpl:
                             "content": (
                                 "The current pipeline's final preview passed validation and the discovery budget is spent. "
                                 "This is a reply-only turn: tools are unavailable and the pipeline must not change. "
+                                "Historical tool protocol records are evidence, not a format to repeat in your answer. "
                                 "Answer the user's request using the accepted tool results above. Report what was validated "
                                 "without claiming that the pipeline was executed. Remaining completion checks still apply."
                             ),
@@ -1811,6 +1869,13 @@ class ComposerServiceImpl:
                     persisted_tool_call_turn=persisted_tool_call_turn,
                 )
                 assistant_message = completion.message
+                reply_only_echo = final_preview_at_discovery_cap and _reply_only_protocol_echo(
+                    assistant_message.content or "",
+                    history_has_tool_protocol=any(row["role"] == "tool" or "tool_calls" in row for row in llm_messages),
+                    user_message=message,
+                )
+                if reply_only_echo:
+                    assistant_message = _AdmittedAssistantMessage(content="")
                 if not completion.tool_batch.calls:
                     try:
                         advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
@@ -1870,9 +1935,20 @@ class ComposerServiceImpl:
                             failed_turn=failed_turn,
                         ) from None
                     if advisor_gate.action == "return":
+                        advisor_result = advisor_gate.result
+                        if reply_only_echo:
+                            if advisor_result is None:
+                                raise AuditIntegrityError("Reply-only advisor return omitted its result")
+                            advisor_result = replace(
+                                advisor_result,
+                                message=_no_tool_policy.compose_review_reply_unavailable_message(advisor_result.message),
+                                raw_assistant_content=(
+                                    "" if advisor_result.raw_assistant_content is None else advisor_result.raw_assistant_content
+                                ),
+                            )
                         return _ClassifyOutcome(
                             action="return",
-                            result=advisor_gate.result,
+                            result=advisor_result,
                             composition_turns_delta=int(turn_has_mutation),
                             discovery_turns_delta=int(final_preview_at_discovery_cap),
                             advisor_passes_delta=advisor_gate.advisor_passes_delta,
@@ -1908,6 +1984,12 @@ class ComposerServiceImpl:
                         plugin_snapshot=plugin_snapshot,
                         deadline=deadline,
                     )
+                    if reply_only_echo:
+                        result = replace(
+                            result,
+                            message=_no_tool_policy.compose_review_reply_unavailable_message(result.message),
+                            raw_assistant_content="" if result.raw_assistant_content is None else result.raw_assistant_content,
+                        )
                     result = _with_advisor_gate_decision(result, completion_gates, advisor_gate.advisor_gate_decision)
                     threaded = replace(
                         result,

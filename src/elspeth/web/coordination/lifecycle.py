@@ -188,6 +188,25 @@ def _failure_after_cancellation(
     return escaping
 
 
+def _retain_adoption_cancellation_outcome(observations: list[asyncio.CancelledError] | None, failure: BaseException | None) -> None:
+    """Keep cancelled physical outcomes as objects even when selection reduces them to notes."""
+    if observations is None or failure is None:
+        return
+    pending = [failure]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        if isinstance(current, asyncio.CancelledError):
+            _retain_cancellation(observations, current)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+
+
 def _validate_lifecycle_timing(*, lease_seconds: int, renew_interval_seconds: float | None) -> float:
     if type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600:
         raise ValueError("lease_seconds must be an exact integer from 1 through 3600")
@@ -296,6 +315,7 @@ async def _raise_adopt_failure_after_release(
     failure: BaseException,
     *,
     phase: Literal["validation", "compare-and-swap"],
+    cancellation_observations: list[asyncio.CancelledError] | None = None,
 ) -> Never:
     """Release an exact context before surfacing adoption failure or cancellation."""
     failure_refs = [failure]
@@ -310,7 +330,12 @@ async def _raise_adopt_failure_after_release(
     try:
         shielded_release_error = await asyncio.shield(release_tasks[0])
     except asyncio.CancelledError as cancellation:
-        joined_release_error = await _join_shielded_task_after_cancellation(release_tasks[0])
+        if cancellation_observations is not None:
+            _retain_cancellation(cancellation_observations, cancellation)
+        joined_release_error = await _join_shielded_task_after_cancellation(
+            release_tasks[0], cancellation_observations=cancellation_observations
+        )
+        _retain_adoption_cancellation_outcome(cancellation_observations, joined_release_error)
         cancellation.add_note(f"Session-operation adoption {phase} failed with {failure_type} before cancellation.")
         escaping = _failure_after_cancellation(
             cancellation,
@@ -331,6 +356,7 @@ async def _raise_adopt_failure_after_release(
     else:
         primary = failure_refs.pop()
         release_tasks.clear()
+        _retain_adoption_cancellation_outcome(cancellation_observations, shielded_release_error)
         escaping = _preserve_failures(
             primary,
             (shielded_release_error,),
@@ -344,12 +370,16 @@ async def _raise_adopt_failure_after_release(
         raise escaping from escaping.__cause__
 
 
-async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T:
+async def _join_shielded_task_after_cancellation[T](
+    task: asyncio.Task[T], *, cancellation_observations: list[asyncio.CancelledError] | None = None
+) -> T:
     """Wait for an owned task even when the awaiting task is being cancelled."""
     while not task.done():
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            if cancellation_observations is not None:
+                _retain_cancellation(cancellation_observations, cancellation)
             continue
     return task.result()
 
@@ -594,6 +624,7 @@ class SessionOperationLease:
         lease_seconds: int,
         renew_interval_seconds: float | None = None,
         required_work: RequiredWorkCoordinator | None = None,
+        cancellation_observations: list[asyncio.CancelledError] | None = None,
     ) -> SessionOperationLease:
         """Adopt a context atomically minted by a composite authority method.
 
@@ -619,6 +650,7 @@ class SessionOperationLease:
                 context,
                 validation_error,
                 phase="validation",
+                cancellation_observations=cancellation_observations,
             )
             del validation_error
             await validation_cleanup
@@ -637,13 +669,19 @@ class SessionOperationLease:
         try:
             await asyncio.shield(compare_and_swap_tasks[0])
         except asyncio.CancelledError as cancellation:
+            if cancellation_observations is not None:
+                _retain_cancellation(cancellation_observations, cancellation)
             cleanup_tasks = [
                 asyncio.create_task(
                     _finish_cancelled_adopt(authority, compare_and_swap_tasks[0], context),
                     name="session-operation-cancelled-adopt-cleanup",
                 )
             ]
-            cancelled_compare_and_swap_error, cancelled_release_error = await _join_shielded_task_after_cancellation(cleanup_tasks[0])
+            cancelled_compare_and_swap_error, cancelled_release_error = await _join_shielded_task_after_cancellation(
+                cleanup_tasks[0], cancellation_observations=cancellation_observations
+            )
+            _retain_adoption_cancellation_outcome(cancellation_observations, cancelled_compare_and_swap_error)
+            _retain_adoption_cancellation_outcome(cancellation_observations, cancelled_release_error)
             escaping = _failure_after_cancellation(
                 cancellation,
                 (
@@ -667,6 +705,7 @@ class SessionOperationLease:
                 context,
                 compare_and_swap_error,
                 phase="compare-and-swap",
+                cancellation_observations=cancellation_observations,
             )
             del compare_and_swap_error
             await compare_and_swap_cleanup

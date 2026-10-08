@@ -1,6 +1,6 @@
 import { type JSX, useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui";
-import { usePreferencesStore } from "@/stores/preferencesStore";
+import { capturePreferenceOwner, requirePreferenceOwner, PreferencesRequestSuperseded, usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { departTutorialSession } from "./tutorialDeparture";
 import {
@@ -35,11 +35,15 @@ export function TutorialTurn7Graduation({
   const [error, setError] = useState<string | null>(null);
   const finishingRef = useRef(false);
   const skippedSessionRef = useRef<string | null>(null);
+  const activeRef = useRef(false);
+  const ownsMountRef = useRef(capturePreferenceOwner());
   const writing = usePreferencesStore((state) => state.writing);
 
   useEffect(() => {
+    activeRef.current = true;
     headingRef.current?.focus();
     window.dispatchEvent(new CustomEvent("tutorial_graduation_shown"));
+    return () => { activeRef.current = false; };
   }, []);
 
   const onFinish = useCallback(async () => {
@@ -47,13 +51,20 @@ export function TutorialTurn7Graduation({
     finishingRef.current = true;
     setPending(true);
     setError(null);
+    const owns = ownsMountRef.current;
+    const requireCurrent = () => {
+      requirePreferenceOwner(owns);
+      if (!activeRef.current) throw new PreferencesRequestSuperseded();
+    };
     try {
+      requireCurrent();
       // Preserve the built pipeline and finish its authoritative mode
       // transition before publishing the tutorial dismissal.
       if (sessionId !== null && !skipped) {
         await useSessionStore
           .getState()
           .renameSession(sessionId, HELLO_WORLD_SESSION_TITLE);
+        requireCurrent();
       }
       if (sessionId !== null && !skipped) {
         // Land the user ON the pipeline they just built so they can click Run
@@ -65,37 +76,45 @@ export function TutorialTurn7Graduation({
         // renders. selectSession loads its composition state, which the
         // composer auto-validates so the Run button enables.
         await useSessionStore.getState().loadSessions();
+        requireCurrent();
         await useSessionStore.getState().selectSession(sessionId);
+        requireCurrent();
         const landed = useSessionStore.getState();
         if (landed.activeSessionId !== sessionId) {
           throw new Error(
             landed.error ?? "The composer could not open your pipeline.",
           );
         }
-        await departTutorialSession(sessionId, "complete");
+        await departTutorialSession(sessionId, "complete", () => activeRef.current && owns());
       } else {
         // Skipped (no built pipeline to land on): drop into a fresh composer
         // session so the user still lands somewhere usable.
-        const completedAt = await usePreferencesStore.getState().markTutorialGraduated({
+        const completion = await usePreferencesStore.getState().markTutorialGraduated({
           via: "skip",
           publishLocally: false,
         });
+        requireCurrent();
+        completion.assertCurrent();
         if (skippedSessionRef.current === null) {
           const previousActiveSessionId = useSessionStore.getState().activeSessionId;
           await useSessionStore.getState().createSession();
+          requireCurrent();
+          completion.assertCurrent();
           const sessionState = useSessionStore.getState();
           if (sessionState.activeSessionId === null || sessionState.activeSessionId === previousActiveSessionId) {
             throw new Error(sessionState.error ?? "The composer session could not be created.");
           }
           skippedSessionRef.current = sessionState.activeSessionId;
         }
-        usePreferencesStore.getState().publishTutorialGraduation(completedAt);
+        requireCurrent();
+        completion.publish();
       }
     } catch (err) {
+      if (!activeRef.current || !owns() || err instanceof PreferencesRequestSuperseded) return;
       setError(formatError(err));
     } finally {
       finishingRef.current = false;
-      setPending(false);
+      if (activeRef.current && owns()) setPending(false);
     }
   }, [sessionId, skipped]);
 

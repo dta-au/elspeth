@@ -1472,6 +1472,41 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     });
   });
 
+  it("does not offer a tutorial or a false preferences save to an admin without the user role", async () => {
+    vi.mocked(api.fetchUserComposerPreferences).mockRejectedValueOnce({
+      status: 403,
+      error_type: "user_role_required",
+      detail: "A live user role is required",
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(usePreferencesStore.getState().unavailableForRole).toBe(true));
+    expect(usePreferencesStore.getState().loaded).toBe(false);
+    expect(screen.queryByTestId("tutorial-stub")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Couldn't load your preferences/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    expect(screen.queryByRole("button", { name: /composer preferences/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /switch to light theme/i })).toBeInTheDocument();
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
+  });
+
+  it("unmounts an already-open Composer preferences panel when the owned role refusal arrives", async () => {
+    let rejectFetch!: (reason: unknown) => void;
+    vi.mocked(api.fetchUserComposerPreferences).mockImplementationOnce(
+      () => new Promise<Awaited<ReturnType<typeof api.fetchUserComposerPreferences>>>((_, reject) => { rejectFetch = reject; }),
+    );
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    await userEvent.click(screen.getByRole("button", { name: /composer preferences/i }));
+    expect(screen.getByRole("dialog", { name: /composer preferences/i })).toBeInTheDocument();
+
+    rejectFetch({ status: 403, error_type: "user_role_required", detail: "User role required" });
+    await waitFor(() => expect(usePreferencesStore.getState().unavailableForRole).toBe(true));
+    expect(screen.queryByRole("dialog", { name: /composer preferences/i })).not.toBeInTheDocument();
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
+  });
+
   it("renders the tutorial instead of the composer layout before completion", async () => {
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     usePreferencesStore.setState({

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
   ComposerPreferencesForm,
@@ -106,7 +106,7 @@ describe("ComposerPreferencesForm", () => {
     });
     const resetTutorial = vi
       .spyOn(usePreferencesStore.getState(), "resetTutorial")
-      .mockResolvedValueOnce(undefined);
+      .mockResolvedValueOnce({ assertCurrent: () => undefined });
 
     render(<ComposerPreferencesForm />);
     await userEvent.click(screen.getByRole("button", { name: /reset tutorial/i }));
@@ -117,7 +117,7 @@ describe("ComposerPreferencesForm", () => {
   it("closes the preferences panel after a successful tutorial reset", async () => {
     const resetTutorial = vi
       .spyOn(usePreferencesStore.getState(), "resetTutorial")
-      .mockResolvedValueOnce(undefined);
+      .mockResolvedValueOnce({ assertCurrent: () => undefined });
     const onClose = vi.fn();
 
     render(<ComposerPreferencesPanel onClose={onClose} />);
@@ -308,5 +308,29 @@ describe("ComposerPreferencesPanel — modal chrome", () => {
     // form correctly.
     expect(screen.getByRole("group", { name: /theme/i })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: /detail level/i })).toBeInTheDocument();
+  });
+});
+
+
+describe("preference reset callback ownership", () => {
+  beforeEach(() => {
+    usePreferencesStore.getState().reset();
+    vi.resetAllMocks();
+    usePreferencesStore.setState({ loaded: true });
+  });
+
+  it.each(["account changes", "panel unmounts"] as const)("does not complete the UI reset when the %s during PATCH", async (change) => {
+    let resolve!: (payload: Awaited<ReturnType<typeof updateUserComposerPreferences>>) => void;
+    vi.mocked(updateUserComposerPreferences).mockReturnValueOnce(new Promise((yes) => { resolve = yes; }));
+    const completed = vi.fn();
+    const view = render(<ComposerPreferencesForm onResetTutorialComplete={completed} />);
+    await userEvent.click(screen.getByRole("button", { name: /reset tutorial/i }));
+    expect(updateUserComposerPreferences).toHaveBeenCalledTimes(1);
+    if (change === "account changes") act(() => usePreferencesStore.getState().reset());
+    else view.unmount();
+    await act(async () => {
+      resolve({ freeform_intro_dismissed_at: null, tutorial_completed_at: null, tutorial_stage: null, tutorial_session_id: null, tutorial_run_id: null, tutorial_source_data_hash: null, show_advanced: false, updated_at: null });
+    });
+    await waitFor(() => expect(completed).not.toHaveBeenCalled());
   });
 });

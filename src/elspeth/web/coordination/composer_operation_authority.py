@@ -211,7 +211,7 @@ def _select_failure_on_connection(
     if restore_utc(row.deadline_at) <= now:
         body = {
             "error_type": "composer_operation_deadline_expired",
-            "detail": "The composer request waited too long to start. Please resubmit.",
+            "detail": "The composer request timed out. Reload to review the current session state before resubmitting.",
             "timeout_seconds": (restore_utc(row.deadline_at) - restore_utc(row.created_at)).total_seconds(),
         }
         body["request_id"] = row.request_id

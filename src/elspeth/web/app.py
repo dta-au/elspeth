@@ -2788,9 +2788,9 @@ def _create_app(
     # the non-slash variant, returning 404 because no `metrics` file exists
     # in dist/. Route handlers match before mounts in Starlette, so this
     # also wins precedence over the SPA catch-all regardless of order.
-    # Backed by the retained process-level Prometheus reader; all OTel
-    # counters/histograms registered via metrics.get_meter() feed into this
-    # endpoint automatically via the global REGISTRY.
+    # Scrape the registry retained by this application's telemetry owner.
+    # The production installation uses the process-global REGISTRY; isolated
+    # test installations retain their own registry and provider.
     @app.get("/metrics", include_in_schema=False)
     def _prometheus_metrics(request: Request) -> Response:
         configured_token = request.app.state.settings.operator_metrics_bearer_token
@@ -2813,7 +2813,7 @@ def _create_app(
                 headers={**_METRICS_NO_STORE_HEADERS, "WWW-Authenticate": 'Bearer realm="metrics"'},
             )
 
-        # ``generate_latest()`` walks the global REGISTRY; a corrupted
+        # ``generate_latest()`` walks the app's retained registry; a corrupted
         # collector would raise here and Starlette's default 500 handler
         # leaks the traceback into the response body. /metrics is a
         # scrape endpoint — return a safe 503 with no internal detail so
@@ -2826,7 +2826,7 @@ def _create_app(
         # identifies which collector broke without reading request-controlled
         # input.
         try:
-            body = generate_latest()
+            body = generate_latest(request.app.state.operator_telemetry.cleanup_owner.installation.registry)
         except Exception as scrape_exc:
             _handler_slog.error(
                 "prometheus_scrape_failed",

@@ -446,10 +446,10 @@ async def test_unresolved_card_blocks_run_resolving_permits(
             if not transferred:
                 await execute_lease.close()
         assert run_id is not None
+        execution_input = await sessions_service.get_run_execution_input(run_id)
     finally:
         await execution_fixture.shutdown_service(execution_service)
 
-    execution_input = await sessions_service.get_run_execution_input(run_id)
     assert execution_input is not None
     resolved = secret_resolver.resolve("alice", "RUN_BACKSTOP_PROVIDER_KEY")
     assert resolved is not None

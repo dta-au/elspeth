@@ -67,10 +67,12 @@ from tests.unit.web.sessions.test_routes import (
     _EMPTY_STATE,
     _cancelled_error_with_llm_call,
     _create_canonical_pipeline_route_proposal,
+    _create_running_pipeline_route_proposal,
     _llm_call,
     _llm_call_audit_rows,
     _make_app,
     _make_composer_mock,
+    _prepare_canonical_pipeline_route_proposal,
 )
 from tests.unit.web.sessions.test_unwind_persist_forensics import _tool_invocation
 
@@ -1077,17 +1079,22 @@ async def test_send_turn_auto_commit_settles_through_the_services_bundle_with_th
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """D6 + E14: the settlement is reached through the bundle and receives what is left of the job budget."""
-    app, service, _pipeline, session_id, row, _endpoint = await _create_canonical_pipeline_route_proposal(
+    app, service, _pipeline, session_id, creation, _endpoint = await _prepare_canonical_pipeline_route_proposal(
         tmp_path, monkeypatch, tool_call_id="turn-auto-pipeline"
     )
-    assert row.pipeline_metadata is not None
     composer = _make_composer_mock()
-    composer.compose.return_value = ComposerResult(
-        message="Pipeline prepared.",
-        state=_EMPTY_STATE,
-        repair_turns_used=2,
-        pipeline_commit_intent=PipelineCommitIntent(proposal_id=row.id, draft_hash=row.pipeline_metadata.draft_hash),
-    )
+
+    async def compose_with_owned_proposal(*args: Any, **kwargs: Any) -> ComposerResult:
+        row = await _create_running_pipeline_route_proposal(service, creation, kwargs)
+        assert row.pipeline_metadata is not None
+        return ComposerResult(
+            message="Pipeline prepared.",
+            state=_EMPTY_STATE,
+            repair_turns_used=2,
+            pipeline_commit_intent=PipelineCommitIntent(proposal_id=row.id, draft_hash=row.pipeline_metadata.draft_hash),
+        )
+
+    composer.compose.side_effect = compose_with_owned_proposal
     app.state.composer_service = composer
     seen_budgets: list[float] = []
     real_settle = composer_turn.settle_auto_commit_intent

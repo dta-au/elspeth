@@ -15,10 +15,14 @@ from elspeth.web.sessions.models import run_events_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.helpers.session_fences import seed_live_operation_context
 from tests.unit.web.blobs.test_service import _seed_active_run
 from tests.unit.web.blobs.test_service_fencing import _insert_session
 from tests.unit.web.execution.test_run_accounting_schemas import _fanout_accounting
+
+execution_fixture = execution_custody.execution_fixture
 
 
 @pytest.mark.asyncio
@@ -68,64 +72,157 @@ async def test_terminal_recovery_preserves_completed_and_emits_once(initial_stat
 @pytest.mark.parametrize(
     "live_leader,dispatch_accepts,rebind_refused", [(True, False, False), (False, True, False), (False, False, False), (False, False, True)]
 )
-async def test_live_seat_defers_and_dispatch_transfers_only_on_acceptance(monkeypatch, live_leader, dispatch_accepts, rebind_refused):
-    from datetime import UTC, datetime
-    from unittest.mock import AsyncMock, Mock, create_autospec
+async def test_live_seat_defers_and_dispatch_transfers_only_on_acceptance(
+    monkeypatch, tmp_path, execution_fixture: ExecutionTestCustody, live_leader, dispatch_accepts, rebind_refused
+):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock, patch
     from uuid import uuid4
 
     from elspeth.web.blobs.service import BlobServiceImpl
     from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
     from elspeth.web.coordination.lifecycle import SessionOperationLease
+    from elspeth.web.coordination.repository import _composer_liveness_proof, _RepositoryRunMutations
     from elspeth.web.execution import recovery as recovery_module
     from elspeth.web.execution.recovery import RunRecoveryCoordinator
-    from elspeth.web.execution.service import ExecutionServiceImpl
-    from elspeth.web.sessions.protocol import RunRecord, SessionOperationAuthority
+    from elspeth.web.sessions.protocol import SessionOperationAuthority
+    from tests.unit.web.execution.test_session_operation_lease import _execution_service
 
-    run = RunRecord(
-        id=uuid4(),
-        session_id=uuid4(),
-        state_id=uuid4(),
-        status="running",
-        started_at=datetime.now(UTC),
-        finished_at=None,
-        rows_processed=0,
-        rows_succeeded=0,
-        rows_failed=0,
-        rows_routed_success=0,
-        rows_routed_failure=0,
-        rows_quarantined=0,
-        error=None,
-        landscape_run_id=None,
-        pipeline_yaml=None,
+    session_id = uuid4()
+    observed = execution_fixture.observe_authority(session_id)
+    engine = observed.authority._engine
+    compose = observed.authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="recovery-seed",
+        lease_seconds=30,
     )
+    try:
+        run_id = UUID(
+            await _seed_active_run(
+                engine,
+                session_id,
+                session_operation_context=compose,
+                status="running",
+                source={"plugin": "csv", "on_success": "rows", "options": {"path": "input.csv"}, "on_validation_failure": "discard"},
+            )
+        )
+    finally:
+        observed.authority.release(compose)
+    actual_sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    run = await actual_sessions.get_run(run_id)
     sessions = Mock(spec=SessionServiceImpl)
     sessions.list_recoverable_run_records = AsyncMock(spec=SessionServiceImpl.list_recoverable_run_records, return_value=(run,))
     sessions.get_run = AsyncMock(spec=SessionServiceImpl.get_run, return_value=run)
-    sessions.session_operation_authority = Mock(spec=SessionOperationAuthority)
-    if rebind_refused:
-        sessions.session_operation_authority.mutate.side_effect = SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+    sessions.session_operation_authority = observed.authority
     sessions.session_operation_owner_instance_id = "recoverer"
     sessions.session_operation_lease_seconds = 30
-    execution = create_autospec(ExecutionServiceImpl, instance=True)
-    execution.get_live_run_ids.return_value = frozenset()
-    execution.recover_run.return_value = dispatch_accepts
-    lease = Mock(spec=SessionOperationLease)
-    lease.close = AsyncMock(spec=SessionOperationLease.close)
-    monkeypatch.setattr(SessionOperationLease, "acquire", AsyncMock(spec=SessionOperationLease.acquire, return_value=lease))
+    execution, _, _ = _execution_service(asyncio.get_running_loop(), execution_fixture)
+    recover_run = AsyncMock()
+    monkeypatch.setattr(execution, "recover_run", recover_run)
+    original_acquire = SessionOperationLease.acquire
+    acquired = []
+
+    async def observe_acquire(cls, authority: SessionOperationAuthority, **kwargs):
+        lease = await original_acquire(authority, **kwargs)
+        execution_fixture.track_route_lease(lease)
+        acquired.append(lease)
+        return lease
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(observe_acquire))
     monkeypatch.setattr(
         recovery_module,
         "observe_run",
         Mock(spec=recovery_module.observe_run, return_value=RecoveryObservation(RunStatus.RUNNING, live_leader, None)),
     )
-    coordinator = RunRecoveryCoordinator(sessions, execution, Mock(spec=BlobServiceImpl), landscape_url="sqlite://", create_tables=False)
-    await coordinator.recover()
+    coordinator = RunRecoveryCoordinator(
+        sessions, execution, BlobServiceImpl(engine, tmp_path), landscape_url="sqlite://", create_tables=False
+    )
+    from contextlib import nullcontext
+
+    from elspeth.web.sessions.models import runs_table, session_operation_fences_table
+
+    with engine.connect() as connection:
+        original_binding = connection.execute(
+            select(runs_table.c.owner_instance_id, runs_table.c.owner_epoch, runs_table.c.owner_lease_expires_at).where(
+                runs_table.c.id == str(run_id)
+            )
+        ).one()
+    assert tuple(original_binding) == (None, None, None)
+    dispatch_bindings = []
+
+    async def observe_dispatch(dispatched_run, dispatched_lease, *, resume_existing):
+        assert dispatched_run is run and dispatched_lease is acquired[0]
+        assert resume_existing is True
+        with engine.connect() as connection:
+            active_run_binding = connection.execute(
+                select(runs_table.c.owner_instance_id, runs_table.c.owner_epoch, runs_table.c.owner_lease_expires_at).where(
+                    runs_table.c.id == str(run_id)
+                )
+            ).one()
+            active_fence = connection.execute(
+                select(
+                    session_operation_fences_table.c.operation_id,
+                    session_operation_fences_table.c.lease_token,
+                    session_operation_fences_table.c.owner_instance_id,
+                    session_operation_fences_table.c.operation_epoch,
+                    session_operation_fences_table.c.lease_expires_at,
+                    session_operation_fences_table.c.released_at,
+                ).where(session_operation_fences_table.c.session_id == str(session_id))
+            ).one()
+        assert active_fence.released_at is None
+        assert active_fence.operation_id == dispatched_lease.context.fence.operation_id
+        assert active_fence.lease_token == dispatched_lease.context.fence.lease_token
+        assert tuple(active_run_binding) == (
+            active_fence.owner_instance_id,
+            active_fence.operation_epoch,
+            active_fence.lease_expires_at,
+        )
+        assert active_run_binding.owner_instance_id == "recoverer"
+        assert active_run_binding.owner_epoch == dispatched_lease.context.fence.operation_epoch
+        dispatch_bindings.append(tuple(active_run_binding))
+        return dispatch_accepts
+
+    recover_run.side_effect = observe_dispatch
+    rebind_fault = SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+    rebind_control = (
+        patch.object(_RepositoryRunMutations, "rebind_run_ownership", side_effect=rebind_fault) if rebind_refused else nullcontext(None)
+    )
+    with rebind_control as rebind, patch.object(observed.authority, "mutate", wraps=observed.authority.mutate) as mutate:
+        await coordinator.recover()
+        assert len(mutate.call_args_list) == (1 if live_leader else 2)
+        guard_context, guard_callback = mutate.call_args_list[0].args
+        assert guard_context.operation_kind is SessionOperationKind.EXECUTE
+        assert guard_callback is _composer_liveness_proof
+        if rebind_refused:
+            assert rebind is not None
+            rebind.assert_called_once_with(run_id=run.id)
+        if live_leader or rebind_refused:
+            assert dispatch_bindings == []
+            with engine.connect() as connection:
+                current_binding = connection.execute(
+                    select(runs_table.c.owner_instance_id, runs_table.c.owner_epoch, runs_table.c.owner_lease_expires_at).where(
+                        runs_table.c.id == str(run_id)
+                    )
+                ).one()
+            assert current_binding == original_binding
+    assert len(acquired) == 1
+    lease = acquired[0]
     if live_leader or rebind_refused:
-        execution.recover_run.assert_not_called()
+        recover_run.assert_not_awaited()
     else:
-        execution.recover_run.assert_awaited_once_with(run, lease, resume_existing=True)
-    assert lease.close.await_count == (0 if not live_leader and dispatch_accepts else 1)
-    if live_leader:
-        sessions.session_operation_authority.mutate.assert_not_called()
+        assert len(dispatch_bindings) == 1
+        with engine.connect() as connection:
+            rebound = connection.execute(
+                select(runs_table.c.owner_instance_id, runs_table.c.owner_epoch, runs_table.c.owner_lease_expires_at).where(
+                    runs_table.c.id == str(run_id)
+                )
+            ).one()
+        assert tuple(rebound) == dispatch_bindings[0]
+        assert rebound.owner_instance_id == "recoverer"
+        assert rebound.owner_epoch == lease.context.fence.operation_epoch
+        recover_run.assert_awaited_once_with(run, lease, resume_existing=True)
+    assert lease.closed is (live_leader or rebind_refused or not dispatch_accepts)
 
 
 @pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.INTERRUPTED])
@@ -213,15 +310,18 @@ def test_stale_reconciliation_leader_refuses_before_projection(tmp_path, monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("archive_after_discovery", [False, True])
-async def test_archived_terminal_session_does_not_block_other_recovery(tmp_path, monkeypatch, archive_after_discovery):
+async def test_archived_terminal_session_does_not_block_other_recovery(
+    tmp_path, monkeypatch, execution_fixture: ExecutionTestCustody, archive_after_discovery
+):
     """Archive before discovery or in its acquisition race; another run progresses."""
-    from unittest.mock import create_autospec
+    import asyncio
+    from unittest.mock import AsyncMock
 
     from elspeth.core.landscape.database import LandscapeDB
     from elspeth.web.blobs.service import BlobServiceImpl
     from elspeth.web.coordination.contracts import RecoveryRequiredReason, RunSagaState
     from elspeth.web.execution.recovery import RunRecoveryCoordinator
-    from elspeth.web.execution.service import ExecutionServiceImpl
+    from tests.unit.web.execution.test_session_operation_lease import _execution_service
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
@@ -264,8 +364,9 @@ async def test_archived_terminal_session_does_not_block_other_recovery(tmp_path,
     landscape_url = f"sqlite:///{tmp_path / 'landscape.db'}"
     with LandscapeDB.from_url(landscape_url):
         pass
-    execution = create_autospec(ExecutionServiceImpl, instance=True)
-    execution.get_live_run_ids.return_value = frozenset()
+    execution, _, _ = _execution_service(asyncio.get_running_loop(), execution_fixture)
+    recover_run = AsyncMock(return_value=False)
+    monkeypatch.setattr(execution, "recover_run", recover_run)
     coordinator = RunRecoveryCoordinator(
         sessions, execution, BlobServiceImpl(engine, tmp_path), landscape_url=landscape_url, create_tables=False
     )
@@ -275,20 +376,23 @@ async def test_archived_terminal_session_does_not_block_other_recovery(tmp_path,
         assert healthy.saga_state is RunSagaState.RECOVERY_REQUIRED
         assert healthy.recovery_required_reason is RecoveryRequiredReason.MISSING_BASELINE
         assert (await sessions.get_run(archived_run.id)).status == "completed"
-        execution.recover_run.assert_not_called()
+        recover_run.assert_not_awaited()
     finally:
         engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_recovery_acquisition_propagates_missing_fence_integrity_failure(tmp_path, monkeypatch):
-    from unittest.mock import create_autospec
+async def test_recovery_acquisition_propagates_missing_fence_integrity_failure(
+    tmp_path, monkeypatch, execution_fixture: ExecutionTestCustody
+):
+    import asyncio
+    from unittest.mock import AsyncMock
 
     from elspeth.web.blobs.service import BlobServiceImpl
     from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
     from elspeth.web.execution.recovery import RunRecoveryCoordinator
-    from elspeth.web.execution.service import ExecutionServiceImpl
     from elspeth.web.sessions.models import session_operation_fences_table
+    from tests.unit.web.execution.test_session_operation_lease import _execution_service
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
@@ -313,8 +417,9 @@ async def test_recovery_acquisition_propagates_missing_fence_integrity_failure(t
         return candidates
 
     monkeypatch.setattr(sessions, "list_recoverable_run_records", discover_then_corrupt)
-    execution = create_autospec(ExecutionServiceImpl, instance=True)
-    execution.get_live_run_ids.return_value = frozenset()
+    execution, _, _ = _execution_service(asyncio.get_running_loop(), execution_fixture)
+    recover_run = AsyncMock(return_value=False)
+    monkeypatch.setattr(execution, "recover_run", recover_run)
     coordinator = RunRecoveryCoordinator(
         sessions, execution, BlobServiceImpl(engine, tmp_path), landscape_url="sqlite://", create_tables=False
     )
@@ -322,6 +427,6 @@ async def test_recovery_acquisition_propagates_missing_fence_integrity_failure(t
         with pytest.raises(SessionOperationFenceLost) as caught:
             await coordinator.recover()
         assert caught.value.reason is FenceLossReason.MISSING
-        execution.recover_run.assert_not_called()
+        recover_run.assert_not_awaited()
     finally:
         engine.dispose()

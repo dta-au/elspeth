@@ -797,6 +797,17 @@ async def test_stop_between_fresh_read_and_retry_lock_refuses_success(operation_
     assert terminal.failure_code == (
         "http_error" if original_integrity else "request_cancelled" if changed_state == "stop" else "deadline_expired"
     )
+    if changed_state == "deadline" and not original_integrity:
+        assert terminal.result_json is not None
+        error = ComposerOperationError.model_validate_json(terminal.result_json, strict=True)
+        assert error.http_status == 504 and error.failure_code == "deadline_expired"
+        assert error.error_type == "composer_operation_deadline_expired"
+        assert error.body == {
+            "error_type": "composer_operation_deadline_expired",
+            "detail": "The composer request timed out. Reload to review the current session state before resubmitting.",
+            "timeout_seconds": 3.0,
+            "request_id": "correlation",
+        }
     with engine.connect() as conn:
         assert list(conn.execute(select(chat_messages_table.c.role).where(chat_messages_table.c.session_id == str(sid))).scalars()) == [
             "user"
@@ -930,6 +941,17 @@ def test_queued_settlement_rechecks_priority_under_owned_claim_lock(operation_st
     assert terminal.failure_code == (
         "http_error" if original_integrity else "request_cancelled" if changed_state == "stop" else "deadline_expired"
     )
+    if changed_state == "deadline" and not original_integrity:
+        assert terminal.result_json is not None
+        error = ComposerOperationError.model_validate_json(terminal.result_json, strict=True)
+        assert error.http_status == 504 and error.failure_code == "deadline_expired"
+        assert error.error_type == "composer_operation_deadline_expired"
+        assert error.body == {
+            "error_type": "composer_operation_deadline_expired",
+            "detail": "The composer request timed out. Reload to review the current session state before resubmitting.",
+            "timeout_seconds": 3.0,
+            "request_id": "correlation",
+        }
     assert terminal.status == "failed" and terminal.settled_by == "settle_unstarted" and terminal.user_message_id is None
     assert authority.settle_unstarted(claim, session_id=sid, operation_id=record.operation_id, failure=failed()) == terminal
 

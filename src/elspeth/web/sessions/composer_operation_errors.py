@@ -46,7 +46,7 @@ def deadline_expired_error(*, request_id: str | None, timeout_seconds: float) ->
         error_type="composer_operation_deadline_expired",
         body={
             "error_type": "composer_operation_deadline_expired",
-            "detail": "The composer request waited too long to start. Please resubmit.",
+            "detail": "The composer request timed out. Reload to review the current session state before resubmitting.",
             "timeout_seconds": timeout_seconds,
             "request_id": request_id,
         },

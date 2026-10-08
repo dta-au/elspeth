@@ -256,6 +256,10 @@ async def _serve(
                             observation = observations.pop(argument)
                             await asyncio.wait_for(observation.task, timeout=10)
                             assert any(frame["event"] == "terminal" for frame in observation.frames), observation.frames
+                            deadline = asyncio.get_running_loop().time() + 5
+                            while app.state.composer_stream_permits.occupied != 0:
+                                assert asyncio.get_running_loop().time() < deadline, "unfinished stream I/O retained capacity"
+                                await asyncio.sleep(0.01)
                             assert app.state.composer_stream_permits.occupied == 0
                             pipe.send({"terminal_observed": argument, "permits": 0, "sdk_calls": sdk_calls})
                         else:

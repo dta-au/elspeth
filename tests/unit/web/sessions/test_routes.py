@@ -1507,8 +1507,11 @@ async def test_canonical_reject_joins_worker_before_lease_close_and_exact_retry(
         tool_call_id="canonical-reject-custody",
     )
     endpoint = accept_endpoint.removesuffix("/accept") + "/reject"
-    original_reject = type(service).reject_pipeline_composition_proposal
-    original_run_sync = service._run_sync
+    from elspeth.web.required_work import RequiredWorkSource
+    from elspeth.web.sessions import service as service_module
+
+    original_reject = service.reject_pipeline_composition_proposal_finish_once
+    original_sql = service_module.run_required_sql_finish_once
     original_close = SessionOperationLease.close
     worker_at_gate = asyncio.Event()
     release_worker = asyncio.Event()
@@ -1517,21 +1520,21 @@ async def test_canonical_reject_joins_worker_before_lease_close_and_exact_retry(
     gate_worker = False
     order: list[str] = []
 
-    async def gated_run_sync(func: Any, *args: Any, **kwargs: Any) -> Any:
-        if gate_worker and not cancel_after_commit:
+    async def gated_required_sql(ticket: Any, func: Any, *args: Any, **kwargs: Any) -> Any:
+        if gate_worker and not cancel_after_commit and ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL:
 
             def paused_transaction() -> Any:
                 test_loop.call_soon_threadsafe(worker_at_gate.set)
                 assert release_worker_thread.wait(10), "proposal worker was never released"
                 return func(*args, **kwargs)
 
-            return await original_run_sync(paused_transaction)
-        return await original_run_sync(func, *args, **kwargs)
+            return await original_sql(ticket, paused_transaction)
+        return await original_sql(ticket, func, *args, **kwargs)
 
-    async def gated_reject(self: object, **kwargs: Any) -> CompositionProposalRecord:
+    async def gated_reject(**kwargs: Any) -> Any:
         nonlocal gate_worker
         gate_worker = True
-        result = await original_reject(self, **kwargs)
+        result = await original_reject(**kwargs)
         gate_worker = False
         order.append("committed")
         if cancel_after_commit:
@@ -1543,8 +1546,8 @@ async def test_canonical_reject_joins_worker_before_lease_close_and_exact_retry(
         order.append("lease_close")
         await original_close(lease)
 
-    monkeypatch.setattr(type(service), "reject_pipeline_composition_proposal", gated_reject)
-    monkeypatch.setattr(service, "_run_sync", gated_run_sync)
+    monkeypatch.setattr(service, "reject_pipeline_composition_proposal_finish_once", gated_reject)
+    monkeypatch.setattr(service_module, "run_required_sql_finish_once", gated_required_sql)
     monkeypatch.setattr(SessionOperationLease, "close", observed_close)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         request_task = asyncio.create_task(client.post(endpoint, json={}))
@@ -1561,7 +1564,7 @@ async def test_canonical_reject_joins_worker_before_lease_close_and_exact_retry(
             await asyncio.wait_for(request_task, timeout=5)
         assert not lease_closed_before_worker
         assert order == ["committed", "lease_close"]
-        monkeypatch.setattr(type(service), "reject_pipeline_composition_proposal", original_reject)
+        monkeypatch.setattr(service, "reject_pipeline_composition_proposal_finish_once", original_reject)
         retry = await client.post(endpoint, json={})
 
     assert retry.status_code == 200

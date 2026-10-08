@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1061,7 +1062,7 @@ def test_invented_source_review_rehydrates_only_for_the_same_content_identity() 
 
 
 def test_named_invented_source_review_rebinds_only_to_the_same_named_content() -> None:
-    content_hash = "a" * 64
+    content_hash = sha256(b"generated rows").hexdigest()
     authoring = {
         "modality": "llm_generated",
         "content_hash": content_hash,
@@ -1086,7 +1087,12 @@ def test_named_invented_source_review_rebinds_only_to_the_same_named_content() -
     previous_source = SourceSpec(
         plugin="csv",
         on_success="orders_rows",
-        options={SOURCE_AUTHORING_KEY: authoring, INTERPRETATION_REQUIREMENTS_KEY: [resolved]},
+        options={
+            "blob_ref": "2e9e41eb-e34d-4918-b334-3c1e9ee0f8ff",
+            "path": "/data/blobs/generated.csv",
+            SOURCE_AUTHORING_KEY: authoring,
+            INTERPRETATION_REQUIREMENTS_KEY: [resolved],
+        },
         on_validation_failure="discard",
     )
     previous = CompositionState(
@@ -1103,6 +1109,8 @@ def test_named_invented_source_review_rebinds_only_to_the_same_named_content() -
             "orders": replace(
                 previous_source,
                 options={
+                    "blob_ref": "2e9e41eb-e34d-4918-b334-3c1e9ee0f8ff",
+                    "path": "/data/blobs/generated.csv",
                     SOURCE_AUTHORING_KEY: {**authoring, "review_event_id": None, "resolved_kind": None},
                     INTERPRETATION_REQUIREMENTS_KEY: [shell],
                 },
@@ -1123,8 +1131,9 @@ def test_named_invented_source_review_rebinds_only_to_the_same_named_content() -
                     **proposed.sources["orders"].options,
                     SOURCE_AUTHORING_KEY: {
                         **proposed.sources["orders"].options[SOURCE_AUTHORING_KEY],
-                        "content_hash": "b" * 64,
+                        "content_hash": sha256(b"changed rows").hexdigest(),
                     },
+                    INTERPRETATION_REQUIREMENTS_KEY: [{**shell, "draft": "changed rows"}],
                 },
             )
         },

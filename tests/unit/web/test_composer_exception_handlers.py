@@ -26,7 +26,9 @@ from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.middleware.request_id import MAX_REQUEST_ID_LENGTH
 from elspeth.web.preferences.service import CorruptPreferencesError
+from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
+from elspeth.web.sessions.manual_proposal_failure import ComposerManualProposalFailure
 from elspeth.web.sessions.protocol import (
     AuditAccessLogWriteError,
     RunAlreadyActiveError,
@@ -597,6 +599,21 @@ async def test_run_already_active_error_handler_returns_correlated_409(tmp_path:
 # BECAUSE their bodies must equal the ordinary ownership refusal exactly.
 _NONLEAKING_HANDLERS: tuple[type[Exception], ...] = (SessionOperationFenceLost, SessionOperationConflictError)
 
+# A completed manual proposal carries an issued, joined invocation, so a bare
+# exception cannot serve as an envelope test case. The real route-bound
+# positive case is test_actual_app_manual_sql503_keeps_originals_correlation_and_redaction
+# in test_manual_proposal_failure_presentation.py; the refusal is pinned below.
+_ISSUED_CARRIER_HANDLERS: tuple[type[Exception], ...] = (ComposerManualProposalFailure,)
+
+
+@pytest.mark.asyncio
+async def test_unissued_manual_failure_cannot_render_an_envelope(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with pytest.raises(AuditIntegrityError):
+        await app.exception_handlers[ComposerManualProposalFailure](
+            _audit_request("req-unissued-manual-1"), ComposerManualProposalFailure("unissued private detail")
+        )
+
 
 @pytest.mark.asyncio
 async def test_credential_material_refused_handler_returns_fixed_correlated_422(tmp_path: Path) -> None:
@@ -651,6 +668,7 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
         (StaleComposeStateError, StaleComposeStateError("x")),
         (AuditAccessLogWriteError, AuditAccessLogWriteError("x")),
         (RunAlreadyActiveError, RunAlreadyActiveError("x")),
+        (RequiredGenerationUnavailable, RequiredGenerationUnavailable("private generation detail")),
         (FingerprintKeyMissingError, FingerprintKeyMissingError("x")),
         (SecretDecryptionError, SecretDecryptionError("x")),
         (
@@ -669,7 +687,7 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
     # covered; if a new one is registered, this assertion names it.
     excluded = (StarletteHTTPException, RequestValidationError, WebSocketRequestValidationError, *_NONLEAKING_HANDLERS)
     structured = {key for key in app.exception_handlers if isinstance(key, type) and issubclass(key, Exception) and key not in excluded}
-    assert structured == {case[0] for case in cases}
+    assert structured == {case[0] for case in cases} | set(_ISSUED_CARRIER_HANDLERS)
 
     for exc_type, exc in cases:
         request = _audit_request("req-invariant-1")
@@ -679,6 +697,10 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
         response = await app.exception_handlers[exc_type](request, exc)
         body = json.loads(response.body)
         assert body["request_id"] == "req-invariant-1", exc_type.__name__
+        if exc_type is RequiredGenerationUnavailable:
+            assert response.status_code == 503
+            assert body["error_type"] == "database_unavailable"
+            assert "private generation detail" not in response.body.decode()
 
 
 @pytest.mark.asyncio

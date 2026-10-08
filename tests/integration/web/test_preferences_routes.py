@@ -22,6 +22,7 @@ from collections.abc import Iterator
 
 import pytest
 from fastapi import FastAPI, HTTPException
+from sqlalchemy import select, update
 from sqlalchemy.pool import StaticPool
 
 from elspeth.web.auth.middleware import get_current_user
@@ -31,6 +32,7 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.preferences.routes import create_preferences_router
 from elspeth.web.preferences.service import PreferencesService
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import identity_roles_table, user_preferences_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import wire_test_pipeline_user_authority
@@ -279,6 +281,29 @@ def test_patch_requires_auth(client_anonymous: TestClient) -> None:
         json={"show_advanced": True},
     )
     assert response.status_code == 401
+
+
+def test_admin_without_user_role_cannot_read_or_write_composer_preferences() -> None:
+    app = _make_app("admin")
+    with app.state.session_engine.begin() as conn:
+        conn.execute(
+            update(identity_roles_table)
+            .where(identity_roles_table.c.identity_id == "admin", identity_roles_table.c.role == "user")
+            .values(role="admin")
+        )
+        assert (
+            conn.execute(select(identity_roles_table.c.role).where(identity_roles_table.c.identity_id == "admin")).scalar_one() == "admin"
+        )
+
+    client = TestClient(app)
+    read = client.get("/api/composer-preferences")
+    write = client.patch("/api/composer-preferences", json={"show_advanced": True})
+    assert read.status_code == 403
+    assert write.status_code == 403
+    assert read.json()["detail"]["error_type"] == "user_role_required"
+    assert write.json()["detail"]["error_type"] == "user_role_required"
+    with app.state.session_engine.connect() as conn:
+        assert conn.execute(select(user_preferences_table.c.user_id).where(user_preferences_table.c.user_id == "admin")).first() is None
 
 
 def test_users_cannot_see_each_others_preferences(

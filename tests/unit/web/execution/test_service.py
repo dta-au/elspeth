@@ -1353,8 +1353,8 @@ class TestExecutionFlow:
             await _execute(service, session_id=session_id, user_id="alice", execution_fixture=execution_fixture)
 
         submitted_args = submit.call_args.args[0].args
-        assert submitted_args[4].plugin_snapshot is snapshot
-        assert submitted_args[4].executable_config is not submitted_args[4].audit_safe_config
+        assert submitted_args[3].plugin_snapshot is snapshot
+        assert submitted_args[3].executable_config is not submitted_args[3].audit_safe_config
 
     @pytest.mark.asyncio
     async def test_execute_lowers_profile_into_fanout_guard_and_frozen_executable_config(

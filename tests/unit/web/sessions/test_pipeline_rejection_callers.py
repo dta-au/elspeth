@@ -16,8 +16,11 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.application_policy import PluginPolicyContextFactory
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.availability import ComposerAvailability
+from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
+from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.pipeline_commit import PipelineCommitError
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.planning_application import PlanningApplication
@@ -344,9 +347,9 @@ async def test_actual_planner_creation_cancel_retains_nonzero_child_rejection_sc
     settings = _settings(tmp_path, operator_metrics_bearer_token=None)
     planner = PlanningApplication(
         sessions_service=service,
-        policy_context=MagicMock(),
-        chargeable_admission=MagicMock(),
-        preflight=MagicMock(),
+        policy_context=MagicMock(spec=PluginPolicyContextFactory),
+        chargeable_admission=MagicMock(spec=ComposerChargeableAdmission),
+        preflight=MagicMock(spec=ComposerPreflight),
         schema_disclosure=SchemaDisclosureTracker(),
         settings=settings,
         availability=ComposerAvailability(True, "test-model", "test"),

@@ -15,9 +15,9 @@ import pytest
 
 _TERMINAL_PREFIX = "ACTUAL_TERMINAL_SNAPSHOT "
 _REGISTRY_PATH = "src/elspeth/web/execution_lease_cleanup.py"
-_REGISTRY_SHA = "49cc0c0235dc9e0b30dbeef4ca9a7ef029cf01358514d6f28f19add72692e9f4"
+_REGISTRY_SHA = "531122f2c5d57c7a0a1a887411769e7428c2fe5fdf6957eb656b4e97b87d1e59"
 _CHILD_PATH = "tests/helpers/execute_failed_physical_join_child.py"
-_CHILD_SHA = "1270bbff0d9d0dc994cd9f2bd0b9486d3e0dea22854f17a9d161b668782cb4ec"
+_CHILD_SHA = "cca2195062f2a5cba23ae2e5c1c5cac0e1e5de44695af8dc45e472ef32fa83a4"
 _BOOLEAN_STATUS = (
     "private_join_returned",
     "second_sql_exited",

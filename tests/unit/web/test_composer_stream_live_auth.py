@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -25,7 +26,13 @@ async def test_stream_before_headers_has_distinct_opaque_session_and_operation_m
         assert missing_operation.status_code == 404
         assert missing_operation.json() == {"detail": "Operation not found"}
         assert missing_session.headers["cache-control"] == missing_operation.headers["cache-control"] == "no-store"
-    assert setup.app.state.composer_stream_permits.occupied == 0
+    # The preheader response cancels its disconnect task, then releases the
+    # permit only after that actual task reports completion on the event loop.
+    permits = setup.app.state.composer_stream_permits
+    async with asyncio.timeout(5):
+        while permits.occupied != 0:
+            await asyncio.sleep(0.01)
+    assert permits.occupied == 0
 
 
 @pytest.mark.asyncio

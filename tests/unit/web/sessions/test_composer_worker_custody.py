@@ -8,7 +8,6 @@ import sys
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import cast
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -18,19 +17,28 @@ from starlette.exceptions import HTTPException
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
-from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.async_workers import outstanding_admissions, run_sync_in_worker
-from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.provider_gateway import _litellm_acompletion
-from elspeth.web.composer.provider_quota import composer_quota_scope, quota_provider_calls
+from elspeth.web.composer.provider_gateway import ProviderGateway
+from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+    RequiredWorkSource,
+    RequiredWorkTicket,
+)
 from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.composer_async_worker import _owned
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
-from elspeth.web.sessions.protocol import SessionServiceProtocol
-from tests.unit.web.composer.test_provider_quota import CONTEXT, AttemptService, terminal
+from elspeth.web.sessions.composer_operations import COMPOSER_SHUTDOWN
+from tests.unit.web.composer.test_llm_sampling_config import _settings
 from tests.unit.web.sessions.test_composer_async_worker import _admit, _file_app, _worker
 from tests.unit.web.sessions.test_run_composer_turn import _running_job
+from tests.unit.web.sessions.test_token_usage_adapters import _ledger, _quota_service
 
 
 @pytest.mark.asyncio
@@ -96,33 +104,61 @@ async def test_authoritative_failure_outranks_explicit_stop(tmp_path, failure: B
 
 @pytest.mark.asyncio
 async def test_real_quota_settlement_fault_outranks_durable_stop(tmp_path) -> None:
+    from litellm import ModelResponse
+
     original = RuntimeError("accounting child failed")
+    quota_engine, quota_authority, quota_service = _quota_service(tmp_path)
+    quota_session = quota_authority.create_session_with_initial_fence(
+        user_id="alice", title="Quota priority", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
+    )
+    context = quota_authority.acquire(
+        session_id=quota_session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="owner", lease_seconds=60
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+    )
+    owner = ProviderInvocationOwner(service=quota_service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    actual_finish = quota_service.finish_provider_attempt
+    physical_attempts: list[str] = []
 
-    class FailedAccounting(AttemptService):
-        async def finish_provider_attempt(self, *, session_operation_context: SessionOperationContext, call: ComposerLLMCall) -> None:
-            assert session_operation_context is CONTEXT
-            assert self.pending is not None and call.call_id == self.pending.attempt_id
-            raise original
+    async def provider(**_kwargs: object) -> ModelResponse:
+        assert custody.attempt is not None
+        physical_attempts.append(custody.attempt.attempt_id)
+        return ModelResponse(
+            model="test/model",
+            choices=[{"message": {"role": "assistant", "content": "An ordinary provider reply.", "tool_calls": None}}],
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        )
 
-    accounting = FailedAccounting()
-    recorder = BufferingRecorder()
+    async def failed_finish(
+        _service,
+        *,
+        session_operation_context: SessionOperationContext,
+        call: ComposerLLMCall,
+        required_work: RequiredWorkTicket,
+    ) -> None:
+        assert session_operation_context is context
+        assert required_work.key.source is RequiredWorkSource.PROVIDER_SETTLEMENT_SQL
+        await actual_finish(session_operation_context=session_operation_context, call=call, required_work=required_work)
+        assert required_work.complete
+        raise original
 
-    async def provider(**kwargs: object) -> None:
-        return None
-
-    @quota_provider_calls
-    async def dispatched_turn() -> None:
-        await _litellm_acompletion(model="test-model", messages=[])
-        terminal(recorder)
-
-    with (
-        composer_quota_scope(cast(SessionServiceProtocol, accounting), CONTEXT),
-        patch("litellm.acompletion", new=provider),
-        pytest.raises(ComposerOwnedSettlementFailure) as caught,
-    ):
-        await dispatched_turn()
+    gateway = ProviderGateway(model="test/model", settings=_settings(tmp_path), endpoint_base_url=None, endpoint_api_key=None)
+    try:
+        with (
+            patch("litellm.acompletion", new=provider),
+            patch.object(type(quota_service), "finish_provider_attempt", new=failed_finish),
+            pytest.raises(ComposerOwnedSettlementFailure) as caught,
+        ):
+            await gateway._call_llm_with_audit([], [], timeout=5, recorder=None, provider_custody=custody)
+        assert len(physical_attempts) == 1
+        assert len(_ledger(quota_engine)) == 1
+        coordinator.assert_completed()
+    finally:
+        quota_authority.release(context)
+        quota_engine.dispose()
     assert caught.value.__cause__ is original
-    assert accounting.pending is not None and accounting.calls == []
     app, service, engine, _composer = _file_app(tmp_path)
     try:
         session = await service.create_session("alice", "Quota priority", "local")
@@ -150,40 +186,27 @@ async def test_shutdown_drain_retains_worker_slot_until_actual_terminal_sql_fini
     release = threading.Event()
     baseline = outstanding_admissions()
 
-    actual_run_sql = service._run_composer_sql
-    terminal_phase = False
-    complete = service.complete_composer_async_operation
+    actual_terminal_sql = service._run_composer_terminal_sql
 
-    async def terminal_composite(_service, *args, **kwargs):
-        nonlocal terminal_phase
-        terminal_phase = True
-        return await complete(*args, **kwargs)
-
-    async def retained_sql(_service, func):
-        if not terminal_phase:
-            return await actual_run_sql(func)
-
+    async def retained_terminal_sql(_service, running, func, **kwargs):
         def held_sql():
             entered.set()
             assert release.wait(timeout=5)
             return func()
 
-        return await _owned(run_sync_in_worker(held_sql))
+        return await actual_terminal_sql(running, held_sql, **kwargs)
 
     worker = _worker(app, authority)
     try:
         record = await _admit(app, service, authority, operation_id=str(uuid4()))
-        with (
-            patch.object(type(service), "complete_composer_async_operation", new=terminal_composite),
-            patch.object(type(service), "_run_composer_sql", new=retained_sql),
-        ):
+        with patch.object(type(service), "_run_composer_terminal_sql", new=retained_terminal_sql):
             assert await worker._claim_once() == 1
             for _ in range(200):
                 if entered.is_set():
                     break
                 await asyncio.sleep(0.01)
             assert entered.is_set()
-            assert terminal_phase and composer.calls == 1
+            assert composer.calls == 1
             owned_jobs = tuple(worker._jobs.values())
             assert len(owned_jobs) == 1
             await asyncio.wait_for(worker.stop(), timeout=0.5)
@@ -191,12 +214,15 @@ async def test_shutdown_drain_retains_worker_slot_until_actual_terminal_sql_fini
             assert len(worker._jobs) == 1
             assert outstanding_admissions() >= baseline + 1
             release.set()
-            await asyncio.wait_for(asyncio.gather(*owned_jobs), timeout=2)
+            with pytest.raises(asyncio.CancelledError) as cancellation:
+                await asyncio.wait_for(asyncio.gather(*owned_jobs), timeout=2)
+            assert cancellation.value.args == (COMPOSER_SHUTDOWN,)
             await asyncio.sleep(0)
             assert not worker._jobs
             assert outstanding_admissions() == baseline
         final = authority.get(session_id=record.session_id, operation_id=record.operation_id)
         assert final is not None and final.status == "completed"
+        assert final.session_id == record.session_id and final.operation_id == record.operation_id
         assert final.cancel_requested_at is None and composer.calls == 1
     finally:
         release.set()

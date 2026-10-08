@@ -475,17 +475,20 @@ def test_failed_app_constructor_arms_before_lexical_telemetry_cleanup(tmp_path, 
     from elspeth.web.process_watchdog_codec import RecoveryReason
     from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 
-    custody = owner()
     watchdogs: list[OwnedTestProcessWatchdog] = []
     original = KeyboardInterrupt()
     observed: list[str] = []
-    shutdown = custody.shutdown_sync
 
-    def cleanup():
-        assert watchdogs[0].reasons == [RecoveryReason.FAILED_STARTUP]
-        assert not watchdogs[0].completed
-        observed.append("telemetry")
-        return shutdown()
+    class ObservingOwner(OperatorTelemetryCleanupOwner):
+        __slots__ = ()
+
+        def shutdown_sync(self):
+            assert watchdogs[0].reasons == [RecoveryReason.FAILED_STARTUP]
+            assert not watchdogs[0].completed
+            observed.append("telemetry")
+            return super().shutdown_sync()
+
+    custody = ObservingOwner(installation=OwnedTestTelemetryInstallation())
 
     def factory(event):
         watchdog = OwnedTestProcessWatchdog(event)
@@ -496,7 +499,6 @@ def test_failed_app_constructor_arms_before_lexical_telemetry_cleanup(tmp_path, 
         raise original
 
     monkeypatch.setattr(OperatorTelemetryCleanupOwner, "create_for_application", classmethod(lambda cls: custody))
-    monkeypatch.setattr(custody, "shutdown_sync", cleanup)
     monkeypatch.setattr(app_module, "create_catalog_service", fail_catalog)
     with pytest.raises(KeyboardInterrupt) as failed:
         app_module.create_app(

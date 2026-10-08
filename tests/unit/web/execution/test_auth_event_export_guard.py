@@ -21,6 +21,7 @@ from tests.unit.web.execution.test_service import (
 from tests.unit.web.execution.test_service import (
     broadcaster as broadcaster,
 )
+from tests.unit.web.execution.test_service import execution_fixture as execution_fixture
 from tests.unit.web.execution.test_service import (
     mock_loop as mock_loop,
 )

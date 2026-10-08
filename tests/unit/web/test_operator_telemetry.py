@@ -291,6 +291,8 @@ class _FactoryRecord:
 class _RecordingFactories(OwnedTestOperatorTelemetryFactories):
     def __init__(self, record: _FactoryRecord) -> None:
         class Installation(OwnedTestTelemetryInstallation):
+            __slots__ = ()
+
             def set_provider(self, provider: OwnedMeterProvider) -> None:
                 super().set_provider(provider)
                 record.installed.append(provider)

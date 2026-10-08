@@ -1794,8 +1794,10 @@ def _prose_decline_notice() -> str:
     return (
         "If this request cannot be built with the capabilities available to this planning session, "
         f'reply in plain text starting with "{_PROSE_DECLINE_MARKER} " and state plainly, in the '
-        "user's terms, what is missing. Use that prefix only for an honest decline; otherwise "
-        "continue with tool calls."
+        "user's terms, what is missing. If required artifacts are absent or product requirements "
+        "conflict and no faithful reviewable draft is possible, use the same prefix to explain "
+        "the blocker and ask a focused question. Use that prefix only when you cannot build "
+        "the requested workflow from the available information; otherwise continue with tool calls."
     )
 
 
@@ -3675,6 +3677,25 @@ async def _plan_pipeline_inner(
                 recorder.record_llm_call(call, provider_custody=provider_custody)
                 begin_response_attempt(call)
                 raise PipelinePlannerError("planner provider cost continuation cap exceeded", code="COST_CAP_EXCEEDED")
+            if call.finish_reason == "length":
+                # A provider output-limit stop is authoritative even when its
+                # partial tool arguments happen to form valid JSON. Reject the
+                # whole reply before parsing or dispatching any authored call.
+                truncated_response = PipelinePlannerError(
+                    "planner response was truncated at the completion token limit",
+                    code="RESPONSE_TRUNCATED",
+                )
+                recorder.record_llm_call(
+                    replace(
+                        call,
+                        status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
+                        error_class=type(truncated_response).__name__,
+                        error_message=truncated_response.code,
+                    ),
+                    provider_custody=provider_custody,
+                )
+                begin_response_attempt(call)
+                raise truncated_response
             try:
                 parsed_response = _parse_response_tool_calls(
                     response,
@@ -3707,15 +3728,9 @@ async def _plan_pipeline_inner(
                     raise
                 if exc.code not in ("MALFORMED_RESPONSE", "PROSE_REPLY"):
                     raise
-                # A response that failed to parse was almost certainly cut
-                # off mid-write when it consumed the whole completion budget,
-                # or when the provider itself reports it stopped at an output
-                # limit (a model or gateway limit can sit below the requested
-                # cap). That is a capacity event, not malformed output, and the
-                # loop can repair it by asking for a more compact reply.
-                truncated = (
-                    call.completion_tokens is not None and call.completion_tokens >= budget_policy.max_completion_tokens
-                ) or call.finish_reason == "length"
+                # Without an explicit provider stop reason, a parse failure
+                # at the requested cap retains the existing capacity repair.
+                truncated = call.completion_tokens >= budget_policy.max_completion_tokens
                 recorder.record_llm_call(
                     replace(
                         call,

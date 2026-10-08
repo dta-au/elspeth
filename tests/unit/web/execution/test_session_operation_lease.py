@@ -20,13 +20,19 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import json
 import operator
+import os
 import re
+import subprocess
+import sys
 import textwrap
 import threading
+import time
+import traceback
 from asyncio.tasks import run_coroutine_threadsafe
 from asyncio.threads import to_thread
-from collections.abc import Iterator
+from collections.abc import Coroutine, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -48,6 +54,7 @@ from starlette.requests import Request
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.core.events import EventBus
 from elspeth.engine.orchestrator.core import Orchestrator
+from elspeth.web import async_workers
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
@@ -57,6 +64,7 @@ from elspeth.web.coordination.contracts import (
     SessionOperationFence,
     SessionOperationFenceLost,
     SessionOperationKind,
+    StartPermitState,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionDerivedCustodyError, SessionOperationConflictError
@@ -69,7 +77,13 @@ from elspeth.web.execution.routes import create_execution_router
 from elspeth.web.execution.schemas import ProgressData, RunEvent, ValidationReadiness, ValidationResult
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.sessions.models import run_events_table
-from elspeth.web.sessions.protocol import CompositionStateData, SessionOperationAuthority, SessionServiceProtocol
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    RunRecord,
+    RunStartPermitRecord,
+    SessionOperationAuthority,
+    SessionServiceProtocol,
+)
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
@@ -445,6 +459,7 @@ class _RouteExecutionService:
         self.started = asyncio.Event()
         self.allowed = asyncio.Event()
         self.error: BaseException | None = None
+        self.cancellation_originals: list[asyncio.CancelledError] = []
         self.calls: list[dict[str, object]] = []
         self._trace = trace
 
@@ -453,10 +468,42 @@ class _RouteExecutionService:
         if self._trace is not None:
             self._trace.append("execute")
         self.started.set()
-        await self.allowed.wait()
+        try:
+            await self.allowed.wait()
+        except asyncio.CancelledError as original:
+            self.cancellation_originals.append(original)
+            raise
         if self.error is not None:
             raise self.error
         return self.run_id
+
+
+class _ExactCloseWaitCancellationObserver:
+    """Observe the request's delivered cancellation at the real close join."""
+
+    def __init__(self, lease: _CanonicalRouteLeaseControl) -> None:
+        self.lease = lease
+        self.request_task: asyncio.Task[object] | None = None
+        self.delivered: list[asyncio.CancelledError] = []
+        self.original_wait = asyncio.wait
+
+    async def __call__(self, fs: set[asyncio.Task[object]], *args: object, **kwargs: object) -> object:
+        try:
+            return await self.original_wait(fs, *args, **kwargs)
+        except asyncio.CancelledError as original:
+            if asyncio.current_task() is self.request_task and len(fs) == 1:
+                close_task = next(iter(fs))
+                coroutine = close_task.get_coro()
+                frame = coroutine.cr_frame
+                if (
+                    close_task.get_name() == "execution-pretransfer-lease-close"
+                    and coroutine.cr_code is SessionOperationLease.close.__code__
+                    and frame is not None
+                    and self.lease.actual is not None
+                    and frame.f_locals["self"] is self.lease.actual
+                ):
+                    self.delivered.append(original)
+            raise
 
 
 @dataclass
@@ -562,6 +609,15 @@ async def test_execute_route_acquires_exact_execute_lease_and_transfers_it(
     response = await _invoke_execute_route(harness, service, session_id=session_id)
 
     assert response == {"run_id": str(run_id)}
+    assert lease.actual is not None
+    obligation = lease.actual.execution_obligation
+    assert obligation is not None
+    assert obligation.lease is lease.actual
+    assert obligation.registry is harness.session_service.registry
+    assert obligation.authority is harness.session_service.session_operation_authority
+    assert obligation.session_id == session_id
+    assert obligation.owner_instance_id == "execution-route-test"
+    assert obligation.lease_seconds == 41
     assert acquired == [
         {
             "authority": harness.session_service.session_operation_authority,
@@ -569,10 +625,11 @@ async def test_execute_route_acquires_exact_execute_lease_and_transfers_it(
             "operation_kind": SessionOperationKind.EXECUTE,
             "owner_instance_id": "execution-route-test",
             "lease_seconds": 41,
+            "execution_obligation": obligation,
         }
     ]
     assert len(service.calls) == 1
-    assert service.calls[0]["session_operation_lease"] is lease
+    assert service.calls[0]["session_operation_lease"] is lease.actual
     assert lease.close_calls == 0, "successful submission transfers ownership to background completion"
 
 
@@ -596,11 +653,13 @@ async def test_fastapi_execute_orders_ownership_before_acquire_before_exact_serv
     assert response.status_code == 202
     assert trace == ["ownership", "acquire", "execute"]
     assert len(acquired) == 1
+    assert lease.actual is not None
+    assert acquired[0]["execution_obligation"] is lease.actual.execution_obligation
     assert execution_service.calls == [
         {
             "session_id": session_id,
             "state_id": None,
-            "session_operation_lease": lease,
+            "session_operation_lease": lease.actual,
             "user_id": _USER_ID,
             "auth_provider_type": "local",
             "fanout_ack_token": None,
@@ -649,7 +708,9 @@ async def test_execute_route_pretransfer_failure_closes_and_joins_exact_lease(
         await _invoke_execute_route(harness, service, session_id=session_id)
 
     assert len(acquired) == 1
-    assert service.calls[0]["session_operation_lease"] is lease
+    assert lease.actual is not None
+    assert acquired[0]["execution_obligation"] is lease.actual.execution_obligation
+    assert service.calls[0]["session_operation_lease"] is lease.actual
     assert lease.close_calls == 1
     assert lease.close_finished.is_set()
 
@@ -664,25 +725,266 @@ async def test_cancelled_execute_request_before_transfer_cannot_interrupt_lease_
     lease = _CanonicalRouteLeaseControl(harness.session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease)
     service = _RouteExecutionService(uuid4())
-    task = asyncio.create_task(_invoke_execute_route(harness, service, session_id=session_id))
-    await asyncio.wait_for(service.started.wait(), timeout=2)
+    observer = _ExactCloseWaitCancellationObserver(lease)
+    with patch("elspeth.web.execution.service.asyncio.wait", new=observer):
+        task = asyncio.create_task(_invoke_execute_route(harness, service, session_id=session_id))
+        observer.request_task = task
+        await asyncio.wait_for(service.started.wait(), timeout=2)
 
-    task.cancel()
-    await asyncio.wait_for(lease.close_started.wait(), timeout=2)
-    task.cancel()  # A second cancellation must not cancel close()/renewal-task join.
-    await asyncio.sleep(0)
-    assert not task.done()
-    lease.close_allowed.set()
+        try:
+            task.cancel()
+            await asyncio.wait_for(lease.close_started.wait(), timeout=2)
+            assert task.cancel()  # A second cancellation must not cancel close()/renewal-task join.
+            await asyncio.sleep(0)
+            assert not task.done()
+        finally:
+            lease.close_allowed.set()
+            service.allowed.set()
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=2)
+        with pytest.raises(BaseExceptionGroup) as retained:
+            await asyncio.wait_for(task, timeout=2)
+    assert len(service.cancellation_originals) == 1
+    assert len(observer.delivered) == 1
+    _assert_exact_cancellation_originals(retained.value, [service.cancellation_originals[0], observer.delivered[0]])
+    assert len(_original_leaves(retained.value)) == 2
     assert len(acquired) == 1
     assert lease.close_calls == 1
     assert not lease.close_cancelled
     assert lease.close_finished.is_set()
 
 
-@pytest.mark.asyncio
+def _original_leaves(original: BaseException) -> list[BaseException]:
+    if isinstance(original, BaseExceptionGroup):
+        return [leaf for child in original.exceptions for leaf in _original_leaves(child)]
+    return [original]
+
+
+def _assert_exact_cancellation_originals(original: BaseException, delivered: list[asyncio.CancelledError]) -> None:
+    cancellations = [leaf for leaf in _original_leaves(original) if isinstance(leaf, asyncio.CancelledError)]
+    assert len(cancellations) == len(delivered)
+    assert len({id(leaf) for leaf in cancellations}) == len(cancellations)
+    assert all(actual is expected for actual, expected in zip(cancellations, delivered, strict=True))
+
+
+def _atomic_child_checkpoint(path: Path, proof: dict[str, object]) -> None:
+    from tests.unit.web.execution.test_canonical_execution_fixture import _publish_checkpoint
+
+    _publish_checkpoint(path, proof)
+
+
+async def _child_with_failure_checkpoint(root: Path, child: Coroutine[object, object, None]) -> None:
+    try:
+        await child
+    except BaseException as original:
+        _atomic_child_checkpoint(
+            root / "failure.json",
+            {
+                "type": type(original).__name__,
+                "message": str(original),
+                "traceback": "".join(traceback.format_exception(original)),
+            },
+        )
+        raise
+
+
+def _assert_child_checkpoint_or_failure(checkpoint: Path, failure: Path, log: Path) -> dict[str, object]:
+    assert not failure.exists() or not checkpoint.exists(), "child published both success and failure checkpoints"
+    if failure.exists():
+        evidence = json.loads(failure.read_text())
+        raise AssertionError(
+            "actual owned custody child assertion failed: " + evidence["type"] + ": " + evidence["message"] + "\n" + evidence["traceback"]
+        )
+    assert checkpoint.exists(), "actual custody child failed before checkpoint: " + log.read_text()
+    return json.loads(checkpoint.read_text())
+
+
+async def _failed_http_release_child(
+    root: Path, cleanup_error_type: type[Exception], logger_error_type: type[Exception] | None, repeat_cancellation: bool
+) -> None:
+    custody = ExecutionTestCustody(asyncio.get_running_loop(), root)
+    session_id = uuid4()
+    session_service = _RouteSessionService(session_id, execution_fixture=custody)
+    lease = _CanonicalRouteLeaseControl(session_service, custody)
+    cleanup_error = cleanup_error_type("private lease failure detail")
+    lease.close_error = cleanup_error
+    monkeypatch = pytest.MonkeyPatch()
+    acquired = _install_acquire(monkeypatch, lease)
+    execution_service = _RouteExecutionService(uuid4())
+    app = _http_route_app(session_service=session_service, execution_service=execution_service)
+    logger_error = None if logger_error_type is None else logger_error_type("private logger failure detail")
+    observer = _ExactCloseWaitCancellationObserver(lease)
+    with (
+        patch("elspeth.web.execution.routes.slog.error", side_effect=logger_error) as log_error,
+        patch("elspeth.web.execution.service.asyncio.wait", new=observer),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            request_task = asyncio.create_task(client.post(f"/api/sessions/{session_id}/execute"))
+            observer.request_task = request_task
+            try:
+                await asyncio.wait_for(execution_service.started.wait(), timeout=2)
+                assert request_task.cancel("initial request cancellation")
+                await asyncio.wait_for(lease.close_started.wait(), timeout=2)
+                if repeat_cancellation:
+                    assert request_task.cancel("repeated request cancellation")
+                    await asyncio.sleep(0)
+                assert not request_task.done()
+            finally:
+                lease.close_allowed.set()
+                execution_service.allowed.set()
+            completed, _ = await asyncio.wait({request_task}, timeout=2)
+            assert request_task in completed, "actual request remained pending after both gates opened"
+            with pytest.raises(BaseExceptionGroup) as retained:
+                request_task.result()
+    leaves = _original_leaves(retained.value)
+    assert len(execution_service.cancellation_originals) == 1
+    primary = execution_service.cancellation_originals[0]
+    assert leaves[0] is primary
+    assert cleanup_error in leaves and sum(leaf is cleanup_error for leaf in leaves) == 1
+    assert len(observer.delivered) == int(repeat_cancellation)
+    _assert_exact_cancellation_originals(retained.value, [primary, *observer.delivered])
+    assert len({id(leaf) for leaf in leaves}) == len(leaves)
+    assert len(leaves) == 2 + int(repeat_cancellation)
+    log_error.assert_not_called()
+    assert len(acquired) == 1 and lease.actual is not None
+    obligation = lease.actual.execution_obligation
+    assert obligation is not None and acquired[0]["execution_obligation"] is obligation
+    assert obligation.lease is lease.actual and obligation.registry is session_service.registry
+    assert lease.close_calls == 1 and lease.close_finished.is_set() and not lease.close_cancelled
+    assert obligation.lifecycle_original_error is cleanup_error
+    release = obligation.release_submission
+    assert release is not None and release.future is not None and release.reservation is not None
+    session_service.registry.observe_ready()
+    receipt = release.reservation.witness.snapshot()
+    assert release.future.done() and release.future.exception() is cleanup_error
+    assert release.original_error is cleanup_error and release.observed
+    assert release.reservation.released and release.callback_return_observed
+    assert receipt.callable_finished and receipt.exited and not receipt.impossible
+    assert session_service.observation.release_calls == [lease.actual.context]
+    assert not obligation.release_succeeded and not obligation.retired
+    assert session_service.registry.has_pending_physical_owners()
+    assert session_service.registry.executor_finalizer is None
+    assert not session_service.registry._executor_allocation_declared
+    assert session_service.registry._execution_executor is None
+    assert not session_service.registry.executor_join_succeeded
+    custody.witness_cleanup_original(cleanup_error)
+    shutdown = asyncio.create_task(custody.close())
+    await asyncio.sleep(0)
+    assert not shutdown.done()
+    with pytest.raises(BaseExceptionGroup) as refused:
+        session_service.registry.assert_completed()
+    assert any(leaf is cleanup_error for leaf in _original_leaves(refused.value))
+    assert not custody.recovery.watchdog.completed
+    _atomic_child_checkpoint(
+        root / "checkpoint.json",
+        {
+            "exact_primary_and_release_originals": True,
+            "actual_failed_release_future_exited": True,
+            "actual_registry_retained_pending": True,
+            "no_private_executor_allocated": True,
+            "shutdown_pending_and_complete_refused": True,
+            "watchdog_completion_unsent": True,
+        },
+    )
+    await asyncio.Event().wait()
+
+
+def _run_failed_http_release_child(
+    root: Path, cleanup_error_type: type[Exception], logger_error_type: type[Exception] | None, repeat_cancellation: bool
+) -> None:
+    from tests.unit.web.execution.test_canonical_execution_fixture import _project_reaping_failures, _reap_owned_child
+
+    repo = Path(__file__).resolve().parents[4]
+    environment = {
+        "PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin",
+        "PYTHONPATH": os.pathsep.join((str(repo / "src"), str(repo / "elspeth-lints/src"), str(repo))),
+        "PYTHONUNBUFFERED": "1",
+        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+    }
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--failed-http-release-child",
+        str(root),
+        cleanup_error_type.__name__,
+        logger_error_type.__name__ if logger_error_type is not None else "None",
+        str(repeat_cancellation),
+    ]
+    primary = None
+    log = root / "failed-http-release-child.log"
+    with log.open("wb") as stream:
+        process = subprocess.Popen(command, cwd=repo, env=environment, stdout=stream, stderr=subprocess.STDOUT)
+        try:
+            checkpoint = root / "checkpoint.json"
+            failure = root / "failure.json"
+            deadline = time.monotonic() + 15
+            while not checkpoint.exists() and not failure.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert _assert_child_checkpoint_or_failure(checkpoint, failure, log) == {
+                "exact_primary_and_release_originals": True,
+                "actual_failed_release_future_exited": True,
+                "actual_registry_retained_pending": True,
+                "no_private_executor_allocated": True,
+                "shutdown_pending_and_complete_refused": True,
+                "watchdog_completion_unsent": True,
+            }
+            assert process.poll() is None, "failed release silently reported completed custody"
+        except BaseException as original:
+            primary = original
+            raise
+        finally:
+            originals = _reap_owned_child(process)
+            if process.returncode is None:
+                originals.append(AssertionError("exact owned route child was not waited"))
+            _project_reaping_failures(primary, originals)
+
+
+def _run_failed_shutdown_release_child(root: Path, error_type: type[Exception], peer_fails: bool) -> None:
+    from tests.unit.web.execution.test_canonical_execution_fixture import _project_reaping_failures, _reap_owned_child
+
+    repo = Path(__file__).resolve().parents[4]
+    environment = {
+        "PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin",
+        "PYTHONPATH": os.pathsep.join((str(repo / "src"), str(repo / "elspeth-lints/src"), str(repo))),
+        "PYTHONUNBUFFERED": "1",
+        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+    }
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--failed-shutdown-release-child",
+        str(root),
+        error_type.__name__,
+        str(peer_fails),
+    ]
+    primary = None
+    log = root / "failed-shutdown-release-child.log"
+    with log.open("wb") as stream:
+        process = subprocess.Popen(command, cwd=repo, env=environment, stdout=stream, stderr=subprocess.STDOUT)
+        try:
+            checkpoint = root / "checkpoint.json"
+            failure = root / "failure.json"
+            deadline = time.monotonic() + 15
+            while not checkpoint.exists() and not failure.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert _assert_child_checkpoint_or_failure(checkpoint, failure, log) == {
+                "exact_failed_completion_original": True,
+                "failed_release_retained_pending": True,
+                "peer_release_observed": True,
+                "private_executor_joined": True,
+                "shutdown_pending_and_complete_refused": True,
+                "watchdog_completion_unsent": True,
+            }
+            assert process.poll() is None, "failed release silently reported completed custody"
+        except BaseException as original:
+            primary = original
+            raise
+        finally:
+            originals = _reap_owned_child(process)
+            if process.returncode is None:
+                originals.append(AssertionError("exact owned shutdown child was not waited"))
+            _project_reaping_failures(primary, originals)
+
+
 @pytest.mark.parametrize(
     ("cleanup_error_type", "logger_error_type"),
     [
@@ -695,65 +997,13 @@ async def test_cancelled_execute_request_before_transfer_cannot_interrupt_lease_
     ],
 )
 @pytest.mark.parametrize("repeat_cancellation", [False, True])
-async def test_cancelled_http_execute_observes_cleanup_failure_without_losing_primary(
-    monkeypatch: pytest.MonkeyPatch,
-    execution_fixture: ExecutionTestCustody,
+def test_cancelled_http_execute_observes_cleanup_failure_without_losing_primary(
+    tmp_path: Path,
     cleanup_error_type: type[Exception],
     logger_error_type: type[Exception] | None,
     repeat_cancellation: bool,
 ) -> None:
-    session_id = uuid4()
-    session_service = _RouteSessionService(session_id, execution_fixture=execution_fixture)
-    lease = _CanonicalRouteLeaseControl(session_service, execution_fixture)
-    cleanup_error = cleanup_error_type("private lease failure detail")
-    lease.close_error = cleanup_error
-    _install_acquire(monkeypatch, lease)
-    execution_service = _RouteExecutionService(uuid4())
-    app = _http_route_app(session_service=session_service, execution_service=execution_service)
-    logger_error = None if logger_error_type is None else logger_error_type("private logger failure detail")
-    expected_integrity_error = (
-        cleanup_error
-        if cleanup_error_type in (AuditIntegrityError, FrameworkBugError)
-        else logger_error
-        if logger_error_type in (AuditIntegrityError, FrameworkBugError)
-        else None
-    )
-
-    with patch("elspeth.web.execution.routes.slog.error", side_effect=logger_error) as log_error:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            request_task = asyncio.create_task(client.post(f"/api/sessions/{session_id}/execute"))
-            await asyncio.wait_for(execution_service.started.wait(), timeout=2)
-            request_task.cancel("initial request cancellation")
-            await asyncio.wait_for(lease.close_started.wait(), timeout=2)
-            if repeat_cancellation:
-                request_task.cancel("repeated request cancellation")
-                await asyncio.sleep(0)
-            assert not request_task.done()
-            lease.close_allowed.set()
-            if expected_integrity_error is not None:
-                with pytest.raises(type(expected_integrity_error)) as raised_integrity:
-                    await asyncio.wait_for(request_task, timeout=2)
-                assert raised_integrity.value is expected_integrity_error
-            else:
-                with pytest.raises(asyncio.CancelledError) as raised_cancellation:
-                    await asyncio.wait_for(request_task, timeout=2)
-                assert raised_cancellation.value.args == ("initial request cancellation",)
-
-    assert lease.close_calls == 1
-    assert lease.close_finished.is_set()
-    assert not lease.close_cancelled
-    if cleanup_error_type is OSError:
-        log_error.assert_called_once_with(
-            "execution_pretransfer_lease_close_failed",
-            session_id=str(session_id),
-            operation_id=lease.context.fence.operation_id,
-            operation_epoch=lease.context.fence.operation_epoch,
-            error_type="OSError",
-            primary_error_type="CancelledError",
-        )
-        assert "private" not in repr(log_error.call_args)
-    else:
-        log_error.assert_not_called()
+    _run_failed_http_release_child(tmp_path, cleanup_error_type, logger_error_type, repeat_cancellation)
 
 
 @pytest.mark.asyncio
@@ -845,6 +1095,63 @@ def _durable_effect_call_counts(session_service: Any) -> dict[str, int]:
         "append_run_event": session_service.append_run_event.call_count,
         "record_blob_inline_resolutions": session_service.record_blob_inline_resolutions.call_count,
     }
+
+
+@pytest.mark.asyncio
+async def test_recovery_missing_yaml_rejects_before_watcher_or_shutdown_map(
+    execution_fixture: ExecutionTestCustody,
+) -> None:
+    service, sessions, executor = _execution_service(asyncio.get_running_loop(), execution_fixture)
+    session_id = uuid4()
+    run_id = uuid4()
+    run = RunRecord(
+        id=run_id,
+        session_id=session_id,
+        state_id=uuid4(),
+        status="running",
+        started_at=datetime.now(UTC),
+        finished_at=None,
+        rows_processed=0,
+        rows_succeeded=0,
+        rows_failed=0,
+        rows_routed_success=0,
+        rows_routed_failure=0,
+        rows_quarantined=0,
+        error=None,
+        landscape_run_id=None,
+        pipeline_yaml=None,
+    )
+    sessions.assess_run_start_admission.return_value = RunStartPermitRecord(
+        run_id=str(run_id),
+        state=StartPermitState.START_PERMITTED,
+        permit_id=str(uuid4()),
+        permit_epoch=1,
+        subject_hash="recover-missing-yaml",
+        issued_at=datetime.now(UTC),
+        cancelled_at=None,
+    )
+    sessions.get_session.return_value = SimpleNamespace(
+        archived_at=None,
+        user_id=_USER_ID,
+        auth_provider_type="local",
+    )
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=session_id)
+    authority.release_allowed.set()
+    try:
+        with (
+            patch.object(service, "_restore_admitted_run", return_value=SimpleNamespace(settings=object())) as restore,
+            patch.object(service, "_create_loss_watcher", wraps=service._create_loss_watcher) as create_watcher,
+            pytest.raises(AssertionError),
+        ):
+            await service.recover_run(run, lease, resume_existing=False)
+        restore.assert_awaited_once()
+        sessions.assess_run_start_admission.assert_awaited_once()
+        create_watcher.assert_not_called()
+        assert str(run_id) not in service._shutdown_events
+        assert executor.submit_calls == []
+        assert not lease.closed
+    finally:
+        await lease.close()
 
 
 @pytest.mark.asyncio
@@ -1034,18 +1341,22 @@ async def test_done_callback_logger_failure_is_tracked_after_exact_lease_close(
         assert shutdown_failure.value.exceptions == (logging_error,)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error_type", [RuntimeError, AuditIntegrityError, FrameworkBugError])
-@pytest.mark.parametrize("peer_fails", [False, True])
-async def test_shutdown_preserves_completed_lease_failure_and_joins_peer(
-    error_type: type[Exception], peer_fails: bool, execution_fixture: ExecutionTestCustody
-) -> None:
-    service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
-    failed_lease, failed_authority = await _canonical_execute_lease(service, execution_fixture, session_id=uuid4())
+async def _await_owned_thread_signal(signal: threading.Event, *, name: str, timeout: float) -> None:
+    """Observe a producer's thread event without making another worker admission."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not signal.is_set() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    assert signal.is_set(), f"actual {name} did not occur before its bounded deadline"
+
+
+async def _failed_shutdown_release_child(root: Path, error_type: type[Exception], peer_fails: bool) -> None:
+    custody = ExecutionTestCustody(asyncio.get_running_loop(), root)
+    service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=custody)
+    failed_lease, failed_authority = await _canonical_execute_lease(service, custody, session_id=uuid4())
     cleanup_error = error_type("authority release failure")
     failed_authority.release_error = cleanup_error
     failed_authority.release_allowed.set()
-    peer_lease, peer_authority = await _canonical_execute_lease(service, execution_fixture, session_id=uuid4())
+    peer_lease, peer_authority = await _canonical_execute_lease(service, custody, session_id=uuid4())
     peer_error = OSError("peer authority release unavailable")
     if peer_fails:
         peer_authority.release_error = peer_error
@@ -1056,35 +1367,117 @@ async def test_shutdown_preserves_completed_lease_failure_and_joins_peer(
     peer_watcher = service._create_loss_watcher(peer_lease, threading.Event(), run_id=uuid4())
     failed_physical = executor.future
     service._submit_owned_pipeline(failed_obligation, failed_lease, failed_watcher, partial(lambda: None))
-    executor.future = PhysicalPipelineCompletionControl(execution_fixture)
+    executor.future = PhysicalPipelineCompletionControl(custody)
     peer_physical = executor.future
     service._submit_owned_pipeline(peer_obligation, peer_lease, peer_watcher, partial(lambda: None))
     failed_physical.set_result(None)
-    for _ in range(200):
-        if failed_obligation.completion is not None:
-            break
+    deadline = asyncio.get_running_loop().time() + 5
+    while failed_obligation.completion is None and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.01)
     failed_completion = failed_obligation.completion
     assert failed_completion is not None
+    completed, _ = await asyncio.wait({asyncio.wrap_future(failed_completion)}, timeout=2)
+    assert completed, "actual failed completion did not finish"
     with pytest.raises(error_type) as completed_failure:
-        await asyncio.wait_for(asyncio.wrap_future(failed_completion), timeout=2)
+        failed_completion.result()
     assert completed_failure.value is cleanup_error
-
+    assert async_workers._INSTANCE_DRAINING is custody.recovery.instance_draining
+    await _await_owned_thread_signal(custody.recovery.instance_draining, name="selected process drain", timeout=3)
     peer_physical.set_result(None)
-    await asyncio.wait_for(run_sync_in_worker(peer_authority.release_called.wait, 2), timeout=2)
-    shutdown = asyncio.create_task(execution_fixture.shutdown_service(service))
     try:
-        await asyncio.wait_for(run_sync_in_worker(executor.shutdown_started.wait, 2), timeout=2)
-        await asyncio.sleep(0)
-        assert not shutdown.done(), "a failed cleanup must not abandon a peer's authority release"
+        await _await_owned_thread_signal(peer_authority.release_called, name="peer SQL release entry", timeout=3)
+        shutdown = asyncio.create_task(custody.shutdown_service(service))
+        await _await_owned_thread_signal(executor.shutdown_started, name="private executor shutdown entry", timeout=3)
+        assert not shutdown.done(), "failed release cannot produce registry completion"
     finally:
         peer_authority.release_allowed.set()
-        with pytest.raises(ExceptionGroup) as shutdown_failure:
-            await asyncio.wait_for(shutdown, timeout=2)
+    registry = service.execution_lease_release_registry
+    deadline = asyncio.get_running_loop().time() + 5
+    while not registry.executor_join_succeeded and asyncio.get_running_loop().time() < deadline:
+        registry.observe_ready()
+        await asyncio.sleep(0.01)
+    assert registry.executor_join_succeeded
+    peer_completion = peer_obligation.completion
+    assert peer_completion is not None
+    peer_completed, _ = await asyncio.wait({asyncio.wrap_future(peer_completion)}, timeout=2)
+    assert peer_completed, "actual peer completion did not finish"
+    if peer_fails:
+        with pytest.raises(OSError) as completed_peer_failure:
+            peer_completion.result()
+        assert completed_peer_failure.value is peer_error
+    else:
+        assert peer_completion.result() is None
+    deadline = asyncio.get_running_loop().time() + 5
+    while asyncio.get_running_loop().time() < deadline:
+        registry.observe_ready()
+        observed_peer_release = peer_obligation.release_submission
+        if observed_peer_release is not None and observed_peer_release.future is not None and observed_peer_release.reservation is not None:
+            peer_receipt = observed_peer_release.reservation.witness.snapshot()
+            if (
+                observed_peer_release.future.done()
+                and observed_peer_release.observed
+                and observed_peer_release.callback_return_observed
+                and observed_peer_release.reservation.released
+                and peer_receipt.callable_finished
+                and peer_receipt.exited
+                and peer_lease.closed
+                and peer_obligation.completion_outcome_recorded
+                and peer_obligation.completion_observed
+                and peer_obligation.lifecycle_outcome_recorded
+                and peer_obligation.lifecycle_observed
+                and (peer_fails or peer_obligation.retired)
+            ):
+                break
+        await asyncio.sleep(0.01)
+    assert peer_lease.closed and peer_authority.release_calls == [peer_lease.context]
+    assert peer_obligation.completion_outcome_recorded and peer_obligation.completion_observed
+    assert peer_obligation.lifecycle_outcome_recorded and peer_obligation.lifecycle_observed
+    assert peer_obligation.completion_original_error is (peer_error if peer_fails else None)
+    assert peer_obligation.lifecycle_original_error is (peer_error if peer_fails else None)
+    failed_release = failed_obligation.release_submission
+    peer_release = peer_obligation.release_submission
+    assert failed_release is not None and failed_release.future is not None and failed_release.reservation is not None
+    assert peer_release is not None and peer_release.future is not None and peer_release.reservation is not None
+    registry.observe_ready()
+    assert failed_release.future.done() and failed_release.future.exception() is cleanup_error
+    assert failed_release.original_error is cleanup_error and failed_release.observed
+    failed_trace = failed_release.reservation.witness.snapshot()
+    assert failed_trace.callable_finished and failed_trace.exited and not failed_trace.impossible
+    assert not failed_obligation.release_succeeded and not failed_obligation.retired
+    assert peer_release.future.done() and peer_release.observed
+    peer_trace = peer_release.reservation.witness.snapshot()
+    assert peer_trace.callable_finished and peer_trace.exited and not peer_trace.impossible
+    if peer_fails:
+        assert peer_release.future.exception() is peer_error and peer_release.original_error is peer_error
+        assert not peer_obligation.release_succeeded and not peer_obligation.retired
+    else:
+        assert peer_release.future.exception() is None
+        assert peer_obligation.release_succeeded and peer_obligation.retired
     expected_errors = {cleanup_error, peer_error} if peer_fails else {cleanup_error}
-    assert set(shutdown_failure.value.exceptions) == expected_errors
-    assert peer_lease.closed
-    assert peer_authority.release_calls == [peer_lease.context]
+    assert {leaf for original in registry._failures for leaf in _original_leaves(original)} == expected_errors
+    assert registry.has_pending_physical_owners() and not shutdown.done()
+    with pytest.raises(BaseExceptionGroup) as refused:
+        registry.assert_completed()
+    assert expected_errors <= set(_original_leaves(refused.value))
+    assert not custody.recovery.watchdog.completed
+    _atomic_child_checkpoint(
+        root / "checkpoint.json",
+        {
+            "exact_failed_completion_original": True,
+            "failed_release_retained_pending": True,
+            "peer_release_observed": True,
+            "private_executor_joined": True,
+            "shutdown_pending_and_complete_refused": True,
+            "watchdog_completion_unsent": True,
+        },
+    )
+    await asyncio.Event().wait()
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, AuditIntegrityError, FrameworkBugError])
+@pytest.mark.parametrize("peer_fails", [False, True])
+def test_shutdown_preserves_completed_lease_failure_and_joins_peer(tmp_path: Path, error_type: type[Exception], peer_fails: bool) -> None:
+    _run_failed_shutdown_release_child(tmp_path, error_type, peer_fails)
 
 
 def _function_node(owner: type[object], name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
@@ -1990,8 +2383,702 @@ class _ExecutionEffectFindings:
     escaped_class_helpers: tuple[str, ...]
 
 
+def _exact_recovery_lease_owner_edges(member: _FunctionNode) -> frozenset[int]:
+    """Prove recover_run's bound submit and awaited no-completion cleanup."""
+    if member.name != "recover_run":
+        return frozenset()
+    parents = {child: node for node in ast.walk(member) for child in ast.iter_child_nodes(node)}
+    calls = [node for node in ast.walk(member) if isinstance(node, ast.Call)]
+
+    def one(target: str) -> ast.Call | None:
+        matching = [call for call in calls if ast.unparse(call.func) == target]
+        return matching[0] if len(matching) == 1 else None
+
+    obligation = one("self._execution_obligation")
+    watcher = one("self._create_loss_watcher")
+    submit = one("self._submit_owned_pipeline")
+    join = one("self._join_loss_watcher")
+    if any(call is None for call in (obligation, watcher, submit, join)):
+        return frozenset()
+    assert obligation is not None and watcher is not None and submit is not None and join is not None
+
+    def assigned_once(call: ast.Call, name: str) -> bool:
+        parent = parents[call]
+        return (
+            isinstance(parent, ast.Assign)
+            and len(parent.targets) == 1
+            and isinstance(parent.targets[0], ast.Name)
+            and parent.targets[0].id == name
+            and sum(isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Store) for node in ast.walk(member)) == 1
+            and not any(isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Del) for node in ast.walk(member))
+        )
+
+    if not (
+        assigned_once(obligation, "obligation")
+        and assigned_once(watcher, "watcher")
+        and len(obligation.args) == 1
+        and ast.unparse(obligation.args[0]) == "session_operation_lease"
+        and not obligation.keywords
+        and tuple(ast.unparse(arg) for arg in watcher.args) == ("session_operation_lease", "shutdown_event")
+        and len(watcher.keywords) == 1
+        and watcher.keywords[0].arg == "run_id"
+        and ast.unparse(watcher.keywords[0].value) == "run.id"
+        and tuple(ast.unparse(arg) for arg in submit.args[:3]) == ("obligation", "session_operation_lease", "watcher")
+        and len(submit.args) == 4
+        and not submit.keywords
+        and tuple(ast.unparse(arg) for arg in join.args) == ("watcher", "session_operation_lease")
+        and not join.keywords
+    ):
+        return frozenset()
+    partial_call = submit.args[3]
+    if not (
+        isinstance(partial_call, ast.Call)
+        and isinstance(partial_call.func, ast.Name)
+        and partial_call.func.id == "partial"
+        and tuple(ast.unparse(arg) for arg in partial_call.args)
+        == (
+            "self._run_pipeline",
+            "str(run.id)",
+            "run.pipeline_yaml",
+            "shutdown_event",
+            "restored.settings",
+            "session.user_id",
+            "session.auth_provider_type",
+        )
+        and [keyword.arg for keyword in partial_call.keywords]
+        == ["session_operation_lease", "durable_admission", "resume_existing", "restored_envelope"]
+        and tuple(ast.unparse(keyword.value) for keyword in partial_call.keywords)
+        == ("session_operation_lease", "True", "resume_existing", "restored")
+    ):
+        return frozenset()
+
+    # The nominal obligation contains the exact lease. Account for its every
+    # read, not just loads of the raw lease parameter. The watcher likewise
+    # remains only on the physical submit/join edges.
+    submit_obligation = submit.args[0]
+    submit_watcher = submit.args[2]
+    join_watcher = join.args[0]
+    if not (
+        isinstance(parents[submit], ast.Expr) and isinstance(parents[join], ast.Await) and isinstance(parents[parents[join]], ast.Assign)
+    ):
+        return frozenset()
+    submit_statement = parents[submit]
+    submit_try = parents[submit_statement]
+    if not (
+        isinstance(submit_try, ast.Try)
+        and parents[submit_try] is member
+        and submit_try.body == [submit_statement]
+        and len(submit_try.handlers) == 1
+        and not submit_try.orelse
+        and not submit_try.finalbody
+        and len(member.body) >= 2
+        and member.body[-2] is submit_try
+        and isinstance(member.body[-1], ast.Return)
+        and isinstance(member.body[-1].value, ast.Constant)
+        and member.body[-1].value.value is True
+    ):
+        return frozenset()
+    # The lease owner is created on the method's executed path. A lexical
+    # assignment nested under a skipped branch is not an initialized owner.
+    obligation_statement = parents[obligation]
+    watcher_statement = parents[watcher]
+    if parents[obligation_statement] is not member or parents[watcher_statement] is not member:
+        return frozenset()
+    obligation_index = member.body.index(obligation_statement)
+    watcher_index = member.body.index(watcher_statement)
+    submit_index = member.body.index(submit_try)
+    if not (obligation_index < watcher_index < submit_index):
+        return frozenset()
+    # Before the first owner is acquired, only the docstring and imports may
+    # execute. In particular no branch can skip its assignment and continue.
+    if any(
+        not (
+            isinstance(statement, (ast.ImportFrom, ast.Import))
+            or (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str))
+        )
+        for statement in member.body[:obligation_index]
+    ):
+        return frozenset()
+    # Before the watcher exists, the caller may still retain a refused lease,
+    # but it must not report a successful transfer without a submission.
+    if any(
+        isinstance(node, ast.Return) and not (isinstance(node.value, ast.Constant) and node.value.value is False)
+        for statement in member.body[obligation_index + 1 : watcher_index]
+        for node in ast.walk(statement)
+    ):
+        return frozenset()
+    # The optional YAML assertion must precede both shutdown-map registration
+    # and watcher creation, so a failed assertion cannot strand either owner.
+    if watcher_index < 3:
+        return frozenset()
+    expected_assert = ast.parse("assert run.pipeline_yaml is not None").body[0]
+    expected_event = ast.parse("shutdown_event = threading.Event()").body[0]
+    map_statement = member.body[watcher_index - 1]
+    expected_map = ast.parse("with self._shutdown_events_lock:\n    self._shutdown_events[str(run.id)] = shutdown_event\n").body[0]
+    if any(
+        ast.dump(actual, include_attributes=False) != ast.dump(expected, include_attributes=False)
+        for actual, expected in zip(
+            member.body[watcher_index - 3 : watcher_index], (expected_assert, expected_event, expected_map), strict=True
+        )
+    ):
+        return frozenset()
+
+    # Once the watcher exists, only inert, fresh diagnostic facts may precede
+    # the checked submission. They cannot return, raise, await, call, branch,
+    # rebind a consumed name, or strand the watcher outside the handler.
+    def inert_fact(statement: ast.stmt) -> bool:
+        if isinstance(statement, ast.Assign):
+            if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+                return False
+            target = statement.targets[0]
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            if (
+                not isinstance(statement.target, ast.Name)
+                or statement.simple != 1
+                or not isinstance(statement.annotation, ast.Name)
+                or statement.annotation.id != "int"
+            ):
+                return False
+            target = statement.target
+            value = statement.value
+        else:
+            return False
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, (str, int, float, bool, type(None))):
+            return False
+        return sum(isinstance(node, ast.Name) and node.id == target.id for node in ast.walk(member)) == 1
+
+    if any(not inert_fact(statement) for statement in member.body[watcher_index + 1 : submit_index]):
+        return frozenset()
+    handler = submit_try.handlers[0]
+    if not (
+        isinstance(handler.type, ast.Name)
+        and handler.type.id == "BaseException"
+        and handler.name is not None
+        and len(handler.body) == 2
+        and isinstance(handler.body[0], ast.If)
+        and isinstance(handler.body[1], ast.Raise)
+        and handler.body[1].exc is None
+    ):
+        return frozenset()
+    no_completion = handler.body[0]
+    condition = no_completion.test
+    if not (
+        isinstance(condition, ast.UnaryOp)
+        and isinstance(condition.op, ast.Not)
+        and isinstance(condition.operand, ast.Attribute)
+        and condition.operand.attr == "completion_required"
+        and isinstance(condition.operand.value, ast.Name)
+        and condition.operand.value.id == "obligation"
+        and not no_completion.orelse
+        and no_completion.body
+        and parents[parents[join]] is no_completion.body[0]
+    ):
+        return frozenset()
+    join_assignment = parents[parents[join]]
+    if not (
+        len(join_assignment.targets) == 1
+        and isinstance(join_assignment.targets[0], ast.Tuple)
+        and len(join_assignment.targets[0].elts) == 2
+        and all(isinstance(item, ast.Name) for item in join_assignment.targets[0].elts)
+    ):
+        return frozenset()
+    cancellation_name, watcher_error_name = (item.id for item in join_assignment.targets[0].elts)
+    if cancellation_name == watcher_error_name:
+        return frozenset()
+    # This is the entire no-completion arm. No unproved middle statement may
+    # return success, erase retained errors, or bypass shutdown-map cleanup.
+    if len(no_completion.body) != 5:
+        return frozenset()
+    failures_assignment = no_completion.body[1]
+    if not (
+        isinstance(failures_assignment, ast.AnnAssign)
+        and isinstance(failures_assignment.target, ast.Name)
+        and ast.unparse(failures_assignment.annotation) == "list[BaseException]"
+        and isinstance(failures_assignment.value, ast.List)
+        and len(failures_assignment.value.elts) == 1
+        and isinstance(failures_assignment.value.elts[0], ast.Name)
+        and failures_assignment.value.elts[0].id == handler.name
+    ):
+        return frozenset()
+    failure_name = failures_assignment.target.id
+    watcher_error_arm = no_completion.body[2]
+    if not (
+        isinstance(watcher_error_arm, ast.If)
+        and ast.unparse(watcher_error_arm.test) == f"{watcher_error_name} is not None"
+        and len(watcher_error_arm.body) == 1
+        and isinstance(watcher_error_arm.body[0], ast.Expr)
+        and ast.unparse(watcher_error_arm.body[0].value) == f"{failure_name}.append({watcher_error_name})"
+        and not watcher_error_arm.orelse
+        and isinstance(no_completion.body[4], ast.Expr)
+        and ast.unparse(no_completion.body[4].value) == f"_raise_lifecycle_originals({cancellation_name}, {failure_name})"
+    ):
+        return frozenset()
+    cleanup_try = no_completion.body[3]
+    if not (isinstance(cleanup_try, ast.Try) and len(cleanup_try.handlers) == 1 and cleanup_try.handlers[0].name is not None):
+        return frozenset()
+    cleanup_original_name = cleanup_try.handlers[0].name
+    expected_cleanup = ast.parse(
+        "try:\n"
+        "    with self._shutdown_events_lock:\n"
+        "        del self._shutdown_events[str(run.id)]\n"
+        f"except BaseException as {cleanup_original_name}:\n"
+        f"    {failure_name}.append({cleanup_original_name})\n"
+    ).body[0]
+    if ast.dump(cleanup_try, include_attributes=False) != ast.dump(expected_cleanup, include_attributes=False):
+        return frozenset()
+    # Bound callable lookups must still resolve on the proven receiver. In
+    # this reviewed method the only attribute/subscript mutations are the
+    # exact shutdown-map registration and deletion already checked above.
+    # Any other store/delete can replace an owned callable, carrier or input.
+    mutating_targets = [
+        node for node in ast.walk(member) if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    map_targets = [
+        node
+        for node in ast.walk(map_statement)
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    cleanup_targets = [
+        node
+        for node in ast.walk(cleanup_try)
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    if (
+        len(map_targets) != 1
+        or len(cleanup_targets) != 1
+        or not isinstance(map_targets[0], ast.Subscript)
+        or not isinstance(map_targets[0].ctx, ast.Store)
+        or not isinstance(cleanup_targets[0], ast.Subscript)
+        or not isinstance(cleanup_targets[0].ctx, ast.Del)
+        or {id(node) for node in mutating_targets} != {id(map_targets[0]), id(cleanup_targets[0])}
+    ):
+        return frozenset()
+    # Dynamic mutation or reflection can replace the checked method lookup
+    # without a direct AST store. This method uses none of those operations;
+    # fail closed rather than attempting to interpret arbitrary aliases.
+    reflective_names = {"setattr", "delattr", "vars", "getattr", "globals", "locals", "eval", "exec"}
+    reflective_methods = {"__setattr__", "__delattr__", "__getattribute__"}
+    if any(
+        (isinstance(node, ast.Attribute) and node.attr in reflective_names | reflective_methods | {"__dict__"})
+        or (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in reflective_names)
+        or (isinstance(node, ast.alias) and node.name.split(".")[-1] in reflective_names)
+        for node in ast.walk(member)
+    ):
+        return frozenset()
+    # A lexical ledger proves where every protected value is bound and read.
+    # Name(Store) alone misses Python's exception, import, match and definition
+    # bindings; a global declaration changes where an otherwise exact store
+    # writes. Walk nested scopes too and reject extra bindings conservatively.
+    bindings: dict[str, set[int]] = {}
+
+    def bind(name: str, node: ast.AST) -> None:
+        bindings.setdefault(name, set()).add(id(node))
+
+    declarations: set[str] = set()
+    deleted: set[str] = set()
+    for node in ast.walk(member):
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store):
+                bind(node.id, node)
+            elif isinstance(node.ctx, ast.Del):
+                deleted.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            bind(node.name, node)
+        elif isinstance(node, ast.arg):
+            bind(node.arg, node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node is not member:
+            bind(node.name, node)
+        elif isinstance(node, ast.alias):
+            bind(node.asname if node.asname is not None else node.name.split(".")[0], node)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+            bind(node.name, node)
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            bind(node.rest, node)
+        elif isinstance(node, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)):
+            bind(node.name, node)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            declarations.update(node.names)
+
+    watcher_test = watcher_error_arm.test
+    watcher_append = watcher_error_arm.body[0].value
+    cleanup_append = cleanup_try.handlers[0].body[0].value
+    lifecycle_raise = no_completion.body[4].value
+    if not (
+        isinstance(watcher_test, ast.Compare)
+        and isinstance(watcher_test.left, ast.Name)
+        and isinstance(watcher_append, ast.Call)
+        and isinstance(watcher_append.func, ast.Attribute)
+        and isinstance(watcher_append.func.value, ast.Name)
+        and len(watcher_append.args) == 1
+        and isinstance(watcher_append.args[0], ast.Name)
+        and isinstance(cleanup_append, ast.Call)
+        and isinstance(cleanup_append.func, ast.Attribute)
+        and isinstance(cleanup_append.func.value, ast.Name)
+        and len(cleanup_append.args) == 1
+        and isinstance(cleanup_append.args[0], ast.Name)
+        and isinstance(lifecycle_raise, ast.Call)
+        and len(lifecycle_raise.args) == 2
+        and all(isinstance(arg, ast.Name) for arg in lifecycle_raise.args)
+    ):
+        return frozenset()
+    # The event is a local owner carrier, while the receiver, run, lease and
+    # resume input are roots of the checked physical graph. Derive the root
+    # parameter set from actual checked call arguments, not example mutation
+    # names. Every such name must retain its original ast.arg binding.
+    event_assignment = member.body[watcher_index - 2]
+    if not (
+        isinstance(event_assignment, ast.Assign)
+        and len(event_assignment.targets) == 1
+        and isinstance(event_assignment.targets[0], ast.Name)
+        and isinstance(obligation.func, ast.Attribute)
+        and isinstance(obligation.func.value, ast.Name)
+        and isinstance(obligation.args[0], ast.Name)
+        and isinstance(watcher.keywords[0].value, ast.Attribute)
+        and isinstance(watcher.keywords[0].value.value, ast.Name)
+        and isinstance(partial_call.keywords[2].value, ast.Name)
+        and isinstance(watcher.args[1], ast.Name)
+        and isinstance(partial_call.args[3], ast.Name)
+    ):
+        return frozenset()
+    event_name = ast.unparse(event_assignment.targets[0])
+    event_reads_in_map = [
+        node for node in ast.walk(map_statement) if isinstance(node, ast.Name) and node.id == event_name and isinstance(node.ctx, ast.Load)
+    ]
+    if len(event_reads_in_map) != 1 or ast.unparse(watcher.args[1]) != event_name or ast.unparse(partial_call.args[3]) != event_name:
+        return frozenset()
+    root_uses = (
+        obligation.func.value,
+        obligation.args[0],
+        watcher.keywords[0].value.value,
+        partial_call.keywords[2].value,
+    )
+    root_names = {ast.unparse(node) for node in root_uses}
+    parameter_nodes = (
+        member.args.posonlyargs
+        + member.args.args
+        + member.args.kwonlyargs
+        + ([member.args.vararg] if member.args.vararg is not None else [])
+        + ([member.args.kwarg] if member.args.kwarg is not None else [])
+    )
+    parameter_origins = {arg.arg: {id(arg)} for arg in parameter_nodes}
+    if len(root_names) != len(root_uses) or root_names != parameter_origins.keys():
+        return frozenset()
+    # Stable origin is insufficient if a new consumer receives the receiver
+    # or one of the bound methods as a first-class value. Every receiver read
+    # must remain an attribute receiver in the reviewed method-use graph.
+    receiver_name = ast.unparse(root_uses[0])
+    receiver_counts: dict[str, int] = {}
+    for node in ast.walk(member):
+        if isinstance(node, ast.Name) and node.id == receiver_name and isinstance(node.ctx, ast.Load):
+            parent = parents[node]
+            if not isinstance(parent, ast.Attribute) or parent.value is not node:
+                return frozenset()
+            receiver_counts[parent.attr] = receiver_counts.get(parent.attr, 0) + 1
+    # This is the reviewed receiver-use inventory, not a list of forbidden
+    # examples. A new use of even an existing attribute changes the graph.
+    expected_receiver_counts = {
+        "_approval_inputs_from_frozen": 1,
+        "_create_loss_watcher": 1,
+        "_execution_obligation": 1,
+        "_join_loss_watcher": 1,
+        "_materialize_durable_cancellation": 1,
+        "_principal_is_active": 2,
+        "_record_recovery_refusal": 2,
+        "_restore_admitted_run": 2,
+        "_run_pipeline": 1,
+        "_session_service": 6,
+        "_settings": 1,
+        "_settle_admission_refusal": 1,
+        "_shutdown_events": 2,
+        "_shutdown_events_lock": 2,
+        "_submit_owned_pipeline": 1,
+        "_trained_operator_mode": 2,
+    }
+    if receiver_counts != expected_receiver_counts:
+        return frozenset()
+    # Check the complete in-method consumer path for each reviewed receiver
+    # and receiver-derived local read. A bound method, collaborator, settings
+    # object or restore result must reach only its original AST consumer.
+    # The path records each ancestor's field/index and the exact call function;
+    # one-for-one wrappers, inline captures, and new aliases all change it.
+    derived_names = {"session", "active", "approval_inputs", "permit", "restored"}
+    owned_roles = {"obligation", "watcher"}
+    derived_origins: dict[str, set[int]] = {name: set() for name in derived_names}
+    for assignment in ast.walk(member):
+        if isinstance(assignment, ast.Assign) and len(assignment.targets) == 1 and isinstance(assignment.targets[0], ast.Name):
+            target = assignment.targets[0]
+            value = assignment.value
+        elif isinstance(assignment, ast.AnnAssign) and isinstance(assignment.target, ast.Name):
+            target = assignment.target
+            value = assignment.value
+        else:
+            continue
+        if (
+            value is not None
+            and any(isinstance(part, ast.Name) and part.id == receiver_name and isinstance(part.ctx, ast.Load) for part in ast.walk(value))
+            and target.id not in owned_roles
+        ):
+            if target.id not in derived_names:
+                return frozenset()
+            derived_origins[target.id].add(id(target))
+        elif target.id in derived_names and isinstance(value, ast.Constant) and value.value is None:
+            derived_origins[target.id].add(id(target))
+    if {name: len(origins) for name, origins in derived_origins.items()} != {
+        "session": 3,
+        "active": 2,
+        "approval_inputs": 2,
+        "permit": 2,
+        "restored": 3,
+    }:
+        return frozenset()
+
+    def consumer_path(node: ast.AST) -> str:
+        segments: list[str] = []
+        while node is not member:
+            parent = parents[node]
+            position = None
+            for field, value in ast.iter_fields(parent):
+                if value is node:
+                    position = field
+                    break
+                if isinstance(value, list):
+                    for index, item in enumerate(value):
+                        if item is node:
+                            position = f"{field}[{index}]"
+                            break
+                    if position is not None:
+                        break
+            if position is None:
+                return "<unknown>"
+            label = type(parent).__name__
+            if isinstance(parent, ast.Attribute):
+                label += f"[{parent.attr}]"
+            if isinstance(parent, ast.Call):
+                label += f"[{ast.unparse(parent.func)}]"
+            segments.append(f"{label}.{position}")
+            node = parent
+            if isinstance(parent, ast.stmt):
+                break
+        return "/".join(segments)
+
+    actual_paths: dict[str, dict[str, int]] = {}
+    for node in ast.walk(member):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in derived_names | {receiver_name}:
+            by_path = actual_paths.setdefault(node.id, {})
+            path = consumer_path(node)
+            by_path[path] = by_path.get(path, 0) + 1
+    expected_paths = {
+        "active": {
+            "Call[run_sync_in_worker].args[0]/Await.value/UnaryOp.operand/BoolOp.values[1]/BoolOp.values[1]/BoolOp.values[1]/If.test": 2,
+            "Compare.left/BoolOp.values[0]/BoolOp.values[1]/BoolOp.values[1]/If.test": 2,
+        },
+        "approval_inputs": {
+            "Compare.left/If.test": 1,
+            "keyword.value/Call[self._session_service.assess_run_start_admission].keywords[1]/Await.value/Assign.value": 1,
+        },
+        "permit": {
+            "Attribute[execution_refusal].value/Compare.left/BoolOp.values[1]/If.test": 1,
+            "Attribute[state].value/Compare.left/BoolOp.values[0]/If.test": 1,
+            "Attribute[state].value/Compare.left/If.test": 1,
+        },
+        "restored": {
+            "Attribute[settings].value/Call[partial].args[4]/Call[self._submit_owned_pipeline].args[3]/Expr.value": 1,
+            "Attribute[settings].value/Call[run_sync_in_worker].args[1]/Await.value/Assign.value": 1,
+            "Compare.left/If.test": 1,
+            "keyword.value/Call[partial].keywords[3]/Call[self._submit_owned_pipeline].args[3]/Expr.value": 1,
+        },
+        "self": {
+            "Attribute[_approval_inputs_from_frozen].value/Call[run_sync_in_worker].args[0]/Await.value/Assign.value": 1,
+            "Attribute[_create_loss_watcher].value/Call[self._create_loss_watcher].func/Assign.value": 1,
+            "Attribute[_execution_obligation].value/Call[self._execution_obligation].func/Assign.value": 1,
+            "Attribute[_join_loss_watcher].value/Call[self._join_loss_watcher].func/Await.value/Assign.value": 1,
+            "Attribute[_materialize_durable_cancellation].value/Call[self._materialize_durable_cancellation].func/Await.value/Expr.value": 1,
+            "Attribute[_principal_is_active].value/Assign.value": 2,
+            "Attribute[_record_recovery_refusal].value/Call[self._record_recovery_refusal].func/Await.value/Expr.value": 2,
+            "Attribute[_restore_admitted_run].value/Call[self._restore_admitted_run].func/Await.value/Assign.value": 2,
+            "Attribute[_run_pipeline].value/Call[partial].args[0]/Call[self._submit_owned_pipeline].args[3]/Expr.value": 1,
+            "Attribute[_session_service].value/Attribute[assess_run_start_admission].value/Call[self._session_service.assess_run_start_admission].func/Await.value/Assign.value": 2,
+            "Attribute[_session_service].value/Attribute[get_session].value/Call[self._session_service.get_session].func/Await.value/Assign.value": 2,
+            "Attribute[_session_service].value/Attribute[session_operation_authority].value/Attribute[mutate].value/Call[run_sync_in_worker].args[0]/Await.value/Expr.value": 2,
+            "Attribute[_settings].value/Attribute[workflow_governance].value/Compare.left/If.test": 1,
+            "Attribute[_settle_admission_refusal].value/Call[self._settle_admission_refusal].func/Await.value/Expr.value": 1,
+            "Attribute[_shutdown_events].value/Subscript.value/Assign.targets[0]": 1,
+            "Attribute[_shutdown_events].value/Subscript.value/Delete.targets[0]": 1,
+            "Attribute[_shutdown_events_lock].value/withitem.context_expr/With.items[0]": 2,
+            "Attribute[_submit_owned_pipeline].value/Call[self._submit_owned_pipeline].func/Expr.value": 1,
+            "Attribute[_trained_operator_mode].value/UnaryOp.operand/BoolOp.values[0]/BoolOp.values[1]/If.test": 2,
+        },
+        "session": {
+            "Attribute[archived_at].value/Compare.left/BoolOp.values[0]/If.test": 2,
+            "Attribute[auth_provider_type].value/Call[partial].args[6]/Call[self._submit_owned_pipeline].args[3]/Expr.value": 1,
+            "Attribute[auth_provider_type].value/keyword.value/Call[self._restore_admitted_run].keywords[1]/Await.value/Assign.value": 2,
+            "Attribute[user_id].value/Call[partial].args[5]/Call[self._submit_owned_pipeline].args[3]/Expr.value": 1,
+            "Attribute[user_id].value/Call[run_sync_in_worker].args[1]/Await.value/UnaryOp.operand/BoolOp.values[1]/BoolOp.values[1]/BoolOp.values[1]/If.test": 2,
+            "Attribute[user_id].value/keyword.value/Call[run_sync_in_worker].keywords[0]/Await.value/Assign.value": 1,
+            "Attribute[user_id].value/keyword.value/Call[self._restore_admitted_run].keywords[0]/Await.value/Assign.value": 2,
+            "Compare.left/If.test": 1,
+        },
+    }
+    if actual_paths != expected_paths:
+        return frozenset()
+    protected_callable_lookups = (obligation.func, watcher.func, submit.func, join.func, partial_call.args[0])
+    if not all(
+        isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == receiver_name
+        for node in protected_callable_lookups
+    ):
+        return frozenset()
+    lookup_names = {node.attr for node in protected_callable_lookups if isinstance(node, ast.Attribute)}
+    if len(lookup_names) != len(protected_callable_lookups):
+        return frozenset()
+    seen_lookups = {
+        id(node)
+        for node in ast.walk(member)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == receiver_name
+        and node.attr in lookup_names
+        and isinstance(node.ctx, ast.Load)
+    }
+    if seen_lookups != {id(node) for node in protected_callable_lookups}:
+        return frozenset()
+    protected_origins = {
+        "obligation": {id(parents[obligation].targets[0])},
+        "watcher": {id(parents[watcher].targets[0])},
+        event_name: {id(event_assignment.targets[0])},
+        handler.name: {id(handler)},
+        cancellation_name: {id(join_assignment.targets[0].elts[0])},
+        watcher_error_name: {id(join_assignment.targets[0].elts[1])},
+        failure_name: {id(failures_assignment.target)},
+        cleanup_original_name: {id(cleanup_try.handlers[0])},
+    }
+    if len(protected_origins) != 8 or protected_origins.keys() & root_names:
+        return frozenset()
+    protected_reads = {
+        "obligation": {id(submit_obligation), id(condition.operand.value)},
+        "watcher": {id(submit_watcher), id(join_watcher)},
+        event_name: {id(event_reads_in_map[0]), id(watcher.args[1]), id(partial_call.args[3])},
+        handler.name: {id(failures_assignment.value.elts[0])},
+        cancellation_name: {id(lifecycle_raise.args[0])},
+        watcher_error_name: {id(watcher_test.left), id(watcher_append.args[0])},
+        failure_name: {id(watcher_append.func.value), id(cleanup_append.func.value), id(lifecycle_raise.args[1])},
+        cleanup_original_name: {id(cleanup_append.args[0])},
+    }
+    if len(protected_reads) != 8:
+        return frozenset()
+
+    # These names are taken from helper calls, exception types and the list
+    # annotation in the *verified* graph. None may become a local binding or
+    # be captured by an owned role. This protects partial/str/raiser/type
+    # lookup without maintaining a list of sample collision strings.
+    dependency_names = {call.func.id for call in ast.walk(submit_try) if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)}
+    dependency_names.update(
+        node.id
+        for expression in (handler.type, cleanup_try.handlers[0].type, failures_assignment.annotation)
+        for node in ast.walk(expression)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    )
+    if dependency_names & (protected_origins.keys() | root_names):
+        return frozenset()
+    if any(name in bindings or name in declarations or name in deleted for name in dependency_names):
+        return frozenset()
+    # Check the ledger against Python's own lexical scope classification.
+    # A newly supported binding form that changes a helper into a local must
+    # not be silently treated as the original module/built-in dependency.
+    import symtable
+
+    try:
+        module_symbols = symtable.symtable(ast.unparse(member), "<recovery-lease-proof>", "exec")
+        function_symbols = module_symbols.get_children()
+        if len(function_symbols) != 1 or function_symbols[0].get_name() != member.name:
+            return frozenset()
+        lexical_scope = function_symbols[0]
+        for name in protected_origins:
+            symbol = lexical_scope.lookup(name)
+            if not symbol.is_local() or symbol.is_global() or symbol.is_nonlocal() or symbol.is_parameter():
+                return frozenset()
+        for name in root_names:
+            symbol = lexical_scope.lookup(name)
+            if not symbol.is_local() or symbol.is_global() or symbol.is_nonlocal() or not symbol.is_parameter():
+                return frozenset()
+        for name in dependency_names:
+            symbol = lexical_scope.lookup(name)
+            if symbol.is_local() or symbol.is_parameter() or symbol.is_nonlocal():
+                return frozenset()
+    except (KeyError, SyntaxError, ValueError):
+        return frozenset()
+    for name, origins in protected_origins.items():
+        reads = {id(node) for node in ast.walk(member) if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)}
+        if bindings.get(name) != origins or reads != protected_reads[name] or name in declarations or name in deleted:
+            return frozenset()
+    for name, origins in derived_origins.items():
+        if bindings.get(name) != origins or name in declarations or name in deleted:
+            return frozenset()
+    for name, origins in parameter_origins.items():
+        if bindings.get(name) != origins or name in declarations or name in deleted:
+            return frozenset()
+    # The semantic owner proof above checks the five physical edges, live
+    # bindings, cleanup and exact consumer paths. Close the remaining
+    # in-method effect surface by comparing the entire executed source shape
+    # with the reviewed method. Only independently proved inert fresh facts
+    # and collision-free cleanup role alpha-renames are canonicalized. Thus a
+    # new class/global consumer, call, with statement, comprehension or alias
+    # cannot ride on the fact that it avoids the receiver-use inventory.
+    import copy
+    import hashlib
+
+    inert_indices: set[int] = set()
+    for index in range(obligation_index + 1, submit_index):
+        statement = member.body[index]
+        if not inert_fact(statement):
+            continue
+        target = statement.targets[0] if isinstance(statement, ast.Assign) else statement.target
+        assert isinstance(target, ast.Name)
+        if (
+            target.id in declarations
+            or target.id in deleted
+            or target.id in parameter_origins
+            or target.id in protected_origins
+            or target.id in derived_origins
+            or target.id in dependency_names
+            or bindings.get(target.id) != {id(target)}
+        ):
+            return frozenset()
+        inert_indices.add(index)
+    canonical = copy.deepcopy(member)
+    canonical.body = [statement for index, statement in enumerate(canonical.body) if index not in inert_indices]
+    alpha_roles = {
+        handler.name: "primary",
+        cancellation_name: "cancellations",
+        watcher_error_name: "watcher_error",
+        failure_name: "failures",
+        cleanup_original_name: "original",
+    }
+    if len(alpha_roles) != 5:
+        return frozenset()
+    for node in ast.walk(canonical):
+        if isinstance(node, ast.Name) and node.id in alpha_roles:
+            node.id = alpha_roles[node.id]
+        elif isinstance(node, ast.ExceptHandler) and node.name in alpha_roles:
+            node.name = alpha_roles[node.name]
+    reviewed_shape = "1520d733a3b0e819d7d529f549f7569b3892869a83c47326c62693879829015b"
+    if hashlib.sha256(ast.dump(canonical, include_attributes=False).encode()).hexdigest() != reviewed_shape:
+        return frozenset()
+    return frozenset(
+        id(node)
+        for node in (
+            obligation.args[0],
+            watcher.args[0],
+            submit.args[1],
+            partial_call.keywords[0].value,
+            join.args[1],
+        )
+    )
+
+
 def _caller_lease_escapes(member: _FunctionNode) -> bool:
     """Keep the transferred lease within the reviewed execution consumers."""
+    recovery_edges = _exact_recovery_lease_owner_edges(member)
     parents = {child: node for node in ast.walk(member) for child in ast.iter_child_nodes(node)}
     positional_consumers = {
         "self._signal_shutdown_on_operation_loss": 0,
@@ -2011,6 +3098,8 @@ def _caller_lease_escapes(member: _FunctionNode) -> bool:
     }
     for node in ast.walk(member):
         if not (isinstance(node, ast.Name) and node.id == "session_operation_lease" and isinstance(node.ctx, ast.Load)):
+            continue
+        if id(node) in recovery_edges:
             continue
         consumer = parents[node]
         if isinstance(consumer, ast.Attribute) and consumer.value is node and isinstance(consumer.ctx, ast.Load):
@@ -3376,10 +4465,32 @@ async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_an
     finally:
         worker_release.set()
         blocked_authority.renew_allowed.set()
-        await asyncio.to_thread(blocker.result, 5)
-        await asyncio.to_thread(pool.shutdown, True)
-        if successor is not None:
-            authority.release(successor)
+        primary = sys.exception()
+        cleanup_failures: list[BaseException] = []
+        try:
+            if successor is not None:
+                authority.release(successor)
+        except BaseException as original:
+            cleanup_failures.append(original)
+        try:
+            await asyncio.to_thread(blocker.result, 5)
+        except BaseException as original:
+            cleanup_failures.append(original)
+        pool_join = asyncio.create_task(asyncio.to_thread(pool.shutdown, True))
+        completed, _ = await asyncio.wait({pool_join}, timeout=5)
+        if pool_join not in completed:
+            cleanup_failures.append(TimeoutError("Real executor join remains physically unresolved after successor release"))
+        else:
+            try:
+                pool_join.result()
+            except BaseException as original:
+                cleanup_failures.append(original)
+        if cleanup_failures:
+            if primary is not None:
+                raise BaseExceptionGroup("Takeover assertion and physical cleanup failed", [primary, *cleanup_failures]) from None
+            if len(cleanup_failures) == 1:
+                raise cleanup_failures[0]
+            raise BaseExceptionGroup("Takeover physical cleanup failed", cleanup_failures) from None
 
 
 @pytest.mark.asyncio
@@ -3534,3 +4645,27 @@ def _envelope_blob_verifier_case(
 )
 def test_envelope_blob_verifier_callback_requires_exact_worker_and_restore_consumer(case_id: str, case: _EdgeControlCase) -> None:
     _assert_edge_control(case)
+
+
+if __name__ == "__main__":
+    failure_types = {"OSError": OSError, "AuditIntegrityError": AuditIntegrityError, "FrameworkBugError": FrameworkBugError}
+    if len(sys.argv) == 6 and sys.argv[1] == "--failed-http-release-child":
+        cleanup_type = failure_types[sys.argv[3]]
+        logger_type = None if sys.argv[4] == "None" else failure_types[sys.argv[4]]
+        assert sys.argv[5] in {"True", "False"}
+        child_root = Path(sys.argv[2])
+        asyncio.run(
+            _child_with_failure_checkpoint(
+                child_root, _failed_http_release_child(child_root, cleanup_type, logger_type, sys.argv[5] == "True")
+            )
+        )
+    elif len(sys.argv) == 5 and sys.argv[1] == "--failed-shutdown-release-child":
+        assert sys.argv[3] in {"RuntimeError", "AuditIntegrityError", "FrameworkBugError"}
+        assert sys.argv[4] in {"True", "False"}
+        shutdown_type = RuntimeError if sys.argv[3] == "RuntimeError" else failure_types[sys.argv[3]]
+        child_root = Path(sys.argv[2])
+        asyncio.run(
+            _child_with_failure_checkpoint(child_root, _failed_shutdown_release_child(child_root, shutdown_type, sys.argv[4] == "True"))
+        )
+    else:
+        raise AssertionError("unknown exact owned execution child")

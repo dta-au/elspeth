@@ -5796,7 +5796,7 @@ _reserve_CANCEL_ROUTE_SHA256 = "c22e0829551dc6c7120ca773d7e5924ec3f8db3fa770c1b7
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
     "src/elspeth/web/sessions/composer_turn.py": "52b167d070ae13ed6ccc83ef2a92c7fff8bad23eed5dfbb29db07da43b3a72b5",
-    "src/elspeth/web/sessions/composer_async_worker.py": "6960be46b3800be5adc154b71324c19fa794012133d32258344ca7c9f5874aa8",
+    "src/elspeth/web/sessions/composer_async_worker.py": "7321f41aee1ccbc19181e282e4fe7767f47dd710fd2589c4aa1719678344ef37",
 }
 
 
@@ -6238,6 +6238,94 @@ def _reserve_pure_class_check(call, resolver, selected):
     return qualified == "typing.cast" and call.args[0] is selected
 
 
+def _reserve_private_key(name, origin):
+    if not name.startswith("__") or name.endswith("__") or "." in name:
+        return name
+    current = origin
+    while current is not None:
+        parent = getattr(current, "_landscape_parent", None)
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.TypeAlias)) and current in parent.type_params:
+            return None
+        if isinstance(parent, ast.ClassDef) and current in parent.body:
+            owner = parent.name.lstrip("_")
+            return "_" + owner + name if owner else name
+        current = parent
+    return name
+
+
+def _reserve_private_binding_facts(tree):
+    """Summarize the exact compiler-private binding cases for one parsed module."""
+
+    unknown = False
+    collisions = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names = [node.id]
+        elif isinstance(node, ast.arg):
+            names = [node.arg]
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            or (isinstance(node, ast.ExceptHandler) and node.name is not None)
+            or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None)
+        ):
+            names = [node.name]
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            names = [node.rest]
+        elif isinstance(node, ast.Import):
+            names = [alias.asname or alias.name.partition(".")[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [alias.asname or alias.name for alias in node.names if alias.name != "*"]
+        elif isinstance(node, ast.type_param):
+            names = [node.name]
+        else:
+            names = []
+        for name in names:
+            transformed = _reserve_private_key(name, node)
+            if transformed is None:
+                unknown = True
+            elif transformed != name:
+                collisions.add(transformed)
+    return unknown, frozenset(collisions)
+
+
+def _reserve_private_selector_unknown(expression, facts_by_tree):
+    tree = expression
+    while getattr(tree, "_landscape_parent", None) is not None:
+        tree = tree._landscape_parent
+    if not isinstance(tree, ast.Module):
+        return True
+    if isinstance(expression, ast.Name):
+        supplied_name = expression.id
+    elif isinstance(expression, ast.arg):
+        supplied_name = expression.arg
+    elif isinstance(expression, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        supplied_name = expression.name
+    else:
+        return True
+    effective = _reserve_private_key(supplied_name, expression)
+    if effective is None or effective != supplied_name:
+        return True
+    facts = facts_by_tree.get(id(tree))
+    if facts is None:
+        return True
+    unknown, collisions = facts
+    return unknown or effective in collisions
+
+
+def _reserve_private_name_unknown(expression, facts_by_tree):
+    tree = expression
+    while getattr(tree, "_landscape_parent", None) is not None:
+        tree = tree._landscape_parent
+    facts = facts_by_tree.get(id(tree))
+    if facts is None:
+        return True
+    effective = _reserve_private_key(expression.id, expression)
+    if effective is None or effective != expression.id:
+        return True
+    unknown, collisions = facts
+    return unknown or effective in collisions
+
+
 class _reserve_ReserveProof:
     def __init__(self, units):
         self.units = tuple(units)
@@ -6546,8 +6634,14 @@ class _reserve_ReserveProof:
         for methods in carrier_methods.values():
             inspected_methods.update(methods)
         carrier_callable_names = set().union(*carrier_methods.values()) - {"required_work", "__init__"}
+        self._private_binding_facts = {}
         for unit in self.units:
             r = _resolver_for_unit(unit)
+
+            # These are the exact binding cases checked by each private-name
+            # query below. Facts belong to this one parsed SourceUnit; no
+            # result can survive a later source mutation or a new proof run.
+            self._private_binding_facts[id(unit.tree)] = _reserve_private_binding_facts(unit.tree)
 
             lexical_nodes = {}
             binding_events = {}
@@ -6876,71 +6970,7 @@ class _reserve_ReserveProof:
             closed_reader = closed_reader_key in writer_recipes and stable_ast_dump(unit.tree) == writer_recipes[closed_reader_key]
 
             def finite_local_tuple(expression, use, seen=frozenset(), r=r):
-                def compiler_private_selector_unknown(expression):
-                    tree = expression
-                    while getattr(tree, "_landscape_parent", None) is not None:
-                        tree = tree._landscape_parent
-                    if not isinstance(tree, ast.Module):
-                        return True
-                    if isinstance(expression, ast.Name):
-                        supplied_name = expression.id
-                    elif isinstance(expression, ast.arg):
-                        supplied_name = expression.arg
-                    elif isinstance(expression, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        supplied_name = expression.name
-                    else:
-                        return True
-
-                    def private_key(name, origin):
-                        if not name.startswith("__") or name.endswith("__") or "." in name:
-                            return name
-                        current = origin
-                        while current is not None:
-                            parent = getattr(current, "_landscape_parent", None)
-                            if (
-                                isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.TypeAlias))
-                                and current in parent.type_params
-                            ):
-                                return None
-                            if isinstance(parent, ast.ClassDef) and current in parent.body:
-                                owner = parent.name.lstrip("_")
-                                return "_" + owner + name if owner else name
-                            current = parent
-                        return name
-
-                    effective = private_key(supplied_name, expression)
-                    if effective is None or effective != supplied_name:
-                        # Never replay an unmangled supplier for a compiler-transformed read.
-                        return True
-                    for node in ast.walk(tree):
-                        names = []
-                        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                            names = [node.id]
-                        elif isinstance(node, ast.arg):
-                            names = [node.arg]
-                        elif (
-                            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                            or (isinstance(node, ast.ExceptHandler) and node.name is not None)
-                            or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None)
-                        ):
-                            names = [node.name]
-                        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
-                            names = [node.rest]
-                        elif isinstance(node, ast.Import):
-                            names = [alias.asname or alias.name.partition(".")[0] for alias in node.names]
-                        elif isinstance(node, ast.ImportFrom):
-                            names = [alias.asname or alias.name for alias in node.names if alias.name != "*"]
-                        elif isinstance(node, ast.type_param):
-                            names = [node.name]
-                        for name in names:
-                            transformed = private_key(name, node)
-                            if transformed is None or (transformed != name and transformed == effective):
-                                # Unknown possible writes/formals/imports are not evidence that
-                                # an unchanged textual read still refers to its old supplier.
-                                return True
-                    return False
-
-                if isinstance(expression, ast.Name) and compiler_private_selector_unknown(expression):
+                if isinstance(expression, ast.Name) and _reserve_private_selector_unknown(expression, self._private_binding_facts):
                     return {None}
                 if isinstance(expression, ast.Tuple) and all(
                     isinstance(value, ast.Constant) and type(value.value) is str for value in expression.elts
@@ -7000,76 +7030,12 @@ class _reserve_ReserveProof:
                 return {None}
 
             def finite_closed_parameter(function, name, seen, r=r, unit=unit):
-                def compiler_private_selector_unknown(expression):
-                    tree = expression
-                    while getattr(tree, "_landscape_parent", None) is not None:
-                        tree = tree._landscape_parent
-                    if not isinstance(tree, ast.Module):
-                        return True
-                    if isinstance(expression, ast.Name):
-                        supplied_name = expression.id
-                    elif isinstance(expression, ast.arg):
-                        supplied_name = expression.arg
-                    elif isinstance(expression, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        supplied_name = expression.name
-                    else:
-                        return True
-
-                    def private_key(name, origin):
-                        if not name.startswith("__") or name.endswith("__") or "." in name:
-                            return name
-                        current = origin
-                        while current is not None:
-                            parent = getattr(current, "_landscape_parent", None)
-                            if (
-                                isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.TypeAlias))
-                                and current in parent.type_params
-                            ):
-                                return None
-                            if isinstance(parent, ast.ClassDef) and current in parent.body:
-                                owner = parent.name.lstrip("_")
-                                return "_" + owner + name if owner else name
-                            current = parent
-                        return name
-
-                    effective = private_key(supplied_name, expression)
-                    if effective is None or effective != supplied_name:
-                        # Never replay an unmangled supplier for a compiler-transformed read.
-                        return True
-                    for node in ast.walk(tree):
-                        names = []
-                        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                            names = [node.id]
-                        elif isinstance(node, ast.arg):
-                            names = [node.arg]
-                        elif (
-                            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                            or (isinstance(node, ast.ExceptHandler) and node.name is not None)
-                            or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None)
-                        ):
-                            names = [node.name]
-                        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
-                            names = [node.rest]
-                        elif isinstance(node, ast.Import):
-                            names = [alias.asname or alias.name.partition(".")[0] for alias in node.names]
-                        elif isinstance(node, ast.ImportFrom):
-                            names = [alias.asname or alias.name for alias in node.names if alias.name != "*"]
-                        elif isinstance(node, ast.type_param):
-                            names = [node.name]
-                        for name in names:
-                            transformed = private_key(name, node)
-                            if transformed is None or (transformed != name and transformed == effective):
-                                # Unknown possible writes/formals/imports are not evidence that
-                                # an unchanged textual read still refers to its old supplier.
-                                return True
-                    return False
-
                 parameters_with_origins = (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs)
                 parameter_origin = next((argument for argument in parameters_with_origins if argument.arg == name), None)
                 if (
                     parameter_origin is None
-                    or compiler_private_selector_unknown(function)
-                    or compiler_private_selector_unknown(parameter_origin)
+                    or _reserve_private_selector_unknown(function, self._private_binding_facts)
+                    or _reserve_private_selector_unknown(parameter_origin, self._private_binding_facts)
                 ):
                     return {None}
                 if function.decorator_list or function.type_params:
@@ -7257,71 +7223,7 @@ class _reserve_ReserveProof:
                 return values if found and values else {None}
 
             def finite_selector_values(expression, use, seen=frozenset(), r=r):
-                def compiler_private_selector_unknown(expression):
-                    tree = expression
-                    while getattr(tree, "_landscape_parent", None) is not None:
-                        tree = tree._landscape_parent
-                    if not isinstance(tree, ast.Module):
-                        return True
-                    if isinstance(expression, ast.Name):
-                        supplied_name = expression.id
-                    elif isinstance(expression, ast.arg):
-                        supplied_name = expression.arg
-                    elif isinstance(expression, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        supplied_name = expression.name
-                    else:
-                        return True
-
-                    def private_key(name, origin):
-                        if not name.startswith("__") or name.endswith("__") or "." in name:
-                            return name
-                        current = origin
-                        while current is not None:
-                            parent = getattr(current, "_landscape_parent", None)
-                            if (
-                                isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.TypeAlias))
-                                and current in parent.type_params
-                            ):
-                                return None
-                            if isinstance(parent, ast.ClassDef) and current in parent.body:
-                                owner = parent.name.lstrip("_")
-                                return "_" + owner + name if owner else name
-                            current = parent
-                        return name
-
-                    effective = private_key(supplied_name, expression)
-                    if effective is None or effective != supplied_name:
-                        # Never replay an unmangled supplier for a compiler-transformed read.
-                        return True
-                    for node in ast.walk(tree):
-                        names = []
-                        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                            names = [node.id]
-                        elif isinstance(node, ast.arg):
-                            names = [node.arg]
-                        elif (
-                            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                            or (isinstance(node, ast.ExceptHandler) and node.name is not None)
-                            or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None)
-                        ):
-                            names = [node.name]
-                        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
-                            names = [node.rest]
-                        elif isinstance(node, ast.Import):
-                            names = [alias.asname or alias.name.partition(".")[0] for alias in node.names]
-                        elif isinstance(node, ast.ImportFrom):
-                            names = [alias.asname or alias.name for alias in node.names if alias.name != "*"]
-                        elif isinstance(node, ast.type_param):
-                            names = [node.name]
-                        for name in names:
-                            transformed = private_key(name, node)
-                            if transformed is None or (transformed != name and transformed == effective):
-                                # Unknown possible writes/formals/imports are not evidence that
-                                # an unchanged textual read still refers to its old supplier.
-                                return True
-                    return False
-
-                if isinstance(expression, ast.Name) and compiler_private_selector_unknown(expression):
+                if isinstance(expression, ast.Name) and _reserve_private_selector_unknown(expression, self._private_binding_facts):
                     return {None}
                 if isinstance(expression, ast.Constant) and type(expression.value) is str:
                     return {expression.value}
@@ -7391,58 +7293,7 @@ class _reserve_ReserveProof:
                 if isinstance(expression, ast.IfExp):
                     return reflection_forms(expression.body, use, seen) | reflection_forms(expression.orelse, use, seen)
                 if isinstance(expression, ast.Name):
-
-                    def compiler_private_binding_unknown(tree, expression):
-                        def private_key(name, origin):
-                            if not name.startswith("__") or name.endswith("__") or "." in name:
-                                return name
-                            current = origin
-                            while current is not None:
-                                parent = getattr(current, "_landscape_parent", None)
-                                if (
-                                    isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.TypeAlias))
-                                    and current in parent.type_params
-                                ):
-                                    return None
-                                if isinstance(parent, ast.ClassDef) and current in parent.body:
-                                    owner = parent.name.lstrip("_")
-                                    return "_" + owner + name if owner else name
-                                current = parent
-                            return name
-
-                        effective = private_key(expression.id, expression)
-                        if effective is None or effective != expression.id:
-                            # Never replay an unmangled supplier for a compiler-transformed read.
-                            return True
-                        for node in ast.walk(tree):
-                            names = []
-                            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                                names = [node.id]
-                            elif isinstance(node, ast.arg):
-                                names = [node.arg]
-                            elif (
-                                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                                or (isinstance(node, ast.ExceptHandler) and node.name is not None)
-                                or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None)
-                            ):
-                                names = [node.name]
-                            elif isinstance(node, ast.MatchMapping) and node.rest is not None:
-                                names = [node.rest]
-                            elif isinstance(node, ast.Import):
-                                names = [alias.asname or alias.name.partition(".")[0] for alias in node.names]
-                            elif isinstance(node, ast.ImportFrom):
-                                names = [alias.asname or alias.name for alias in node.names if alias.name != "*"]
-                            elif isinstance(node, ast.type_param):
-                                names = [node.name]
-                            for name in names:
-                                transformed = private_key(name, node)
-                                if transformed is None or (transformed != name and transformed == effective):
-                                    # Unknown possible writes/formals/imports are not evidence that
-                                    # an unchanged textual read still refers to its old supplier.
-                                    return True
-                        return False
-
-                    if compiler_private_binding_unknown(unit.tree, expression):
+                    if _reserve_private_name_unknown(expression, self._private_binding_facts):
                         return {None}
 
                     def compiler_binding_unknown(tree, expression, use, lexical_scope):
@@ -7692,57 +7543,7 @@ class _reserve_ReserveProof:
                 return {None}
 
             def possible_reflection(expression, use, seen=frozenset(), unit=unit, r=r):
-                def compiler_private_binding_unknown(tree, expression):
-                    def private_key(name, origin):
-                        if not name.startswith("__") or name.endswith("__") or "." in name:
-                            return name
-                        current = origin
-                        while current is not None:
-                            parent = getattr(current, "_landscape_parent", None)
-                            if (
-                                isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.TypeAlias))
-                                and current in parent.type_params
-                            ):
-                                return None
-                            if isinstance(parent, ast.ClassDef) and current in parent.body:
-                                owner = parent.name.lstrip("_")
-                                return "_" + owner + name if owner else name
-                            current = parent
-                        return name
-
-                    effective = private_key(expression.id, expression)
-                    if effective is None or effective != expression.id:
-                        # Never replay an unmangled supplier for a compiler-transformed read.
-                        return True
-                    for node in ast.walk(tree):
-                        names = []
-                        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                            names = [node.id]
-                        elif isinstance(node, ast.arg):
-                            names = [node.arg]
-                        elif (
-                            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                            or (isinstance(node, ast.ExceptHandler) and node.name is not None)
-                            or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None)
-                        ):
-                            names = [node.name]
-                        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
-                            names = [node.rest]
-                        elif isinstance(node, ast.Import):
-                            names = [alias.asname or alias.name.partition(".")[0] for alias in node.names]
-                        elif isinstance(node, ast.ImportFrom):
-                            names = [alias.asname or alias.name for alias in node.names if alias.name != "*"]
-                        elif isinstance(node, ast.type_param):
-                            names = [node.name]
-                        for name in names:
-                            transformed = private_key(name, node)
-                            if transformed is None or (transformed != name and transformed == effective):
-                                # Unknown possible writes/formals/imports are not evidence that
-                                # an unchanged textual read still refers to its old supplier.
-                                return True
-                    return False
-
-                if isinstance(expression, ast.Name) and compiler_private_binding_unknown(unit.tree, expression):
+                if isinstance(expression, ast.Name) and _reserve_private_name_unknown(expression, self._private_binding_facts):
                     return True
                 if r.qualified_name(expression, use=use) in {"getattr", "builtins.getattr"}:
                     return True

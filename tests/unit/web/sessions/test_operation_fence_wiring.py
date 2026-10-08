@@ -53,7 +53,7 @@ from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import protocol as sessions_protocol
 from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
-from elspeth.web.sessions.composer_turn import run_composer_turn
+from elspeth.web.sessions.composer_turn import _run_composer_turn, run_composer_turn
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import RunEventRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes import interpretation as interpretation_routes
@@ -84,7 +84,7 @@ def test_run_admission_requires_the_exact_session_context(owner: type[Any], meth
 
 def _assert_composer_turn_authority(source: str) -> None:
     tree = ast.parse(textwrap.dedent(source))
-    function = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_composer_turn")
+    function = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_composer_turn")
     guard = next(
         node
         for node in ast.walk(function)
@@ -118,7 +118,7 @@ def _assert_composer_turn_authority(source: str) -> None:
 
 
 def test_detached_turn_checks_exact_adopted_authority_before_state_or_message_access() -> None:
-    _assert_composer_turn_authority(inspect.getsource(run_composer_turn))
+    _assert_composer_turn_authority(inspect.getsource(_run_composer_turn))
 
 
 @pytest.mark.parametrize(
@@ -131,7 +131,7 @@ def test_detached_turn_checks_exact_adopted_authority_before_state_or_message_ac
     ],
 )
 def test_detached_turn_authority_control_rejects_changed_fence_or_child_owner(before: str, after: str) -> None:
-    source = inspect.getsource(run_composer_turn)
+    source = inspect.getsource(_run_composer_turn)
     assert before in source
     _assert_composer_turn_authority(source)
     with pytest.raises((AssertionError, StopIteration)):

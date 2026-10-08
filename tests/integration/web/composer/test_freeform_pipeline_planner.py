@@ -597,11 +597,11 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
     worker_started = asyncio.Event()
     release_worker = threading.Event()
     worker_finished = asyncio.Event()
-    original_run_sync = sessions._run_sync  # type: ignore[attr-defined]
+    original_run_composer_sql = sessions._run_composer_sql
 
     async def pause_create_worker(func: Any, *args: Any, **kwargs: Any) -> Any:
-        if "create_pipeline_composition_proposal.<locals>._sync" not in func.__qualname__:
-            return await original_run_sync(func, *args, **kwargs)
+        if func.__qualname__ != "SessionServiceImpl._create_pipeline_composition_proposal.<locals>._sync":
+            return await original_run_composer_sql(func, *args, **kwargs)
 
         def paused_create() -> Any:
             loop.call_soon_threadsafe(worker_started.set)
@@ -612,9 +612,9 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
             finally:
                 loop.call_soon_threadsafe(worker_finished.set)
 
-        return await original_run_sync(paused_create)
+        return await original_run_composer_sql(paused_create)
 
-    monkeypatch.setattr(sessions, "_run_sync", pause_create_worker)
+    monkeypatch.setattr(sessions, "_run_composer_sql", pause_create_worker)
     compose_task = asyncio.create_task(
         composer.compose(
             "Build a CSV to JSONL pipeline.",

@@ -982,8 +982,18 @@ async def test_terminal_failure_required_coordinator_observes_each_actual_attemp
         return result
 
     monkeypatch.setattr(service_module, "settle_composer_operation_on_connection", lose_first_ack)
-    terminal = await service.fail_composer_async_operation(running, failure=failed(), required_work=coordinator)
+    projection = coordinator.reserve(
+        RequiredWorkSource.TERMINAL_FAILURE_PROJECTION,
+        transition_ordinal=0,
+        semantic_ordinal=0,
+        recurrence_ordinal=0,
+    )
+    terminal = await service.fail_composer_async_operation(
+        running, failure=failed(), required_work=coordinator, failure_projection_work=projection
+    )
+    projection.begin_projection()
     assert terminal.status == "failed" and authority.get(session_id=sid, operation_id=record.operation_id) == terminal
+    projection.complete_owned()
     coordinator.assert_completed()
     terminal_tickets = [ticket for ticket in coordinator.tickets if ticket.key.source is RequiredWorkSource.TERMINAL_FAILURE_SQL]
     assert [ticket.key.sql_attempt_ordinal for ticket in terminal_tickets] == ([0, 1] if retry else [0])

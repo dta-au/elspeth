@@ -594,7 +594,7 @@ async def test_actual_recovery_preadmits_and_closes_missing_baseline_or_late_aut
 async def test_actual_pipeline_decision_refuses_copied_or_wrong_kind_context_without_submission(actual):
     obligation, lease = await actual.lease(_insert_session(actual.sessions._engine))
     original = lease.context
-    copies = [replace(original), replace(original, operation_kind=SessionOperationKind.VALIDATE)]
+    copies = [replace(original), replace(original, operation_kind=SessionOperationKind.COMPOSE)]
     for context in copies:
         assert context is not original
         with pytest.raises(AuditIntegrityError), obligation.pipeline_submission_decision(context):

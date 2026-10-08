@@ -2766,11 +2766,11 @@ class ExecutionServiceImpl:
             except ExecutionEnvelopeRefused as exc:
                 await self._record_recovery_refusal(run.id, session_operation_lease, exc)
                 return False
+        assert run.pipeline_yaml is not None
         shutdown_event = threading.Event()
         with self._shutdown_events_lock:
             self._shutdown_events[str(run.id)] = shutdown_event
         watcher = self._create_loss_watcher(session_operation_lease, shutdown_event, run_id=run.id)
-        assert run.pipeline_yaml is not None
         try:
             self._submit_owned_pipeline(
                 obligation,
