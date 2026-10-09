@@ -1,0 +1,1 @@
+"from elspeth.web.process_recovery import ProcessRecovery as Recovery\nRecovery.required_generation_expired = foreign\n"

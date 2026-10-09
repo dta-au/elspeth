@@ -1,0 +1,1 @@
+"def benign(worker):\n    worker._INSTANCE_DRAINING = 'ordinary local argument'\n"

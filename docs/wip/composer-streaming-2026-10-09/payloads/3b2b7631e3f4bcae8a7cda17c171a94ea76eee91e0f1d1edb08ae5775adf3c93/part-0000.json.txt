@@ -1,0 +1,1 @@
+"import importlib\nimportlib.import_module('elspeth.web.async_workers')._INSTANCE_DRAINING = foreign\n"

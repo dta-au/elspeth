@@ -1,0 +1,1 @@
+"#!/usr/bin/env bash\nset -u\ncd <TASK_ROOT> || exit 1\npython3 run_admin_frontend_native_root_1.py > root-admin-frontend-native-detached-1/controller.log 2>&1\nresult=$?\nprintf '%s\\n' \"$result\" > root-admin-frontend-native-detached-1/.exit\nprintf 'complete\\n' > root-admin-frontend-native-detached-1/.done\nexit \"$result\"\n"

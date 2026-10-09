@@ -1,0 +1,1 @@
+"class Ordinary:\n    _INSTANCE_DRAINING = None\nOrdinary._INSTANCE_DRAINING = 1\n"

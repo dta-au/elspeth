@@ -1,0 +1,1172 @@
+[
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/configured_owner_not_same_argument.py",
+    "original_sha256": "83a8c3996921888e3ad0868fc62bc7394c7003711bbee9b9621c6e0bc544d5e4",
+    "original_bytes": 46670,
+    "portable_sha256": "83a8c3996921888e3ad0868fc62bc7394c7003711bbee9b9621c6e0bc544d5e4",
+    "portable_bytes": 46670,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/83a8c3996921888e3ad0868fc62bc7394c7003711bbee9b9621c6e0bc544d5e4/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/constructor_import_same_spelling_wrong_origin.py",
+    "original_sha256": "4c588045add233cd7f7e2da22bfd87aa0a1f20d3cc0e8937a148d23d6cb49c07",
+    "original_bytes": 144009,
+    "portable_sha256": "4c588045add233cd7f7e2da22bfd87aa0a1f20d3cc0e8937a148d23d6cb49c07",
+    "portable_bytes": 144009,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/4c588045add233cd7f7e2da22bfd87aa0a1f20d3cc0e8937a148d23d6cb49c07/part-0000.json.txt",
+      "payloads/4c588045add233cd7f7e2da22bfd87aa0a1f20d3cc0e8937a148d23d6cb49c07/part-0001.json.txt",
+      "payloads/4c588045add233cd7f7e2da22bfd87aa0a1f20d3cc0e8937a148d23d6cb49c07/part-0002.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/drain_type_guard_changed.py",
+    "original_sha256": "81c4ddb99289d821134ad5eed247e67e5b55db3faac65f9ea73c5f790910aa03",
+    "original_bytes": 46596,
+    "portable_sha256": "81c4ddb99289d821134ad5eed247e67e5b55db3faac65f9ea73c5f790910aa03",
+    "portable_bytes": 46596,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/81c4ddb99289d821134ad5eed247e67e5b55db3faac65f9ea73c5f790910aa03/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/draining_constructor_wrong.py",
+    "original_sha256": "0a2c91ac3b31241799dbf10c4f08cf7880c3ca01773a59b3eb999121925f6cf5",
+    "original_bytes": 143970,
+    "portable_sha256": "0a2c91ac3b31241799dbf10c4f08cf7880c3ca01773a59b3eb999121925f6cf5",
+    "portable_bytes": 143970,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/0a2c91ac3b31241799dbf10c4f08cf7880c3ca01773a59b3eb999121925f6cf5/part-0000.json.txt",
+      "payloads/0a2c91ac3b31241799dbf10c4f08cf7880c3ca01773a59b3eb999121925f6cf5/part-0001.json.txt",
+      "payloads/0a2c91ac3b31241799dbf10c4f08cf7880c3ca01773a59b3eb999121925f6cf5/part-0002.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/event_import_wrong_origin.py",
+    "original_sha256": "e42aecf95741cb08394e97af5788592daaed17692dbd8186505ee839231d0eb9",
+    "original_bytes": 143984,
+    "portable_sha256": "e42aecf95741cb08394e97af5788592daaed17692dbd8186505ee839231d0eb9",
+    "portable_bytes": 143984,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e42aecf95741cb08394e97af5788592daaed17692dbd8186505ee839231d0eb9/part-0000.json.txt",
+      "payloads/e42aecf95741cb08394e97af5788592daaed17692dbd8186505ee839231d0eb9/part-0001.json.txt",
+      "payloads/e42aecf95741cb08394e97af5788592daaed17692dbd8186505ee839231d0eb9/part-0002.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_alias_cell_replace.py",
+    "original_sha256": "131eb55b7ae03b5c5b4a9ed87d510303f6e64b75475bdb7bf14d97ef2d7ff8d3",
+    "original_bytes": 103,
+    "portable_sha256": "131eb55b7ae03b5c5b4a9ed87d510303f6e64b75475bdb7bf14d97ef2d7ff8d3",
+    "portable_bytes": 103,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/131eb55b7ae03b5c5b4a9ed87d510303f6e64b75475bdb7bf14d97ef2d7ff8d3/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_alias_reflection_replace.py",
+    "original_sha256": "eaf33e6fdfdb740ba422c5118824d8322ad0938dc4e85904542075e3f6ff46ef",
+    "original_bytes": 128,
+    "portable_sha256": "eaf33e6fdfdb740ba422c5118824d8322ad0938dc4e85904542075e3f6ff46ef",
+    "portable_bytes": 128,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/eaf33e6fdfdb740ba422c5118824d8322ad0938dc4e85904542075e3f6ff46ef/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_branch_alias_cell_replace.py",
+    "original_sha256": "588cf773a6257c2d6993145c47c9d166fa62e26f9f299f08488b0b69e74c9ba5",
+    "original_bytes": 120,
+    "portable_sha256": "588cf773a6257c2d6993145c47c9d166fa62e26f9f299f08488b0b69e74c9ba5",
+    "portable_bytes": 120,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/588cf773a6257c2d6993145c47c9d166fa62e26f9f299f08488b0b69e74c9ba5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_callback_member_replace.py",
+    "original_sha256": "9d8d8486e53cae4627960f6412274ed2489a023adb0042465aab4bee6f2e62df",
+    "original_bytes": 116,
+    "portable_sha256": "9d8d8486e53cae4627960f6412274ed2489a023adb0042465aab4bee6f2e62df",
+    "portable_bytes": 116,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9d8d8486e53cae4627960f6412274ed2489a023adb0042465aab4bee6f2e62df/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_cell_delete.py",
+    "original_sha256": "4dfd89a2e43a3f72a25dd33b0bb7398eb49b339dbf14eb88d050c01fa71a8d08",
+    "original_bytes": 83,
+    "portable_sha256": "4dfd89a2e43a3f72a25dd33b0bb7398eb49b339dbf14eb88d050c01fa71a8d08",
+    "portable_bytes": 83,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/4dfd89a2e43a3f72a25dd33b0bb7398eb49b339dbf14eb88d050c01fa71a8d08/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_dynamic_loader_replace.py",
+    "original_sha256": "3b2b7631e3f4bcae8a7cda17c171a94ea76eee91e0f1d1edb08ae5775adf3c93",
+    "original_bytes": 99,
+    "portable_sha256": "3b2b7631e3f4bcae8a7cda17c171a94ea76eee91e0f1d1edb08ae5775adf3c93",
+    "portable_bytes": 99,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/3b2b7631e3f4bcae8a7cda17c171a94ea76eee91e0f1d1edb08ae5775adf3c93/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_dynamic_reflection_replace.py",
+    "original_sha256": "3e03785c22b08c11cc362910928fbcfe6aa3349fb68ac35c26a1a98622db8fd1",
+    "original_bytes": 75,
+    "portable_sha256": "3e03785c22b08c11cc362910928fbcfe6aa3349fb68ac35c26a1a98622db8fd1",
+    "portable_bytes": 75,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/3e03785c22b08c11cc362910928fbcfe6aa3349fb68ac35c26a1a98622db8fd1/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_event_type_replace.py",
+    "original_sha256": "45d67f9e00160587fe52ea84720153b83e9afdaff6a5a3cba007369594712308",
+    "original_bytes": 43,
+    "portable_sha256": "45d67f9e00160587fe52ea84720153b83e9afdaff6a5a3cba007369594712308",
+    "portable_bytes": 43,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/45d67f9e00160587fe52ea84720153b83e9afdaff6a5a3cba007369594712308/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_extra_configure_call.py",
+    "original_sha256": "9098c71ffdbd740b8b0ec5043308e57a8f8fd3fa682745724077358ed728680e",
+    "original_bytes": 125,
+    "portable_sha256": "9098c71ffdbd740b8b0ec5043308e57a8f8fd3fa682745724077358ed728680e",
+    "portable_bytes": 125,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9098c71ffdbd740b8b0ec5043308e57a8f8fd3fa682745724077358ed728680e/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_function_globals_replace.py",
+    "original_sha256": "2c0c48142bee3dcbd952fae74221b0804d7726764603369ff12df57592399c2a",
+    "original_bytes": 142,
+    "portable_sha256": "2c0c48142bee3dcbd952fae74221b0804d7726764603369ff12df57592399c2a",
+    "portable_bytes": 142,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2c0c48142bee3dcbd952fae74221b0804d7726764603369ff12df57592399c2a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_module_cell_replace.py",
+    "original_sha256": "ac322f15b40b0074bdb645360f1085d312324fce25a2506584ea51ab29733431",
+    "original_bytes": 79,
+    "portable_sha256": "ac322f15b40b0074bdb645360f1085d312324fce25a2506584ea51ab29733431",
+    "portable_bytes": 79,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/ac322f15b40b0074bdb645360f1085d312324fce25a2506584ea51ab29733431/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_module_dict_replace.py",
+    "original_sha256": "fc47a115f3814e78b8b31523b9627960ba81e05e3063ff722d609d9ead3f052a",
+    "original_bytes": 91,
+    "portable_sha256": "fc47a115f3814e78b8b31523b9627960ba81e05e3063ff722d609d9ead3f052a",
+    "portable_bytes": 91,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/fc47a115f3814e78b8b31523b9627960ba81e05e3063ff722d609d9ead3f052a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_owner_member_replace.py",
+    "original_sha256": "cc8c408fb2add298d7b6bbca698308b935a37635aa5bc198a589d797f1a2ab36",
+    "original_bytes": 104,
+    "portable_sha256": "cc8c408fb2add298d7b6bbca698308b935a37635aa5bc198a589d797f1a2ab36",
+    "portable_bytes": 104,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/cc8c408fb2add298d7b6bbca698308b935a37635aa5bc198a589d797f1a2ab36/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_reflected_cell_replace.py",
+    "original_sha256": "fb7cc5d9a28a4fe7d4444d791321e46ad3145da68ee1455dfef4f8c3c1a5cb61",
+    "original_bytes": 90,
+    "portable_sha256": "fb7cc5d9a28a4fe7d4444d791321e46ad3145da68ee1455dfef4f8c3c1a5cb61",
+    "portable_bytes": 90,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/fb7cc5d9a28a4fe7d4444d791321e46ad3145da68ee1455dfef4f8c3c1a5cb61/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_sys_modules_replace.py",
+    "original_sha256": "7a43ce540cf0a3d91be0ba6189610ed8d2e4049f92b7aa79b0fc68da29d9a79a",
+    "original_bytes": 91,
+    "portable_sha256": "7a43ce540cf0a3d91be0ba6189610ed8d2e4049f92b7aa79b0fc68da29d9a79a",
+    "portable_bytes": 91,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7a43ce540cf0a3d91be0ba6189610ed8d2e4049f92b7aa79b0fc68da29d9a79a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/external_vars_namespace_replace.py",
+    "original_sha256": "861b4325d0cae07f8b1fcaa224cc852ff1c5a91023f73f10c94a3467e43e2f32",
+    "original_bytes": 120,
+    "portable_sha256": "861b4325d0cae07f8b1fcaa224cc852ff1c5a91023f73f10c94a3467e43e2f32",
+    "portable_bytes": 120,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/861b4325d0cae07f8b1fcaa224cc852ff1c5a91023f73f10c94a3467e43e2f32/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/owner_constructor_lock_changed.py",
+    "original_sha256": "15ab977bb8c0c6201b69c180ea777e85ddfd986336ffe3080799e7645910a89f",
+    "original_bytes": 13087,
+    "portable_sha256": "15ab977bb8c0c6201b69c180ea777e85ddfd986336ffe3080799e7645910a89f",
+    "portable_bytes": 13087,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/15ab977bb8c0c6201b69c180ea777e85ddfd986336ffe3080799e7645910a89f/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/owner_constructor_wrong.py",
+    "original_sha256": "1f81a2c70539dac0718237a48d04388eccb7a68703fde82b7f0ae862d6fa244b",
+    "original_bytes": 143960,
+    "portable_sha256": "1f81a2c70539dac0718237a48d04388eccb7a68703fde82b7f0ae862d6fa244b",
+    "portable_bytes": 143960,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/1f81a2c70539dac0718237a48d04388eccb7a68703fde82b7f0ae862d6fa244b/part-0000.json.txt",
+      "payloads/1f81a2c70539dac0718237a48d04388eccb7a68703fde82b7f0ae862d6fa244b/part-0001.json.txt",
+      "payloads/1f81a2c70539dac0718237a48d04388eccb7a68703fde82b7f0ae862d6fa244b/part-0002.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/owner_global_class_rebound.py",
+    "original_sha256": "1979eff949984a18f6e7f301f0729b8b0233131acddd1168e5728f93cdb77093",
+    "original_bytes": 13131,
+    "portable_sha256": "1979eff949984a18f6e7f301f0729b8b0233131acddd1168e5728f93cdb77093",
+    "portable_bytes": 13131,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/1979eff949984a18f6e7f301f0729b8b0233131acddd1168e5728f93cdb77093/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/owner_lookup_override.py",
+    "original_sha256": "656ecaaacf43c2e33e567b3efc1964e8624d4af3aeab5e4d089828e060456697",
+    "original_bytes": 13156,
+    "portable_sha256": "656ecaaacf43c2e33e567b3efc1964e8624d4af3aeab5e4d089828e060456697",
+    "portable_bytes": 13156,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/656ecaaacf43c2e33e567b3efc1964e8624d4af3aeab5e4d089828e060456697/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/recovery_constructor_owned_guard_changed.py",
+    "original_sha256": "ebcb3e5dc29c410d55e9cd2cbd76c6c8da5cd7a59cbe31a6af403c549a203765",
+    "original_bytes": 3816,
+    "portable_sha256": "ebcb3e5dc29c410d55e9cd2cbd76c6c8da5cd7a59cbe31a6af403c549a203765",
+    "portable_bytes": 3816,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/ebcb3e5dc29c410d55e9cd2cbd76c6c8da5cd7a59cbe31a6af403c549a203765/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/recovery_constructor_retained_event_changed.py",
+    "original_sha256": "e1623595f166e3849b0470c409b3ce1b48aa2c108fccc47397ccce4e45854370",
+    "original_bytes": 3859,
+    "portable_sha256": "e1623595f166e3849b0470c409b3ce1b48aa2c108fccc47397ccce4e45854370",
+    "portable_bytes": 3859,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e1623595f166e3849b0470c409b3ce1b48aa2c108fccc47397ccce4e45854370/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/worker_global_event_deleted.py",
+    "original_sha256": "bad0c8ff662327178d6f2217f730d395be44cf40baef2106e4609588f384fe07",
+    "original_bytes": 46753,
+    "portable_sha256": "bad0c8ff662327178d6f2217f730d395be44cf40baef2106e4609588f384fe07",
+    "portable_bytes": 46753,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/bad0c8ff662327178d6f2217f730d395be44cf40baef2106e4609588f384fe07/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/worker_global_owner_rebound.py",
+    "original_sha256": "5b2e1a0b30ab60af135c5334992eac1f5bce54feebec0ecbbeb284998625a13b",
+    "original_bytes": 46779,
+    "portable_sha256": "5b2e1a0b30ab60af135c5334992eac1f5bce54feebec0ecbbeb284998625a13b",
+    "portable_bytes": 46779,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/5b2e1a0b30ab60af135c5334992eac1f5bce54feebec0ecbbeb284998625a13b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/specimens/worker_initial_event_wrong.py",
+    "original_sha256": "f174e20497c4622fc7b7ac06537e090b5b94d5209bd06db195140524085500c4",
+    "original_bytes": 46670,
+    "portable_sha256": "f174e20497c4622fc7b7ac06537e090b5b94d5209bd06db195140524085500c4",
+    "portable_bytes": 46670,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f174e20497c4622fc7b7ac06537e090b5b94d5209bd06db195140524085500c4/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-recovery-producer-contract-1/version2/verify_artifacts.py",
+    "original_sha256": "46af9a50b2f7901f16cbc736e8e92e5786bfd194620517ce96318a140b817c00",
+    "original_bytes": 4436,
+    "portable_sha256": "dd8c2d449b8253fecf3192279b42968c1d80f067e8f2646cc796f1bf0f2e2d7c",
+    "portable_bytes": 4367,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/dd8c2d449b8253fecf3192279b42968c1d80f067e8f2646cc796f1bf0f2e2d7c/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-route-qualification-selection-1/REPORT.md",
+    "original_sha256": "2271357908e155e3987985f8a1e66f473a004d263119e2b615bbb227316a2416",
+    "original_bytes": 3952,
+    "portable_sha256": "2271357908e155e3987985f8a1e66f473a004d263119e2b615bbb227316a2416",
+    "portable_bytes": 3952,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2271357908e155e3987985f8a1e66f473a004d263119e2b615bbb227316a2416/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/INTERFACE.md",
+    "original_sha256": "8ebb6626d63a12bd8177d87974524464f403348d4c0ae9fe9a013ce2776521e2",
+    "original_bytes": 2734,
+    "portable_sha256": "8ebb6626d63a12bd8177d87974524464f403348d4c0ae9fe9a013ce2776521e2",
+    "portable_bytes": 2734,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/8ebb6626d63a12bd8177d87974524464f403348d4c0ae9fe9a013ce2776521e2/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/REPORT.md",
+    "original_sha256": "2259e985c134e5bfcfc91d364121ef20a41faa3c6fa8e547c9e1e3006ab8075a",
+    "original_bytes": 13270,
+    "portable_sha256": "2259e985c134e5bfcfc91d364121ef20a41faa3c6fa8e547c9e1e3006ab8075a",
+    "portable_bytes": 13270,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2259e985c134e5bfcfc91d364121ef20a41faa3c6fa8e547c9e1e3006ab8075a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/candidates/test_web_landscape_mutation_fencing.py",
+    "original_sha256": "b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35",
+    "original_bytes": 1259652,
+    "portable_sha256": "b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35",
+    "portable_bytes": 1259652,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0000.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0001.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0002.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0003.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0004.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0005.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0006.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0007.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0008.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0009.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0010.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0011.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0012.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0013.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0014.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0015.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0016.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0017.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0018.json.txt",
+      "payloads/b4ed093d852481708f958d57cb8fbf37dd07901dbdb7ed93847dd3b11e2a3b35/part-0019.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/consumer.patch",
+    "original_sha256": "f119d4a647a6ce47ed0938c63928378c5388b8ec31820dc2747fdacef9a60ff5",
+    "original_bytes": 521,
+    "portable_sha256": "f119d4a647a6ce47ed0938c63928378c5388b8ec31820dc2747fdacef9a60ff5",
+    "portable_bytes": 521,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f119d4a647a6ce47ed0938c63928378c5388b8ec31820dc2747fdacef9a60ff5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/controls.py",
+    "original_sha256": "4b93db96c729d6ca76e205dc136b53e16bf296d299bba3417ba298371bebcf30",
+    "original_bytes": 16814,
+    "portable_sha256": "92b91f547759df8efcab294a4d61871386b51e19887908bd82efde6d297eb0ec",
+    "portable_bytes": 16679,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/92b91f547759df8efcab294a4d61871386b51e19887908bd82efde6d297eb0ec/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/preimages/test_web_landscape_mutation_fencing.py",
+    "original_sha256": "682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e",
+    "original_bytes": 1259628,
+    "portable_sha256": "682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e",
+    "portable_bytes": 1259628,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0000.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0001.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0002.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0003.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0004.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0005.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0006.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0007.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0008.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0009.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0010.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0011.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0012.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0013.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0014.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0015.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0016.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0017.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0018.json.txt",
+      "payloads/682309bf1e3bb5a6841405b3605e6ff04b3642481be033a1caa4dd813fc9228e/part-0019.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/version2/INTERFACE.md",
+    "original_sha256": "867d1136302c053bc6b9b9415fecbc5f2ed0dc1e76bae5bbe64ce9f7685f7de5",
+    "original_bytes": 2723,
+    "portable_sha256": "867d1136302c053bc6b9b9415fecbc5f2ed0dc1e76bae5bbe64ce9f7685f7de5",
+    "portable_bytes": 2723,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/867d1136302c053bc6b9b9415fecbc5f2ed0dc1e76bae5bbe64ce9f7685f7de5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/version2/REPORT.md",
+    "original_sha256": "317213b618e7d1bbdcc149ce9b1e3aeee14dc08eed2789bb2385c2c8e6200a03",
+    "original_bytes": 7085,
+    "portable_sha256": "317213b618e7d1bbdcc149ce9b1e3aeee14dc08eed2789bb2385c2c8e6200a03",
+    "portable_bytes": 7085,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/317213b618e7d1bbdcc149ce9b1e3aeee14dc08eed2789bb2385c2c8e6200a03/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/version2/consumer.patch",
+    "original_sha256": "7710ef1540108c3fc0eb36df885b47ef3ee2f837cbc309d7e595b29936428c9b",
+    "original_bytes": 2643,
+    "portable_sha256": "7710ef1540108c3fc0eb36df885b47ef3ee2f837cbc309d7e595b29936428c9b",
+    "portable_bytes": 2643,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7710ef1540108c3fc0eb36df885b47ef3ee2f837cbc309d7e595b29936428c9b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/version2/controls.py",
+    "original_sha256": "790af1b93ae5b75568c5010fc13f636d053be209e6fb7a04e73336d240159f96",
+    "original_bytes": 11370,
+    "portable_sha256": "790af1b93ae5b75568c5010fc13f636d053be209e6fb7a04e73336d240159f96",
+    "portable_bytes": 11370,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/790af1b93ae5b75568c5010fc13f636d053be209e6fb7a04e73336d240159f96/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-shared-reserve-consumers-1/version2/test_web_landscape_mutation_fencing.py",
+    "original_sha256": "6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25",
+    "original_bytes": 1260082,
+    "portable_sha256": "6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25",
+    "portable_bytes": 1260082,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0000.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0001.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0002.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0003.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0004.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0005.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0006.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0007.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0008.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0009.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0010.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0011.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0012.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0013.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0014.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0015.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0016.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0017.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0018.json.txt",
+      "payloads/6b83c1771bc85401d3a32b10d3d27ea9a2655bb48b224186605b5cb244048a25/part-0019.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-tls-current-epoch-preparation-76/REPORT.md",
+    "original_sha256": "0846e16cbbbce0b60f1288725aaa55f7af4570cf6809ce186f0e27531bee9b55",
+    "original_bytes": 5829,
+    "portable_sha256": "0846e16cbbbce0b60f1288725aaa55f7af4570cf6809ce186f0e27531bee9b55",
+    "portable_bytes": 5829,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/0846e16cbbbce0b60f1288725aaa55f7af4570cf6809ce186f0e27531bee9b55/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-tls-current-epoch-preparation-76/current-selected-images/src/elspeth/web/coordination/lifecycle.py",
+    "original_sha256": "e71f280555a04eae5c80fd1fe655a2e7da957d62e4a9fb49c02f93c523901b2c",
+    "original_bytes": 73315,
+    "portable_sha256": "e71f280555a04eae5c80fd1fe655a2e7da957d62e4a9fb49c02f93c523901b2c",
+    "portable_bytes": 73315,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e71f280555a04eae5c80fd1fe655a2e7da957d62e4a9fb49c02f93c523901b2c/part-0000.json.txt",
+      "payloads/e71f280555a04eae5c80fd1fe655a2e7da957d62e4a9fb49c02f93c523901b2c/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-tls-current-epoch-preparation-76/current-selected-images/src/elspeth/web/execution/service.py",
+    "original_sha256": "31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428",
+    "original_bytes": 277939,
+    "portable_sha256": "31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428",
+    "portable_bytes": 277939,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428/part-0000.json.txt",
+      "payloads/31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428/part-0001.json.txt",
+      "payloads/31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428/part-0002.json.txt",
+      "payloads/31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428/part-0003.json.txt",
+      "payloads/31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428/part-0004.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-tls-current-epoch-preparation-76/current-selected-images/src/elspeth/web/execution_lease_cleanup.py",
+    "original_sha256": "4e4cd915e93ae99be36b98bf81f989d97e6e33fb9e300287795d77cc2296bb42",
+    "original_bytes": 47281,
+    "portable_sha256": "4e4cd915e93ae99be36b98bf81f989d97e6e33fb9e300287795d77cc2296bb42",
+    "portable_bytes": 47281,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/4e4cd915e93ae99be36b98bf81f989d97e6e33fb9e300287795d77cc2296bb42/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-tls-current-epoch-preparation-76/current-selected-images/tests/helpers/composer_https.py",
+    "original_sha256": "b21ae0ca9dbbcddd738b4b6b9ea794ab6eac3692de8ee5a028c2d67248b1b0e5",
+    "original_bytes": 11058,
+    "portable_sha256": "b21ae0ca9dbbcddd738b4b6b9ea794ab6eac3692de8ee5a028c2d67248b1b0e5",
+    "portable_bytes": 11058,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/b21ae0ca9dbbcddd738b4b6b9ea794ab6eac3692de8ee5a028c2d67248b1b0e5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-tls-current-epoch-preparation-76/four-selected-source-delta.patch",
+    "original_sha256": "290c8dee857cdedec21b247922e0a31b7ae3727676c6c16953f1887743fdf70a",
+    "original_bytes": 17050,
+    "portable_sha256": "290c8dee857cdedec21b247922e0a31b7ae3727676c6c16953f1887743fdf70a",
+    "portable_bytes": 17050,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/290c8dee857cdedec21b247922e0a31b7ae3727676c6c16953f1887743fdf70a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-tls-saturation-cause-preparation.md",
+    "original_sha256": "74b15df1eb0c555cba74a10b180422df8172c3d5bdb1ac96f4f665a322296721",
+    "original_bytes": 10591,
+    "portable_sha256": "74b15df1eb0c555cba74a10b180422df8172c3d5bdb1ac96f4f665a322296721",
+    "portable_bytes": 10591,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/74b15df1eb0c555cba74a10b180422df8172c3d5bdb1ac96f4f665a322296721/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "stage_wip_checkpoint_root.attempt1.py",
+    "original_sha256": "9aa63d42d67e7c4c317b69595255c0f8d944af2683547c1cbc8ed461c9b71bba",
+    "original_bytes": 3892,
+    "portable_sha256": "6bad0b1d36d77b7fa98e125381bfc70c63763af8c4db30f452aeb28bef9d090a",
+    "portable_bytes": 3893,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6bad0b1d36d77b7fa98e125381bfc70c63763af8c4db30f452aeb28bef9d090a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "stage_wip_checkpoint_root.py",
+    "original_sha256": "a27d1f62d0d49c68beb2faffcb3586510b2225e463a5b860d22c77a7f94010f4",
+    "original_bytes": 4028,
+    "portable_sha256": "4b5cf2ecdd4890776d8daeac0e31aa1973b537824f9240f51ba2cdf3d4cb4563",
+    "portable_bytes": 4027,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/4b5cf2ecdd4890776d8daeac0e31aa1973b537824f9240f51ba2cdf3d4cb4563/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "start_coherent_static_gate2_root.sh",
+    "original_sha256": "9bd207b13e7e2cd6080ab1eb9bec00a5f37751642b770fbe8692daabcb728f38",
+    "original_bytes": 867,
+    "portable_sha256": "98835189815b6e6582d66634ee26044e8122b918b4e622089c8b154a7f92dd85",
+    "portable_bytes": 837,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/98835189815b6e6582d66634ee26044e8122b918b4e622089c8b154a7f92dd85/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "start_coherent_static_gate_root.sh",
+    "original_sha256": "bbdfa24743c5dc84d284950251541ae19d93d4882041be7926d69abcde504e06",
+    "original_bytes": 867,
+    "portable_sha256": "6751bcecbaa2f6fc93c8d0bca7954faf354d9cb6b407be1532efd5839b9a1992",
+    "portable_bytes": 837,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6751bcecbaa2f6fc93c8d0bca7954faf354d9cb6b407be1532efd5839b9a1992/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "start_default_gate_root.sh",
+    "original_sha256": "0c3c888bd128c1750f22c6ee2973a856738be73c639cb401132aa8a75c365b15",
+    "original_bytes": 814,
+    "portable_sha256": "6a1e16da57e8fb4710a99f8bbeee6afc3c1ce2b9c0ccd6f37c62d58edc0a5a06",
+    "portable_bytes": 784,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6a1e16da57e8fb4710a99f8bbeee6afc3c1ce2b9c0ccd6f37c62d58edc0a5a06/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "start_default_gate_root2.sh",
+    "original_sha256": "0c46b76ae5377726ca68e3ab9b8c28bf6e6e50f7fd5a23f9640e56a5042b8b78",
+    "original_bytes": 1321,
+    "portable_sha256": "ee39cc73787ecd0583d5c892b31138b62adb31e7c2c4a9aa04ef7bace58c8e33",
+    "portable_bytes": 1291,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/ee39cc73787ecd0583d5c892b31138b62adb31e7c2c4a9aa04ef7bace58c8e33/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "start_default_gate_root3.sh",
+    "original_sha256": "6e80175989547422d3788fceaa4011b3e8bcf32091c59e862f978bab5d8dc284",
+    "original_bytes": 2488,
+    "portable_sha256": "6fafdf3170857a48a2b3e2f5059dfc593831da9149845580c9ebb4a37526bdcb",
+    "portable_bytes": 2461,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6fafdf3170857a48a2b3e2f5059dfc593831da9149845580c9ebb4a37526bdcb/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "start_postgres_gate_root.sh",
+    "original_sha256": "d4b7b2a7754c31c4c761d448845d54bbda3e5bebf372c73e3afd33449630f0fb",
+    "original_bytes": 809,
+    "portable_sha256": "88cdaa487bab556e79c74eb3aff4ed3d0bd2273dceb8055778e6f2a3c2b603e4",
+    "portable_bytes": 779,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/88cdaa487bab556e79c74eb3aff4ed3d0bd2273dceb8055778e6f2a3c2b603e4/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "start_postgres_gate_root2.sh",
+    "original_sha256": "e05a3749a0d3178ead75069f45a1594663b3cc886c4114851e0185ca7913908f",
+    "original_bytes": 789,
+    "portable_sha256": "cf7517f5cb184049cb5af3b53ad3a80bf74ae577328c9c81b87ecd8f0f252fc5",
+    "portable_bytes": 759,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/cf7517f5cb184049cb5af3b53ad3a80bf74ae577328c9c81b87ecd8f0f252fc5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "stop_owned_capacity_attempt2_root.py",
+    "original_sha256": "84e51834d96c332751323601191779e3e96a3f50b12894ce0504141a7b9c480b",
+    "original_bytes": 2274,
+    "portable_sha256": "6bc88ef87eb2b06315f5a6016e51a9dd511c37d4c19605ecd1e10e90d340a3a0",
+    "portable_bytes": 2242,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6bc88ef87eb2b06315f5a6016e51a9dd511c37d4c19605ecd1e10e90d340a3a0/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "stop_owned_default3_root.py",
+    "original_sha256": "e12a9fcde42fb363749905879788369614ddbbe509e0e2a653020bdccd5385f9",
+    "original_bytes": 2857,
+    "portable_sha256": "5d226aa910681dd4649c4cb229ad2289b657f7feaa9bf4ef9658a3b984479ccc",
+    "portable_bytes": 2825,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/5d226aa910681dd4649c4cb229ad2289b657f7feaa9bf4ef9658a3b984479ccc/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "stop_owned_transport_diagnostics.py",
+    "original_sha256": "93e454a1a5c2eab4f046c7de05f7cd43e4fe131d82cda24ac8fcfe134aa3c09d",
+    "original_bytes": 1829,
+    "portable_sha256": "ebb3780234ec16cd71c13a5f89dd1c6b82d76c3e740899a4eb3fbc50ab528d23",
+    "portable_bytes": 1830,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/ebb3780234ec16cd71c13a5f89dd1c6b82d76c3e740899a4eb3fbc50ab528d23/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "stop_owned_turn_diagnostic.py",
+    "original_sha256": "72182264d5f5a4ad6bef172c57baf8f263daa8e683b5e158e00d937e15ebe6d0",
+    "original_bytes": 1626,
+    "portable_sha256": "e2860d4c654ad2acb8804f4e0c16e4e5573b1edd0eccb023615574400d686402",
+    "portable_bytes": 1627,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e2860d4c654ad2acb8804f4e0c16e4e5573b1edd0eccb023615574400d686402/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-amendment-approval-blocker-20261006.md",
+    "original_sha256": "af924c9ee9a32facefc96c178429f2444b01098e14c0fdd19b973b56041b7bef",
+    "original_bytes": 3742,
+    "portable_sha256": "af924c9ee9a32facefc96c178429f2444b01098e14c0fdd19b973b56041b7bef",
+    "portable_bytes": 3742,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/af924c9ee9a32facefc96c178429f2444b01098e14c0fdd19b973b56041b7bef/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-archive-fixture-comparison.md",
+    "original_sha256": "9a47e3e6b402485a0cd667176562d7bb939899eb1ea20759e77e25488194c16e",
+    "original_bytes": 1439,
+    "portable_sha256": "9a47e3e6b402485a0cd667176562d7bb939899eb1ea20759e77e25488194c16e",
+    "portable_bytes": 1439,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9a47e3e6b402485a0cd667176562d7bb939899eb1ea20759e77e25488194c16e/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-atomic-pipeline-architecture.md",
+    "original_sha256": "7998647713f96d8864aa79d80dae7269cf9eedc369623b968e42df5b2c5f9e7a",
+    "original_bytes": 9701,
+    "portable_sha256": "7998647713f96d8864aa79d80dae7269cf9eedc369623b968e42df5b2c5f9e7a",
+    "portable_bytes": 9701,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7998647713f96d8864aa79d80dae7269cf9eedc369623b968e42df5b2c5f9e7a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-default-gate-classification.md",
+    "original_sha256": "178998e07f6ee631a81d0e18d8804781ad606cad7dad50e7a7455c3f32321560",
+    "original_bytes": 17986,
+    "portable_sha256": "178998e07f6ee631a81d0e18d8804781ad606cad7dad50e7a7455c3f32321560",
+    "portable_bytes": 17986,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/178998e07f6ee631a81d0e18d8804781ad606cad7dad50e7a7455c3f32321560/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-full-review-progress.md",
+    "original_sha256": "92c839b2fe2396a053fbfb14fbfdf32684cd1d294826cecf2247a94b0da88dfc",
+    "original_bytes": 3047,
+    "portable_sha256": "92c839b2fe2396a053fbfb14fbfdf32684cd1d294826cecf2247a94b0da88dfc",
+    "portable_bytes": 3047,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/92c839b2fe2396a053fbfb14fbfdf32684cd1d294826cecf2247a94b0da88dfc/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-keyless-owner-review-4.md",
+    "original_sha256": "152cfd59090e54df34773c1673b23657925429f6f68c3f4e4b01429e075b8550",
+    "original_bytes": 16373,
+    "portable_sha256": "152cfd59090e54df34773c1673b23657925429f6f68c3f4e4b01429e075b8550",
+    "portable_bytes": 16373,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/152cfd59090e54df34773c1673b23657925429f6f68c3f4e4b01429e075b8550/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-required-future-custody-design-v4.md",
+    "original_sha256": "3c769c3855ca26347b094a8ccd5e207e4d0bd32f0ac62902e2ad64fe05829773",
+    "original_bytes": 23792,
+    "portable_sha256": "3c769c3855ca26347b094a8ccd5e207e4d0bd32f0ac62902e2ad64fe05829773",
+    "portable_bytes": 23792,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/3c769c3855ca26347b094a8ccd5e207e4d0bd32f0ac62902e2ad64fe05829773/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-required-future-custody-design.md",
+    "original_sha256": "d33d5ba163d2bab96ce6c502eaa5afb857267486791cd13bec66337c47471eea",
+    "original_bytes": 20704,
+    "portable_sha256": "d33d5ba163d2bab96ce6c502eaa5afb857267486791cd13bec66337c47471eea",
+    "portable_bytes": 20704,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d33d5ba163d2bab96ce6c502eaa5afb857267486791cd13bec66337c47471eea/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-revocation-source-split-design-preserved-v1.md",
+    "original_sha256": "eb31ee2ad62e3a2129e22790ec8cb01fda4028a0a88c9b7f89e45b26e929a217",
+    "original_bytes": 4427,
+    "portable_sha256": "eb31ee2ad62e3a2129e22790ec8cb01fda4028a0a88c9b7f89e45b26e929a217",
+    "portable_bytes": 4427,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/eb31ee2ad62e3a2129e22790ec8cb01fda4028a0a88c9b7f89e45b26e929a217/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-revocation-source-split-design-preserved-v2-before-b6.md",
+    "original_sha256": "73daa9bee5b8e47ba60b8250f4c3d2b513688a9d25d2f97c2e58a629f3f1b498",
+    "original_bytes": 9833,
+    "portable_sha256": "73daa9bee5b8e47ba60b8250f4c3d2b513688a9d25d2f97c2e58a629f3f1b498",
+    "portable_bytes": 9833,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/73daa9bee5b8e47ba60b8250f4c3d2b513688a9d25d2f97c2e58a629f3f1b498/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-revocation-source-split-design-preserved-v2-pre-rewrite.md",
+    "original_sha256": "8d0bfdf3a6eabd6672554ae471735c625a27338f593cef70e047ea50119fcfe2",
+    "original_bytes": 11811,
+    "portable_sha256": "8d0bfdf3a6eabd6672554ae471735c625a27338f593cef70e047ea50119fcfe2",
+    "portable_bytes": 11811,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/8d0bfdf3a6eabd6672554ae471735c625a27338f593cef70e047ea50119fcfe2/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-revocation-source-split-design-preserved-v2.md",
+    "original_sha256": "7d47f4b776374b2cea44901e8da2e1c525625ca1091e13fad068bd723d294c53",
+    "original_bytes": 8902,
+    "portable_sha256": "7d47f4b776374b2cea44901e8da2e1c525625ca1091e13fad068bd723d294c53",
+    "portable_bytes": 8902,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7d47f4b776374b2cea44901e8da2e1c525625ca1091e13fad068bd723d294c53/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-revocation-source-split-design-v2.md",
+    "original_sha256": "73daa9bee5b8e47ba60b8250f4c3d2b513688a9d25d2f97c2e58a629f3f1b498",
+    "original_bytes": 9833,
+    "portable_sha256": "73daa9bee5b8e47ba60b8250f4c3d2b513688a9d25d2f97c2e58a629f3f1b498",
+    "portable_bytes": 9833,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/73daa9bee5b8e47ba60b8250f4c3d2b513688a9d25d2f97c2e58a629f3f1b498/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-revocation-source-split-design-v3-before-issuer-parity.md",
+    "original_sha256": "17d75900d012ef5c6a69a4db7a96632641d4c90222a91aa8ca344bd737764a43",
+    "original_bytes": 9870,
+    "portable_sha256": "17d75900d012ef5c6a69a4db7a96632641d4c90222a91aa8ca344bd737764a43",
+    "portable_bytes": 9870,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/17d75900d012ef5c6a69a4db7a96632641d4c90222a91aa8ca344bd737764a43/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-revocation-source-split-design-v3.md",
+    "original_sha256": "f0e2aa5f278617d4546b7c8509cfe57a5380ba1b046364223ae09ebacb46e443",
+    "original_bytes": 12361,
+    "portable_sha256": "f0e2aa5f278617d4546b7c8509cfe57a5380ba1b046364223ae09ebacb46e443",
+    "portable_bytes": 12361,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f0e2aa5f278617d4546b7c8509cfe57a5380ba1b046364223ae09ebacb46e443/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "storage-revocation-source-split-design.md",
+    "original_sha256": "eb31ee2ad62e3a2129e22790ec8cb01fda4028a0a88c9b7f89e45b26e929a217",
+    "original_bytes": 4427,
+    "portable_sha256": "eb31ee2ad62e3a2129e22790ec8cb01fda4028a0a88c9b7f89e45b26e929a217",
+    "portable_bytes": 4427,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/eb31ee2ad62e3a2129e22790ec8cb01fda4028a0a88c9b7f89e45b26e929a217/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-blocked-resume-handoff-20261007.md",
+    "original_sha256": "2304fbde126d823c30042302f9ef0c65c64ca72563a8fa19b52b515026f49c94",
+    "original_bytes": 8089,
+    "portable_sha256": "1ef82c19af4b38455af1fcacc71f373f9d66b57d68f11e5dbe2dd23d13365db8",
+    "portable_bytes": 8090,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/1ef82c19af4b38455af1fcacc71f373f9d66b57d68f11e5dbe2dd23d13365db8/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-implementation-checkpoint-2026-10-06.md",
+    "original_sha256": "cade13723f1ae99feada3a9a65d1efcd8f9d05c8a6635d1c5b031c9c7a8f6809",
+    "original_bytes": 3531,
+    "portable_sha256": "cade13723f1ae99feada3a9a65d1efcd8f9d05c8a6635d1c5b031c9c7a8f6809",
+    "portable_bytes": 3531,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/cade13723f1ae99feada3a9a65d1efcd8f9d05c8a6635d1c5b031c9c7a8f6809/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-paused-handoff-20261006.md",
+    "original_sha256": "8a5c8422df3d31f176dec2e8fd0db9a4fb02c6547eb48052b394c5c6aef757dc",
+    "original_bytes": 9794,
+    "portable_sha256": "f483e0be4287714ddc493864bfdcf83f660cfedd519ef1ff349b93fd173c851d",
+    "portable_bytes": 9795,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f483e0be4287714ddc493864bfdcf83f660cfedd519ef1ff349b93fd173c851d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-readiness-forecast-20261007-0155UTC.md",
+    "original_sha256": "35c30d5cdffa299fd87fb8a97359b8681a6600f2e6f382c3b7697f71b65cef89",
+    "original_bytes": 3304,
+    "portable_sha256": "35c30d5cdffa299fd87fb8a97359b8681a6600f2e6f382c3b7697f71b65cef89",
+    "portable_bytes": 3304,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/35c30d5cdffa299fd87fb8a97359b8681a6600f2e6f382c3b7697f71b65cef89/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-before-refresh20-20261007.md",
+    "original_sha256": "6243225e2d3678b71a8de44e480245ec46196974cf2f47e0d23493bc37494755",
+    "original_bytes": 4309,
+    "portable_sha256": "6243225e2d3678b71a8de44e480245ec46196974cf2f47e0d23493bc37494755",
+    "portable_bytes": 4309,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6243225e2d3678b71a8de44e480245ec46196974cf2f47e0d23493bc37494755/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-20261007.md",
+    "original_sha256": "d8fe41c005ca5ead7ab7b6cd5aea33a16706c0d22d25a3159e2872ebaeaf13a1",
+    "original_bytes": 9875,
+    "portable_sha256": "d8fe41c005ca5ead7ab7b6cd5aea33a16706c0d22d25a3159e2872ebaeaf13a1",
+    "portable_bytes": 9875,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d8fe41c005ca5ead7ab7b6cd5aea33a16706c0d22d25a3159e2872ebaeaf13a1/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-composite-dependency-review-20261007.md",
+    "original_sha256": "eb8c3465e4cf78f665153a0daa7c553da837b409f6681a49a5a6f873b8a3644d",
+    "original_bytes": 6281,
+    "portable_sha256": "eb8c3465e4cf78f665153a0daa7c553da837b409f6681a49a5a6f873b8a3644d",
+    "portable_bytes": 6281,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/eb8c3465e4cf78f665153a0daa7c553da837b409f6681a49a5a6f873b8a3644d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-composite2-application-20261007.md",
+    "original_sha256": "a41140b14c86c199da30f28ec9edbff5ec608400e06c230a14ef3d14e55208bc",
+    "original_bytes": 6703,
+    "portable_sha256": "a41140b14c86c199da30f28ec9edbff5ec608400e06c230a14ef3d14e55208bc",
+    "portable_bytes": 6703,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/a41140b14c86c199da30f28ec9edbff5ec608400e06c230a14ef3d14e55208bc/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-concise-refresh-20261007.md",
+    "original_sha256": "af573bd1e8a6cee4ba05f68059215d8c43a99602952194e7d6c6833bf6a4de9a",
+    "original_bytes": 10796,
+    "portable_sha256": "af573bd1e8a6cee4ba05f68059215d8c43a99602952194e7d6c6833bf6a4de9a",
+    "portable_bytes": 10796,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/af573bd1e8a6cee4ba05f68059215d8c43a99602952194e7d6c6833bf6a4de9a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-native-shadow-and-cross-controller-20261007.md",
+    "original_sha256": "d331233c0de73a3246ea249264027417ecb6c67c473e352676e210953ae628ef",
+    "original_bytes": 9711,
+    "portable_sha256": "d331233c0de73a3246ea249264027417ecb6c67c473e352676e210953ae628ef",
+    "portable_bytes": 9711,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d331233c0de73a3246ea249264027417ecb6c67c473e352676e210953ae628ef/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-reader-diagnostic.md",
+    "original_sha256": "626d09906a09a332f19efa789cfad0ac9b26a662bbade2f31f2cff08d8943e56",
+    "original_bytes": 8409,
+    "portable_sha256": "626d09906a09a332f19efa789cfad0ac9b26a662bbade2f31f2cff08d8943e56",
+    "portable_bytes": 8409,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/626d09906a09a332f19efa789cfad0ac9b26a662bbade2f31f2cff08d8943e56/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-reflection-diagnostic.md",
+    "original_sha256": "680befe8d0582ce787b6fedb348989e10db46381bf62dbb5d38bd68f2d568b7d",
+    "original_bytes": 8066,
+    "portable_sha256": "680befe8d0582ce787b6fedb348989e10db46381bf62dbb5d38bd68f2d568b7d",
+    "portable_bytes": 8066,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/680befe8d0582ce787b6fedb348989e10db46381bf62dbb5d38bd68f2d568b7d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-refresh17-20261007.md",
+    "original_sha256": "322ea28ec4f5201af23b96e027a92e10595909ebc03a714dc1a9ff5b77705cf3",
+    "original_bytes": 7275,
+    "portable_sha256": "322ea28ec4f5201af23b96e027a92e10595909ebc03a714dc1a9ff5b77705cf3",
+    "portable_bytes": 7275,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/322ea28ec4f5201af23b96e027a92e10595909ebc03a714dc1a9ff5b77705cf3/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-refresh18-20261007.md",
+    "original_sha256": "5d8c24c6e637a762f36a8e141f4871193174ac0232ffcb64a5b9aa51707445b6",
+    "original_bytes": 7040,
+    "portable_sha256": "5d8c24c6e637a762f36a8e141f4871193174ac0232ffcb64a5b9aa51707445b6",
+    "portable_bytes": 7040,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/5d8c24c6e637a762f36a8e141f4871193174ac0232ffcb64a5b9aa51707445b6/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-refresh19-20261007.md",
+    "original_sha256": "46195c2ad5c9d80703a25e4a1100256a0025634c34117e0544739d32df71121a",
+    "original_bytes": 3924,
+    "portable_sha256": "46195c2ad5c9d80703a25e4a1100256a0025634c34117e0544739d32df71121a",
+    "portable_bytes": 3924,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/46195c2ad5c9d80703a25e4a1100256a0025634c34117e0544739d32df71121a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-refresh21-20261007.md",
+    "original_sha256": "cbc373473c9238d92130efe7a1acc54c963192735f0dd220a9b0a238cb5f2270",
+    "original_bytes": 6156,
+    "portable_sha256": "cbc373473c9238d92130efe7a1acc54c963192735f0dd220a9b0a238cb5f2270",
+    "portable_bytes": 6156,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/cbc373473c9238d92130efe7a1acc54c963192735f0dd220a9b0a238cb5f2270/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-refresh22-20261007.md",
+    "original_sha256": "f39cef64748f5a31a0171ac7766a749e8ad168095a82e187c281d5c30662a53d",
+    "original_bytes": 7896,
+    "portable_sha256": "f39cef64748f5a31a0171ac7766a749e8ad168095a82e187c281d5c30662a53d",
+    "portable_bytes": 7896,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f39cef64748f5a31a0171ac7766a749e8ad168095a82e187c281d5c30662a53d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-refresh23-20261007.md",
+    "original_sha256": "5b489905b8d6e5e79bf7a0595952983cd3d44860ffe624ce4dcbfa51524cf521",
+    "original_bytes": 10889,
+    "portable_sha256": "5b489905b8d6e5e79bf7a0595952983cd3d44860ffe624ce4dcbfa51524cf521",
+    "portable_bytes": 10889,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/5b489905b8d6e5e79bf7a0595952983cd3d44860ffe624ce4dcbfa51524cf521/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-refresh24-20261007.md",
+    "original_sha256": "f42093187e63d35692a9919d8316737e727b44c4bb52cb10f47a2eb90f1f4c9f",
+    "original_bytes": 1704,
+    "portable_sha256": "f42093187e63d35692a9919d8316737e727b44c4bb52cb10f47a2eb90f1f4c9f",
+    "portable_bytes": 1704,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f42093187e63d35692a9919d8316737e727b44c4bb52cb10f47a2eb90f1f4c9f/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-refresh25-20261007.md",
+    "original_sha256": "2cfed308515ad0f5ad5092af84afc41ebf833a1a9005237740350f035bc7b985",
+    "original_bytes": 1935,
+    "portable_sha256": "2cfed308515ad0f5ad5092af84afc41ebf833a1a9005237740350f035bc7b985",
+    "portable_bytes": 1935,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2cfed308515ad0f5ad5092af84afc41ebf833a1a9005237740350f035bc7b985/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "streaming-status-for-john-before-refresh26-20261007.md",
+    "original_sha256": "7f111489f76b3dd683ed308096c3b53225b79621fa9764db3c1b85dea65c9f3c",
+    "original_bytes": 2187,
+    "portable_sha256": "7f111489f76b3dd683ed308096c3b53225b79621fa9764db3c1b85dea65c9f3c",
+    "portable_bytes": 2187,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7f111489f76b3dd683ed308096c3b53225b79621fa9764db3c1b85dea65c9f3c/part-0000.json.txt"
+    ]
+  }
+]

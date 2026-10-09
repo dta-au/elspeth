@@ -1,0 +1,1149 @@
+[
+  {
+    "source_path": "sol-bounded-provider-mint-transfer-1/version2/prior-replay-3.13/specimens/turn_provider_binding_foreign.py",
+    "original_sha256": "b4ab792208ee776ee22da0d657ab7b1d575c17572bf30633196ca37f49ec636e",
+    "original_bytes": 81105,
+    "portable_sha256": "b4ab792208ee776ee22da0d657ab7b1d575c17572bf30633196ca37f49ec636e",
+    "portable_bytes": 81105,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/b4ab792208ee776ee22da0d657ab7b1d575c17572bf30633196ca37f49ec636e/part-0000.json.txt",
+      "payloads/b4ab792208ee776ee22da0d657ab7b1d575c17572bf30633196ca37f49ec636e/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-provider-mint-transfer-1/version2/prior-replay-3.13/specimens/turn_rebind_unchanged_constructor_mint.py",
+    "original_sha256": "0bcbb28140487578c37150466126aa853f0844fcb2d75cae184e198adc6814cb",
+    "original_bytes": 63939,
+    "portable_sha256": "0bcbb28140487578c37150466126aa853f0844fcb2d75cae184e198adc6814cb",
+    "portable_bytes": 63939,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/0bcbb28140487578c37150466126aa853f0844fcb2d75cae184e198adc6814cb/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-provider-mint-transfer-1/version2/prior-replay-3.13/specimens/turn_retained_service_foreign.py",
+    "original_sha256": "d3b40909e8f57f157a9b335e1cd4a30531592b2f0850ada9105a9a6debf357a0",
+    "original_bytes": 81153,
+    "portable_sha256": "d3b40909e8f57f157a9b335e1cd4a30531592b2f0850ada9105a9a6debf357a0",
+    "portable_bytes": 81153,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d3b40909e8f57f157a9b335e1cd4a30531592b2f0850ada9105a9a6debf357a0/part-0000.json.txt",
+      "payloads/d3b40909e8f57f157a9b335e1cd4a30531592b2f0850ada9105a9a6debf357a0/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-provider-mint-transfer-1/version2/provider_mint_contract.py",
+    "original_sha256": "d7d8d0218c10fe4de190a692ea93f009541f0f7e35ba368798eb0fc560e421dc",
+    "original_bytes": 61160,
+    "portable_sha256": "d7d8d0218c10fe4de190a692ea93f009541f0f7e35ba368798eb0fc560e421dc",
+    "portable_bytes": 61160,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d7d8d0218c10fe4de190a692ea93f009541f0f7e35ba368798eb0fc560e421dc/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/REPORT.md",
+    "original_sha256": "e5b48092b70241e120049e6342036af3b0990da8190fd5003a6420f045027d96",
+    "original_bytes": 14211,
+    "portable_sha256": "e5b48092b70241e120049e6342036af3b0990da8190fd5003a6420f045027d96",
+    "portable_bytes": 14211,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e5b48092b70241e120049e6342036af3b0990da8190fd5003a6420f045027d96/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/family_contracts.py",
+    "original_sha256": "6b4fd17796e7aca8d9cfb84f64ae016da99c3e6603a958eeda8c29d672293831",
+    "original_bytes": 35233,
+    "portable_sha256": "6b4fd17796e7aca8d9cfb84f64ae016da99c3e6603a958eeda8c29d672293831",
+    "portable_bytes": 35233,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6b4fd17796e7aca8d9cfb84f64ae016da99c3e6603a958eeda8c29d672293831/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/source_controls.py",
+    "original_sha256": "5adbc629026061fa8808272514d0096b83f6531f344f263a92f5bf92a038003b",
+    "original_bytes": 13534,
+    "portable_sha256": "41564c04c91a61e1cd51f5ee73e085371a357bbd9ab67326f2abd4de42408218",
+    "portable_bytes": 13465,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/41564c04c91a61e1cd51f5ee73e085371a357bbd9ab67326f2abd4de42408218/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/REPORT.md",
+    "original_sha256": "7a4894c8c15bc226a8bc3adce968858969e030be5aeee9cc000fd70240caefbb",
+    "original_bytes": 6170,
+    "portable_sha256": "7a4894c8c15bc226a8bc3adce968858969e030be5aeee9cc000fd70240caefbb",
+    "portable_bytes": 6170,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7a4894c8c15bc226a8bc3adce968858969e030be5aeee9cc000fd70240caefbb/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/four-selected-source-delta.patch",
+    "original_sha256": "d83f9f93a71aa5c1470d50c1b03864b8e21bd5ed3349fdc5d05c7ae6af166a03",
+    "original_bytes": 17010,
+    "portable_sha256": "d83f9f93a71aa5c1470d50c1b03864b8e21bd5ed3349fdc5d05c7ae6af166a03",
+    "portable_bytes": 17010,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d83f9f93a71aa5c1470d50c1b03864b8e21bd5ed3349fdc5d05c7ae6af166a03/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/app.py",
+    "original_sha256": "56bea116d317349defc2d537789d8ee8a816c0f07efb99cc8a9929d6f97d6640",
+    "original_bytes": 143975,
+    "portable_sha256": "56bea116d317349defc2d537789d8ee8a816c0f07efb99cc8a9929d6f97d6640",
+    "portable_bytes": 143975,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/56bea116d317349defc2d537789d8ee8a816c0f07efb99cc8a9929d6f97d6640/part-0000.json.txt",
+      "payloads/56bea116d317349defc2d537789d8ee8a816c0f07efb99cc8a9929d6f97d6640/part-0001.json.txt",
+      "payloads/56bea116d317349defc2d537789d8ee8a816c0f07efb99cc8a9929d6f97d6640/part-0002.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/application_finalizers.py",
+    "original_sha256": "8b2a467ada33ad68738cf8875b3237de9b5de8ffecfaa174f6bf1f2feb331d71",
+    "original_bytes": 13095,
+    "portable_sha256": "8b2a467ada33ad68738cf8875b3237de9b5de8ffecfaa174f6bf1f2feb331d71",
+    "portable_bytes": 13095,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/8b2a467ada33ad68738cf8875b3237de9b5de8ffecfaa174f6bf1f2feb331d71/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/async_workers.py",
+    "original_sha256": "40b670cb74242c59fa129fefb6cee2fcd6f1e03127a1128e484d651fadd7b034",
+    "original_bytes": 46680,
+    "portable_sha256": "40b670cb74242c59fa129fefb6cee2fcd6f1e03127a1128e484d651fadd7b034",
+    "portable_bytes": 46680,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/40b670cb74242c59fa129fefb6cee2fcd6f1e03127a1128e484d651fadd7b034/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/composer/planning_application.py",
+    "original_sha256": "9b5e7ef45e468006d2d3fbe7b504e9429b28e6f782b3521a61c15f216f28069b",
+    "original_bytes": 48967,
+    "portable_sha256": "9b5e7ef45e468006d2d3fbe7b504e9429b28e6f782b3521a61c15f216f28069b",
+    "portable_bytes": 48967,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9b5e7ef45e468006d2d3fbe7b504e9429b28e6f782b3521a61c15f216f28069b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/composer/provider_quota.py",
+    "original_sha256": "175000caebfe520470e2fd8226e12e6663db5fcf61ad513088ed211ba982041c",
+    "original_bytes": 23601,
+    "portable_sha256": "175000caebfe520470e2fd8226e12e6663db5fcf61ad513088ed211ba982041c",
+    "portable_bytes": 23601,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/175000caebfe520470e2fd8226e12e6663db5fcf61ad513088ed211ba982041c/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/composer_watch_reads.py",
+    "original_sha256": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
+    "original_bytes": 13064,
+    "portable_sha256": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
+    "portable_bytes": 13064,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/coordination/composer_operation_authority.py",
+    "original_sha256": "5bad9ea1a642317306cbe4dc79b73e214ad7114bd15b1328603b2b4e82901f87",
+    "original_bytes": 48754,
+    "portable_sha256": "5bad9ea1a642317306cbe4dc79b73e214ad7114bd15b1328603b2b4e82901f87",
+    "portable_bytes": 48754,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/5bad9ea1a642317306cbe4dc79b73e214ad7114bd15b1328603b2b4e82901f87/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/coordination/lifecycle.py",
+    "original_sha256": "e71f280555a04eae5c80fd1fe655a2e7da957d62e4a9fb49c02f93c523901b2c",
+    "original_bytes": 73315,
+    "portable_sha256": "e71f280555a04eae5c80fd1fe655a2e7da957d62e4a9fb49c02f93c523901b2c",
+    "portable_bytes": 73315,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e71f280555a04eae5c80fd1fe655a2e7da957d62e4a9fb49c02f93c523901b2c/part-0000.json.txt",
+      "payloads/e71f280555a04eae5c80fd1fe655a2e7da957d62e4a9fb49c02f93c523901b2c/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/execution/recovery.py",
+    "original_sha256": "33a837822149e283d4da30b02b85c128c3391638e374be7fc8deba57e0186415",
+    "original_bytes": 14282,
+    "portable_sha256": "33a837822149e283d4da30b02b85c128c3391638e374be7fc8deba57e0186415",
+    "portable_bytes": 14282,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/33a837822149e283d4da30b02b85c128c3391638e374be7fc8deba57e0186415/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/execution/routes.py",
+    "original_sha256": "2f91459ea1c65782810c894a3628b798aab22afb2b49fba79b60833683f7463d",
+    "original_bytes": 99382,
+    "portable_sha256": "2f91459ea1c65782810c894a3628b798aab22afb2b49fba79b60833683f7463d",
+    "portable_bytes": 99382,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2f91459ea1c65782810c894a3628b798aab22afb2b49fba79b60833683f7463d/part-0000.json.txt",
+      "payloads/2f91459ea1c65782810c894a3628b798aab22afb2b49fba79b60833683f7463d/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/execution/service.py",
+    "original_sha256": "31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428",
+    "original_bytes": 277939,
+    "portable_sha256": "31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428",
+    "portable_bytes": 277939,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428/part-0000.json.txt",
+      "payloads/31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428/part-0001.json.txt",
+      "payloads/31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428/part-0002.json.txt",
+      "payloads/31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428/part-0003.json.txt",
+      "payloads/31331093dc3a36b23685572c17a5a95e9e37b346791419fe8717966b0ae23428/part-0004.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/execution_lease_cleanup.py",
+    "original_sha256": "4e4cd915e93ae99be36b98bf81f989d97e6e33fb9e300287795d77cc2296bb42",
+    "original_bytes": 47281,
+    "portable_sha256": "4e4cd915e93ae99be36b98bf81f989d97e6e33fb9e300287795d77cc2296bb42",
+    "portable_bytes": 47281,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/4e4cd915e93ae99be36b98bf81f989d97e6e33fb9e300287795d77cc2296bb42/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/operator_telemetry.py",
+    "original_sha256": "bd94719a6dc80883974675d79e87dbf119a8b19d47245095573029e224a0bb45",
+    "original_bytes": 23469,
+    "portable_sha256": "bd94719a6dc80883974675d79e87dbf119a8b19d47245095573029e224a0bb45",
+    "portable_bytes": 23469,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/bd94719a6dc80883974675d79e87dbf119a8b19d47245095573029e224a0bb45/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/operator_telemetry_custody.py",
+    "original_sha256": "88746bf282e01818f00a72cdb4f15c02232df99fdf67ef867b6c0e9be186c722",
+    "original_bytes": 28304,
+    "portable_sha256": "88746bf282e01818f00a72cdb4f15c02232df99fdf67ef867b6c0e9be186c722",
+    "portable_bytes": 28304,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/88746bf282e01818f00a72cdb4f15c02232df99fdf67ef867b6c0e9be186c722/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/operator_telemetry_dispatch.py",
+    "original_sha256": "3d77f1b4c36e8505be3efd9b6dd85172fab3c2eaf3933ce236c9a9e9d4638035",
+    "original_bytes": 4209,
+    "portable_sha256": "3d77f1b4c36e8505be3efd9b6dd85172fab3c2eaf3933ce236c9a9e9d4638035",
+    "portable_bytes": 4209,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/3d77f1b4c36e8505be3efd9b6dd85172fab3c2eaf3933ce236c9a9e9d4638035/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/operator_telemetry_installation.py",
+    "original_sha256": "7a2f8b2a4abbc9a631c2656ef607b6ff2df46daf7f7eca76eae69534d877a67a",
+    "original_bytes": 7185,
+    "portable_sha256": "7a2f8b2a4abbc9a631c2656ef607b6ff2df46daf7f7eca76eae69534d877a67a",
+    "portable_bytes": 7185,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7a2f8b2a4abbc9a631c2656ef607b6ff2df46daf7f7eca76eae69534d877a67a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/required_work.py",
+    "original_sha256": "7d04c0cecccc6587da79b83ac8d290769f93fd46b19f06e021912d643592b5d1",
+    "original_bytes": 76785,
+    "portable_sha256": "7d04c0cecccc6587da79b83ac8d290769f93fd46b19f06e021912d643592b5d1",
+    "portable_bytes": 76785,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7d04c0cecccc6587da79b83ac8d290769f93fd46b19f06e021912d643592b5d1/part-0000.json.txt",
+      "payloads/7d04c0cecccc6587da79b83ac8d290769f93fd46b19f06e021912d643592b5d1/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/composer_async_worker.py",
+    "original_sha256": "7321f41aee1ccbc19181e282e4fe7767f47dd710fd2589c4aa1719678344ef37",
+    "original_bytes": 79971,
+    "portable_sha256": "7321f41aee1ccbc19181e282e4fe7767f47dd710fd2589c4aa1719678344ef37",
+    "portable_bytes": 79971,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7321f41aee1ccbc19181e282e4fe7767f47dd710fd2589c4aa1719678344ef37/part-0000.json.txt",
+      "payloads/7321f41aee1ccbc19181e282e4fe7767f47dd710fd2589c4aa1719678344ef37/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/composer_turn.py",
+    "original_sha256": "4bf85258c9d207573387567b1e67ff8f5a269eedb28cd7b82a630c2ea9f6be5e",
+    "original_bytes": 81170,
+    "portable_sha256": "4bf85258c9d207573387567b1e67ff8f5a269eedb28cd7b82a630c2ea9f6be5e",
+    "portable_bytes": 81170,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/4bf85258c9d207573387567b1e67ff8f5a269eedb28cd7b82a630c2ea9f6be5e/part-0000.json.txt",
+      "payloads/4bf85258c9d207573387567b1e67ff8f5a269eedb28cd7b82a630c2ea9f6be5e/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/manual_proposal_failure.py",
+    "original_sha256": "d7b423198cf639f6585632cea1042b9db556ff126f55fae1a843f3d7af9d75ff",
+    "original_bytes": 21255,
+    "portable_sha256": "d7b423198cf639f6585632cea1042b9db556ff126f55fae1a843f3d7af9d75ff",
+    "portable_bytes": 21255,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d7b423198cf639f6585632cea1042b9db556ff126f55fae1a843f3d7af9d75ff/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/pipeline_rejection.py",
+    "original_sha256": "b34a1c868d395ec7713dd5f7a7e67bcb9d7132d9ef701e8cc9d4e852098676a3",
+    "original_bytes": 1334,
+    "portable_sha256": "b34a1c868d395ec7713dd5f7a7e67bcb9d7132d9ef701e8cc9d4e852098676a3",
+    "portable_bytes": 1334,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/b34a1c868d395ec7713dd5f7a7e67bcb9d7132d9ef701e8cc9d4e852098676a3/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/pipeline_rejection_custody.py",
+    "original_sha256": "e433ffd4ac0fa4195e0bdb47d006f2d3026e7cd361db2ac3ef86d1afd1627c53",
+    "original_bytes": 12919,
+    "portable_sha256": "e433ffd4ac0fa4195e0bdb47d006f2d3026e7cd361db2ac3ef86d1afd1627c53",
+    "portable_bytes": 12919,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e433ffd4ac0fa4195e0bdb47d006f2d3026e7cd361db2ac3ef86d1afd1627c53/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/pipeline_rejection_finish_once.py",
+    "original_sha256": "7fd585a4bcada2003ff2c7c88933c637e3c26dcc2162adf618a820928e0cdab0",
+    "original_bytes": 6700,
+    "portable_sha256": "7fd585a4bcada2003ff2c7c88933c637e3c26dcc2162adf618a820928e0cdab0",
+    "portable_bytes": 6700,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7fd585a4bcada2003ff2c7c88933c637e3c26dcc2162adf618a820928e0cdab0/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/protocol.py",
+    "original_sha256": "86394d1d968f41aee842816df7880e93579d9357dffeddfd4360a0abc2605930",
+    "original_bytes": 139005,
+    "portable_sha256": "86394d1d968f41aee842816df7880e93579d9357dffeddfd4360a0abc2605930",
+    "portable_bytes": 139005,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/86394d1d968f41aee842816df7880e93579d9357dffeddfd4360a0abc2605930/part-0000.json.txt",
+      "payloads/86394d1d968f41aee842816df7880e93579d9357dffeddfd4360a0abc2605930/part-0001.json.txt",
+      "payloads/86394d1d968f41aee842816df7880e93579d9357dffeddfd4360a0abc2605930/part-0002.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/routes/_helpers.py",
+    "original_sha256": "cc0bcb074d6e9f1bf6d7e0bba7ab24c298658a047a2bb734a235cefacc4e0010",
+    "original_bytes": 186960,
+    "portable_sha256": "cc0bcb074d6e9f1bf6d7e0bba7ab24c298658a047a2bb734a235cefacc4e0010",
+    "portable_bytes": 186960,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/cc0bcb074d6e9f1bf6d7e0bba7ab24c298658a047a2bb734a235cefacc4e0010/part-0000.json.txt",
+      "payloads/cc0bcb074d6e9f1bf6d7e0bba7ab24c298658a047a2bb734a235cefacc4e0010/part-0001.json.txt",
+      "payloads/cc0bcb074d6e9f1bf6d7e0bba7ab24c298658a047a2bb734a235cefacc4e0010/part-0002.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/routes/composer/pipeline_settlement.py",
+    "original_sha256": "981f9fa99394091ee50d9b989a61e17e8532194a6dbd6dd8404297ad35a4103c",
+    "original_bytes": 37581,
+    "portable_sha256": "981f9fa99394091ee50d9b989a61e17e8532194a6dbd6dd8404297ad35a4103c",
+    "portable_bytes": 37581,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/981f9fa99394091ee50d9b989a61e17e8532194a6dbd6dd8404297ad35a4103c/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/routes/composer/proposals.py",
+    "original_sha256": "9476ee1e95410455fb9ad7c8cb48b45827d3bf69019bbacc6ed8c5e1d3e349bc",
+    "original_bytes": 41648,
+    "portable_sha256": "9476ee1e95410455fb9ad7c8cb48b45827d3bf69019bbacc6ed8c5e1d3e349bc",
+    "portable_bytes": 41648,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9476ee1e95410455fb9ad7c8cb48b45827d3bf69019bbacc6ed8c5e1d3e349bc/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/src/elspeth/web/sessions/service.py",
+    "original_sha256": "72a3c18c3811835c4caaa0ae1f78d1d043f7961e88d216c751eeccf82c9ad9c2",
+    "original_bytes": 442682,
+    "portable_sha256": "72a3c18c3811835c4caaa0ae1f78d1d043f7961e88d216c751eeccf82c9ad9c2",
+    "portable_bytes": 442682,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/72a3c18c3811835c4caaa0ae1f78d1d043f7961e88d216c751eeccf82c9ad9c2/part-0000.json.txt",
+      "payloads/72a3c18c3811835c4caaa0ae1f78d1d043f7961e88d216c751eeccf82c9ad9c2/part-0001.json.txt",
+      "payloads/72a3c18c3811835c4caaa0ae1f78d1d043f7961e88d216c751eeccf82c9ad9c2/part-0002.json.txt",
+      "payloads/72a3c18c3811835c4caaa0ae1f78d1d043f7961e88d216c751eeccf82c9ad9c2/part-0003.json.txt",
+      "payloads/72a3c18c3811835c4caaa0ae1f78d1d043f7961e88d216c751eeccf82c9ad9c2/part-0004.json.txt",
+      "payloads/72a3c18c3811835c4caaa0ae1f78d1d043f7961e88d216c751eeccf82c9ad9c2/part-0005.json.txt",
+      "payloads/72a3c18c3811835c4caaa0ae1f78d1d043f7961e88d216c751eeccf82c9ad9c2/part-0006.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/tests/helpers/composer_https.py",
+    "original_sha256": "b21ae0ca9dbbcddd738b4b6b9ea794ab6eac3692de8ee5a028c2d67248b1b0e5",
+    "original_bytes": 11058,
+    "portable_sha256": "b21ae0ca9dbbcddd738b4b6b9ea794ab6eac3692de8ee5a028c2d67248b1b0e5",
+    "portable_bytes": 11058,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/b21ae0ca9dbbcddd738b4b6b9ea794ab6eac3692de8ee5a028c2d67248b1b0e5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/tests/helpers/composer_operations.py",
+    "original_sha256": "80938fac2c0dfb39cf1cf11c9e290bf4676ed46e34d1455273fd45cf2dcf8eaf",
+    "original_bytes": 10875,
+    "portable_sha256": "80938fac2c0dfb39cf1cf11c9e290bf4676ed46e34d1455273fd45cf2dcf8eaf",
+    "portable_bytes": 10875,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/80938fac2c0dfb39cf1cf11c9e290bf4676ed46e34d1455273fd45cf2dcf8eaf/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/images-candidate/tests/integration/web/test_composer_https_acceptance.py",
+    "original_sha256": "97484fe72ec41600d35e4ab14333b972642bbd6d315a479b8cc9b3c8706285e8",
+    "original_bytes": 58801,
+    "portable_sha256": "97484fe72ec41600d35e4ab14333b972642bbd6d315a479b8cc9b3c8706285e8",
+    "portable_bytes": 58801,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/97484fe72ec41600d35e4ab14333b972642bbd6d315a479b8cc9b3c8706285e8/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/preimages/RUN_RECIPE.md",
+    "original_sha256": "1c3135249409abec32ac098f0e914328ce370fbf8d7b174f9e6c69183d25c5a4",
+    "original_bytes": 2269,
+    "portable_sha256": "abe71cb6f3a2b3242e7f306efd4e07d8b9e1a9a86ca0d5c647f090e54f71a42a",
+    "portable_bytes": 1999,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/abe71cb6f3a2b3242e7f306efd4e07d8b9e1a9a86ca0d5c647f090e54f71a42a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/preimages/launch-root.sh",
+    "original_sha256": "aa738827b93e04bb72f9e446b5e57b0275473e02e93efe6ffda5cb2642d2f43c",
+    "original_bytes": 1572,
+    "portable_sha256": "e4842ea65e776b35531dd18f11726a8caaffcebbeac2a2dc3a06cfa4cda1062d",
+    "portable_bytes": 1470,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e4842ea65e776b35531dd18f11726a8caaffcebbeac2a2dc3a06cfa4cda1062d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/preimages/run_root.py",
+    "original_sha256": "09e30ed0c42a3490ec52af0ba4a9132be226efb2c1b534c8af97df51f631797e",
+    "original_bytes": 9082,
+    "portable_sha256": "4eaf255333692da70b84991e6fc31486c48fb149cf9d3712ffa784e73cf8115f",
+    "portable_bytes": 8980,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/4eaf255333692da70b84991e6fc31486c48fb149cf9d3712ffa784e73cf8115f/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/preimages/selected-source/src/elspeth/web/coordination/lifecycle.py",
+    "original_sha256": "7bb959dbea303d2c70e138da3c55d4d5ec836d81625e3dda7cae650800ab089c",
+    "original_bytes": 70742,
+    "portable_sha256": "7bb959dbea303d2c70e138da3c55d4d5ec836d81625e3dda7cae650800ab089c",
+    "portable_bytes": 70742,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7bb959dbea303d2c70e138da3c55d4d5ec836d81625e3dda7cae650800ab089c/part-0000.json.txt",
+      "payloads/7bb959dbea303d2c70e138da3c55d4d5ec836d81625e3dda7cae650800ab089c/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/preimages/selected-source/src/elspeth/web/execution/service.py",
+    "original_sha256": "1f1cb0e59e9bca00cda7c87f52665ae80fa199e76d564499b42ac75cb5ed96f5",
+    "original_bytes": 276832,
+    "portable_sha256": "1f1cb0e59e9bca00cda7c87f52665ae80fa199e76d564499b42ac75cb5ed96f5",
+    "portable_bytes": 276832,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/1f1cb0e59e9bca00cda7c87f52665ae80fa199e76d564499b42ac75cb5ed96f5/part-0000.json.txt",
+      "payloads/1f1cb0e59e9bca00cda7c87f52665ae80fa199e76d564499b42ac75cb5ed96f5/part-0001.json.txt",
+      "payloads/1f1cb0e59e9bca00cda7c87f52665ae80fa199e76d564499b42ac75cb5ed96f5/part-0002.json.txt",
+      "payloads/1f1cb0e59e9bca00cda7c87f52665ae80fa199e76d564499b42ac75cb5ed96f5/part-0003.json.txt",
+      "payloads/1f1cb0e59e9bca00cda7c87f52665ae80fa199e76d564499b42ac75cb5ed96f5/part-0004.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/preimages/selected-source/src/elspeth/web/execution_lease_cleanup.py",
+    "original_sha256": "531122f2c5d57c7a0a1a887411769e7428c2fe5fdf6957eb656b4e97b87d1e59",
+    "original_bytes": 44592,
+    "portable_sha256": "531122f2c5d57c7a0a1a887411769e7428c2fe5fdf6957eb656b4e97b87d1e59",
+    "portable_bytes": 44592,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/531122f2c5d57c7a0a1a887411769e7428c2fe5fdf6957eb656b4e97b87d1e59/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/preimages/selected-source/tests/helpers/composer_https.py",
+    "original_sha256": "0803f1e9de0b3d479aa9583383587402a9e9d3341b968fdba8a825bad4824ed0",
+    "original_bytes": 10667,
+    "portable_sha256": "0803f1e9de0b3d479aa9583383587402a9e9d3341b968fdba8a825bad4824ed0",
+    "portable_bytes": 10667,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/0803f1e9de0b3d479aa9583383587402a9e9d3341b968fdba8a825bad4824ed0/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/preimages/source_controls10.py",
+    "original_sha256": "788797a791e854904bee55467e9a96646a517f78fc81e11c1e137d96c43edf1a",
+    "original_bytes": 22725,
+    "portable_sha256": "fbb309b3285df1abbb83a00ba5987b0f2c25c11d97c9caf29fb38204b60c407c",
+    "portable_bytes": 22726,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/fbb309b3285df1abbb83a00ba5987b0f2c25c11d97c9caf29fb38204b60c407c/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/preimages/source_controls11.py",
+    "original_sha256": "eecc5ba187ef26b1bc48c3604de57b8efe7f2ec8d82e82eda9585945ee58687b",
+    "original_bytes": 7454,
+    "portable_sha256": "36bb0e43686f93a37b6f2875eaba7ca593776a75939fb57b452c1b113d8cddbc",
+    "portable_bytes": 7385,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/36bb0e43686f93a37b6f2875eaba7ca593776a75939fb57b452c1b113d8cddbc/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/preimages/source_controls9.py",
+    "original_sha256": "d9045a8e6a545cea78ebf87c4e528471e12e6e08b39284dcd976d3bf7a7d255c",
+    "original_bytes": 22258,
+    "portable_sha256": "4432435fefd714dc02071ef463a666e6fadbc413ef9970c832961ef89d5d5a18",
+    "portable_bytes": 22259,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/4432435fefd714dc02071ef463a666e6fadbc413ef9970c832961ef89d5d5a18/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/prepare_static.py",
+    "original_sha256": "cb533a9d63c2e8477a278a81f8e0ea295d1576bbe28197d104a86dc7740ab421",
+    "original_bytes": 13371,
+    "portable_sha256": "18b45fc7c9548182328969dd112d9a9bbfb441a039e299176b39a7b3235c62b7",
+    "portable_bytes": 13302,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/18b45fc7c9548182328969dd112d9a9bbfb441a039e299176b39a7b3235c62b7/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/runtime/identity_publication.py",
+    "original_sha256": "485271a6425ae27c669910410566e6513164b81f82746b393fcca9036c6bb694",
+    "original_bytes": 334,
+    "portable_sha256": "485271a6425ae27c669910410566e6513164b81f82746b393fcca9036c6bb694",
+    "portable_bytes": 334,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/485271a6425ae27c669910410566e6513164b81f82746b393fcca9036c6bb694/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/runtime/lineage_protocol.py",
+    "original_sha256": "6b784db79828fbdb12c14a194894929cc10fd099482a2303768d2ca5982cce6b",
+    "original_bytes": 15697,
+    "portable_sha256": "6b784db79828fbdb12c14a194894929cc10fd099482a2303768d2ca5982cce6b",
+    "portable_bytes": 15697,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6b784db79828fbdb12c14a194894929cc10fd099482a2303768d2ca5982cce6b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/runtime/owned_process.py",
+    "original_sha256": "1f6c888a29abfc883876e8c1013326a2e35122931428e91901e7b7c4696e0473",
+    "original_bytes": 1917,
+    "portable_sha256": "1f6c888a29abfc883876e8c1013326a2e35122931428e91901e7b7c4696e0473",
+    "portable_bytes": 1917,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/1f6c888a29abfc883876e8c1013326a2e35122931428e91901e7b7c4696e0473/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/runtime/owned_signal_handoff.py",
+    "original_sha256": "9fffa7bef3feea0c7003196f1cd9ed18d7915da2a9d882b0166696e65b264196",
+    "original_bytes": 1326,
+    "portable_sha256": "9fffa7bef3feea0c7003196f1cd9ed18d7915da2a9d882b0166696e65b264196",
+    "portable_bytes": 1326,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9fffa7bef3feea0c7003196f1cd9ed18d7915da2a9d882b0166696e65b264196/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/runtime/run_lineage_child.py",
+    "original_sha256": "141ae10a6087c61641ca939325f390b2820e45654f43f1aaf2cc274621accaba",
+    "original_bytes": 4434,
+    "portable_sha256": "141ae10a6087c61641ca939325f390b2820e45654f43f1aaf2cc274621accaba",
+    "portable_bytes": 4434,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/141ae10a6087c61641ca939325f390b2820e45654f43f1aaf2cc274621accaba/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/runtime/run_lineage_owned.py",
+    "original_sha256": "d1f6478aa607115701a5dc02e6d6712de5fe3c8343f3e44dfe755c8b7b6f2c53",
+    "original_bytes": 7958,
+    "portable_sha256": "d1f6478aa607115701a5dc02e6d6712de5fe3c8343f3e44dfe755c8b7b6f2c53",
+    "portable_bytes": 7958,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d1f6478aa607115701a5dc02e6d6712de5fe3c8343f3e44dfe755c8b7b6f2c53/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/tls-successor-static-1/runtime/tls_lineage.py",
+    "original_sha256": "8dc7b8e650090adbc257fd3c78ef220393356a431a8c4a870ef806a0cb4436c3",
+    "original_bytes": 35790,
+    "portable_sha256": "8dc7b8e650090adbc257fd3c78ef220393356a431a8c4a870ef806a0cb4436c3",
+    "portable_bytes": 35790,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/8dc7b8e650090adbc257fd3c78ef220393356a431a8c4a870ef806a0cb4436c3/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version2/REPORT.md",
+    "original_sha256": "de845f437dc439cf927835669aa572f43a8da5705858990c7cb696a5f296484f",
+    "original_bytes": 13171,
+    "portable_sha256": "de845f437dc439cf927835669aa572f43a8da5705858990c7cb696a5f296484f",
+    "portable_bytes": 13171,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/de845f437dc439cf927835669aa572f43a8da5705858990c7cb696a5f296484f/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version2/dependency_roles.py",
+    "original_sha256": "46dc8da6a48b4c77c1384c8f7702dae80cd37f85dffbc9ed97d8ace81014b853",
+    "original_bytes": 11243,
+    "portable_sha256": "46dc8da6a48b4c77c1384c8f7702dae80cd37f85dffbc9ed97d8ace81014b853",
+    "portable_bytes": 11243,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/46dc8da6a48b4c77c1384c8f7702dae80cd37f85dffbc9ed97d8ace81014b853/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version2/family_contracts.py",
+    "original_sha256": "52cbf60c6f686fc72d4df9c1c1c937cd47d4267ec84bedd07b55a812e38a1715",
+    "original_bytes": 56639,
+    "portable_sha256": "52cbf60c6f686fc72d4df9c1c1c937cd47d4267ec84bedd07b55a812e38a1715",
+    "portable_bytes": 56639,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/52cbf60c6f686fc72d4df9c1c1c937cd47d4267ec84bedd07b55a812e38a1715/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version2/source_controls.py",
+    "original_sha256": "a87f935cac599116779a2c37afb21fecbbd042afdf390ea8e40842473bae9568",
+    "original_bytes": 16285,
+    "portable_sha256": "bdf7012a8adf87f7cfaf1486bbd8086588803c5c451e5946af71450d495c4136",
+    "portable_bytes": 16216,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/bdf7012a8adf87f7cfaf1486bbd8086588803c5c451e5946af71450d495c4136/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version2/typed_dependency_controls.py",
+    "original_sha256": "a940a7de902db7c0b192ef25aa634af41daf2a7d180ccc59e697511984f3fd1e",
+    "original_bytes": 4137,
+    "portable_sha256": "403c8505a286d30097d5331a5317dc2e2788fb25053201b9f66e233ed2dd3c67",
+    "portable_bytes": 4068,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/403c8505a286d30097d5331a5317dc2e2788fb25053201b9f66e233ed2dd3c67/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version3/REPORT.md",
+    "original_sha256": "a8c12cbe111ed66a9ccdc3445372b4c643a2c49c9248cc0c368e485e72903fc0",
+    "original_bytes": 19999,
+    "portable_sha256": "a8c12cbe111ed66a9ccdc3445372b4c643a2c49c9248cc0c368e485e72903fc0",
+    "portable_bytes": 19999,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/a8c12cbe111ed66a9ccdc3445372b4c643a2c49c9248cc0c368e485e72903fc0/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version3/dependency_roles.py",
+    "original_sha256": "e11c29ec5be40dbd25d22561156e3268fba217dd9285282bd6a3c4d566576bb5",
+    "original_bytes": 12780,
+    "portable_sha256": "e11c29ec5be40dbd25d22561156e3268fba217dd9285282bd6a3c4d566576bb5",
+    "portable_bytes": 12780,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e11c29ec5be40dbd25d22561156e3268fba217dd9285282bd6a3c4d566576bb5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version3/family_contracts.py",
+    "original_sha256": "e2afa86dc933cc4cdc3d5db75942465ca5d981cb4c1268377f0f5420e7572c50",
+    "original_bytes": 64016,
+    "portable_sha256": "e2afa86dc933cc4cdc3d5db75942465ca5d981cb4c1268377f0f5420e7572c50",
+    "portable_bytes": 64016,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e2afa86dc933cc4cdc3d5db75942465ca5d981cb4c1268377f0f5420e7572c50/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version3/source_controls.py",
+    "original_sha256": "c6758bda44f96b65eb2e167a266b7710ac22902e680222714481bc750993bf56",
+    "original_bytes": 22581,
+    "portable_sha256": "22c0838d7656cc626ac5092a0777a848c3a70f521f25fb88ea16b53a7e106e05",
+    "portable_bytes": 22512,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/22c0838d7656cc626ac5092a0777a848c3a70f521f25fb88ea16b53a7e106e05/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version3/typed_dependency_controls.py",
+    "original_sha256": "29e0bda7f3b8fe64a5888e81a523ade65bd00b6eaf2fe38e6eced08aff7f5745",
+    "original_bytes": 7759,
+    "portable_sha256": "3cdf543c0a4dd6bb1ac637cbeb4387158de450722299868c5bd85811fdb9124f",
+    "portable_bytes": 7690,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/3cdf543c0a4dd6bb1ac637cbeb4387158de450722299868c5bd85811fdb9124f/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version4/REPORT.md",
+    "original_sha256": "26282083791a295154ad624544b23ab5a644bcaa7931f83099f3a64c582d895d",
+    "original_bytes": 11191,
+    "portable_sha256": "26282083791a295154ad624544b23ab5a644bcaa7931f83099f3a64c582d895d",
+    "portable_bytes": 11191,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/26282083791a295154ad624544b23ab5a644bcaa7931f83099f3a64c582d895d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version4/dependency_roles.py",
+    "original_sha256": "37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5",
+    "original_bytes": 14071,
+    "portable_sha256": "37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5",
+    "portable_bytes": 14071,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version4/family_contracts.py",
+    "original_sha256": "bccef43116cd30e0de4d9a530cbf5ace02147904f409986bdf61fb77225acc2b",
+    "original_bytes": 69192,
+    "portable_sha256": "bccef43116cd30e0de4d9a530cbf5ace02147904f409986bdf61fb77225acc2b",
+    "portable_bytes": 69192,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/bccef43116cd30e0de4d9a530cbf5ace02147904f409986bdf61fb77225acc2b/part-0000.json.txt",
+      "payloads/bccef43116cd30e0de4d9a530cbf5ace02147904f409986bdf61fb77225acc2b/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version4/review_replay.py",
+    "original_sha256": "582c6f12985f0233c27c461960465111ef1381994336a35e8288e71a344f2391",
+    "original_bytes": 5206,
+    "portable_sha256": "6da56baaf6667cdff4f60200acc450dfa2da359873ef81fd2e549a9b0892882d",
+    "portable_bytes": 5137,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6da56baaf6667cdff4f60200acc450dfa2da359873ef81fd2e549a9b0892882d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version4/source_controls.py",
+    "original_sha256": "10ce272268ce8ec8a96a33a58f408a9f9fddb1d3dbd4ab258ea4e40d0208908b",
+    "original_bytes": 28143,
+    "portable_sha256": "48d354bda916afce0ea8cf30584c64e897b3785aa396bfea267a915145c3d5b8",
+    "portable_bytes": 28074,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/48d354bda916afce0ea8cf30584c64e897b3785aa396bfea267a915145c3d5b8/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version4/typed_dependency_controls.py",
+    "original_sha256": "851f79d443ad9cf9843ec424bee78850748fc362913c6d2ab76a4eeb3ef7122b",
+    "original_bytes": 8419,
+    "portable_sha256": "2b1302384212a4bb265c17aca334bdda6bf890d9822fc6b05af9a1e485f13c93",
+    "portable_bytes": 8350,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2b1302384212a4bb265c17aca334bdda6bf890d9822fc6b05af9a1e485f13c93/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version5/REPORT.md",
+    "original_sha256": "396099cbb20066c89c5ecae5768d648cdbe5dee23ad0e3892d704af182b5dea9",
+    "original_bytes": 17625,
+    "portable_sha256": "396099cbb20066c89c5ecae5768d648cdbe5dee23ad0e3892d704af182b5dea9",
+    "portable_bytes": 17625,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/396099cbb20066c89c5ecae5768d648cdbe5dee23ad0e3892d704af182b5dea9/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version5/dependency_roles.py",
+    "original_sha256": "37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5",
+    "original_bytes": 14071,
+    "portable_sha256": "37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5",
+    "portable_bytes": 14071,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version5/family_contracts.py",
+    "original_sha256": "2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816",
+    "original_bytes": 69389,
+    "portable_sha256": "2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816",
+    "portable_bytes": 69389,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816/part-0000.json.txt",
+      "payloads/2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version5/family_source_controls.py",
+    "original_sha256": "266b659132184b15ec3bf6a0ef69e3cd0adc104ef6b950de5d6f663e5f105282",
+    "original_bytes": 29300,
+    "portable_sha256": "1e76f1f2887ea759f88743953fed89012097a40637d0ae0432f542ca1b208dc6",
+    "portable_bytes": 29231,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/1e76f1f2887ea759f88743953fed89012097a40637d0ae0432f542ca1b208dc6/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version5/source-controls-first.py",
+    "original_sha256": "c9af4eef57c5fa28805299359a6e7b66cabca18be534cfc87398309f3c0ac7b8",
+    "original_bytes": 11897,
+    "portable_sha256": "34531d979bd2200622f3de7b0c49ae16baeb5b6649c67edde720af5a47eeb1d3",
+    "portable_bytes": 11828,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/34531d979bd2200622f3de7b0c49ae16baeb5b6649c67edde720af5a47eeb1d3/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version5/source_controls.py",
+    "original_sha256": "9b15dafc1b2cb217e70572319df11cd1f06cc370a69f06b82fe3fd719b94cc47",
+    "original_bytes": 16090,
+    "portable_sha256": "724f42003997bffbb04dc7a181be689750183d6486d3e35d8945a845522e8869",
+    "portable_bytes": 16021,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/724f42003997bffbb04dc7a181be689750183d6486d3e35d8945a845522e8869/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version5/supplier-contracts-first.py",
+    "original_sha256": "580369800fd76fb2de36608276add6d457a139d231ad1e9b662bf3f61f28ffde",
+    "original_bytes": 36173,
+    "portable_sha256": "580369800fd76fb2de36608276add6d457a139d231ad1e9b662bf3f61f28ffde",
+    "portable_bytes": 36173,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/580369800fd76fb2de36608276add6d457a139d231ad1e9b662bf3f61f28ffde/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version5/supplier_contracts.py",
+    "original_sha256": "569227640053db2bdd1a1db25dc1386d6ef15e630a46abab85fa599ad66fda1a",
+    "original_bytes": 43045,
+    "portable_sha256": "569227640053db2bdd1a1db25dc1386d6ef15e630a46abab85fa599ad66fda1a",
+    "portable_bytes": 43045,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/569227640053db2bdd1a1db25dc1386d6ef15e630a46abab85fa599ad66fda1a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version6/REPORT.md",
+    "original_sha256": "719073384f38c47b2246e28ed1db6a9343711105af3e3e0ef20120e4211987fe",
+    "original_bytes": 6465,
+    "portable_sha256": "719073384f38c47b2246e28ed1db6a9343711105af3e3e0ef20120e4211987fe",
+    "portable_bytes": 6465,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/719073384f38c47b2246e28ed1db6a9343711105af3e3e0ef20120e4211987fe/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version6/dependency_roles.py",
+    "original_sha256": "37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5",
+    "original_bytes": 14071,
+    "portable_sha256": "37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5",
+    "portable_bytes": 14071,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version6/family_contracts.py",
+    "original_sha256": "2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816",
+    "original_bytes": 69389,
+    "portable_sha256": "2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816",
+    "portable_bytes": 69389,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816/part-0000.json.txt",
+      "payloads/2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version6/source_controls.py",
+    "original_sha256": "1f5caf7369d3902aa50a28ce6f4a313dac55f9d35d6f1304f54a296e22e62204",
+    "original_bytes": 18547,
+    "portable_sha256": "b044b4fa466b5a64eb8c192c76e393815bfef9c63b4023188819b26f042ec746",
+    "portable_bytes": 18478,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/b044b4fa466b5a64eb8c192c76e393815bfef9c63b4023188819b26f042ec746/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version6/supplier_contracts.py",
+    "original_sha256": "3757a7b502225580ab5da6f2550ce72b33b8a527a73a718b264fee01e2fb10db",
+    "original_bytes": 44786,
+    "portable_sha256": "3757a7b502225580ab5da6f2550ce72b33b8a527a73a718b264fee01e2fb10db",
+    "portable_bytes": 44786,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/3757a7b502225580ab5da6f2550ce72b33b8a527a73a718b264fee01e2fb10db/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version7/REPORT.md",
+    "original_sha256": "e7a47c9bdae5146948693610b371bfdd6d700a92a93b29d96d3f249b3f977403",
+    "original_bytes": 7961,
+    "portable_sha256": "e7a47c9bdae5146948693610b371bfdd6d700a92a93b29d96d3f249b3f977403",
+    "portable_bytes": 7961,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e7a47c9bdae5146948693610b371bfdd6d700a92a93b29d96d3f249b3f977403/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version7/controls-3.12.json",
+    "original_sha256": "e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0",
+    "original_bytes": 1019326,
+    "portable_sha256": "e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0",
+    "portable_bytes": 1019326,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0000.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0001.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0002.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0003.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0004.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0005.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0006.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0007.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0008.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0009.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0010.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0011.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0012.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0013.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0014.json.txt",
+      "payloads/e9195651424bd0f0c39af7e4af37eb18fb36e2ef86fca72793bccca43550e3a0/part-0015.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version7/dependency_roles.py",
+    "original_sha256": "37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5",
+    "original_bytes": 14071,
+    "portable_sha256": "37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5",
+    "portable_bytes": 14071,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/37e856572f6460e80086350592dbc8f5c7daac6e4ce5e72a51ac6a3dffdceae5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version7/family_contracts.py",
+    "original_sha256": "2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816",
+    "original_bytes": 69389,
+    "portable_sha256": "2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816",
+    "portable_bytes": 69389,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816/part-0000.json.txt",
+      "payloads/2f4f3e9b83b9df4b17bbc766fc2e5db2c14f097f4a7ef08a4f47c43d59451816/part-0001.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version7/family_source_controls.py",
+    "original_sha256": "266b659132184b15ec3bf6a0ef69e3cd0adc104ef6b950de5d6f663e5f105282",
+    "original_bytes": 29300,
+    "portable_sha256": "1e76f1f2887ea759f88743953fed89012097a40637d0ae0432f542ca1b208dc6",
+    "portable_bytes": 29231,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/1e76f1f2887ea759f88743953fed89012097a40637d0ae0432f542ca1b208dc6/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version7/source_controls.py",
+    "original_sha256": "1f5caf7369d3902aa50a28ce6f4a313dac55f9d35d6f1304f54a296e22e62204",
+    "original_bytes": 18547,
+    "portable_sha256": "b044b4fa466b5a64eb8c192c76e393815bfef9c63b4023188819b26f042ec746",
+    "portable_bytes": 18478,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/b044b4fa466b5a64eb8c192c76e393815bfef9c63b4023188819b26f042ec746/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version7/successor_controls.py",
+    "original_sha256": "e4f3c11272a1edd129497a36d7d784b3ac8c636c16c5ec90dd5fae615d9ce9f9",
+    "original_bytes": 8264,
+    "portable_sha256": "f1891e55fc0be221df6d2f4e34e1cb80258bda1ba93776a9bc136842f43fe396",
+    "portable_bytes": 8195,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f1891e55fc0be221df6d2f4e34e1cb80258bda1ba93776a9bc136842f43fe396/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-reserve-remaining-families-1/version7/supplier_contracts.py",
+    "original_sha256": "54151cdcb80c6bf5a6dca2e57a21d79644e80dd05ee4c8c605abd42a88b2e21b",
+    "original_bytes": 47283,
+    "portable_sha256": "54151cdcb80c6bf5a6dca2e57a21d79644e80dd05ee4c8c605abd42a88b2e21b",
+    "portable_bytes": 47283,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/54151cdcb80c6bf5a6dca2e57a21d79644e80dd05ee4c8c605abd42a88b2e21b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-scalar-input-flow-1/REPORT.md",
+    "original_sha256": "18fbb3ca33220d6347a6992b72c09126e2db6805c703f1bae3f1b5bf4a996b11",
+    "original_bytes": 13470,
+    "portable_sha256": "18fbb3ca33220d6347a6992b72c09126e2db6805c703f1bae3f1b5bf4a996b11",
+    "portable_bytes": 13470,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/18fbb3ca33220d6347a6992b72c09126e2db6805c703f1bae3f1b5bf4a996b11/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-scalar-input-flow-1/controls.py",
+    "original_sha256": "7a1ab69cf8ee2d2a25bae2388137b9f35deebbf969d00bee170004292eb897a5",
+    "original_bytes": 16481,
+    "portable_sha256": "9d7aefd766156eb6b8fe3a930379257e35262196a6bd299249fe88057244f313",
+    "portable_bytes": 16412,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9d7aefd766156eb6b8fe3a930379257e35262196a6bd299249fe88057244f313/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-scalar-input-flow-1/scalar_input_flow.py",
+    "original_sha256": "34be26366e5a65cd0c8fab7381e70e7b58c43a38ec418a85661fac5477a11d03",
+    "original_bytes": 30472,
+    "portable_sha256": "34be26366e5a65cd0c8fab7381e70e7b58c43a38ec418a85661fac5477a11d03",
+    "portable_bytes": 30472,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/34be26366e5a65cd0c8fab7381e70e7b58c43a38ec418a85661fac5477a11d03/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-scalar-input-flow-1/source_inventory.py",
+    "original_sha256": "cc6164a82a2d686fddfa761a555ee266549c1e30f9aa557fb03aecb98a92b063",
+    "original_bytes": 6138,
+    "portable_sha256": "7cc8c37deaa087e800dd4b310df61d20f54b87ec92b6c171e6064baee19c14e2",
+    "portable_bytes": 6036,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7cc8c37deaa087e800dd4b310df61d20f54b87ec92b6c171e6064baee19c14e2/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "sol-bounded-scalar-input-flow-1/version2/INTEGRATION.md",
+    "original_sha256": "635d5f503b474bbf449051da2e463d6fdd2d24e51172428c491f49977a85b849",
+    "original_bytes": 2833,
+    "portable_sha256": "635d5f503b474bbf449051da2e463d6fdd2d24e51172428c491f49977a85b849",
+    "portable_bytes": 2833,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/635d5f503b474bbf449051da2e463d6fdd2d24e51172428c491f49977a85b849/part-0000.json.txt"
+    ]
+  }
+]

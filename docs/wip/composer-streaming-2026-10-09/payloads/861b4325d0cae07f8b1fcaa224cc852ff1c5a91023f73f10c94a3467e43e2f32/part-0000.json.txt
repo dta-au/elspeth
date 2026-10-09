@@ -1,0 +1,1 @@
+"import elspeth.web.async_workers as worker\nnamespace = vars(worker)\nnamespace['_APPLICATION_FINALIZER_OWNER'] = foreign\n"

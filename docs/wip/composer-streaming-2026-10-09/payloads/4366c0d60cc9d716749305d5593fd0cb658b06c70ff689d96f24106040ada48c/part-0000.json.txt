@@ -1,0 +1,1 @@
+"import elspeth.web.async_workers as worker\ndef benign(worker):\n    worker._INSTANCE_DRAINING = 'ordinary local argument'\n"

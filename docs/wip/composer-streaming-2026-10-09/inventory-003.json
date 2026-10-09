@@ -1,0 +1,1102 @@
+[
+  {
+    "source_path": "astra-core3-finite-native-controls-code-review-2.md",
+    "original_sha256": "1c9b2ff2c9c79758ead005d8570f55e313668e929b318fa4c5675eb55a77b064",
+    "original_bytes": 11196,
+    "portable_sha256": "1c9b2ff2c9c79758ead005d8570f55e313668e929b318fa4c5675eb55a77b064",
+    "portable_bytes": 11196,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/1c9b2ff2c9c79758ead005d8570f55e313668e929b318fa4c5675eb55a77b064/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-finite-native-controls-code-review-3.md",
+    "original_sha256": "55d5f0bbc698e9188644b64f7f730a6f024fa7921a35a6f32255b2a26afdb827",
+    "original_bytes": 10427,
+    "portable_sha256": "55d5f0bbc698e9188644b64f7f730a6f024fa7921a35a6f32255b2a26afdb827",
+    "portable_bytes": 10427,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/55d5f0bbc698e9188644b64f7f730a6f024fa7921a35a6f32255b2a26afdb827/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-finite-native-controls-code-review-4.md",
+    "original_sha256": "6a78d00dd88124e886665582f77b32d519642e2aa8150ec357914db39341900b",
+    "original_bytes": 7265,
+    "portable_sha256": "6a78d00dd88124e886665582f77b32d519642e2aa8150ec357914db39341900b",
+    "portable_bytes": 7265,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6a78d00dd88124e886665582f77b32d519642e2aa8150ec357914db39341900b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge-native-controls-code-review-1.md",
+    "original_sha256": "165732c15effd5c5d3c20a88bd45112f63a48ea6f0c9268ef10a06c86f21f588",
+    "original_bytes": 11516,
+    "portable_sha256": "165732c15effd5c5d3c20a88bd45112f63a48ea6f0c9268ef10a06c86f21f588",
+    "portable_bytes": 11516,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/165732c15effd5c5d3c20a88bd45112f63a48ea6f0c9268ef10a06c86f21f588/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge-native-controls-code-review-2.md",
+    "original_sha256": "67e1f3007fb770da2cbd7681e220d43293c3ae80163be27aa6fb2366a57e4e4b",
+    "original_bytes": 11046,
+    "portable_sha256": "67e1f3007fb770da2cbd7681e220d43293c3ae80163be27aa6fb2366a57e4e4b",
+    "portable_bytes": 11046,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/67e1f3007fb770da2cbd7681e220d43293c3ae80163be27aa6fb2366a57e4e4b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge-native-controls-code-review-3.md",
+    "original_sha256": "a9da3f0b305ffdb7ccf2c6c934e8350aae5633b9b13372f84e2bc9dbd4c0d85b",
+    "original_bytes": 8951,
+    "portable_sha256": "a9da3f0b305ffdb7ccf2c6c934e8350aae5633b9b13372f84e2bc9dbd4c0d85b",
+    "portable_bytes": 8951,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/a9da3f0b305ffdb7ccf2c6c934e8350aae5633b9b13372f84e2bc9dbd4c0d85b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge-native-controls-code-review-4.md",
+    "original_sha256": "92dd08be01d5000e170c7d6135e2ec5452133e1152b6c57083b2ee3f7f3792d6",
+    "original_bytes": 5426,
+    "portable_sha256": "92dd08be01d5000e170c7d6135e2ec5452133e1152b6c57083b2ee3f7f3792d6",
+    "portable_bytes": 5426,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/92dd08be01d5000e170c7d6135e2ec5452133e1152b6c57083b2ee3f7f3792d6/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge-native-controls-code-review-5.md",
+    "original_sha256": "a3495f5f86f61d336422523d14b66f93fd50462c98df3e543be2efcd77f09c9e",
+    "original_bytes": 5377,
+    "portable_sha256": "a3495f5f86f61d336422523d14b66f93fd50462c98df3e543be2efcd77f09c9e",
+    "portable_bytes": 5377,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/a3495f5f86f61d336422523d14b66f93fd50462c98df3e543be2efcd77f09c9e/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge1-controls.py",
+    "original_sha256": "6a306384421b67ad8fc94f5f2f8740a78e165591ebbf21dc267b67608b964fdf",
+    "original_bytes": 8532,
+    "portable_sha256": "9063f175e9950b2cef18d294f5a5c4b7727aeb9f867353598568b9a58a1c6e69",
+    "portable_bytes": 8500,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9063f175e9950b2cef18d294f5a5c4b7727aeb9f867353598568b9a58a1c6e69/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge1-guard-controls.py",
+    "original_sha256": "972ab62dc250a0053909b237309afe35035fe18721a380908aa1053f89d519c6",
+    "original_bytes": 2914,
+    "portable_sha256": "ee6bff3f69f487fc0fc1632457594bd30af55e4b3b9e60aaaf6cef0e9055970b",
+    "portable_bytes": 2882,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/ee6bff3f69f487fc0fc1632457594bd30af55e4b3b9e60aaaf6cef0e9055970b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge1-owner-controls.py",
+    "original_sha256": "0113d069c16534bc8175bc4e02f07a90df6d782a3f783c5cec38db9aca39e42a",
+    "original_bytes": 3961,
+    "portable_sha256": "34210c086ca833137d1eb2c8c6dd64e8aa6474507403e965fa9078fc7eabb862",
+    "portable_bytes": 3928,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/34210c086ca833137d1eb2c8c6dd64e8aa6474507403e965fa9078fc7eabb862/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge2-controls.py",
+    "original_sha256": "1fce56784630dbe4e5064f034448b248b600f60446fc510dce0e36306d479554",
+    "original_bytes": 6633,
+    "portable_sha256": "509bab85b7af3510388ae9f1933b47d62a9efee82b809739bc57e7f1798bba23",
+    "portable_bytes": 6601,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/509bab85b7af3510388ae9f1933b47d62a9efee82b809739bc57e7f1798bba23/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge2-guard-controls.py",
+    "original_sha256": "8424609263943d5395280666f03e442d7981dc3729739414ad0404f17e6a148a",
+    "original_bytes": 2914,
+    "portable_sha256": "4eefa5ed457627575548e8af8619d2ef1a7e49e7621093e86ec74f83c7a8a8d5",
+    "portable_bytes": 2882,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/4eefa5ed457627575548e8af8619d2ef1a7e49e7621093e86ec74f83c7a8a8d5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge2-scope-controls.py",
+    "original_sha256": "003e6a9bde206d1ce732dece2801079ed085c9c5ea83a75776192a4ea81be357",
+    "original_bytes": 3434,
+    "portable_sha256": "681fd85e2644fc60be7e4f0969fbddd13fcaa2bc3728e3652888deacdd957904",
+    "portable_bytes": 3402,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/681fd85e2644fc60be7e4f0969fbddd13fcaa2bc3728e3652888deacdd957904/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge3-guard-controls.py",
+    "original_sha256": "1ab0716f55dd6d553ff71836f945d0805ca6423a180904656a320ffe96d6cb5b",
+    "original_bytes": 2914,
+    "portable_sha256": "fcdff9c96b0d60bed771f45b8a82ee38941a7d5e1d7bc6b5864ed5acb5c0b606",
+    "portable_bytes": 2882,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/fcdff9c96b0d60bed771f45b8a82ee38941a7d5e1d7bc6b5864ed5acb5c0b606/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge3-independent-controls.py",
+    "original_sha256": "9cbfd980bdc6f5c09fd23b85be3d7e27aaab1539e87e47315c8865299328c24b",
+    "original_bytes": 5878,
+    "portable_sha256": "9cbfd980bdc6f5c09fd23b85be3d7e27aaab1539e87e47315c8865299328c24b",
+    "portable_bytes": 5878,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9cbfd980bdc6f5c09fd23b85be3d7e27aaab1539e87e47315c8865299328c24b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-edge4-controls.py",
+    "original_sha256": "19fc7d2fec1f5d41829b3598bb699c7e50ec6a9bd66f88d54bff76c9124f78de",
+    "original_bytes": 4944,
+    "portable_sha256": "7f06168dc98a12d2906a7b59ba7ea5cdb580be7e71db6df4f50d19d8bdcfb994",
+    "portable_bytes": 4945,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7f06168dc98a12d2906a7b59ba7ea5cdb580be7e71db6df4f50d19d8bdcfb994/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-remaining-gap-source-assessment-1.md",
+    "original_sha256": "1d8c865b2207c62bad8c9584c0454e42c01f7ffa7b43049275a9512655de32f5",
+    "original_bytes": 11668,
+    "portable_sha256": "1d8c865b2207c62bad8c9584c0454e42c01f7ffa7b43049275a9512655de32f5",
+    "portable_bytes": 11668,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/1d8c865b2207c62bad8c9584c0454e42c01f7ffa7b43049275a9512655de32f5/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-fixture-remaining-gap-source-assessment-1.py",
+    "original_sha256": "307ea46dc7af91972cc4b03a13ee82073c0160013b6d0e2648f0cc68cfec3337",
+    "original_bytes": 11377,
+    "portable_sha256": "75ddee03f9888be70636cf578aeefaee7c4a95b4b85bf73d23cee2a6bdcc2db1",
+    "portable_bytes": 11345,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/75ddee03f9888be70636cf578aeefaee7c4a95b4b85bf73d23cee2a6bdcc2db1/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-native-adjudication-1.md",
+    "original_sha256": "52b57a274dc1953317928333601ea2954923cd2a94ebe7db5af5185331cf8323",
+    "original_bytes": 13847,
+    "portable_sha256": "52b57a274dc1953317928333601ea2954923cd2a94ebe7db5af5185331cf8323",
+    "portable_bytes": 13847,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/52b57a274dc1953317928333601ea2954923cd2a94ebe7db5af5185331cf8323/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-native-adjudication-check.py",
+    "original_sha256": "494f5d3a37b4ac18c799bfe2db6842b5c55d161473b93fb4de0572926da4f6c6",
+    "original_bytes": 8928,
+    "portable_sha256": "e96a58d82facd0687d04f85e1106ed68ca6e2592bc16ff636c1e259e8bd27d2b",
+    "portable_bytes": 8929,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e96a58d82facd0687d04f85e1106ed68ca6e2592bc16ff636c1e259e8bd27d2b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-native-controls1-probes.py",
+    "original_sha256": "dc75ae1484e3f02f28069473164e65c83bcfb43d0318b6ca25af3171cbe3f13c",
+    "original_bytes": 6991,
+    "portable_sha256": "dc75ae1484e3f02f28069473164e65c83bcfb43d0318b6ca25af3171cbe3f13c",
+    "portable_bytes": 6991,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/dc75ae1484e3f02f28069473164e65c83bcfb43d0318b6ca25af3171cbe3f13c/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-native-controls1-source-check.py",
+    "original_sha256": "38032bb28c3a8e8474e99ca4b2832eaf0b095586d137d66a6ad6b8a89e4adad7",
+    "original_bytes": 4486,
+    "portable_sha256": "2ce658a03dcbafb37f3d4d9c6d0c961a43a3829a357d749180f1bc96e48d0b39",
+    "portable_bytes": 4487,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2ce658a03dcbafb37f3d4d9c6d0c961a43a3829a357d749180f1bc96e48d0b39/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-native-controls2-probes.py",
+    "original_sha256": "607721b81ef5b701346abe644f4a55aaba1e54776e0308306a61cab60742acc1",
+    "original_bytes": 6060,
+    "portable_sha256": "e81e9e3eed2fbe9fe290248c55a4fce79c2aa3c790a5750334fd3cf4d9dd3c30",
+    "portable_bytes": 6061,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e81e9e3eed2fbe9fe290248c55a4fce79c2aa3c790a5750334fd3cf4d9dd3c30/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-native-controls2-source-check.py",
+    "original_sha256": "39e45b25c342e3befc21271bfa0453ac8b90c6fcfc3b28646e88626a4171ed8a",
+    "original_bytes": 3624,
+    "portable_sha256": "6c759e76b9dc207e5154672289b2993fcae4525763d5a54c9a0aca89a3b42d12",
+    "portable_bytes": 3625,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6c759e76b9dc207e5154672289b2993fcae4525763d5a54c9a0aca89a3b42d12/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-native-controls3-exit-probe.py",
+    "original_sha256": "493db806f34d6aac8359761ec4157bcec45e32f3afc496aebd4bc3f858131e02",
+    "original_bytes": 4877,
+    "portable_sha256": "493db806f34d6aac8359761ec4157bcec45e32f3afc496aebd4bc3f858131e02",
+    "portable_bytes": 4877,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/493db806f34d6aac8359761ec4157bcec45e32f3afc496aebd4bc3f858131e02/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-native-controls3-source-check.py",
+    "original_sha256": "0fd64515d53cf284bd65c25072895798299b80a863a28cc10dc1a90cf869fbb4",
+    "original_bytes": 5218,
+    "portable_sha256": "39ffbdd40a1edc49c75133a58c5b3a9367cb66b09402aef41f85c094b7c21948",
+    "portable_bytes": 5219,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/39ffbdd40a1edc49c75133a58c5b3a9367cb66b09402aef41f85c094b7c21948/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-native-controls4-exit-probe.py",
+    "original_sha256": "9c9a7cbb372e6b47dcb45b3cf861d6617ce3eb576dabccb6fbfcef467024d338",
+    "original_bytes": 4875,
+    "portable_sha256": "9c9a7cbb372e6b47dcb45b3cf861d6617ce3eb576dabccb6fbfcef467024d338",
+    "portable_bytes": 4875,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9c9a7cbb372e6b47dcb45b3cf861d6617ce3eb576dabccb6fbfcef467024d338/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core3-native-controls4-source-check.py",
+    "original_sha256": "e994b6b67d87e8374ecdce144ec4df7fea69606a420d5395ec0b0c5df8a22f06",
+    "original_bytes": 6139,
+    "portable_sha256": "29bbaa5d53f6695ff35c39695017da91cbe29f979d504adb508a5d8897893713",
+    "portable_bytes": 6140,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/29bbaa5d53f6695ff35c39695017da91cbe29f979d504adb508a5d8897893713/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core5-source-check.py",
+    "original_sha256": "2ca808d27eb82fbe4c618e16673349510a99e12de92b7ccca1c916a99f63f63e",
+    "original_bytes": 7609,
+    "portable_sha256": "8742139b52cf748dfcf98f526da6aa13976f886efa42f9926d2e98e90898ca4b",
+    "portable_bytes": 7610,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/8742139b52cf748dfcf98f526da6aa13976f886efa42f9926d2e98e90898ca4b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core5-source-review.md",
+    "original_sha256": "829476b6c627d131f319862f13d8dcc73ada7012112ce83a5ad5abb123e22157",
+    "original_bytes": 7637,
+    "portable_sha256": "829476b6c627d131f319862f13d8dcc73ada7012112ce83a5ad5abb123e22157",
+    "portable_bytes": 7637,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/829476b6c627d131f319862f13d8dcc73ada7012112ce83a5ad5abb123e22157/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core6-falsewait-native-adjudication-review.md",
+    "original_sha256": "5630064ec2754f922f8c9f24d1c57da7304cfe0f1337da720e3917721008a935",
+    "original_bytes": 7096,
+    "portable_sha256": "5630064ec2754f922f8c9f24d1c57da7304cfe0f1337da720e3917721008a935",
+    "portable_bytes": 7096,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/5630064ec2754f922f8c9f24d1c57da7304cfe0f1337da720e3917721008a935/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core6-falsewait-native-check.py",
+    "original_sha256": "8d9932bfe3a2e87fa942419e6c0e1631e606c63ed1c729fd6f09d974976748fd",
+    "original_bytes": 8099,
+    "portable_sha256": "61f7faca85351e3a977ad7902f061b3e295f3b89260c688b0ace1da250ed9194",
+    "portable_bytes": 8067,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/61f7faca85351e3a977ad7902f061b3e295f3b89260c688b0ace1da250ed9194/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core6-source-check.py",
+    "original_sha256": "a692adf96e032fb4f2aaccab3796379ea74a00f7128f6d5235ec0362f1b38417",
+    "original_bytes": 5602,
+    "portable_sha256": "a692adf96e032fb4f2aaccab3796379ea74a00f7128f6d5235ec0362f1b38417",
+    "portable_bytes": 5602,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/a692adf96e032fb4f2aaccab3796379ea74a00f7128f6d5235ec0362f1b38417/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-core6-source-review.md",
+    "original_sha256": "ecc652e16033df42341104800bd251d58de9f0592ae2aa4e25c03b8fd9ff993c",
+    "original_bytes": 5569,
+    "portable_sha256": "ecc652e16033df42341104800bd251d58de9f0592ae2aa4e25c03b8fd9ff993c",
+    "portable_bytes": 5569,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/ecc652e16033df42341104800bd251d58de9f0592ae2aa4e25c03b8fd9ff993c/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-current-keyless-browser-evidence-76/REPORT.md",
+    "original_sha256": "08db510803566bbad4bd2610cb541157ae4fa855f3d2282c922f639f8f488459",
+    "original_bytes": 14955,
+    "portable_sha256": "08db510803566bbad4bd2610cb541157ae4fa855f3d2282c922f639f8f488459",
+    "portable_bytes": 14955,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/08db510803566bbad4bd2610cb541157ae4fa855f3d2282c922f639f8f488459/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-current-keyless-tier-delta-review-1/REPORT.md",
+    "original_sha256": "7a1558217d52f0ca2ec6a1449db0c80ef255cbed9193e85db0ad7ec85a9c62e4",
+    "original_bytes": 21310,
+    "portable_sha256": "7a1558217d52f0ca2ec6a1449db0c80ef255cbed9193e85db0ad7ec85a9c62e4",
+    "portable_bytes": 21310,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7a1558217d52f0ca2ec6a1449db0c80ef255cbed9193e85db0ad7ec85a9c62e4/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-current-main-keyless-delta-review-1/REPORT.md",
+    "original_sha256": "6fb1325b721412c816f85dff2e5917e6df3316b2b5e117b13ef40b290d6dee33",
+    "original_bytes": 13109,
+    "portable_sha256": "b164ff0facf5cec30fbaa234e2f7ddc9f38de46b0270af1717c4663e47f76aac",
+    "portable_bytes": 13076,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/b164ff0facf5cec30fbaa234e2f7ddc9f38de46b0270af1717c4663e47f76aac/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-current-masquerade-baseline-review-1/REPORT.md",
+    "original_sha256": "d41c39b048813702cd3e06a74caee18594f4952889340e389d550d8532609f05",
+    "original_bytes": 9933,
+    "portable_sha256": "420d95d444054b79334b2c831ea376075d5063f4fac36a72f2653dbb006e7500",
+    "portable_bytes": 9900,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/420d95d444054b79334b2c831ea376075d5063f4fac36a72f2653dbb006e7500/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-current-readiness-docs-review-1/REPORT.md",
+    "original_sha256": "145787979c34ae2070ba03861b1a974a151631846014e4d1febb41569ef41114",
+    "original_bytes": 9168,
+    "portable_sha256": "145787979c34ae2070ba03861b1a974a151631846014e4d1febb41569ef41114",
+    "portable_bytes": 9168,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/145787979c34ae2070ba03861b1a974a151631846014e4d1febb41569ef41114/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-current-readiness-docs-review-2/REPORT.md",
+    "original_sha256": "8750994093807c7c06b9abee0ae877ff8f05ca6b65878a44da1f3ff98e10d38e",
+    "original_bytes": 6564,
+    "portable_sha256": "8750994093807c7c06b9abee0ae877ff8f05ca6b65878a44da1f3ff98e10d38e",
+    "portable_bytes": 6564,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/8750994093807c7c06b9abee0ae877ff8f05ca6b65878a44da1f3ff98e10d38e/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-dag-registry-digest-review-1/REPORT.md",
+    "original_sha256": "c9f55c5c74ab8da43f9954a80fffb541ab256ee29fb919c97e1ec76b53c26391",
+    "original_bytes": 7838,
+    "portable_sha256": "c9f55c5c74ab8da43f9954a80fffb541ab256ee29fb919c97e1ec76b53c26391",
+    "portable_bytes": 7838,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/c9f55c5c74ab8da43f9954a80fffb541ab256ee29fb919c97e1ec76b53c26391/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-aca-inventory-review-1/REPORT.md",
+    "original_sha256": "a4a71da44f71f518ff0874aebdeed25a8af3f66ed7657fac4127c23e30477912",
+    "original_bytes": 9533,
+    "portable_sha256": "a4a71da44f71f518ff0874aebdeed25a8af3f66ed7657fac4127c23e30477912",
+    "portable_bytes": 9533,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/a4a71da44f71f518ff0874aebdeed25a8af3f66ed7657fac4127c23e30477912/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-adoption-fork-review-2/REPORT.md",
+    "original_sha256": "a23acc13f01382357d26cd90d14df63b9d2677ab047f65685bdf60c92eafb6ef",
+    "original_bytes": 5011,
+    "portable_sha256": "a23acc13f01382357d26cd90d14df63b9d2677ab047f65685bdf60c92eafb6ef",
+    "portable_bytes": 5011,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/a23acc13f01382357d26cd90d14df63b9d2677ab047f65685bdf60c92eafb6ef/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-adoption-native-fixtures-review-3/REPORT.md",
+    "original_sha256": "c7ae20181ee90cf753d237c6eccd321d8b3211c83765da9c96473bbbeccee4e3",
+    "original_bytes": 14730,
+    "portable_sha256": "8d3e4b043f89a4ec6358dace6ecb8d88adc7dacbf89f145feb92ea04500258ff",
+    "portable_bytes": 14731,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/8d3e4b043f89a4ec6358dace6ecb8d88adc7dacbf89f145feb92ea04500258ff/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-adoption-native-fixtures-review-4/REPORT.md",
+    "original_sha256": "0fc5a4566ac8c7bb3688118f70be1a04799010af500ef81869e7bdadc9be9eeb",
+    "original_bytes": 11884,
+    "portable_sha256": "13e50c23c417257e16492b3c6a440c46814dc07b1da6e207827feeaaf651723f",
+    "portable_bytes": 11885,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/13e50c23c417257e16492b3c6a440c46814dc07b1da6e207827feeaaf651723f/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-adoption-native-fixtures-review-5/REPORT.md",
+    "original_sha256": "390e3bfab70cfe95484148609e368a8ae0d6c174df7aa165e3a295ea245858cd",
+    "original_bytes": 10784,
+    "portable_sha256": "3a3d7637f86ca4f79de12b3b970a29c12e45cf5ec8f945d0f2d0b6c33ebc73bc",
+    "portable_bytes": 10785,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/3a3d7637f86ca4f79de12b3b970a29c12e45cf5ec8f945d0f2d0b6c33ebc73bc/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-adoption-originals-review-3/REPORT.md",
+    "original_sha256": "9559c65711cc4440ec47424060b65b36bf2d6da9eb05ad07f833bc1b40b27396",
+    "original_bytes": 15216,
+    "portable_sha256": "9559c65711cc4440ec47424060b65b36bf2d6da9eb05ad07f833bc1b40b27396",
+    "portable_bytes": 15216,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/9559c65711cc4440ec47424060b65b36bf2d6da9eb05ad07f833bc1b40b27396/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-adoption-originals-review-4/REPORT.md",
+    "original_sha256": "ad651f9f76e762c0b720e8f32acf4ff8b2525e44c968911f4bd9031c2f037284",
+    "original_bytes": 17254,
+    "portable_sha256": "ad651f9f76e762c0b720e8f32acf4ff8b2525e44c968911f4bd9031c2f037284",
+    "portable_bytes": 17254,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/ad651f9f76e762c0b720e8f32acf4ff8b2525e44c968911f4bd9031c2f037284/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-adoption-originals-review-5/REPORT.md",
+    "original_sha256": "f44fcfd0401c3f9339854de637ea29609d06d60c5bdf3c19e70e8243aef92af1",
+    "original_bytes": 16029,
+    "portable_sha256": "f44fcfd0401c3f9339854de637ea29609d06d60c5bdf3c19e70e8243aef92af1",
+    "portable_bytes": 16029,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f44fcfd0401c3f9339854de637ea29609d06d60c5bdf3c19e70e8243aef92af1/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-adoption-originals-review-6/REPORT.md",
+    "original_sha256": "a244a67543462c3adfe0f07164cac6a35d42bf3c10ad68bf26d351517dfead62",
+    "original_bytes": 14715,
+    "portable_sha256": "a244a67543462c3adfe0f07164cac6a35d42bf3c10ad68bf26d351517dfead62",
+    "portable_bytes": 14715,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/a244a67543462c3adfe0f07164cac6a35d42bf3c10ad68bf26d351517dfead62/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-adoption-originals-review-7/REPORT.md",
+    "original_sha256": "08e1d15ec3d68a27155bdfc5d744b3a322d34c392e8c34edbb0db50017cdf419",
+    "original_bytes": 14477,
+    "portable_sha256": "08e1d15ec3d68a27155bdfc5d744b3a322d34c392e8c34edbb0db50017cdf419",
+    "portable_bytes": 14477,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/08e1d15ec3d68a27155bdfc5d744b3a322d34c392e8c34edbb0db50017cdf419/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-adoption-originals-review-8/REPORT.md",
+    "original_sha256": "d62436a30096ee7117720d5d8d929fb063e8048ec9b466b3f750efcb41767674",
+    "original_bytes": 13507,
+    "portable_sha256": "d62436a30096ee7117720d5d8d929fb063e8048ec9b466b3f750efcb41767674",
+    "portable_bytes": 13507,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d62436a30096ee7117720d5d8d929fb063e8048ec9b466b3f750efcb41767674/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-blob-child-review-1/REPORT.md",
+    "original_sha256": "ce60e15f5c5bc152f6f559098ae3cc7d619af443a12778ee68f3469666713f71",
+    "original_bytes": 7149,
+    "portable_sha256": "ce60e15f5c5bc152f6f559098ae3cc7d619af443a12778ee68f3469666713f71",
+    "portable_bytes": 7149,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/ce60e15f5c5bc152f6f559098ae3cc7d619af443a12778ee68f3469666713f71/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-dag-review-1/REPORT.md",
+    "original_sha256": "91d803b0d9b5e9d84dbc115a0365d78a5da219fb039b4fc10506255b6088617d",
+    "original_bytes": 4753,
+    "portable_sha256": "91d803b0d9b5e9d84dbc115a0365d78a5da219fb039b4fc10506255b6088617d",
+    "portable_bytes": 4753,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/91d803b0d9b5e9d84dbc115a0365d78a5da219fb039b4fc10506255b6088617d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-dag-review-2/REPORT.md",
+    "original_sha256": "18165f382d22a31848ec43aa92869d53fe9b77c697aff1b37305a18715d66671",
+    "original_bytes": 8213,
+    "portable_sha256": "18165f382d22a31848ec43aa92869d53fe9b77c697aff1b37305a18715d66671",
+    "portable_bytes": 8213,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/18165f382d22a31848ec43aa92869d53fe9b77c697aff1b37305a18715d66671/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-authority-review-10/REPORT.md",
+    "original_sha256": "a0a87bd40b028942d653a3ace7fb348e47279ddc6f72739ba963bcf7926d3c8f",
+    "original_bytes": 12762,
+    "portable_sha256": "d78ad704c0c5ee8b0934bc20cf1e2ff2a45b3ee2f01790584dae00f5e8670ebb",
+    "portable_bytes": 12766,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d78ad704c0c5ee8b0934bc20cf1e2ff2a45b3ee2f01790584dae00f5e8670ebb/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-authority-review-11/REPORT.md",
+    "original_sha256": "6a35485696303c8b706dad454b051cbd23f59d3727dd02804a16059ab014a943",
+    "original_bytes": 13868,
+    "portable_sha256": "494917ae846b935ec57dd202d6b84fe1f94309136235ce7223c2536e71114762",
+    "portable_bytes": 13872,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/494917ae846b935ec57dd202d6b84fe1f94309136235ce7223c2536e71114762/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-authority-review-2/REPORT.md",
+    "original_sha256": "0fc826a0cff56aadc1bb33d016ac012ccf6aa382dad329cc9473c00352d5ed70",
+    "original_bytes": 10720,
+    "portable_sha256": "0fc826a0cff56aadc1bb33d016ac012ccf6aa382dad329cc9473c00352d5ed70",
+    "portable_bytes": 10720,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/0fc826a0cff56aadc1bb33d016ac012ccf6aa382dad329cc9473c00352d5ed70/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-authority-review-3/REPORT.md",
+    "original_sha256": "1ebd82140bae3222a0ff690218c83f7caa514e8c5dda69cf8a596a4d42250efb",
+    "original_bytes": 13665,
+    "portable_sha256": "fcb36b48ad6a314d8031a020f3cebb4611272b76aad245393103e4224d004a15",
+    "portable_bytes": 13667,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/fcb36b48ad6a314d8031a020f3cebb4611272b76aad245393103e4224d004a15/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-authority-review-4/REPORT.md",
+    "original_sha256": "fadef9a145f75db24099de293f9a65d25b1d1fd2cb1c0897a26ffd4a51afa037",
+    "original_bytes": 6282,
+    "portable_sha256": "e47d2ed933c2c3f41a922d8bd2df3fd2098a9cda907efd71823c1e29c47cdb10",
+    "portable_bytes": 6283,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e47d2ed933c2c3f41a922d8bd2df3fd2098a9cda907efd71823c1e29c47cdb10/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-authority-review-5/REPORT.md",
+    "original_sha256": "91cdafd262798d83509a1081e5313cbf1281f540107b449c420239355f0acfff",
+    "original_bytes": 8972,
+    "portable_sha256": "c709374a2f0196ef0f172b0a5ea0237c4f41aceddfb18c4a8ea0ee319fb4d8b9",
+    "portable_bytes": 8973,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/c709374a2f0196ef0f172b0a5ea0237c4f41aceddfb18c4a8ea0ee319fb4d8b9/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-authority-review-6/REPORT.md",
+    "original_sha256": "9509a1ea3d6acab8d5ae08c1c0c2a82d2bc94558631ac4aa68a3280d3e0a9fff",
+    "original_bytes": 11208,
+    "portable_sha256": "3464722d1d95a04f2dba2b3a6f60bed9caa12bc446c74a0062f647fb1a9ae8fe",
+    "portable_bytes": 11209,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/3464722d1d95a04f2dba2b3a6f60bed9caa12bc446c74a0062f647fb1a9ae8fe/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-authority-review-7/REPORT.md",
+    "original_sha256": "6894638e223a9de3a63716ab09941301f31659911b71ceeb7422da9941bbcad0",
+    "original_bytes": 12637,
+    "portable_sha256": "e1311a8f88bf5010739fe05a7f7fb7b344c7113b1a4217c5ff1d8ade8169a349",
+    "portable_bytes": 12640,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e1311a8f88bf5010739fe05a7f7fb7b344c7113b1a4217c5ff1d8ade8169a349/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-authority-review-8/REPORT.md",
+    "original_sha256": "6be6fc77042740dcfe06808086ec76219f040ce86119a9e20ef68eefb771b303",
+    "original_bytes": 10847,
+    "portable_sha256": "04ba02de5a451763ac8f61bda0b5c978ab5a7dff5736010fde957dd7643bb2f3",
+    "portable_bytes": 10848,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/04ba02de5a451763ac8f61bda0b5c978ab5a7dff5736010fde957dd7643bb2f3/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-authority-review-9/REPORT.md",
+    "original_sha256": "996ae43a282b9816096b969c04fae943d051be8c6508cdea7886f2bc1ddb8c99",
+    "original_bytes": 13678,
+    "portable_sha256": "ee7777037dfade52eb295512d001511153bfa4e2bb1cb516f96d09c2ea098953",
+    "portable_bytes": 13682,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/ee7777037dfade52eb295512d001511153bfa4e2bb1cb516f96d09c2ea098953/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-execution-review-1/REPORT.md",
+    "original_sha256": "769c5d957cdd2916cf2faca8987ae08abc8611726f38112eac7839ba40efcbce",
+    "original_bytes": 10997,
+    "portable_sha256": "769c5d957cdd2916cf2faca8987ae08abc8611726f38112eac7839ba40efcbce",
+    "portable_bytes": 10997,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/769c5d957cdd2916cf2faca8987ae08abc8611726f38112eac7839ba40efcbce/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-fixture-export-review-1/REPORT.md",
+    "original_sha256": "921e084108ad63929d45ce6e209cae62a0b59996df18528ed2d0cd0e87c7bfa2",
+    "original_bytes": 6841,
+    "portable_sha256": "921e084108ad63929d45ce6e209cae62a0b59996df18528ed2d0cd0e87c7bfa2",
+    "portable_bytes": 6841,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/921e084108ad63929d45ce6e209cae62a0b59996df18528ed2d0cd0e87c7bfa2/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-freeform-cancel-review-1/REPORT.md",
+    "original_sha256": "6d888d590cac5c2126c5c763a57eccd18c4d0ebb20c75bdc75456953319dbae2",
+    "original_bytes": 7780,
+    "portable_sha256": "6d888d590cac5c2126c5c763a57eccd18c4d0ebb20c75bdc75456953319dbae2",
+    "portable_bytes": 7780,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/6d888d590cac5c2126c5c763a57eccd18c4d0ebb20c75bdc75456953319dbae2/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-inlineblob-style-review-1/REPORT.md",
+    "original_sha256": "59209ec07cbd5915c3b61ba547f1f59715c1bf415ccc5c35d21acee1834d1320",
+    "original_bytes": 4943,
+    "portable_sha256": "59209ec07cbd5915c3b61ba547f1f59715c1bf415ccc5c35d21acee1834d1320",
+    "portable_bytes": 4943,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/59209ec07cbd5915c3b61ba547f1f59715c1bf415ccc5c35d21acee1834d1320/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-inlineblob-style-review-2/REPORT.md",
+    "original_sha256": "dc1b6a25ab5f3fe050039792a6908abf44e8de671eb85595de5afe11db8f9805",
+    "original_bytes": 3507,
+    "portable_sha256": "dc1b6a25ab5f3fe050039792a6908abf44e8de671eb85595de5afe11db8f9805",
+    "portable_bytes": 3507,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/dc1b6a25ab5f3fe050039792a6908abf44e8de671eb85595de5afe11db8f9805/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-metrics-owner-review-1/REPORT.md",
+    "original_sha256": "191a6de01a12d79eefc59216058b60b484cab30d4d5f55799cbc6818dfeda6eb",
+    "original_bytes": 9850,
+    "portable_sha256": "d51401dbd1ca6a795095468469cd261e1cbca223c9e42ccd6bac7e0d5e25a731",
+    "portable_bytes": 9851,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d51401dbd1ca6a795095468469cd261e1cbca223c9e42ccd6bac7e0d5e25a731/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-mock-discipline-review-1/REPORT.md",
+    "original_sha256": "afa304a6016c212c30032bb0fa4ab06e9cb70bc68b581fbeaf5fd7dbc712561c",
+    "original_bytes": 6151,
+    "portable_sha256": "afa304a6016c212c30032bb0fa4ab06e9cb70bc68b581fbeaf5fd7dbc712561c",
+    "portable_bytes": 6151,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/afa304a6016c212c30032bb0fa4ab06e9cb70bc68b581fbeaf5fd7dbc712561c/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-quota-legacy-scope-review-3/REPORT.md",
+    "original_sha256": "a391e05b50193dfe891ff2376122fbd315023697e605b86028b533dfb2df33b7",
+    "original_bytes": 11829,
+    "portable_sha256": "68ef003a7ca14d68b5b4ce5b8c147d3f61c7a85c4930172acb8c19afb70dc6d1",
+    "portable_bytes": 11830,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/68ef003a7ca14d68b5b4ce5b8c147d3f61c7a85c4930172acb8c19afb70dc6d1/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-readiness-test-review-1/REPORT.md",
+    "original_sha256": "99a7d273e596847efc1cade43a316fd8dd3950e745612cead92abff51c7b6ba9",
+    "original_bytes": 4146,
+    "portable_sha256": "99a7d273e596847efc1cade43a316fd8dd3950e745612cead92abff51c7b6ba9",
+    "portable_bytes": 4146,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/99a7d273e596847efc1cade43a316fd8dd3950e745612cead92abff51c7b6ba9/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-scanner-full-capture-review-1/REPORT.md",
+    "original_sha256": "69fceee12aca7e4af79a734e1cde00b832eb447f6fc78518d000ed20fb39065f",
+    "original_bytes": 10706,
+    "portable_sha256": "69fceee12aca7e4af79a734e1cde00b832eb447f6fc78518d000ed20fb39065f",
+    "portable_bytes": 10706,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/69fceee12aca7e4af79a734e1cde00b832eb447f6fc78518d000ed20fb39065f/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-scanner-full-capture-review-2/REPORT.md",
+    "original_sha256": "0ac41454779fbf84667dcf255f86dbd5cb73e7d6e7596b458774ee5e5cae0971",
+    "original_bytes": 11827,
+    "portable_sha256": "0ac41454779fbf84667dcf255f86dbd5cb73e7d6e7596b458774ee5e5cae0971",
+    "portable_bytes": 11827,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/0ac41454779fbf84667dcf255f86dbd5cb73e7d6e7596b458774ee5e5cae0971/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-scanner-full-capture-review-4/REPORT.md",
+    "original_sha256": "76d40c55ac77d4a70b55eda4a7d07e3894ea0f86071c66df2f1384f8b2fd4946",
+    "original_bytes": 12641,
+    "portable_sha256": "57b229b669a3186452bcf5976f8a9537608af89ec3f9b194e25e4f48156ff8b0",
+    "portable_bytes": 12609,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/57b229b669a3186452bcf5976f8a9537608af89ec3f9b194e25e4f48156ff8b0/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-scanner-full-capture-review-5/REPORT.md",
+    "original_sha256": "e275b7540e33c2161b77853e8ce90eb7a28b37e937d46ea7ee3804b1fa310b8a",
+    "original_bytes": 12486,
+    "portable_sha256": "ac19e8080248dab56370aaf97bfa32d940d8e456efd9b86113add2f36559104a",
+    "portable_bytes": 12453,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/ac19e8080248dab56370aaf97bfa32d940d8e456efd9b86113add2f36559104a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-scanner-runtime-review-1/REPORT.md",
+    "original_sha256": "677538f6039793ac95a1375cc79d1719150b92250c41e12487b0863a5e7ee763",
+    "original_bytes": 10455,
+    "portable_sha256": "e8f62bb50333e67dbb59267d0572e2698f4c979771c2da49e75653b4e1d98b88",
+    "portable_bytes": 10456,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/e8f62bb50333e67dbb59267d0572e2698f4c979771c2da49e75653b4e1d98b88/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-session-authority-pin-review-1/REPORT.md",
+    "original_sha256": "ba7ac5d41c10944f0a405d508e9a7d507e2854644f348776e25c2844958395be",
+    "original_bytes": 12260,
+    "portable_sha256": "02b45f30687724d81727b6b9114e034d42dd97bafb2d06dc19ed106682bb6adc",
+    "portable_bytes": 12261,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/02b45f30687724d81727b6b9114e034d42dd97bafb2d06dc19ed106682bb6adc/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-sessions-review-1/REPORT.md",
+    "original_sha256": "f0fb6fc9d4359486d44f72d5646c498a4748d939011f4d20b93c4481929cab41",
+    "original_bytes": 5706,
+    "portable_sha256": "f0fb6fc9d4359486d44f72d5646c498a4748d939011f4d20b93c4481929cab41",
+    "portable_bytes": 5706,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f0fb6fc9d4359486d44f72d5646c498a4748d939011f4d20b93c4481929cab41/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-sessions-review-2/REPORT.md",
+    "original_sha256": "f1d5b75e859f9f83831a5ae5c3573a2c704ac4df3edf5484f87d54038b0bda33",
+    "original_bytes": 9930,
+    "portable_sha256": "f1d5b75e859f9f83831a5ae5c3573a2c704ac4df3edf5484f87d54038b0bda33",
+    "portable_bytes": 9930,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f1d5b75e859f9f83831a5ae5c3573a2c704ac4df3edf5484f87d54038b0bda33/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-static-stream-review-1/REPORT.md",
+    "original_sha256": "d67f0175c0b3959b63ccc89e8df4ee63859dc357b7c88b08c79b657bb9c384d2",
+    "original_bytes": 10110,
+    "portable_sha256": "d67f0175c0b3959b63ccc89e8df4ee63859dc357b7c88b08c79b657bb9c384d2",
+    "portable_bytes": 10110,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d67f0175c0b3959b63ccc89e8df4ee63859dc357b7c88b08c79b657bb9c384d2/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-telemetry-lifecycle-review-1/REPORT.md",
+    "original_sha256": "cc483d19357597e947bde300c3c7523e026a9ca9f278b60d517cd724d4f1d39d",
+    "original_bytes": 8760,
+    "portable_sha256": "cc483d19357597e947bde300c3c7523e026a9ca9f278b60d517cd724d4f1d39d",
+    "portable_bytes": 8760,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/cc483d19357597e947bde300c3c7523e026a9ca9f278b60d517cd724d4f1d39d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-telemetry-lifecycle-review-2/REPORT.md",
+    "original_sha256": "a9ec460dc368740bff30ccb845954c9d2d2f93fb2e40d00d5e5d02c0aa18d003",
+    "original_bytes": 7226,
+    "portable_sha256": "a9ec460dc368740bff30ccb845954c9d2d2f93fb2e40d00d5e5d02c0aa18d003",
+    "portable_bytes": 7226,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/a9ec460dc368740bff30ccb845954c9d2d2f93fb2e40d00d5e5d02c0aa18d003/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-telemetry-lifecycle-review-3/REPORT.md",
+    "original_sha256": "407a737beaaf9157fda8d6fc01cdb3fc6e4eda2d383819326b620ac61646be00",
+    "original_bytes": 8910,
+    "portable_sha256": "407a737beaaf9157fda8d6fc01cdb3fc6e4eda2d383819326b620ac61646be00",
+    "portable_bytes": 8910,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/407a737beaaf9157fda8d6fc01cdb3fc6e4eda2d383819326b620ac61646be00/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-default3-telemetry-test-review-1/REPORT.md",
+    "original_sha256": "4bc172e9955de2060d7b7e17f48bf0219faa138aa281cafe93297e8139465961",
+    "original_bytes": 6513,
+    "portable_sha256": "4bc172e9955de2060d7b7e17f48bf0219faa138aa281cafe93297e8139465961",
+    "portable_bytes": 6513,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/4bc172e9955de2060d7b7e17f48bf0219faa138aa281cafe93297e8139465961/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-document-curation-review-1/REPORT.md",
+    "original_sha256": "1c5b5a69b0e358a77f1323513ccf8dbf504e0317c5f890adae177052d486139d",
+    "original_bytes": 9888,
+    "portable_sha256": "1c5b5a69b0e358a77f1323513ccf8dbf504e0317c5f890adae177052d486139d",
+    "portable_bytes": 9888,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/1c5b5a69b0e358a77f1323513ccf8dbf504e0317c5f890adae177052d486139d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-document-curation-review-2/REPORT.md",
+    "original_sha256": "7eeeb28e9b01a0247901e206e4f8dfa77105ad2f5ccc546c219731bb48b6302d",
+    "original_bytes": 9694,
+    "portable_sha256": "7eeeb28e9b01a0247901e206e4f8dfa77105ad2f5ccc546c219731bb48b6302d",
+    "portable_bytes": 9694,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/7eeeb28e9b01a0247901e206e4f8dfa77105ad2f5ccc546c219731bb48b6302d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-dynamic-selector-closure-design-1.md",
+    "original_sha256": "fa2306a3928249759b63fc61a354b46555a2fb7f7a5edac54228363ebf66c54a",
+    "original_bytes": 10870,
+    "portable_sha256": "fa2306a3928249759b63fc61a354b46555a2fb7f7a5edac54228363ebf66c54a",
+    "portable_bytes": 10870,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/fa2306a3928249759b63fc61a354b46555a2fb7f7a5edac54228363ebf66c54a/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-dynamic-selector-design-evidence.py",
+    "original_sha256": "e07ab88d20fe024aa8824d36aec9dfbdd787fd09dfb9e530906049018dbce670",
+    "original_bytes": 6670,
+    "portable_sha256": "797f5c03d5f13b9b7d013f845f9ef114bf03e498745d329c289f89d3b443ebe6",
+    "portable_bytes": 6639,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/797f5c03d5f13b9b7d013f845f9ef114bf03e498745d329c289f89d3b443ebe6/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-entry5-native-adjudication-1.md",
+    "original_sha256": "f6074bcc549d4ad1e7de0d932c163310f42eca76d33148259792be61831f76ef",
+    "original_bytes": 10904,
+    "portable_sha256": "f6074bcc549d4ad1e7de0d932c163310f42eca76d33148259792be61831f76ef",
+    "portable_bytes": 10904,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/f6074bcc549d4ad1e7de0d932c163310f42eca76d33148259792be61831f76ef/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-entry5-native-evidence-check-1.py",
+    "original_sha256": "6e926957fa997840bb2dd786579c07e9de6ad4e6e72ef1ee948cc1351cdbb680",
+    "original_bytes": 11825,
+    "portable_sha256": "461e7760ef24bbfcf865bd8e3eac1ccec8fdc2d284e80ff6660688b820895a97",
+    "portable_bytes": 11793,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/461e7760ef24bbfcf865bd8e3eac1ccec8fdc2d284e80ff6660688b820895a97/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-execute-app-failed-physical-code-review-1.md",
+    "original_sha256": "d34cd6c5b0e57792bfe3f39fb50345210900466d8ae0ca5f30f5be5f6e531d84",
+    "original_bytes": 11859,
+    "portable_sha256": "d34cd6c5b0e57792bfe3f39fb50345210900466d8ae0ca5f30f5be5f6e531d84",
+    "portable_bytes": 11859,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/d34cd6c5b0e57792bfe3f39fb50345210900466d8ae0ca5f30f5be5f6e531d84/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-execute-app-failed-physical-code-review-2.md",
+    "original_sha256": "67dc4cf8731a8941f1f471148a74f81f533e03b5bfca928393ce83034961b76d",
+    "original_bytes": 8030,
+    "portable_sha256": "67dc4cf8731a8941f1f471148a74f81f533e03b5bfca928393ce83034961b76d",
+    "portable_bytes": 8030,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/67dc4cf8731a8941f1f471148a74f81f533e03b5bfca928393ce83034961b76d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-execute-app-failed-physical-code-review-3.md",
+    "original_sha256": "c985736095394753b0562c12612c5c1c1b842880ec5e1c8182f496224dd1074f",
+    "original_bytes": 9048,
+    "portable_sha256": "c985736095394753b0562c12612c5c1c1b842880ec5e1c8182f496224dd1074f",
+    "portable_bytes": 9048,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/c985736095394753b0562c12612c5c1c1b842880ec5e1c8182f496224dd1074f/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-execute-app-integration-code-review-1.md",
+    "original_sha256": "420bbe7112a9d8453841f61f56bae9293bfe3e5f6182e46d6073528853fbda3d",
+    "original_bytes": 9963,
+    "portable_sha256": "420bbe7112a9d8453841f61f56bae9293bfe3e5f6182e46d6073528853fbda3d",
+    "portable_bytes": 9963,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/420bbe7112a9d8453841f61f56bae9293bfe3e5f6182e46d6073528853fbda3d/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-execute-app-integration-code-review-2.md",
+    "original_sha256": "2fb4a7d034ae694edca57b0353732bff71f9da8b00cee2b4a364502a2ba7942b",
+    "original_bytes": 13620,
+    "portable_sha256": "2fb4a7d034ae694edca57b0353732bff71f9da8b00cee2b4a364502a2ba7942b",
+    "portable_bytes": 13620,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/2fb4a7d034ae694edca57b0353732bff71f9da8b00cee2b4a364502a2ba7942b/part-0000.json.txt"
+    ]
+  },
+  {
+    "source_path": "astra-execute-app-integration-code-review-3.md",
+    "original_sha256": "99d490f5b6313ced12c3d197997b5f3b1c5d9ac8143672235f3342b9f4f61148",
+    "original_bytes": 8144,
+    "portable_sha256": "99d490f5b6313ced12c3d197997b5f3b1c5d9ac8143672235f3342b9f4f61148",
+    "portable_bytes": 8144,
+    "credential_shaped_redactions": 0,
+    "parts": [
+      "payloads/99d490f5b6313ced12c3d197997b5f3b1c5d9ac8143672235f3342b9f4f61148/part-0000.json.txt"
+    ]
+  }
+]

@@ -1,0 +1,1 @@
+"\"\"\"Atomic diagnostic publication retains exact originals, never cleanup proof.\"\"\"\n\n\ndef publish_retaining(path, document, custody):\n    temporary = path.with_name(path.name + \".tmp\")\n    try:\n        temporary.write_text(document)\n        temporary.replace(path)\n    except BaseException as original:\n        custody.retain(original)\n"

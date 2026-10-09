@@ -1,0 +1,32 @@
+{
+  "status": "UNFINISHED_SOURCE_ONLY_BACKUP_NOT_ADMISSION",
+  "inventory_parts": [
+    "inventory-000.json",
+    "inventory-001.json",
+    "inventory-002.json",
+    "inventory-003.json",
+    "inventory-004.json",
+    "inventory-005.json",
+    "inventory-006.json",
+    "inventory-007.json",
+    "inventory-008.json",
+    "inventory-009.json",
+    "inventory-010.json",
+    "inventory-011.json",
+    "inventory-012.json",
+    "inventory-013.json",
+    "inventory-014.json",
+    "inventory-015.json",
+    "inventory-016.json",
+    "inventory-017.json",
+    "inventory-018.json",
+    "inventory-019.json",
+    "inventory-020.json",
+    "inventory-021.json"
+  ],
+  "runtime_captures_included": false,
+  "raw_logs_included": false,
+  "credentials_included": false,
+  "portable_home_placeholders": true,
+  "credential_shaped_redactions": 23
+}

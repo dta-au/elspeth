@@ -1,0 +1,1 @@
+"import elspeth.web.async_workers as worker\ndel worker._APPLICATION_FINALIZER_OWNER\n"

@@ -1,0 +1,1 @@
+"import elspeth.web.async_workers as worker\nother = worker\nother._APPLICATION_FINALIZER_OWNER = foreign\n"

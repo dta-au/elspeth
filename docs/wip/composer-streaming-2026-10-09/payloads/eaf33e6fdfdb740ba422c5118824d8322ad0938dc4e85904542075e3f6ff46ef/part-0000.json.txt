@@ -1,0 +1,1 @@
+"import elspeth.web.async_workers as worker\nfrom builtins import setattr as assign\nassign(worker, '_INSTANCE_DRAINING', foreign)\n"

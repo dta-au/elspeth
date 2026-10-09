@@ -1,0 +1,1 @@
+"import sys\nsys.modules['elspeth.web.async_workers']._APPLICATION_FINALIZER_OWNER = foreign\n"

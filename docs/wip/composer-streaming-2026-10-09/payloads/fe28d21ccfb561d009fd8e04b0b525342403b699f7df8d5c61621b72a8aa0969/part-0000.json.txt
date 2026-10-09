@@ -1,0 +1,1 @@
+"{\n  \"actual_local_failures\": [],\n  \"all_eight_exact_Astra_refused\": true,\n  \"all_original_controls_preserved\": 63,\n  \"counts\": {\n    \"common_UNKNOWN\": 3,\n    \"inert_seams\": 2,\n    \"local_positives\": 13,\n    \"local_refusals\": 78\n  },\n  \"equal_except_python_version\": true,\n  \"python_versions\": [\n    \"3.12.3\",\n    \"3.13.15\"\n  ]\n}\n"

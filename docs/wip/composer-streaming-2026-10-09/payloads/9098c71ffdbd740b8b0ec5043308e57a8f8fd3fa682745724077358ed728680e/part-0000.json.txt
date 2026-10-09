@@ -1,0 +1,1 @@
+"from elspeth.web.async_workers import configure_required_executor_recovery as configure\nconfigure(instance_draining=foreign)\n"
