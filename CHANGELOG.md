@@ -11,6 +11,16 @@ All notable changes to ELSPETH are documented here.
   recovery after interrupted cleanup. It retains collision checks and durable
   database custody rather than assuming the filesystem has atomic no-replace
   rename. This is merged source from PR #276.
+- **The tracked LLM gateway accepts a 64,000-token completion allowance.**
+  Its default request bound now matches an operator-configured 64,000-token
+  planner call for either `max_tokens` spelling. Values above the bound are
+  refused, a lower explicit gateway bound still applies, and an admitted
+  value reaches the reference adapter unchanged. This includes reasoning
+  tokens within the requested completion allowance; it does not raise the
+  Web Composer's 16,384-token default or its independent job, transport,
+  cost and repair limits. Standalone mock-upstream and conformance tests
+  passed locally; no deployed gateway image or genuine-model replay is
+  established by this source candidate.
 - **The proposed Web Composer transport delivers live progress over authenticated
   HTTPS.** An operation-scoped server-sent event subscription follows the same
   durable operation and progress authority as the authenticated status GET.
@@ -27,6 +37,25 @@ All notable changes to ELSPETH are documented here.
   pending review, terminal publication and physical cleanup against their
   committed authorities. These changes are likewise awaiting final frozen
   default, serial PostgreSQL, TLS and browser acceptance gates.
+- **The first-run tutorial keeps its Build and Run chrome out of the Composer
+  workspace.** Each step's title, one instruction that says what to do next,
+  and its actions (Continue to Run; Run, Retry or Continue) sit in a header
+  above both panes. The tutorial no longer removes the workspace's height
+  floor, so the conversation stays readable on short and narrow screens
+  (measured at 1280×560: 49 px before, 110 px after). The chat header lines up
+  with the pipeline toolbar again, and nothing in the authoring pane sits flush
+  against the window edge. A disabled Continue to Run is described by the
+  instruction naming what it waits for, and stays visible in the narrow Compose
+  view. Run results wrap inside the pane instead of cutting off the summary
+  column.
+- **The Composer chat no longer offers to turn a message into source data,
+  and drops its authority chip.** The "This looks like source data — Create
+  source" offer resent the whole message, instructions included, whenever it
+  contained a URL; the composer creates sources from the conversation itself.
+  The "Auto-apply on" chip and the header row it sat in are gone: nothing in
+  the interface changes the composer's authority, so the chip always said the
+  same thing, and the transcript already labels each change the composer
+  applies. The conversation now starts at the top of the chat pane.
 - **Container and dependency maintenance advances.** Merged main updates the
   distroless runtime base for patched OpenSSL, the gateway FastAPI and
   Hatchling locks, root Playwright tooling, and pinned GitHub Actions. The
@@ -105,17 +134,6 @@ release claim. Use only a separately verified published image tag or digest.
   source, workflow and build run. Missing or conflicting identities refuse
   qualification and release promotion; image scans, signing, signature
   verification and smoke checks remain required.
-- **The first-run tutorial keeps its Build and Run chrome out of the Composer
-  workspace.** Each step's title, one instruction that says what to do next,
-  and its actions (Continue to Run; Run, Retry or Continue) sit in a header
-  above both panes. The tutorial no longer removes the workspace's height
-  floor, so the conversation stays readable on short and narrow screens
-  (measured at 1280×560: 49 px before, 110 px after). The chat header lines up
-  with the pipeline toolbar again, and nothing in the authoring pane sits flush
-  against the window edge. A disabled Continue to Run is described by the
-  instruction naming what it waits for, and stays visible in the narrow Compose
-  view. Run results wrap inside the pane instead of cutting off the summary
-  column.
 
 **Upgrade and publication notes.** Session epoch 71 and Landscape epoch 49
 are unchanged from 0.8.1; this release adds no schema-epoch cutover. Installations

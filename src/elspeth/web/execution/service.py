@@ -572,6 +572,11 @@ async def close_execute_lease_before_transfer(
         except BaseException as original:
             obligation.registry.record_failure(original)
             failures.append(original)
+        else:
+            if cancellations:
+                lease._retain_execution_loss_originals(failures)
+                for retained_failure in failures:
+                    obligation.registry.record_failure(retained_failure)
     if (failures or cancellations) and primary is not None and not isinstance(primary, asyncio.CancelledError):
         failures.insert(0, primary)
     _raise_lifecycle_originals(cancellations, failures)
@@ -1852,10 +1857,10 @@ class ExecutionServiceImpl:
             or not obligation.lifecycle_task.done()
             or release is None
             or not release.observed
-            or release.original_error is not None
+            or (release.original_error is not None and not obligation.release_lost)
             or release.future is None
             or not release.future.done()
-            or not obligation.release_succeeded
+            or not obligation.release_settled
             or lease is None
             or not lease.closed
             or obligation.pipeline_submission_unknown is not None
@@ -5108,6 +5113,11 @@ class ExecutionServiceImpl:
                 await self._close_execution_authority(session_operation_lease, loss_watcher, exc)
             except BaseException as original:
                 failures.append(original)
+            else:
+                if failures:
+                    session_operation_lease._retain_execution_loss_originals(failures)
+                    for retained_failure in failures:
+                        obligation.registry.record_failure(retained_failure)
             _raise_lifecycle_originals([], failures)
         except BaseException as original:
             obligation.record_completion_outcome(original)
@@ -5135,6 +5145,9 @@ class ExecutionServiceImpl:
             await close_execute_lease_before_transfer(session_operation_lease)
         except BaseException as original:
             failures.append(original)
+            close_succeeded = False
+        else:
+            close_succeeded = True
         try:
             if failed_loss_watcher is not None and loss_watcher is not None:
                 slog.error(
@@ -5148,6 +5161,13 @@ class ExecutionServiceImpl:
                 slog.error("pipeline_done_callback_exception", exc_type=type(exc).__name__, exc_class_chain=_exception_class_chain(exc))
         except BaseException as original:
             failures.append(original)
+        if close_succeeded and (cancellations or failures):
+            session_operation_lease._retain_execution_loss_originals(failures)
+            obligation = session_operation_lease.execution_obligation
+            if type(obligation) is not ExecutionAcquisitionObligation:
+                raise AuditIntegrityError("EXECUTE completion lost actual acquisition ownership")
+            for retained_failure in failures:
+                obligation.registry.record_failure(retained_failure)
         _raise_lifecycle_originals(cancellations, failures)
 
     def _observe_pipeline_done(

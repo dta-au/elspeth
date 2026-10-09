@@ -451,8 +451,9 @@ jobs:
           test "$(npm --version)" = "$(node -p 'require("./package.json").packageManager.split("@")[1]')"
           npm --prefix src/elspeth/web/frontend ci
           npm --prefix src/elspeth/web/frontend run test:e2e:install
-          test -x /usr/bin/caddy
-          /usr/bin/caddy version
+          caddy_binary="$(command -v caddy)"
+          test -x "$caddy_binary"
+          "$caddy_binary" version
 
       - name: Install Terraform (native deployment-package contract tests)
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
@@ -682,8 +683,9 @@ jobs:
           test "$(npm --version)" = "$(node -p 'require("./package.json").packageManager.split("@")[1]')"
           npm --prefix src/elspeth/web/frontend ci
           npm --prefix src/elspeth/web/frontend run test:e2e:install
-          test -x /usr/bin/caddy
-          /usr/bin/caddy version
+          caddy_binary="$(command -v caddy)"
+          test -x "$caddy_binary"
+          "$caddy_binary" version
 
       - name: Install dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}

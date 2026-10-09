@@ -278,13 +278,15 @@ test("Build keeps its chrome out of the authoring pane and its Continue reachabl
       .map((box) => Math.round(box.left - pane.left));
     return {
       minInset: Math.min(...insets),
-      chatHeaderTop: Math.round(rect(".chat-panel-header").top),
+      paneTop: Math.round(pane.top),
+      transcriptTop: Math.round(rect(".chat-panel-messages").top),
       toolbarTop: Math.round(rect(".artifact-workspace-toolbar").top),
       transcript: Math.round(rect(".chat-panel-messages").height),
     };
   });
   expect(geometry.minInset, "every authoring control and line keeps the pane's 16px gutter").toBeGreaterThanOrEqual(16);
-  expect(geometry.chatHeaderTop, "the two pane bands are one row across the seam").toBe(geometry.toolbarTop);
+  expect(geometry.paneTop, "both panes start on one row across the seam").toBe(geometry.toolbarTop);
+  expect(geometry.transcriptTop, "no chrome sits above the conversation in its pane").toBe(geometry.paneTop);
   expect(geometry.transcript, "the conversation keeps its 160px floor").toBeGreaterThanOrEqual(160);
 
   // Narrow Compose view hides the workspace bar's artifact cell, which is why

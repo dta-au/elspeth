@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
@@ -25,7 +23,6 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -84,24 +81,17 @@ async def test_historical_orphan_rebind_requests_new_term_and_resolves_strictly(
     service = recovery_service
     session_id = uuid4()
     _insert_test_session_with_released_create_fence(service, session_id, title="Generated source orphan recovery")
-    user_message_id = str(uuid4())
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(chat_messages_table).values(
-                id=user_message_id,
-                session_id=str(session_id),
-                role="user",
-                content="Please create URL-list source artifacts from my project briefs.",
-                raw_content=None,
-                tool_calls=None,
-                tool_call_id=None,
-                sequence_no=1,
-                writer_principal="route_user_message",
-                created_at=datetime.now(UTC),
-                composition_state_id=None,
-                parent_assistant_id=None,
-            )
+    with fenced_operation_context(service._engine, str(session_id)) as operation:
+        user_message = await service.add_message(
+            session_id,
+            role="user",
+            content="Please create URL-list source artifacts from my project briefs.",
+            writer_principal="route_user_message",
+            session_operation_context=operation,
         )
+    assert user_message.session_id == session_id
+    assert user_message.sequence_no == 1
+    user_message_id = str(user_message.id)
     catalog = _mock_catalog()
     context = ToolContext(
         catalog=catalog,

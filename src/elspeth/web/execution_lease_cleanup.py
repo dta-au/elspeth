@@ -103,7 +103,11 @@ class ExecutionLeaseSQLSubmission:
 
     def invoke(self) -> SessionOperationContext | None:
         from elspeth.web.coordination.contracts import SessionOperationFenceLost
-        from elspeth.web.coordination.repository import SessionOperationConflictError, _SessionOperationAuthorityRepository
+        from elspeth.web.coordination.repository import (
+            CanonicalExecutionReleaseLoss,
+            SessionOperationConflictError,
+            _SessionOperationAuthorityRepository,
+        )
 
         obligation = self.obligation
         acquire, release = obligation._acquire, obligation._release
@@ -140,7 +144,15 @@ class ExecutionLeaseSQLSubmission:
             or context.fence.session_id != str(obligation.session_id)
         ):
             raise AuditIntegrityError("EXECUTE release lacks exact joined acquired context")
-        release(context)
+        try:
+            release(context)
+        except CanonicalExecutionReleaseLoss as original:
+            # A successor's epoch refuses this exact old context. Keep the
+            # original on this issued invocation; observation still needs the
+            # actual SQL Future, invocation exit and release callback receipt.
+            if type(original) is CanonicalExecutionReleaseLoss and original.context is context:
+                self.domain_refusal = original
+            raise
         return None
 
     @property
@@ -273,6 +285,8 @@ class ExecutionLeaseSQLSubmission:
                     self.observed = True
                     if self.arm is _ExecutionSQLArm.ACQUIRE and original is self.domain_refusal:
                         registry._retire_no_resource(self.obligation)
+                    elif self.arm is _ExecutionSQLArm.RELEASE and self.obligation.release_lost:
+                        registry._retire_settled_if_complete(self.obligation)
                     else:
                         registry._retain_failure(original)
                         failed_cleanup = original
@@ -291,7 +305,7 @@ class ExecutionLeaseSQLSubmission:
                     self.observed = True
                     if self.arm is _ExecutionSQLArm.RELEASE:
                         self.obligation.release_succeeded = True
-                        registry._retire_success_if_complete(self.obligation)
+                        registry._retire_settled_if_complete(self.obligation)
             if failed_cleanup is not None:
                 registry.record_failure(failed_cleanup)
         except BaseException as original:
@@ -349,6 +363,52 @@ class ExecutionAcquisitionObligation:
         self.pipeline_submission_unknown: BaseException | None = None
         self.unknown_pipeline_cleanup_declared = False
         self.observation_failures: dict[_ExecutionObservationPhase, BaseException] = {}
+
+    @property
+    def release_lost(self) -> bool:
+        """A joined canonical stale-epoch refusal is LOST, never successful release."""
+        from elspeth.web.coordination.contracts import FenceLossReason
+        from elspeth.web.coordination.repository import CanonicalExecutionReleaseLoss
+
+        release = self.release_submission
+        if (
+            type(release) is not ExecutionLeaseSQLSubmission
+            or release.obligation is not self
+            or release.arm is not _ExecutionSQLArm.RELEASE
+            or not release.observed
+            or release.projection_failure is not None
+            or release.reservation is None
+        ):
+            return False
+        original = release.original_error
+        reservation = release.reservation
+        trace = reservation.witness.snapshot()
+        return (
+            original is not None
+            and original is release.domain_refusal
+            and type(original) is CanonicalExecutionReleaseLoss
+            and original.context is self.context
+            and original.reason is FenceLossReason.STALE_EPOCH
+            and release.callback_return_observed
+            and reservation._registering_generation is self.generation
+            and reservation.released
+            and reservation.submission_error is None
+            and reservation.setup_error is None
+            and reservation.setup_outcome_error is None
+            and reservation.integrity_error is None
+            and reservation.semantic_observation_error is None
+            and not trace.impossible
+            and trace.exited
+            and trace.callable_finished
+            and release.future is reservation.future
+            and release.future is not None
+            and release.future.done()
+        )
+
+    @property
+    def release_settled(self) -> bool:
+        """Known terminal authority disposition; success and loss stay distinct."""
+        return self.release_succeeded or self.release_lost
 
     def validate_acquisition_request(self, authority: object, *, session_id: UUID, owner_instance_id: str, lease_seconds: int) -> None:
         with self.registry._lock:
@@ -489,7 +549,7 @@ class ExecutionAcquisitionObligation:
                         "EXECUTE lifecycle Task erased its original producer failure"
                     ) from self.lifecycle_original_error
             self.lifecycle_observed = True
-            self.registry._retire_success_if_complete(self)
+            self.registry._retire_settled_if_complete(self)
         if failure is not None:
             self.registry.record_failure(failure)
 
@@ -538,8 +598,8 @@ class ExecutionAcquisitionObligation:
                         "EXECUTE completion Task erased original producer failure"
                     ) from self.completion_original_error
             self.completion_observed = True
-            if self.release_succeeded:
-                self.registry._retire_success_if_complete(self)
+            if self.release_settled:
+                self.registry._retire_settled_if_complete(self)
         if failure is not None:
             self.registry.record_failure(failure)
 
@@ -745,11 +805,11 @@ class ExecutionLeaseReleaseRegistry:
         obligation.no_resource = obligation.retired = True
         del self._pending[id(obligation)]
 
-    def _retire_success_if_complete(self, obligation: ExecutionAcquisitionObligation) -> None:
+    def _retire_settled_if_complete(self, obligation: ExecutionAcquisitionObligation) -> None:
         self._require_obligation(obligation)
         if (
             not obligation.retired
-            and obligation.release_succeeded
+            and obligation.release_settled
             and (not obligation.completion_required or obligation.completion_observed)
             and (not obligation.lifecycle_required or obligation.lifecycle_observed)
         ):

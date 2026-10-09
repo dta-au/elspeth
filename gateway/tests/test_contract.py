@@ -703,7 +703,32 @@ def test_bounds_defaults():
     )
     assert bounds.temperature_min == 0.0
     assert bounds.temperature_max == 2.0
-    assert bounds.max_max_tokens == 32768
+    assert bounds.max_max_tokens == 64000
+
+
+@pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+def test_default_completion_budget_accepts_64000_and_rejects_64001_for_both_spellings(field):
+    bounds = _bounds()
+    assert bounds.max_max_tokens == 64000
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    admitted = ChatRequest.model_validate({**body, field: 64000})
+    assert admitted.max_tokens == 64000
+    bounds_check(admitted, bounds)
+
+    over_budget = ChatRequest.model_validate({**body, field: 64001})
+    with pytest.raises(GatewayError) as exc_info:
+        bounds_check(over_budget, bounds)
+    assert exc_info.value.code == GatewayErrorCode.INVALID_REQUEST
+
+
+@pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+def test_lower_configured_completion_budget_still_rejects_higher_requests(field):
+    bounds = _bounds(max_max_tokens=4096)
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    bounds_check(ChatRequest.model_validate({**body, field: 4096}), bounds)
+    with pytest.raises(GatewayError) as exc_info:
+        bounds_check(ChatRequest.model_validate({**body, field: 4097}), bounds)
+    assert exc_info.value.code == GatewayErrorCode.INVALID_REQUEST
 
 
 def test_bounds_forbids_extra():

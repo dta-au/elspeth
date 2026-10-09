@@ -13,13 +13,13 @@
 //
 // This panel is a DUMB RENDER of decisionPanelRows.projectDecisionRows plus
 // callbacks. It owns no store and builds no prompt: ChatPanel computes the
-// rows and the compose gate. Suggestion and source actions use provider-backed
+// rows and the compose gate. Suggestion actions use provider-backed
 // composition; proposal and interpretation approvals use their existing APIs.
 //
-// Pending proposals, interpretation reviews and source fallback actions
-// have one interactive home here; anchored transcript cards remain history.
+// Pending proposals and interpretation reviews have one interactive home
+// here; anchored transcript cards remain history.
 //
-// Contract (test-pinned, InlineSourceFallbackPrompt style):
+// Contract (test-pinned):
 //   * root is `<section role="region" aria-label="Awaiting your decision (N)">`;
 //   * Apply buttons are named `Apply optional suggestion: <humanised text>`
 //     and the row says "Optional" in visible text. Observed live (session
@@ -87,7 +87,6 @@ export interface DecisionPanelProps {
   askDisabledReason?: string | null;
   onOpenChecks: () => void;
   interpretationContent?: ReactNode;
-  renderSourceFallback?: (candidateText: string) => ReactNode;
   onEmptyFocus?: () => void;
   onAcceptProposal: (proposalId: string) => void;
   onRejectProposal: (proposalId: string) => void;
@@ -167,7 +166,6 @@ export function DecisionPanel({
   askDisabledReason = null,
   onOpenChecks,
   interpretationContent,
-  renderSourceFallback,
   onEmptyFocus,
   onAcceptProposal,
   onRejectProposal,
@@ -298,7 +296,6 @@ export function DecisionPanel({
                   onReject={setRejectConfirmId}
                 />
               ))}
-              {row.kind === "inline_source_fallback" && renderSourceFallback?.(row.candidateText)}
             </li>
           ))}
         </ul>

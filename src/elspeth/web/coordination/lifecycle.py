@@ -1156,30 +1156,74 @@ class SessionOperationLease:
                 renewal_join_failure = original
                 if all(original is not earlier for earlier in failures):
                     failures.append(original)
+            # Renewal loss does not supply the registered release receipt.
+            # Join the same issued canonical release even after a successor
+            # took over; its actual refusal can settle LOST without changing
+            # that successor or fabricating a successful release.
+            outcome = await run_execution_lease_sql_finish_once(obligation.issue_release(self._context))
+            for delivered_cancellation in outcome.deferred_cancellations:
+                _retain_cancellation(cancellations, delivered_cancellation)
+            release = obligation.release_submission
+            matching_renewal_loss = self._renewal_error is None or (
+                type(self._renewal_error) is SessionOperationFenceLost and self._renewal_error.reason is FenceLossReason.STALE_EPOCH
+            )
+            pure_loss = (
+                type(outcome) is RequiredSQLRaised
+                and obligation.release_lost
+                and release is not None
+                and outcome.error is release.original_error
+                and matching_renewal_loss
+                and not failures
+                and not cancellations
+            )
+            if type(outcome) is RequiredSQLRaised:
+                self._disposition = (
+                    SessionOperationLeaseDisposition.LOST
+                    if isinstance(outcome.error, SessionOperationFenceLost)
+                    else SessionOperationLeaseDisposition.UNKNOWN
+                )
+                if not pure_loss and all(outcome.error is not earlier for earlier in failures):
+                    failures.append(outcome.error)
+            else:
+                self._disposition = SessionOperationLeaseDisposition.RELEASED
             if self._renewal_error is not None:
-                if all(self._renewal_error is not earlier for earlier in failures):
+                if not pure_loss and all(self._renewal_error is not earlier for earlier in failures):
                     failures.append(self._renewal_error)
                 self._disposition = SessionOperationLeaseDisposition.LOST
             elif renewal_join_failure is not None:
                 self._disposition = SessionOperationLeaseDisposition.UNKNOWN
-            else:
-                outcome = await run_execution_lease_sql_finish_once(obligation.issue_release(self._context))
-                for delivered_cancellation in outcome.deferred_cancellations:
-                    _retain_cancellation(cancellations, delivered_cancellation)
-                if type(outcome) is RequiredSQLRaised:
-                    failures.append(outcome.error)
-                    self._disposition = (
-                        SessionOperationLeaseDisposition.LOST
-                        if isinstance(outcome.error, SessionOperationFenceLost)
-                        else SessionOperationLeaseDisposition.UNKNOWN
-                    )
-                else:
-                    self._disposition = SessionOperationLeaseDisposition.RELEASED
         finally:
             self._closed = True
         for retained_failure in failures:
             obligation.registry.record_failure(retained_failure)
         _raise_lifecycle_originals(cancellations, failures)
+
+    def _retain_execution_loss_originals(self, failures: list[BaseException]) -> None:
+        """Retain a pure inner loss when its successful close projection faults."""
+        obligation = self._execution_obligation
+        if (
+            type(obligation) is not ExecutionAcquisitionObligation
+            or obligation.lease is not self
+            or not obligation.lifecycle_outcome_recorded
+            or obligation.lifecycle_original_error is not None
+            or not obligation.release_lost
+            or (
+                self._renewal_error is not None
+                and (
+                    type(self._renewal_error) is not SessionOperationFenceLost
+                    or self._renewal_error.reason is not FenceLossReason.STALE_EPOCH
+                )
+            )
+        ):
+            return
+        release = obligation.release_submission
+        if release is None or release.original_error is None:
+            raise contract_errors.AuditIntegrityError("Qualified EXECUTE loss lacks its canonical original")
+        # The successful inner producer already established domain-only loss.
+        # Do not inspect or flatten another producer's exception group.
+        for original in (release.original_error, self._renewal_error):
+            if original is not None and all(original is not earlier for earlier in failures):
+                failures.append(original)
 
     async def _run_archive_action(self) -> None:
         action_task = asyncio.create_task(
@@ -1496,6 +1540,10 @@ class SessionOperationLease:
             _raise_lifecycle_originals(cancellations, [*failures, failure])
         if obligation.lifecycle_original_error is not None:
             failures.append(obligation.lifecycle_original_error)
+        elif cancellations or failures:
+            self._retain_execution_loss_originals(failures)
+            for retained_failure in failures:
+                obligation.registry.record_failure(retained_failure)
         _raise_lifecycle_originals(cancellations, failures)
 
     async def consume_archive(

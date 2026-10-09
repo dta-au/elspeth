@@ -5,7 +5,7 @@
    .message-failed-*, .message-retry-btn, .message-pending, .message-tools*,
    .message-sources-created*, .inline-source-created-turn*,
    .message-group-separator, .tool-call-*,
-   .inline-source-fallback-prompt*, .pending-overlay-pill, .spec-pending-proposal,
+   .pending-overlay-pill, .spec-pending-proposal,
    .yaml-pending-summary, .runs-pending-proposal, .composing-*,
    .freeform-introduction, .proposal-diff*.
    Tenants (execution- or composer-named but chat-mounted — they render
@@ -669,7 +669,6 @@
 }
 
 @media (min-width: 761px) and (max-height: 800px) {
-  .chat-panel-header,
   .chat-input {
     padding-block: var(--space-xs);
   }
@@ -983,7 +982,7 @@
      ancestor walk (scrollIntoView, focus(), find-in-page, an AT caret) can
      move this panel's content and leave it moved. That is not hypothetical:
      scrollIntoView on the transcript's end sentinel was measured driving this
-     box to scrollTop 130, carrying .chat-panel-header to -49 and stranding
+     box to scrollTop 130, carrying the panel's header row to -49 and stranding
      the composer above a void that survived every re-render, because a scroll
      offset is DOM state React does not own. A `clip` box is not a scroll
      container at all, so the offset cannot exist to begin with. The panel's
@@ -1087,77 +1086,6 @@
   padding: var(--space-2xl);
   text-align: center;
 }
-
-.chat-panel-header {
-  /* Shared band-height contract with .artifact-workspace-toolbar across the
-     pane seam (see tokens.css): height comes from the token, content centers
-     via the flex row below — no vertical padding, so the short-screen
-     density regime (workspace.css) can compress this band through the token.
-     Before the contract this row stayed 53px inside the ≤800px-tall compact
-     regime while the toolbar dropped to 45px.
-     The inline gutter is the shared band-row gutter (elspeth-dfc207f341):
-     this band and .artifact-workspace-toolbar are ONE row across the pane
-     divider, and when the toolbar sat at --space-sm the divider had 16px of
-     clearance on its left against 8px on its right — visibly off-centre in
-     its own row. The toolbar now reads --artifact-gutter, which resolves to
-     --space-lg (workspace.css, elspeth-87195dda2c), so the two halves agree
-     at 16px; chatBubbleGutter.test.ts pins the agreement, spelled either
-     way. */
-  min-height: var(--size-workspace-band);
-  padding: 0 var(--space-lg);
-  border-bottom: 1px solid var(--color-border);
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-  color: var(--color-text);
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  gap: var(--space-md);
-}
-
-/* Header action cluster: authority chip + mode switch (the session title and
-   model chip moved to AppHeader, elspeth-8fa71e6d15 — this column keeps only
-   compose-state chrome). margin-left:auto right-aligns the cluster now that
-   no flex-1 title occupies the left side. Was an inline style prop on
-   ChatPanel's header (elspeth-0b70269ccc), which outranked every stylesheet
-   rule and made the row unresponsive at any breakpoint. */
-.chat-panel-header-actions {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-sm);
-  min-width: 0;
-  flex: 0 1 auto;
-  margin-left: auto;
-}
-
-/* Composer-authority chip (elspeth-f5e6723133) — names whether this session
-   auto-applies mutations or gates them behind proposals. Sibling of
-   the mode switch in the header actions row; the left accent is the
-   recurring edge motif. Auto-apply carries the warning accent because it is
-   the mode where the composer acts without asking — the one fact a user
-   must be able to see at a glance. */
-.chat-authority-chip {
-  flex: 0 0 auto;
-  padding: 2px var(--space-sm);
-  border: 1px solid var(--color-border);
-  border-left-width: 3px;
-  border-radius: var(--radius-sm);
-  background: var(--color-surface);
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-xs);
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.chat-authority-chip--auto_commit {
-  border-left-color: var(--color-warning);
-}
-
-.chat-authority-chip--explicit_approve {
-  border-left-color: var(--color-success);
-}
-
 
 .chat-panel-error {
   padding: var(--space-sm) var(--space-md);
@@ -1851,8 +1779,8 @@
      (this card and .ack-stack) differed by exactly one pixel — too small to
      read as intentional, too large to be invisible. 3px is the settled
      width: it is what .trusted-system-notice, the .tool-call-ribbon outcome
-     accents, .ack-stack and .chat-authority-chip already used, i.e. the
-     modal value, so the fewest surfaces move. The 4px DASHED accents on
+     accents and .ack-stack already used, i.e. the modal value, so the
+     fewest surfaces move. The 4px DASHED accents on
      .spec-pending-proposal and its siblings are a different species (dashed
      = "not yet applied") and stay as they are. */
   border-left: 3px solid var(--color-warning);
@@ -2139,67 +2067,6 @@
 
 .decision-panel-checks-btn {
   min-height: var(--size-control-compact);
-}
-
-/* Inline-source fallback prompt. This sits beside the chat input rather than
-   inside the message log, so it owns its own input-aligned margins. */
-.inline-source-fallback-prompt {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-md);
-  margin: 0 var(--space-lg) var(--space-sm);
-  padding: var(--space-sm) var(--space-md);
-  border: 1px solid var(--color-border-strong);
-  /* Settled transcript accent width — see .tool-call-card. */
-  border-left: 3px solid var(--color-accent);
-  border-radius: var(--radius-md);
-  background: var(--color-surface-elevated);
-  color: var(--color-text);
-}
-
-.inline-source-fallback-prompt-copy {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.inline-source-fallback-prompt-title,
-.inline-source-fallback-prompt-detail {
-  margin: 0;
-  line-height: 1.35;
-}
-
-.inline-source-fallback-prompt-title {
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-}
-
-.inline-source-fallback-prompt-detail {
-  margin-top: var(--space-2xs);
-  color: var(--color-text-muted);
-  font-size: var(--font-size-sm);
-}
-
-.inline-source-fallback-prompt-actions {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: var(--space-sm);
-}
-
-.inline-source-fallback-prompt-dismiss {
-  background: transparent;
-}
-
-@media (max-width: 760px) {
-  .inline-source-fallback-prompt {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .inline-source-fallback-prompt-actions {
-    flex-wrap: wrap;
-  }
 }
 
 .pending-overlay-pill {

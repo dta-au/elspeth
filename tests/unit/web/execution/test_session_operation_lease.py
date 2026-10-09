@@ -58,6 +58,7 @@ from elspeth.web import async_workers
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.coordination import lifecycle as lifecycle_module
 from elspeth.web.coordination.contracts import (
     FenceLossReason,
     SessionOperationContext,
@@ -67,7 +68,11 @@ from elspeth.web.coordination.contracts import (
     StartPermitState,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.coordination.repository import SessionDerivedCustodyError, SessionOperationConflictError
+from elspeth.web.coordination.repository import (
+    CanonicalExecutionReleaseLoss,
+    SessionDerivedCustodyError,
+    SessionOperationConflictError,
+)
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution import service as execution_service_module
 from elspeth.web.execution.envelope import restore_execution_envelope
@@ -805,7 +810,11 @@ async def _failed_http_release_child(
     session_id = uuid4()
     session_service = _RouteSessionService(session_id, execution_fixture=custody)
     lease = _CanonicalRouteLeaseControl(session_service, custody)
-    cleanup_error = cleanup_error_type("private lease failure detail")
+    cleanup_error = (
+        SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
+        if cleanup_error_type is SessionOperationFenceLost
+        else cleanup_error_type("private lease failure detail")
+    )
     lease.close_error = cleanup_error
     monkeypatch = pytest.MonkeyPatch()
     acquired = _install_acquire(monkeypatch, lease)
@@ -860,7 +869,8 @@ async def _failed_http_release_child(
     assert release.reservation.released and release.callback_return_observed
     assert receipt.callable_finished and receipt.exited and not receipt.impossible
     assert session_service.observation.release_calls == [lease.actual.context]
-    assert not obligation.release_succeeded and not obligation.retired
+    assert not obligation.release_succeeded and not obligation.release_lost and not obligation.retired
+    assert release.domain_refusal is None, "a pre-SQL exception cannot issue canonical terminal loss"
     assert session_service.registry.has_pending_physical_owners()
     assert session_service.registry.executor_finalizer is None
     assert not session_service.registry._executor_allocation_declared
@@ -889,7 +899,12 @@ async def _failed_http_release_child(
 
 
 def _run_failed_http_release_child(
-    root: Path, cleanup_error_type: type[Exception], logger_error_type: type[Exception] | None, repeat_cancellation: bool
+    root: Path,
+    cleanup_error_type: type[Exception],
+    logger_error_type: type[Exception] | None,
+    repeat_cancellation: bool,
+    *,
+    setup_after_arm: bool = False,
 ) -> None:
     from tests.unit.web.execution.test_canonical_execution_fixture import _project_reaping_failures, _reap_owned_child
 
@@ -909,6 +924,8 @@ def _run_failed_http_release_child(
         logger_error_type.__name__ if logger_error_type is not None else "None",
         str(repeat_cancellation),
     ]
+    if setup_after_arm:
+        command.append("--setup-after-arm")
     primary = None
     log = root / "failed-http-release-child.log"
     with log.open("wb") as stream:
@@ -919,7 +936,7 @@ def _run_failed_http_release_child(
             deadline = time.monotonic() + 15
             while not checkpoint.exists() and not failure.exists() and process.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert _assert_child_checkpoint_or_failure(checkpoint, failure, log) == {
+            expected = {
                 "exact_primary_and_release_originals": True,
                 "actual_failed_release_future_exited": True,
                 "actual_registry_retained_pending": True,
@@ -927,6 +944,16 @@ def _run_failed_http_release_child(
                 "shutdown_pending_and_complete_refused": True,
                 "watchdog_completion_unsent": True,
             }
+            if setup_after_arm:
+                expected = {
+                    "actual_armed_setup_and_sql_originals": True,
+                    "actual_release_future_callback_exited": True,
+                    "mixed_lifecycle_group_not_flattened": True,
+                    "faulty_receipt_refused_pending_retained": True,
+                    "successor_authority_unchanged": True,
+                    "watchdog_completion_unsent": True,
+                }
+            assert _assert_child_checkpoint_or_failure(checkpoint, failure, log) == expected
             assert process.poll() is None, "failed release silently reported completed custody"
         except BaseException as original:
             primary = original
@@ -994,6 +1021,7 @@ def _run_failed_shutdown_release_child(root: Path, error_type: type[Exception], 
         (OSError, FrameworkBugError),
         (AuditIntegrityError, None),
         (FrameworkBugError, None),
+        (SessionOperationFenceLost, None),
     ],
 )
 @pytest.mark.parametrize("repeat_cancellation", [False, True])
@@ -1204,10 +1232,15 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
             break
         await asyncio.sleep(0.01)
     assert lease.closed
-    assert authority.release_calls == [], "a proven-lost lease closes without releasing a successor's authority"
+    assert authority.release_calls == [lease.context], "completion must join the original context's canonical release"
+    obligation = lease.execution_obligation
+    assert obligation is not None
+    assert obligation.release_succeeded and not obligation.release_lost
+    assert any(original is loss for original in service.execution_lease_release_registry._failures)
     with pytest.raises(ExceptionGroup) as cleanup_failure:
         await asyncio.wait_for(execution_fixture.shutdown_service(service), timeout=2)
     assert cleanup_failure.value.exceptions == (loss,)
+    execution_fixture.witness_cleanup_original(loss)
 
 
 @pytest.mark.asyncio
@@ -4047,45 +4080,128 @@ def test_loss_watcher_signals_shutdown_without_becoming_a_lease_owned_task() -> 
     assert "create_task" not in call_names, "a lease-owned watcher can be cancelled before it signals loss"
 
 
-def test_done_callback_is_nonblocking_and_async_cleanup_closes_exactly_once() -> None:
-    callback = _function_node(ExecutionServiceImpl, "_on_pipeline_done")
+def _assert_async_completion_close_owner(owner: ast.ClassDef, helper: ast.AsyncFunctionDef) -> None:
+    import hashlib
+
+    callback = next(member for member in owner.body if isinstance(member, ast.FunctionDef) and member.name == "_on_pipeline_done")
     callback_body = _walk_function_body_without_nested_functions(callback)
     callback_calls = [_call_name(node) for node in callback_body if isinstance(node, ast.Call)]
     assert "run_coroutine_threadsafe" in callback_calls
     assert callback_calls.count("exception") + callback_calls.count("result") == 1, "worker Future must be consumed exactly once"
     assert not any(isinstance(node, ast.Await) for node in callback_body)
 
-    owner = _class_node(ExecutionServiceImpl)
-    close_sites: list[ast.AsyncFunctionDef] = []
-    for member in ast.walk(owner):
+    close_sites: list[tuple[ast.AsyncFunctionDef, ast.Call]] = []
+    for member in owner.body:
         if not isinstance(member, ast.AsyncFunctionDef):
             continue
         closes = [
             node
             for node in ast.walk(member)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "close"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "session_operation_lease"
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "close_execute_lease_before_transfer"
         ]
         if closes:
-            close_sites.extend([member] * len(closes))
-    assert len(close_sites) == 1, "one async completion path must own the sole execution-lease close"
-    close_function = close_sites[0]
-    finally_closes = [
-        call
-        for try_node in ast.walk(close_function)
-        if isinstance(try_node, ast.Try)
-        for statement in try_node.finalbody
-        for call in ast.walk(statement)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "close"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "session_operation_lease"
+            close_sites.extend((member, call) for call in closes)
+    assert len(close_sites) == 1, "one async completion path must own the sole lease-close handoff"
+    close_function, close_call = close_sites[0]
+    assert close_function.name == "_close_execution_authority"
+    assert [ast.unparse(arg) for arg in close_call.args] == ["session_operation_lease"] and close_call.keywords == []
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "close"
+        and ast.unparse(node.func.value) == "session_operation_lease"
+        for node in ast.walk(owner)
+    ), "completion must not close the lease again outside its owned helper"
+
+    finish = next(
+        member for member in owner.body if isinstance(member, ast.AsyncFunctionDef) and member.name == "_finish_execution_authority"
+    )
+    scheduled = [
+        node for node in callback_body if isinstance(node, ast.Call) and ast.unparse(node.func) == "asyncio.run_coroutine_threadsafe"
     ]
-    assert len(finally_closes) == 1, "the exact lease close must be structurally inside cleanup finally"
+    assert len(scheduled) == 1
+    assert ast.unparse(scheduled[0].args[0]) == "self._finish_execution_authority(obligation, session_operation_lease, loss_watcher, exc)"
+    finish_calls = [
+        node
+        for node in ast.walk(finish)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func) == "self._close_execution_authority"
+    ]
+    assert len(finish_calls) == 1
+    assert [ast.unparse(arg) for arg in finish_calls[0].value.args] == ["session_operation_lease", "loss_watcher", "exc"]
+
+    join = next(statement for statement in close_function.body if isinstance(statement, ast.If))
+    assert ast.unparse(join.test) == "loss_watcher is not None"
+    join_try = join.body[0]
+    assert isinstance(join_try, ast.Try) and len(join_try.handlers) == 1
+    handler = join_try.handlers[0]
+    assert handler.type is not None and ast.unparse(handler.type) == "BaseException"
+    assert len(handler.body) == 1 and ast.unparse(handler.body[0]) == "failed_loss_watcher = original"
+    close_try = close_function.body[close_function.body.index(join) + 1]
+    assert isinstance(close_try, ast.Try) and len(close_try.body) == 1
+    close_edge = close_try.body[0]
+    assert isinstance(close_edge, ast.Expr) and isinstance(close_edge.value, ast.Await) and close_edge.value.value is close_call
+    helper_closes = [node for node in ast.walk(helper) if isinstance(node, ast.Call) and ast.unparse(node.func) == "lease.close"]
+    assert len(helper_closes) == 1
+    create_tasks = [node for node in ast.walk(helper) if isinstance(node, ast.Call) and ast.unparse(node.func) == "asyncio.create_task"]
+    assert len(create_tasks) == 1 and create_tasks[0].args == [helper_closes[0]]
+
+    # Catch-all watcher settlement followed by the unconditional owned close has
+    # finally semantics. Pin these producer bodies after proving the exact edges:
+    # an early return, narrowed handler, lease substitution or unjoined close
+    # requires review rather than a syntactically convincing helper reference.
+    shapes = {
+        "_close_execution_authority": "62563bc01a2af20846053d30bb70583462c71eb3ac76ad49a7cf910bd33859f2",
+        "_finish_execution_authority": "e749535b4ff010c0b4063ce9a3d4f55f15f10633e42f5a09a7b91ff5760a89ec",
+        "close_execute_lease_before_transfer": "2b58bf6b6eecb7aa94745bc0506939eb778cf4de1cfe95a9ae3fbb28cd13afda",
+    }
+    assert {node.name: hashlib.sha256(_stable_ast_bytes(node)).hexdigest() for node in (close_function, finish, helper)} == shapes
+
+
+def test_done_callback_is_nonblocking_and_async_cleanup_closes_exactly_once() -> None:
+    helper = ast.parse(textwrap.dedent(inspect.getsource(execution_service_module.close_execute_lease_before_transfer))).body[0]
+    assert isinstance(helper, ast.AsyncFunctionDef)
+    _assert_async_completion_close_owner(_class_node(ExecutionServiceImpl), helper)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["duplicate_handoff", "removed_handoff", "wrong_owner", "duplicate_close", "early_return", "narrowed_handler", "unjoined_close"],
+)
+def test_async_completion_close_owner_rejects_broken_handoff(mutation: str) -> None:
+    import copy
+
+    owner = _class_node(ExecutionServiceImpl)
+    helper = ast.parse(textwrap.dedent(inspect.getsource(execution_service_module.close_execute_lease_before_transfer))).body[0]
+    assert isinstance(helper, ast.AsyncFunctionDef)
+    close = next(
+        member for member in owner.body if isinstance(member, ast.AsyncFunctionDef) and member.name == "_close_execution_authority"
+    )
+    handoff = next(
+        node for node in ast.walk(close) if isinstance(node, ast.Call) and _call_name(node) == "close_execute_lease_before_transfer"
+    )
+    if mutation == "duplicate_handoff":
+        close.body.append(ast.Expr(value=ast.Await(value=copy.deepcopy(handoff))))
+    elif mutation == "removed_handoff":
+        handoff.func = ast.Name(id="unrelated_helper", ctx=ast.Load())
+    elif mutation == "wrong_owner":
+        handoff.args[0] = ast.Name(id="other_lease", ctx=ast.Load())
+    elif mutation == "duplicate_close":
+        helper.body.append(ast.parse("lease.close()").body[0])
+    elif mutation == "early_return":
+        close.body.insert(0, ast.Return(value=None))
+    elif mutation == "narrowed_handler":
+        join = next(statement for statement in close.body if isinstance(statement, ast.If))
+        assert isinstance(join.body[0], ast.Try)
+        join.body[0].handlers[0].type = ast.Name(id="Exception", ctx=ast.Load())
+    else:
+        edge = next(node for node in ast.walk(close) if isinstance(node, ast.Await) and node.value is handoff)
+        edge.value = ast.Call(func=ast.Name(id="unrelated_helper", ctx=ast.Load()), args=[], keywords=[])
+    ast.fix_missing_locations(owner)
+    ast.fix_missing_locations(helper)
+    with pytest.raises(AssertionError):
+        _assert_async_completion_close_owner(owner, helper)
 
 
 def test_submit_failure_terminalizes_under_same_context_before_authority_returns() -> None:
@@ -4609,6 +4725,78 @@ async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_an
 
             assert lease.closed
             assert stale_event_dml == []
+            obligation = lease.execution_obligation
+            assert obligation is not None
+            for _ in range(200):
+                if obligation.retired:
+                    break
+                await asyncio.sleep(0.01)
+            assert obligation.retired, "known lost authority must retire only after its actual cleanup owners join"
+            release = obligation.release_submission
+            assert release is not None and release.observed and release.callback_return_observed
+            assert type(release.original_error) is CanonicalExecutionReleaseLoss
+            assert release.original_error is release.domain_refusal
+            assert release.original_error.context is lease.context
+            assert obligation.release_lost and obligation.release_settled and not obligation.release_succeeded
+            canonical_loss = release.original_error
+            try:
+                canonical_loss.context = _context(uuid4())
+                assert not obligation.release_lost, "a receipt for another context must not settle this lease"
+            finally:
+                canonical_loss.context = lease.context
+            actual_future = release.future
+            try:
+                release.future = cast(Any, obligation.pipeline)
+                assert not obligation.release_lost, "a different completed Future cannot reuse the captured receipt"
+            finally:
+                release.future = actual_future
+            actual_generation = obligation.generation
+            try:
+                obligation.generation = cast(Any, object())
+                assert not obligation.release_lost, "a receipt from another generation cannot settle current custody"
+            finally:
+                obligation.generation = actual_generation
+            assert obligation.release_lost
+            assert release.reservation is not None
+            reservation = release.reservation
+            injected = OSError("reservation setup or observation failed")
+            try:
+                reservation.submission_error = injected
+                assert not obligation.release_lost
+            finally:
+                reservation.submission_error = None
+            try:
+                reservation.setup_error = injected
+                assert not obligation.release_lost
+            finally:
+                reservation.setup_error = None
+            try:
+                reservation.setup_outcome_error = injected
+                assert not obligation.release_lost
+            finally:
+                reservation.setup_outcome_error = None
+            try:
+                reservation.integrity_error = cast(Any, injected)
+                assert not obligation.release_lost
+            finally:
+                reservation.integrity_error = None
+            try:
+                reservation.semantic_observation_error = injected
+                assert not obligation.release_lost
+            finally:
+                reservation.semantic_observation_error = None
+            assert obligation.release_lost
+            assert blocked_authority.release_calls == [lease.context]
+            assert not service.execution_lease_release_registry.has_pending_physical_owners()
+            assert not async_workers._INSTANCE_DRAINING.is_set()
+            assert not async_workers._GENERATION_UNAVAILABLE.is_set()
+            assert lease.renewal_error is loss
+            assert lease.disposition.value == "lost"
+            assert obligation.pipeline is not None and obligation.pipeline.exception() is loss
+            assert obligation.lifecycle_original_error is None and obligation.completion_original_error is None
+            assert service.execution_lease_release_registry._failures == []
+            assert successor is not None
+            authority.compare_and_swap(successor)
             assert (await real_sessions.get_run(run_id)).status == "pending"
             assert not canonical_output.exists()
             assert broadcaster.events == []
@@ -4642,6 +4830,11 @@ async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_an
             if len(cleanup_failures) == 1:
                 raise cleanup_failures[0]
             raise BaseExceptionGroup("Takeover physical cleanup failed", cleanup_failures) from None
+
+
+def test_canonical_execution_release_loss_rejects_unissued_constructor() -> None:
+    with pytest.raises(AuditIntegrityError, match="canonical release issuance"):
+        CanonicalExecutionReleaseLoss(object(), _context(uuid4()))
 
 
 @pytest.mark.asyncio
@@ -4798,9 +4991,239 @@ def test_envelope_blob_verifier_callback_requires_exact_worker_and_restore_consu
     _assert_edge_control(case)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    ["pure", "pure_no_renewal", "child", "cancel", "renewal_join", "setup_group", "outer_close", "outer_helper"],
+)
+async def test_canonical_release_loss_retains_mixed_cleanup_originals(
+    execution_fixture: ExecutionTestCustody,
+    fault: str,
+) -> None:
+    """Real canonical refusal; controlled mixed producer outcomes remain intact."""
+    service, sessions, _executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    session_id = sessions.get_current_state.return_value.session_id
+    independent = OSError(f"independent {fault} cleanup fault")
+    delivered_cancel = asyncio.CancelledError("deferred release cancellation")
+    original_renew = SessionOperationLease._renew_forever
+
+    async def renew_then_fault(lease: SessionOperationLease) -> None:
+        await original_renew(lease)
+        if fault == "renewal_join":
+            raise independent
+
+    with patch.object(SessionOperationLease, "_renew_forever", renew_then_fault):
+        lease, observed = await _canonical_execute_lease(
+            service,
+            execution_fixture,
+            session_id=session_id,
+            renew_interval_seconds=20 if fault == "pure_no_renewal" else 0.01,
+        )
+    observed.renew_allowed.clear()
+    observed.release_allowed.set()
+    await asyncio.to_thread(observed.authority.release, lease.context)
+    successor = await asyncio.to_thread(
+        observed.authority.acquire,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id="mixed-loss-successor",
+        lease_seconds=30,
+    )
+    observed.renew_allowed.set()
+    renewal = None if fault == "pure_no_renewal" else await asyncio.wait_for(lease.wait_until_lost(), timeout=2)
+    if renewal is not None:
+        assert type(renewal) is SessionOperationFenceLost and renewal.reason is FenceLossReason.STALE_EPOCH
+    if fault == "child":
+
+        async def fail_child() -> None:
+            raise independent
+
+        child = lease.create_task(fail_child())
+        with pytest.raises(OSError) as child_error:
+            await child
+        assert child_error.value is independent
+
+    original_bridge = lifecycle_module.run_execution_lease_sql_finish_once
+    returned: list[BaseException] = []
+
+    async def release_then_project(submission):
+        outcome = await original_bridge(submission)
+        assert type(outcome) is async_workers.RequiredSQLRaised
+        returned.append(outcome.error)
+        if fault == "setup_group":
+            # This is the bridge's setup-after-arm outcome shape, with the
+            # actual canonical SQL original retained as a nested member.
+            # It does not claim to inject a real executor setup failure.
+            grouped = BaseExceptionGroup("setup and actual SQL originals", [independent, outcome.error])
+            returned.append(grouped)
+            return async_workers.RequiredSQLRaised(grouped, outcome.deferred_cancellations)
+        if fault == "cancel":
+            return async_workers.RequiredSQLRaised(outcome.error, (delivered_cancel,))
+        return outcome
+
+    observed.release_called.clear()
+    observed.release_allowed.clear()
+    caught: BaseException | None = None
+    try:
+        with patch.object(lifecycle_module, "run_execution_lease_sql_finish_once", release_then_project):
+            closer = execution_service_module.close_execute_lease_before_transfer(lease) if fault == "outer_helper" else lease.close()
+            close_task = asyncio.create_task(closer)
+            assert await asyncio.to_thread(observed.release_called.wait, 2)
+            if fault in ("outer_close", "outer_helper"):
+                close_task.cancel("outer close caller cancellation")
+                await asyncio.sleep(0)
+            observed.release_allowed.set()
+            try:
+                await close_task
+            except BaseException as original:
+                caught = original
+        obligation = lease.execution_obligation
+        assert obligation is not None and obligation.release_lost and not obligation.release_succeeded
+        release = obligation.release_submission
+        assert release is not None and release.original_error is returned[0]
+        canonical = returned[0]
+        if fault in ("pure", "pure_no_renewal"):
+            assert caught is None and obligation.lifecycle_original_error is None
+            assert service.execution_lease_release_registry._failures == []
+            if fault == "pure_no_renewal":
+                assert lease.renewal_error is None
+                assert not observed.renew_called.is_set()
+        else:
+            assert caught is not None
+            leaves = _original_leaves(caught)
+            assert sum(original is canonical for original in leaves) == 1
+            assert sum(original is renewal for original in leaves) == 1
+            if fault in ("child", "renewal_join", "setup_group"):
+                assert sum(original is independent for original in leaves) == 1
+            if fault == "setup_group":
+                assert isinstance(caught, BaseExceptionGroup)
+                assert caught.exceptions == (returned[1], renewal)
+            elif fault == "cancel":
+                assert isinstance(caught, BaseExceptionGroup)
+                assert caught.exceptions == (delivered_cancel, canonical, renewal)
+            elif fault in ("child", "renewal_join"):
+                assert isinstance(caught, BaseExceptionGroup)
+                assert caught.exceptions == (independent, canonical, renewal)
+            else:
+                assert isinstance(caught, BaseExceptionGroup)
+                assert isinstance(caught.exceptions[0], asyncio.CancelledError)
+                assert caught.exceptions[1:] == (canonical, renewal)
+                assert obligation.lifecycle_original_error is None
+            for original in leaves:
+                if not isinstance(original, asyncio.CancelledError):
+                    execution_fixture.witness_cleanup_original(original)
+            if fault == "cancel":
+                execution_fixture.witness_cleanup_original(delivered_cancel)
+        # Lost release never mutates or releases the successor's authority.
+        await asyncio.to_thread(observed.authority.compare_and_swap, successor)
+    finally:
+        observed.release_allowed.set()
+        observed.renew_allowed.set()
+        await asyncio.to_thread(observed.authority.release, successor)
+
+
+async def _setup_after_arm_canonical_loss_child(root: Path) -> None:
+    from elspeth.web.required_executor import InvocationGate, RequiredInvocationWitness
+
+    custody = ExecutionTestCustody(asyncio.get_running_loop(), root)
+    service, sessions, _executor = _execution_service(asyncio.get_running_loop(), execution_fixture=custody)
+    session_id = sessions.get_current_state.return_value.session_id
+    lease, observed = await _canonical_execute_lease(
+        service,
+        custody,
+        session_id=session_id,
+        renew_interval_seconds=0.01,
+    )
+    observed.renew_allowed.clear()
+    observed.release_allowed.set()
+    await asyncio.to_thread(observed.authority.release, lease.context)
+    successor = await asyncio.to_thread(
+        observed.authority.acquire,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id="setup-arm-successor",
+        lease_seconds=30,
+    )
+    observed.renew_allowed.set()
+    renewal = await asyncio.wait_for(lease.wait_until_lost(), timeout=2)
+    obligation = lease.execution_obligation
+    assert obligation is not None
+    setup_error = OSError("actual RELEASE setup failed after publishing ARMED")
+    original_arm = RequiredInvocationWitness.arm
+    armed: list[RequiredInvocationWitness] = []
+
+    def arm_then_fail(witness: RequiredInvocationWitness) -> None:
+        original_arm(witness)
+        release = obligation.release_submission
+        if release is not None and release.reservation is not None and witness is release.reservation.witness:
+            assert witness.snapshot().gate is InvocationGate.ARMED
+            armed.append(witness)
+            raise setup_error
+
+    with patch.object(RequiredInvocationWitness, "arm", arm_then_fail), pytest.raises(BaseExceptionGroup) as caught:
+        await lease.close()
+    release = obligation.release_submission
+    assert release is not None and release.reservation is not None and release.future is not None
+    canonical = release.original_error
+    assert type(canonical) is CanonicalExecutionReleaseLoss and canonical.context is lease.context
+    assert release.domain_refusal is canonical and release.future.exception() is canonical
+    assert release.reservation.setup_error is setup_error
+    assert armed == [release.reservation.witness]
+    trace = release.reservation.witness.snapshot()
+    assert trace.exited and trace.callable_finished and not trace.impossible
+    assert release.reservation.released and release.callback_return_observed and release.observed
+    assert caught.value is obligation.lifecycle_original_error
+    assert len(caught.value.exceptions) == 2
+    bridge_group, retained_renewal = caught.value.exceptions
+    assert isinstance(bridge_group, BaseExceptionGroup)
+    assert bridge_group.exceptions == (setup_error, canonical) and retained_renewal is renewal
+    assert _original_leaves(caught.value) == [setup_error, canonical, renewal]
+    assert not obligation.release_lost and not obligation.release_succeeded and not obligation.retired
+    assert service.execution_lease_release_registry.has_pending_physical_owners()
+    assert async_workers._INSTANCE_DRAINING.is_set() and async_workers._GENERATION_UNAVAILABLE.is_set()
+    for original in (setup_error, canonical, renewal):
+        custody.witness_cleanup_original(original)
+    await asyncio.to_thread(observed.authority.compare_and_swap, successor)
+    await asyncio.to_thread(observed.authority.release, successor)
+    shutdown = asyncio.create_task(custody.close())
+    await asyncio.sleep(0)
+    assert not shutdown.done()
+    with pytest.raises(BaseExceptionGroup) as refused:
+        service.execution_lease_release_registry.assert_completed()
+    assert any(original is setup_error for original in _original_leaves(refused.value))
+    assert not custody.recovery.watchdog.completed
+    _atomic_child_checkpoint(
+        root / "checkpoint.json",
+        {
+            "actual_armed_setup_and_sql_originals": True,
+            "actual_release_future_callback_exited": True,
+            "mixed_lifecycle_group_not_flattened": True,
+            "faulty_receipt_refused_pending_retained": True,
+            "successor_authority_unchanged": True,
+            "watchdog_completion_unsent": True,
+        },
+    )
+    # Intentionally unresolved failed setup stays owned until the existing
+    # exact child reaper observes termination and physically waits it.
+    await asyncio.Event().wait()
+
+
+def test_actual_setup_after_arm_retains_canonical_loss_group_and_pending_owner(tmp_path: Path) -> None:
+    _run_failed_http_release_child(tmp_path, OSError, None, False, setup_after_arm=True)
+
+
 if __name__ == "__main__":
-    failure_types = {"OSError": OSError, "AuditIntegrityError": AuditIntegrityError, "FrameworkBugError": FrameworkBugError}
-    if len(sys.argv) == 6 and sys.argv[1] == "--failed-http-release-child":
+    failure_types = {
+        "OSError": OSError,
+        "AuditIntegrityError": AuditIntegrityError,
+        "FrameworkBugError": FrameworkBugError,
+        "SessionOperationFenceLost": SessionOperationFenceLost,
+    }
+    if len(sys.argv) == 7 and sys.argv[1] == "--failed-http-release-child" and sys.argv[6] == "--setup-after-arm":
+        assert sys.argv[3:6] == ["OSError", "None", "False"]
+        child_root = Path(sys.argv[2])
+        asyncio.run(_child_with_failure_checkpoint(child_root, _setup_after_arm_canonical_loss_child(child_root)))
+    elif len(sys.argv) == 6 and sys.argv[1] == "--failed-http-release-child":
         cleanup_type = failure_types[sys.argv[3]]
         logger_type = None if sys.argv[4] == "None" else failure_types[sys.argv[4]]
         assert sys.argv[5] in {"True", "False"}

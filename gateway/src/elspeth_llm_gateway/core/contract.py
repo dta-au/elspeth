@@ -329,7 +329,7 @@ class Bounds(BaseModel):
     max_schema_depth: int
     temperature_min: float = 0.0
     temperature_max: float = 2.0
-    max_max_tokens: int = 32768
+    max_max_tokens: int = 64000
 
 
 def _schema_exceeds_depth(root: object, max_depth: int) -> bool:
