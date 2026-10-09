@@ -267,15 +267,18 @@ describe("one type size across both speakers (elspeth-b6e82c12bb)", () => {
   });
 });
 
-describe("one gutter across the shared band row (elspeth-dfc207f341)", () => {
-  // .chat-panel-header and .artifact-workspace-toolbar are ONE horizontal
-  // band across the pane divider. With --space-lg on the authoring side and
-  // --space-sm on the artifact side, the divider sat off-centre in its own
-  // row: 16px of clearance on its left, 8px on its right, measured at 1280.
-  // Agreement with the toolbar, not a pinned literal — and agreement on what
-  // the two sides RENDER, not on spelling: the toolbar names the gutter
-  // through workspace.css's --artifact-gutter indirection while the header
-  // names the spacing token directly.
+describe("one gutter on either side of the pane seam (elspeth-dfc207f341)", () => {
+  // The conversation's rows and the artifact column's toolbar inset their
+  // content by the same amount, so the pane divider sits centred between
+  // them. (This was pinned on the chat column's header row until that row —
+  // which held only a constant "Auto-apply on" chip — was removed on
+  // 2026-10-08; the transcript rows now carry the authoring side's gutter.)
+  // With --space-lg on one side and --space-sm on the other, the divider sat
+  // off-centre: 16px of clearance on its left, 8px on its right, measured at
+  // 1280. Agreement, not a pinned literal — and agreement on what the two
+  // sides RENDER, not on spelling: the toolbar names the gutter through
+  // workspace.css's --artifact-gutter indirection while the rows name the
+  // spacing token directly.
 
   /** Resolve var() chains against every custom-property declaration in the
    *  barrel (tokens.css :root plus component-scoped properties such as
@@ -296,15 +299,15 @@ describe("one gutter across the shared band row (elspeth-dfc207f341)", () => {
     );
   }
 
-  it("gives both band halves the same rendered inline gutter", () => {
-    const headerInline = declaredValue(".chat-panel-header", "padding").split(
+  it("gives the conversation rows and the artifact toolbar the same rendered inline gutter", () => {
+    const rowInline = declaredValue(".message-row", "padding").split(
       /\s+(?![^(]*\))/,
     )[1];
     const toolbarInline = declaredValue(
       ".artifact-workspace-toolbar",
       "padding",
     ).split(/\s+(?![^(]*\))/)[1];
-    expect(resolveVars(headerInline)).toBe(resolveVars(toolbarInline));
+    expect(resolveVars(rowInline)).toBe(resolveVars(toolbarInline));
   });
 });
 

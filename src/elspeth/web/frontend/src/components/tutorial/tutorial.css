@@ -118,8 +118,8 @@
    that says what to do next, and the step's forward action, on a band that
    spans both panes. Tutorial chrome stays OUT of the authoring pane: there it
    shrank the conversation's min(160px, 30%) floor with the chat panel and
-   pushed .chat-panel-header 97px below the .artifact-workspace-toolbar it
-   shares a row with across the seam. Its inset is the progress row's, so the
+   pushed the conversation 97px below the top of the artifact pane beside
+   it. Its inset is the progress row's, so the
    two bands share one left edge; the rule underneath closes the tutorial's
    chrome off from the workspace's own bands. */
 .tutorial-step-header {

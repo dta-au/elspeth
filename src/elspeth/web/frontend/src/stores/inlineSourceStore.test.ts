@@ -141,20 +141,6 @@ describe("inlineSourceStore", () => {
     expect(useInlineSourceStore.getState().getSummaries("session-1")[0]?.provenance).toBe("verbatim");
     expect(useInlineSourceStore.getState().getSummaries("session-2")[0]?.provenance).toBe("llm-generated");
   });
-
-  // --- Fallback-prompt dismiss persistence tests (F-20) ---
-
-  it("markDismissed records a session-scoped dismissal timestamp", () => {
-    const before = Date.now();
-    useInlineSourceStore.getState().markDismissed("session-1");
-    const ts = useInlineSourceStore.getState().dismissedAt.get("session-1");
-    expect(ts).toBeGreaterThanOrEqual(before);
-    expect(useInlineSourceStore.getState().isDismissed("session-1")).toBe(true);
-  });
-
-  it("isDismissed returns false for sessions that were never dismissed", () => {
-    expect(useInlineSourceStore.getState().isDismissed("session-never")).toBe(false);
-  });
 });
 
 describe("projectInlineSourceSummary", () => {

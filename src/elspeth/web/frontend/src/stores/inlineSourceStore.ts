@@ -8,13 +8,6 @@
 // downstream consumers read from here:
 //   - InlineSourceCreatedTurn — confirmation widget after creation.
 //   - Audit-readiness panel surface — readiness row for inline source.
-//
-// The store has two responsibilities, intentionally co-located in one
-// container:
-//   1. Per-session inline-source summary projection (summariesBySession).
-//   2. Per-session dismissal timestamp for the fallback prompt (F-20),
-//      so a dismissed prompt does not re-fire within the same session
-//      regardless of predicate re-evaluation.
 // ============================================================================
 
 import { create } from "zustand";
@@ -148,13 +141,6 @@ interface InlineSourceState {
   clearSummary: (sessionId: string) => void;
   retainSummaries: (sessionId: string, blobIds: readonly string[]) => void;
   getSummaries: (sessionId: string) => readonly InlineSourceSummary[];
-
-  // --- Fallback-prompt dismiss persistence (F-20) ---
-  // Keyed by sessionId. A dismissed fallback prompt must not re-fire
-  // within the same session regardless of predicate re-evaluation.
-  dismissedAt: Map<string, number>;
-  markDismissed: (sessionId: string) => void;
-  isDismissed: (sessionId: string) => boolean;
 }
 
 const EMPTY_SUMMARIES: readonly InlineSourceSummary[] = [];
@@ -184,13 +170,4 @@ export const useInlineSourceStore = create<InlineSourceState>((set, get) => ({
     },
   })),
   getSummaries: (sessionId) => get().summariesBySession[sessionId] ?? EMPTY_SUMMARIES,
-
-  dismissedAt: new Map(),
-  markDismissed: (sessionId) =>
-    set((s) => {
-      const next = new Map(s.dismissedAt);
-      next.set(sessionId, Date.now());
-      return { dismissedAt: next };
-    }),
-  isDismissed: (sessionId) => get().dismissedAt.has(sessionId),
 }));

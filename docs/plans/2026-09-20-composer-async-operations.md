@@ -1,3 +1,11 @@
+# Current readiness update — 2026-10-08
+
+John reports that the streaming branch has been verified on Azure and that Azure is the correct deployment home. He also reports that the AWS ALB was fixed; his earlier AWS streamed-graph and forked-query acceptance remains historical user-reported evidence. No deployed SHA, image digest or test inventory accompanies either report. A separate AWS deployment recheck is not a current completion requirement. This update supersedes only the older preparation-status paragraphs below; their dated failures and evidence limits remain intact.
+
+The current local repair HEAD at this update is `703cdd1674d01d422baa4d54f210105edccf498c`, with reviewed main `85806a05e9b03d71e9dc793bbf45e0bd8150ddb7` integrated and 18 reviewed outputs checked on the recorded source map. Bounded current runs of 79 full-fence, 42 complement, 18 preproposal and 159 settlement cases passed on their recorded epochs; canonical frozen Ruff, mypy and contracts passed before the later frontend-only merge. Browser SOURCE7 has a new ancestor-cycle NO-GO pending SOURCE8; TLS10 has source GO but native acceptance is unrun. Final frontend, default pytest, serial PostgreSQL, browser and loaded TLS, public scanner, typed parity and protected current-head CI remain owed. Protected merge is authorized when those required gates clear. The accepted identical inherited Chroma #280 criterion is narrow and does not waive other findings. No tag, release, paid-provider result or operator signature clearance is inferred from John's deployment report.
+
+## Retained preparation checkpoint
+
 # Implementation readiness checkpoint — 2026-10-08
 
 **Preparation scope — 2026-10-08:** Status and source observations below describe the saved preparation checkpoint `3771e273238c44ed27b945d0772719fff6e7d3d1143739e840ef526b8aaebd39` and its published-head/CI receipts. Later documentation application or a local checkpoint commit is outside this observation.

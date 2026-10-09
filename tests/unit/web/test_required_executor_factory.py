@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import subprocess
+import sys
 import threading
+import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -362,7 +368,7 @@ def test_watching_only_bootstrap_fault_completes_without_arming_recovery(tmp_pat
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "boundary",
-    ["blob_reconciliation", "membership_start", "execution_lock", "execution_constructor", "catalog_prime", "run_recovery", "worker_start"],
+    ["blob_reconciliation", "membership_start", "execution_lock", "catalog_prime", "run_recovery", "worker_start"],
 )
 async def test_startup_acquisition_fault_arms_before_once_finalization_and_joins_returned_owners(tmp_path, monkeypatch, boundary) -> None:
     import elspeth.web.app as web_app
@@ -396,8 +402,6 @@ async def test_startup_acquisition_fault_arms_before_once_finalization_and_joins
 
     def observe_executor(*args, **kwargs):
         executor_attempts.append("constructor")
-        if boundary == "execution_constructor":
-            raise original
         return actual_executor(*args, **kwargs)
 
     monkeypatch.setattr(execution_module, "ThreadPoolExecutor", observe_executor)
@@ -408,8 +412,6 @@ async def test_startup_acquisition_fault_arms_before_once_finalization_and_joins
         monkeypatch.setattr(type(app.state.web_instance_membership), "start", fail_async)
     elif boundary == "execution_lock":
         monkeypatch.setattr(execution_module, "threading", SimpleNamespace(Lock=fail_sync, Event=threading.Event))
-    elif boundary == "execution_constructor":
-        pass
     elif boundary == "catalog_prime":
         monkeypatch.setattr(web_app, "_boot_prime_openrouter_catalog", fail_async)
     elif boundary == "run_recovery":
@@ -426,7 +428,7 @@ async def test_startup_acquisition_fault_arms_before_once_finalization_and_joins
         assert watchdog.draining.is_set() and not watchdog.completed
         if boundary == "execution_lock":
             assert executor_attempts == []
-        elif boundary in {"execution_constructor", "catalog_prime", "run_recovery", "worker_start"}:
+        elif boundary in {"catalog_prime", "run_recovery", "worker_start"}:
             assert executor_attempts == ["constructor"]
         app.state.composer_async_worker.assert_shutdown_complete()
         if boundary in {"catalog_prime", "run_recovery", "worker_start"}:
@@ -441,3 +443,159 @@ async def test_startup_acquisition_fault_arms_before_once_finalization_and_joins
         with pytest.raises(RuntimeError) as observed:
             await app.state.process_recovery.join_monitor_after_completion()
         assert observed.value is monitor_failure
+
+
+async def _unknown_constructor_child(root: Path) -> None:
+    import elspeth.web.app as web_app
+    import elspeth.web.execution.service as execution_module
+    from elspeth.web.execution_lease_cleanup import ExecutionLeaseReleaseRegistry
+
+    async def offline_catalog_prime(settings):
+        return None
+
+    # Reproduce the root fixture's nominal watchdog without creating a helper
+    # process: the exact parent-owned child bounds unresolved physical custody.
+    patches = pytest.MonkeyPatch()
+    patches.setattr(web_app, "create_process_watchdog", OwnedTestProcessWatchdog)
+    patches.setattr(web_app, "_boot_prime_openrouter_catalog", offline_catalog_prime)
+    fixture = await build_composer_operation_app(root)
+    app = fixture.app
+    watchdog = app.state.process_watchdog
+    assert type(watchdog) is OwnedTestProcessWatchdog
+    original = AuditIntegrityError("controlled acquisition failure")
+    attempts = []
+    refusals = []
+    actual_record_join = ExecutionLeaseReleaseRegistry.record_executor_join_return
+
+    def fail_constructor(*args, **kwargs):
+        attempts.append("constructor")
+        raise original
+
+    def observe_join(registry, capability, executor):
+        try:
+            return actual_record_join(registry, capability, executor)
+        except AuditIntegrityError as refusal:
+            refusals.append((registry, capability, executor, refusal))
+            raise
+
+    patches.setattr(execution_module, "ThreadPoolExecutor", fail_constructor)
+    patches.setattr(ExecutionLeaseReleaseRegistry, "record_executor_join_return", observe_join)
+    context = app.router.lifespan_context(app)
+    acquisition = asyncio.create_task(context.__aenter__())
+    async with asyncio.timeout(5):
+        while not refusals:
+            assert not acquisition.done(), "constructor acquisition returned before its physical refusal"
+            await asyncio.sleep(0.001)
+        registry, capability, executor, refusal = refusals[0]
+        while not any(error is refusal for error in capability.physical_failure_originals):
+            assert not acquisition.done(), "unknown allocation silently completed"
+            await asyncio.sleep(0.001)
+    assert len(refusals) == 1 and attempts == ["constructor"]
+    assert registry is app.state.execution_lease_release_registry
+    assert registry.recovery is app.state.process_recovery
+    assert registry.executor_finalizer is capability
+    assert capability.kind is ApplicationFinalizerKind.EXECUTION_EXECUTOR_JOIN
+    assert registry.owner.owns_claimed(capability)
+    partial_service = capability._invocation.__self__
+    assert type(partial_service) is execution_module.ExecutionServiceImpl
+    assert capability._invocation.__func__ is execution_module.ExecutionServiceImpl.join_executor_shutdown
+    assert partial_service.execution_lease_release_registry is registry and partial_service._executor is None
+    assert registry._executor_allocation_declared and registry._execution_executor is None
+    assert executor is None and not registry._executor_join_returned
+    assert type(refusal) is AuditIntegrityError
+    assert str(refusal) == "EXECUTE executor allocation remains physically unknown"
+    assert any(error is original for error in registry._failures)
+    assert any(error is refusal for error in capability.physical_failure_originals)
+    assert not registry.executor_join_physically_observed
+    assert watchdog.reasons == [RecoveryReason.FAILED_STARTUP]
+    assert watchdog._ack is not None and watchdog._ack.target == watchdog.target
+    assert watchdog.draining is app.state.instance_draining and watchdog.draining.is_set()
+    assert not watchdog.completed and not acquisition.done()
+    assert fixture.composer.calls == 0
+    checkpoint = root / "constructor-unknown.json"
+    staged = checkpoint.with_suffix(".pending")
+    staged.write_text(
+        json.dumps(
+            {
+                "original_identity_retained": True,
+                "exact_physical_refusal_retained": True,
+                "FAILED_STARTUP_acknowledged": True,
+                "instance_draining": True,
+                "allocation_declared_executor_unknown": True,
+                "exact_finalizer_claimed": True,
+                "physical_join_unobserved": True,
+                "acquisition_pending": True,
+                "watchdog_completion_unsent": True,
+                "composer_calls": 0,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    staged.replace(checkpoint)
+    # Do not cancel/join the fail-closed lifecycle or manufacture completion.
+    # The parent terminates and waits for this exact child and its threads.
+    await asyncio.Event().wait()
+
+
+def test_startup_constructor_fault_retains_unknown_allocation_in_owned_child(tmp_path: Path) -> None:
+    from tests.unit.web.execution.test_canonical_execution_fixture import _reap_owned_child
+
+    repo = Path(__file__).resolve().parents[3]
+    environment = {
+        "PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin",
+        "PYTHONPATH": os.pathsep.join((str(repo / "src"), str(repo / "elspeth-lints/src"), str(repo))),
+        "PYTHONUNBUFFERED": "1",
+        "LITELLM_MODE": "PRODUCTION",
+        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+    }
+    primary = None
+    log = tmp_path / "constructor-unknown-child.log"
+    with log.open("wb") as stream:
+        child = subprocess.Popen(
+            [sys.executable, "-P", str(Path(__file__).resolve()), "--constructor-unknown-child", str(tmp_path)],
+            cwd=repo,
+            env=environment,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=False,
+        )
+        try:
+            checkpoint = tmp_path / "constructor-unknown.json"
+            deadline = time.monotonic() + 15
+            while not checkpoint.exists() and child.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert checkpoint.exists(), "constructor child missed its oracle: " + log.read_text()
+            assert json.loads(checkpoint.read_bytes()) == {
+                "original_identity_retained": True,
+                "exact_physical_refusal_retained": True,
+                "FAILED_STARTUP_acknowledged": True,
+                "instance_draining": True,
+                "allocation_declared_executor_unknown": True,
+                "exact_finalizer_claimed": True,
+                "physical_join_unobserved": True,
+                "acquisition_pending": True,
+                "watchdog_completion_unsent": True,
+                "composer_calls": 0,
+            }
+            assert child.poll() is None, "unknown constructor custody silently exited"
+        except BaseException as original:
+            primary = original
+            raise
+        finally:
+            originals = _reap_owned_child(child)
+            if child.returncode is None:
+                originals.append(AssertionError("exact constructor child was not waited"))
+            if originals:
+                raise BaseExceptionGroup(
+                    "Constructor custody assertion and owned child cleanup failed",
+                    [*([primary] if primary is not None else []), *originals],
+                ) from None
+
+
+if __name__ == "__main__":
+    assert len(sys.argv) == 3 and sys.argv[1] == "--constructor-unknown-child"
+    # Unlike asyncio.run, this does not cancel and join the pending lifecycle
+    # after an assertion failure; parent-owned process cleanup remains bounded.
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(_unknown_constructor_child(Path(sys.argv[2])))

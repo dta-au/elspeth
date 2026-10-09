@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import os
+import shutil
 import signal
 import socket
 import ssl
@@ -158,6 +160,16 @@ def _restore_tls_stop(owners: _TLSOwners) -> None:
             owners.originals.append(original)
 
 
+def _caddy_executable() -> Path:
+    selected = shutil.which("caddy")
+    if selected is None:
+        raise FileNotFoundError("local TLS acceptance requires provisioned caddy on PATH")
+    executable = Path(selected).resolve(strict=True)
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise FileNotFoundError("local TLS acceptance requires a regular executable Caddy binary")
+    return executable
+
+
 @contextlib.contextmanager
 def local_composer_tls(
     app: ASGIApp,
@@ -176,8 +188,7 @@ def local_composer_tls(
     """
     # Fail before acquiring physical owners when the CI prerequisite is absent.
     # A failure after the Popen attempt still retains unresolved custody.
-    if not Path("/usr/bin/caddy").is_file():
-        raise FileNotFoundError("local TLS requires /usr/bin/caddy")
+    caddy_executable = _caddy_executable()
     directory.mkdir(parents=True, exist_ok=True)
     certificate = directory / "localhost.crt"
     private_key = directory / "localhost.key"
@@ -240,7 +251,7 @@ def local_composer_tls(
         _raise_tls_originals(owners)
         owners.proxy_requested = True
         owners.proxy = subprocess.Popen(
-            ["/usr/bin/caddy", "run", "--config", str(configuration), "--adapter", "caddyfile"],
+            [str(caddy_executable), "run", "--config", str(configuration), "--adapter", "caddyfile"],
             cwd=directory,
             stdout=owners.output,
             stderr=subprocess.STDOUT,

@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
 from unittest.mock import patch
 
 import httpx
 import pytest
 
+from elspeth.web import async_workers
 from elspeth.web.async_workers import (
     AsyncWorkerAdmissionTimeoutError,
     outstanding_admissions,
     run_stream_read_in_worker,
 )
 from elspeth.web.composer_stream import BoundedComposerStreamResponse, ComposerStreamCapacityError, ComposerStreamPermits
+from elspeth.web.required_work import reduce_composer_failures
+from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
+from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
 from tests.helpers.composer_operations import build_composer_operation_app, message_body, submit_and_settle
 
 
@@ -33,6 +36,11 @@ async def test_eight_hung_stream_reads_leave_shared_pool_for_real_auth_and_termi
     finished = [Event() for _ in range(8)]
     subscribers = []
     assert outstanding_admissions() == 0
+    executor = async_workers._get_shared_executor()
+    generation = async_workers._generation_for(executor)
+    assert executor._max_workers == 16
+    assert async_workers._SHARED_EXECUTOR is executor
+    assert async_workers._GENERATION_CUSTODIAN is generation
 
     async def authorize():
         return True
@@ -56,8 +64,17 @@ async def test_eight_hung_stream_reads_leave_shared_pool_for_real_auth_and_termi
         yield b"data: released\n\n"
 
     with (
-        ThreadPoolExecutor(max_workers=16) as executor,
-        patch("elspeth.web.async_workers._get_shared_executor", autospec=True, return_value=executor),
+        patch.object(
+            ComposerAsyncWorker, "_failure_for", autospec=True, side_effect=ComposerAsyncWorker._failure_for
+        ) as failure_selections,
+        patch(
+            "elspeth.web.sessions.composer_async_worker.reduce_composer_failures", autospec=True, side_effect=reduce_composer_failures
+        ) as failure_reductions,
+        patch(
+            "elspeth.web.sessions.composer_async_worker.project_composer_operation_error",
+            autospec=True,
+            side_effect=project_composer_operation_error,
+        ) as failure_projections,
     ):
         try:
             for index in range(8):
@@ -78,6 +95,34 @@ async def test_eight_hung_stream_reads_leave_shared_pool_for_real_auth_and_termi
                     settled = await submit_and_settle(
                         client, setup.app, path=f"/api/sessions/{setup.session_id}/messages", body=message_body("Ordinary request")
                     )
+                snapshot = settled.final.json()
+                if snapshot["status"] != "completed":
+                    originals = []
+                    for selection in failure_selections.call_args_list:
+                        current = selection.args[1]
+                        if current.session_id == setup.session_id and current.operation_id == snapshot["operation_id"]:
+                            original = selection.args[3]
+                            if all(original is not retained for retained in originals):
+                                originals.append(original)
+                    for reduction in failure_reductions.call_args_list:
+                        for receipt in reduction.args[0]:
+                            authority = receipt.key.authority
+                            if (
+                                authority.context.fence.session_id == str(setup.session_id)
+                                and authority.durable_operation_id == snapshot["operation_id"]
+                                and all(receipt.original_root is not retained for retained in originals)
+                            ):
+                                originals.append(receipt.original_root)
+                    for projection in failure_projections.call_args_list:
+                        if projection.kwargs["request_id"] == settled.accepted.headers["X-Request-ID"]:
+                            original = projection.args[0]
+                            if all(original is not retained for retained in originals):
+                                originals.append(original)
+                    if originals:
+                        raise AssertionError(settled.final.text) from BaseExceptionGroup(
+                            "Actual same-operation failure selection inputs (not a claimed winner)", originals
+                        )
+                assert snapshot["status"] == "completed", settled.final.text
                 assert settled.result()["message"]["content"] == "Completed delayed response."
             assert setup.composer.calls == 1
             assert not any(item.is_set() for item in finished)
@@ -102,6 +147,11 @@ async def test_shared_pool_sixteen_running_sixteen_queued_bounds_growth_and_actu
     completed = 0
     tasks = []
     assert outstanding_admissions() == 0
+    executor = async_workers._get_shared_executor()
+    generation = async_workers._generation_for(executor)
+    assert executor._max_workers == 16
+    assert async_workers._SHARED_EXECUTOR is executor
+    assert async_workers._GENERATION_CUSTODIAN is generation
 
     def read():
         nonlocal started, completed
@@ -112,31 +162,27 @@ async def test_shared_pool_sixteen_running_sixteen_queued_bounds_growth_and_actu
             completed += 1
         return "actual-result"
 
-    with (
-        ThreadPoolExecutor(max_workers=16) as executor,
-        patch("elspeth.web.async_workers._get_shared_executor", autospec=True, return_value=executor),
-    ):
-        try:
-            tasks = [asyncio.create_task(run_stream_read_in_worker(read)) for _ in range(32)]
-            await _wait_for(lambda: started == 16 and outstanding_admissions() == 32)
-            with pytest.raises(AsyncWorkerAdmissionTimeoutError):
-                await run_stream_read_in_worker(read)
-            assert started == 16 and completed == 0 and outstanding_admissions() == 32
-            for task in tasks:
-                task.cancel()
-            await _wait_for(lambda: outstanding_admissions() == 16)
-            assert started == 16 and completed == 0
-            assert sum(task.done() for task in tasks) == 16
-            for task in tasks:
-                task.cancel()
-            await asyncio.sleep(0.02)
-            assert outstanding_admissions() == 16 and completed == 0
-            release.set()
-            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-            assert all(isinstance(outcome, asyncio.CancelledError) for outcome in outcomes)
-            assert completed == 16 and started == 16
-            assert outstanding_admissions() == 0
-        finally:
-            release.set()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await _wait_for(lambda: outstanding_admissions() == 0)
+    try:
+        tasks = [asyncio.create_task(run_stream_read_in_worker(read)) for _ in range(32)]
+        await _wait_for(lambda: started == 16 and outstanding_admissions() == 32)
+        with pytest.raises(AsyncWorkerAdmissionTimeoutError):
+            await run_stream_read_in_worker(read)
+        assert started == 16 and completed == 0 and outstanding_admissions() == 32
+        for task in tasks:
+            task.cancel()
+        await _wait_for(lambda: outstanding_admissions() == 16)
+        assert started == 16 and completed == 0
+        assert sum(task.done() for task in tasks) == 16
+        for task in tasks:
+            task.cancel()
+        await asyncio.sleep(0.02)
+        assert outstanding_admissions() == 16 and completed == 0
+        release.set()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        assert all(isinstance(outcome, asyncio.CancelledError) for outcome in outcomes)
+        assert completed == 16 and started == 16
+        assert outstanding_admissions() == 0
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await _wait_for(lambda: outstanding_admissions() == 0)

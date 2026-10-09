@@ -277,6 +277,60 @@ async def test_valid_tool_call_arguments_returns_200(content):
     assert response.status_code == 200
 
 
+# --- completion budget across the real ASGI, service and adapter path ---------
+
+
+@pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+@respx.mock
+async def test_default_64000_completion_budget_reaches_mock_upstream_unchanged(field):
+    _mock_token()
+    upstream_route = respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"result": {"text": "hello"}, "halt": "complete"}))
+    body = {**CHAT_BODY, field: 64000}
+
+    async with _client_for(_config()) as client:
+        response = await client.post("/v1/chat/completions", json=body, headers=_headers())
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "hello"
+    assert len(upstream_route.calls) == 1
+    assert json.loads(upstream_route.calls[0].request.content)["generation"]["max_output"] == 64000
+
+
+@pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+@respx.mock
+async def test_default_budget_rejects_64001_before_token_or_upstream_dispatch(field):
+    token_route = _mock_token()
+    upstream_route = respx.post(UPSTREAM_URL).mock(
+        return_value=httpx.Response(200, json={"result": {"text": "unexpected"}, "halt": "complete"})
+    )
+
+    async with _client_for(_config()) as client:
+        response = await client.post("/v1/chat/completions", json={**CHAT_BODY, field: 64001}, headers=_headers())
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert not token_route.called
+    assert not upstream_route.called
+
+
+@pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+@respx.mock
+async def test_lower_configured_completion_budget_rejects_without_upstream_dispatch(field):
+    token_route = _mock_token()
+    upstream_route = respx.post(UPSTREAM_URL).mock(
+        return_value=httpx.Response(200, json={"result": {"text": "unexpected"}, "halt": "complete"})
+    )
+    config = _config(ELSPETH_LLM_GATEWAY_MAX_MAX_TOKENS="4096")
+
+    async with _client_for(config) as client:
+        response = await client.post("/v1/chat/completions", json={**CHAT_BODY, field: 4097}, headers=_headers())
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert not token_route.called
+    assert not upstream_route.called
+
+
 # --- capability check ------------------------------------------------------------
 
 

@@ -290,6 +290,23 @@ def _new_lease_token(*, owner_instance_id: str) -> str:
     return token
 
 
+_EXECUTION_RELEASE_LOSS_ISSUER = object()
+
+
+class CanonicalExecutionReleaseLoss(SessionOperationFenceLost):
+    """Canonical release proved this exact EXECUTE context has a stale epoch."""
+
+    def __init__(self, seal: object, context: SessionOperationContext) -> None:
+        if (
+            seal is not _EXECUTION_RELEASE_LOSS_ISSUER
+            or type(context) is not SessionOperationContext
+            or context.operation_kind is not SessionOperationKind.EXECUTE
+        ):
+            raise AuditIntegrityError("EXECUTE terminal loss lacks canonical release issuance")
+        self.context = context
+        super().__init__(FenceLossReason.STALE_EPOCH)
+
+
 class SessionOperationConflictError(RuntimeError):
     """A live holder, or an owner that is not provably expired, blocks claim."""
 
@@ -4971,6 +4988,7 @@ class _SessionOperationAuthorityRepository:
         context: SessionOperationContext,
         *,
         database_now: datetime,
+        execution_release: bool = False,
     ) -> None:
         fence = context.fence
         row = conn.execute(
@@ -4992,6 +5010,8 @@ class _SessionOperationAuthorityRepository:
             reason = FenceLossReason.LEASE_EXPIRED
         else:
             reason = FenceLossReason.OWNER_INACTIVE
+        if execution_release and reason is FenceLossReason.STALE_EPOCH:
+            raise CanonicalExecutionReleaseLoss(_EXECUTION_RELEASE_LOSS_ISSUER, context)
         raise SessionOperationFenceLost(reason)
 
     def _compare_and_swap_on_connection(
@@ -5645,7 +5665,12 @@ class _SessionOperationAuthorityRepository:
                 .values(lease_expires_at=database_now, released_at=database_now)
             )
             if result.rowcount != 1:
-                self._raise_fence_lost(conn, context, database_now=database_now)
+                self._raise_fence_lost(
+                    conn,
+                    context,
+                    database_now=database_now,
+                    execution_release=context.operation_kind is SessionOperationKind.EXECUTE,
+                )
 
     def archive_delete(self, context: SessionOperationContext) -> None:
         """Delete a parent only while its exact current archive fence is live."""

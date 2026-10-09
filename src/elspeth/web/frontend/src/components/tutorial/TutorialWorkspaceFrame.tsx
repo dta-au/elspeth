@@ -25,8 +25,8 @@ interface TutorialWorkspaceFrameProps {
  *
  * Tutorial chrome lives in the step header, never inside the authoring pane:
  * anything stacked around the ChatPanel there shrinks the conversation's
- * min(160px, 30%) floor (chat.css) and pushes the chat header off the row it
- * shares with the artifact toolbar across the pane seam.
+ * min(160px, 30%) floor (chat.css) and pushes the conversation below the top
+ * of the artifact pane beside it.
  *
  * The panes read the session store; the caller binds it before display.
  */

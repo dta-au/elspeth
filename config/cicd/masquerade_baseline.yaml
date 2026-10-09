@@ -433,6 +433,118 @@ entries:
   classification: external-parse
   justification: Sentinel-parses the needed LiteLLM completion fields, validates their
     exact container and value types, and returns an owned admitted carrier.
+- path: tests/helpers/web_reserve_composer_receiver.py
+  qualname: actual_code
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - a8d5a55baed519ab8247d38635bc096586b129907b929b78970fe9bbf0b9a530
+  classification: approved-introspection
+  justification: Checks AST generic metadata on a nominally selected function definition;
+    a nonempty type_params list rejects the canonical source definition. This does
+    not inspect a live callable.
+- path: tests/helpers/web_reserve_composer_receiver.py
+  qualname: composer_receiver_local_contracts
+  kind: getattr
+  occurrences: 6
+  probe_shapes:
+  - 2ba15a6635ab31b24a18fd9f2bae50e5ca18443a6fb75d9a7bd33256ec4222b1
+  - 3afb895646b5c99cc78885be596ee26113c950c26c71bc75ca93d7de5c2e979d
+  - 4fad6f1c9f6f084333a966af978c49cd8fbc81c2b1d7d2461c7ef49b13266fa1
+  - 679332bdd2da5a52df751bfd301bc6a5398cfee314e08e5dc61a4abc2d40e547
+  - 9ba2120b9748d639f6653118d8bac302816f7903b808af37c2b3878773d4091e
+  - ad9c0ba16d3778b1e821aa832a44def9fdd21892f4d7d93797915bb22e8370e1
+  classification: approved-introspection
+  justification: Six source-tree probes inspect AST generic metadata on selected app,
+    DTO, turn and method definitions and nullable exception/pattern name and mapping
+    rest binders on nominally selected AST kinds. Noncanonical generics or producer
+    rebinding enter explicit failure paths; these do not classify runtime service
+    objects.
+- path: tests/helpers/web_reserve_composer_receiver.py
+  qualname: immediate
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - ad2180e40a512e7ab2a310e67f026a95d5c2524619073a65a867c714711b7a53
+  classification: approved-introspection
+  justification: Traverses definition-time expressions of parsed function and lambda
+    nodes. decorator_list is optional for Lambda, whose defaults are still visited;
+    this is AST schema handling, not a runtime capability fallback.
+- path: tests/helpers/web_reserve_composer_receiver.py
+  qualname: lexical_binding_events.visit
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 2c959565ed7a950f83e35f7f8f020dd9657a22a280e60d44919cb104263b958d
+  - ad2180e40a512e7ab2a310e67f026a95d5c2524619073a65a867c714711b7a53
+  classification: approved-introspection
+  justification: The lexical AST walker reads optional decorator_list on Lambda and
+    elt/key/value across comprehension node kinds to enumerate definition-time expressions
+    and named-expression binders. Missing fields mean that AST kind has no such expression.
+- path: tests/helpers/web_reserve_composer_receiver.py
+  qualname: plain_class
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - e24d813bcec63b93fe662274c2848f21b538fbbcd9772a04e0d7eaa9a2f6052d
+  classification: approved-introspection
+  justification: After a nominal ClassDef check, reads AST generic metadata and rejects
+    nonempty type_params before the separate DTO field, decorator and ordinary-method
+    checks.
+- path: tests/helpers/web_reserve_composer_receiver.py
+  qualname: receiver_transfer_prefix
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 52d04c94bd5cac64b6de59183414b5aa55ab77e6875df86d788cb3c996049eea
+  classification: approved-introspection
+  justification: Checks optional type_params on the parsed deferred settle_post_provider
+    AsyncFunctionDef while pinning its parameters, decorators, and transfer prefix.
+    A generic definition fails the source-only contract.
+- path: tests/helpers/web_reserve_composer_receiver.py
+  qualname: runtime_walk
+  kind: getattr
+  occurrences: 3
+  probe_shapes:
+  - 97ec4ae093fd18be44fee014abd8bfbaf9372132109597d5671eb65d23d42e33
+  - ad2180e40a512e7ab2a310e67f026a95d5c2524619073a65a867c714711b7a53
+  - e7e58a2641eef74e65f5cb32701e4dd6067e6c50a376250721c989f72baa7025
+  classification: approved-introspection
+  justification: 'Traverses executable expression roles across parsed function and
+    lambda AST kinds: Lambda has no decorator_list, and function vararg/kwarg nodes
+    or their annotations may be None. Absent syntax is skipped according to node kind
+    and annotation mode; no runtime authority is admitted.'
+- path: tests/helpers/web_reserve_composer_receiver.py
+  qualname: safe_method_definition
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - e24d813bcec63b93fe662274c2848f21b538fbbcd9772a04e0d7eaa9a2f6052d
+  classification: approved-introspection
+  justification: Reads optional type_params on a parsed method definition and rejects
+    a nonempty generic list before checking literal defaults and definition-time safety.
+    It does not probe a live method.
+- path: tests/helpers/web_reserve_family_contracts.py
+  qualname: _owned_method_definition_failures
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 32aaf76e5f2fd6ec2ca7e4c5115769ab99b9fe75ac3084ba2c9feadde7e63ee1
+  classification: approved-introspection
+  justification: Reads optional TypeVar.default_value after exact TypeVar selection
+    in the finite PEP 695 AST parameter grammar. A non-None default rejects the method;
+    this AST field is version dependent.
+- path: tests/helpers/web_reserve_family_contracts.py
+  qualname: _same
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 3053baf86edf5beb3895490d216d94e62a1e3474cab78ee40e87ec35cd48005b
+  - 32509861839e257888c19f91280bd80c7cbc54945f50e4a93d3b77431857e400
+  classification: approved-introspection
+  justification: The source-only AST opcode matcher compares actual and expected nodes
+    only after exact AST type equality, then reads the field names supplied by expected._fields.
+    It recursively compares every field and has no runtime product-object fallback.
 - path: tests/testcontainer/web/test_session_operation_fence_postgres.py
   qualname: test_postgres_fenced_mutation_supports_same_session_crud
   kind: getattr
@@ -1229,30 +1341,6 @@ entries:
     Missing ancestry or an unsupported scope yields {None}. This is a finite static
     selector proof over parsed syntax, not structural admission of a runtime callable.
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
-  qualname: _reserve_ReserveProof.dispatch_failures.finite_closed_parameter.compiler_private_selector_unknown
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 054d9c6d6ef3c487ce9a2780f6810865dcab717389c5b434df93f5418b273a9f
-  classification: approved-introspection
-  justification: The single optional parent read ascends the parsed selector origin
-    to its AST module while checking compiler-private names for closed-function formal
-    selectors. A non-module root or unsupported spelling returns True (unknown); the
-    ensuing module walk compares compiler-mangled bindings. It does not recover a
-    runtime namespace.
-- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
-  qualname: _reserve_ReserveProof.dispatch_failures.finite_closed_parameter.compiler_private_selector_unknown.private_key
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
-  classification: approved-introspection
-  justification: The single optional parent read climbs the parsed origin to identify
-    the enclosing class body for Python private-name mangling in closed-function formal
-    selectors. Type-parameter ownership returns None (unknown); reaching no class
-    leaves the spelling unchanged, matching non-class lexical mangling. No product
-    instance attribute is accessed.
-- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _reserve_ReserveProof.dispatch_failures.finite_closed_parameter.proven_local
   kind: getattr
   occurrences: 1
@@ -1292,30 +1380,6 @@ entries:
     climb outer lexical scopes. Missing ancestry or an unsupported form yields the
     explicit unknown selector set {None}.
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
-  qualname: _reserve_ReserveProof.dispatch_failures.finite_local_tuple.compiler_private_selector_unknown
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 054d9c6d6ef3c487ce9a2780f6810865dcab717389c5b434df93f5418b273a9f
-  classification: approved-introspection
-  justification: The single optional parent read ascends the parsed selector origin
-    to its AST module while checking compiler-private names for local-tuple selectors.
-    A non-module root or unsupported spelling returns True (unknown); the ensuing
-    module walk compares compiler-mangled bindings. It does not recover a runtime
-    namespace.
-- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
-  qualname: _reserve_ReserveProof.dispatch_failures.finite_local_tuple.compiler_private_selector_unknown.private_key
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
-  classification: approved-introspection
-  justification: The single optional parent read climbs the parsed origin to identify
-    the enclosing class body for Python private-name mangling in local-tuple selectors.
-    Type-parameter ownership returns None (unknown); reaching no class leaves the
-    spelling unchanged, matching non-class lexical mangling. No product instance attribute
-    is accessed.
-- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _reserve_ReserveProof.dispatch_failures.finite_selector_values
   kind: getattr
   occurrences: 3
@@ -1328,30 +1392,6 @@ entries:
     assignment, obtain assignment ancestry for dominance, and climb enclosing scopes.
     Unsupported stores return {None}; lack of dominance preserves None in the selector
     set. Only bounded parsed literal/assignment/formal syntax can supply finite names.
-- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
-  qualname: _reserve_ReserveProof.dispatch_failures.finite_selector_values.compiler_private_selector_unknown
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 054d9c6d6ef3c487ce9a2780f6810865dcab717389c5b434df93f5418b273a9f
-  classification: approved-introspection
-  justification: The single optional parent read ascends the parsed selector origin
-    to its AST module while checking compiler-private names for finite expression
-    selectors. A non-module root or unsupported spelling returns True (unknown); the
-    ensuing module walk compares compiler-mangled bindings. It does not recover a
-    runtime namespace.
-- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
-  qualname: _reserve_ReserveProof.dispatch_failures.finite_selector_values.compiler_private_selector_unknown.private_key
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
-  classification: approved-introspection
-  justification: The single optional parent read climbs the parsed origin to identify
-    the enclosing class body for Python private-name mangling in finite expression
-    selectors. Type-parameter ownership returns None (unknown); reaching no class
-    leaves the spelling unchanged, matching non-class lexical mangling. No product
-    instance attribute is accessed.
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _reserve_ReserveProof.dispatch_failures.possible_bindings
   kind: getattr
@@ -1410,18 +1450,6 @@ entries:
     unknown compiler-private names are already treated as possible reflection. This
     is source traversal, not a dynamic capability check on an executed callable.
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
-  qualname: _reserve_ReserveProof.dispatch_failures.possible_reflection.compiler_private_binding_unknown.private_key
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
-  classification: approved-introspection
-  justification: The single optional parent read locates the enclosing class body
-    for compiler-private alias spelling in possible_reflection. Type-parameter context
-    yields unknown; reaching the syntax root preserves a non-class spelling. The result
-    feeds conservative reflection-name analysis and is not a lookup on the product
-    callable or its live globals.
-- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _reserve_ReserveProof.dispatch_failures.reflection_forms
   kind: getattr
   occurrences: 5
@@ -1449,18 +1477,6 @@ entries:
     return True (binding uncertain). Reaching a root ends syntax inspection; subsequent
     explicit class analysis remains. This is compiler-scope introspection on AST nodes,
     not probing an owned business object.
-- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
-  qualname: _reserve_ReserveProof.dispatch_failures.reflection_forms.compiler_private_binding_unknown.private_key
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
-  classification: approved-introspection
-  justification: The single optional parent read locates the enclosing class body
-    for compiler-private alias spelling in reflection_forms. Type-parameter context
-    yields unknown; reaching the syntax root preserves a non-class spelling. The result
-    feeds conservative reflection-name analysis and is not a lookup on the product
-    callable or its live globals.
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _reserve_ReserveProof.dispatch_failures.reflection_forms.ordinary_class_namespace
   kind: getattr
@@ -1529,6 +1545,17 @@ entries:
     identity are still required. A missing parent cannot pass these certificate conditions;
     live installation/custody objects are not probed.
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _reserve_captured_composer_receiver
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 4f0c154b9df33835fbd9cb052a00c82a383a78873a2d8ed67770befbca97e7b0
+  - ee41cba02edf969d1e4ba5c5ea13012e9000dd8b02e4e6617ca73f3877f743b8
+  classification: approved-introspection
+  justification: Reads AST generic metadata on the parsed registry ClassDef and deferred
+    AsyncFunctionDef. Nonempty type_params rejects the source interval and constructor
+    grammar; complete DTO capture and same-AST call checks remain required.
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _reserve_dominating_direct_statement
   kind: getattr
   occurrences: 4
@@ -1567,6 +1594,66 @@ entries:
     to its assignment. Admission requires an ast.Assign in the actual handler body
     whose call resolves to the exact raise helper. A missing parent fails that predicate;
     no runtime exception or callback is inspected.
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _reserve_private_key
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: The optional `_landscape_parent` read traverses parsed AST ownership
+    to implement compiler-private name mangling. A type-parameter owner yields None/unknown;
+    an enclosing class body supplies its lexical class name; reaching the syntax root
+    preserves a non-class spelling. This is analysis of parser-owned syntax and attached
+    parent links, not dynamic access to a product instance or runtime authority. The
+    shared helper replaces the previously reviewed duplicated private_key walkers.
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _reserve_private_name_unknown
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 054d9c6d6ef3c487ce9a2780f6810865dcab717389c5b434df93f5418b273a9f
+  classification: approved-introspection
+  justification: The optional `_landscape_parent` read finds the parsed name's root
+    for lookup in the module-identity binding index. Missing facts or unknown/private-mangled/colliding
+    bindings conservatively return True/unknown; a clear result requires the same
+    module's previously constructed binding facts. This shared path serves reflection_forms
+    and possible_reflection analysis. No product object, callable globals or persisted
+    authority is dynamically recovered.
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _reserve_private_selector_unknown
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 054d9c6d6ef3c487ce9a2780f6810865dcab717389c5b434df93f5418b273a9f
+  classification: approved-introspection
+  justification: The optional `_landscape_parent` read ascends a parsed selector origin
+    to its module. A non-module root, unsupported origin, changed private spelling,
+    missing per-module facts, unknown binding or collision returns True/unknown. The
+    indexed facts are built from that same parsed module before use. The probe navigates
+    syntax only and does not recover or authorize a runtime namespace.
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _reserve_safe_canonical_plugin_bind
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 9572e06437e205c2b607d27099babe8b272a33c5e78bb338a19b90bfaf1e5390
+  - d006b27d47973aede37a9550fe510826eccef41b1a6f446569833f490c747f66
+  classification: approved-introspection
+  justification: Walks scanner-attached _landscape_parent links on parsed AST nodes
+    to require the exact canonical plugin-binding enclosing function. Missing parent
+    rejects this narrow source exception; no runtime plugin attribute is probed.
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _reserve_selected_origin_effect_failures
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 21693b46f9395b1ade23949e97b2bbf5a8be4dcd17113712bb5f16c5f370415b
+  - 8bd066f901337178e2d73cee0a98b6d4ef5389335ae8160c73dde38924608396
+  classification: approved-introspection
+  justification: Reads optional lineno and col_offset on parsed AST nodes only to
+    correlate requested diagnostic observations; some AST node kinds have no location
+    fields. The observations do not grant source-effect admission.
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _reserve_statement_dominates_same_body
   kind: getattr

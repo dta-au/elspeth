@@ -1353,6 +1353,29 @@ async def _prepare_canonical_pipeline_route_proposal(
     return app, service, pipeline, session_id, creation, ""
 
 
+def _install_manual_proposal_handler(app: FastAPI, tmp_path: Path) -> None:
+    from contextlib import ExitStack
+
+    from elspeth.web.app import create_app
+    from elspeth.web.sessions.manual_proposal_failure import ComposerManualProposalFailure
+    from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
+
+    handler_settings = app.state.settings.model_copy(update={"data_dir": tmp_path / "handler-owner", "composer_boot_probe_enabled": False})
+    handler_app = create_app(handler_settings, process_watchdog_factory=OwnedTestProcessWatchdog)
+    with ExitStack() as cleanup:
+        cleanup.callback(handler_app.state.readiness_probe_runner.close)
+        cleanup.callback(handler_app.state._session_engine_finalizer)
+        cleanup.callback(handler_app.state._auth_audit_finalizer)
+        actual_handler = handler_app.exception_handlers[ComposerManualProposalFailure]
+    app.state.manual_proposal_originals = []
+
+    async def observe_manual_proposal_failure(request, carrier):
+        app.state.manual_proposal_originals.append(carrier.__cause__)
+        return await actual_handler(request, carrier)
+
+    app.add_exception_handler(ComposerManualProposalFailure, observe_manual_proposal_failure)
+
+
 async def _create_canonical_pipeline_route_proposal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1371,6 +1394,7 @@ async def _create_canonical_pipeline_route_proposal(
         with_review_site=with_review_site,
     )
     app, service, pipeline, session_id, creation, _ = prepared
+    _install_manual_proposal_handler(app, tmp_path)
     row = await _create_test_pipeline_composition_proposal(service, **creation)
     return app, service, pipeline, session_id, row, f"/api/sessions/{session_id}/proposals/{row.id}/accept"
 
@@ -1514,19 +1538,26 @@ async def test_canonical_reject_joins_worker_before_lease_close_and_exact_retry(
     original_sql = service_module.run_required_sql_finish_once
     original_close = SessionOperationLease.close
     worker_at_gate = asyncio.Event()
-    release_worker = asyncio.Event()
     release_worker_thread = threading.Event()
     test_loop = asyncio.get_running_loop()
     gate_worker = False
     order: list[str] = []
 
     async def gated_required_sql(ticket: Any, func: Any, *args: Any, **kwargs: Any) -> Any:
-        if gate_worker and not cancel_after_commit and ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL:
+        if gate_worker and ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL:
 
             def paused_transaction() -> Any:
+                if cancel_after_commit:
+                    result = func(*args, **kwargs)
+                    order.append("committed")
+                    test_loop.call_soon_threadsafe(worker_at_gate.set)
+                    assert release_worker_thread.wait(10), "proposal worker was never released"
+                    return result
                 test_loop.call_soon_threadsafe(worker_at_gate.set)
                 assert release_worker_thread.wait(10), "proposal worker was never released"
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
+                order.append("committed")
+                return result
 
             return await original_sql(ticket, paused_transaction)
         return await original_sql(ticket, func, *args, **kwargs)
@@ -1536,10 +1567,6 @@ async def test_canonical_reject_joins_worker_before_lease_close_and_exact_retry(
         gate_worker = True
         result = await original_reject(**kwargs)
         gate_worker = False
-        order.append("committed")
-        if cancel_after_commit:
-            worker_at_gate.set()
-            await release_worker.wait()
         return result
 
     async def observed_close(lease: SessionOperationLease) -> None:
@@ -1556,10 +1583,7 @@ async def test_canonical_reject_joins_worker_before_lease_close_and_exact_retry(
         request_task.cancel()
         await asyncio.sleep(0)
         lease_closed_before_worker = "lease_close" in order
-        if cancel_after_commit:
-            release_worker.set()
-        else:
-            release_worker_thread.set()
+        release_worker_thread.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(request_task, timeout=5)
         assert not lease_closed_before_worker
@@ -2320,6 +2344,21 @@ def test_canonical_pipeline_accept_terminalizes_audited_executor_failure(
     assert events[-1].payload["dispatch"]["result_hash"] == invocation["result_hash"]
 
 
+def _capture_pipeline_cancellations(monkeypatch: pytest.MonkeyPatch) -> list[asyncio.CancelledError]:
+    from elspeth.web.sessions.routes.composer import pipeline_settlement
+
+    delivered: list[asyncio.CancelledError] = []
+    original = pipeline_settlement._DeferredCancellationState.retain
+
+    def retain(state, error):
+        if all(error is not previous for previous in delivered):
+            delivered.append(error)
+        original(state, error)
+
+    monkeypatch.setattr(pipeline_settlement._DeferredCancellationState, "retain", retain)
+    return delivered
+
+
 @pytest.mark.asyncio
 async def test_canonical_pipeline_cancel_then_prepare_failure_terminalizes_before_reraising(
     tmp_path,
@@ -2332,13 +2371,15 @@ async def test_canonical_pipeline_cancel_then_prepare_failure_terminalizes_befor
         monkeypatch,
         tool_call_id="canonical-cancel-prepare-call",
     )
+    delivered = _capture_pipeline_cancellations(monkeypatch)
+    original_failure = PipelineCommitError("candidate validation failed", code="VALIDATION_FAILED")
     started = asyncio.Event()
     release = asyncio.Event()
 
     async def fail_prepare(**_kwargs: Any):
         started.set()
         await release.wait()
-        raise PipelineCommitError("candidate validation failed", code="VALIDATION_FAILED")
+        raise original_failure
 
     monkeypatch.setattr(
         "elspeth.web.sessions.routes.composer.pipeline_settlement.prepare_pipeline_proposal_commit",
@@ -2349,8 +2390,11 @@ async def test_canonical_pipeline_cancel_then_prepare_failure_terminalizes_befor
         await started.wait()
         request_task.cancel()
         release.set()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(BaseExceptionGroup) as caught:
             await request_task
+    assert len(delivered) == 1
+    assert caught.value.exceptions == (original_failure, delivered[0])
+    assert caught.value.exceptions[0] is original_failure and caught.value.exceptions[1] is delivered[0]
 
     proposals = await service.list_composition_proposals(session_id)
     assert proposals[0].status == "rejected"
@@ -2391,18 +2435,15 @@ async def test_canonical_pipeline_cancel_then_prepare_failure_preserves_binding_
         version_after=0,
     )
     dispatch = PipelineDispatchAuditBinding.from_invocation(invocation)
+    delivered = _capture_pipeline_cancellations(monkeypatch)
+    original_failure = PipelineCommitError("executor validation failed", code="VALIDATION_FAILED", invocation=invocation, dispatch=dispatch)
     prepare_started = asyncio.Event()
     prepare_release = asyncio.Event()
 
     async def fail_prepare(**_kwargs: Any):
         prepare_started.set()
         await prepare_release.wait()
-        raise PipelineCommitError(
-            "executor validation failed",
-            code="VALIDATION_FAILED",
-            invocation=invocation,
-            dispatch=dispatch,
-        )
+        raise original_failure
 
     async def lose_binding(*_args: Any, **_kwargs: Any):
         return ()
@@ -2414,13 +2455,17 @@ async def test_canonical_pipeline_cancel_then_prepare_failure_preserves_binding_
         await prepare_started.wait()
         request_task.cancel()
         prepare_release.set()
-        with pytest.raises(asyncio.CancelledError) as caught:
+        with pytest.raises(BaseExceptionGroup) as caught:
             await request_task
 
-    cleanup_failure = caught.value.__cause__
+    assert len(delivered) == 1
+    assert len(caught.value.exceptions) == 3
+    assert caught.value.exceptions[0] is original_failure
+    assert caught.value.exceptions[2] is delivered[0]
+    cleanup_failure = caught.value.exceptions[1]
     assert isinstance(cleanup_failure, RuntimeError)
     assert "did not persist exactly one rebound binding" in str(cleanup_failure)
-    assert isinstance(cleanup_failure.__cause__ or cleanup_failure.__context__, PipelineCommitError)
+    assert cleanup_failure.__cause__ is original_failure
     assert (await service.list_composition_proposals(session_id))[0].status == "pending"
 
 
@@ -2437,31 +2482,46 @@ async def test_canonical_pipeline_cancel_then_prepare_failure_preserves_rejectio
         monkeypatch,
         tool_call_id="canonical-cancel-rejection-cleanup-call",
     )
+    from elspeth.web.required_work import RequiredWorkSource
+    from elspeth.web.sessions import service as service_module
+
+    delivered = _capture_pipeline_cancellations(monkeypatch)
+    original_failure = PipelineCommitError("candidate validation failed", code="VALIDATION_FAILED")
+    rejection_failure = RuntimeError("rejection cleanup failed")
+    original_sql = service_module.run_required_sql_finish_once
     prepare_started = asyncio.Event()
     prepare_release = asyncio.Event()
 
     async def fail_prepare(**_kwargs: Any):
         prepare_started.set()
         await prepare_release.wait()
-        raise PipelineCommitError("candidate validation failed", code="VALIDATION_FAILED")
+        raise original_failure
 
-    async def fail_rejection(**_kwargs: Any):
-        raise RuntimeError("rejection cleanup failed")
+    def fail_rejection():
+        raise rejection_failure
+
+    async def reject_sql_failure(ticket: Any, func: Any, *args: Any, **kwargs: Any) -> Any:
+        if ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL:
+            return await original_sql(ticket, fail_rejection)
+        return await original_sql(ticket, func, *args, **kwargs)
 
     monkeypatch.setattr(proposal_routes, "prepare_pipeline_proposal_commit", fail_prepare)
-    monkeypatch.setattr(service, "reject_pipeline_composition_proposal", fail_rejection)
+    monkeypatch.setattr(service_module, "run_required_sql_finish_once", reject_sql_failure)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         request_task = asyncio.create_task(client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash}))
         await prepare_started.wait()
         request_task.cancel()
         prepare_release.set()
-        with pytest.raises(asyncio.CancelledError) as caught:
-            await request_task
+        response = await request_task
 
-    cleanup_failure = caught.value.__cause__
-    assert isinstance(cleanup_failure, RuntimeError)
-    assert str(cleanup_failure) == "rejection cleanup failed"
-    assert isinstance(cleanup_failure.__cause__ or cleanup_failure.__context__, PipelineCommitError)
+    assert response.status_code == 500
+    assert len(delivered) == 1
+    (retained,) = app.state.manual_proposal_originals
+    assert type(retained) is BaseExceptionGroup
+    assert retained.exceptions == (original_failure, rejection_failure, delivered[0])
+    assert retained.exceptions[0] is original_failure
+    assert retained.exceptions[1] is rejection_failure
+    assert retained.exceptions[2] is delivered[0]
     assert (await service.list_composition_proposals(session_id))[0].status == "pending"
 
 
@@ -2520,14 +2580,14 @@ async def test_canonical_pipeline_cancel_during_failed_dispatch_audit_persist_te
     )
     dispatch = PipelineDispatchAuditBinding.from_invocation(rebound_invocation)
 
+    delivered = _capture_pipeline_cancellations(monkeypatch)
+    original_failure = PipelineCommitError(
+        "executor validation failed", code="VALIDATION_FAILED", invocation=rebound_invocation, dispatch=dispatch
+    )
+
     async def fail_after_dispatch(*, recorder, **_kwargs: Any):
         recorder.record(recorder_invocation)
-        raise PipelineCommitError(
-            "executor validation failed",
-            code="VALIDATION_FAILED",
-            invocation=rebound_invocation,
-            dispatch=dispatch,
-        )
+        raise original_failure
 
     persist_started = asyncio.Event()
     persist_release = asyncio.Event()
@@ -2545,8 +2605,11 @@ async def test_canonical_pipeline_cancel_during_failed_dispatch_audit_persist_te
         await persist_started.wait()
         request_task.cancel()
         persist_release.set()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(BaseExceptionGroup) as caught:
             await request_task
+    assert len(delivered) == 1
+    assert caught.value.exceptions == (original_failure, delivered[0])
+    assert caught.value.exceptions[0] is original_failure and caught.value.exceptions[1] is delivered[0]
 
     proposals = await service.list_composition_proposals(session_id)
     assert proposals[0].status == "rejected"
@@ -2592,7 +2655,7 @@ async def test_canonical_pipeline_cancel_then_settlement_failure_preserves_cance
     observed_order = []
     original_retain = pipeline_settlement._DeferredCancellationState.retain
     original_settle = service.settle_pipeline_composition_proposal_finish_once
-    original_close = proposal_routes._close_proposal_lease_before_commit
+    original_close = proposal_routes.close_required_proposal_lease
 
     def observe_cancellation(state, error):
         if all(error is not retained for retained in delivered_cancellations):
@@ -2606,16 +2669,16 @@ async def test_canonical_pipeline_cancel_then_settlement_failure_preserves_cance
         observed_order.append("service_handoff")
         return handoff
 
-    async def observe_close(lease, *, primary):
+    async def observe_close(lease, *, coordinator):
         assert len(handoffs) == 1
         assert projection_tickets[0].complete
-        assert type(primary) is BaseExceptionGroup
+        assert lease.required_work is coordinator
         observed_order.append("lease_close")
-        return await original_close(lease, primary=primary)
+        return await original_close(lease, coordinator=coordinator)
 
     monkeypatch.setattr(pipeline_settlement._DeferredCancellationState, "retain", observe_cancellation)
     monkeypatch.setattr(service, "settle_pipeline_composition_proposal_finish_once", observe_settlement)
-    monkeypatch.setattr(proposal_routes, "_close_proposal_lease_before_commit", observe_close)
+    monkeypatch.setattr(proposal_routes, "close_required_proposal_lease", observe_close)
 
     def fail_settlement(**_kwargs: Any):
         settle_started.set()
@@ -2630,17 +2693,19 @@ async def test_canonical_pipeline_cancel_then_settlement_failure_preserves_cance
         assert await run_sync_in_worker(settle_started.wait, 5), "actual publication SQL did not start"
         request_task.cancel("publication-caller-cancel")
         settle_release.set()
-        with pytest.raises(BaseExceptionGroup) as caught:
-            await request_task
+        response = await request_task
+    assert response.status_code == 500
+    assert str(original_failure) not in response.text
+    (retained,) = app.state.manual_proposal_originals
 
     assert len(delivered_cancellations) == 1
     assert type(delivered_cancellations[0]) is asyncio.CancelledError
     assert delivered_cancellations[0].args == ("publication-caller-cancel",)
-    assert type(caught.value) is BaseExceptionGroup
-    assert caught.value.message == "Pipeline publication and cancellation"
-    assert caught.value.exceptions == (original_failure, delivered_cancellations[0])
-    assert caught.value.exceptions[0] is original_failure
-    assert caught.value.exceptions[1] is delivered_cancellations[0]
+    assert type(retained) is BaseExceptionGroup
+    assert retained.message == "Pipeline publication and cancellation"
+    assert retained.exceptions == (original_failure, delivered_cancellations[0])
+    assert retained.exceptions[0] is original_failure
+    assert retained.exceptions[1] is delivered_cancellations[0]
     assert observed_order == ["physical_sql_failure", "service_handoff", "lease_close"]
     (handoff,) = handoffs
     assert type(handoff) is ComposerPipelineRaised
@@ -2670,6 +2735,7 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
     app, service = _make_app(tmp_path)
+    _install_manual_proposal_handler(app, tmp_path)
     # Settlement surfaces interpretation reviews via the composer service —
     # a required app-state member in production (create_app always wires it).
     app.state.composer_service = _make_composer_mock()
@@ -2749,13 +2815,17 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
 
     from elspeth.web.sessions import service as service_module
 
+    original_failure = RuntimeError("interrupted before atomic settlement")
+
     def interrupt_before_settlement(**kwargs: Any):
         del kwargs
-        raise RuntimeError("interrupted before atomic settlement")
+        raise original_failure
 
     original_sql = _install_publication_sql_fault(monkeypatch, interrupt_before_settlement)
-    with pytest.raises(RuntimeError, match="interrupted before atomic settlement"):
-        client.post(endpoint, json={"draft_hash": proposal_envelope.draft_hash})
+    failed = client.post(endpoint, json={"draft_hash": proposal_envelope.draft_hash})
+    assert failed.status_code == 500
+    assert str(original_failure) not in failed.text
+    assert app.state.manual_proposal_originals[-1] is original_failure
     assert asyncio.run(service.get_current_state(session_id)) is None
     audit_rows_before_retry = [
         message for message in asyncio.run(service.get_messages(session_id, limit=None)) if message.role == "audit" and message.tool_calls
@@ -2843,14 +2913,18 @@ async def test_canonical_pipeline_recovery_rejects_tampered_bound_content_hash(t
     )
     from elspeth.web.sessions import service as service_module
 
+    original_failure = RuntimeError("interrupted before atomic settlement")
+
     def interrupt_before_settlement(**kwargs: Any):
         del kwargs
-        raise RuntimeError("interrupted before atomic settlement")
+        raise original_failure
 
     original_sql = _install_publication_sql_fault(monkeypatch, interrupt_before_settlement)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        with pytest.raises(RuntimeError, match="interrupted before atomic settlement"):
-            await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
+        failed = await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
+        assert failed.status_code == 500
+        assert str(original_failure) not in failed.text
+        assert app.state.manual_proposal_originals[-1] is original_failure
 
         with service._engine.begin() as conn:
             audit_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "audit")).one()
@@ -2886,14 +2960,18 @@ async def test_canonical_pipeline_http_readback_rejects_malformed_bound_content_
     )
     from elspeth.web.sessions import service as service_module
 
+    original_failure = RuntimeError("interrupted before atomic settlement")
+
     def interrupt_before_settlement(**kwargs: Any):
         del kwargs
-        raise RuntimeError("interrupted before atomic settlement")
+        raise original_failure
 
     original_sql = _install_publication_sql_fault(monkeypatch, interrupt_before_settlement)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        with pytest.raises(RuntimeError, match="interrupted before atomic settlement"):
-            await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
+        failed = await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
+        assert failed.status_code == 500
+        assert str(original_failure) not in failed.text
+        assert app.state.manual_proposal_originals[-1] is original_failure
 
         hash_canary = "RAW_CANARY_" + "A" * 53
         assert len(hash_canary) == 64
@@ -2908,10 +2986,14 @@ async def test_canonical_pipeline_http_readback_rejects_malformed_bound_content_
             conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit_row.id).values(tool_calls=envelopes))
 
         monkeypatch.setattr(service_module, "run_required_sql_finish_once", original_sql)
-        with pytest.raises(AuditIntegrityError, match="pipeline dispatch result content hash is malformed") as exc_info:
-            await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
+        refused = await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
+        assert refused.status_code == 500
+        retained = app.state.manual_proposal_originals[-1]
+        assert isinstance(retained, AuditIntegrityError)
+        assert "pipeline dispatch result content hash is malformed" in str(retained)
+        assert hash_canary not in refused.text
 
-    assert hash_canary not in str(exc_info.value)
+    assert hash_canary not in str(retained)
     assert await service.get_current_state(session_id) is None
 
 
