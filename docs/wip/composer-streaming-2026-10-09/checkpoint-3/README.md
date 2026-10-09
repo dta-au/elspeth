@@ -1,0 +1,7 @@
+# Streaming source/review checkpoint 3
+
+This adds 54 completed source/review records as 49 deduplicated portable payloads, 115 ordered JSON-string parts, the inventory and this README. Concatenate decoded parts in each inventory record and check its portable SHA256 to recover portable UTF-8 bytes. Thirty-one records preserve original bytes; 23 normalize private/user path prefixes. No credential-shaped literals were redacted in this delta. Transformed originals are not fully recoverable remotely; original checksums identify preserved local originals.
+
+The inventory defines archive membership. Historical source package manifests can name excluded logs or captures and do not imply those are present. Raw logs, browser/native runtime captures, databases, output artifacts, binaries, credentials, dependencies and mutable SOURCE9 are excluded.
+
+The exact implementation backup remains 0dfa20699e2b354d11a2616b85bd9df30aaa815b. This supplementary checkpoint preserves reviewed private workflow sink-ID correction, conditional worker-caller source/reviews, native terminal-observer source and root integration helpers. Fixture128 is independently qualified; browser133 subsequently failed custody after the fixture tests passed because a foreign frontend metadata read raised FileNotFoundError. Its original filename/cause remains UNKNOWN; workflow/tutorial did not run. Diagnostic-only successor work and common-boundary completion remain local and incomplete. No complete browser/default/TLS/signature, merge or deployment clearance is asserted.

@@ -1,0 +1,669 @@
+{
+  "status": "SOURCE_ONLY_WIP_DELTA_NOT_ADMISSION",
+  "records": [
+    {
+      "source_path": "sol-browser-workflow-sink-identity-source-7/REPORT.md",
+      "original_sha256": "30b4d48157ad0ac331f46a5fadb0b8daaacb22b4057d74d6e9b83e73f8bb8b42",
+      "portable_sha256": "30b4d48157ad0ac331f46a5fadb0b8daaacb22b4057d74d6e9b83e73f8bb8b42",
+      "original_bytes": 3937,
+      "portable_bytes": 3937,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/30b4d48157ad0ac331f46a5fadb0b8daaacb22b4057d74d6e9b83e73f8bb8b42/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-browser-workflow-sink-identity-source-7/control_source.py",
+      "original_sha256": "dbd7af2ab97da093398e0b1a56a52b27db2df3f25e19fde4d34aa0f639c990ff",
+      "portable_sha256": "dbd7af2ab97da093398e0b1a56a52b27db2df3f25e19fde4d34aa0f639c990ff",
+      "original_bytes": 3259,
+      "portable_bytes": 3259,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/dbd7af2ab97da093398e0b1a56a52b27db2df3f25e19fde4d34aa0f639c990ff/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-browser-workflow-sink-identity-source-7/manifest.json",
+      "original_sha256": "d309d8eb33ce91405f0809895245b4f8939af6b0642bf56871b563fffdaa6c40",
+      "portable_sha256": "d309d8eb33ce91405f0809895245b4f8939af6b0642bf56871b563fffdaa6c40",
+      "original_bytes": 1256,
+      "portable_bytes": 1256,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/d309d8eb33ce91405f0809895245b4f8939af6b0642bf56871b563fffdaa6c40/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-browser-workflow-sink-identity-source-7/preimages/simple-workflows.spec.ts",
+      "original_sha256": "03e777b69d1215ddf44c8aa342c39733323f9fedfecc2c242c3c693e56f8fda6",
+      "portable_sha256": "2ae7bbfa1613ad2e734daa7682bae1703f525701647477dbe28a615c2c035acf",
+      "original_bytes": 8599,
+      "portable_bytes": 8497,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/2ae7bbfa1613ad2e734daa7682bae1703f525701647477dbe28a615c2c035acf/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-browser-workflow-sink-identity-source-7/proposal.patch",
+      "original_sha256": "8b1565fb66920a98734c63da855b917e51ce8022aae7c84509494a1501f090a9",
+      "portable_sha256": "319b4e275331a468a5504ef9ff0ec114757c2406e3cf51bcb3f374b2ed62b5d8",
+      "original_bytes": 3658,
+      "portable_bytes": 3592,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/319b4e275331a468a5504ef9ff0ec114757c2406e3cf51bcb3f374b2ed62b5d8/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-browser-workflow-sink-identity-source-7/source-controls.json",
+      "original_sha256": "b954eda512d021a628fb6133c01437113f27ee1d805d748d2a96dcbf9d554d4a",
+      "portable_sha256": "b954eda512d021a628fb6133c01437113f27ee1d805d748d2a96dcbf9d554d4a",
+      "original_bytes": 1269,
+      "portable_bytes": 1269,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/b954eda512d021a628fb6133c01437113f27ee1d805d748d2a96dcbf9d554d4a/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-browser-workflow-sink-identity-source-7/tests/simple-workflows.spec.ts",
+      "original_sha256": "76e7d30e9abf78f5f682026fa92b4fb8c9043cfee5f3e8a38d388ca58f05cc8b",
+      "portable_sha256": "7f9691d19068026be29a560327ee63ef90ac8e43d8196979a48861d011ad859b",
+      "original_bytes": 8728,
+      "portable_bytes": 8626,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/7f9691d19068026be29a560327ee63ef90ac8e43d8196979a48861d011ad859b/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-browser-workflow-sink-identity-source-7/tests/sink-identity.ts",
+      "original_sha256": "1a5f37c575352e0270044922deca9e84756a47bcd9d0769dd6e732b9430ab55c",
+      "portable_sha256": "58e94fc8bef8137e650b82ca9c52175c9ee7938f5c71d6f53ac3d2d5db232a80",
+      "original_bytes": 1884,
+      "portable_bytes": 1851,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/58e94fc8bef8137e650b82ca9c52175c9ee7938f5c71d6f53ac3d2d5db232a80/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-browser-workflow-sink-identity-source7-review-1/REPORT.md",
+      "original_sha256": "20053481878b1494bfed2b66a6c0d26e966f97bc4b12831e965b674c8719f042",
+      "portable_sha256": "08bd76aabd19e231c3b76f82d052b9de86c51c7fb5b71c407295c901b06b7356",
+      "original_bytes": 9718,
+      "portable_bytes": 9685,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/08bd76aabd19e231c3b76f82d052b9de86c51c7fb5b71c407295c901b06b7356/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-browser-workflow-sink-identity-source7-review-1/controls.py",
+      "original_sha256": "22ec44ed51f91d355a06371422331f8b41e2be20c3cc6f6a1552ab5fcd10e7a5",
+      "portable_sha256": "24ad5b38b2c39379aa01d12b69fd67cdcd581b19c9eaca182f1300d769f79ed7",
+      "original_bytes": 7327,
+      "portable_bytes": 7294,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/24ad5b38b2c39379aa01d12b69fd67cdcd581b19c9eaca182f1300d769f79ed7/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-browser-workflow-sink-identity-source7-review-1/controls.json",
+      "original_sha256": "b4d2d050d1847a8ff3ea742373326f740ef9c9c4ae85c2e8c7bbea86679ba0a9",
+      "portable_sha256": "b4d2d050d1847a8ff3ea742373326f740ef9c9c4ae85c2e8c7bbea86679ba0a9",
+      "original_bytes": 3426,
+      "portable_bytes": 3426,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/b4d2d050d1847a8ff3ea742373326f740ef9c9c4ae85c2e8c7bbea86679ba0a9/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-browser-workflow-sink-identity-source7-review-1/package-pins.json",
+      "original_sha256": "1edacc6e60852791499cbfc78a21eb6beca52591b56ed00c9a2e587539cae6f1",
+      "portable_sha256": "1edacc6e60852791499cbfc78a21eb6beca52591b56ed00c9a2e587539cae6f1",
+      "original_bytes": 1226,
+      "portable_bytes": 1226,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/1edacc6e60852791499cbfc78a21eb6beca52591b56ed00c9a2e587539cae6f1/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-browser-workflow-sink-identity-source7-review-1/source-pins.json",
+      "original_sha256": "ec0dd71f6702b0b049a1e82f7f2f465d87cdc4a47d925837f396e8f71e91905f",
+      "portable_sha256": "0048aec1cd761d95133d2076ecb4e137c0c56ce146d646c02588a431fe49ba22",
+      "original_bytes": 2433,
+      "portable_bytes": 2232,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/0048aec1cd761d95133d2076ecb4e137c0c56ce146d646c02588a431fe49ba22/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-browser-workflow-sink-identity-source7-review-1/author-replay/control_source.py",
+      "original_sha256": "dbd7af2ab97da093398e0b1a56a52b27db2df3f25e19fde4d34aa0f639c990ff",
+      "portable_sha256": "dbd7af2ab97da093398e0b1a56a52b27db2df3f25e19fde4d34aa0f639c990ff",
+      "original_bytes": 3259,
+      "portable_bytes": 3259,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/dbd7af2ab97da093398e0b1a56a52b27db2df3f25e19fde4d34aa0f639c990ff/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-browser-workflow-sink-identity-source7-review-1/author-replay/preimages/simple-workflows.spec.ts",
+      "original_sha256": "03e777b69d1215ddf44c8aa342c39733323f9fedfecc2c242c3c693e56f8fda6",
+      "portable_sha256": "2ae7bbfa1613ad2e734daa7682bae1703f525701647477dbe28a615c2c035acf",
+      "original_bytes": 8599,
+      "portable_bytes": 8497,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/2ae7bbfa1613ad2e734daa7682bae1703f525701647477dbe28a615c2c035acf/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-browser-workflow-sink-identity-source7-review-1/author-replay/source-controls.json",
+      "original_sha256": "b954eda512d021a628fb6133c01437113f27ee1d805d748d2a96dcbf9d554d4a",
+      "portable_sha256": "b954eda512d021a628fb6133c01437113f27ee1d805d748d2a96dcbf9d554d4a",
+      "original_bytes": 1269,
+      "portable_bytes": 1269,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/b954eda512d021a628fb6133c01437113f27ee1d805d748d2a96dcbf9d554d4a/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-browser-workflow-sink-identity-source7-review-1/author-replay/tests/simple-workflows.spec.ts",
+      "original_sha256": "76e7d30e9abf78f5f682026fa92b4fb8c9043cfee5f3e8a38d388ca58f05cc8b",
+      "portable_sha256": "7f9691d19068026be29a560327ee63ef90ac8e43d8196979a48861d011ad859b",
+      "original_bytes": 8728,
+      "portable_bytes": 8626,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/7f9691d19068026be29a560327ee63ef90ac8e43d8196979a48861d011ad859b/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-browser-workflow-sink-identity-source7-review-1/author-replay/tests/sink-identity.ts",
+      "original_sha256": "1a5f37c575352e0270044922deca9e84756a47bcd9d0769dd6e732b9430ab55c",
+      "portable_sha256": "58e94fc8bef8137e650b82ca9c52175c9ee7938f5c71d6f53ac3d2d5db232a80",
+      "original_bytes": 1884,
+      "portable_bytes": 1851,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/58e94fc8bef8137e650b82ca9c52175c9ee7938f5c71d6f53ac3d2d5db232a80/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/REPORT.md",
+      "original_sha256": "c922ad60674068c73f3d5952fa8452e6f22f6eb3085afb44efecba281fa5e515",
+      "portable_sha256": "c922ad60674068c73f3d5952fa8452e6f22f6eb3085afb44efecba281fa5e515",
+      "original_bytes": 6778,
+      "portable_bytes": 6778,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/c922ad60674068c73f3d5952fa8452e6f22f6eb3085afb44efecba281fa5e515/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/comparison.json",
+      "original_sha256": "a759165fe6a1820749963095736c7e37a464365dd3b07ac98f1e82f4ac98667d",
+      "portable_sha256": "64e82cdeb96c62ea0e87306699014d5d07f81b15fd2ea115afec7dc7c5b3e8cc",
+      "original_bytes": 1414,
+      "portable_bytes": 1381,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/64e82cdeb96c62ea0e87306699014d5d07f81b15fd2ea115afec7dc7c5b3e8cc/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/controls.py",
+      "original_sha256": "63961e1edc184fb052bc92b7343aad9e8a4511d7ce9aef3238861950b8152a9c",
+      "portable_sha256": "acc00a244e5dea92ed7567f4ded8b038fa5cdc3af747fb1d67863119d36897af",
+      "original_bytes": 14463,
+      "portable_bytes": 14394,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/acc00a244e5dea92ed7567f4ded8b038fa5cdc3af747fb1d67863119d36897af/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/controls-3.12.json",
+      "original_sha256": "2c2c3657bf83a6b94efd2f3960fcffe2f53459236a8cceb1c2198352cb44721c",
+      "portable_sha256": "2c2c3657bf83a6b94efd2f3960fcffe2f53459236a8cceb1c2198352cb44721c",
+      "original_bytes": 30190,
+      "portable_bytes": 30190,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/2c2c3657bf83a6b94efd2f3960fcffe2f53459236a8cceb1c2198352cb44721c/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/controls-3.13.json",
+      "original_sha256": "06e6b39ff48d5d55d43d5185fa829d6029a579b3cf02c2b5eef990c16cc17a11",
+      "portable_sha256": "afabde6dcdeb9bb7e49bcbfb76810dfc4bd90fb4ca6830f06b639d694452405a",
+      "original_bytes": 30254,
+      "portable_bytes": 30221,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/afabde6dcdeb9bb7e49bcbfb76810dfc4bd90fb4ca6830f06b639d694452405a/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/helper.sha256",
+      "original_sha256": "6f704dc93f0082cfa5a782484c7a52748b5b3bbd61ec075f157652c1d9966d77",
+      "portable_sha256": "6f704dc93f0082cfa5a782484c7a52748b5b3bbd61ec075f157652c1d9966d77",
+      "original_bytes": 83,
+      "portable_bytes": 83,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/6f704dc93f0082cfa5a782484c7a52748b5b3bbd61ec075f157652c1d9966d77/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/prepare.py",
+      "original_sha256": "673bc1b1b0daa6458b796b5084aa2d55e46c1f3f0c6f264e2a31201e568fbbc2",
+      "portable_sha256": "8eab4d0844bb50c6500e2e77e4066540cd052518a82c70ba72669a62327a4c41",
+      "original_bytes": 1974,
+      "portable_bytes": 1872,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/8eab4d0844bb50c6500e2e77e4066540cd052518a82c70ba72669a62327a4c41/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/source/app.py",
+      "original_sha256": "56bea116d317349defc2d537789d8ee8a816c0f07efb99cc8a9929d6f97d6640",
+      "portable_sha256": "56bea116d317349defc2d537789d8ee8a816c0f07efb99cc8a9929d6f97d6640",
+      "original_bytes": 143975,
+      "portable_bytes": 143975,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/56bea116d317349defc2d537789d8ee8a816c0f07efb99cc8a9929d6f97d6640/part-0000.json.txt",
+        "payloads/56bea116d317349defc2d537789d8ee8a816c0f07efb99cc8a9929d6f97d6640/part-0001.json.txt",
+        "payloads/56bea116d317349defc2d537789d8ee8a816c0f07efb99cc8a9929d6f97d6640/part-0002.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/source/composer_async_worker.py",
+      "original_sha256": "7321f41aee1ccbc19181e282e4fe7767f47dd710fd2589c4aa1719678344ef37",
+      "portable_sha256": "7321f41aee1ccbc19181e282e4fe7767f47dd710fd2589c4aa1719678344ef37",
+      "original_bytes": 79971,
+      "portable_bytes": 79971,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/7321f41aee1ccbc19181e282e4fe7767f47dd710fd2589c4aa1719678344ef37/part-0000.json.txt",
+        "payloads/7321f41aee1ccbc19181e282e4fe7767f47dd710fd2589c4aa1719678344ef37/part-0001.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/source/composer_turn.py",
+      "original_sha256": "4bf85258c9d207573387567b1e67ff8f5a269eedb28cd7b82a630c2ea9f6be5e",
+      "portable_sha256": "4bf85258c9d207573387567b1e67ff8f5a269eedb28cd7b82a630c2ea9f6be5e",
+      "original_bytes": 81170,
+      "portable_bytes": 81170,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/4bf85258c9d207573387567b1e67ff8f5a269eedb28cd7b82a630c2ea9f6be5e/part-0000.json.txt",
+        "payloads/4bf85258c9d207573387567b1e67ff8f5a269eedb28cd7b82a630c2ea9f6be5e/part-0001.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/source-provenance.json",
+      "original_sha256": "cca35f661c857bce0e7cd135450229dd4d74538fe41e57c8c34a36c5771f35ba",
+      "portable_sha256": "cca35f661c857bce0e7cd135450229dd4d74538fe41e57c8c34a36c5771f35ba",
+      "original_bytes": 1355,
+      "portable_bytes": 1355,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/cca35f661c857bce0e7cd135450229dd4d74538fe41e57c8c34a36c5771f35ba/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/verify_bundle.py",
+      "original_sha256": "aa52ca1c54adbc48a9708e14dd9336e50afbdb9b3d65421283991bca9cbaff6c",
+      "portable_sha256": "aa52ca1c54adbc48a9708e14dd9336e50afbdb9b3d65421283991bca9cbaff6c",
+      "original_bytes": 1382,
+      "portable_bytes": 1382,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/aa52ca1c54adbc48a9708e14dd9336e50afbdb9b3d65421283991bca9cbaff6c/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-web-worker-caller-transfer-1/worker_caller.py",
+      "original_sha256": "1a9dbe212daf44a06b990ef468aced8b55041d1d047cbac36639c67b3d9cb7d9",
+      "portable_sha256": "1a9dbe212daf44a06b990ef468aced8b55041d1d047cbac36639c67b3d9cb7d9",
+      "original_bytes": 16097,
+      "portable_bytes": 16097,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/1a9dbe212daf44a06b990ef468aced8b55041d1d047cbac36639c67b3d9cb7d9/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-web-worker-caller-transfer-v1-review-1/REPORT.md",
+      "original_sha256": "b2243de64238711c2adccda71205175ebb826c2fc82594cd354e607b8928fb0b",
+      "portable_sha256": "2754b90a9e036d0c8c8889feef92942396b965fd0b643e12bfd36b3bd126767a",
+      "original_bytes": 10066,
+      "portable_bytes": 10067,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/2754b90a9e036d0c8c8889feef92942396b965fd0b643e12bfd36b3bd126767a/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-web-worker-caller-transfer-v1-review-1/review.py",
+      "original_sha256": "60b247bd9df9e99bf0de56011ee4780561027409e651a6b750041a600c99f9e6",
+      "portable_sha256": "8f129df7fb90fbcfceaa9a8ad9e849c84cdf3bb4b9bfc829b1c42f2f45d5ffbc",
+      "original_bytes": 9778,
+      "portable_bytes": 9676,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/8f129df7fb90fbcfceaa9a8ad9e849c84cdf3bb4b9bfc829b1c42f2f45d5ffbc/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-web-worker-caller-transfer-v1-review-1/author-3.12.json",
+      "original_sha256": "05367f9c6a6d8438e5a297e796ada6c64950b5363dfb184bdc56ed59653bca3d",
+      "portable_sha256": "05367f9c6a6d8438e5a297e796ada6c64950b5363dfb184bdc56ed59653bca3d",
+      "original_bytes": 30187,
+      "portable_bytes": 30187,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/05367f9c6a6d8438e5a297e796ada6c64950b5363dfb184bdc56ed59653bca3d/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-web-worker-caller-transfer-v1-review-1/author-3.13.json",
+      "original_sha256": "1c877fcfb9c4bc0131a57cdddfae676afc3c5821b5841ed721ca17d261e8cdbb",
+      "portable_sha256": "b6533fe8fcd88797c8813d9094b506baed11d515381797b9bbaf5af4739c6198",
+      "original_bytes": 30256,
+      "portable_bytes": 30257,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/b6533fe8fcd88797c8813d9094b506baed11d515381797b9bbaf5af4739c6198/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-web-worker-caller-transfer-v1-review-1/review-3.12.json",
+      "original_sha256": "d51a191e21e4c99554a87eab0c32b3582082049b9bd302846559fef722c41344",
+      "portable_sha256": "d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d",
+      "original_bytes": 2096674,
+      "portable_bytes": 2096641,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0000.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0001.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0002.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0003.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0004.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0005.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0006.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0007.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0008.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0009.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0010.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0011.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0012.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0013.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0014.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0015.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0016.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0017.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0018.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0019.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0020.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0021.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0022.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0023.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0024.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0025.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0026.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0027.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0028.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0029.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0030.json.txt",
+        "payloads/d137e1d98cc483aa1859ddae4bfe29df2b35f512a5cd9c6aa76bdda6c602614d/part-0031.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-web-worker-caller-transfer-v1-review-1/review-3.13.json",
+      "original_sha256": "31fc0143e31c74bc03d42094028ff5e89c32bda12f1b259b5522924f854d844c",
+      "portable_sha256": "f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b",
+      "original_bytes": 2096690,
+      "portable_bytes": 2096657,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0000.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0001.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0002.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0003.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0004.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0005.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0006.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0007.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0008.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0009.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0010.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0011.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0012.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0013.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0014.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0015.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0016.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0017.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0018.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0019.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0020.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0021.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0022.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0023.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0024.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0025.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0026.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0027.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0028.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0029.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0030.json.txt",
+        "payloads/f57b2ccc6bcf092a4f8e279b561b01108f80e546fb2c94a21ac2245c40eb0a7b/part-0031.json.txt"
+      ]
+    },
+    {
+      "source_path": "source13-native-terminal-prerequisite-1/REPORT.md",
+      "original_sha256": "567b8c6bb3d53d5eed488de01c03209c8321615d281eda14cb7ea2ca0682ceaa",
+      "portable_sha256": "567b8c6bb3d53d5eed488de01c03209c8321615d281eda14cb7ea2ca0682ceaa",
+      "original_bytes": 4243,
+      "portable_bytes": 4243,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/567b8c6bb3d53d5eed488de01c03209c8321615d281eda14cb7ea2ca0682ceaa/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "source13-native-terminal-prerequisite-1/driver.py",
+      "original_sha256": "69d4e56efa6c87bcb79f401bfb6e32a5737788389f50cbff071b9de3843daaa5",
+      "portable_sha256": "f7eb632eb162aafe65bb075b80b81543392ef9160fb6a6c06eb1486ed8fa9a7e",
+      "original_bytes": 18398,
+      "portable_bytes": 18296,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/f7eb632eb162aafe65bb075b80b81543392ef9160fb6a6c06eb1486ed8fa9a7e/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "source13-native-terminal-prerequisite-1/control_source.py",
+      "original_sha256": "135e12332cc486d3b7ed0bd84f36784f711ac20bd7be71fa5f620d000489e81d",
+      "portable_sha256": "44381291f44647b0c34b1fc114447f36eb49ecc4505dce8625540d502373b55e",
+      "original_bytes": 6779,
+      "portable_bytes": 6746,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/44381291f44647b0c34b1fc114447f36eb49ecc4505dce8625540d502373b55e/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "source13-native-terminal-prerequisite-1/control_guards.py",
+      "original_sha256": "fa4d80d8550464d21f63a75553437dc8a70e4670005d91872d7cb018119f1881",
+      "portable_sha256": "fa4d80d8550464d21f63a75553437dc8a70e4670005d91872d7cb018119f1881",
+      "original_bytes": 4704,
+      "portable_bytes": 4704,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/fa4d80d8550464d21f63a75553437dc8a70e4670005d91872d7cb018119f1881/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "source13-native-terminal-prerequisite-1/control_cleanup.py",
+      "original_sha256": "f23e8d2d07a0a45586b269079682012c5bfe4f94cc2c3517f2746c90b28ea2b5",
+      "portable_sha256": "f23e8d2d07a0a45586b269079682012c5bfe4f94cc2c3517f2746c90b28ea2b5",
+      "original_bytes": 6907,
+      "portable_bytes": 6907,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/f23e8d2d07a0a45586b269079682012c5bfe4f94cc2c3517f2746c90b28ea2b5/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "source13-native-terminal-prerequisite-1/manifest.json",
+      "original_sha256": "e1959e9e91763b313d983254d8195c6a0328bf1fb4fad3b9bdb7ff22e4bdca47",
+      "portable_sha256": "e1959e9e91763b313d983254d8195c6a0328bf1fb4fad3b9bdb7ff22e4bdca47",
+      "original_bytes": 4020,
+      "portable_bytes": 4020,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/e1959e9e91763b313d983254d8195c6a0328bf1fb4fad3b9bdb7ff22e4bdca47/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "source13-native-terminal-prerequisite-1/source-controls.json",
+      "original_sha256": "f66ad4d3ce9ba2d8f50886642005bb3f2cd1ec644f8082f9fe478cee9248eb50",
+      "portable_sha256": "f66ad4d3ce9ba2d8f50886642005bb3f2cd1ec644f8082f9fe478cee9248eb50",
+      "original_bytes": 823,
+      "portable_bytes": 823,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/f66ad4d3ce9ba2d8f50886642005bb3f2cd1ec644f8082f9fe478cee9248eb50/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "source13-native-terminal-prerequisite-1/guard-controls.json",
+      "original_sha256": "67a5f190bbe7ec3d67c928bfda6840da643b8158335bf044d257de86686d4427",
+      "portable_sha256": "67a5f190bbe7ec3d67c928bfda6840da643b8158335bf044d257de86686d4427",
+      "original_bytes": 867,
+      "portable_bytes": 867,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/67a5f190bbe7ec3d67c928bfda6840da643b8158335bf044d257de86686d4427/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "source13-native-terminal-prerequisite-1/cleanup-controls.json",
+      "original_sha256": "f8c17ece2b4171afb25a0d99a1c9ca3737c43abc9b3da00bfca5618ea5489c43",
+      "portable_sha256": "f8c17ece2b4171afb25a0d99a1c9ca3737c43abc9b3da00bfca5618ea5489c43",
+      "original_bytes": 646,
+      "portable_bytes": 646,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/f8c17ece2b4171afb25a0d99a1c9ca3737c43abc9b3da00bfca5618ea5489c43/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "browser-vite-recipe-closure-13-ready-1/terminal_specimen.c",
+      "original_sha256": "5544651d4e603228595a520e2f170e077f2199d8f96e05375bf30d1dd7b69309",
+      "portable_sha256": "5544651d4e603228595a520e2f170e077f2199d8f96e05375bf30d1dd7b69309",
+      "original_bytes": 637,
+      "portable_bytes": 637,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/5544651d4e603228595a520e2f170e077f2199d8f96e05375bf30d1dd7b69309/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "astra-source13-native-prerequisite-review-1/REPORT.md",
+      "original_sha256": "3d207d97b39056da1593f7727b5947b81838a1c0fc8ef140b519576a8d7e04da",
+      "portable_sha256": "3d207d97b39056da1593f7727b5947b81838a1c0fc8ef140b519576a8d7e04da",
+      "original_bytes": 9168,
+      "portable_bytes": 9168,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/3d207d97b39056da1593f7727b5947b81838a1c0fc8ef140b519576a8d7e04da/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "apply_browser_sink_identity_source7_131.py",
+      "original_sha256": "d60ea2399de81794e66ce0108b2c7c0103bae9d3038d76e6bd001eb00cfb7eb6",
+      "portable_sha256": "d60ea2399de81794e66ce0108b2c7c0103bae9d3038d76e6bd001eb00cfb7eb6",
+      "original_bytes": 5167,
+      "portable_bytes": 5167,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/d60ea2399de81794e66ce0108b2c7c0103bae9d3038d76e6bd001eb00cfb7eb6/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "run_reviewed_browser_source7_132_133.py",
+      "original_sha256": "f9be371b25e8512ea21314b0b19d98498fa6197d1c64b10450b57b4aaac7b270",
+      "portable_sha256": "f9be371b25e8512ea21314b0b19d98498fa6197d1c64b10450b57b4aaac7b270",
+      "original_bytes": 7789,
+      "portable_bytes": 7789,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/f9be371b25e8512ea21314b0b19d98498fa6197d1c64b10450b57b4aaac7b270/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "preserve_browser_stage_homes_130.py",
+      "original_sha256": "f33415ea3affd9d68791403ba7be179839a05992e75b5e05e93ef2650ea4bde4",
+      "portable_sha256": "f33415ea3affd9d68791403ba7be179839a05992e75b5e05e93ef2650ea4bde4",
+      "original_bytes": 4511,
+      "portable_bytes": 4511,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/f33415ea3affd9d68791403ba7be179839a05992e75b5e05e93ef2650ea4bde4/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "browser_sink_identity_runtime_probe_131.mts",
+      "original_sha256": "9e7f00a40f9897747ef525698093c24c1b41589dfc90c1ffaf13c52b02730573",
+      "portable_sha256": "e35cfc027e750410aa3c0e9d73a0c54c3c93021054c3f6bc5bbd6175c18b7147",
+      "original_bytes": 2525,
+      "portable_bytes": 2492,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/e35cfc027e750410aa3c0e9d73a0c54c3c93021054c3f6bc5bbd6175c18b7147/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "browser-workflow-source7-tsconfig-131.json",
+      "original_sha256": "2148af4f248311e4ac517cf5911ba857953c5b95d3fc27e92f005170c75b0179",
+      "portable_sha256": "9df780b50d34d92971c251ffe979fcfdbfd84256ffa0c2710e11a7f98e61a718",
+      "original_bytes": 1027,
+      "portable_bytes": 793,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/9df780b50d34d92971c251ffe979fcfdbfd84256ffa0c2710e11a7f98e61a718/part-0000.json.txt"
+      ]
+    },
+    {
+      "source_path": "sol-browser128-fixture-qualification-1/REPORT.md",
+      "original_sha256": "080c56f4f59a35b12b26f091275c7c235d988804bea30cd8291c378b75482c7f",
+      "portable_sha256": "080c56f4f59a35b12b26f091275c7c235d988804bea30cd8291c378b75482c7f",
+      "original_bytes": 1998,
+      "portable_bytes": 1998,
+      "credential_shaped_redactions": 0,
+      "parts": [
+        "payloads/080c56f4f59a35b12b26f091275c7c235d988804bea30cd8291c378b75482c7f/part-0000.json.txt"
+      ]
+    }
+  ],
+  "raw_logs_included": false,
+  "runtime_captures_included": false,
+  "source_unchanged_during_capture": true,
+  "reconstruction_scope": "portable bytes only; transformed originals not fully recoverable"
+}
