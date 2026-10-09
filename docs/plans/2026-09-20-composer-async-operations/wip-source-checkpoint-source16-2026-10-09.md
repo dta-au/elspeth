@@ -1,0 +1,7 @@
+# Composer HTTPS streaming WIP source checkpoint — 2026-10-09
+
+This ordinary source checkpoint follows published backup commit `0dfa20699e2b354d11a2616b85bd9df30aaa815b`. It adds the reviewed SOURCE16 reserve proof checker and its source-only helpers, plus the qualified 16 px chat inset correction. The 948 Python production files are unchanged from the reviewed input inventory. This is a WIP content checkpoint, not a completed merge or release approval.
+
+Independent source review approved the exact SOURCE16 proof bytes. The whole-tree Ruff stage passed. The first affected native gate completed with 251 tests passed and one masquerade-baseline failure; its common-only stage did not run. A later common-only native run was still in progress when this note was prepared, so it has no reported outcome here. A one-line correction for an owned source-carrier probe has independent source approval but is not included in this checkpoint; the final masquerade baseline must be regenerated from the actual tree after that correction is applied.
+
+The fresh default suite, final TLS qualification, full CI, operator-held signature verification and merge remain pending. Earlier PostgreSQL, frontend and browser results remain scoped to the trees and selections on which they ran. Historical proof-obligation statuses, missing original attachments, custody limits and external exact-image availability are unchanged by this checkpoint. No paid-provider, deployment, publication-readiness or production approval is implied.
