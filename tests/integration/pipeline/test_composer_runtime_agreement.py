@@ -146,7 +146,7 @@ where the architectural fix landed:
   error on, never to clear with); presence-direction abstention untouched.
   The runtime half of this shape is the executor-level per-row input
   validation, not a graph-build check, so the pin lives at the composer unit
-  layer: ``tests/unit/web/composer/test_state.py::TestCompositionStateRowUnion``
+  layer: ``tests/unit/web/composer/test_state_row_union.py::TestCompositionStateRowUnion``
   (7 tests incl. the ticket's literal graph and the Rule B gate→sink
   topology), per the Shape 6 precedent for coverage housed outside this file.
 * Shape 16 — pending-review handoff announce truncation (battery-2026-08-04
