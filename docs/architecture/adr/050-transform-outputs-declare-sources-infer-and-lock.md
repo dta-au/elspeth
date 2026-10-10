@@ -526,7 +526,7 @@ value-checked, the recorded contract never changes type).
     `test_value_transform_contract_metadata.py` (three functions renamed and
     re-pinned, two added for the typed target),
     `test_composer_runtime_agreement.py::…::test_both_reject_computed_unknown_against_a_concrete_type`
-    and `test_state.py::…::test_union_coalesce_rejects_unproven_expression_output_type`
+    and `test_state_schema_contracts.py::…::test_union_coalesce_rejects_unproven_expression_output_type`
     (both now use an untyped branch; an accepting twin covers the typed
     branch).
 - **`7fc149014` type_coerce "reconcile declared output presence

@@ -146,7 +146,7 @@ where the architectural fix landed:
   error on, never to clear with); presence-direction abstention untouched.
   The runtime half of this shape is the executor-level per-row input
   validation, not a graph-build check, so the pin lives at the composer unit
-  layer: ``tests/unit/web/composer/test_state.py::TestCompositionStateRowUnion``
+  layer: ``tests/unit/web/composer/test_state_row_union.py::TestCompositionStateRowUnion``
   (7 tests incl. the ticket's literal graph and the Rule B gate→sink
   topology), per the Shape 6 precedent for coverage housed outside this file.
 * Shape 16 — pending-review handoff announce truncation (battery-2026-08-04
@@ -210,7 +210,7 @@ where the architectural fix landed:
   string-mode negative controls), ``tests/unit/core/dag/test_builder_validation.py``
   (``TestTransformOutputFieldCollisionRejectedAtBuild`` — the ticket's literal
   g05 topology through the real ``text`` source and real ``llm`` plugin), and
-  ``tests/unit/web/composer/test_state.py`` for Rule D.
+  ``tests/unit/web/composer/test_state_schema_contracts.py`` for Rule D.
 
   Bug verification protocol, performed 2026-08-05 and recorded verbatim as this
   file requires:
@@ -343,7 +343,7 @@ where the architectural fix landed:
       the mirror can be exact instead of authored-schema-only.
 
   Pinned by ``TestComposerRuntimeCoalesceUnionTypeAgreement`` here, with
-  composer-level coverage in ``tests/unit/web/composer/test_state.py``
+  composer-level coverage in ``tests/unit/web/composer/test_state_schema_contracts.py``
   (``TestSchemaContractValidation``: rejection, compatible-types negative
   control, unresolved-branch abstention, mode-mixed precedence, and nested-merge
   exemption).
@@ -523,7 +523,7 @@ where the architectural fix landed:
     cycle passes the per-node reachability check. ``_node_topology_cycle``
     mirrors ``ExecutionGraph.validate()``. Pinned by
     ``TestComposerRuntimeCensusAgreement`` (diamond control in
-    ``test_state.py``).
+    ``test_state_stage1.py``).
   - **Shape 23** — node id outside the runtime NAME rule (max 38, leading
     letter, node-name character class, not a reserved edge label; queues
     lowercase). Stage 1 mirrored these for SOURCE names only.

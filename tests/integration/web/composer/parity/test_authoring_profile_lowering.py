@@ -14,7 +14,7 @@ the real profile-aware policy stack (as ``app.py`` wires it) and assert the
 profiled node clears the retry-budget gate.
 
 The NON-profiled rejection (the safety gate that must survive the guard) is
-covered by ``test_tools.TestTransformLlmRetryBudgetPolicy`` — the parity web
+covered by ``test_tools_mutations.TestTransformLlmRetryBudgetPolicy`` — the parity web
 policy requires the profile authoring form, so a direct provider/model ``llm``
 node is rejected earlier as ``profile_unavailable`` and cannot reach the
 retry-budget gate on this surface.

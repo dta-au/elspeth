@@ -3,7 +3,7 @@ and the E2 unbound consumer-fed fork-branch destination (spec §7 E2).
 
 NEW FILE — test_state.py is under active maintainer edit; do not add to it
 (see task-6-brief.md). Construction idiom copied from
-``TestStage1Validation`` in test_state.py (``_empty_state``/``_fork_gate``/
+``TestStage1Validation`` in test_state_stage1.py (``_empty_state``/``_fork_gate``/
 coalesce ``NodeSpec`` shapes), not imported from it, since these are the
 same small builders repeated file-locally throughout that suite.
 """

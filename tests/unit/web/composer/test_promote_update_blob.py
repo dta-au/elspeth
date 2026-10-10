@@ -361,7 +361,7 @@ class TestSummarizerTypeVariability:
     create_blob test) is deliberate: the two models are independent
     raise sites and one should be moveable without the other (same
     discipline as :class:`TestUpdateBlobTypeGuard` / :class:`TestCreateBlobTypeGuard`
-    in ``test_tools.py``).
+    in ``test_tools_blobs.py``).
     """
 
     def test_pydantic_model_rejects_none_content(self) -> None:

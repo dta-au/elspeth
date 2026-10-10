@@ -81,6 +81,7 @@ from elspeth.web.execution.protocol import ExecutionService
 from elspeth.web.execution.routes import create_execution_router
 from elspeth.web.execution.schemas import ProgressData, RunEvent, ValidationReadiness, ValidationResult
 from elspeth.web.execution.service import ExecutionServiceImpl
+from elspeth.web.required_executor import RequiredExecutorGenerationCustodian, RequiredGenerationUnavailable
 from elspeth.web.sessions.models import run_events_table
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
@@ -5130,6 +5131,110 @@ async def test_canonical_release_loss_retains_mixed_cleanup_originals(
         await asyncio.to_thread(observed.authority.release, successor)
 
 
+async def _assert_failed_setup_refuses_ordinary_work(generation: RequiredExecutorGenerationCustodian) -> None:
+    assert async_workers._INSTANCE_DRAINING.is_set(), "process draining absent"
+    assert async_workers.required_generation_unavailable(), "effective refusal absent"
+    # A joined generation may install its replacement before the queued process
+    # drain callback runs. Observe the complete publication under the same lock
+    # as _drain, including recovery_finished after generation_unavailable clears.
+    with generation.submission_lock:
+        if not async_workers._GENERATION_UNAVAILABLE.is_set():
+            assert generation.state == "closed", "generation closure absent"
+            assert generation.joined.is_set(), "physical join absent"
+            assert generation.recovery_finished.is_set(), "generation recovery unfinished"
+    called = threading.Event()
+    try:
+        await run_sync_in_worker(called.set)
+    except RequiredGenerationUnavailable:
+        assert not called.is_set(), "refused ordinary callable ran"
+    else:
+        assert not called.is_set(), "ordinary callable ran despite draining"
+        raise AssertionError("ordinary submission admitted despite draining")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "join-before-drain",
+        "drain-before-join",
+        "missing-drain",
+        "missing-effective-refusal",
+        "missing-closure",
+        "missing-join",
+        "unfinished-recovery",
+        "ordinary-admission-bypass",
+    ],
+)
+async def test_failed_setup_refusal_ordering_and_guards(tmp_path: Path, case: str) -> None:
+    loop = asyncio.get_running_loop()
+    custody = ExecutionTestCustody(loop, tmp_path)
+    registry = custody.registry(loop)
+    generation = async_workers._generation_for(async_workers._get_shared_executor())
+    original = OSError("controlled setup failure retains process drain")
+    registry.record_failure(original)
+    custody.witness_cleanup_original(original)
+
+    async def observe_queued_drain() -> None:
+        observed = asyncio.Event()
+        # record_failure queued the actual recovery callback before this marker.
+        loop.call_soon(observed.set)
+        await observed.wait()
+        assert async_workers._INSTANCE_DRAINING.is_set()
+
+    try:
+        if case == "drain-before-join":
+            await observe_queued_drain()
+        generation.quarantine()
+        # Deliberately retain the loop while the actual drain thread joins, so
+        # join-before-drain cannot accidentally exercise only the other order.
+        assert generation.recovery_finished.wait(2), "controlled physical join did not finish"
+        assert generation.joined.is_set()
+        if case == "drain-before-join":
+            assert generation.state == "quarantined"
+            assert async_workers._GENERATION_UNAVAILABLE.is_set()
+        else:
+            assert generation.state == "closed"
+            assert not async_workers._GENERATION_UNAVAILABLE.is_set()
+            assert not async_workers._INSTANCE_DRAINING.is_set()
+            await observe_queued_drain()
+        await _assert_failed_setup_refuses_ordinary_work(generation)
+
+        if case == "missing-drain":
+            async_workers._INSTANCE_DRAINING.clear()
+            try:
+                with pytest.raises(AssertionError, match="process draining absent"):
+                    await _assert_failed_setup_refuses_ordinary_work(generation)
+            finally:
+                async_workers._INSTANCE_DRAINING.set()
+        elif case == "missing-effective-refusal":
+            with (
+                patch.object(async_workers, "required_generation_unavailable", return_value=False),
+                pytest.raises(AssertionError, match="effective refusal absent"),
+            ):
+                await _assert_failed_setup_refuses_ordinary_work(generation)
+        elif case == "missing-closure":
+            with patch.object(generation, "state", "quarantined"), pytest.raises(AssertionError, match="generation closure absent"):
+                await _assert_failed_setup_refuses_ordinary_work(generation)
+        elif case in ("missing-join", "unfinished-recovery"):
+            proof = generation.joined if case == "missing-join" else generation.recovery_finished
+            expected = "physical join absent" if case == "missing-join" else "generation recovery unfinished"
+            proof.clear()
+            try:
+                with pytest.raises(AssertionError, match=expected):
+                    await _assert_failed_setup_refuses_ordinary_work(generation)
+            finally:
+                proof.set()
+        elif case == "ordinary-admission-bypass":
+            with (
+                patch.object(async_workers, "_submission_unavailable", return_value=False),
+                pytest.raises(AssertionError, match="ordinary callable ran despite draining"),
+            ):
+                await _assert_failed_setup_refuses_ordinary_work(generation)
+    finally:
+        await custody.close()
+
+
 async def _setup_after_arm_canonical_loss_child(root: Path) -> None:
     from elspeth.web.required_executor import InvocationGate, RequiredInvocationWitness
 
@@ -5188,7 +5293,7 @@ async def _setup_after_arm_canonical_loss_child(root: Path) -> None:
     assert _original_leaves(caught.value) == [setup_error, canonical, renewal]
     assert not obligation.release_lost and not obligation.release_succeeded and not obligation.retired
     assert service.execution_lease_release_registry.has_pending_physical_owners()
-    assert async_workers._INSTANCE_DRAINING.is_set() and async_workers._GENERATION_UNAVAILABLE.is_set()
+    await _assert_failed_setup_refuses_ordinary_work(obligation.generation)
     for original in (setup_error, canonical, renewal):
         custody.witness_cleanup_original(original)
     await asyncio.to_thread(observed.authority.compare_and_swap, successor)
