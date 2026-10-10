@@ -2037,6 +2037,10 @@ class TestQueryResultLimit:
                 return [(1,), (2,)]
 
         class FakeConnection:
+            from types import SimpleNamespace
+
+            dialect = SimpleNamespace(name="sqlite")
+
             def __enter__(self) -> FakeConnection:
                 return self
 

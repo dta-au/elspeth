@@ -1300,7 +1300,11 @@ def query(
 
     from sqlalchemy import text
 
+    from elspeth.mcp.sql_guard import admit_postgres_query_connection
+
     with db.read_only_connection() as conn:
+        if conn.dialect.name == "postgresql":
+            admit_postgres_query_connection(conn)
         result = conn.execute(text(sql), params or {})
         columns = list(result.keys())
         rows = result.fetchmany(limit)

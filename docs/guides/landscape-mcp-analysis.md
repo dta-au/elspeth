@@ -146,6 +146,48 @@ Use `query` only for read-only investigation. The server rejects non-SELECT
 statements and validates SQL before execution, but callers should still prefer
 maintained tools when a tool exists for the question.
 
+For PostgreSQL, connect with a **dedicated audit-reader LOGIN**, using its own
+credentials. Runtime, schema-owner, administrator and `SET ROLE` connections
+are refused by the raw SQL tool. Maintained analysis tools still use the
+ordinary read-only repository connections.
+
+Provision the reader after initializing a dedicated Landscape database. For
+example, from an operator-controlled `psql` session with the reader password
+supplied through `reader_password`:
+
+```sql
+CREATE ROLE elspeth_audit_reader LOGIN PASSWORD :'reader_password'
+    NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+GRANT CONNECT ON DATABASE elspeth_landscape TO elspeth_audit_reader;
+GRANT USAGE ON SCHEMA public TO elspeth_audit_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO elspeth_audit_reader;
+```
+
+The reader must have no role memberships (including non-inherited memberships
+that permit `SET ROLE`), object ownership, database/schema creation rights or
+table/column/sequence write grants. Older PostgreSQL installations may grant
+schema creation to `PUBLIC`; the operator must remove that grant before using
+the SQL tool. PostgreSQL's built-in `pg_settings` session-configuration view is
+exempt from the persistent-relation write check.
+
+The SQL tool checks capabilities on the actual executing connection before
+every query. PostgreSQL's original `pg_init_privs` ACLs identify restricted
+built-in routines even after a direct or `PUBLIC` grant. File access, privileged
+server inspection and executable custom/extension routines are refused. The
+database must expose only Landscape base tables in `public` to this reader;
+custom views, foreign tables, operators, casts, types and large-object access
+are outside the supported raw-query surface. Landscape trigger routines and
+their table row types remain supported. Bootstrap PostgreSQL catalog and
+information-schema helpers remain available, as do ordinary SELECTs, joins,
+aggregates, bound parameters and CTEs.
+
+`READ ONLY` is an additional database-write control, not a confidentiality or
+resource sandbox. Database administrators remain trusted to maintain the
+catalogs and audit schema. SQLite and SQLCipher retain their file-backed
+read-only open modes and `query_only` enforcement. The SQL result limit bounds
+rows returned; it does not bound query execution time or bytes in a single
+field.
+
 ## Schema Notes
 
 - Landscape uses SQLAlchemy Core table definitions in
