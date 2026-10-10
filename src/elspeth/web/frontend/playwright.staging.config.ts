@@ -24,6 +24,8 @@ import { fileURLToPath } from "node:url";
 
 import { defineConfig, devices } from "@playwright/test";
 
+import { configureStagingOrigin } from "./scripts/staging-origin.mjs";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STORAGE_STATE_PATH = resolve(
   HERE,
@@ -33,12 +35,7 @@ const STORAGE_STATE_PATH = resolve(
   "staging-user.json",
 );
 
-const STAGING_BASE_URL = process.env.STAGING_BASE_URL;
-if (!STAGING_BASE_URL) {
-  throw new Error(
-    "STAGING_BASE_URL is not set: the staging config has no default host; export the deployed origin",
-  );
-}
+const STAGING_BASE_URL = configureStagingOrigin();
 
 export default defineConfig({
   testDir: "./tests/e2e",
