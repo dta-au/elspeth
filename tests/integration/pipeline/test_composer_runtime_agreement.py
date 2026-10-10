@@ -523,7 +523,7 @@ where the architectural fix landed:
     cycle passes the per-node reachability check. ``_node_topology_cycle``
     mirrors ``ExecutionGraph.validate()``. Pinned by
     ``TestComposerRuntimeCensusAgreement`` (diamond control in
-    ``test_state.py``).
+    ``test_state_stage1.py``).
   - **Shape 23** — node id outside the runtime NAME rule (max 38, leading
     letter, node-name character class, not a reserved edge label; queues
     lowercase). Stage 1 mirrored these for SOURCE names only.
