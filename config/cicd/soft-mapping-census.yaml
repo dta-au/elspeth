@@ -336,7 +336,7 @@ files:
   src/elspeth/plugins/infrastructure/clients/dataverse.py:
     dict[str, Any]: 4
   src/elspeth/plugins/infrastructure/clients/http.py:
-    Mapping[str, Any]: 16
+    Mapping[str, Any]: 18
     dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/clients/llm.py:
     Mapping[str, Any]: 3
@@ -1054,10 +1054,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 751
+  Mapping[str, Any]: 753
   Mapping[str, object]: 312
   MutableMapping[str, Any]: 8
   boundary: 59
   dict[str, Any]: 1068
   dict[str, object]: 390
-  soft: 2529
+  soft: 2531

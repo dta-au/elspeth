@@ -50,14 +50,19 @@ from elspeth.contracts import CallStatus, CallType, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.call_governance import LLMCallGovernance
-from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.chat_parts import ChatMessage, audit_messages, image_response_is_audit_safe, wire_messages
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import ValueSource
 from elspeth.core.llm_pricing import provider_cost_from_response
-from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
+from elspeth.plugins.infrastructure.clients.http import (
+    AuditedHTTPClient,
+    HTTPResponseAuditRejectedError,
+    HTTPResponseBodyTooLargeError,
+    HTTPResponseEncodingLimitError,
+)
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -115,6 +120,11 @@ _GATEWAY_CONTRACT_HEADER = "X-ELSPETH-LLM-Gateway-Contract"
 #: agency/gateway-controlled text through an exception message — the full
 #: response body remains available only through the audited HTTP payload.
 _STATIC_GATEWAY_ERROR = "Gateway LLM request failed"
+
+# The gateway permits up to 131072 completion tokens. Leave ample envelope
+# headroom while bounding both decoded payloads and compressed transfer bytes.
+_MAX_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
+_MAX_ENCODED_RESPONSE_BYTES = 16 * 1024 * 1024
 
 logger = structlog.get_logger(__name__)
 
@@ -621,7 +631,7 @@ class GatewayLLMProvider:
             if response_format is not None:
                 request_body["response_format"] = response_format
 
-            response = self._post_chat_completion(http_client, request_body)
+            response = self._post_chat_completion(http_client, request_body, messages)
             observed_usage = observe_http_token_usage(response.content)
             observed_response_body = response.content
             self._validate_completion_status(response)
@@ -686,7 +696,9 @@ class GatewayLLMProvider:
                 if primary_error is None:
                     raise cleanup_error
 
-    def _post_chat_completion(self, http_client: AuditedHTTPClient, request_body: dict[str, Any]) -> httpx.Response:
+    def _post_chat_completion(
+        self, http_client: AuditedHTTPClient, request_body: dict[str, Any], messages: Sequence[ChatMessage]
+    ) -> httpx.Response:
         """POST one request, mapping transport failures.
 
         ``httpx.TimeoutException`` is a subclass of ``httpx.RequestError`` —
@@ -699,8 +711,12 @@ class GatewayLLMProvider:
             response = http_client.post(
                 "/chat/completions",
                 json=request_body,
+                audit_json={**request_body, "messages": audit_messages(messages)},
+                response_admission=lambda response, body: image_response_is_audit_safe(messages, response, body=body),
                 headers={"Content-Type": "application/json"},
             )
+        except (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError, HTTPResponseAuditRejectedError) as e:
+            raise LLMClientError(_STATIC_GATEWAY_ERROR, retryable=False) from e
         except httpx.TimeoutException as e:
             raise NetworkError(_STATIC_GATEWAY_ERROR) from e
         except httpx.RequestError as e:
@@ -852,12 +868,16 @@ class GatewayLLMProvider:
             timeout=self._timeout,
             base_url=self._readyz_base_url(),
             headers=self._request_headers,
+            max_response_body_bytes=_MAX_RESPONSE_BODY_BYTES,
+            max_encoded_response_bytes=_MAX_ENCODED_RESPONSE_BYTES,
             limiter=self._limiter,
             call_mode_session=self._call_mode_session,
         )
         try:
             try:
                 response = http_client.get("/readyz")
+            except (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError) as e:
+                raise LLMClientError(_STATIC_GATEWAY_ERROR, retryable=False) from e
             except httpx.TimeoutException as e:
                 raise NetworkError(_STATIC_GATEWAY_ERROR) from e
             except httpx.RequestError as e:
@@ -903,6 +923,8 @@ class GatewayLLMProvider:
                     timeout=self._timeout,
                     base_url=self._base_url,
                     headers=self._request_headers,
+                    max_response_body_bytes=_MAX_RESPONSE_BODY_BYTES,
+                    max_encoded_response_bytes=_MAX_ENCODED_RESPONSE_BYTES,
                     limiter=self._limiter,
                     call_mode_session=self._call_mode_session,
                     **audit_parent.client_kwargs(),

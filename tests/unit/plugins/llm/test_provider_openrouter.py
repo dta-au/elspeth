@@ -282,6 +282,15 @@ class FakeHTTPClient:
             raise AssertionError("FakeHTTPClient.response must be set before post()")
         return self.response
 
+    @contextmanager
+    def stream(self, method: str, url: str, **kwargs: Any) -> Iterator[httpx.Response]:
+        assert method == "POST"
+        response = self.post(url, **kwargs)
+        try:
+            yield response
+        finally:
+            response.close()
+
     def close(self) -> None:
         self.close_calls += 1
         self.closed = True

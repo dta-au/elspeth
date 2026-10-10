@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
@@ -27,6 +29,7 @@ from elspeth.contracts.binary_documents import (
     BINARY_DOCUMENT_MIME_BY_FORMAT,
     binary_document_signature_matches,
 )
+from elspeth.contracts.call_data import HTTPCallResponse
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
 
@@ -37,6 +40,7 @@ widening to pdf is a deliberate later change, not a config knob."""
 IMAGE_FORMATS: frozenset[str] = frozenset(get_args(ImageFormat))
 
 _IMAGE_MIME_BY_FORMAT = {fmt: BINARY_DOCUMENT_MIME_BY_FORMAT[fmt] for fmt in IMAGE_FORMATS}
+_JSON_STRING_LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +165,54 @@ def wire_messages(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:
 def audit_messages(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:
     """Bytes-free audit form for LLMCallRequest recording."""
     return [{"role": m.role, "content": _audit_content(m.content)} for m in messages]
+
+
+def image_response_is_audit_safe(messages: Sequence[ChatMessage], response: HTTPCallResponse, *, body: bytes | None = None) -> bool:
+    """Refuse submitted image bytes echoed anywhere in a candidate HTTP audit.
+
+    Admission never rewrites completion text. A provider echo cannot be retained
+    as a parsed body, a header, or exact replay bytes. JSON string normalization
+    also catches slash/unicode escapes, including malformed/duplicate-key bodies
+    whose diagnostic representation would otherwise retain their raw text.
+    """
+    images = [
+        part for message in messages if not isinstance(message.content, str) for part in message.content if isinstance(part, ImagePart)
+    ]
+    if not images:
+        return True
+    protected = tuple(base64.b64encode(image.data).decode("ascii") for image in images)
+    audit_text = canonical_json(response.to_dict())
+    if any(value in audit_text for value in protected):
+        return False
+    bodies = [body] if body is not None else []
+    if body is None:
+        for evidence in (response.transport, response.decoded_body):
+            if evidence is not None:
+                bodies.append(base64.b64decode(evidence.body_b64, validate=True))
+    for raw_body in bodies:
+        if any(image.data in raw_body for image in images):
+            return False
+        try:
+            normalized = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        except RecursionError:
+            return False
+        else:
+            normalized_text = json.dumps(normalized, ensure_ascii=True)
+            if any(value in normalized_text for value in protected):
+                return False
+        text = raw_body.decode("utf-8", errors="replace")
+        if any(value in text for value in protected):
+            return False
+        for literal in _JSON_STRING_LITERAL.finditer(text):
+            try:
+                normalized_string = json.loads(literal.group())
+            except json.JSONDecodeError:
+                continue
+            if any(value in normalized_string for value in protected):
+                return False
+    return True
 
 
 def parts_hash(content: tuple[ContentPart, ...]) -> str:
