@@ -22,6 +22,9 @@ continues to require literal successful results. No required-check rule is relax
 
 ## Admission before activation
 
+The [operator proposal](nyx-ci-admission-proposal.md) names the external controller,
+GitHub settings, remaining evidence adapters and minimum operator decision.
+
 The operator selected maintainer admission of exact PR commits. External
 enforcement must prevent an unadmitted job from acquiring a persistent runner
 **before allocation**, even when a contributor changes workflow YAML, adds a job,
