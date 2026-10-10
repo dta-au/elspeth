@@ -210,7 +210,7 @@ where the architectural fix landed:
   string-mode negative controls), ``tests/unit/core/dag/test_builder_validation.py``
   (``TestTransformOutputFieldCollisionRejectedAtBuild`` — the ticket's literal
   g05 topology through the real ``text`` source and real ``llm`` plugin), and
-  ``tests/unit/web/composer/test_state.py`` for Rule D.
+  ``tests/unit/web/composer/test_state_schema_contracts.py`` for Rule D.
 
   Bug verification protocol, performed 2026-08-05 and recorded verbatim as this
   file requires:
@@ -343,7 +343,7 @@ where the architectural fix landed:
       the mirror can be exact instead of authored-schema-only.
 
   Pinned by ``TestComposerRuntimeCoalesceUnionTypeAgreement`` here, with
-  composer-level coverage in ``tests/unit/web/composer/test_state.py``
+  composer-level coverage in ``tests/unit/web/composer/test_state_schema_contracts.py``
   (``TestSchemaContractValidation``: rejection, compatible-types negative
   control, unresolved-branch abstention, mode-mixed precedence, and nested-merge
   exemption).
