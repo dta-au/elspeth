@@ -8,7 +8,8 @@ dependencies before these local relationships can become certificates.
 
 import ast
 import builtins
-import copy
+
+from tests.helpers.web_reserve_proposal_child_transfers import copy_ast_fields
 
 
 def n(name):
@@ -1417,8 +1418,8 @@ def _telemetry_transfer(unit):
     # Retain the actual signature and annotation/type-parameter scope. Original
     # signature validation above refuses type parameters; projection must never
     # erase them before dependency recovery or an independent consumer sees it.
-    selected = copy.deepcopy(fn)
-    selected.body = copy.deepcopy(body[:4])
+    selected = copy_ast_fields(fn)
+    selected.body = copy_ast_fields(body[:4])
     return failures, _global_dependencies(unit, selected) | {
         "elspeth.web.operator_telemetry.bootstrap_operator_telemetry",
         "elspeth.web.operator_telemetry_dispatch.validate_telemetry_reservation_owner",

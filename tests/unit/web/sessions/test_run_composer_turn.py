@@ -134,6 +134,7 @@ async def _running_job(
     )
     await run_sync_in_worker(
         authority.admit,
+        quota=app.state.rate_limiter.composer_admission,
         session_id=session_id,
         operation_id=operation_id,
         kind=kind,

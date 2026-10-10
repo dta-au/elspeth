@@ -14,21 +14,21 @@ import json
 import types
 
 
+def copy_ast_fields(value):
+    """Copy declared source fields without following parser parent metadata."""
+    if isinstance(value, ast.AST):
+        return type(value)(**{field: copy_ast_fields(item) for field, item in ast.iter_fields(value)})
+    if isinstance(value, list):
+        return [copy_ast_fields(item) for item in value]
+    return value
+
+
 def namespace_grammar(class_node):
     """Complete finite class declaration/suite, with deferred bodies inert.
 
     Definition headers and recursively executed nested classes stay visible;
     this hash is a conservative source refusal, not runtime class construction.
     """
-
-    def fields_only(value):
-        # Parent metadata can link shared AST context nodes to unrelated trees.
-        # Only declared AST fields belong to the finite source namespace.
-        if isinstance(value, ast.AST):
-            return type(value)(**{field: fields_only(item) for field, item in ast.iter_fields(value)})
-        if isinstance(value, list):
-            return [fields_only(item) for item in value]
-        return value
 
     class Headers(ast.NodeTransformer):
         def visit_FunctionDef(self, node):
@@ -43,7 +43,7 @@ def namespace_grammar(class_node):
             node.body = ast.Constant(value=None)
             return node
 
-    return grammar(Headers().visit(fields_only(class_node)))
+    return grammar(Headers().visit(copy_ast_fields(class_node)))
 
 
 def chain(node):

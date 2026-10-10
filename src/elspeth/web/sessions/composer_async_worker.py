@@ -48,7 +48,6 @@ from elspeth.web.sessions.composer_operation_errors import (
 )
 from elspeth.web.sessions.composer_operations import (
     COMPOSER_CANCEL_REQUESTED,
-    COMPOSER_DEADLINE,
     COMPOSER_LEASE_LOST,
     COMPOSER_SHUTDOWN,
     ComposerOperationCancelledBeforeStart,
@@ -941,9 +940,14 @@ class ComposerAsyncWorker:
                 if current.cancel_requested_at is not None:
                     owner.cancel(COMPOSER_CANCEL_REQUESTED)
                     return
-                if restore_utc(current.deadline_at) <= now or anchor.remaining_seconds(monotonic_now=time.monotonic()) <= 0:
-                    owner.cancel(COMPOSER_DEADLINE)
-                    return
+                remaining = anchor.remaining_seconds(monotonic_now=time.monotonic())
+                if restore_utc(current.deadline_at) <= now or remaining <= 0:
+                    raise ComposerTurnDeadlineExpired(
+                        session_id=running.claim.session_id,
+                        operation_id=running.claim.operation_id,
+                        remaining_seconds=remaining,
+                        budget_seconds_at_running=anchor.remaining_at_running_seconds,
+                    )
                 if self._stopping or self._instance_draining.is_set():
                     owner.cancel(COMPOSER_SHUTDOWN)
                     return

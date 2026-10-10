@@ -260,7 +260,10 @@ async def test_running_deadline_keeps_truthful_durable_detail(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_owned_running_timeout_keeps_deadline_when_sqlite_clock_precedes_fractional_deadline(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("deadline_source", ["timeout", "watcher"])
+async def test_owned_running_timeout_keeps_deadline_when_sqlite_clock_precedes_fractional_deadline(
+    tmp_path, monkeypatch, deadline_source
+) -> None:
     app, service, engine, _composer = _file_app(tmp_path)
     canonical_snapshot_factory = app.state.plugin_snapshot_factory
     authority = ComposerAsyncOperationAuthority(
@@ -291,8 +294,14 @@ async def test_owned_running_timeout_keeps_deadline_when_sqlite_clock_precedes_f
             worker = _worker(app, authority)
             selections = []
             owned_timeouts = []
+            watcher_deadlines = []
+            post_read_remaining = []
             original_select = worker._failure_for
             original_owned_failure = worker_module._owned_deadline_failure
+            original_watch = worker._watch
+            original_read = worker_module.ComposerOperationWatchReader.read
+            original_cadence = worker_module.ComposerOperationWatchReader.wait_watch_cadence
+            original_timeout = asyncio.timeout
             admitted_operation_id = record.operation_id
 
             def observe_selection(
@@ -316,9 +325,42 @@ async def test_owned_running_timeout_keeps_deadline_when_sqlite_clock_precedes_f
                     _owned_timeouts.append((timeout_scope, original))
                 return _original_owned_failure(original, timeout_scope=timeout_scope, record=record, anchor=anchor)
 
+            async def observe_watch(*args, _original_watch=original_watch, _watcher_deadlines=watcher_deadlines, **kwargs):
+                try:
+                    return await _original_watch(*args, **kwargs)
+                except ComposerTurnDeadlineExpired as watcher_failure:
+                    _watcher_deadlines.append(watcher_failure)
+                    raise
+
+            async def wait_for_owned_timeout(reader, _original_cadence=original_cadence):
+                # Keep the real cadence's private-cleanup provenance while
+                # letting the owned timeout win this independent control.
+                while True:
+                    await _original_cadence(reader)
+
+            async def resume_read_after_deadline(reader, _original_read=original_read, _post_read_remaining=post_read_remaining):
+                current, now = await _original_read(reader)
+                remaining = reader.anchor.remaining_seconds(monotonic_now=worker_module.time.monotonic())
+                assert remaining > 0
+                _post_read_remaining.append(remaining)
+                # Retain the actual SQL result across a scheduling delay. This
+                # selects the post-read expiry branch, rather than the reader's
+                # separate pre-submission cutoff.
+                await asyncio.sleep(remaining + 0.02)
+                return current, now
+
+            def later_owned_timeout(delay, _original_timeout=original_timeout):
+                return _original_timeout(None if delay is None else delay + 2.0)
+
             with monkeypatch.context() as patcher:
                 patcher.setattr(worker, "_failure_for", observe_selection)
                 patcher.setattr(worker_module, "_owned_deadline_failure", observe_owned_failure)
+                patcher.setattr(worker, "_watch", observe_watch)
+                if deadline_source == "timeout":
+                    patcher.setattr(worker_module.ComposerOperationWatchReader, "wait_watch_cadence", wait_for_owned_timeout)
+                else:
+                    patcher.setattr(worker_module.ComposerOperationWatchReader, "read", resume_read_after_deadline)
+                    patcher.setattr(asyncio, "timeout", later_owned_timeout)
                 active_task = asyncio.create_task(worker.run_until_idle())
                 await asyncio.wait_for(held.entered.wait(), timeout=5)
                 coordinator = worker._required_coordinators[(record.session_id, record.operation_id)]
@@ -332,18 +374,30 @@ async def test_owned_running_timeout_keeps_deadline_when_sqlite_clock_precedes_f
                 assert terminal.failure_code == "deadline_expired"
                 continue
             deadlines = tuple(leaf for leaf in required_failure_leaves(failure) if isinstance(leaf, ComposerTurnDeadlineExpired))
-            assert len(deadlines) == 1
-            original_timeout = deadlines[0].__cause__
-            assert type(original_timeout) is TimeoutError
+            assert len(deadlines) == 1, tuple(required_failure_leaves(failure))
             assert len(owned_timeouts) == 1
             actual_scope, scoped_original = owned_timeouts[0]
-            assert actual_scope is not None and actual_scope.expired() is True
-            assert scoped_original is original_timeout
+            assert actual_scope is not None
             turn_tickets = tuple(
                 ticket for ticket in coordinator.tickets if ticket.key.source is RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER
             )
             assert len(turn_tickets) == 1 and turn_tickets[0].complete
-            assert any(error is original_timeout for error in turn_tickets[0].errors)
+            assert any(error is scoped_original for error in turn_tickets[0].errors)
+            if deadline_source == "timeout":
+                original_timeout_error = deadlines[0].__cause__
+                assert type(original_timeout_error) is TimeoutError
+                assert actual_scope.expired() is True
+                assert scoped_original is original_timeout_error
+                assert not watcher_deadlines and not post_read_remaining
+            else:
+                assert actual_scope.expired() is False
+                assert isinstance(scoped_original, asyncio.CancelledError)
+                assert len(watcher_deadlines) == 1 and deadlines[0] is watcher_deadlines[0]
+                assert len(post_read_remaining) == 1 and post_read_remaining[0] > 0
+                assert deadlines[0].session_id == record.session_id
+                assert deadlines[0].operation_id == record.operation_id
+                assert deadlines[0].remaining_seconds <= 0
+                assert deadlines[0].budget_seconds_at_running > 0
             assert terminal.failure_code == "deadline_expired"
             assert terminal.result_json is not None
             error = ComposerOperationError.model_validate_json(terminal.result_json, strict=True)

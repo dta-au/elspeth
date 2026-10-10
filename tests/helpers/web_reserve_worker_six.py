@@ -291,5 +291,5 @@ SUPPLIER_IMPORT_GRAMMARS = {
     "elspeth.web.coordination.lifecycle": "3f71a5261ad1f880340240640fa10a6c784bba1726112c93621c177612d69909",
     "elspeth.contracts.session_operation": "64ee5d516987d7b041060d4e50942522660437bafdb01f40054ad67431417306",
     "elspeth.web.required_sql_outcomes": "6ab23511eebf3383ddcdcfbcc511b8dae4b1c358df3e02781732ffb460b741c7",
-    "elspeth.web.sessions.composer_operations": "69e2f8607c5c890655862635283de8099440087af26fa5fb19df10f98e08884f",
+    "elspeth.web.sessions.composer_operations": "747dacdbbb06c576e01bb44de86d6df77b5eb26b914cf0ea296f68fed5b81758",
 }

@@ -42,7 +42,6 @@ allowance.  The standalone ``register_run_leader`` wrapper is never admitted.
 from __future__ import annotations
 
 import ast
-import copy
 import hashlib
 import json as _reserve_json
 import re
@@ -5810,7 +5809,7 @@ _reserve_CANCEL_ROUTE_SHA256 = "86d206255665ac50b5e2c65bb77bfebc3971e335127483d4
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
     "src/elspeth/web/sessions/composer_turn.py": "4bf85258c9d207573387567b1e67ff8f5a269eedb28cd7b82a630c2ea9f6be5e",
-    "src/elspeth/web/sessions/composer_async_worker.py": "7321f41aee1ccbc19181e282e4fe7767f47dd710fd2589c4aa1719678344ef37",
+    "src/elspeth/web/sessions/composer_async_worker.py": "ce8543b819fbcf7e6b613a808724df892bf17a120831941cf9ff83cebf3191ee",
 }
 
 
@@ -6366,7 +6365,7 @@ def _bind_canonical_module_to_parent(canonical_name: str, module: object) -> Non
         raise RuntimeError(f"Canonical module identity changed while binding {canonical_name!r}")
     setattr(parent, child_name, module)
 """).body[0]
-    actual = copy.deepcopy(owner)
+    actual = _reserve_proposal_child_transfers.copy_ast_fields(owner)
     # Ignore only literal documentation. Every executable name, argument,
     # guard, identity check and effect must match.
     actual_body = [
@@ -6412,7 +6411,7 @@ def _canonical_module_name(py_file: Path) -> str | None:
 """).body[0]
     if not isinstance(canonical, ast.FunctionDef):
         return ["selected plugin canonical path function is missing"]
-    candidate = copy.deepcopy(canonical)
+    candidate = _reserve_proposal_child_transfers.copy_ast_fields(canonical)
     candidate.body = [
         node
         for node in candidate.body
@@ -27538,11 +27537,22 @@ def test_actual_ticket_runtime_clock_override_withdraws_read_proof():
 
 
 def test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metadata() -> None:
-    """Foreign parser metadata cannot withdraw an unchanged namespace receipt."""
+    """Foreign parser metadata cannot withdraw unchanged source contracts."""
     helper = _reserve_proposal_child_transfers
     units = tuple(_read_source(_repo_root() / path, anchor=_repo_root()) for path in (helper.SETTLEMENT, helper.REQUIRED))
     failures, baseline = helper.proposal_child_local_contracts(units)
     assert not failures, failures
+    service = _read_source(_repo_root() / _reserve_terminal_sql_transfers.SERVICE, anchor=_repo_root())
+    service_class = _reserve_node_at(service, _reserve_terminal_sql_transfers.CLASS)
+    assert _reserve_terminal_sql_transfers.namespace_grammar(service_class) == _reserve_terminal_sql_transfers.NAMESPACE_GRAMMAR
+    telemetry = _read_source(_repo_root() / "src/elspeth/web/operator_telemetry.py", anchor=_repo_root())
+    telemetry_failures, telemetry_dependencies = _reserve_family_contracts._telemetry_transfer(telemetry)
+    assert not telemetry_failures, telemetry_failures
+    discovery = _read_source(_repo_root() / "src/elspeth/plugins/infrastructure/discovery.py", anchor=_repo_root())
+    assert _reserve_plugin_path_producer_failures((discovery,)) == []
+    binder = _reserve_node_at(discovery, "_bind_canonical_module_to_parent")
+    binding_call = binder.body[-1].value
+    assert _reserve_safe_canonical_plugin_bind(discovery, binding_call)
     shared_context = next(node.ctx for node in ast.walk(units[1].tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load))
     original_parent = shared_context._landscape_parent
     try:
@@ -27551,11 +27561,32 @@ def test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metad
         failures, receipt = helper.proposal_child_local_contracts(units)
         assert not failures, failures
         assert receipt["reserve_calls"] == baseline["reserve_calls"]
+        assert _reserve_terminal_sql_transfers.namespace_grammar(service_class) == _reserve_terminal_sql_transfers.NAMESPACE_GRAMMAR
+        telemetry_failures, dependencies = _reserve_family_contracts._telemetry_transfer(telemetry)
+        assert not telemetry_failures, telemetry_failures
+        assert dependencies == telemetry_dependencies
+        assert _reserve_plugin_path_producer_failures((discovery,)) == []
+        assert _reserve_safe_canonical_plugin_bind(discovery, binding_call)
         required = units[1]
         header = "class RequiredWorkCoordinator:"
         assert required.source.count(header) == 1
         changed = _parse_source(required.path, required.source.replace(header, "class RequiredWorkCoordinator(ForeignBase):"))
         failures, _ = helper.proposal_child_local_contracts((units[0], changed))
         assert "proposal child transfer: finite supplier class namespace changed RequiredWorkCoordinator" in failures, failures
+        changed_class = helper.copy_ast_fields(service_class)
+        changed_class.bases.append(ast.Name(id="ForeignBase", ctx=ast.Load()))
+        assert _reserve_terminal_sql_transfers.namespace_grammar(changed_class) != _reserve_terminal_sql_transfers.NAMESPACE_GRAMMAR
+        transfer = "installation.reserve(cleanup_owner)"
+        assert telemetry.source.count(transfer) == 1
+        changed_telemetry = _parse_source(telemetry.path, telemetry.source.replace(transfer, "installation.reserve(None)"))
+        telemetry_failures, _ = _reserve_family_contracts._telemetry_transfer(changed_telemetry)
+        assert telemetry_failures
+        canonical_return = 'return ".".join(parts)'
+        assert discovery.source.count(canonical_return) == 1
+        changed_discovery = _parse_source(discovery.path, discovery.source.replace(canonical_return, 'return "elspeth"'))
+        assert _reserve_plugin_path_producer_failures((changed_discovery,)) == ["selected plugin canonical path producer changed"]
+        changed_binder = _parse_source(discovery.path, discovery.source.replace("sys.modules[canonical_name] is not module", "False"))
+        changed_call = _reserve_node_at(changed_binder, "_bind_canonical_module_to_parent").body[-1].value
+        assert not _reserve_safe_canonical_plugin_bind(changed_binder, changed_call)
     finally:
         shared_context._landscape_parent = original_parent

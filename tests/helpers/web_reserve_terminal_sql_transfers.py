@@ -7,6 +7,8 @@ import inspect
 import json
 import types
 
+from tests.helpers.web_reserve_proposal_child_transfers import copy_ast_fields
+
 SERVICE = "src/elspeth/web/sessions/service.py"
 REQUIRED = "src/elspeth/web/required_work.py"
 WORKERS = "src/elspeth/web/async_workers.py"
@@ -52,7 +54,7 @@ def namespace_grammar(class_node):
             node.body = ast.Constant(value=None)
             return node
 
-    return grammar(Headers().visit(copy.deepcopy(class_node)))
+    return grammar(Headers().visit(copy_ast_fields(class_node)))
 
 
 def chain(node):
