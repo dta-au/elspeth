@@ -182,7 +182,7 @@ _CACHEABLE_DISCOVERY_TOOL_NAMES: Final[frozenset[str]] = derive_cacheable_names(
 # non-DISCOVERY tool of any kind may be cacheable), and every member here IS
 # DISCOVERY kind, so it accepts ``cacheable=True`` on any of them. The three
 # stateful discovery tools stay uncached ONLY because two test pins name
-# them: ``tests/unit/web/composer/test_tools.py::TestToolRegistry::
+# them: ``tests/unit/web/composer/test_tools_discovery.py::TestToolRegistry::
 # test_cacheable_discovery_is_opt_in_with_named_mutable_complement`` (exact
 # set equality, so a new discovery tool cannot land in either category
 # without a deliberate classification) and
