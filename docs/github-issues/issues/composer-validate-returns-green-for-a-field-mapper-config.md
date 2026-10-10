@@ -30,7 +30,7 @@ Correct behaviour: a configuration error that can never be resolved by finishing
 Two directions, and picking between them is the first task:
 
 - Let the config-validation path, which already runs and already holds the `PluginConfigError`, report it as a blocking validation entry, instead of leaving the probes to notice and stay silent.
-- Or sort the exceptions at the probe boundary: a type error on a declared option is permanent, a missing required option on a half-written node is not. A closed set of tolerated exceptions already exists — `test_rule_c_unexpected_constructor_exception_propagates` (`tests/unit/web/composer/test_state.py:5722`) pins that anything outside `_is_config_probe_exception` must propagate rather than be deferred to run time — so this may be a matter of widening that set at the right place rather than inventing one.
+- Or sort the exceptions at the probe boundary: a type error on a declared option is permanent, a missing required option on a half-written node is not. A closed set of tolerated exceptions already exists — `test_rule_c_unexpected_constructor_exception_propagates` (`tests/unit/web/composer/test_state_schema_contracts.py::TestSchemaContractValidation::test_rule_c_unexpected_constructor_exception_propagates`) pins that anything outside `_is_config_probe_exception` must propagate rather than be deferred to run time — so this may be a matter of widening that set at the right place rather than inventing one.
 
 Do not fix this by making the probes raise on any construction failure: that turns every unfinished draft into a hard error, which is what the silence was added to prevent.
 
