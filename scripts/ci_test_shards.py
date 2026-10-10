@@ -9,17 +9,23 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import heapq
 import json
 import os
 import subprocess
 import sys
-from collections.abc import Generator, Iterator
+from collections.abc import Generator, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 import coverage
 import pytest
+from pluggy import Result
 
 PROOF_MARKER = "landscape_long_run"
+ASSIGNMENT_ALGORITHM = "duration-lpt-v1"
+DURATION_PROFILE_PATH = Path("config/cicd/pytest-duration-profile.json")
 _PROOF_CALL_PASSED = pytest.StashKey[bool | None]()
 LONG_RUN_CASES = {
     "no-escape": (
@@ -46,8 +52,61 @@ def collection_digest(nodeids: list[str]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+@dataclass(frozen=True)
+class DurationProfile:
+    default_weight_ms: int
+    weights_ms: Mapping[str, int]
+    sha256: str
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate duration-profile key: {key}")
+        result[key] = value
+    return result
+
+
+def load_duration_profile(checkout: Path) -> DurationProfile:
+    """Read the checked-out estimate; it never defines collection membership."""
+    raw = (checkout / DURATION_PROFILE_PATH).read_bytes()
+    value = json.loads(raw, object_pairs_hook=_unique_json_object)
+    if not isinstance(value, dict) or set(value) != {"schema_version", "default_weight_ms", "weights_ms", "source"}:
+        raise ValueError("Invalid duration profile shape")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1 or not isinstance(value["source"], dict):
+        raise ValueError("Invalid duration profile identity")
+    default = value["default_weight_ms"]
+    weights = value["weights_ms"]
+    if type(default) is not int or default < 1 or not isinstance(weights, dict):
+        raise ValueError("Duration weights must be positive literal integers")
+    if any(not isinstance(node, str) or not node or type(weight) is not int or weight < 1 for node, weight in weights.items()):
+        raise ValueError("Duration weights require nonempty node IDs and positive literal integers")
+    return DurationProfile(default, MappingProxyType(weights), hashlib.sha256(raw).hexdigest())
+
+
+def ordinary_assignment(nodeids: list[str], count: int, profile: DurationProfile) -> dict[str, int]:
+    """Deterministic longest-estimated-first scheduling over native IDs only."""
+    if type(count) is not int or count < 1 or len(nodeids) != len(set(nodeids)):
+        raise ValueError("Assignment requires a positive literal shard count and unique node IDs")
+    loads = [(0, index) for index in range(count)]
+    heapq.heapify(loads)
+    assignment: dict[str, int] = {}
+    for node in sorted(nodeids, key=lambda node: (-profile.weights_ms.get(node, profile.default_weight_ms), node)):
+        load, index = heapq.heappop(loads)
+        assignment[node] = index
+        heapq.heappush(loads, (load + profile.weights_ms.get(node, profile.default_weight_ms), index))
+    return assignment
+
+
 def select_long_run_nodeids(
-    nodeids: list[str], marked_nodeids: list[str], partition: str, case: str | None, count: int, index: int
+    nodeids: list[str],
+    marked_nodeids: list[str],
+    partition: str,
+    case: str | None,
+    count: int,
+    index: int,
+    profile: DurationProfile | None = None,
 ) -> list[str]:
     """Select ordinary buckets or one of the three exact long-run cases.
 
@@ -71,7 +130,11 @@ def select_long_run_nodeids(
     if partition == "proof":
         assert case is not None
         return [LONG_RUN_CASES[case]]
-    return [nodeid for nodeid in nodeids if nodeid not in cases and shard_index(nodeid, count) == index]
+    if profile is None:
+        profile = load_duration_profile(Path(__file__).resolve().parents[1])
+    ordinary = [nodeid for nodeid in nodeids if nodeid not in cases]
+    assignment = ordinary_assignment(ordinary, count, profile)
+    return [nodeid for nodeid in ordinary if assignment[nodeid] == index]
 
 
 def evidence_identity(checkout: Path) -> dict[str, str | None]:
@@ -96,14 +159,17 @@ def evidence_identity(checkout: Path) -> dict[str, str | None]:
 def build_long_run_manifest(
     checkout: Path, nodeids: list[str], marked_nodeids: list[str], partition: str, case: str | None, count: int, index: int
 ) -> dict[str, object]:
-    """Build schema-3 evidence from the complete marker-selected collection."""
-    selected = select_long_run_nodeids(nodeids, marked_nodeids, partition, case, count, index)
+    """Build schema-4 evidence from the complete marker-selected collection."""
+    profile = load_duration_profile(checkout)
+    selected = select_long_run_nodeids(nodeids, marked_nodeids, partition, case, count, index, profile)
     identity = evidence_identity(checkout)
     producer = os.environ.get("GITHUB_JOB") if identity["github_run_id"] is not None else None
     if identity["github_run_id"] is not None and producer != ("test" if partition == "ordinary" else "proof"):
         raise ValueError("Long-run evidence requires the exact native producer role")
     return {
-        "schema_version": 3,
+        "schema_version": 4,
+        "assignment_algorithm": ASSIGNMENT_ALGORITHM,
+        "duration_profile_sha256": profile.sha256,
         **identity,
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
         "producer_job": producer,
@@ -142,12 +208,12 @@ def finalize_long_run_manifest(
         raise ValueError("Terminal evidence requires a literal boolean call result")
     if (
         type(manifest["schema_version"]) is not int
-        or manifest["schema_version"] != 3
+        or manifest["schema_version"] != 4
         or manifest["exit_status"] is not None
         or "proof_call_passed" in manifest
         or "coverage_sha256" in manifest
     ):
-        raise ValueError("Finalize only unfinalized schema-3 collection evidence")
+        raise ValueError("Finalize only unfinalized schema-4 collection evidence")
     partition = manifest["partition"]
     case = manifest["proof_case"]
     if partition == "ordinary":
@@ -240,7 +306,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 count,
                 index,
             )
-            selected = [item for item in items if item.nodeid in manifest["selected_nodeids"]]
+            partition_nodeids = manifest["selected_nodeids"]
+            assert isinstance(partition_nodeids, list)
+            selected = [item for item in items if item.nodeid in partition_nodeids]
     except ValueError as error:
         raise pytest.UsageError(str(error)) from error
     selected_nodeids = {item.nodeid for item in selected}
@@ -275,7 +343,7 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) ->
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> Iterator[None]:
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> Generator[None, Result[object], None]:
     proof_partition = session.config.getoption("ci_partition") == "proof"
     proof_passed = session.config.stash.get(_PROOF_CALL_PASSED, None)
     if proof_partition and proof_passed is not True and session.exitstatus == 0:
@@ -290,7 +358,9 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> Iterator[N
     database = Path(os.environ.get("COVERAGE_FILE", ".coverage")) if session.config.getoption("cov_source", default=None) else None
     if session.config.getoption("ci_partition") != "all":
         manifest = finalize_long_run_manifest(manifest, int(session.exitstatus), proof_passed if proof_partition else None, database)
-        session.exitstatus = manifest["exit_status"]
+        effective_status = manifest["exit_status"]
+        assert type(effective_status) is int
+        session.exitstatus = effective_status
     else:
         manifest["exit_status"] = int(exitstatus)
     if database is not None and session.config.getoption("ci_partition") == "all":
@@ -383,15 +453,18 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
         raise ValueError("Supply a literal integer ordinary shard count")
     if count < 1 or python_version not in {"3.12", "3.13"}:
         raise ValueError("Supply a positive shard count and Python 3.12 or 3.13")
+    profile = load_duration_profile(checkout)
     identity = evidence_identity(checkout)
     if identity["github_run_id"] is None:
         raise ValueError("Partitioned artifact resolution requires a native Actions run identity")
     current_attempt = identity["github_run_attempt"]
     assert current_attempt is not None
     cases = LONG_RUN_CASES
-    producers = {f"ordinary-shard-{python_version}-{index}": ("ordinary", index, count, "test", None) for index in range(count)}
-    for case in cases:
-        producers[f"landscape-proof-{case}-{python_version}"] = ("proof", 0, 1, "proof", case)
+    producers: dict[str, tuple[str, int, int, str, str | None]] = {
+        f"ordinary-shard-{python_version}-{index}": ("ordinary", index, count, "test", None) for index in range(count)
+    }
+    for proof_case in cases:
+        producers[f"landscape-proof-{proof_case}-{python_version}"] = ("proof", 0, 1, "proof", proof_case)
     candidates: dict[str, dict[int, Path]] = {producer: {} for producer in producers}
     for folder in sorted(artifact_dir.iterdir()):
         producer, separator, raw_attempt = folder.name.rpartition("-attempt-")
@@ -413,6 +486,7 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
     digests: set[str] = set()
     databases: list[str] = []
     resolved: dict[str, str] = {}
+    ordinary_groups: dict[int, list[str]] = {}
     for producer, attempts in candidates.items():
         if not attempts:
             raise ValueError(f"Missing producer evidence: {producer}")
@@ -424,7 +498,9 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
             raise ValueError(f"Artifact {folder.name} lacks a manifest object")
         if (
             any(type(manifest.get(field)) is not int for field in ("schema_version", "shard_count", "shard_index"))
-            or manifest.get("schema_version") != 3
+            or manifest.get("schema_version") != 4
+            or manifest.get("assignment_algorithm") != ASSIGNMENT_ALGORITHM
+            or manifest.get("duration_profile_sha256") != profile.sha256
             or manifest.get("tested_commit") != identity["tested_commit"]
             or manifest.get("github_run_id") != identity["github_run_id"]
             or manifest.get("github_run_attempt") != str(attempt)
@@ -448,10 +524,13 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
         ):
             raise ValueError(f"Newest artifact {folder.name} did not successfully finalize a selected collection")
         if partition == "proof":
+            assert case is not None
             if nodeids != [cases[case]] or manifest.get("proof_call_passed") is not True:
                 raise ValueError(f"Artifact {folder.name} lacks the singleton successful proof call")
-        elif any(nodeid in cases.values() or shard_index(nodeid, count) != index for nodeid in nodeids):
-            raise ValueError(f"Artifact {folder.name} contains a proof overlap or misassigned ordinary test")
+        else:
+            if any(nodeid in cases.values() for nodeid in nodeids):
+                raise ValueError(f"Artifact {folder.name} contains a proof overlap or misassigned ordinary test")
+            ordinary_groups[index] = nodeids
         digest = manifest.get("collection_digest")
         if not isinstance(digest, str):
             raise ValueError(f"Artifact {folder.name} lacks a collection digest")
@@ -462,6 +541,9 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
             databases.append(_coverage_database(folder, manifest))
     if len(selected) != len(set(selected)) or digests != {collection_digest(selected)}:
         raise ValueError("Ordinary and proof collections overlap, differ, or omit selected tests")
+    assignment = ordinary_assignment([node for group in ordinary_groups.values() for node in group], count, profile)
+    if any(assignment[node] != index for index, group in ordinary_groups.items() for node in group):
+        raise ValueError("Artifact union contains a misassigned ordinary test")
     if python_version == "3.13":
         _combine_coverage(databases, checkout)
     return resolved

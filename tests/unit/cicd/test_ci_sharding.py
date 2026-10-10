@@ -18,6 +18,8 @@ import coverage
 import pytest
 import yaml
 from scripts.ci_test_shards import (
+    ASSIGNMENT_ALGORITHM,
+    DURATION_PROFILE_PATH,
     LONG_RUN_CASES,
     _publish_manifest,
     build_long_run_manifest,
@@ -25,7 +27,9 @@ from scripts.ci_test_shards import (
     combine_shards,
     evidence_identity,
     finalize_long_run_manifest,
+    load_duration_profile,
     long_run_call_result,
+    ordinary_assignment,
     select_long_run_nodeids,
     shard_index,
     validate_long_run_shards,
@@ -42,6 +46,9 @@ def _local_producer_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _init_checkout(checkout: Path) -> str:
+    profile = checkout / DURATION_PROFILE_PATH
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(REPO_ROOT / DURATION_PROFILE_PATH, profile)
     subprocess.run(["git", "init", str(checkout)], capture_output=True, text=True, check=True)
     subprocess.run(
         ["git", "-c", "user.name=Shard Test", "-c", "user.email=shard@example.invalid", "commit", "--allow-empty", "-m", "fixture"],
@@ -88,9 +95,10 @@ def test_long_run_selector_preserves_complete_disjoint_union_and_full_digest(rev
     digest = collection_digest(nodeids)
     marked = list(reversed(LONG_RUN_CASES.values()))
     shards = [select_long_run_nodeids(nodeids, marked, "ordinary", None, 4, index) for index in range(4)]
+    assignment = ordinary_assignment(ordinary, 4, load_duration_profile(REPO_ROOT))
     assert all(shards)
     for index, selected in enumerate(shards):
-        assert selected == [nodeid for nodeid in nodeids if nodeid in ordinary and shard_index(nodeid, 4) == index]
+        assert selected == [nodeid for nodeid in nodeids if nodeid in ordinary and assignment[nodeid] == index]
     proofs = [select_long_run_nodeids(nodeids, marked, "proof", case, 1, 0) for case in LONG_RUN_CASES]
     assert proofs == [[nodeid] for nodeid in LONG_RUN_CASES.values()]
     combined = [nodeid for selected in shards + proofs for nodeid in selected]
@@ -241,7 +249,9 @@ def test_long_run_manifest_builder_binds_actual_identity(
     nodeids = ["test_sample.py::test_ordinary", *marked]
     manifest = build_long_run_manifest(tmp_path, nodeids, marked, partition, case, 1, 0)
     assert manifest == {
-        "schema_version": 3,
+        "schema_version": 4,
+        "assignment_algorithm": ASSIGNMENT_ALGORITHM,
+        "duration_profile_sha256": load_duration_profile(tmp_path).sha256,
         "tested_commit": commit,
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
         "github_run_id": "1234",
@@ -398,7 +408,7 @@ def test_long_run_producer_with_real_pytest_cov(tmp_path: Path, case: str, outco
     expected_exit = 0 if outcome == "pass" else (5 if outcome == "no_call" else 1)
     assert result.returncode == expected_exit, result.stdout + result.stderr
     manifest = json.loads((tmp_path / "producer.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
     assert manifest["proof_case"] == selected_case
     assert manifest["producer_job"] == environment["GITHUB_JOB"]
     assert manifest["tested_commit"] == commit
@@ -1053,10 +1063,15 @@ def test_active_partitions_preserve_complete_disjoint_marker_selected_collection
         assert result.returncode == 0, result.stdout + result.stderr
         manifest = json.loads(report.read_text(encoding="utf-8"))
         assert manifest["partition"] == "ordinary"
-        assert manifest["schema_version"] == 3 and manifest["proof_case"] is None
+        assert manifest["schema_version"] == 4 and manifest["proof_case"] is None
         assert "proof_call_passed" not in manifest
         assert manifest["collection_digest"] == complete["collection_digest"]
-        assert all(shard_index(nodeid, 4) == index for nodeid in manifest["selected_nodeids"])
+        assignment = ordinary_assignment(
+            [nodeid for nodeid in complete["selected_nodeids"] if nodeid not in LONG_RUN_CASES.values()],
+            4,
+            load_duration_profile(tmp_path),
+        )
+        assert all(assignment[nodeid] == index for nodeid in manifest["selected_nodeids"])
         ordinary.extend(manifest["selected_nodeids"])
     proofs = []
     for case, nodeid in LONG_RUN_CASES.items():
@@ -1064,7 +1079,7 @@ def test_active_partitions_preserve_complete_disjoint_marker_selected_collection
         assert result.returncode == 0, result.stdout + result.stderr
         proof = json.loads(report.read_text(encoding="utf-8"))
         assert proof["partition"] == "proof" and proof["proof_case"] == case
-        assert proof["schema_version"] == 3
+        assert proof["schema_version"] == 4
         assert proof["selected_nodeids"] == [nodeid]
         assert proof["collection_digest"] == complete["collection_digest"]
         assert proof["proof_call_passed"] is True
@@ -1256,6 +1271,8 @@ def test_active_no_call_refusal_is_visible_to_inner_finalizers(tmp_path: Path, c
 def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str) -> Path:
     artifacts = _artifacts(tmp_path)
     nodeids = [f"test_sample.py::test_example[{index}]" for index in range(100)] + list(LONG_RUN_CASES.values())
+    profile = load_duration_profile(tmp_path)
+    assignment = ordinary_assignment(nodeids[:-3], 4, profile)
     commit = evidence_identity(tmp_path)["tested_commit"]
     assert commit is not None
     for name, value in {
@@ -1272,7 +1289,10 @@ def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version
         manifest = json.loads(report.read_text(encoding="utf-8"))
         attempt = "1" if index < 2 else "2"
         manifest.update(
-            schema_version=3,
+            schema_version=4,
+            assignment_algorithm=ASSIGNMENT_ALGORITHM,
+            duration_profile_sha256=profile.sha256,
+            selected_nodeids=[nodeid for nodeid in nodeids[:-3] if assignment[nodeid] == index],
             proof_case=None,
             collection_digest=collection_digest(nodeids),
             partition="ordinary",
@@ -1290,7 +1310,9 @@ def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version
         folder = artifacts / f"landscape-proof-{case}-{version}-attempt-2"
         folder.mkdir()
         manifest = {
-            "schema_version": 3,
+            "schema_version": 4,
+            "assignment_algorithm": ASSIGNMENT_ALGORITHM,
+            "duration_profile_sha256": profile.sha256,
             "tested_commit": commit,
             "python_version": version,
             "github_run_id": "1234",
@@ -1353,6 +1375,9 @@ def test_long_run_consumer_requires_seven_producers_and_all_case_coverage(
     [
         "missing",
         "schema",
+        "legacy_partitioned_schema",
+        "assignment_algorithm",
+        "duration_profile",
         "schema_float",
         "count_bool",
         "count_float",
@@ -1393,7 +1418,10 @@ def test_long_run_consumer_rejects_selected_invalid_evidence(
     manifest = json.loads(report.read_text())
     changes = {
         "schema": ("schema_version", 2),
-        "schema_float": ("schema_version", 3.0),
+        "legacy_partitioned_schema": ("schema_version", 3),
+        "assignment_algorithm": ("assignment_algorithm", "sha256-modulo"),
+        "duration_profile": ("duration_profile_sha256", "0" * 64),
+        "schema_float": ("schema_version", 4.0),
         "count_bool": ("shard_count", True),
         "count_float": ("shard_count", 4.0 if producer == "ordinary" else 1.0),
         "index_bool": ("shard_index", False),
@@ -1547,7 +1575,7 @@ def test_long_run_consumer_retains_newest_attempt_content_policy(
             "wrong_producer": ("producer_job", "unknown"),
             "wrong_shard": ("shard_index", 99),
             "wrong_attempt": ("github_run_attempt", "99"),
-            "schema_float": ("schema_version", 3.0),
+            "schema_float": ("schema_version", 4.0),
             "status_bool": ("exit_status", False),
         }[damage]
         manifest[field] = value
@@ -1608,12 +1636,47 @@ def test_long_run_consumer_bucket_check_is_independent_of_union_digest(
     validate_long_run_shards(artifacts, 4, tmp_path, version)
     reports = list(artifacts.glob("*/shard-manifest.json"))
     manifests = {report: json.loads(report.read_text()) for report in reports}
-    report = artifacts / f"ordinary-shard-{version}-0-attempt-1" / "shard-manifest.json"
-    wrong = next(f"wrong[{i}]" for i in range(100) if shard_index(f"wrong[{i}]", 4) != 0)
-    manifests[report]["selected_nodeids"][0] = wrong
-    digest = collection_digest([nodeid for manifest in manifests.values() for nodeid in manifest["selected_nodeids"]])
+    first = artifacts / f"ordinary-shard-{version}-0-attempt-1" / "shard-manifest.json"
+    second = artifacts / f"ordinary-shard-{version}-1-attempt-1" / "shard-manifest.json"
+    manifests[first]["selected_nodeids"][0], manifests[second]["selected_nodeids"][0] = (
+        manifests[second]["selected_nodeids"][0],
+        manifests[first]["selected_nodeids"][0],
+    )
     for report, manifest in manifests.items():
-        manifest["collection_digest"] = digest
+        report.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="misassigned"):
+        validate_long_run_shards(artifacts, 4, tmp_path, version)
+
+
+@pytest.mark.parametrize("version", ["3.12", "3.13"])
+def test_long_run_consumer_rederives_unequal_weights_instead_of_equal_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
+    validate_long_run_shards(artifacts, 4, tmp_path, version)
+    reports = list(artifacts.glob("*/shard-manifest.json"))
+    manifests = {report: json.loads(report.read_text()) for report in reports}
+    ordinary = [manifest for manifest in manifests.values() if manifest["partition"] == "ordinary"]
+    nodeids = [node for manifest in ordinary for node in manifest["selected_nodeids"]]
+    old_assignment = ordinary_assignment(nodeids, 4, load_duration_profile(tmp_path))
+    slow = next(node for node in sorted(nodeids) if old_assignment[node] != 0)
+    path = tmp_path / DURATION_PROFILE_PATH
+    profile_json = json.loads(path.read_text())
+    profile_json["weights_ms"] = {slow: 1000000}
+    path.write_text(json.dumps(profile_json), encoding="utf-8")
+    profile = load_duration_profile(tmp_path)
+    weighted_assignment = ordinary_assignment(nodeids, 4, profile)
+    assert weighted_assignment[slow] == 0
+    assert weighted_assignment != old_assignment
+    for report, manifest in manifests.items():
+        manifest["duration_profile_sha256"] = profile.sha256
+        if manifest["partition"] == "ordinary":
+            manifest["selected_nodeids"] = [node for node in nodeids if weighted_assignment[node] == manifest["shard_index"]]
+        report.write_text(json.dumps(manifest), encoding="utf-8")
+    assert len(validate_long_run_shards(artifacts, 4, tmp_path, version)) == 7
+    for report, manifest in manifests.items():
+        if manifest["partition"] == "ordinary":
+            manifest["selected_nodeids"] = [node for node in nodeids if old_assignment[node] == manifest["shard_index"]]
         report.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="misassigned"):
         validate_long_run_shards(artifacts, 4, tmp_path, version)
@@ -1654,7 +1717,7 @@ def test_partitioned_validator_consumes_real_successful_pytest_producers(tmp_pat
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    producers = [("ordinary", 4, index, None) for index in range(4)] + [("proof", 1, 0, case) for case in LONG_RUN_CASES]
+    producers = [("ordinary", 8, index, None) for index in range(8)] + [("proof", 1, 0, case) for case in LONG_RUN_CASES]
     for partition, count, index, case in producers:
         stem = f"ordinary-shard-{version}-{index}" if partition == "ordinary" else f"landscape-proof-{case}-{version}"
         folder = artifacts / f"{stem}-attempt-2"
@@ -1674,8 +1737,11 @@ def test_partitioned_validator_consumes_real_successful_pytest_producers(tmp_pat
     destination = tmp_path / "aggregate"
     (destination / "src" / "elspeth").mkdir(parents=True)
     (destination / "src" / "elspeth" / "sample.py").write_text(source_text, encoding="utf-8")
-    resolved = validate_long_run_shards(artifacts, 4, destination, version)
-    assert len(resolved) == 7
+    profile = destination / DURATION_PROFILE_PATH
+    profile.parent.mkdir(parents=True)
+    shutil.copyfile(tmp_path / DURATION_PROFILE_PATH, profile)
+    resolved = validate_long_run_shards(artifacts, 8, destination, version)
+    assert len(resolved) == 11
     if version == "3.13":
         data = coverage.CoverageData(basename=str(destination / ".coverage"))
         data.read()
