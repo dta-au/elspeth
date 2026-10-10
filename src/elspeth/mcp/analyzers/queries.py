@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
-from typing import Any, cast
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts import NodeStateStatus
 from elspeth.contracts.audit import CallVerification
@@ -46,6 +47,9 @@ from elspeth.mcp.types import (
     TokenRecord,
     VerificationDecisionRecord,
 )
+
+if TYPE_CHECKING:
+    from elspeth.mcp.query_control import QueryControl
 
 _serialize_datetime = serialize_datetime
 _dataclass_to_dict = dataclass_to_dict
@@ -1274,6 +1278,8 @@ def query(
     sql: str,
     params: dict[str, Any] | None = None,
     limit: int = MCP_QUERY_DEFAULT_LIMIT,
+    *,
+    control: QueryControl | None = None,
 ) -> list[dict[str, Any]]:
     """Execute a read-only SQL query.
 
@@ -1302,12 +1308,18 @@ def query(
 
     from elspeth.mcp.sql_guard import admit_postgres_query_connection
 
-    with db.read_only_connection() as conn:
+    with db.read_only_connection() as conn, control.monitor(conn) if control is not None else nullcontext():
         if conn.dialect.name == "postgresql":
             admit_postgres_query_connection(conn)
-        result = conn.execute(text(sql), params or {})
-        columns = list(result.keys())
-        rows = result.fetchmany(limit)
+        execution_conn = conn
+        if control is not None and conn.dialect.name == "postgresql":
+            execution_conn = conn.execution_options(stream_results=True, max_row_buffer=limit)
+        result = execution_conn.execute(text(sql), params or {})
+        try:
+            columns = list(result.keys())
+            rows = result.fetchmany(limit)
+        finally:
+            result.close()
 
     if len(columns) != len(set(columns)):
         from collections import Counter

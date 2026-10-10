@@ -2025,6 +2025,8 @@ class TestQueryResultLimit:
         """Raw query must not materialize every selected row before limiting."""
         from elspeth.mcp.analyzers.queries import query
 
+        closed: list[bool] = []
+
         class FakeResult:
             def keys(self) -> list[str]:
                 return ["value"]
@@ -2035,6 +2037,9 @@ class TestQueryResultLimit:
             def fetchmany(self, size: int) -> list[tuple[int]]:
                 assert size == 2
                 return [(1,), (2,)]
+
+            def close(self) -> None:
+                closed.append(True)
 
         class FakeConnection:
             from types import SimpleNamespace
@@ -2057,6 +2062,7 @@ class TestQueryResultLimit:
         results = query(cast(Any, FakeDB()), cast(Any, object()), "SELECT value FROM rows", limit=2)
 
         assert results == [{"value": 1}, {"value": 2}]
+        assert closed == [True]
 
 
 # ===========================================================================
