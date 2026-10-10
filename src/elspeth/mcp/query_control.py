@@ -11,7 +11,7 @@ from contextlib import contextmanager
 
 from sqlalchemy import Connection
 
-from elspeth.mcp.query_protocol import POSTGRES_STATEMENT_MILLISECONDS, QueryBudgetExceeded, QueryWorkerError
+from elspeth.mcp.query_protocol import QueryBudgetExceeded, QueryWorkerError
 
 
 class QueryControl:
@@ -75,7 +75,7 @@ class QueryControl:
             self._cancel = cancel
         try:
             if conn.dialect.name == "postgresql":
-                conn.exec_driver_sql(f"SET LOCAL statement_timeout = '{POSTGRES_STATEMENT_MILLISECONDS}ms'")
+                conn.exec_driver_sql("SET LOCAL statement_timeout = '10000ms'")
             yield
         finally:
             with self._lock:
