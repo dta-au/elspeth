@@ -36,8 +36,10 @@ if TYPE_CHECKING:
     from pydantic import JsonValue
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class QueryRequest:
+    """Child-owned parsed request; JSON parameters intentionally remain mutable."""
+
     database_url: str
     passphrase: str | None
     sql: str
