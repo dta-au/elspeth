@@ -51,7 +51,9 @@
 #
 # Output: one directory per run under --log-dir (default
 # $ELSPETH_GATE_LOG_DIR or /tmp/elspeth-gates/$USER), containing
-#   preflight.txt · <stage>.log · pytest-junit.xml · summary.txt · .done (last)
+#   preflight.txt · <stage>.log · <stage>-<ordinal>.exit (observed stage rc)
+#   pytest-junit.xml · summary.txt · driver.exit · .done (last, driver terminal
+#   receipt only; read stage exit and frozen status before qualifying a run)
 # Nothing is ever piped through tail; read summary.txt, then the logs.
 #
 # Usage:
@@ -184,13 +186,43 @@ tree_state() {
     # (measured on git 2.43: 10/10 rewrites), and this runs every 5 s inside a
     # tree other lanes may be working in. A path containing a newline or a
     # double quote is only covered by its status line.
-    local st; st="$(git --no-optional-locks status --porcelain -uall)"
-    printf '%s %s\n' "$(git rev-parse HEAD)" "$( { printf '%s\n' "$st"; awk '{print $NF}' <<<"$st" | grep -v '^$' | tr '\n' '\0' | xargs -0 -r sha256sum 2>/dev/null; } | sha256sum | cut -c1-16)"
+    local st head file_hashes digest row code path hash_line
+    st="$(git --no-optional-locks status --porcelain -uall)" || return 1
+    head="$(git rev-parse HEAD)" || return 1
+    file_hashes=""
+    if [ -n "$st" ]; then
+        while IFS= read -r row; do
+            [ -n "$row" ] || continue
+            code="${row:0:2}"
+            path="$(awk '{print $NF}' <<<"$row")" || return 1
+            # These exact porcelain states describe a tracked path deleted
+            # from the worktree. Its status line is evidence; no file remains
+            # to hash. Every other missing path remains a failed sample.
+            case "$code" in
+                'D '|' D'|'MD')
+                    [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+                    continue ;;
+            esac
+            hash_line="$(sha256sum -- "$path")" || return 1
+            file_hashes+="$hash_line"$'\n'
+        done <<<"$st"
+    fi
+    digest="$( { printf '%s\n' "$st"; printf '%s' "$file_hashes"; } | sha256sum)" || return 1
+    printf '%s %s\n' "$head" "${digest:0:16}"
 }
-BEFORE="$(tree_state)"
-pre "tree state  : $BEFORE  (HEAD + sha256 of status+diff; must match after the run)"
-DIRTY_N="$(git --no-optional-locks status --porcelain | wc -l)"
-[ "$DIRTY_N" -gt 0 ] && pre "note        : $DIRTY_N uncommitted path(s); the measurement is of the WORKING TREE, not of HEAD"
+if BEFORE="$(tree_state)"; then
+    pre "tree state  : $BEFORE  (HEAD + sha256 of status+diff; must match after the run)"
+else
+    BEFORE="UNKNOWN"
+    pre "REFUSED     : initial tree-state sample failed; source freeze cannot be proved"
+    REFUSE=1
+fi
+if DIRTY_N="$(git --no-optional-locks status --porcelain | wc -l)"; then
+    [ "$DIRTY_N" -gt 0 ] && pre "note        : $DIRTY_N uncommitted path(s); the measurement is of the WORKING TREE, not of HEAD"
+else
+    pre "REFUSED     : working-tree status failed during preflight"
+    REFUSE=1
+fi
 
 # --- the commands ------------------------------------------------------------
 RUFF_PATHS=(src/ tests/ scripts/ examples/ elspeth-lints/src/)
@@ -237,25 +269,142 @@ if [ "$DETACH" = 1 ]; then
 fi
 
 # --- execute -----------------------------------------------------------------
-: >"$SUMMARY"
 note() { printf '%s\n' "$*" | tee -a "$SUMMARY"; }
+RESULT=0
+MONITOR_FAILED=0
+STAGE_SEQ=0
+CURRENT_STAGE="none"
+CURRENT_PHASE="setup"
+OBSERVED_STAGE_RC="UNKNOWN"
+TERMINAL_REASON="EXIT"
+CURRENT_WATCH_PID=""
+CURRENT_WATCH_STOP=""
+CURRENT_MONITOR="UNKNOWN"
+
+record_cleanup_pending() {
+    # A nonterminal observation before any watcher wait. It is not a child
+    # completion, a clean freeze, or a substitute for driver.exit.
+    printf 'cleanup_pending=1 phase=%s stage=%s stage_exit=%s watcher_pid=%s\n' \
+        "$CURRENT_PHASE" "$CURRENT_STAGE" "$OBSERVED_STAGE_RC" "$CURRENT_WATCH_PID" \
+        >"$RUN_DIR/driver.cleanup-pending" || true
+}
+
+record_driver_exit() {
+    local observed_rc="$1" driver_rc="$1" line summary_ok=0 marker_ok=0 watch_rc
+    trap - EXIT ERR INT TERM
+    record_cleanup_pending
+    # Cooperative stop only: a shell-only signal during a nested source scan
+    # would not prove that its descendants were joined.
+    if [ -n "$CURRENT_WATCH_PID" ]; then
+        if ! : >"$CURRENT_WATCH_STOP"; then
+            CURRENT_MONITOR="UNKNOWN"
+            printf 'could not request watcher stop; cleanup remains pending\n' >&2
+        fi
+        if wait "$CURRENT_WATCH_PID"; then watch_rc=0; else watch_rc=$?; fi
+        [ "$watch_rc" = 0 ] || CURRENT_MONITOR="UNKNOWN"
+    fi
+    line="driver_exit=$observed_rc reason=$TERMINAL_REASON phase=$CURRENT_PHASE stage=$CURRENT_STAGE stage_exit=$OBSERVED_STAGE_RC freeze_monitor=$CURRENT_MONITOR"
+    if printf '%s\n' "$line" >>"$SUMMARY"; then
+        summary_ok=1
+    else
+        driver_rc=1
+        printf 'could not append terminal summary: %s\n' "$line" >&2
+    fi
+    line="driver_exit=UNKNOWN observed_exit=$observed_rc summary_write=$summary_ok marker_write=pending reason=$TERMINAL_REASON phase=$CURRENT_PHASE stage=$CURRENT_STAGE stage_exit=$OBSERVED_STAGE_RC freeze_monitor=$CURRENT_MONITOR"
+    if printf '%s\n' "$line" >"$RUN_DIR/driver.exit"; then
+        # Prepare a regular marker privately, then publish it only after the
+        # final independent driver receipt has been written successfully.
+        if [ ! -e "$RUN_DIR/.done.pending" ] && [ ! -L "$RUN_DIR/.done.pending" ] &&
+           printf 'driver_receipt_complete=1\n' >"$RUN_DIR/.done.pending" &&
+           [ -f "$RUN_DIR/.done.pending" ] && [ ! -L "$RUN_DIR/.done.pending" ]; then
+            line="driver_exit=$driver_rc observed_exit=$observed_rc summary_write=$summary_ok marker_write=1 reason=$TERMINAL_REASON phase=$CURRENT_PHASE stage=$CURRENT_STAGE stage_exit=$OBSERVED_STAGE_RC freeze_monitor=$CURRENT_MONITOR"
+            if printf '%s\n' "$line" >"$RUN_DIR/driver.exit" &&
+               [ ! -e "$RUN_DIR/.done" ] && [ ! -L "$RUN_DIR/.done" ] &&
+               mv -T -- "$RUN_DIR/.done.pending" "$RUN_DIR/.done" &&
+               [ -f "$RUN_DIR/.done" ] && [ ! -L "$RUN_DIR/.done" ]; then
+                marker_ok=1
+            fi
+        fi
+        if [ "$marker_ok" = 0 ]; then
+            driver_rc=1
+            line="driver_exit=1 observed_exit=$observed_rc summary_write=$summary_ok marker_write=0 reason=$TERMINAL_REASON phase=$CURRENT_PHASE stage=$CURRENT_STAGE stage_exit=$OBSERVED_STAGE_RC freeze_monitor=$CURRENT_MONITOR"
+            printf '%s\n' "$line" >"$RUN_DIR/driver.exit" || true
+            [ "$summary_ok" = 0 ] || printf 'driver_marker_failed=1 actual_exit=1\n' >>"$SUMMARY" || true
+            rm -f -- "$RUN_DIR/.done.pending" 2>/dev/null || true
+            printf 'could not publish complete driver marker: %s\n' "$line" >&2
+        fi
+    else
+        driver_rc=1
+        printf 'could not persist independent driver receipt: %s\n' "$line" >&2
+        [ "$summary_ok" = 0 ] || printf 'driver_receipt_failed=1 actual_exit=1\n' >>"$SUMMARY" || true
+    fi
+    # A failed sink changes the real driver exit. The original observed exit
+    # stays visible in the independent receipt when that sink remains usable.
+    if [ "$driver_rc" != "$observed_rc" ]; then exit "$driver_rc"; fi
+}
+set -E
+trap 'TERMINAL_REASON="ERR"' ERR
+trap 'TERMINAL_REASON="SIGINT"; exit 130' INT
+trap 'TERMINAL_REASON="SIGTERM"; exit 143' TERM
+trap 'record_driver_exit "$?"' EXIT
+: >"$SUMMARY"
 note "run_dir=$RUN_DIR"
 note "tree=$ROOT head=$(git rev-parse HEAD) before=$BEFORE"
-RESULT=0
 
 run_stage() { # run_stage <name> <fatal 0|1> <command string>
-    local name="$1" fatal="$2" cmd="$3" log="$RUN_DIR/$1.log" t0 t1 rc
+    local name="$1" fatal="$2" cmd="$3" log="$RUN_DIR/$1.log" t0 t1 rc watch_rc monitor attempt
+    local watch_ready watch_stop watch_done stage_exit_file
+    STAGE_SEQ=$((STAGE_SEQ + 1))
+    watch_ready="$RUN_DIR/.watch-$name-$STAGE_SEQ.ready"
+    watch_stop="$RUN_DIR/.watch-$name-$STAGE_SEQ.stop"
+    watch_done="$RUN_DIR/.watch-$name-$STAGE_SEQ.done"
+    stage_exit_file="$RUN_DIR/$name-$STAGE_SEQ.exit"
+    CURRENT_STAGE="$name"
+    CURRENT_PHASE="stage"
+    OBSERVED_STAGE_RC="UNKNOWN"
+    CURRENT_MONITOR="UNKNOWN"
     t0="$(date +%s)"
     say ">>> [$name] $(date -u +%H:%M:%SZ)  log: $log"
     # Continuous freeze watch: an endpoint-only comparison misses a change that
-    # is made and reverted mid-stage. Every deviation is appended with a time.
-    ( while :; do s="$(tree_state)"; [ "$s" = "$BEFORE" ] || echo "$(date -u +%FT%TZ) stage=$name $s" >>"$RUN_DIR/tree-moved.log"; sleep 5; done ) &
+    # is made and reverted mid-stage. Normal stop is acknowledged by the
+    # watcher; a vanished or failed watcher cannot qualify a frozen run.
+    ( while :; do
+        if s="$(tree_state)"; then :; else
+            printf 'source_sample_failed=1 stage=%s\n' "$name" >"$RUN_DIR/.watch-$name-$STAGE_SEQ.error" || true
+            exit 4
+        fi
+        [ "$s" = "$BEFORE" ] || echo "$(date -u +%FT%TZ) stage=$name $s" >>"$RUN_DIR/tree-moved.log"
+        : >"$watch_ready"
+        [ ! -e "$watch_stop" ] || break
+        sleep 5
+      done
+      : >"$watch_done"
+    ) &
     local watch=$!
-    set +e
-    bash -c "$cmd" >"$log" 2>&1
-    rc=$?
-    set -e
-    kill "$watch" 2>/dev/null; wait "$watch" 2>/dev/null || true
+    CURRENT_WATCH_PID="$watch"
+    CURRENT_WATCH_STOP="$watch_stop"
+    CURRENT_PHASE="watcher_start"
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        [ ! -f "$watch_ready" ] || break
+        kill -0 "$watch" 2>/dev/null || break
+        sleep 0.05
+    done
+    if [ ! -f "$watch_ready" ]; then
+        MONITOR_FAILED=1
+        RESULT=1
+        CURRENT_MONITOR="UNKNOWN"
+        record_cleanup_pending
+        : >"$watch_stop"
+        if wait "$watch"; then watch_rc=0; else watch_rc=$?; fi
+        CURRENT_WATCH_PID=""
+        note "freeze_monitor stage=$name status=UNKNOWN reason=no_initial_sample_or_startup_deadline watcher_exit=$watch_rc"
+        return 1
+    fi
+    CURRENT_PHASE="stage"
+    if bash -c "$cmd" >"$log" 2>&1; then rc=0; else rc=$?; fi
+    OBSERVED_STAGE_RC="$rc"
+    # Preserve the actual child result before fallible watcher/log cleanup.
+    printf '%s\n' "$rc" >"$stage_exit_file"
     t1="$(date +%s)"
     local extra=""
     case "$name" in
@@ -263,7 +412,24 @@ run_stage() { # run_stage <name> <fatal 0|1> <command string>
         pytest|testcontainer) extra=" $(grep -E '^(=+ .*(passed|failed|error).* =+)$' "$log" | tail -n 1 | tr -d '=' | sed 's/^ *//; s/ *$//' || true)" ;;
     esac
     note "stage=$name exit=$rc seconds=$((t1 - t0)) fatal=$fatal$extra"
+    CURRENT_PHASE="watcher_cleanup"
+    record_cleanup_pending
+    : >"$watch_stop"
+    if wait "$watch"; then watch_rc=0; else watch_rc=$?; fi
+    CURRENT_WATCH_PID=""
+    if [ "$watch_rc" = 0 ] && [ -f "$watch_ready" ] && [ -f "$watch_done" ]; then
+        monitor=healthy
+    else
+        monitor=UNKNOWN
+        MONITOR_FAILED=1
+        RESULT=1
+    fi
+    CURRENT_MONITOR="$monitor"
+    note "freeze_monitor stage=$name status=$monitor watcher_exit=$watch_rc"
     if [ "$rc" -ne 0 ] && [ "$fatal" = 1 ]; then RESULT=1; fi
+    CURRENT_STAGE="none"
+    CURRENT_PHASE="between_stages"
+    OBSERVED_STAGE_RC="UNKNOWN"
 }
 
 for s in "${STAGE_LIST[@]}"; do
@@ -272,16 +438,34 @@ for s in "${STAGE_LIST[@]}"; do
     run_stage "$s" "$fatal" "$cmd"
 done
 
-AFTER="$(tree_state)"
-if [ "$AFTER" = "$BEFORE" ] && [ ! -s "$RUN_DIR/tree-moved.log" ]; then
-    note "after=$AFTER frozen=yes"
-elif [ "$AFTER" = "$BEFORE" ]; then
-    note "after=$AFTER frozen=NO — the tree moved mid-run and was restored ($(grep -c . "$RUN_DIR/tree-moved.log") sample(s) in tree-moved.log); this run is not evidence"
-    RESULT=1
+CURRENT_PHASE="final_freeze"
+if AFTER="$(tree_state)"; then
+    FINAL_SAMPLE_OK=1
 else
-    note "after=$AFTER frozen=NO — the tree moved during the run; this run is not evidence"
+    AFTER="UNKNOWN"
+    FINAL_SAMPLE_OK=0
+    MONITOR_FAILED=1
     RESULT=1
 fi
-note "RESULT=$([ "$RESULT" = 0 ] && echo PASS || echo FAIL)"
-touch "$RUN_DIR/.done"
+if [ "$FINAL_SAMPLE_OK" = 0 ]; then
+    note "after=UNKNOWN frozen=UNKNOWN — final source-state sample failed; this run is not evidence"
+elif [ "$AFTER" = "$BEFORE" ] && [ -s "$RUN_DIR/tree-moved.log" ]; then
+    note "after=$AFTER frozen=NO — the tree moved mid-run and was restored ($(grep -c . "$RUN_DIR/tree-moved.log") sample(s) in tree-moved.log); this run is not evidence"
+    RESULT=1
+elif [ "$AFTER" != "$BEFORE" ]; then
+    note "after=$AFTER frozen=NO — the tree moved during the run; this run is not evidence"
+    RESULT=1
+elif [ "$MONITOR_FAILED" = 1 ]; then
+    note "after=$AFTER frozen=UNKNOWN — a stage watcher did not prove its full lifetime"
+    RESULT=1
+else
+    note "after=$AFTER frozen=yes"
+fi
+if [ "$MONITOR_FAILED" = 1 ]; then
+    note "RESULT=INCOMPLETE"
+else
+    note "RESULT=$([ "$RESULT" = 0 ] && echo PASS || echo FAIL)"
+fi
+CURRENT_PHASE="complete"
+TERMINAL_REASON="completed"
 exit "$RESULT"

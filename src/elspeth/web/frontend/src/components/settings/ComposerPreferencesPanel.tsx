@@ -1,5 +1,5 @@
 import { type JSX, useCallback, useEffect, useRef } from "react";
-import { usePreferencesStore } from "@/stores/preferencesStore";
+import { capturePreferenceOwner, requirePreferenceOwner, PreferencesRequestSuperseded, usePreferencesStore } from "@/stores/preferencesStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { useTheme, type Theme } from "@/hooks/useTheme";
 import { Button, Input } from "@/components/ui";
@@ -29,16 +29,27 @@ export function ComposerPreferencesForm({
   const setShowAdvanced = usePreferencesStore((s) => s.setShowAdvanced);
   const { theme, setTheme } = useTheme();
 
+  const activeRef = useRef(false);
+  const ownsMountRef = useRef(capturePreferenceOwner());
+  useEffect(() => {
+    activeRef.current = true;
+    return () => { activeRef.current = false; };
+  }, []);
+
   // TODO(hidden-jobs-settings): Add a user-settings view for hidden jobs
   // (run-bearing sessions archived from the switcher). The session switcher
   // can hide/show archived rows locally, but settings should become the
   // durable management surface for review/restore/delete policy.
 
   const onResetTutorial = useCallback(async () => {
+    const owns = ownsMountRef.current;
     try {
-      await resetTutorial();
-      onResetTutorialComplete?.();
+      requirePreferenceOwner(owns);
+      const receipt = await resetTutorial();
+      receipt.assertCurrent();
+      if (activeRef.current && owns()) onResetTutorialComplete?.();
     } catch (err) {
+      if (!activeRef.current || !owns() || err instanceof PreferencesRequestSuperseded) return;
       console.error("[preferences] resetTutorial failed:", err);
     }
   }, [onResetTutorialComplete, resetTutorial]);
@@ -52,9 +63,12 @@ export function ComposerPreferencesForm({
 
   const onDetailLevelChange = useCallback(
     async (value: boolean) => {
+      const owns = ownsMountRef.current;
       try {
+        requirePreferenceOwner(owns);
         await setShowAdvanced(value);
       } catch (err) {
+        if (!activeRef.current || !owns() || err instanceof PreferencesRequestSuperseded) return;
         // Surfaced via writeError -> role="alert" region below.
         console.error("[preferences] setShowAdvanced failed:", err);
       }

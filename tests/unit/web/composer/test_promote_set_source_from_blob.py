@@ -1120,9 +1120,10 @@ class TestEchoedServerOwnedMetadata:
             assert result.updated_state.version == previous_version + 1
             state = CompositionState.from_dict(json.loads(json.dumps(result.updated_state.to_dict())))
 
+    @pytest.mark.parametrize("public_dispatch", [False, True])
     @pytest.mark.parametrize("same_content", [False, True])
     def test_rebind_approval_is_content_bound_not_blob_id_bound(
-        self, tmp_path: Path, operation_scopes: ExitStack, same_content: bool
+        self, tmp_path: Path, operation_scopes: ExitStack, same_content: bool, public_dispatch: bool
     ) -> None:
         ctx, state, options = self._bound_source(tmp_path, operation_scopes)
         state, resolved_options = self._resolved_state(state, options)
@@ -1137,19 +1138,38 @@ class TestEchoedServerOwnedMetadata:
         )
         assert created.success, created.data
         assert created.data["blob_id"] != options["blob_ref"]
-        result = _execute_set_source_from_blob(
-            {"blob_id": created.data["blob_id"], "on_success": "rows", "options": {"schema": {"mode": "observed"}}}, state, ctx
-        )
-        assert result.success, result.data
-        source_options = result.updated_state.sources["source"].options
-        (requirement,) = deep_thaw(source_options[INTERPRETATION_REQUIREMENTS_KEY])
-        if same_content:
-            assert requirement == resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]
-            assert deep_thaw(source_options[SOURCE_AUTHORING_KEY]) == resolved_options[SOURCE_AUTHORING_KEY]
-        else:
-            assert requirement["status"] == "pending"
-            assert source_options[SOURCE_AUTHORING_KEY]["content_hash"] != resolved_options[SOURCE_AUTHORING_KEY]["content_hash"]
-            assert source_options[SOURCE_AUTHORING_KEY]["review_event_id"] is None
+        arguments = {"blob_id": created.data["blob_id"], "on_success": "rows", "options": {"schema": {"mode": "observed"}}}
+        for _attempt in range(2):
+            if public_dispatch:
+                assert ctx.plugin_snapshot is not None
+                result = execute_tool(
+                    "set_source_from_blob",
+                    arguments,
+                    state,
+                    ctx.catalog,
+                    plugin_snapshot=ctx.plugin_snapshot,
+                    data_dir=ctx.data_dir,
+                    session_engine=ctx.session_engine,
+                    session_id=ctx.session_id,
+                    session_operation_context=ctx.session_operation_context,
+                    session_operation_authority=ctx.session_operation_authority,
+                    validate_arguments=True,
+                    require_data_dir_for_paths=True,
+                )
+            else:
+                result = _execute_set_source_from_blob(arguments, state, ctx)
+            assert result.success, result.data
+            source_options = result.updated_state.sources["source"].options
+            (requirement,) = deep_thaw(source_options[INTERPRETATION_REQUIREMENTS_KEY])
+            if same_content:
+                assert requirement == resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]
+                assert deep_thaw(source_options[SOURCE_AUTHORING_KEY]) == resolved_options[SOURCE_AUTHORING_KEY]
+            else:
+                assert requirement["status"] == "pending"
+                assert requirement["event_id"] is None
+                assert source_options[SOURCE_AUTHORING_KEY]["content_hash"] != resolved_options[SOURCE_AUTHORING_KEY]["content_hash"]
+                assert source_options[SOURCE_AUTHORING_KEY]["review_event_id"] is None
+            state = CompositionState.from_dict(json.loads(json.dumps(result.updated_state.to_dict())))
 
     def test_rebind_changed_bytes_at_same_blob_id_requires_new_approval(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         ctx, approved_state, options = self._bound_source(tmp_path, operation_scopes)

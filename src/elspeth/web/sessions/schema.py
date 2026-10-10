@@ -42,7 +42,7 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # Epoch 70 replaces the persisted tutorial Build stage's old label with build.
 # Epoch 71 is freeform-only, removes the Composer mode preference, and adds
 # ordinary fork/revert receipts. Existing stores are recreated.
-_COORDINATION_HARD_CUT_EPOCH = 71
+_COORDINATION_HARD_CUT_EPOCH = 72
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
@@ -95,6 +95,8 @@ _COORDINATION_HARD_CUT_TABLES: frozenset[str] = frozenset({*_COORDINATION_HARD_C
 # attempt to mutate the protected rows.
 _REQUIRED_AUDIT_TRIGGERS: frozenset[str] = frozenset(
     {
+        "trg_composer_async_operations_transition_guard",
+        "trg_composer_async_operations_no_delete_live",
         "trg_interpretation_events_immutable_resolved",
         "trg_interpretation_events_no_delete_resolved",
         "trg_composer_completion_events_no_update",
@@ -389,6 +391,10 @@ class SessionSchemaAuthority:
                     OR (relation.relname = 'chat_messages' AND trigger.tgname IN (
                       'trg_chat_messages_immutable_content',
                       'trg_chat_messages_no_delete'
+                    ))
+                    OR (relation.relname = 'composer_async_operations' AND trigger.tgname IN (
+                      'trg_composer_async_operations_transition_guard',
+                      'trg_composer_async_operations_no_delete_live'
                     ))
                     OR (relation.relname = 'message_ingress_receipts' AND trigger.tgname IN (
                       'trg_message_ingress_receipts_no_update',

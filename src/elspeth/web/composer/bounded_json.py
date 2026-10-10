@@ -85,9 +85,20 @@ def _preflight_raw_json(raw: str, *, label: str) -> None:
             open_containers -= 1
 
 
-def _validate_decoded_json(value: Any, *, label: str) -> None:
+def _validate_json_structure(
+    value: object,
+    *,
+    label: str,
+    owned_string_type: type[str] | None = None,
+) -> None:
+    """Share fixed JSON bounds with one explicitly owned scalar boundary.
+
+    The raw decoder uses the strict wrapper below. Internal callers may retain
+    one exact nominal string type; its subclasses and nominal object keys are
+    refused, and no value is converted or detached during validation.
+    """
     budget = JsonTraversalBudget()
-    stack: list[tuple[Any, int]] = [(value, 0)]
+    stack: list[tuple[object, int]] = [(value, 0)]
     while stack:
         current, depth = stack.pop()
         budget.check_depth(depth, label=label)
@@ -103,7 +114,7 @@ def _validate_decoded_json(value: Any, *, label: str) -> None:
             budget.consume_items(len(current), label=label)
             stack.extend((child, depth + 1) for child in current)
             continue
-        if type(current) is str:
+        if type(current) is str or (owned_string_type is not None and type(current) is owned_string_type):
             budget.consume_text(current, label=label, enforce_string_limit=False)
             continue
         if current is None or type(current) in {bool, int}:
@@ -111,6 +122,11 @@ def _validate_decoded_json(value: Any, *, label: str) -> None:
         if type(current) is float and math.isfinite(current):
             continue
         raise ValueError(f"{label} contains a value outside strict finite JSON")
+
+
+def _validate_decoded_json(value: Any, *, label: str) -> None:
+    """Validate raw decoded values as exact finite JSON, without nominal types."""
+    _validate_json_structure(value, label=label)
 
 
 def bounded_json_loads(

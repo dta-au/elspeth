@@ -32,8 +32,13 @@ from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.helpers.session_fences import adopt_execute_lease, close_adopted_lease
 from tests.unit.web.execution.test_service import _run_record_stub, _WebSettingsStub, _YamlGeneratorStub
+
+execution_fixture = execution_custody.execution_fixture
+
 
 Outcome = Literal["transient", "running", "cancelled"]
 TRANSIENT: Outcome = "transient"
@@ -61,15 +66,18 @@ def session_service() -> MagicMock:
 
 
 @pytest.fixture
-def service(session_service: MagicMock) -> ExecutionServiceImpl:
+def service(session_service: MagicMock, execution_fixture: ExecutionTestCustody) -> ExecutionServiceImpl:
     mock_loop = MagicMock(spec=asyncio.AbstractEventLoop)
-    return ExecutionServiceImpl.for_trained_operator(
-        loop=mock_loop,
-        broadcaster=ProgressBroadcaster(mock_loop),
-        settings=_WebSettingsStub(),
-        session_service=session_service,
-        yaml_generator=_YamlGeneratorStub(),
-        telemetry=build_sessions_telemetry(),
+    return execution_fixture.bind(
+        ExecutionServiceImpl.for_trained_operator(
+            loop=execution_fixture.loop,
+            broadcaster=ProgressBroadcaster(mock_loop),
+            settings=_WebSettingsStub(),
+            session_service=session_service,
+            yaml_generator=_YamlGeneratorStub(),
+            telemetry=build_sessions_telemetry(),
+            execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+        )
     )
 
 

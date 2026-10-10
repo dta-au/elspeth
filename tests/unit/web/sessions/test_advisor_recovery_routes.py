@@ -20,6 +20,7 @@ from elspeth.web.execution.completion_gates import (
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.helpers.composer_operations import submit_and_settle
 from tests.unit.web.sessions.test_completion_gate_roundtrip import _green_result
 from tests.unit.web.sessions.test_routes import _make_app, _make_authoring_valid_partial
 
@@ -71,18 +72,19 @@ async def test_metadata_recovery_save_does_not_reattribute_prior_advisor_note(tm
     app.state.composer_service = InterruptedComposer()
     if route == "recompose":
         user_message = await service.add_message(session.id, "user", "Revise the intent", writer_principal="route_user_message")
-        request_body = {"expected_user_message_id": str(user_message.id)}
+        request_body = {"expected_user_message_id": str(user_message.id), "operation_id": str(uuid4()), "state_id": str(before.id)}
     else:
-        request_body = {"content": "Revise the intent", "client_request_id": str(uuid4())}
+        request_body = {"content": "Revise the intent", "operation_id": str(uuid4()), "state_id": str(before.id)}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(f"/api/sessions/{session.id}/{route}", json=request_body)
-    assert response.status_code == 422, response.text
+        settled = await submit_and_settle(client, app, path=f"/api/sessions/{session.id}/{route}", body=request_body)
+        status, response_body = settled.error()
+    assert status == 422, response_body
     after = await service.get_current_state(session.id)
     assert after is not None
     assert after.id != before.id
     assert after.version == before.version + 1
-    assert response.json()["detail"]["error_type"] == "convergence"
-    assert response.json()["detail"]["partial_state"]["id"] == str(after.id)
+    assert response_body["detail"]["error_type"] == "convergence"
+    assert response_body["detail"]["partial_state"]["id"] == str(after.id)
     rebuilt = state_from_record(after)
     assert rebuilt.metadata == reviewed.with_metadata(patch).metadata
     reloaded_facts = parse_completion_gates(after.composer_meta)
@@ -156,12 +158,13 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
     app.state.composer_service = DecisionComposer()
     if route == "recompose":
         user_message = await service.add_message(session.id, "user", "Please retry the review", writer_principal="route_user_message")
-        request_body = {"expected_user_message_id": str(user_message.id)}
+        request_body = {"expected_user_message_id": str(user_message.id), "operation_id": str(uuid4()), "state_id": str(before.id)}
     else:
-        request_body = {"content": "Please retry the review", "client_request_id": str(uuid4())}
+        request_body = {"content": "Please retry the review", "operation_id": str(uuid4()), "state_id": str(before.id)}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(f"/api/sessions/{session.id}/{route}", json=request_body)
-    assert response.status_code == 200, response.text
+        settled = await submit_and_settle(client, app, path=f"/api/sessions/{session.id}/{route}", body=request_body)
+    assert settled.final.status_code == 200, settled.final.text
+    response_body = settled.result()
     assert calls == [before.version]
     after = await service.get_current_state(session.id)
     assert after is not None
@@ -170,7 +173,6 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
     rebuilt = state_from_record(after)
     assert completion_gate_fingerprint(rebuilt) == fingerprint
     reloaded_facts = parse_completion_gates(after.composer_meta)
-    response_body = response.json()
     assert response_body["state"]["id"] == str(after.id)
     assert response_body["message"]["composition_state_id"] == str(after.id)
     assert parse_completion_gates(response_body["state"]["composer_meta"]) == reloaded_facts
@@ -231,11 +233,16 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
         ):
             if route == "recompose":
                 user_message = await service.add_message(session.id, "user", "Retry review", writer_principal="route_user_message")
-                request_body = {"expected_user_message_id": str(user_message.id)}
+                request_body = {
+                    "expected_user_message_id": str(user_message.id),
+                    "operation_id": str(uuid4()),
+                    "state_id": str(previous.id),
+                }
             else:
-                request_body = {"content": "Retry review", "client_request_id": str(uuid4())}
-            response = await client.post(f"/api/sessions/{session.id}/{route}", json=request_body)
-            assert response.status_code == 200, response.text
+                request_body = {"content": "Retry review", "operation_id": str(uuid4()), "state_id": str(previous.id)}
+            settled = await submit_and_settle(client, app, path=f"/api/sessions/{session.id}/{route}", body=request_body)
+            assert settled.final.status_code == 200, settled.final.text
+            settled.result()
             record = await service.get_current_state(session.id)
             assert record is not None
             assert (record.id != previous.id) is should_save

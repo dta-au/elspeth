@@ -10,9 +10,9 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from scripts.composer_acceptance.artifacts import current_artifacts
 from scripts.composer_acceptance.checks import check_case
@@ -41,7 +41,11 @@ class ApiClient:
             headers["Authorization"] = "Bearer " + self.token
         req = urllib.request.Request(self.base + path, data=None if body is None else json.dumps(body).encode(), headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=950 if body is not None else 15) as response:
+            with urllib.request.urlopen(
+                req, timeout=30 if body is not None and path.endswith("/messages") else 950 if body is not None else 15
+            ) as response:
+                if body is not None and path.endswith("/messages") and response.status != 202:
+                    raise ValueError("Composer operation admission must return HTTP 202")
                 content = response.read()
                 if not isinstance(content, bytes):
                     raise ValueError("HTTP response body is not bytes")
@@ -70,21 +74,59 @@ def authenticate(api: ApiClient, output: Path) -> None:
 
 
 def compose(api: ApiClient, prefix: str, prompt: str, out: Path, index: int) -> dict[str, Any]:
-    save(out / f"turn-{index}.request.json", {"content": prompt})
-    samples = []
+    request_path = out / f"turn-{index}.request.json"
+    admission_unknown = request_path.exists()
+    if admission_unknown:
+        body = json.loads(request_path.read_text())
+        if body["content"] != prompt:
+            raise ValueError("Pending composer request differs from the retained immutable action")
+        operation_id = body["operation_id"]
+    else:
+        current = api.json(prefix + "/state")
+        operation_id = str(uuid4())
+        body = {"content": prompt, "operation_id": operation_id, "state_id": current["id"] if current is not None else None}
+        save(request_path, body)
     started = time.monotonic()
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(api.json, prefix + "/messages", {"content": prompt})
-        while True:
-            try:
-                result = future.result(timeout=5)
-                break
-            except TimeoutError:
-                if future.done():
-                    result = future.result()
-                    break
-                samples.append(api.json(prefix + "/composer-progress"))
-                save(out / f"turn-{index}.progress.json", samples)
+    operation_path = prefix + "/operations/" + operation_id
+    observation_deadline = started + 950
+    if not admission_unknown:
+        try:
+            accepted = api.json(prefix + "/messages", body)
+        except (urllib.error.URLError, TimeoutError):
+            admission_unknown = True
+        else:
+            save(out / f"turn-{index}.accepted.json", accepted)
+    samples = []
+    while True:
+        if time.monotonic() >= observation_deadline:
+            api.json(operation_path + "/cancel", {})
+            raise TimeoutError("Composer operation observation exceeded the acceptance deadline")
+        try:
+            snapshot = api.json(operation_path)
+        except ApiError as exc:
+            if admission_unknown and exc.status == 404 and json.loads(exc.body) == {"detail": "Operation not found"}:
+                # Retain the same immutable action if the first insert may still commit.
+                try:
+                    api.json(prefix + "/messages", body)
+                except (urllib.error.URLError, TimeoutError):
+                    time.sleep(1)
+                    continue
+                admission_unknown = False
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError):
+            time.sleep(1)
+            continue
+        if snapshot["status"] == "completed":
+            result = snapshot["result"]
+            break
+        if snapshot["status"] == "failed":
+            error = snapshot["error"]
+            raise ApiError(error["http_status"], json.dumps(error["body"]))
+        observation_deadline = min(observation_deadline, time.monotonic() + snapshot["deadline_remaining_ms"] / 1000 + 30)
+        samples.append(snapshot)
+        save(out / f"turn-{index}.progress.json", samples)
+        time.sleep(snapshot["poll_after_ms"] / 1000)
     save(out / f"turn-{index}.response.json", result)
     save(out / f"turn-{index}.timing.json", {"elapsed_seconds": time.monotonic() - started})
     save(out / f"turn-{index}.messages.json", api.json(prefix + "/messages?include_raw_content=true"))
@@ -338,11 +380,20 @@ def run_case(
         if checkpoint["user_turns"] >= scenario["max_user_turns"]:
             raise ValueError("Scenario user-turn budget exhausted")
         checkpoint["user_turns"] += 1
+        checkpoint["pending_turn"] = {"index": checkpoint["user_turns"], "prompt": prompt}
         save(checkpoint_path, checkpoint)
         compose(api, prefix, prompt, out, checkpoint["user_turns"])
         save(out / f"turn-{checkpoint['user_turns']}.state.json", api.json(prefix + "/state"))
+        del checkpoint["pending_turn"]
+        save(checkpoint_path, checkpoint)
 
     try:
+        if "pending_turn" in checkpoint:
+            pending = checkpoint["pending_turn"]
+            compose(api, prefix, pending["prompt"], out, pending["index"])
+            save(out / f"turn-{pending['index']}.state.json", api.json(prefix + "/state"))
+            del checkpoint["pending_turn"]
+            save(checkpoint_path, checkpoint)
         execution_path = out / "execute.json"
         execution = json.loads(execution_path.read_text()) if execution_path.exists() else None
         if checkpoint["status"] == "executing":

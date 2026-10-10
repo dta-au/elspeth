@@ -29,6 +29,7 @@ class ScenarioApi(ApiClient):
         self.pending = False
         self.approved = False
         self.turns = 0
+        self.operations: dict[str, dict] = {}
 
     def json(self, path: str, body: dict | None = None):
         self.sent.append((path, body))
@@ -57,7 +58,13 @@ class ScenarioApi(ApiClient):
             self.turns += 1
             if not self.approved:
                 self.pending = True
-            return {"message": {"content": "Fixture proposal"}}
+            operation_id = body["operation_id"]
+            assert body["state_id"] == self.state["id"]
+            result = {"message": {"content": "Fixture proposal"}}
+            self.operations[operation_id] = {"status": "completed", "operation_id": operation_id, "result": result}
+            return {"operation_id": operation_id, "status": "queued", "poll_path": "/api/sessions/session-test/operations/" + operation_id}
+        if "/operations/" in path:
+            return self.operations[path.rsplit("/", 1)[-1]]
         if path.endswith("/messages?include_raw_content=true"):
             return [
                 {
@@ -452,3 +459,60 @@ def test_collector_reads_only_run_bound_runtime_calls_and_physical_blobs(tmp_pat
     blob_path.write_text("changed")
     changed = measured_runtime_evidence(tmp_path, out, scenario, state, run)
     assert changed["input_blobs"][0]["physical_after_hash"] != digest
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_ambiguous_admission_recovers_only_exact_operation_and_body(tmp_path: Path, committed: bool) -> None:
+    class AmbiguousApi(ScenarioApi):
+        def __init__(self):
+            super().__init__(CASES[0])
+            self.submissions: list[dict] = []
+
+        def json(self, path: str, body: dict | None = None):
+            if path.endswith("/messages") and body is not None:
+                self.submissions.append(dict(body))
+                if len(self.submissions) == 1:
+                    if committed:
+                        super().json(path, body)
+                    raise TimeoutError("Admission acknowledgement was lost")
+            if "/operations/" in path and path.rsplit("/", 1)[-1] not in self.operations:
+                raise runner.ApiError(404, json.dumps({"detail": "Operation not found"}))
+            return super().json(path, body)
+
+    api = AmbiguousApi()
+    result = compose(api, "/api/sessions/session-test", "One immutable request", tmp_path, 1)
+    assert result["message"]["content"] == "Fixture proposal"
+    assert api.turns == 1
+    assert len(api.submissions) == (1 if committed else 2)
+    assert all(body == api.submissions[0] for body in api.submissions)
+    saved = json.loads((tmp_path / "turn-1.request.json").read_text())
+    assert saved == api.submissions[0]
+    assert not any(path.endswith("composer-progress") for path, _ in api.sent)
+
+
+def test_resume_reconciles_retained_composer_job_before_any_next_prompt(tmp_path: Path) -> None:
+    class InterruptedComposerApi(ScenarioApi):
+        interrupted = False
+
+        def json(self, path: str, body: dict | None = None):
+            if "/operations/" in path and not self.interrupted:
+                self.interrupted = True
+                raise KeyboardInterrupt
+            return super().json(path, body)
+
+    case = next(case for case in CASES if case["id"] == "01_cleanup_edit")
+    api = InterruptedComposerApi(case)
+    _session_store(tmp_path)
+    with pytest.raises(KeyboardInterrupt):
+        run_case(api, case, tmp_path, set())
+    out = tmp_path / "cases" / case["id"]
+    retained_bytes = (out / "turn-1.request.json").read_bytes()
+    checkpoint = json.loads((out / "checkpoint.json").read_text())
+    assert checkpoint["pending_turn"] == {"index": 1, "prompt": case["turns"][0]}
+    assert api.turns == 1
+    result = run_case(api, case, tmp_path, set())
+    assert result["status"] == "needs_review"
+    assert "pending_turn" not in result
+    assert result["user_turns"] == 1 and api.turns == 1
+    assert (out / "turn-1.request.json").read_bytes() == retained_bytes
+    assert (out / "turn-1.response.json").is_file()

@@ -55,7 +55,7 @@ def test_load_config_happy_path_uses_defaults_for_optional_vars():
     assert config.bounds.max_tools == 10
     assert config.bounds.temperature_min == 0.0
     assert config.bounds.temperature_max == 2.0
-    assert config.bounds.max_max_tokens == 32768
+    assert config.bounds.max_max_tokens == 64000
     assert config.model_mappings == {"gpt-4o": {"target": "backend-a"}}
     assert config.inbound_bearer.get_secret_value() == "b" * 40
 

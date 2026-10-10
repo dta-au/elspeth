@@ -25,6 +25,7 @@ from elspeth.web.blobs.protocol import BlobForkWriteFence, fork_blob_id
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.config import WebSettings
+from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blobs_table,
@@ -53,6 +54,7 @@ from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_u
 from tests.helpers.session_fences import create_blob_under_fence, read_blob_content_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
+from tests.unit.web.sessions.test_service import _admit_durable_ingress
 
 
 @pytest.fixture
@@ -466,15 +468,39 @@ class TestForkSession:
     async def test_forked_history_does_not_copy_ingress_request_identity(self, engine, service) -> None:
         session = await service.create_session("alice", "Request identity", "local")
         request_id = uuid.uuid4()
-        first = await service.add_message_with_transcript(
-            session.id,
-            "user",
-            "first",
-            client_request_id=request_id,
-            requested_state_id=None,
-            writer_principal="route_user_message",
+        authority, admitted, fresh = _admit_durable_ingress(
+            service, session.id, operation_id=request_id, content="first", requested_state_id=None
         )
+        assert fresh and admitted.operation_id == str(request_id)
+        (claim,) = authority.claim_next(limit=1)
+        context = service.session_operation_authority.start_composer_async_operation(
+            claim,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+            auth_provider_type="local",
+        )
+        try:
+            first = await service.add_message_with_transcript(
+                session.id,
+                "user",
+                "first",
+                operation_id=request_id,
+                requested_state_id=None,
+                writer_principal="route_user_message",
+                session_operation_context=context,
+                running=ComposerOperationRunning(claim=claim, session_operation_context=context),
+            )
+        finally:
+            service.session_operation_authority.release(context)
         assert isinstance(first, MessageIngressFresh)
+        assert first.message.operation_id == request_id
+        with engine.connect() as conn:
+            parent_receipt = conn.execute(
+                select(message_ingress_receipts_table.c.operation_id, message_ingress_receipts_table.c.user_message_id).where(
+                    message_ingress_receipts_table.c.session_id == str(session.id)
+                )
+            ).one()
+        assert parent_receipt == (str(request_id), str(first.message.id))
         fork_point = await service.add_message(session.id, "user", "second", writer_principal="route_user_message")
         child, _, _ = await _fork_session(
             service,
@@ -486,7 +512,7 @@ class TestForkSession:
         )
         child_messages = await service.get_messages(child.id, limit=None)
         assert any(message.content == "first" for message in child_messages)
-        assert all(message.client_request_id is None for message in child_messages)
+        assert all(message.operation_id is None for message in child_messages)
         with engine.connect() as conn:
             assert (
                 conn.scalar(

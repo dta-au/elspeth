@@ -1,0 +1,166 @@
+{
+  "scope": "Independent source/AST/byte verification only. No publisher, constructor, test, runner, project import, provider or child invocation. Worker publication instrumentation is author evidence, not native control evidence.",
+  "manifest_note": "No manifest.json exists; guards.json and frozen-summary.json supply the actual package bindings. Initial read request reported missing manifest file; no source mutation.",
+  "existing_files": [
+    {
+      "path": "tests/e2e/recovery/test_sink_effect_deployment_profiles.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/integration/cli/test_state_engine_lifecycle_profiles.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/integration/pipeline/test_composer_runtime_agreement.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/integration/web/composer/parity/test_readiness_preflight_profile_lowering.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/integration/web/composer/test_interpretation_run_backstop.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/integration/web/test_plugin_policy_end_to_end.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/integration/web/test_preflight_per_class.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/testcontainer/web/test_cross_process_execution_handoff_postgres.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/testcontainer/web/test_cross_process_run_reconciliation_postgres.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_loss_watcher_backoff.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_service.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_session_operation_lease.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_validate_blob_inline.py",
+      "preimage_guard": true,
+      "replacement_guard": true,
+      "live_preimage_matches": true,
+      "preimage_equals_package5": true,
+      "replacement_equals_package5": true
+    }
+  ],
+  "new_files": [
+    {
+      "path": "tests/helpers/execution_custody.py",
+      "sha256": "93808a65d9b7af2bdce63d27a4a09fe1f6b44fa39bfc60b114cc36f404f15ce0",
+      "guard": true,
+      "repository_absence": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_execution_constructor_custody.py",
+      "sha256": "4045c31f53787b1e21c8ce41bd014023577621c959b77c9a43ca3b2ebaab02b0",
+      "guard": true,
+      "repository_absence": true
+    }
+  ],
+  "helper_unchanged_from_package5": true,
+  "control_change_projects_exactly_to_prior_AST": true,
+  "all_original_control_assertion_AST_unchanged": true,
+  "assertion_mutant_rejected": true,
+  "parent_function_byte_identical": true,
+  "process_cleanup_function_byte_identical": true,
+  "AST_publication_call_sites_not_runtime_count": 4,
+  "atomic_patch_exact": true,
+  "complete_patch_exact": true,
+  "complete_patch_sha256": "5b73e3fad1c1d32ba89f708e721db0c682be2490b18c277f74ec6117f322fc4c",
+  "atomic_patch_sha256": "c0492ec028ab49627a1c49dd39308a90bf47912021e733eabae042b7e62af350",
+  "guarded_controls": [
+    {
+      "name": "late-selected-draining",
+      "runner_identical_to_package5": true,
+      "mutant_identical_to_package5": true,
+      "source_preimage_identical_to_package5": true,
+      "case_only_control_hash_changed": true,
+      "current_helper_guard": true,
+      "current_control_guard": true
+    },
+    {
+      "name": "allocation-error-abandons-later-join",
+      "runner_identical_to_package5": true,
+      "mutant_identical_to_package5": true,
+      "source_preimage_identical_to_package5": true,
+      "case_only_control_hash_changed": true,
+      "current_helper_guard": true,
+      "current_control_guard": true
+    }
+  ],
+  "worker_publication_evidence": {
+    "actual_publisher_AST_isolated": true,
+    "project_imports_executed": false,
+    "native_tests_executed": false,
+    "staged_partial_not_published": true,
+    "complete_positive_readable": true,
+    "partial_successor_preserves_previous_complete_document": true,
+    "complete_successor_replaces_document": true,
+    "former_direct_partial_reader_rejected": true
+  },
+  "verdict": "Narrow source GO; C1 resolved by same-directory atomic publication. F1/F2 helper assessment unchanged. Native controls, canonical fixtures, coherent source and whole-tree/runtime gates HOLD."
+}

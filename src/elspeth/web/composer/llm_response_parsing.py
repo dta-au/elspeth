@@ -67,7 +67,7 @@ from elspeth.web.composer.bounded_json import (
     JsonTraversalBudget,
     require_bounded_text,
 )
-from elspeth.web.composer.provider_quota import bind_provider_attempt
+from elspeth.web.composer.provider_quota import ProviderCallCustody, bind_provider_attempt
 from elspeth.web.credential_guard import require_no_credential_material_in_llm_metadata
 
 if TYPE_CHECKING:
@@ -672,6 +672,7 @@ def build_llm_call_record(
     planner_policy_hash: str | None = None,
     planner_call_ordinal: int | None = None,
     credential_surface: str = "composer_provider_response",
+    provider_custody: ProviderCallCustody | None = None,
 ) -> ComposerLLMCall:
     if response_metadata is None:
         usage = token_usage_from_response(response)
@@ -760,7 +761,7 @@ def build_llm_call_record(
         tool_contract_dialect=tool_contract_dialect,
         strict_tool_count=strict_tool_count,
     )
-    return bind_provider_attempt(call)
+    return provider_custody.bind_call(call) if provider_custody is not None else bind_provider_attempt(call)
 
 
 def attach_llm_calls(

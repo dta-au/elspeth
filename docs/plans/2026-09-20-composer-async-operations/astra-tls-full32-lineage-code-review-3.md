@@ -1,0 +1,49 @@
+<!-- Durable copy: machine paths normalized; exact private original retained. -->
+
+# Actual Astra TLS lineage observer successor 3 review
+
+**Bounded source GO for the exact observer-only delta as an external diagnostic candidate.** Root may compose it with the previously reviewed isolated child/controller and use its independently owned finite original-test runner. Actual pytest-rewritten instruction binding and a complete new native capture remain unproved. The earlier inconclusive capture is not retroactively repaired; no historical worker_lost cause, sibling-load guarantee or broader runtime clearance follows.
+
+Evidence: `astra-tls-full32-lineage-code-review-3-evidence.json`.
+
+## Exact source and scope
+
+Observer replacement SHA-256: `57cbc088cf356832cf19955dbcc0ab5c95ea717c9c56d7c6b6583e5a2bb185b7`; exact predecessor: `515c3269873d837bba36b3d22eac1fd89985f72fb304020e0cf48c0526b3d7e8`; patch: `d8013d367ff7519f096b3e332f60c2386f9bac84a2650aecf97cfb595c15fd5c`; manifest: `18501b911e466b34fcc46194bf68b20ec41669389f68bdec370a73dd1ec7c173`.
+
+I read the report, complete new anchor functions, changed observer methods and their prior full-source context, patch, full source-only control and completed log/exit. I also read the retained original native log/exit and child/parent result records, and independently inspected its raw capture JSON. This is a delta review carried on exact prior bytes, not a new review of all unchanged production modules.
+
+Independent checks verified all 11 manifest entries, exact observer preimage, unchanged parser and guard bytes, and patch reconstruction after stripping only diff-header timestamps. The only existing top-level definition changed is `TLSLineage`; its existing method changes are `__init__`, `_verify_sources`, `_observe`, with new `_bind_test_code`. New top-level helpers are `_unique_opcode` and `opcode_catalog`. Every other existing definition is AST-identical. All 30 current production/test/helper guard hashes still match. The strict parser is unchanged at `6b784db79828fbdb12c14a194894929cc10fd099482a2303768d2ca5982cce6b`.
+
+This package does not include a new controller or child. The original TLS2 child remains ineligible because of its separately reviewed dotenv blocker; composition must retain the exact isolated child successor, existing bounded process custody and default-off invocation gate. A fresh composed-overlay byte check remains root's responsibility.
+
+## Prior native result remains separated
+
+The retained native log records the unchanged original TLS test passing once, with three warnings, in 10.84 seconds. Raw capture reports internal pytest exit 0. Its child result is INCONCLUSIVE_CAPTURE and native child exit 3; the parent result records child 3, joined true and one wait, with an original AssertionError. This agrees with the root's reported parent exit 2; it is not a successful diagnostic capture.
+
+Independent raw JSON counting finds 16 operation_post, 16 operation_admitted and eight final snapshots, plus duplicated saturation/overflow and four gate-open events. The report does not hide these by rewriting the parser or deduplicating retained data. The existing parser correctly refuses these counts. The raw failure is preserved as evidence of this observation defect, not evidence that sixteen HTTP submissions actually happened or that the historical worker_lost cause is known.
+
+## Instruction-bound line capture
+
+The new code still consumes `line` events. It does not depend on `opcode` callbacks. It reads `frame.f_lasti` and binds offsets from the actual executing CodeType, checking selected code name, filename, first source line, instruction uniqueness, source positions and expected instruction relationships. Numeric offsets printed by the unrewritten-source control are not embedded into the observer.
+
+The selected POST boundary is the unique keyword tuple immediately before the original HTTP CALL_KW. Admission is the original paths.append call after the unchanged HTTP-202 assertion. Saturation is a unique source-position boundary after the actual JSON call. Gate request is the release_pool load before the actual set call; gate-open is the first selected tuple-building boundary after that call's return. Overflow records entry into the actual branch body instead of repeatedly counting evaluation of its if condition.
+
+These anchors correspond to particular executions, not operation-ID filtering. Every visit to the selected offset can emit a record; a genuine second execution remains visible and the strict parser can reject it. The admitted record still reads the actual response status/public ID, gate-open still checks the actual Event, and pool counters still come from the current actual source. The public final snapshot, original assertion/error identity, renewal/watcher lineage and terminal selection logic remain unchanged.
+
+Binding happens on the selected frame's call event. A missing/ambiguous opcode, unexpected code provenance or unsupported layout raises inside the existing observer trace protection, setting capture_inconclusive and recording an observer error. Missing anchors cannot silently select arbitrary later events as completion evidence. The protected phases no longer fall back to every matching source-line callback. Other phase behavior remains unchanged and is still subject to the strict parser.
+
+The source-position/end-line constraints deliberately pin this unchanged test and interpreter family. They are not a general compiler abstraction. In particular, pytest rewrites assertions and may introduce additional instructions with the same source positions. Such an actual code object can be rejected even though the unrewritten source compiled successfully. This is a disclosed runtime applicability uncertainty, not authority to loosen uniqueness or parser counts.
+
+## Controls and their limits
+
+The complete authored control compiles the exact original source without importing or executing the project test, binds both original and nested pool code, and exercises an AST-extracted original 3+4+1 admission loop with instrument-owned fake clients. Its completed exit-0 log under Python 3.13.15 records 16 raw line events but eight selected offset events for each POST/admission phase. The fake clients' call counts and returned paths independently distinguish real loop activity from trace event multiplicity. They provide trace-mechanism evidence only, not HTTP, SQL or executor-custody evidence.
+
+Duplicating either actual call statement at the same source position makes unique binding fail. Changed code first-line and filename also fail provenance binding. These are meaningful source/instrument negatives. Pool anchors are checked against compiled original source, but the control does not execute the real pool or simulate all pytest rewrite layouts. No new native capture has demonstrated the anchors under the exact selected pytest rewrite.
+
+The report mentions a prior no-opcode-callback experiment. The selected implementation needs no such callback, so approval does not depend on promoting that unbundled experiment into an independent result. I rely on the actual line-event control source and its complete recorded output. I ran only source/AST/hash and retained-JSON checks; no candidate/project module, pytest, child, TLS, SQL or provider was executed by this reviewer.
+
+## Disposition
+
+No new blocking source defect was found in this bounded diagnostic delta. A root-owned finite native invocation may determine whether the actual rewritten code binds. If it does, root must still inspect full raw capture, exact eight POST/admissions, required single pool phases, all original assertions/identities, no observer errors, before/after source guards and actual child join. If it does not, the result remains inconclusive and needs an exact new source review; a generic timeout, missing capture or passed original test alone is not diagnostic success.
+
+The original test, timers, gates, 16-running/16-queued cap, 33rd refusal, eight-success expectation and production semantics are unchanged. The scanner successor-3 NO-GO, source51/52 and full recipe holds, original 102 obligations/four collections/two UNKNOWNs, PostgreSQL/provider/full-suite gates and John's final manual/local/merge decisions remain separate and intact.

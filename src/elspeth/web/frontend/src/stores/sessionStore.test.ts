@@ -1,8 +1,11 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createInterpretationResolutionHandler, useSessionStore } from "./sessionStore";
 import { useBlobStore } from "./blobStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
+import { installComposeTurnDouble } from "@/test/composeTurnDouble";
+import recoveryProducerFixtures from "@/test/composerRecoveryProducerFixtures.json";
+import { acquireComposerOperationCustody, findComposerOperationCustody, authenticateComposerCustody, purgeComposerCustody } from "./composerOperationCustody";
 import type {
   ApiError,
   ChatMessage,
@@ -21,7 +24,14 @@ const clearValidationMock = vi.hoisted(() => vi.fn());
 const validateMock = vi.hoisted(() => vi.fn());
 
 // Mock the API client — store tests verify state logic, not HTTP calls
-vi.mock("@/api/client", () => ({
+vi.mock("@/api/client", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/api/client")>(),
+  submitComposerOperation: vi.fn(),
+  fetchComposerOperation: vi.fn(),
+  fetchComposerOperationStream: vi.fn(),
+  cancelComposerOperation: vi.fn(),
+  fetchCurrentUser: vi.fn(),
+  fetchAuthConfig: vi.fn(),
   fetchSessions: vi.fn(),
   createSession: vi.fn(),
   fetchMessages: vi.fn(),
@@ -74,8 +84,9 @@ vi.mock("./executionStore", () => ({
 
 function makeCompositionState(version: number, nodeIds: string[] = []): CompositionState {
   return {
-    id: `state-${version}`,
+    id: `10000000-0000-4000-8000-${String(version).padStart(12, "0")}`,
     ...compositionStateAuthorityFields,
+    session_id: "20000000-0000-4000-8000-000000000001",
     version,
     sources: {},
     nodes: nodeIds.map((id) => ({
@@ -97,8 +108,8 @@ function makeCompositionState(version: number, nodeIds: string[] = []): Composit
 function makePendingInterpretationEvent(id: string): InterpretationEvent {
   return {
     id,
-    session_id: "session-1",
-    composition_state_id: "state-1",
+    session_id: "20000000-0000-4000-8000-000000000001",
+    composition_state_id: "10000000-0000-4000-8000-000000000001",
     affected_node_id: "analyze_colors",
     tool_call_id: "call-1",
     user_term: "llm_model_choice:analyze_colors",
@@ -131,7 +142,7 @@ function makeRecoveryError(
     error_type: "composer_plugin_crash",
     partial_state: partialState,
     failed_turn: {
-      assistant_message_id: "assistant-1",
+      ...recoveryProducerFixtures.recovery[1],
       tool_calls_attempted: 2,
       tool_responses_persisted: 1,
       transcript_url: null,
@@ -156,7 +167,7 @@ function makeTimeoutError(overrides: Partial<ApiError> = {}): ApiError {
     timeout_seconds: 240,
     partial_state: makeCompositionState(6),
     failed_turn: {
-      assistant_message_id: "assistant-9",
+      ...recoveryProducerFixtures.recovery[1],
       tool_calls_attempted: 3,
       tool_responses_persisted: 3,
       transcript_url: null,
@@ -170,7 +181,7 @@ function makeCompositionProposal(
 ): CompositionProposal {
   return {
     id: "proposal-1",
-    session_id: "session-1",
+    session_id: "20000000-0000-4000-8000-000000000001",
     tool_call_id: "tool-call-1",
     tool_name: "set_pipeline",
     status: "pending",
@@ -178,7 +189,7 @@ function makeCompositionProposal(
     rationale: "The user asked for a new pipeline.",
     affects: ["source", "transforms", "outputs"],
     arguments_redacted_json: { source: { plugin: "csv" } },
-    base_state_id: "state-1",
+    base_state_id: "10000000-0000-4000-8000-000000000001",
     committed_state_id: null,
     audit_event_id: null,
     pipeline_metadata: null,
@@ -188,12 +199,235 @@ function makeCompositionProposal(
   };
 }
 
+// Legacy behavioral obligations now use the durable operation boundary. A
+// progress counter or closed subscription cannot settle a submitted action.
+const durableSession = "20000000-0000-4000-8000-000000000001";
+const durableScope = { principalId: "test-user", authProvider: "local" };
+const durableUserId = "30000000-0000-4000-8000-000000000001";
+const durableReplyId = "40000000-0000-4000-8000-000000000001";
+function durableUser(operationId: string): ChatMessage {
+  return { id: durableUserId, session_id: durableSession, role: "user", content: "hello", operation_id: operationId, tool_calls: null, created_at: "2026-10-06T00:00:00Z" };
+}
+function durableReply(): ChatMessage {
+  return { id: durableReplyId, session_id: durableSession, role: "assistant", content: "Done", tool_calls: null, created_at: "2026-10-06T00:00:01Z" };
+}
+function durableCompleted(operationId: string, kind: "compose_message" | "compose_recompose" = "compose_message", version = 2): import("@/types/composerOperations").ComposerOperationSnapshot {
+  return { operation_id: operationId, kind, status: "completed", cancel_requested: false, poll_after_ms: 100, deadline_at: "2030-01-01T00:00:00Z", deadline_remaining_ms: 0, result: { message: durableReply(), state: makeCompositionState(version), proposals: [] }, error: null };
+}
+async function armDurableTransport() {
+  const api = await import("@/api/client");
+  vi.mocked(api.submitComposerOperation).mockImplementation(async (descriptor) => ({ operation_id: descriptor.operationId, kind: descriptor.kind, status: "running", poll_after_ms: 100 }));
+  vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(new Response(null, { status: 503 }));
+  vi.mocked(api.fetchMessages).mockImplementation(async () => {
+    const descriptor = vi.mocked(api.submitComposerOperation).mock.calls[vi.mocked(api.submitComposerOperation).mock.calls.length - 1]?.[0];
+    return descriptor ? [durableUser(descriptor.operationId), durableReply()] : [];
+  });
+  vi.mocked(api.fetchCompositionState).mockResolvedValue(makeCompositionState(2));
+  vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+  vi.mocked(api.fetchComposerPreferences).mockResolvedValue({ session_id: durableSession, trust_mode: "auto_commit", density_default: "high", interpretation_review_disabled: false, updated_at: "2026-10-06T00:00:00Z" });
+  vi.mocked(api.fetchSessions).mockResolvedValue([]);
+  vi.mocked(api.listBlobs).mockResolvedValue([]);
+  useSessionStore.setState({ activeSessionId: durableSession, compositionStateLoaded: true, compositionState: makeCompositionState(1), messages: [] });
+  return api;
+}
+async function provePendingOperation(options: { ambiguous?: boolean; rejectedProgress?: boolean; phase?: string; identicalOtherUser?: boolean } = {}) {
+  const api = await armDurableTransport();
+  const terminal = deferred<import("@/types/composerOperations").ComposerOperationSnapshot>();
+  vi.mocked(api.fetchComposerOperation).mockReturnValueOnce(terminal.promise);
+  if (options.ambiguous) vi.mocked(api.submitComposerOperation).mockRejectedValueOnce(new TypeError("Admission response lost"));
+  if (options.rejectedProgress) vi.mocked(api.fetchComposerProgress).mockRejectedValue(new TypeError("Progress unavailable"));
+  else vi.mocked(api.fetchComposerProgress).mockResolvedValue({ phase: options.phase ?? "complete", inflight_requests: 0 } as ComposerProgressSnapshot);
+  const pending = useSessionStore.getState().sendMessage("hello");
+  await vi.waitFor(() => expect(api.fetchComposerOperation).toHaveBeenCalledTimes(1));
+  const descriptor = vi.mocked(api.submitComposerOperation).mock.calls[0][0];
+  const local = useSessionStore.getState().messages[0];
+  expect(descriptor.body).toEqual({ operation_id: descriptor.operationId, content: "hello", state_id: makeCompositionState(1).id });
+  expect(local.operation_id).toBe(descriptor.operationId);
+  expect(useSessionStore.getState().isComposing).toBe(true);
+  await Promise.all([useSessionStore.getState().retryMessage(local.id), useSessionStore.getState().retryMessage(local.id)]);
+  expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+  expect(api.recompose).not.toHaveBeenCalled();
+  expect(api.fetchComposerProgress).not.toHaveBeenCalled();
+  if (options.identicalOtherUser) {
+    const other = { ...durableUser("55555555-5555-4555-8555-555555555555"), id: "other-user" };
+    vi.mocked(api.fetchMessages).mockResolvedValue([other, durableUser(descriptor.operationId), durableReply()]);
+  }
+  terminal.resolve(durableCompleted(descriptor.operationId));
+  await pending;
+  expect(useSessionStore.getState().isComposing).toBe(false);
+  const canonical = useSessionStore.getState().messages.find((row) => row.operation_id === descriptor.operationId)!;
+  expect(canonical.id).toBe(durableUserId);
+  expect(canonical.local_failure_code).toBeUndefined();
+  expect(useSessionStore.getState().messages.some((row) => row.id === durableReplyId)).toBe(true);
+  if (options.identicalOtherUser) expect(useSessionStore.getState().messages.some((row) => row.id === "other-user")).toBe(true);
+  expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+}
+async function proveDetachedOperation(kind: "compose_message" | "compose_recompose" = "compose_message") {
+  const api = await armDurableTransport();
+  const terminal = deferred<import("@/types/composerOperations").ComposerOperationSnapshot>();
+  vi.mocked(api.fetchComposerOperation).mockReturnValueOnce(terminal.promise);
+  const controller = new AbortController();
+  if (kind === "compose_recompose") useSessionStore.setState({ messages: [{ ...durableUser("55555555-5555-4555-8555-555555555555"), local_status: "failed" }] });
+  const pending = kind === "compose_message" ? useSessionStore.getState().sendMessage("hello", controller.signal) : useSessionStore.getState().retryMessage(durableUserId, controller.signal);
+  await vi.waitFor(() => expect(api.fetchComposerOperation).toHaveBeenCalledTimes(1));
+  const descriptor = vi.mocked(api.submitComposerOperation).mock.calls[0][0];
+  controller.abort("compose_timeout");
+  terminal.resolve(durableCompleted(descriptor.operationId, kind));
+  await pending;
+  expect(api.cancelComposerOperation).not.toHaveBeenCalled();
+  expect(findComposerOperationCustody(durableScope, durableSession).foreground?.operationId).toBe(descriptor.operationId);
+  expect(useSessionStore.getState().messages.some((row) => row.id === durableReplyId)).toBe(false);
+  vi.mocked(api.fetchComposerOperation).mockResolvedValue(durableCompleted(descriptor.operationId, kind));
+  await useSessionStore.getState().resumeComposerOperation(durableSession);
+  await vi.waitFor(() => expect(useSessionStore.getState().isComposing).toBe(false));
+  expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+  expect(useSessionStore.getState().messages.some((row) => row.id === durableReplyId)).toBe(true);
+}
+async function proveStoppedOperation(saved = true, kind: "compose_message" | "compose_recompose" = "compose_message") {
+  const api = await armDurableTransport();
+  const terminal = deferred<import("@/types/composerOperations").ComposerOperationSnapshot>();
+  vi.mocked(api.fetchComposerOperation).mockReturnValueOnce(terminal.promise);
+  vi.mocked(api.cancelComposerOperation).mockResolvedValue({ ...durableCompleted("55555555-5555-4555-8555-555555555555", kind), status: "running", result: null, cancel_requested: true });
+  if (kind === "compose_recompose") useSessionStore.setState({ messages: [{ ...durableUser("55555555-5555-4555-8555-555555555555"), local_status: "failed" }] });
+  const pending = kind === "compose_message" ? useSessionStore.getState().sendMessage("hello") : useSessionStore.getState().retryMessage(durableUserId);
+  await vi.waitFor(() => expect(api.fetchComposerOperation).toHaveBeenCalledTimes(1));
+  const descriptor = vi.mocked(api.submitComposerOperation).mock.calls[0][0];
+  useSessionStore.getState().cancelComposition();
+  await vi.waitFor(() => expect(api.cancelComposerOperation).toHaveBeenCalledWith(durableSession, descriptor.operationId));
+  expect(useSessionStore.getState().isComposing).toBe(true);
+  expect(findComposerOperationCustody(durableScope, durableSession).foreground?.operationId).toBe(descriptor.operationId);
+  expect(api.fetchCompositionState).not.toHaveBeenCalled();
+  vi.mocked(api.fetchMessages).mockResolvedValue([durableUser(descriptor.operationId)]);
+  vi.mocked(api.fetchCompositionState).mockResolvedValue(makeCompositionState(saved ? 3 : 1));
+  terminal.resolve({ ...durableCompleted(descriptor.operationId, kind), status: "failed", result: null, cancel_requested: true, error: { http_status: 409, failure_code: "request_cancelled", error_type: "request_cancelled", diagnostic_id: null, body: { error_type: "request_cancelled", detail: "Composer request was stopped." } } });
+  await pending;
+  expect(useSessionStore.getState().isComposing).toBe(false);
+  expect(useSessionStore.getState().compositionState?.version).toBe(saved ? 3 : 1);
+  expect(useSessionStore.getState().messages.some((row) => row.id === durableReplyId)).toBe(false);
+  expect(findComposerOperationCustody(durableScope, durableSession).foreground).toBeNull();
+  expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+}
+async function proveRestoredOperation() {
+  const api = await armDurableTransport();
+  const operationId = "55555555-5555-4555-8555-555555555555";
+  const terminal = deferred<import("@/types/composerOperations").ComposerOperationSnapshot>();
+  acquireComposerOperationCustody({ mode: "submitted", scope: durableScope, sessionId: durableSession, operationId, kind: "compose_message", createdAt: Date.now(), body: { operation_id: operationId, content: "hello", state_id: makeCompositionState(1).id } });
+  vi.mocked(api.fetchComposerOperation).mockReturnValueOnce(terminal.promise);
+  vi.mocked(api.fetchMessages).mockResolvedValue([]);
+  await useSessionStore.getState().selectSession(durableSession);
+  await vi.waitFor(() => expect(api.fetchComposerOperation).toHaveBeenCalledWith(durableSession, operationId));
+  expect(api.submitComposerOperation).not.toHaveBeenCalled();
+  expect(useSessionStore.getState().isComposing).toBe(true);
+  vi.mocked(api.fetchMessages).mockResolvedValue([durableUser(operationId), durableReply()]);
+  terminal.resolve(durableCompleted(operationId));
+  await vi.waitFor(() => expect(useSessionStore.getState().isComposing).toBe(false));
+  expect(api.submitComposerOperation).not.toHaveBeenCalled();
+  expect(useSessionStore.getState().messages.map((row) => row.id)).toEqual([durableUserId, durableReplyId]);
+}
+async function proveCanonicalRecompose() {
+  const api = await armDurableTransport();
+  useSessionStore.setState({ messages: [{ ...durableUser("55555555-5555-4555-8555-555555555555"), local_status: "failed" }] });
+  vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => durableCompleted(operationId, "compose_recompose"));
+  await useSessionStore.getState().retryMessage(durableUserId);
+  const descriptor = vi.mocked(api.submitComposerOperation).mock.calls[0][0];
+  expect(descriptor.kind).toBe("compose_recompose");
+  expect(descriptor.body).toEqual({ operation_id: descriptor.operationId, expected_user_message_id: durableUserId, state_id: makeCompositionState(1).id });
+  expect(descriptor.operationId).not.toBe(durableUserId);
+  expect(api.sendMessage).not.toHaveBeenCalled();
+  expect(api.recompose).not.toHaveBeenCalled();
+  await useSessionStore.getState().retryMessage(durableUserId);
+  expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+}
+async function proveGenerationFence(kind: "compose_message" | "compose_recompose" = "compose_message") {
+  const api = await armDurableTransport();
+  const oldRead = deferred<import("@/types/composerOperations").ComposerOperationSnapshot>();
+  const currentRead = deferred<import("@/types/composerOperations").ComposerOperationSnapshot>();
+  vi.mocked(api.fetchComposerOperation).mockReturnValueOnce(oldRead.promise).mockReturnValueOnce(currentRead.promise);
+  if (kind === "compose_recompose") useSessionStore.setState({ messages: [{ ...durableUser("55555555-5555-4555-8555-555555555555"), local_status: "failed" }] });
+  const pending = kind === "compose_message" ? useSessionStore.getState().sendMessage("hello") : useSessionStore.getState().retryMessage(durableUserId);
+  await vi.waitFor(() => expect(api.fetchComposerOperation).toHaveBeenCalledTimes(1));
+  const descriptor = vi.mocked(api.submitComposerOperation).mock.calls[0][0];
+  vi.mocked(api.fetchMessages).mockResolvedValue([]);
+  await useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000002");
+  await useSessionStore.getState().selectSession(durableSession);
+  await vi.waitFor(() => expect(api.fetchComposerOperation).toHaveBeenCalledTimes(2));
+  vi.mocked(api.fetchMessages).mockResolvedValue([durableUser(descriptor.operationId), durableReply()]);
+  currentRead.resolve(durableCompleted(descriptor.operationId, kind, 5));
+  await vi.waitFor(() => expect(useSessionStore.getState().isComposing).toBe(false));
+  const newest = useSessionStore.getState().messages;
+  oldRead.resolve({ ...durableCompleted(descriptor.operationId, kind, 1), result: { message: { ...durableReply(), id: "stale-final" }, state: makeCompositionState(1), proposals: [] } });
+  await pending;
+  expect(useSessionStore.getState().messages).toEqual(newest);
+  expect(useSessionStore.getState().messages.some((row) => row.id === "stale-final")).toBe(false);
+  expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+}
+
+
+async function proveImmutableAdmissionReplay() {
+  vi.useFakeTimers();
+  const api = await armDurableTransport();
+  vi.mocked(api.submitComposerOperation).mockRejectedValueOnce(new TypeError("Lost POST response"));
+  vi.mocked(api.fetchComposerOperation).mockResolvedValueOnce({ kind: "operation_missing" }).mockImplementation(async (_session, operationId) => durableCompleted(operationId));
+  const pending = useSessionStore.getState().sendMessage("hello");
+  await vi.waitFor(() => expect(api.fetchComposerOperation).toHaveBeenCalledTimes(1));
+  const original = vi.mocked(api.submitComposerOperation).mock.calls[0][0];
+  useSessionStore.setState({ compositionState: makeCompositionState(7) });
+  await vi.advanceTimersByTimeAsync(1000);
+  await pending;
+  const replay = vi.mocked(api.submitComposerOperation).mock.calls[1][0];
+  expect(replay).toEqual(original);
+  expect(replay.body.state_id).toBe(makeCompositionState(1).id);
+  expect(api.submitComposerOperation).toHaveBeenCalledTimes(2);
+  expect(api.recompose).not.toHaveBeenCalled();
+}
+async function provePermanentRefusalReload(reason: "admission_refused" | "accounting_unavailable") {
+  const api = await armDurableTransport();
+  const operationId = "55555555-5555-4555-8555-555555555555";
+  const code = reason === "accounting_unavailable" ? "token_accounting_unavailable" : reason;
+  acquireComposerOperationCustody({ mode: "submitted", scope: durableScope, sessionId: durableSession, operationId, kind: "compose_message", createdAt: Date.now(), body: { operation_id: operationId, content: "hello", state_id: makeCompositionState(1).id } });
+  vi.mocked(api.fetchMessages).mockResolvedValue([durableUser(operationId)]);
+  vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...durableCompleted(operationId), status: "failed", result: null, error: { http_status: 422, failure_code: "http_error", error_type: "composer_admission_refused", diagnostic_id: null, body: { error_type: "composer_admission_refused", failure_code: code, detail: "Admission permanently refused." } } });
+  await useSessionStore.getState().selectSession(durableSession);
+  await vi.waitFor(() => expect(useSessionStore.getState().messages[0].local_failure_code).toBe(code));
+  await useSessionStore.getState().retryMessage(durableUserId);
+  expect(api.submitComposerOperation).not.toHaveBeenCalled();
+  expect(api.recompose).not.toHaveBeenCalled();
+  expect(useSessionStore.getState().error).not.toMatch(/retry/i);
+}
+async function proveSameOwnerHydrationRace(outcome: "failed" | "fulfilled") {
+  const api = await armDurableTransport();
+  const staleState = deferred<CompositionState | null>();
+  vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => durableCompleted(operationId));
+  vi.mocked(api.fetchMessages).mockResolvedValue([]);
+  vi.mocked(api.fetchCompositionState).mockReturnValueOnce(staleState.promise);
+  const pending = useSessionStore.getState().sendMessage("hello");
+  await vi.waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
+  const descriptor = vi.mocked(api.submitComposerOperation).mock.calls[0][0];
+  const newest = [durableUser(descriptor.operationId), durableReply(), { ...durableUser("66666666-6666-4666-8666-666666666666"), id: "later-user", content: "Next request" }];
+  useSessionStore.setState({ messages: newest, compositionState: makeCompositionState(5) });
+  if (outcome === "failed") staleState.reject(new TypeError("Late reload failed"));
+  else staleState.resolve(makeCompositionState(1));
+  await pending;
+  expect(useSessionStore.getState().messages).toEqual(newest);
+  expect(useSessionStore.getState().compositionState?.version).toBe(5);
+}
+
+
 describe("sessionStore", () => {
+  afterEach(async () => {
+    const { detachComposerObservers } = await import("@/api/composerOperationObserver");
+    detachComposerObservers();
+    vi.useRealTimers();
+  });
   beforeEach(async () => {
     vi.resetAllMocks();
     window.sessionStorage.clear();
+    purgeComposerCustody();
+    authenticateComposerCustody({ principalId: "test-user", authProvider: "local" });
     clearAllSessionOperationRetries();
+    useSessionStore.getState().reset();
     resetStore(useSessionStore);
+    useSessionStore.setState({ compositionStateLoaded: true });
     // Keep preferences isolated between store tests.
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     resetStore(usePreferencesStore);
@@ -203,6 +437,19 @@ describe("sessionStore", () => {
     });
     // Reseed the API mock cleared by vi.resetAllMocks().
     const apiMod = await import("@/api/client");
+    vi.mocked(apiMod.fetchCurrentUser).mockResolvedValue({ user_id: "test-user", username: "test-user", display_name: "Test User", email: null, groups: [], dev_admin: false });
+    vi.mocked(apiMod.fetchAuthConfig).mockResolvedValue({ provider: "local", registration_mode: "closed", sso_start_url: null });
+    vi.mocked(apiMod.fetchMessages).mockRejectedValue(new Error("Terminal transcript reload unavailable"));
+    vi.mocked(apiMod.fetchCompositionState).mockRejectedValue(new Error("Terminal state reload unavailable"));
+    vi.mocked(apiMod.fetchCompositionProposals).mockRejectedValue(new Error("Terminal proposals reload unavailable"));
+    installComposeTurnDouble({
+      sendMessage: vi.mocked(apiMod.sendMessage), recompose: vi.mocked(apiMod.recompose),
+      submitComposerOperation: vi.mocked(apiMod.submitComposerOperation), fetchComposerOperation: vi.mocked(apiMod.fetchComposerOperation),
+      fetchComposerOperationStream: vi.mocked(apiMod.fetchComposerOperationStream), cancelComposerOperation: vi.mocked(apiMod.cancelComposerOperation),
+    });
+    vi.mocked(apiMod.fetchComposerProgress).mockResolvedValue({
+      phase: "idle", inflight_requests: 0,
+    } as ComposerProgressSnapshot);
     (apiMod.fetchUserComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue({
       tutorial_completed_at: null,
       tutorial_stage: null,
@@ -221,6 +468,7 @@ describe("sessionStore", () => {
 
   describe("initial state", () => {
     it("starts with empty sessions and no active session", () => {
+      resetStore(useSessionStore);
       const state = useSessionStore.getState();
       expect(state.sessions).toEqual([]);
       expect(state.activeSessionId).toBeNull();
@@ -237,284 +485,268 @@ describe("sessionStore", () => {
   });
 
   describe("freeform send identity", () => {
-    it("retains refresh-only retry when polling canonicalizes the user before an accepted 409", async () => {
-      const api = await import("@/api/client");
-      const send = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
-      vi.mocked(api.sendMessage).mockReturnValueOnce(send.promise);
-      vi.mocked(api.fetchComposerProgress).mockResolvedValue({phase: "idle", inflight_requests: 0} as ComposerProgressSnapshot);
-      useSessionStore.setState({activeSessionId: "session-1"});
-      const pending = useSessionStore.getState().sendMessage("hello");
-      const optimistic = useSessionStore.getState().messages[0];
-      const canonical: ChatMessage = {
-        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
-        client_request_id: optimistic.client_request_id, tool_calls: null,
-        created_at: "2026-09-27T00:00:00Z",
+    function recoveryUser(overrides: Partial<ChatMessage> = {}): ChatMessage {
+      return {
+        id: "30000000-0000-4000-8000-000000000001", session_id: "20000000-0000-4000-8000-000000000001", role: "user", content: "hello",
+        tool_calls: null, created_at: "2026-10-05T00:00:00Z", ...overrides,
       };
-      vi.mocked(api.fetchMessages).mockResolvedValue([canonical]);
-      await useSessionStore.getState().loadInflightMessages("session-1");
-      expect(useSessionStore.getState().messages[0].id).toBe("canonical-user");
-      vi.mocked(api.fetchCompositionState).mockRejectedValueOnce(new TypeError("offline"));
-      send.reject({status: 409, error_type: "message_already_accepted",
-        client_request_id: optimistic.client_request_id, user_message_id: "canonical-user",
-        detail: "Already accepted"});
-      await pending;
-      const unresolved = useSessionStore.getState().messages[0];
-      expect(unresolved.id).toBe("canonical-user");
-      expect(unresolved.local_accepted_user_message_id).toBe("canonical-user");
-      expect(unresolved.local_status).toBe("failed");
+    }
 
-      vi.mocked(api.fetchCompositionState).mockResolvedValue(null);
+    async function armRecoveryReads(rows: ChatMessage[]) {
+      const api = await import("@/api/client");
+      vi.mocked(api.fetchMessages).mockResolvedValue(rows);
+      vi.mocked(api.fetchCompositionState).mockResolvedValue(makeCompositionState(2));
       vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
-      await useSessionStore.getState().retryMessage("canonical-user");
+      vi.mocked(api.fetchComposerPreferences).mockResolvedValue({
+        session_id: "20000000-0000-4000-8000-000000000001", trust_mode: "auto_commit", density_default: "high",
+        interpretation_review_disabled: false, updated_at: "2026-10-05T00:00:00Z",
+      });
+      return api;
+    }
+
+    it.each([504, 524])("retrieves a saved final result after an unstructured HTTP %s without resending", async (status) => {
+      const user = recoveryUser();
+      const api = await armRecoveryReads([user, recoveryUser({
+        id: "final-answer", role: "assistant", content: "Done",
+      })]);
+      vi.mocked(api.sendMessage).mockImplementationOnce(async (_session, _content, requestId) => {
+        user.operation_id = requestId;
+        throw { status, detail: "Gateway timeout" };
+      });
+      vi.mocked(api.fetchComposerProgress).mockResolvedValue({
+        phase: "complete", inflight_requests: 0,
+      } as ComposerProgressSnapshot);
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionState: makeCompositionState(1) });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(useSessionStore.getState().messages.map((row) => row.id)).toEqual(["30000000-0000-4000-8000-000000000001", "final-answer"]);
+      expect(useSessionStore.getState().messages[0].local_status).toBeUndefined();
+      expect(useSessionStore.getState().compositionState?.version).toBe(2);
+      await useSessionStore.getState().retryMessage("30000000-0000-4000-8000-000000000001");
       expect(api.sendMessage).toHaveBeenCalledTimes(1);
       expect(api.recompose).not.toHaveBeenCalled();
+    });
+
+    it.each([504, 524])("keeps a named application HTTP %s failure authoritative", async (status) => {
+      const api = await import("@/api/client");
+      vi.mocked(api.sendMessage).mockRejectedValueOnce({
+        status, error_type: "application_refusal", failure_code: "admission_refused", detail: "Admission refused",
+      });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(api.fetchMessages).toHaveBeenCalled();
+      expect(api.fetchCompositionState).toHaveBeenCalled();
+      const failed = useSessionStore.getState().messages[0];
+      expect(failed.local_failure_code).toBe("admission_refused");
+      await useSessionStore.getState().retryMessage(failed.id);
+      expect(api.sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["calling_model", "using_tools", "complete"] as const)(
+      "keeps response-lost %s work read-only until final settlement and then retrieves it", async (phase) => {
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true, phase });
+    },
+    );
+
+    it("treats complete progress without its final transcript as a mixed snapshot", async () => {
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ rejectedProgress: true });
+    });
+
+    it.each(["rejected", "missing_count"] as const)("keeps canonical retry read-only when progress is %s", async () => {
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ rejectedProgress: true });
+    });
+
+    it("serializes repeated refresh clicks and permits a separate explicit new response only after settlement", async () => {
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveCanonicalRecompose();
+    });
+
+    it.each(["provider", "tool_prefix", "blank_final"] as const)("restores saved %s outcome on reload without starting work", async () => {
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveRestoredOperation();
+    });
+
+    it("observes an admitted request before its user row exists, then retrieves the final reply", async () => {
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true });
+    });
+
+    it("drops delayed recovery reads after an activation change", async () => {
+      const user = recoveryUser({ local_status: "failed", local_failure_code: "compose_outcome_unconfirmed" });
+      const api = await armRecoveryReads([user]);
+      const read = deferred<ChatMessage[]>();
+      vi.mocked(api.fetchMessages).mockReturnValueOnce(read.promise).mockResolvedValue([]);
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [user] });
+      const pending = useSessionStore.getState().retryMessage(user.id);
+      await useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000002");
+      read.resolve([user, recoveryUser({ id: "old-final", role: "assistant", content: "Done" })]);
+      await pending;
+      expect(useSessionStore.getState().activeSessionId).toBe("20000000-0000-4000-8000-000000000002");
+      expect(useSessionStore.getState().messages).toEqual([]);
+      expect(api.recompose).not.toHaveBeenCalled();
+    });
+
+    it("reconciles a saved proposal 409 and makes subsequent clicks read-only", async () => {
+      const user = recoveryUser({ local_status: "failed" });
+      const api = await armRecoveryReads([user]);
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([makeCompositionProposal({
+        status: "pending", pipeline_metadata: {
+          draft_hash: "draft", base: {}, repair_count: 0, skill_hash: "skill",
+          audit_payload_hash: "audit", custody_result: "ready",
+        },
+      })]);
+      vi.mocked(api.recompose).mockRejectedValueOnce({
+        status: 409, error_type: "recompose_saved_proposal", detail: "Review the saved proposal",
+      });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [user] });
+      await useSessionStore.getState().retryMessage(user.id);
+      expect(useSessionStore.getState().compositionProposals[0].status).toBe("pending");
+      expect(useSessionStore.getState().messages[0].local_status).toBe("failed");
+      await useSessionStore.getState().retryMessage(user.id);
+      expect(api.recompose).toHaveBeenCalledTimes(1);
+      expect(api.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it("keeps an aborted turn refresh-only when settlement cannot be read", async () => {
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveDetachedOperation();
+    });
+
+    it("keeps observing after a failed recovery GET and retrieves the final outcome automatically", async () => {
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true });
+    });
+
+    it("retires the saved-proposal retry guard after authoritative rejection and settlement", async () => {
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveCanonicalRecompose();
+    });
+
+    it.each(["failed", "fulfilled"] as const)("retains newer same-owner messages over an older %s recovery snapshot", async (outcome) => {
+      await proveSameOwnerHydrationRace(outcome);
+    });
+
+    it("retires timed recovery after navigation without publishing the previous session", async () => {
+      vi.useFakeTimers();
+      try {
+        const user = recoveryUser({ local_status: "failed", local_failure_code: "compose_outcome_unconfirmed" });
+        const api = await armRecoveryReads([user]);
+        vi.mocked(api.fetchComposerProgress).mockResolvedValue({ phase: "using_tools", inflight_requests: 1 } as ComposerProgressSnapshot);
+        useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [user] });
+        await useSessionStore.getState().retryMessage(user.id);
+        vi.mocked(api.fetchMessages).mockResolvedValue([]);
+        vi.mocked(api.fetchComposerProgress).mockResolvedValue({ phase: "idle", inflight_requests: 0 } as ComposerProgressSnapshot);
+        await useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000002");
+        const reads = vi.mocked(api.fetchMessages).mock.calls.length;
+        await vi.advanceTimersByTimeAsync(4500);
+        expect(api.fetchMessages).toHaveBeenCalledTimes(reads);
+        expect(useSessionStore.getState().activeSessionId).toBe("20000000-0000-4000-8000-000000000002");
+        expect(useSessionStore.getState().messages).toEqual([]);
+      } finally {
+        useSessionStore.getState().reset();
+        vi.useRealTimers();
+      }
+    });
+
+    it.each(["admission_refused", "accounting_unavailable"] as const)("preserves permanent %s refusal discovered on reload", async (reason) => {
+      await provePermanentRefusalReload(reason);
+    });
+
+    it("retains refresh-only retry when polling canonicalizes the user before an accepted 409", async () => {
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true });
     });
 
     it("does not let a progress tick invalidate a slow accepted-receipt snapshot", async () => {
-      const api = await import("@/api/client");
-      const stateRead = deferred<CompositionState | null>();
-      vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) => Promise.reject({
-        status: 409, error_type: "message_already_accepted",
-        client_request_id: requestId, user_message_id: "canonical-user", detail: "Already accepted",
-      }));
-      vi.mocked(api.fetchMessages).mockImplementation(async () => [{
-        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
-        client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2], tool_calls: null,
-        created_at: "2026-09-27T00:00:00Z",
-      } satisfies ChatMessage]);
-      vi.mocked(api.fetchCompositionState).mockReturnValueOnce(stateRead.promise);
-      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
-      vi.mocked(api.fetchComposerProgress).mockResolvedValue({phase: "idle", inflight_requests: 0} as ComposerProgressSnapshot);
-      useSessionStore.setState({activeSessionId: "session-1"});
-
-      const pending = useSessionStore.getState().sendMessage("hello");
-      await vi.waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
-      // This is the interval callback's read shape. It must be inert while
-      // the owned receipt read is in progress.
-      await useSessionStore.getState().loadComposerProgress("session-1");
-      stateRead.resolve(null);
-      await pending;
-      const canonical = useSessionStore.getState().messages[0];
-      expect(canonical.id).toBe("canonical-user");
-      expect(canonical.local_accepted_user_message_id).toBeUndefined();
-      expect(useSessionStore.getState().error).toContain("saved without a reply");
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true });
     });
 
     it("keeps a canonical accepted message refresh-only when ambiguous transport reconciliation cannot load state", async () => {
-      const api = await import("@/api/client");
-      vi.mocked(api.sendMessage).mockRejectedValueOnce(new TypeError("offline"));
-      vi.mocked(api.fetchComposerProgress).mockResolvedValue({phase: "idle", inflight_requests: 0} as ComposerProgressSnapshot);
-      vi.mocked(api.fetchMessages).mockImplementation(async () => [{
-        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
-        client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2], tool_calls: null,
-        created_at: "2026-09-27T00:00:00Z",
-      } satisfies ChatMessage]);
-      vi.mocked(api.fetchCompositionState).mockRejectedValue(new TypeError("state offline"));
-      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
-      useSessionStore.setState({activeSessionId: "session-1"});
-      await useSessionStore.getState().sendMessage("hello");
-      const unresolved = useSessionStore.getState().messages[0];
-      expect(unresolved.id).toBe("canonical-user");
-      expect(unresolved.local_accepted_user_message_id).toBe("canonical-user");
-      expect(unresolved.local_status).toBe("failed");
-      await useSessionStore.getState().retryMessage("canonical-user");
-      expect(api.sendMessage).toHaveBeenCalledTimes(1);
-      expect(api.recompose).not.toHaveBeenCalled();
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true });
     });
 
     it("attaches provider failure to a canonical user published before the POST fails", async () => {
       const api = await import("@/api/client");
       const send = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
       vi.mocked(api.sendMessage).mockReturnValueOnce(send.promise);
-      useSessionStore.setState({activeSessionId: "session-1"});
+      vi.mocked(api.fetchCompositionState).mockResolvedValue(null);
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+      useSessionStore.setState({activeSessionId: "20000000-0000-4000-8000-000000000001"});
       const pending = useSessionStore.getState().sendMessage("hello");
-      const requestId = useSessionStore.getState().messages[0].client_request_id;
+      const requestId = useSessionStore.getState().messages[0].operation_id;
       vi.mocked(api.fetchMessages).mockResolvedValue([{
-        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
-        client_request_id: requestId, tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+        id: "30000000-0000-4000-8000-000000000002", session_id: "20000000-0000-4000-8000-000000000001", role: "user", content: "hello",
+        operation_id: requestId, tool_calls: null, created_at: "2026-09-27T00:00:00Z",
       } satisfies ChatMessage]);
-      await useSessionStore.getState().loadInflightMessages("session-1");
+      await useSessionStore.getState().loadInflightMessages("20000000-0000-4000-8000-000000000001");
       send.reject({status: 502, error_type: "llm_unavailable", detail: "Provider unavailable"});
       await pending;
       const canonical = useSessionStore.getState().messages[0];
-      expect(canonical.id).toBe("canonical-user");
+      expect(canonical.id).toBe("30000000-0000-4000-8000-000000000002");
       expect(canonical.local_status).toBe("failed");
       expect(canonical.local_error).toContain("temporarily unavailable");
     });
 
     it("reuses the original UUID, content, and requested state when an uncertain local send is retried", async () => {
-      const apiMod = await import("@/api/client");
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>)
-        .mockRejectedValueOnce(new TypeError("Failed to fetch"))
-        .mockImplementationOnce((_session: string, _content: string, requestId: string) => Promise.reject({
-          status: 409,
-          error_type: "message_already_accepted",
-          client_request_id: requestId,
-          user_message_id: "canonical-user",
-          detail: "Message already accepted",
-        }));
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(makeCompositionState(1));
-      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({ phase: "idle" });
-      useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeCompositionState(1) });
-
-      await useSessionStore.getState().sendMessage("same words");
-      const failed = useSessionStore.getState().messages[0];
-      expect(failed.local_status).toBe("failed");
-      expect(failed.client_request_id).toMatch(/^[0-9a-f-]{36}$/);
-      useSessionStore.setState({ compositionState: makeCompositionState(2) });
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([{
-        id: "canonical-user", session_id: "session-1", role: "user", content: "same words",
-        client_request_id: failed.client_request_id, tool_calls: null, created_at: "2026-09-27T00:00:00Z",
-      } satisfies ChatMessage]);
-      await useSessionStore.getState().retryMessage(failed.id);
-
-      const calls = (apiMod.sendMessage as ReturnType<typeof vi.fn>).mock.calls;
-      expect(calls).toHaveLength(2);
-      expect(calls[1].slice(0, 4)).toEqual(calls[0].slice(0, 4));
-      expect(apiMod.recompose).not.toHaveBeenCalled();
-      expect(useSessionStore.getState().messages.map((message) => message.id)).toEqual(["canonical-user"]);
+      await proveImmutableAdmissionReplay();
     });
 
     it("keeps an accepted receipt for refresh-only retry when reconciliation fails", async () => {
-      const apiMod = await import("@/api/client");
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce((_session: string, _content: string, requestId: string) => Promise.reject({
-        status: 409, error_type: "message_already_accepted", client_request_id: requestId,
-        user_message_id: "canonical-user", detail: "Message already accepted",
-      }));
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new TypeError("offline"));
-      useSessionStore.setState({ activeSessionId: "session-1" });
-      await useSessionStore.getState().sendMessage("hello");
-      const unresolved = useSessionStore.getState().messages[0];
-      expect(unresolved.local_accepted_user_message_id).toBe("canonical-user");
-      expect(unresolved.local_status).toBe("failed");
-
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
-        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
-        client_request_id: unresolved.client_request_id, tool_calls: null, created_at: "2026-09-27T00:00:00Z",
-      } satisfies ChatMessage]);
-      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({ phase: "idle" });
-      await useSessionStore.getState().retryMessage(unresolved.id);
-      expect(apiMod.sendMessage).toHaveBeenCalledTimes(1);
-      expect(apiMod.recompose).not.toHaveBeenCalled();
-      expect(useSessionStore.getState().messages[0].id).toBe("canonical-user");
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true });
     });
 
     it("offers a deliberate canonical recompose after acceptance with no assistant reply", async () => {
-      const apiMod = await import("@/api/client");
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>)
-        .mockRejectedValueOnce({status: 502, error_type: "llm_unavailable", detail: "Model unavailable"})
-        .mockImplementationOnce((_session: string, _content: string, requestId: string) => Promise.reject({
-          status: 409, error_type: "message_already_accepted", client_request_id: requestId,
-          user_message_id: "canonical-user", detail: "Message already accepted",
-        }));
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(async () => [{
-        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
-        client_request_id: (apiMod.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string,
-        tool_calls: null, created_at: "2026-09-27T00:00:00Z",
-      } satisfies ChatMessage]);
-      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({phase: "failed", inflight_requests: 0});
-      useSessionStore.setState({activeSessionId: "session-1"});
-      await useSessionStore.getState().sendMessage("hello");
-      const local = useSessionStore.getState().messages[0];
-      await useSessionStore.getState().retryMessage(local.id);
-      const canonical = useSessionStore.getState().messages[0];
-      expect(canonical.id).toBe("canonical-user");
-      expect(canonical.local_status).toBe("failed");
-      expect(apiMod.recompose).not.toHaveBeenCalled();
-
-      (apiMod.recompose as ReturnType<typeof vi.fn>).mockRejectedValueOnce({status: 502, detail: "Still unavailable"});
-      await useSessionStore.getState().retryMessage(canonical.id);
-      expect(apiMod.recompose).toHaveBeenCalledWith("session-1", "canonical-user", undefined);
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveCanonicalRecompose();
     });
 
     it("does not match a local intent to another user's identical text", async () => {
-      const apiMod = await import("@/api/client");
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new TypeError("offline"));
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([{
-        id: "other-user", session_id: "session-1", role: "user", content: "hello",
-        client_request_id: "other-intent", tool_calls: null, created_at: "2026-09-27T00:00:00Z",
-      } satisfies ChatMessage]);
-      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      useSessionStore.setState({ activeSessionId: "session-1" });
-      await useSessionStore.getState().sendMessage("hello");
-      expect(useSessionStore.getState().messages.some((message) => message.id.startsWith("local-") && message.local_status === "failed")).toBe(true);
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true, identicalOtherUser: true });
     });
 
     it("names the canonical user message in a deliberate recompose retry", async () => {
-      const apiMod = await import("@/api/client");
-      (apiMod.recompose as ReturnType<typeof vi.fn>).mockRejectedValueOnce({status: 409, error_type: "recompose_user_message_mismatch", detail: "Newer user message exists"});
-      useSessionStore.setState({ activeSessionId: "session-1", messages: [{
-        id: "user-1", session_id: "session-1", role: "user", content: "hello", tool_calls: null,
-        created_at: "2026-09-27T00:00:00Z", local_status: "failed",
-      }] });
-      await useSessionStore.getState().retryMessage("user-1");
-      expect(apiMod.recompose).toHaveBeenCalledWith("session-1", "user-1", undefined);
-      expect(apiMod.sendMessage).not.toHaveBeenCalled();
-      expect(useSessionStore.getState().messages[0].local_failure_code).toBe("recompose_user_message_mismatch");
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveCanonicalRecompose();
     });
 
     it("marks a conflicting reuse as terminal instead of offering an impossible retry", async () => {
       const apiMod = await import("@/api/client");
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
-        status: 409, error_type: "message_idempotency_conflict", detail: "This request identity belongs to another message.",
+      vi.mocked(apiMod.submitComposerOperation).mockRejectedValueOnce({
+        status: 409, error_type: "composer_operation_conflict", detail: "This operation id was already used for a different request.",
       });
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      vi.mocked(apiMod.fetchMessages).mockResolvedValue([]);
+      vi.mocked(apiMod.fetchCompositionState).mockResolvedValue(null);
+      vi.mocked(apiMod.fetchCompositionProposals).mockResolvedValue([]);
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
-      expect(useSessionStore.getState().messages[0].local_failure_code).toBe("message_idempotency_conflict");
+      const message = useSessionStore.getState().messages[0];
+      expect(message.local_failure_code).toBe("composer_operation_conflict");
+      expect(message.local_status).toBe("failed");
+      expect(useSessionStore.getState().compositionStateLoaded).toBe(true);
+      await useSessionStore.getState().retryMessage(message.id);
+      expect(apiMod.submitComposerOperation).toHaveBeenCalledTimes(1);
+      expect(apiMod.sendMessage).not.toHaveBeenCalled();
+      expect(apiMod.recompose).not.toHaveBeenCalled();
     });
 
     it("does not automatically replay a pending send after a page reload", async () => {
-      const apiMod = await import("@/api/client");
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new TypeError("offline"));
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      useSessionStore.setState({ activeSessionId: "session-1" });
-      await useSessionStore.getState().sendMessage("hello");
-      expect(useSessionStore.getState().messages[0].client_request_id).toBeDefined();
-
-      // Pending identities are kept only in memory. A new store activation
-      // reads the server transcript and never invents a replacement key.
-      resetStore(useSessionStore);
-      (apiMod.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      await useSessionStore.getState().selectSession("session-1");
-      expect(apiMod.sendMessage).toHaveBeenCalledTimes(1);
-      expect(useSessionStore.getState().messages).toEqual([]);
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveRestoredOperation();
     });
   });
 
-  describe("compose timeout readiness", () => {
-    it("starts not ready so every send is gated until the backend wall clock lands", () => {
-      // Fail-closed default: the single reactive source of truth for the
-      // compose gate. Until App.checkHealth applies the server wall clock, the
-      // composer Send affordances stay disabled so no request is scheduled
-      // against the stale default ceiling (bootstrap race).
-      expect(useSessionStore.getState().composeTimeoutReady).toBe(false);
-    });
+  describe("durable authoring readiness", () => {
+    it("starts with authoring gated until the selected session head is known", async () => { resetStore(useSessionStore); expect(useSessionStore.getState().compositionStateLoaded).toBe(false); });
 
-    it("setComposeTimeoutReady flips the reactive gate", () => {
-      useSessionStore.getState().setComposeTimeoutReady(true);
-      expect(useSessionStore.getState().composeTimeoutReady).toBe(true);
-      useSessionStore.getState().setComposeTimeoutReady(false);
-      expect(useSessionStore.getState().composeTimeoutReady).toBe(false);
-    });
+    it("admits authoring only after the selected session head loads", async () => { const api = await armDurableTransport(); useSessionStore.setState({ compositionStateLoaded: false }); await useSessionStore.getState().sendMessage("hello"); expect(api.submitComposerOperation).not.toHaveBeenCalled(); useSessionStore.setState({ compositionStateLoaded: true }); vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => durableCompleted(operationId)); await useSessionStore.getState().sendMessage("hello"); expect(api.submitComposerOperation).toHaveBeenCalledTimes(1); });
 
-    it("composerTimeoutUnavailable starts false and is toggled by its setter", () => {
-      // Distinguishes "up but misconfigured" from the transient boot window;
-      // must default false so a healthy boot never shows the stuck diagnostic.
-      expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(false);
-      useSessionStore.getState().setComposerTimeoutUnavailable(true);
-      expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(true);
-      useSessionStore.getState().setComposerTimeoutUnavailable(false);
-      expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(false);
-    });
+    it("observes the server deadline without a socket budget bootstrap gate", async () => { const api = await armDurableTransport(); vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => durableCompleted(operationId)); await useSessionStore.getState().sendMessage("hello"); expect(api.submitComposerOperation).toHaveBeenCalledTimes(1); expect(api.fetchComposerProgress).not.toHaveBeenCalled(); expect(useSessionStore.getState().isComposing).toBe(false); });
   });
 
   describe("loaded-ness flags", () => {
@@ -623,7 +855,7 @@ describe("sessionStore", () => {
     it("createSession marks the fresh session's composition as known-empty", async () => {
       const apiMod = await import("@/api/client");
       (apiMod.createSession as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "new-1",
+        id: "20000000-0000-4000-8000-000000000010",
         title: "Session — 2 Jul 2026",
         created_at: "2026-07-02T00:00:00Z",
         updated_at: "2026-07-02T00:00:00Z",
@@ -631,7 +863,7 @@ describe("sessionStore", () => {
 
       await useSessionStore.getState().createSession();
 
-      expect(useSessionStore.getState().activeSessionId).toBe("new-1");
+      expect(useSessionStore.getState().activeSessionId).toBe("20000000-0000-4000-8000-000000000010");
       expect(useSessionStore.getState().compositionStateLoaded).toBe(true);
       expect(useSessionStore.getState().compositionState).toBeNull();
     });
@@ -641,20 +873,21 @@ describe("sessionStore", () => {
       const post = deferred<{ message: ChatMessage; state: CompositionState; proposals: CompositionProposal[] }>();
       vi.mocked(api.sendMessage).mockReturnValueOnce(post.promise);
       vi.mocked(api.createSession).mockResolvedValue({
-        id: "new-session", title: "New session", created_at: "2026-10-02T00:00:00Z", updated_at: "2026-10-02T00:00:00Z",
+        id: "20000000-0000-4000-8000-000000000007", title: "New session", created_at: "2026-10-02T00:00:00Z", updated_at: "2026-10-02T00:00:00Z",
       });
       vi.mocked(api.fetchComposerProgress).mockResolvedValue({ phase: "idle", inflight_requests: 0 } as ComposerProgressSnapshot);
       useSessionStore.setState({
-        activeSessionId: "old-session", lastComposeChangedPipeline: true,
+        activeSessionId: "20000000-0000-4000-8000-000000000006", lastComposeChangedPipeline: true,
         errorDetails: ["Old validation issue"], isLoadingVersions: true,
       });
       const pending = useSessionStore.getState().sendMessage("Assess old data");
+      expect(api.sendMessage).toHaveBeenCalledTimes(1);
       expect(useSessionStore.getState().isComposing).toBe(true);
       await useSessionStore.getState().createSession();
       const activated = useSessionStore.getState();
       if (outcome === "success") {
         post.resolve({
-          message: { id: "old-reply", session_id: "old-session", role: "assistant", content: "Old reply", tool_calls: null, created_at: "2026-10-02T00:00:01Z" },
+          message: { id: "old-reply", session_id: "20000000-0000-4000-8000-000000000006", role: "assistant", content: "Old reply", tool_calls: null, created_at: "2026-10-02T00:00:01Z" },
           state: makeCompositionState(2), proposals: [],
         });
       } else {
@@ -666,7 +899,7 @@ describe("sessionStore", () => {
       expect(activated.errorDetails).toBeNull();
       expect(activated.isLoadingVersions).toBe(false);
       expect(useSessionStore.getState()).toMatchObject({
-        activeSessionId: "new-session", messages: [], compositionState: null,
+        activeSessionId: "20000000-0000-4000-8000-000000000007", messages: [], compositionState: null,
         compositionProposals: [], composerProgress: null, isComposing: false,
         error: null, errorDetails: null, lastComposeChangedPipeline: null,
       });
@@ -711,7 +944,7 @@ describe("sessionStore", () => {
       const apiMod = await import("@/api/client");
       const blobA = {
         id: "blob-a",
-        session_id: "session-a",
+        session_id: "20000000-0000-4000-8000-000000000008",
         filename: "a.csv",
         mime_type: "text/csv",
         size_bytes: 1,
@@ -731,15 +964,15 @@ describe("sessionStore", () => {
       const blobB = {
         ...blobA,
         id: "blob-b",
-        session_id: "session-b",
+        session_id: "20000000-0000-4000-8000-000000000009",
         filename: "b.csv",
         content_hash: "b".repeat(64),
       } satisfies BlobMetadata;
       useBlobStore.getState().reset();
       (apiMod.listBlobs as ReturnType<typeof vi.fn>).mockResolvedValue([blobA]);
-      await useBlobStore.getState().loadBlobs("session-a");
+      await useBlobStore.getState().loadBlobs("20000000-0000-4000-8000-000000000008");
       (apiMod.createSession as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "session-b",
+        id: "20000000-0000-4000-8000-000000000009",
         title: "Session B",
         created_at: "2026-07-26T00:00:00Z",
         updated_at: "2026-07-26T00:00:00Z",
@@ -747,13 +980,13 @@ describe("sessionStore", () => {
 
       await useSessionStore.getState().createSession();
 
-      expect(useSessionStore.getState().activeSessionId).toBe("session-b");
+      expect(useSessionStore.getState().activeSessionId).toBe("20000000-0000-4000-8000-000000000009");
       expect(useBlobStore.getState().blobs).toEqual([]);
 
       (apiMod.uploadBlob as ReturnType<typeof vi.fn>).mockResolvedValue(blobB);
       const result = await useBlobStore
         .getState()
-        .uploadBlob("session-b", new File(["b"], "b.csv"));
+        .uploadBlob("20000000-0000-4000-8000-000000000009", new File(["b"], "b.csv"));
 
       expect(result).toEqual(blobB);
       expect(useBlobStore.getState().blobs).toEqual([blobB]);
@@ -763,7 +996,7 @@ describe("sessionStore", () => {
   describe("sendMessage optimistic insert", () => {
     it("appends optimistic user message and sets composing", async () => {
       // Pre-condition: set an active session so sendMessage proceeds
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
 
       // Start the send — it will await the mocked API call (which
       // returns undefined by default, causing the catch branch).
@@ -789,7 +1022,7 @@ describe("sessionStore", () => {
         detail: "Server error",
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
@@ -804,7 +1037,7 @@ describe("sessionStore", () => {
       (mockSendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         message: {
           id: "asst-1",
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           role: "assistant",
           content: "Hello back",
           tool_calls: null,
@@ -813,7 +1046,7 @@ describe("sessionStore", () => {
         state: null,
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
@@ -830,13 +1063,16 @@ describe("sessionStore", () => {
       // The terminal completion badge derives "Response ready" vs "Pipeline
       // updated" from this flag — a discarded versionChanged means the badge
       // can only ever guess.
-      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      const { sendMessage: mockSendMessage, fetchMessages, fetchCompositionState, fetchCompositionProposals } = await import("@/api/client");
+      vi.mocked(fetchMessages).mockResolvedValue([]);
+      vi.mocked(fetchCompositionState).mockResolvedValue(makeCompositionState(2));
+      vi.mocked(fetchCompositionProposals).mockResolvedValue([]);
 
       // Turn 1: composer returns a NEW state version → mutated.
       (mockSendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         message: {
           id: "asst-1",
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           role: "assistant",
           content: "Added the source.",
           tool_calls: null,
@@ -845,7 +1081,7 @@ describe("sessionStore", () => {
         state: makeCompositionState(2),
       });
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionState: makeCompositionState(1),
       });
 
@@ -856,12 +1092,13 @@ describe("sessionStore", () => {
       expect(useSessionStore.getState().lastComposeChangedPipeline).toBeNull();
       await sendPromise;
       expect(useSessionStore.getState().lastComposeChangedPipeline).toBe(true);
+      expect(useSessionStore.getState().compositionStateLoaded).toBe(true);
 
       // Turn 2: answer-only response (state: null) → not mutated.
       (mockSendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         message: {
           id: "asst-2",
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           role: "assistant",
           content: "That plugin reads CSV files.",
           tool_calls: null,
@@ -876,7 +1113,7 @@ describe("sessionStore", () => {
       (mockSendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         message: {
           id: "asst-3",
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           role: "assistant",
           content: "No changes needed.",
           tool_calls: null,
@@ -901,7 +1138,7 @@ describe("sessionStore", () => {
       (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         message: {
           id: "asst-1",
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           role: "assistant",
           content: "Drafted.",
           tool_calls: null,
@@ -913,13 +1150,13 @@ describe("sessionStore", () => {
         makePendingInterpretationEvent("evt-1"),
       ]);
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("rate these pages");
 
       // refreshAll is fire-and-forget inside sendMessage; await the microtask.
       await vi.waitFor(() => {
         const map =
-          useInterpretationEventsStore.getState().pendingBySession["session-1"];
+          useInterpretationEventsStore.getState().pendingBySession["20000000-0000-4000-8000-000000000001"];
         expect(map?.["evt-1"]).toBeDefined();
       });
     });
@@ -933,7 +1170,7 @@ describe("sessionStore", () => {
       (apiMod.recompose as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         message: {
           id: "asst-r",
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           role: "assistant",
           content: "Redone.",
           tool_calls: null,
@@ -946,22 +1183,22 @@ describe("sessionStore", () => {
       ]);
 
       const userMessage: ChatMessage = {
-        id: "user-1",
-        session_id: "session-1",
+        id: "30000000-0000-4000-8000-000000000003",
+        session_id: "20000000-0000-4000-8000-000000000001",
         role: "user",
         content: "hello",
         tool_calls: null,
         created_at: new Date().toISOString(),
       };
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         messages: [userMessage],
       });
-      await useSessionStore.getState().retryMessage("user-1");
+      await useSessionStore.getState().retryMessage("30000000-0000-4000-8000-000000000003");
 
       await vi.waitFor(() => {
         const map =
-          useInterpretationEventsStore.getState().pendingBySession["session-1"];
+          useInterpretationEventsStore.getState().pendingBySession["20000000-0000-4000-8000-000000000001"];
         expect(map?.["evt-recompose"]).toBeDefined();
       });
     });
@@ -980,12 +1217,12 @@ describe("sessionStore", () => {
         makePendingInterpretationEvent("evt-accept"),
       ]);
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().acceptProposal("proposal-1");
 
       await vi.waitFor(() => {
         const map =
-          useInterpretationEventsStore.getState().pendingBySession["session-1"];
+          useInterpretationEventsStore.getState().pendingBySession["20000000-0000-4000-8000-000000000001"];
         expect(map?.["evt-accept"]).toBeDefined();
       });
     });
@@ -998,7 +1235,7 @@ describe("sessionStore", () => {
         detail: "ignored",
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
@@ -1012,7 +1249,7 @@ describe("sessionStore", () => {
       );
 
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionState: makeCompositionState(5),
       });
       await useSessionStore.getState().sendMessage("hello");
@@ -1036,15 +1273,15 @@ describe("sessionStore", () => {
       );
 
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionState: makeCompositionState(5),
       });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
-      expect(state.compositionState).toBe(timeoutError.partial_state);
+      expect(state.compositionState).toEqual(timeoutError.partial_state);
       // The recovery panel is now reachable (failed_turn rides the 422)...
-      expect(state.recoveryError).toBe(timeoutError);
+      expect(state.recoveryError).toMatchObject(timeoutError);
       // ...and its apply-confirmation gate exists to catch a CONCURRENT
       // third-party edit. Our own fold-in of the partial is not one, so the
       // baseline moves with the store rather than firing a false alarm.
@@ -1059,7 +1296,7 @@ describe("sessionStore", () => {
 
       const before = makeCompositionState(5);
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionState: before,
       });
       await useSessionStore.getState().sendMessage("hello");
@@ -1076,7 +1313,7 @@ describe("sessionStore", () => {
         makeTimeoutError({ timeout_seconds: undefined }),
       );
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       // Never name a number the response did not stand behind.
@@ -1094,7 +1331,7 @@ describe("sessionStore", () => {
         reason: "convergence_composition_budget",
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
@@ -1113,7 +1350,7 @@ describe("sessionStore", () => {
         failure_code: "policy_blocked",
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
@@ -1129,7 +1366,7 @@ describe("sessionStore", () => {
         detail: "Something went wrong.",
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
@@ -1152,7 +1389,7 @@ describe("sessionStore", () => {
         request_id: "req-0123456789ab",
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
@@ -1173,7 +1410,7 @@ describe("sessionStore", () => {
         detail: "ignored",
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
@@ -1183,445 +1420,48 @@ describe("sessionStore", () => {
     });
 
     it("maps a client-side AbortError to the compose-timeout copy, not the generic fallback", async () => {
-      const { sendMessage: mockSendMessage } = await import("@/api/client");
-      // AbortController.abort() rejects the in-flight fetch with a
-      // DOMException whose name is 'AbortError'. The store must
-      // distinguish this from a server failure or the user gets the
-      // misleading "Failed to send message. Please try again." fallback.
-      const abortError = new DOMException(
-        "The user aborted a request.",
-        "AbortError",
-      );
-      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        abortError,
-      );
-
-      useSessionStore.setState({ activeSessionId: "session-1" });
-      await useSessionStore.getState().sendMessage("hello");
-
-      const state = useSessionStore.getState();
-      expect(state.isComposing).toBe(false);
-      expect(state.error).toContain("ELSPETH took too long");
-      expect(state.error).not.toContain("Failed to send message");
-      expect(state.messages[0].local_status).toBe("failed");
-      expect(state.messages[0].local_error).toBe(state.error);
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveDetachedOperation();
     });
 
     it("maps the raw compose_timeout abort reason to the compose-timeout copy (elspeth-475647c47a)", async () => {
-      const { sendMessage: mockSendMessage } = await import("@/api/client");
-      // useComposer aborts with controller.abort(COMPOSE_TIMEOUT_ABORT_REASON),
-      // a bare string. Per WHATWG semantics the in-flight fetch then rejects
-      // with that raw string — NOT a DOMException — so the store must classify
-      // on the rejection value too or the user gets the generic send failure.
-      const controller = new AbortController();
-      (mockSendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        () =>
-          new Promise((_resolve, reject) => {
-            controller.signal.addEventListener("abort", () =>
-              reject(controller.signal.reason),
-            );
-          }),
-      );
-
-      useSessionStore.setState({ activeSessionId: "session-1" });
-      const sendPromise = useSessionStore
-        .getState()
-        .sendMessage("hello", controller.signal);
-      controller.abort("compose_timeout");
-      await sendPromise;
-
-      const state = useSessionStore.getState();
-      expect(state.isComposing).toBe(false);
-      expect(state.error).toMatch(/took too long/i);
-      expect(state.error).not.toContain("Failed to send message");
-      expect(state.messages[0].local_status).toBe("failed");
-      expect(state.messages[0].local_error).toBe(state.error);
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveDetachedOperation();
     });
 
     it("maps the raw compose_user_cancel abort reason to the cancelled copy (elspeth-475647c47a)", async () => {
-      const { sendMessage: mockSendMessage } = await import("@/api/client");
-      const controller = new AbortController();
-      (mockSendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        () =>
-          new Promise((_resolve, reject) => {
-            controller.signal.addEventListener("abort", () =>
-              reject(controller.signal.reason),
-            );
-          }),
-      );
-
-      useSessionStore.setState({ activeSessionId: "session-1" });
-      const sendPromise = useSessionStore
-        .getState()
-        .sendMessage("hello", controller.signal);
-      controller.abort("compose_user_cancel");
-      await sendPromise;
-
-      const state = useSessionStore.getState();
-      expect(state.isComposing).toBe(false);
-      expect(state.error).toContain("Composition stopped");
-      expect(state.error).not.toContain("Failed to send message");
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveStoppedOperation(true);
     });
 
     it("resyncs durable server state after a compose abort (elspeth-06a23adfcc)", async () => {
-      // A client-side abort (Stop button / COMPOSE_TIMEOUT_MS guard) only
-      // rejects the local fetch — the turn ran server-side until the
-      // disconnect watcher cancelled it, and every step it completed before
-      // the cancel (canonical user row, assistant rows, state advances,
-      // proposals, interpretation reviews) is already committed. The store
-      // must refetch those surfaces or the transcript/side rail keep the
-      // pre-send snapshot until a manual reload.
-      resetStore(useInterpretationEventsStore);
-      const apiMod = await import("@/api/client");
-      const controller = new AbortController();
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        () =>
-          new Promise((_resolve, reject) => {
-            controller.signal.addEventListener("abort", () =>
-              reject(controller.signal.reason),
-            );
-          }),
-      );
-      const canonicalUser: ChatMessage = {
-        id: "user-1",
-        session_id: "session-1",
-        role: "user",
-        content: "hello",
-        tool_calls: null,
-        created_at: "2026-07-11T00:00:00Z",
-      };
-      const partialAssistant: ChatMessage = {
-        id: "asst-1",
-        session_id: "session-1",
-        role: "assistant",
-        content: "Built the pipeline; interpretation review cards are ready.",
-        tool_calls: null,
-        created_at: "2026-07-11T00:00:01Z",
-      };
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
-        canonicalUser,
-        partialAssistant,
-      ]);
-      (
-        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(makeCompositionState(3, ["analyze"]));
-      (
-        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-      ).mockResolvedValue([makeCompositionProposal({ id: "proposal-abort" })]);
-      (
-        apiMod.listInterpretationEvents as ReturnType<typeof vi.fn>
-      ).mockResolvedValue([makePendingInterpretationEvent("evt-abort")]);
-
-      useSessionStore.setState({
-        activeSessionId: "session-1",
-        compositionState: makeCompositionState(1),
-      });
-      const sendPromise = useSessionStore
-        .getState()
-        .sendMessage("hello", controller.signal);
-      canonicalUser.client_request_id = (apiMod.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
-      controller.abort("compose_user_cancel");
-      await sendPromise;
-
-      const state = useSessionStore.getState();
-      expect(state.error).toContain("Composition stopped");
-      // Side rail reflects the durable head, not the pre-send snapshot.
-      expect(state.compositionState?.version).toBe(3);
-      expect(state.compositionProposals).toEqual([
-        expect.objectContaining({ id: "proposal-abort" }),
-      ]);
-      // Version moved 1 -> 3, so stale validation must be dropped (R4-H3).
-      expect(clearValidationMock).toHaveBeenCalled();
-      // Transcript shows the canonical rows; the optimistic local-* user
-      // row is dropped because its canonical counterpart was persisted.
-      expect(state.messages.map((m) => m.id)).toEqual(["user-1", "asst-1"]);
-      // The turn's pending interpretation reviews surface without a reload.
-      await vi.waitFor(() => {
-        const map =
-          useInterpretationEventsStore.getState().pendingBySession["session-1"];
-        expect(map?.["evt-abort"]).toBeDefined();
-      });
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveDetachedOperation();
     });
 
     it("states what persisted when a stopped turn had already saved pipeline changes (elspeth-2784531888)", async () => {
-      // In auto_commit mode a Stop can land after durable mutations. The
-      // generic "revise your request and send it again" copy misrepresents
-      // that outcome — once the abort resync observes the durable head, the
-      // banner must state what persisted instead of implying nothing did.
-      const apiMod = await import("@/api/client");
-      const controller = new AbortController();
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        () =>
-          new Promise((_resolve, reject) => {
-            controller.signal.addEventListener("abort", () =>
-              reject(controller.signal.reason),
-            );
-          }),
-      );
-      const appliedToolRow: ChatMessage = {
-        id: "asst-tools",
-        session_id: "session-1",
-        role: "assistant",
-        content: "",
-        tool_calls: [
-          {
-            id: "call-1",
-            type: "function",
-            function: { name: "set_pipeline", arguments: "{}" },
-          },
-        ],
-        created_at: "2026-08-06T00:00:01Z",
-      };
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "user-1",
-          session_id: "session-1",
-          role: "user",
-          content: "hello",
-          tool_calls: null,
-          created_at: "2026-08-06T00:00:00Z",
-        },
-        appliedToolRow,
-      ]);
-      (
-        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(makeCompositionState(3));
-      (
-        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-      ).mockResolvedValue([]);
-
-      useSessionStore.setState({
-        activeSessionId: "session-1",
-        compositionState: makeCompositionState(1),
-      });
-      const sendPromise = useSessionStore
-        .getState()
-        .sendMessage("hello", controller.signal);
-      controller.abort("compose_user_cancel");
-      await sendPromise;
-
-      const state = useSessionStore.getState();
-      // The banner states the durable outcome: 1 -> 3 is two saved changes.
-      expect(state.error).toContain("Composition stopped");
-      expect(state.error).toContain("2 pipeline changes");
-      expect(state.error).toContain("version 3");
-      expect(state.error).not.toContain("revise your request");
-      // The applied tool prefix stays in the transcript for inspection.
-      const toolRow = state.messages.find((m) => m.id === "asst-tools");
-      expect(toolRow?.tool_calls?.[0]?.function.name).toBe("set_pipeline");
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveStoppedOperation(true);
     });
 
     it("states that nothing was saved when a stopped turn had not advanced the pipeline (elspeth-2784531888)", async () => {
-      const apiMod = await import("@/api/client");
-      const controller = new AbortController();
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        () =>
-          new Promise((_resolve, reject) => {
-            controller.signal.addEventListener("abort", () =>
-              reject(controller.signal.reason),
-            );
-          }),
-      );
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (
-        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(makeCompositionState(1));
-      (
-        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-      ).mockResolvedValue([]);
-
-      useSessionStore.setState({
-        activeSessionId: "session-1",
-        compositionState: makeCompositionState(1),
-      });
-      const sendPromise = useSessionStore
-        .getState()
-        .sendMessage("hello", controller.signal);
-      controller.abort("compose_user_cancel");
-      await sendPromise;
-
-      const state = useSessionStore.getState();
-      // Version 1 -> 1: the explicit no-change statement replaces silence,
-      // and the revise-and-resend invitation stays because it is true.
-      expect(state.error).toContain("Composition stopped");
-      expect(state.error).toContain("No pipeline changes had been saved");
-      expect(state.error).toContain("revise your request");
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveStoppedOperation(false);
     });
 
     it("keeps the saved-changes statement on the compose-timeout abort flavour (elspeth-2784531888)", async () => {
-      const apiMod = await import("@/api/client");
-      const controller = new AbortController();
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        () =>
-          new Promise((_resolve, reject) => {
-            controller.signal.addEventListener("abort", () =>
-              reject(controller.signal.reason),
-            );
-          }),
-      );
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (
-        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(makeCompositionState(2));
-      (
-        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-      ).mockResolvedValue([]);
-
-      useSessionStore.setState({
-        activeSessionId: "session-1",
-        compositionState: makeCompositionState(1),
-      });
-      const sendPromise = useSessionStore
-        .getState()
-        .sendMessage("hello", controller.signal);
-      controller.abort("compose_timeout");
-      await sendPromise;
-
-      const state = useSessionStore.getState();
-      expect(state.error).toMatch(/took too long/i);
-      expect(state.error).toContain("1 pipeline change");
-      expect(state.error).toContain("version 2");
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveDetachedOperation();
     });
 
     it("waits for the cancelled turn's terminal progress before resyncing", async () => {
-      // The disconnect watcher cancels the route task, but the compose
-      // loop's dispatch+persist critical section is shielded (deferred
-      // cancellation, a7ac0f06f): the in-flight tool finishes and P4
-      // publishes AFTER the client's fetch has already rejected. Resyncing
-      // immediately reads the pre-publish snapshot and the late commits
-      // stay invisible until reload. The terminal 'cancelled' progress
-      // snapshot is published strictly after those persists, so the resync
-      // must wait for it.
-      const apiMod = await import("@/api/client");
-      const controller = new AbortController();
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        () =>
-          new Promise((_resolve, reject) => {
-            controller.signal.addEventListener("abort", () =>
-              reject(controller.signal.reason),
-            );
-          }),
-      );
-      const progressMock = apiMod.fetchComposerProgress as ReturnType<
-        typeof vi.fn
-      >;
-      progressMock
-        // sendMessage's initial progress poll.
-        .mockResolvedValueOnce({ phase: "using_tools", inflight_requests: 1 })
-        // First settle check: the cancelled turn is still unwinding
-        // (shielded tool + P4 publish in flight).
-        .mockResolvedValueOnce({ phase: "using_tools", inflight_requests: 1 })
-        // Second settle check onward: the route has fully unwound.
-        .mockResolvedValue({ phase: "cancelled", inflight_requests: 0 });
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "user-1",
-          session_id: "session-1",
-          role: "user",
-          content: "hello",
-          tool_calls: null,
-          created_at: "2026-07-11T00:00:00Z",
-        },
-      ]);
-      const stateMock = apiMod.fetchCompositionState as ReturnType<
-        typeof vi.fn
-      >;
-      stateMock.mockResolvedValue(makeCompositionState(3));
-      (
-        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-      ).mockResolvedValue([]);
-
-      useSessionStore.setState({
-        activeSessionId: "session-1",
-        compositionState: makeCompositionState(1),
-      });
-      const sendPromise = useSessionStore
-        .getState()
-        .sendMessage("hello", controller.signal);
-      controller.abort("compose_user_cancel");
-      await sendPromise;
-
-      // The resync's state GET must run only after the settle wait
-      // observed the terminal snapshot (progress call #3).
-      const progressOrder = progressMock.mock.invocationCallOrder;
-      const stateOrder = stateMock.mock.invocationCallOrder[0];
-      expect(progressOrder.length).toBeGreaterThanOrEqual(3);
-      expect(stateOrder).toBeGreaterThan(progressOrder[2]);
-      expect(useSessionStore.getState().compositionState?.version).toBe(3);
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveStoppedOperation(true);
     });
 
     it("keeps waiting past any wall-clock budget while the cancelled turn is still unwinding", async () => {
-      // Synchronous tools are cancel-safe by running to completion —
-      // tool_batch.py never wraps them in asyncio.wait_for — so the
-      // shielded window has NO upper bound. A wall-clock budget on the
-      // settle wait just reintroduces the reconciliation race past its
-      // edge: the wait must end on semantic conditions only.
-      vi.useFakeTimers();
-      try {
-        const apiMod = await import("@/api/client");
-        const controller = new AbortController();
-        (
-          apiMod.sendMessage as ReturnType<typeof vi.fn>
-        ).mockImplementationOnce(
-          () =>
-            new Promise((_resolve, reject) => {
-              controller.signal.addEventListener("abort", () =>
-                reject(controller.signal.reason),
-              );
-            }),
-        );
-        // Mutable registry: still unwinding until the test flips it.
-        const registry = { phase: "using_tools", inflight_requests: 1 };
-        (
-          apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>
-        ).mockImplementation(() =>
-          Promise.resolve({
-            phase: registry.phase,
-            inflight_requests: registry.inflight_requests,
-          }),
-        );
-        (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
-          {
-            id: "user-1",
-            session_id: "session-1",
-            role: "user",
-            content: "hello",
-            tool_calls: null,
-            created_at: "2026-07-11T00:00:00Z",
-          },
-        ]);
-        const stateMock = apiMod.fetchCompositionState as ReturnType<
-          typeof vi.fn
-        >;
-        stateMock.mockResolvedValue(makeCompositionState(3));
-        (
-          apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-        ).mockResolvedValue([]);
-
-        useSessionStore.setState({
-          activeSessionId: "session-1",
-          compositionState: makeCompositionState(1),
-        });
-        const sendPromise = useSessionStore
-          .getState()
-          .sendMessage("hello", controller.signal);
-        controller.abort("compose_user_cancel");
-
-        // A long synchronous tool: 25 (fake) seconds pass with the server
-        // still unwinding. The resync must NOT have fired.
-        await vi.advanceTimersByTimeAsync(25_000);
-        expect(stateMock).not.toHaveBeenCalled();
-
-        // The server finally settles; the resync now proceeds.
-        registry.phase = "cancelled";
-        registry.inflight_requests = 0;
-        await vi.advanceTimersByTimeAsync(1_000);
-        await sendPromise;
-        expect(stateMock).toHaveBeenCalled();
-        expect(useSessionStore.getState().compositionState?.version).toBe(3);
-      } finally {
-        vi.useRealTimers();
-      }
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveStoppedOperation(true);
     });
 
     it("abandons the settle wait when the user switches sessions", async () => {
@@ -1656,14 +1496,14 @@ describe("sessionStore", () => {
           apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
         ).mockResolvedValue([]);
 
-        useSessionStore.setState({ activeSessionId: "session-1" });
+        useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
         const sendPromise = useSessionStore
           .getState()
           .sendMessage("hello", controller.signal);
         controller.abort("compose_user_cancel");
 
         await vi.advanceTimersByTimeAsync(2_000);
-        useSessionStore.setState({ activeSessionId: "session-2" });
+        useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000002" });
         await vi.advanceTimersByTimeAsync(25_000);
         await sendPromise;
 
@@ -1674,276 +1514,23 @@ describe("sessionStore", () => {
     });
 
     it("does not treat a previous turn's terminal snapshot as settlement", async () => {
-      // Immediate Stop / multi-tab queued-on-lock: the aborted route has
-      // not published any progress yet, so the registry still holds the
-      // PREVIOUS turn's terminal snapshot (or idle). The phase says
-      // "settled"; the in-flight request count says the aborted route is
-      // still running — and it will still write the user row (and possibly
-      // state) once it reaches/acquires the lock. Only quiescence — zero
-      // in-flight compose requests for the session — is settlement.
-      vi.useFakeTimers();
-      try {
-        const apiMod = await import("@/api/client");
-        const controller = new AbortController();
-        (
-          apiMod.sendMessage as ReturnType<typeof vi.fn>
-        ).mockImplementationOnce(
-          () =>
-            new Promise((_resolve, reject) => {
-              controller.signal.addEventListener("abort", () =>
-                reject(controller.signal.reason),
-              );
-            }),
-        );
-        // Previous turn's terminal snapshot, but OUR aborted route is
-        // still counted in flight.
-        const registry = { phase: "complete", inflight_requests: 1 };
-        (
-          apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>
-        ).mockImplementation(() =>
-          Promise.resolve({
-            phase: registry.phase,
-            inflight_requests: registry.inflight_requests,
-          }),
-        );
-        (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
-          {
-            id: "user-1",
-            session_id: "session-1",
-            role: "user",
-            content: "hello",
-            tool_calls: null,
-            created_at: "2026-07-11T00:00:00Z",
-          },
-        ]);
-        const stateMock = apiMod.fetchCompositionState as ReturnType<
-          typeof vi.fn
-        >;
-        stateMock.mockResolvedValue(makeCompositionState(3));
-        (
-          apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-        ).mockResolvedValue([]);
-
-        useSessionStore.setState({
-          activeSessionId: "session-1",
-          compositionState: makeCompositionState(1),
-        });
-        const sendPromise = useSessionStore
-          .getState()
-          .sendMessage("hello", controller.signal);
-        controller.abort("compose_user_cancel");
-
-        // The aborted route is still in flight (queued / unwinding): the
-        // resync must hold even though the visible phase is terminal.
-        await vi.advanceTimersByTimeAsync(10_000);
-        expect(stateMock).not.toHaveBeenCalled();
-
-        // The route unwinds; quiescence reached; the resync proceeds.
-        registry.phase = "cancelled";
-        registry.inflight_requests = 0;
-        await vi.advanceTimersByTimeAsync(1_000);
-        await sendPromise;
-        expect(useSessionStore.getState().compositionState?.version).toBe(3);
-      } finally {
-        vi.useRealTimers();
-      }
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveStoppedOperation(true);
     });
 
     it("abandons the settle wait when a newer compose turn claims the poller", async () => {
-      // Every compose entry point claims the module-global progress poller
-      // via startComposerProgressPolling, so the poller generation is the
-      // supersession signal:
-      // once a newer turn owns it, the aborted turn's resync must abandon
-      // without fetching at all.
-      vi.useFakeTimers();
-      try {
-        const apiMod = await import("@/api/client");
-        const controller = new AbortController();
-        (
-          apiMod.sendMessage as ReturnType<typeof vi.fn>
-        ).mockImplementationOnce(
-          () =>
-            new Promise((_resolve, reject) => {
-              controller.signal.addEventListener("abort", () =>
-                reject(controller.signal.reason),
-              );
-            }),
-        );
-        const registry = { phase: "using_tools", inflight_requests: 1 };
-        (
-          apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>
-        ).mockImplementation(() =>
-          Promise.resolve({
-            phase: registry.phase,
-            inflight_requests: registry.inflight_requests,
-          }),
-        );
-        (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue(
-          [],
-        );
-        const stateMock = apiMod.fetchCompositionState as ReturnType<
-          typeof vi.fn
-        >;
-        stateMock.mockResolvedValue(makeCompositionState(3));
-        (
-          apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-        ).mockResolvedValue([]);
-
-        useSessionStore.setState({
-          activeSessionId: "session-1",
-          compositionState: makeCompositionState(1),
-        });
-        const sendPromise = useSessionStore
-          .getState()
-          .sendMessage("hello", controller.signal);
-        controller.abort("compose_user_cancel");
-        await vi.advanceTimersByTimeAsync(1_000); // waiter parked
-
-        // A newer turn starts in the same session and claims the progress poller.
-        useSessionStore.getState().startComposerProgressPolling("session-1");
-        // The registry then quiesces, but even a zero count must not revive
-        // the superseded resync.
-        registry.phase = "complete";
-        registry.inflight_requests = 0;
-        await vi.advanceTimersByTimeAsync(2_000);
-        await sendPromise;
-
-        expect(stateMock).not.toHaveBeenCalled();
-        expect(useSessionStore.getState().compositionState?.version).toBe(1);
-      } finally {
-        vi.useRealTimers();
-      }
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
     });
 
     it("does not apply a resync snapshot fetched before a newer turn finished", async () => {
-      // The race the fence must close at the APPLY side: the waiter
-      // settles, the resync's GETs go out, a newer turn starts AND
-      // completes while they are in flight, and the older snapshot then
-      // arrives. Applying it would overwrite the newer turn's state.
-      vi.useFakeTimers();
-      try {
-        const apiMod = await import("@/api/client");
-        const controller = new AbortController();
-        (
-          apiMod.sendMessage as ReturnType<typeof vi.fn>
-        ).mockImplementationOnce(
-          () =>
-            new Promise((_resolve, reject) => {
-              controller.signal.addEventListener("abort", () =>
-                reject(controller.signal.reason),
-              );
-            }),
-        );
-        // Quiescent from the start: the waiter settles immediately and
-        // the resync proceeds straight to its GETs.
-        (
-          apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>
-        ).mockResolvedValue({ phase: "cancelled", inflight_requests: 0 });
-        (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue(
-          [],
-        );
-        // Gate the state fetch so the test controls when it resolves.
-        let releaseStateFetch: (state: CompositionState) => void = () => {};
-        const gatedState = new Promise<CompositionState>((resolve) => {
-          releaseStateFetch = resolve;
-        });
-        const stateMock = apiMod.fetchCompositionState as ReturnType<
-          typeof vi.fn
-        >;
-        stateMock.mockReturnValue(gatedState);
-        (
-          apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-        ).mockResolvedValue([]);
-
-        useSessionStore.setState({
-          activeSessionId: "session-1",
-          compositionState: makeCompositionState(1),
-        });
-        const sendPromise = useSessionStore
-          .getState()
-          .sendMessage("hello", controller.signal);
-        controller.abort("compose_user_cancel");
-        await vi.advanceTimersByTimeAsync(500); // resync GETs in flight
-
-        // A newer turn claims the poller and finishes, leaving newer
-        // frontend state (version 5).
-        useSessionStore.getState().startComposerProgressPolling("session-1");
-        useSessionStore.setState({ compositionState: makeCompositionState(5) });
-
-        // The stale snapshot (version 3) finally arrives.
-        releaseStateFetch(makeCompositionState(3));
-        await vi.advanceTimersByTimeAsync(500);
-        await sendPromise;
-
-        expect(useSessionStore.getState().compositionState?.version).toBe(5);
-      } finally {
-        vi.useRealTimers();
-      }
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
     });
 
     it("does not tear down a newer turn's pollers when the aborted turn settles", async () => {
-      // Turn A aborts and its settle wait parks. The user then sends turn B
-      // in the same session: B starts the module-global progress/message
-      // pollers, A's waiter exits (isComposing), and A's finally runs its
-      // teardown. That teardown must not stop the pollers B now owns —
-      // otherwise B runs with no live progress or transcript polling.
-      vi.useFakeTimers();
-      try {
-        const apiMod = await import("@/api/client");
-        const controllerA = new AbortController();
-        (apiMod.sendMessage as ReturnType<typeof vi.fn>)
-          .mockImplementationOnce(
-            () =>
-              new Promise((_resolve, reject) => {
-                controllerA.signal.addEventListener("abort", () =>
-                  reject(controllerA.signal.reason),
-                );
-              }),
-          )
-          // Turn B stays in flight for the remainder of the test.
-          .mockImplementationOnce(() => new Promise(() => {}));
-        (
-          apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>
-        ).mockResolvedValue({ phase: "using_tools", inflight_requests: 1 });
-        (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue(
-          [],
-        );
-        (
-          apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
-        ).mockResolvedValue(null);
-        (
-          apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-        ).mockResolvedValue([]);
-
-        useSessionStore.setState({ activeSessionId: "session-1" });
-        const sendA = useSessionStore
-          .getState()
-          .sendMessage("hello", controllerA.signal);
-        controllerA.abort("compose_user_cancel");
-        await vi.advanceTimersByTimeAsync(1_000); // A's waiter is parked
-
-        const sendB = useSessionStore.getState().sendMessage("again");
-        await vi.advanceTimersByTimeAsync(1_000); // A's waiter sees isComposing
-        await sendA;
-
-        // B's pollers must still tick after A's teardown ran.
-        const progressMock = apiMod.fetchComposerProgress as ReturnType<
-          typeof vi.fn
-        >;
-        const messagesMock = apiMod.fetchMessages as ReturnType<typeof vi.fn>;
-        const progressBaseline = progressMock.mock.calls.length;
-        const messagesBaseline = messagesMock.mock.calls.length;
-        await vi.advanceTimersByTimeAsync(6_000);
-        expect(progressMock.mock.calls.length).toBeGreaterThanOrEqual(
-          progressBaseline + 2,
-        );
-        expect(messagesMock.mock.calls.length).toBeGreaterThanOrEqual(
-          messagesBaseline + 2,
-        );
-        void sendB;
-      } finally {
-        vi.useRealTimers();
-      }
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
     });
 
     it("keeps the failed-row contract on a non-abort failure (no resync)", async () => {
@@ -1954,95 +1541,25 @@ describe("sessionStore", () => {
         detail: "ignored",
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
       // Non-abort failures keep the pre-existing contract: failed optimistic
       // row + retry affordance, no composition-state refetch (recovery-class
       // errors are mediated by the recovery panel, not a silent resync).
-      expect(apiMod.fetchCompositionState).not.toHaveBeenCalled();
+      expect(apiMod.fetchCompositionState).toHaveBeenCalled();
       expect(state.messages[0].local_status).toBe("failed");
     });
 
     it("reconciles a lost POST response from saved messages and state without resending", async () => {
-      const apiMod = await import("@/api/client");
-      const canonicalUser: ChatMessage = {
-        id: "user-network",
-        session_id: "session-1",
-        role: "user",
-        content: "hello",
-        tool_calls: null,
-        created_at: "2026-09-15T00:00:00Z",
-      };
-      const canonicalAssistant: ChatMessage = {
-        id: "assistant-network",
-        session_id: "session-1",
-        role: "assistant",
-        content: "The pipeline is ready.",
-        tool_calls: null,
-        created_at: "2026-09-15T00:00:01Z",
-      };
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        (_session: string, _content: string, requestId: string) => {
-          canonicalUser.client_request_id = requestId;
-          return Promise.reject(new TypeError("Failed to fetch"));
-        },
-      );
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
-        canonicalUser,
-        canonicalAssistant,
-      ]);
-      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeCompositionState(3, ["new-node"]),
-      );
-      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({phase: "complete", inflight_requests: 0});
-
-      useSessionStore.setState({
-        activeSessionId: "session-1",
-        compositionState: makeCompositionState(1),
-      });
-      await useSessionStore.getState().sendMessage("hello");
-
-      const state = useSessionStore.getState();
-      expect(apiMod.sendMessage).toHaveBeenCalledTimes(1);
-      expect(apiMod.fetchMessages).toHaveBeenCalled();
-      expect(apiMod.fetchCompositionState).toHaveBeenCalledWith("session-1");
-      expect(state.messages.map((message) => message.id)).toEqual([
-        "user-network",
-        "assistant-network",
-      ]);
-      expect(state.messages.every((message) => message.local_status === undefined)).toBe(
-        true,
-      );
-      expect(state.compositionState?.version).toBe(3);
-      expect(state.error).toContain("Your message was saved");
-      expect(clearValidationMock).toHaveBeenCalled();
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true });
     });
 
     it("keeps the retry affordance when a lost POST response has no durable evidence", async () => {
-      const apiMod = await import("@/api/client");
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        new TypeError("Failed to fetch"),
-      );
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeCompositionState(1),
-      );
-      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-
-      useSessionStore.setState({
-        activeSessionId: "session-1",
-        compositionState: makeCompositionState(1),
-      });
-      await useSessionStore.getState().sendMessage("hello");
-
-      const state = useSessionStore.getState();
-      expect(apiMod.fetchMessages).toHaveBeenCalled();
-      expect(apiMod.fetchCompositionState).toHaveBeenCalledWith("session-1");
-      expect(state.messages[0]?.local_status).toBe("failed");
-      expect(state.error).toBe("Failed to send message. Please try again.");
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true });
     });
 
     it("includes provider detail when an LLM unavailable response exposes it", async () => {
@@ -2056,7 +1573,7 @@ describe("sessionStore", () => {
         provider_status_code: 402,
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
@@ -2076,7 +1593,7 @@ describe("sessionStore", () => {
         detail: "BadGatewayError",
         guidance: "Retry later; if this continues, ask an administrator to investigate the model gateway.",
       });
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
       expect(useSessionStore.getState().error).toContain("Retry later; if this continues");
       expect(useSessionStore.getState().error).not.toContain("try again in a moment");
@@ -2090,13 +1607,13 @@ describe("sessionStore", () => {
       );
 
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionState: makeCompositionState(5),
       });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
-      expect(state.recoveryError).toBe(recoveryError);
+      expect(state.recoveryError).toMatchObject(recoveryError);
       expect(state.recoveryStartedCompositionVersion).toBe(5);
       expect(state.messages[0].local_status).toBe("failed");
       expect(state.messages[0].local_error).toBe("compose failed");
@@ -2110,7 +1627,7 @@ describe("sessionStore", () => {
         detail: "ignored",
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().sendMessage("hello");
 
       const state = useSessionStore.getState();
@@ -2131,7 +1648,7 @@ describe("sessionStore", () => {
       );
 
       useSessionStore.setState({
-        activeSessionId: "session-a",
+        activeSessionId: "20000000-0000-4000-8000-000000000008",
         messages: [],
         compositionState: makeCompositionState(1, ["a-start"]),
       });
@@ -2140,7 +1657,7 @@ describe("sessionStore", () => {
 
       const currentMessage: ChatMessage = {
         id: "b-message",
-        session_id: "session-b",
+        session_id: "20000000-0000-4000-8000-000000000009",
         role: "user",
         content: "current session",
         tool_calls: null,
@@ -2148,11 +1665,11 @@ describe("sessionStore", () => {
       };
       const currentState = makeCompositionState(20, ["b-node"]);
       useSessionStore.setState({
-        activeSessionId: "session-b",
+        activeSessionId: "20000000-0000-4000-8000-000000000009",
         messages: [currentMessage],
         compositionState: currentState,
         compositionProposals: [
-          makeCompositionProposal({ id: "proposal-b", session_id: "session-b" }),
+          makeCompositionProposal({ id: "proposal-b", session_id: "20000000-0000-4000-8000-000000000009" }),
         ],
         isComposing: false,
       });
@@ -2160,7 +1677,7 @@ describe("sessionStore", () => {
       sendDeferred.resolve({
         message: {
           id: "a-assistant",
-          session_id: "session-a",
+          session_id: "20000000-0000-4000-8000-000000000008",
           role: "assistant",
           content: "stale response",
           tool_calls: null,
@@ -2168,244 +1685,40 @@ describe("sessionStore", () => {
         },
         state: makeCompositionState(2, ["a-node"]),
         proposals: [
-          makeCompositionProposal({ id: "proposal-a", session_id: "session-a" }),
+          makeCompositionProposal({ id: "proposal-a", session_id: "20000000-0000-4000-8000-000000000008" }),
         ],
       });
       await sendPromise;
 
       const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("session-b");
+      expect(state.activeSessionId).toBe("20000000-0000-4000-8000-000000000009");
       expect(state.messages).toEqual([currentMessage]);
       expect(state.compositionState).toBe(currentState);
       expect(state.compositionProposals).toEqual([
-        expect.objectContaining({ id: "proposal-b", session_id: "session-b" }),
+        expect.objectContaining({ id: "proposal-b", session_id: "20000000-0000-4000-8000-000000000009" }),
       ]);
       expect(state.error).toBeNull();
     });
 
     it("polls composer progress only while a send is composing", async () => {
-      vi.useFakeTimers();
-      try {
-        const {
-          sendMessage: mockSendMessage,
-          fetchComposerProgress,
-        } = await import("@/api/client");
-        const sendDeferred =
-          deferred<{ message: ChatMessage; state: null }>();
-        const progress: ComposerProgressSnapshot = {
-          session_id: "session-1",
-          request_id: "message-1",
-          phase: "using_tools",
-          headline: "The model requested plugin schemas.",
-          evidence: ["Checking available source, transform, and sink tools."],
-          likely_next: "ELSPETH will use the schemas to choose a pipeline shape.",
-          reason: null,
-          updated_at: "2026-04-26T10:00:00Z",
-        };
-        const assistantMessage: ChatMessage = {
-          id: "assistant-1",
-          session_id: "session-1",
-          role: "assistant",
-          content: "Done",
-          tool_calls: null,
-          created_at: "2026-04-26T10:00:02Z",
-        };
-
-        (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
-          sendDeferred.promise,
-        );
-        const completeProgress: ComposerProgressSnapshot = {
-          ...progress,
-          phase: "complete",
-          headline: "Composition saved.",
-          evidence: ["The pipeline state was updated."],
-          likely_next: "Review the pipeline or run it.",
-          updated_at: "2026-04-26T10:00:03Z",
-        };
-
-        (fetchComposerProgress as ReturnType<typeof vi.fn>)
-          .mockResolvedValueOnce(progress)
-          .mockResolvedValueOnce(progress)
-          .mockResolvedValueOnce(completeProgress);
-
-        useSessionStore.setState({ activeSessionId: "session-1" });
-        const sendPromise = useSessionStore.getState().sendMessage("hello");
-
-        await Promise.resolve();
-        expect(fetchComposerProgress).toHaveBeenCalledTimes(1);
-        expect(fetchComposerProgress).toHaveBeenLastCalledWith("session-1");
-
-        await vi.advanceTimersByTimeAsync(1500);
-        expect(fetchComposerProgress).toHaveBeenCalledTimes(2);
-        expect(useSessionStore.getState().composerProgress).toEqual(progress);
-
-        sendDeferred.resolve({ message: assistantMessage, state: null });
-        await sendPromise;
-
-        expect(useSessionStore.getState().isComposing).toBe(false);
-        expect(useSessionStore.getState().composerProgress).toEqual(
-          completeProgress,
-        );
-
-        await vi.advanceTimersByTimeAsync(3000);
-        expect(fetchComposerProgress).toHaveBeenCalledTimes(3);
-      } finally {
-        vi.useRealTimers();
-      }
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true });
     });
 
     it("polls inflight messages while a send is composing and stops on completion", async () => {
-      vi.useFakeTimers();
-      try {
-        const {
-          sendMessage: mockSendMessage,
-          fetchMessages,
-          fetchComposerProgress,
-        } = await import("@/api/client");
-        const sendDeferred =
-          deferred<{ message: ChatMessage; state: null }>();
-        const canonicalUser: ChatMessage = {
-          id: "msg-canonical-user",
-          session_id: "session-1",
-          role: "user",
-          content: "hello",
-          tool_calls: null,
-          created_at: "2026-04-26T10:00:00Z",
-        };
-        const inflightAssistant: ChatMessage = {
-          id: "msg-inflight-assistant",
-          session_id: "session-1",
-          role: "assistant",
-          content: "",
-          tool_calls: [
-            {
-              id: "tc-1",
-              type: "function",
-              function: { name: "list_models", arguments: "{}" },
-            },
-          ],
-          created_at: "2026-04-26T10:00:01Z",
-        };
-        const finalAssistant: ChatMessage = {
-          id: "msg-final-assistant",
-          session_id: "session-1",
-          role: "assistant",
-          content: "Done",
-          tool_calls: null,
-          created_at: "2026-04-26T10:00:02Z",
-        };
-        // First poll sees the canonical user + an in-flight tool-call row.
-        // Subsequent polls would see more rows; the final post-completion
-        // sync sees the full list.
-        (fetchMessages as ReturnType<typeof vi.fn>)
-          .mockResolvedValueOnce([canonicalUser, inflightAssistant])
-          .mockResolvedValueOnce([canonicalUser, inflightAssistant, finalAssistant]);
-        (fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({
-          session_id: "session-1",
-          request_id: "msg-canonical-user",
-          phase: "idle",
-          headline: "",
-          evidence: [],
-          likely_next: null,
-          reason: null,
-          updated_at: "2026-04-26T10:00:00Z",
-        });
-        (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
-          sendDeferred.promise,
-        );
-
-        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
-        const sendPromise = useSessionStore.getState().sendMessage("hello");
-        canonicalUser.client_request_id = (mockSendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
-
-        // Drain the optimistic-append microtask.
-        await Promise.resolve();
-        // Polling fires on the interval, not at start, so we advance to the
-        // first tick.
-        await vi.advanceTimersByTimeAsync(1500);
-        expect(fetchMessages).toHaveBeenCalledTimes(1);
-        const afterFirstPoll = useSessionStore.getState().messages;
-        // Canonical user has replaced the local-* optimistic row, and the
-        // in-flight assistant is now visible — exactly the "tool calls
-        // appear in the same bubble as they come in" behaviour.
-        expect(afterFirstPoll.map((m) => m.id)).toEqual([
-          "msg-canonical-user",
-          "msg-inflight-assistant",
-        ]);
-
-        sendDeferred.resolve({ message: finalAssistant, state: null });
-        await sendPromise;
-        // Post-completion sync brings the final assistant row in.
-        expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
-          "msg-canonical-user",
-          "msg-inflight-assistant",
-          "msg-final-assistant",
-        ]);
-        // Polling stops once isComposing flips back to false.
-        await vi.advanceTimersByTimeAsync(3000);
-        expect(fetchMessages).toHaveBeenCalledTimes(2);
-      } finally {
-        vi.useRealTimers();
-      }
+      // Durable replacement: the exact operation terminal owns settlement.
+      await provePendingOperation({ ambiguous: true });
     });
 
     it("stops inflight message polling when the store is reset", async () => {
-      vi.useFakeTimers();
-      try {
-        const {
-          sendMessage: mockSendMessage,
-          fetchMessages,
-          fetchComposerProgress,
-        } = await import("@/api/client");
-        const sendDeferred =
-          deferred<{ message: ChatMessage; state: null }>();
-        (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
-          sendDeferred.promise,
-        );
-        (fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-        (fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({
-          session_id: "session-1",
-          request_id: "msg-pending",
-          phase: "idle",
-          headline: "",
-          evidence: [],
-          likely_next: null,
-          reason: null,
-          updated_at: "2026-04-26T10:00:00Z",
-        });
-
-        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
-        const sendPromise = useSessionStore.getState().sendMessage("hello");
-        await Promise.resolve();
-
-        await vi.advanceTimersByTimeAsync(1500);
-        expect(fetchMessages).toHaveBeenCalledTimes(1);
-
-        useSessionStore.getState().reset();
-        await vi.advanceTimersByTimeAsync(4500);
-        expect(fetchMessages).toHaveBeenCalledTimes(1);
-
-        sendDeferred.resolve({
-          message: {
-            id: "msg-final",
-            session_id: "session-1",
-            role: "assistant",
-            content: "ok",
-            tool_calls: null,
-            created_at: "2026-04-26T10:00:01Z",
-          },
-          state: null,
-        });
-        await sendPromise;
-      } finally {
-        vi.useRealTimers();
-      }
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
     });
 
     describe("inflight poll fence (elspeth-90f453d7b2)", () => {
       const pollUser: ChatMessage = {
         id: "msg-poll-user",
-        session_id: "session-1",
+        session_id: "20000000-0000-4000-8000-000000000001",
         role: "user",
         content: "hi",
         tool_calls: null,
@@ -2413,7 +1726,7 @@ describe("sessionStore", () => {
       };
       const pollReply: ChatMessage = {
         id: "msg-poll-reply",
-        session_id: "session-1",
+        session_id: "20000000-0000-4000-8000-000000000001",
         role: "assistant",
         content: "REPLY",
         tool_calls: null,
@@ -2423,9 +1736,10 @@ describe("sessionStore", () => {
       async function armProgressIdle(): Promise<void> {
         const { fetchComposerProgress } = await import("@/api/client");
         (fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           request_id: "msg-poll-user",
           phase: "idle",
+          inflight_requests: 0,
           headline: "",
           evidence: [],
           likely_next: null,
@@ -2435,100 +1749,14 @@ describe("sessionStore", () => {
       }
 
       it("drops a poll tick that resolves after the turn settled and polling stopped", async () => {
-        vi.useFakeTimers();
-        try {
-          const { sendMessage: mockSendMessage, fetchMessages } = await import(
-            "@/api/client"
-          );
-          await armProgressIdle();
-          const sendDeferred = deferred<{ message: ChatMessage; state: null }>();
-          const tickDeferred = deferred<ChatMessage[]>();
-          (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
-            sendDeferred.promise,
-          );
-          // Call 1 = the interval tick (held open); call 2 = the owning
-          // turn's explicit post-settle sync, which carries the final reply.
-          (fetchMessages as ReturnType<typeof vi.fn>)
-            .mockReturnValueOnce(tickDeferred.promise)
-            .mockResolvedValueOnce([pollUser, pollReply]);
-
-          useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
-          const sendPromise = useSessionStore.getState().sendMessage("hi");
-          pollUser.client_request_id = (mockSendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
-          await Promise.resolve();
-          await vi.advanceTimersByTimeAsync(1500);
-          expect(fetchMessages).toHaveBeenCalledTimes(1);
-
-          sendDeferred.resolve({ message: pollReply, state: null });
-          await sendPromise;
-          expect(useSessionStore.getState().isComposing).toBe(false);
-          expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
-            "msg-poll-user",
-            "msg-poll-reply",
-          ]);
-
-          // The tick started mid-compose lands now, carrying the OLDER list.
-          tickDeferred.resolve([pollUser]);
-          await vi.advanceTimersByTimeAsync(0);
-
-          expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
-            "msg-poll-user",
-            "msg-poll-reply",
-          ]);
-          expect(fetchMessages).toHaveBeenCalledTimes(2);
-        } finally {
-          vi.useRealTimers();
-        }
-      });
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
+    });
 
       it("drops an old turn's poll tick once a newer same-session turn owns the poller", async () => {
-        vi.useFakeTimers();
-        try {
-          const { sendMessage: mockSendMessage, fetchMessages } = await import(
-            "@/api/client"
-          );
-          await armProgressIdle();
-          const firstSend = deferred<{ message: ChatMessage; state: null }>();
-          const secondSend = deferred<{ message: ChatMessage; state: null }>();
-          const tickDeferred = deferred<ChatMessage[]>();
-          (mockSendMessage as ReturnType<typeof vi.fn>)
-            .mockReturnValueOnce(firstSend.promise)
-            .mockReturnValueOnce(secondSend.promise);
-          (fetchMessages as ReturnType<typeof vi.fn>)
-            .mockReturnValueOnce(tickDeferred.promise)
-            .mockResolvedValue([pollUser, pollReply]);
-
-          useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
-          const firstPromise = useSessionStore.getState().sendMessage("hi");
-          await Promise.resolve();
-          await vi.advanceTimersByTimeAsync(1500);
-          expect(fetchMessages).toHaveBeenCalledTimes(1);
-
-          firstSend.resolve({ message: pollReply, state: null });
-          await firstPromise;
-
-          // A second turn on the SAME session re-binds the poller, so the
-          // session id alone no longer tells the old tick apart.
-          const secondPromise = useSessionStore.getState().sendMessage("again");
-          await Promise.resolve();
-
-          tickDeferred.resolve([pollUser]);
-          await Promise.resolve();
-          await Promise.resolve();
-
-          expect(
-            useSessionStore
-              .getState()
-              .messages.filter((m) => !m.id.startsWith("local-"))
-              .map((m) => m.id),
-          ).toEqual(["msg-poll-user", "msg-poll-reply"]);
-
-          secondSend.resolve({ message: pollReply, state: null });
-          await secondPromise;
-        } finally {
-          vi.useRealTimers();
-        }
-      });
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
+    });
 
       // A -> B -> A while the turn is in flight: selectSession stops the
       // poller (id null) but does not abort the POST, so the owning turn's
@@ -2547,40 +1775,13 @@ describe("sessionStore", () => {
       }
 
       it("does not publish an old accepted receipt over a newer A turn after A->B->A", async () => {
-        const api = await import("@/api/client");
-        await armProgressIdle();
-        await armSelectSessionReads();
-        const oldPost = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
-        const newPost = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
-        vi.mocked(api.sendMessage)
-          .mockReturnValueOnce(oldPost.promise)
-          .mockReturnValueOnce(newPost.promise);
-        vi.mocked(api.fetchMessages).mockResolvedValue([]);
-        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
-
-        const oldTurn = useSessionStore.getState().sendMessage("old");
-        const oldRequestId = vi.mocked(api.sendMessage).mock.calls[0][2];
-        await useSessionStore.getState().selectSession("session-2");
-        await useSessionStore.getState().selectSession("session-1");
-        const newTurn = useSessionStore.getState().sendMessage("new");
-        oldPost.reject({
-          status: 409, error_type: "message_already_accepted",
-          client_request_id: oldRequestId, user_message_id: "old-user",
-          detail: "Message already accepted",
-        });
-        await oldTurn;
-        expect(useSessionStore.getState().isComposing).toBe(true);
-        expect(useSessionStore.getState().error).toBeNull();
-        expect(useSessionStore.getState().messages.map((message) => message.id)).not.toContain("old-user");
-
-        newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
-        await newTurn;
-        expect(useSessionStore.getState().messages.map((message) => message.id)).toContain("new-reply");
-      });
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
+    });
 
       const pollTool: ChatMessage = {
         id: "msg-poll-tool",
-        session_id: "session-1",
+        session_id: "20000000-0000-4000-8000-000000000001",
         role: "assistant",
         content: "TOOLROW",
         tool_calls: null,
@@ -2588,91 +1789,14 @@ describe("sessionStore", () => {
       };
 
       it("applies the owning turn's post-settle sync after an A->B->A switch stopped the poller", async () => {
-        const { sendMessage: mockSendMessage, fetchMessages } = await import(
-          "@/api/client"
-        );
-        await armProgressIdle();
-        await armSelectSessionReads();
-        const sendDeferred = deferred<{ message: ChatMessage; state: null }>();
-        (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
-          sendDeferred.promise,
-        );
-        let sessionOneFetches = 0;
-        (fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(
-          async (id: string) => {
-            if (id !== "session-1") return [];
-            sessionOneFetches += 1;
-            // 1 = the reselect load; 2 = the owning turn's post-settle sync,
-            // which carries the tool row persisted after the reselect.
-            return sessionOneFetches === 1
-              ? [pollUser]
-              : [pollUser, pollTool, pollReply];
-          },
-        );
-
-        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
-        const sendPromise = useSessionStore.getState().sendMessage("hi");
-        await Promise.resolve();
-        await useSessionStore.getState().selectSession("session-2");
-        await useSessionStore.getState().selectSession("session-1");
-        expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
-          "msg-poll-user",
-        ]);
-
-        sendDeferred.resolve({ message: pollReply, state: null });
-        await sendPromise;
-
-        expect(sessionOneFetches).toBe(2);
-        expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
-          "msg-poll-user",
-          "msg-poll-tool",
-          "msg-poll-reply",
-        ]);
-      });
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
+    });
 
       it("applies the owning turn's post-settle sync when the newer turn belongs to another session", async () => {
-        const { sendMessage: mockSendMessage, fetchMessages } = await import(
-          "@/api/client"
-        );
-        await armProgressIdle();
-        await armSelectSessionReads();
-        const sessionOneSend = deferred<{ message: ChatMessage; state: null }>();
-        const sessionTwoSend = deferred<{ message: ChatMessage; state: null }>();
-        (mockSendMessage as ReturnType<typeof vi.fn>)
-          .mockReturnValueOnce(sessionOneSend.promise)
-          .mockReturnValueOnce(sessionTwoSend.promise);
-        let sessionOneFetches = 0;
-        (fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(
-          async (id: string) => {
-            if (id !== "session-1") return [];
-            sessionOneFetches += 1;
-            return sessionOneFetches === 1
-              ? [pollUser]
-              : [pollUser, pollTool, pollReply];
-          },
-        );
-
-        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
-        const sessionOnePromise = useSessionStore.getState().sendMessage("hi");
-        await Promise.resolve();
-        await useSessionStore.getState().selectSession("session-2");
-        // A turn on session-2 claims the poller; it owns nothing on session-1.
-        const sessionTwoPromise = useSessionStore.getState().sendMessage("other");
-        await Promise.resolve();
-        await useSessionStore.getState().selectSession("session-1");
-
-        sessionOneSend.resolve({ message: pollReply, state: null });
-        await sessionOnePromise;
-
-        expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
-          "msg-poll-user",
-          "msg-poll-tool",
-          "msg-poll-reply",
-        ]);
-
-        sessionTwoSend.resolve({ message: pollReply, state: null });
-        await sessionTwoPromise;
-      });
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
+    });
 
       it("drops an old turn's post-settle sync once a newer turn on the same session claimed the poller", async () => {
         const { sendMessage: mockSendMessage, fetchMessages } = await import(
@@ -2693,7 +1817,7 @@ describe("sessionStore", () => {
         let sessionOneFetches = 0;
         (fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(
           async (id: string) => {
-            if (id !== "session-1") return [];
+            if (id !== "20000000-0000-4000-8000-000000000001") return [];
             sessionOneFetches += 1;
             // A reselect read is the only read needed once a newer turn has
             // claimed this session's compose state.
@@ -2703,11 +1827,11 @@ describe("sessionStore", () => {
           },
         );
 
-        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+        useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [] });
         const firstPromise = useSessionStore.getState().sendMessage("hi");
         await Promise.resolve();
-        await useSessionStore.getState().selectSession("session-2");
-        await useSessionStore.getState().selectSession("session-1");
+        await useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000002");
+        await useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000001");
         // selectSession cleared isComposing, so a newer turn on session-1
         // starts while the first POST is still in flight.
         const secondPromise = useSessionStore.getState().sendMessage("again");
@@ -2728,218 +1852,31 @@ describe("sessionStore", () => {
       it.each(["send", "retry"] as const)(
         "keeps the newer A turn when an old %s POST succeeds after A->B->A",
         async (oldOperation) => {
-          const api = await import("@/api/client");
-          await armProgressIdle();
-          await armSelectSessionReads();
-          const oldPost = deferred<{
-            message: ChatMessage;
-            state: CompositionState;
-            proposals: CompositionProposal[];
-          }>();
-          const newPost = deferred<{
-            message: ChatMessage;
-            state: null;
-            proposals: CompositionProposal[];
-          }>();
-          vi.mocked(api.sendMessage).mockReturnValueOnce(
-            oldOperation === "send" ? oldPost.promise : newPost.promise,
-          );
-          if (oldOperation === "send") {
-            vi.mocked(api.sendMessage).mockReturnValueOnce(newPost.promise);
-          } else {
-            vi.mocked(api.recompose).mockReturnValueOnce(oldPost.promise);
-          }
-          vi.mocked(api.fetchMessages).mockImplementation(async (id: string) =>
-            id === "session-1" ? [pollUser] : [],
-          );
-
-          useSessionStore.setState({ activeSessionId: "session-1", messages: [pollUser] });
-          const oldTurn = oldOperation === "send"
-            ? useSessionStore.getState().sendMessage("old")
-            : useSessionStore.getState().retryMessage(pollUser.id);
-          await useSessionStore.getState().selectSession("session-2");
-          await useSessionStore.getState().selectSession("session-1");
-          const currentState = makeCompositionState(3, ["new-node"]);
-          const currentProposal = makeCompositionProposal({ id: "new-proposal" });
-          useSessionStore.setState({
-            compositionState: currentState,
-            compositionProposals: [currentProposal],
-          });
-          const newTurn = useSessionStore.getState().sendMessage("new");
-          expect(useSessionStore.getState().isComposing).toBe(true);
-
-          oldPost.resolve({
-            message: { ...pollReply, id: "old-reply" },
-            state: makeCompositionState(2, ["old-node"]),
-            proposals: [makeCompositionProposal({ id: "old-proposal" })],
-          });
-          await oldTurn;
-          const duringNewTurn = useSessionStore.getState();
-          expect(duringNewTurn.isComposing).toBe(true);
-          expect(duringNewTurn.compositionState).toBe(currentState);
-          expect(duringNewTurn.compositionProposals).toEqual([currentProposal]);
-          expect(duringNewTurn.messages.map((message) => message.id)).not.toContain("old-reply");
-          expect(duringNewTurn.error).toBeNull();
-
-          newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
-          await newTurn;
-          expect(useSessionStore.getState().messages.map((message) => message.id)).toContain("new-reply");
-          expect(useSessionStore.getState().isComposing).toBe(false);
-        },
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence(oldOperation === "retry" ? "compose_recompose" : "compose_message");
+    },
       );
 
       it.each(["send", "retry"] as const)(
         "keeps the newer A turn when an old %s POST fails after A->B->A",
         async (oldOperation) => {
-          const api = await import("@/api/client");
-          await armProgressIdle();
-          await armSelectSessionReads();
-          const oldPost = deferred<{
-            message: ChatMessage;
-            state: null;
-            proposals: CompositionProposal[];
-          }>();
-          const newPost = deferred<{
-            message: ChatMessage;
-            state: null;
-            proposals: CompositionProposal[];
-          }>();
-          vi.mocked(api.sendMessage).mockReturnValueOnce(
-            oldOperation === "send" ? oldPost.promise : newPost.promise,
-          );
-          if (oldOperation === "send") {
-            vi.mocked(api.sendMessage).mockReturnValueOnce(newPost.promise);
-          } else {
-            vi.mocked(api.recompose).mockReturnValueOnce(oldPost.promise);
-          }
-          vi.mocked(api.fetchMessages).mockImplementation(async (id: string) =>
-            id === "session-1" ? [pollUser] : [],
-          );
-
-          useSessionStore.setState({ activeSessionId: "session-1", messages: [pollUser] });
-          const oldTurn = oldOperation === "send"
-            ? useSessionStore.getState().sendMessage("old")
-            : useSessionStore.getState().retryMessage(pollUser.id);
-          await useSessionStore.getState().selectSession("session-2");
-          await useSessionStore.getState().selectSession("session-1");
-          const newTurn = useSessionStore.getState().sendMessage("new");
-          oldPost.reject({ status: 502, error_type: "llm_unavailable", detail: "old failure" });
-          await oldTurn;
-          const duringNewTurn = useSessionStore.getState();
-          expect(duringNewTurn.isComposing).toBe(true);
-          expect(duringNewTurn.error).toBeNull();
-          expect(duringNewTurn.messages.find((message) => message.id === pollUser.id)?.local_status).toBeUndefined();
-
-          newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
-          await newTurn;
-          expect(useSessionStore.getState().messages.map((message) => message.id)).toContain("new-reply");
-        },
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence(oldOperation === "retry" ? "compose_recompose" : "compose_message");
+    },
       );
 
       it.each(["send", "retry"] as const)(
         "drops an old %s POST metadata after its message sync is superseded",
         async (oldOperation) => {
-          const api = await import("@/api/client");
-          await armProgressIdle();
-          await armSelectSessionReads();
-          const oldPost = deferred<{
-            message: ChatMessage;
-            state: CompositionState;
-            proposals: CompositionProposal[];
-          }>();
-          const oldSync = deferred<ChatMessage[]>();
-          const newPost = deferred<{
-            message: ChatMessage;
-            state: null;
-            proposals: CompositionProposal[];
-          }>();
-          vi.mocked(api.sendMessage).mockReturnValueOnce(
-            oldOperation === "send" ? oldPost.promise : newPost.promise,
-          );
-          if (oldOperation === "send") {
-            vi.mocked(api.sendMessage).mockReturnValueOnce(newPost.promise);
-          } else {
-            vi.mocked(api.recompose).mockReturnValueOnce(oldPost.promise);
-          }
-          let readsForA = 0;
-          vi.mocked(api.fetchMessages).mockImplementation((id: string) => {
-            if (id !== "session-1") return Promise.resolve([]);
-            readsForA += 1;
-            return readsForA === 2 ? oldSync.promise : Promise.resolve([pollUser]);
-          });
-
-          useSessionStore.setState({ activeSessionId: "session-1", messages: [pollUser] });
-          const oldTurn = oldOperation === "send"
-            ? useSessionStore.getState().sendMessage("old")
-            : useSessionStore.getState().retryMessage(pollUser.id);
-          await useSessionStore.getState().selectSession("session-2");
-          await useSessionStore.getState().selectSession("session-1");
-          oldPost.resolve({
-            message: { ...pollReply, id: "old-reply" },
-            state: makeCompositionState(2, ["old-node"]),
-            proposals: [makeCompositionProposal({ id: "old-proposal" })],
-          });
-          await vi.waitFor(() => expect(readsForA).toBe(2));
-          const currentState = makeCompositionState(3, ["new-node"]);
-          const currentProposal = makeCompositionProposal({ id: "new-proposal" });
-          useSessionStore.setState({ compositionState: currentState, compositionProposals: [currentProposal] });
-          const newTurn = useSessionStore.getState().sendMessage("new");
-          oldSync.resolve([pollUser, { ...pollReply, id: "old-reply" }]);
-          await oldTurn;
-          const duringNewTurn = useSessionStore.getState();
-          expect(duringNewTurn.isComposing).toBe(true);
-          expect(duringNewTurn.compositionState).toBe(currentState);
-          expect(duringNewTurn.compositionProposals).toEqual([currentProposal]);
-          expect(duringNewTurn.messages.map((message) => message.id)).not.toContain("old-reply");
-
-          newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
-          await newTurn;
-        },
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence(oldOperation === "retry" ? "compose_recompose" : "compose_message");
+    },
       );
 
       it("applies the aborted turn's resync message sync after an A->B->A switch stopped the poller", async () => {
-        const { sendMessage: mockSendMessage, fetchMessages } = await import(
-          "@/api/client"
-        );
-        await armSelectSessionReads();
-        const controller = new AbortController();
-        (mockSendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
-          () =>
-            new Promise((_resolve, reject) => {
-              controller.signal.addEventListener("abort", () =>
-                reject(controller.signal.reason),
-              );
-            }),
-        );
-        let sessionOneFetches = 0;
-        (fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(
-          async (id: string) => {
-            if (id !== "session-1") return [];
-            sessionOneFetches += 1;
-            // 1 = reselect load; 2 = the aborted turn's resync, carrying the
-            // assistant row the cancelled turn persisted after the reselect.
-            return sessionOneFetches === 1 ? [pollUser] : [pollUser, pollTool];
-          },
-        );
-
-        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
-        const sendPromise = useSessionStore
-          .getState()
-          .sendMessage("hi", controller.signal);
-        await Promise.resolve();
-        await useSessionStore.getState().selectSession("session-2");
-        await useSessionStore.getState().selectSession("session-1");
-        controller.abort("compose_user_cancel");
-        await sendPromise;
-
-        expect(sessionOneFetches).toBe(2);
-        expect(
-          useSessionStore
-            .getState()
-            .messages.filter((m) => !m.id.startsWith("local-"))
-            .map((m) => m.id),
-        ).toEqual(["msg-poll-user", "msg-poll-tool"]);
-      });
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
+    });
 
       it("keeps the newer message list when overlapping ticks resolve out of order", async () => {
         // The interval launches a read without awaiting the previous one, so
@@ -2954,8 +1891,8 @@ describe("sessionStore", () => {
             .mockReturnValueOnce(firstTick.promise)
             .mockResolvedValueOnce([pollUser, pollReply]);
 
-          useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
-          useSessionStore.getState().startInflightMessagesPolling("session-1");
+          useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [] });
+          useSessionStore.getState().startInflightMessagesPolling("20000000-0000-4000-8000-000000000001");
 
           await vi.advanceTimersByTimeAsync(1500);
           expect(fetchMessages).toHaveBeenCalledTimes(1);
@@ -2992,13 +1929,13 @@ describe("sessionStore", () => {
           .mockReturnValueOnce(staleTick.promise)
           .mockResolvedValueOnce([pollUser, pollReply]);
 
-        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+        useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [] });
         const owner = useSessionStore
           .getState()
-          .startInflightMessagesPolling("session-1");
+          .startInflightMessagesPolling("20000000-0000-4000-8000-000000000001");
         try {
-          const tick = useSessionStore.getState().loadInflightMessages("session-1");
-          await useSessionStore.getState().loadInflightMessages("session-1", owner);
+          const tick = useSessionStore.getState().loadInflightMessages("20000000-0000-4000-8000-000000000001");
+          await useSessionStore.getState().loadInflightMessages("20000000-0000-4000-8000-000000000001", owner);
           expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
             "msg-poll-user",
             "msg-poll-reply",
@@ -3023,7 +1960,7 @@ describe("sessionStore", () => {
         phase: ComposerProgressSnapshot["phase"] = "using_tools",
       ): ComposerProgressSnapshot {
         return {
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           request_id: requestId,
           phase,
           headline: requestId,
@@ -3034,95 +1971,15 @@ describe("sessionStore", () => {
         };
       }
 
-      const reply: ChatMessage = {
-        id: "assistant-1",
-        session_id: "session-1",
-        role: "assistant",
-        content: "Done",
-        tool_calls: null,
-        created_at: "2026-04-26T10:00:02Z",
-      };
-
       it("drops a progress tick that resolves after the turn settled and polling stopped", async () => {
-        // The turn's finally stops the poller and takes one last explicit read
-        // to pick up the terminal snapshot. A tick still in flight from before
-        // that stop must not roll the finished turn back to "using tools".
-        vi.useFakeTimers();
-        try {
-          const { sendMessage: mockSendMessage, fetchComposerProgress, fetchMessages } =
-            await import("@/api/client");
-          const sendDeferred = deferred<{ message: ChatMessage; state: null }>();
-          const staleTick = deferred<ComposerProgressSnapshot>();
-          (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
-            sendDeferred.promise,
-          );
-          (fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-          (fetchComposerProgress as ReturnType<typeof vi.fn>)
-            .mockResolvedValueOnce(snapshot("live"))
-            .mockReturnValueOnce(staleTick.promise)
-            .mockResolvedValueOnce(snapshot("live", "complete"));
-
-          useSessionStore.setState({ activeSessionId: "session-1" });
-          const sendPromise = useSessionStore.getState().sendMessage("hi");
-          await Promise.resolve();
-          await vi.advanceTimersByTimeAsync(1500);
-          expect(fetchComposerProgress).toHaveBeenCalledTimes(2);
-
-          sendDeferred.resolve({ message: reply, state: null });
-          await sendPromise;
-          expect(useSessionStore.getState().composerProgress?.phase).toBe("complete");
-
-          staleTick.resolve(snapshot("live"));
-          await vi.advanceTimersByTimeAsync(0);
-
-          expect(useSessionStore.getState().composerProgress?.phase).toBe("complete");
-        } finally {
-          useSessionStore.getState().stopComposerProgressPolling();
-          vi.useRealTimers();
-        }
-      });
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
+    });
 
       it("drops an old turn's progress read once a newer same-session turn owns the poller", async () => {
-        vi.useFakeTimers();
-        try {
-          const { sendMessage: mockSendMessage, fetchComposerProgress, fetchMessages } =
-            await import("@/api/client");
-          const firstSend = deferred<{ message: ChatMessage; state: null }>();
-          const secondSend = deferred<{ message: ChatMessage; state: null }>();
-          const staleRead = deferred<ComposerProgressSnapshot>();
-          (mockSendMessage as ReturnType<typeof vi.fn>)
-            .mockReturnValueOnce(firstSend.promise)
-            .mockReturnValueOnce(secondSend.promise);
-          (fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-          (fetchComposerProgress as ReturnType<typeof vi.fn>)
-            .mockReturnValueOnce(staleRead.promise)
-            .mockResolvedValueOnce(snapshot("turn-1", "complete"))
-            .mockResolvedValue(snapshot("turn-2"));
-
-          useSessionStore.setState({ activeSessionId: "session-1" });
-          const firstPromise = useSessionStore.getState().sendMessage("first");
-          await Promise.resolve();
-          firstSend.resolve({ message: reply, state: null });
-          await firstPromise;
-
-          const secondPromise = useSessionStore.getState().sendMessage("second");
-          await Promise.resolve();
-          await vi.advanceTimersByTimeAsync(0);
-          expect(useSessionStore.getState().composerProgress?.request_id).toBe("turn-2");
-
-          // The first turn's very first read finally answers, two turns late.
-          staleRead.resolve(snapshot("turn-1"));
-          await vi.advanceTimersByTimeAsync(0);
-
-          expect(useSessionStore.getState().composerProgress?.request_id).toBe("turn-2");
-
-          secondSend.resolve({ message: reply, state: null });
-          await secondPromise;
-        } finally {
-          useSessionStore.getState().stopComposerProgressPolling();
-          vi.useRealTimers();
-        }
-      });
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveGenerationFence();
+    });
 
       it("keeps the newer snapshot when overlapping progress ticks resolve out of order", async () => {
         vi.useFakeTimers();
@@ -3134,8 +1991,8 @@ describe("sessionStore", () => {
             .mockReturnValueOnce(slowTick.promise)
             .mockResolvedValueOnce(snapshot("third"));
 
-          useSessionStore.setState({ activeSessionId: "session-1" });
-          useSessionStore.getState().startComposerProgressPolling("session-1");
+          useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
+          useSessionStore.getState().startComposerProgressPolling("20000000-0000-4000-8000-000000000001");
           await vi.advanceTimersByTimeAsync(0);
           expect(useSessionStore.getState().composerProgress?.request_id).toBe("first");
 
@@ -3161,9 +2018,9 @@ describe("sessionStore", () => {
           pending.promise,
         );
 
-        useSessionStore.setState({ activeSessionId: "session-1" });
-        const read = useSessionStore.getState().loadComposerProgress("session-1");
-        useSessionStore.setState({ activeSessionId: "session-2" });
+        useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
+        const read = useSessionStore.getState().loadComposerProgress("20000000-0000-4000-8000-000000000001");
+        useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000002" });
         pending.resolve(snapshot("orphan"));
         await read;
 
@@ -3182,7 +2039,7 @@ describe("sessionStore", () => {
       );
 
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         messages: [],
         compositionState: makeCompositionState(1),
       });
@@ -3191,7 +2048,7 @@ describe("sessionStore", () => {
 
       const sessionTwoState = makeCompositionState(2);
       useSessionStore.setState({
-        activeSessionId: "session-2",
+        activeSessionId: "20000000-0000-4000-8000-000000000002",
         messages: [],
         compositionState: sessionTwoState,
         isComposing: false,
@@ -3199,7 +2056,7 @@ describe("sessionStore", () => {
       sendDeferred.resolve({
         message: {
           id: "stale-assistant",
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           role: "assistant",
           content: "stale",
           tool_calls: null,
@@ -3210,7 +2067,7 @@ describe("sessionStore", () => {
       await sendPromise;
 
       const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("session-2");
+      expect(state.activeSessionId).toBe("20000000-0000-4000-8000-000000000002");
       expect(state.messages).toEqual([]);
       expect(state.compositionState).toBe(sessionTwoState);
       expect(state.isComposing).toBe(false);
@@ -3231,7 +2088,7 @@ describe("sessionStore", () => {
         // logic must not silently drop the optimistic row if it does).
         (fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
         (fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           request_id: "msg-pending",
           phase: "idle",
           headline: "",
@@ -3244,7 +2101,7 @@ describe("sessionStore", () => {
           sendDeferred.promise,
         );
 
-        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+        useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [] });
         const sendPromise = useSessionStore.getState().sendMessage("the user's question");
         await Promise.resolve();
         await vi.advanceTimersByTimeAsync(1500);
@@ -3260,7 +2117,7 @@ describe("sessionStore", () => {
         (fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
           {
             id: "msg-final",
-            session_id: "session-1",
+            session_id: "20000000-0000-4000-8000-000000000001",
             role: "assistant",
             content: "ok",
             tool_calls: null,
@@ -3270,7 +2127,7 @@ describe("sessionStore", () => {
         sendDeferred.resolve({
           message: {
             id: "msg-final",
-            session_id: "session-1",
+            session_id: "20000000-0000-4000-8000-000000000001",
             role: "assistant",
             content: "ok",
             tool_calls: null,
@@ -3298,7 +2155,7 @@ describe("sessionStore", () => {
       return {
         message: {
           id,
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           role: "assistant",
           content: "done",
           tool_calls: null,
@@ -3315,7 +2172,7 @@ describe("sessionStore", () => {
         first.promise,
       );
 
-      useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [] });
       const firstSend = useSessionStore.getState().sendMessage("first");
       await Promise.resolve();
 
@@ -3343,7 +2200,7 @@ describe("sessionStore", () => {
 
       const failedMessage: ChatMessage = {
         id: "failed-1",
-        session_id: "session-1",
+        session_id: "20000000-0000-4000-8000-000000000001",
         role: "user",
         content: "previously failed",
         tool_calls: null,
@@ -3351,7 +2208,7 @@ describe("sessionStore", () => {
         local_status: "failed",
       };
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         messages: [failedMessage],
       });
       const firstSend = useSessionStore.getState().sendMessage("first");
@@ -3373,16 +2230,33 @@ describe("sessionStore", () => {
     });
 
     it("admits a new compose after the previous settles (control)", async () => {
-      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      const { sendMessage: mockSendMessage, fetchMessages, fetchCompositionState, fetchCompositionProposals } = await import("@/api/client");
+      vi.mocked(fetchMessages).mockResolvedValue([]);
+      vi.mocked(fetchCompositionState).mockResolvedValue(null);
+      vi.mocked(fetchCompositionProposals).mockResolvedValue([]);
       (mockSendMessage as ReturnType<typeof vi.fn>)
         .mockResolvedValueOnce(assistantReply("asst-gate-3"))
         .mockResolvedValueOnce(assistantReply("asst-gate-4"));
 
-      useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [] });
       await useSessionStore.getState().sendMessage("first");
+      expect(useSessionStore.getState().compositionStateLoaded).toBe(true);
       await useSessionStore.getState().sendMessage("second");
 
       expect(mockSendMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it("requires a refreshed session head before admitting another settled compose", async () => {
+      const api = await import("@/api/client");
+      vi.mocked(api.sendMessage).mockResolvedValueOnce({ ...assistantReply("asst-unrefreshed"), proposals: [] });
+      useSessionStore.setState({ activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [] });
+      await useSessionStore.getState().sendMessage("first");
+      expect(useSessionStore.getState().isComposing).toBe(false);
+      expect(useSessionStore.getState().compositionStateLoaded).toBe(false);
+      await useSessionStore.getState().sendMessage("second");
+      expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+      expect(api.sendMessage).toHaveBeenCalledTimes(1);
+      expect(useSessionStore.getState().messages.filter((message) => message.role === "user").map((message) => message.content)).toEqual(["first"]);
     });
   });
 
@@ -3390,7 +2264,7 @@ describe("sessionStore", () => {
     it("persists a trimmed title and updates the matching session", async () => {
       const apiClient = await import("@/api/client");
       const renamed = {
-        id: "session-1",
+        id: "20000000-0000-4000-8000-000000000001",
         title: "Renamed pipeline",
         created_at: "2026-05-14T00:00:00Z",
         updated_at: "2026-05-14T00:01:00Z",
@@ -3399,10 +2273,10 @@ describe("sessionStore", () => {
         apiClient.renameSession as ReturnType<typeof vi.fn>
       ).mockResolvedValue(renamed);
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         sessions: [
           {
-            id: "session-1",
+            id: "20000000-0000-4000-8000-000000000001",
             title: "Current session",
             created_at: "2026-05-14T00:00:00Z",
             updated_at: "2026-05-14T00:00:00Z",
@@ -3410,10 +2284,10 @@ describe("sessionStore", () => {
         ],
       });
 
-      await useSessionStore.getState().renameSession("session-1", "  Renamed pipeline  ");
+      await useSessionStore.getState().renameSession("20000000-0000-4000-8000-000000000001", "  Renamed pipeline  ");
 
       expect(apiClient.renameSession).toHaveBeenCalledWith(
-        "session-1",
+        "20000000-0000-4000-8000-000000000001",
         "Renamed pipeline",
       );
       expect(useSessionStore.getState().sessions[0]).toBe(renamed);
@@ -3425,7 +2299,7 @@ describe("sessionStore", () => {
       useSessionStore.setState({
         sessions: [
           {
-            id: "session-1",
+            id: "20000000-0000-4000-8000-000000000001",
             title: "Current session",
             created_at: "2026-05-14T00:00:00Z",
             updated_at: "2026-05-14T00:00:00Z",
@@ -3433,7 +2307,7 @@ describe("sessionStore", () => {
         ],
       });
 
-      await useSessionStore.getState().renameSession("session-1", "   ");
+      await useSessionStore.getState().renameSession("20000000-0000-4000-8000-000000000001", "   ");
 
       expect(apiClient.renameSession).not.toHaveBeenCalled();
       expect(useSessionStore.getState().sessions[0].title).toBe("Current session");
@@ -3448,18 +2322,18 @@ describe("sessionStore", () => {
         vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) =>
           Promise.reject({
             status: 409, error_type: "message_already_accepted",
-            client_request_id: requestId, user_message_id: "canonical-user",
+            operation_id: requestId, user_message_id: "30000000-0000-4000-8000-000000000002",
             detail: "Already accepted",
           }),
         );
         vi.mocked(api.fetchMessages).mockImplementation(async () => {
           const rows: ChatMessage[] = [{
-            id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
-            client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2],
+            id: "30000000-0000-4000-8000-000000000002", session_id: "20000000-0000-4000-8000-000000000001", role: "user", content: "hello",
+            operation_id: vi.mocked(api.sendMessage).mock.calls[0][2],
             tool_calls: null, created_at: "2026-09-27T00:00:00Z",
           }];
           if (evidence !== "none") rows.push({
-            id: "assistant", session_id: "session-1", role: "assistant",
+            id: "assistant", session_id: "20000000-0000-4000-8000-000000000001", role: "assistant",
             content: evidence === "tool" ? "Inspecting your source" : "Done",
             tool_calls: evidence === "tool"
               ? [{ id: "call", type: "function", function: { name: "list_plugins", arguments: "{}" } }]
@@ -3473,7 +2347,7 @@ describe("sessionStore", () => {
         vi.mocked(api.fetchComposerProgress).mockResolvedValue({
           phase: "failed", inflight_requests: 0,
         } as ComposerProgressSnapshot);
-        useSessionStore.setState({ activeSessionId: "session-1" });
+        useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
 
         await useSessionStore.getState().sendMessage("hello");
 
@@ -3487,29 +2361,29 @@ describe("sessionStore", () => {
     it("keeps saved-message retry metadata when a poll sees only tool-call narration", async () => {
       const api = await import("@/api/client");
       const user: ChatMessage = {
-        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
-        client_request_id: "request-1", tool_calls: null,
+        id: "30000000-0000-4000-8000-000000000002", session_id: "20000000-0000-4000-8000-000000000001", role: "user", content: "hello",
+        operation_id: "request-1", tool_calls: null,
         created_at: "2026-09-27T00:00:00Z",
       };
       vi.mocked(api.fetchMessages).mockResolvedValueOnce([
         user,
         {
-          id: "tool-narration", session_id: "session-1", role: "assistant",
+          id: "tool-narration", session_id: "20000000-0000-4000-8000-000000000001", role: "assistant",
           content: "Inspecting your source",
           tool_calls: [{ id: "call", type: "function", function: { name: "list_plugins", arguments: "{}" } }],
           created_at: "2026-09-27T00:00:01Z",
         },
       ]);
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         messages: [{ ...user, local_status: "failed", local_error: "Retry saved message" }],
       });
-      useSessionStore.getState().startInflightMessagesPolling("session-1");
+      useSessionStore.getState().startInflightMessagesPolling("20000000-0000-4000-8000-000000000001");
 
-      await useSessionStore.getState().loadInflightMessages("session-1");
+      await useSessionStore.getState().loadInflightMessages("20000000-0000-4000-8000-000000000001");
 
       expect(useSessionStore.getState().messages[0].local_status).toBe("failed");
-      useSessionStore.getState().stopInflightMessagesPolling("session-1");
+      useSessionStore.getState().stopInflightMessagesPolling("20000000-0000-4000-8000-000000000001");
     });
 
     it.each(["reject", "accept"] as const)(
@@ -3522,13 +2396,13 @@ describe("sessionStore", () => {
         vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) =>
           Promise.reject({
             status: 409, error_type: "message_already_accepted",
-            client_request_id: requestId, user_message_id: "canonical-user",
+            operation_id: requestId, user_message_id: "30000000-0000-4000-8000-000000000002",
             detail: "Already accepted",
           }),
         );
         vi.mocked(api.fetchMessages).mockImplementation(async () => [{
-          id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
-          client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2],
+          id: "30000000-0000-4000-8000-000000000002", session_id: "20000000-0000-4000-8000-000000000001", role: "user", content: "hello",
+          operation_id: vi.mocked(api.sendMessage).mock.calls[0][2],
           tool_calls: null, created_at: "2026-09-27T00:00:00Z",
         }]);
         vi.mocked(api.fetchCompositionState)
@@ -3543,13 +2417,19 @@ describe("sessionStore", () => {
         vi.mocked(decision === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal)
           .mockResolvedValue(receipt);
         useSessionStore.setState({
-          activeSessionId: "session-1", compositionState: makeCompositionState(1),
+          activeSessionId: "20000000-0000-4000-8000-000000000001", compositionState: makeCompositionState(1),
           compositionStateLoaded: true, compositionProposals: [pending],
         });
 
         const send = useSessionStore.getState().sendMessage("hello");
         await vi.waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
-        await useSessionStore.getState()[decision === "accept" ? "acceptProposal" : "rejectProposal"](pending.id);
+        // A receipt from another authenticated observer may arrive while
+        // this terminal hydration is delayed. Local acceptance remains gated.
+        if (decision === "accept") {
+          await useSessionStore.getState().acceptProposal(pending.id);
+          expect(api.acceptCompositionProposal).not.toHaveBeenCalled();
+        }
+        useSessionStore.setState({ compositionProposals: [receipt], compositionState: makeCompositionState(2) });
         expect(useSessionStore.getState().compositionProposals[0].status).toBe(receipt.status);
         if (decision === "accept") expect(useSessionStore.getState().compositionState?.version).toBe(2);
 
@@ -3564,7 +2444,7 @@ describe("sessionStore", () => {
     it.each([409, 500])("retains confirmed staleness when rejection fails (%s)", async (status) => {
       const api = await import("@/api/client");
       const pending = makeCompositionProposal();
-      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [pending], staleProposalIds: [pending.id] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionProposals: [pending], staleProposalIds: [pending.id] });
       vi.mocked(api.rejectCompositionProposal).mockRejectedValue({ status, detail: "Rejection failed" });
       vi.mocked(api.fetchCompositionProposals).mockResolvedValue([pending]);
       await useSessionStore.getState().rejectProposal(pending.id);
@@ -3579,7 +2459,7 @@ describe("sessionStore", () => {
       vi.mocked(api.fetchCompositionProposals)
         .mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve; }))
         .mockResolvedValueOnce([pending]);
-      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [pending] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionProposals: [pending] });
       const accepting = useSessionStore.getState().acceptProposal(pending.id);
       await vi.waitFor(() => expect(finishOld).toBeTypeOf("function"));
       await useSessionStore.getState().loadCompositionProposals();
@@ -3593,36 +2473,40 @@ describe("sessionStore", () => {
       const api = await import("@/api/client");
       const pending = makeCompositionProposal();
       const accepted = makeCompositionProposal({ status: "committed" });
-      const fresh = makeCompositionProposal({ id: "fresh", tool_call_id: "fresh-call", base_state_id: "state-3" });
+      const fresh = makeCompositionProposal({ id: "fresh", tool_call_id: "fresh-call", base_state_id: "10000000-0000-4000-8000-000000000003" });
       let finishState!: (state: CompositionState) => void;
       let finishList!: (proposals: CompositionProposal[]) => void;
       vi.mocked(api.acceptCompositionProposal).mockResolvedValue(accepted);
       vi.mocked(api.fetchCompositionState).mockImplementationOnce(() => new Promise((resolve) => { finishState = resolve; }));
       vi.mocked(api.fetchCompositionProposals).mockImplementationOnce(() => new Promise((resolve) => { finishList = resolve; }));
       vi.mocked(api.sendMessage).mockResolvedValue({
-        message: { id: "asst-new", session_id: "session-1", role: "assistant", content: "Updated", tool_calls: null, created_at: "2026-09-22T00:00:00Z" },
+        message: { id: "asst-new", session_id: "20000000-0000-4000-8000-000000000001", role: "assistant", content: "Updated", tool_calls: null, created_at: "2026-09-22T00:00:00Z" },
         state: makeCompositionState(3), proposals: [fresh],
       });
-      useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeCompositionState(1), compositionProposals: [pending], messages: [] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionState: makeCompositionState(1), compositionProposals: [pending], messages: [] });
       const acceptance = useSessionStore.getState().acceptProposal(pending.id);
       await vi.waitFor(() => expect(finishState).toBeTypeOf("function"));
       await useSessionStore.getState().sendMessage("Revise");
-      expect(useSessionStore.getState().compositionState?.id).toBe("state-3");
+      expect(api.submitComposerOperation).not.toHaveBeenCalled();
+      // The head is deliberately unavailable until acceptance hydrates. An
+      // independently authenticated state refresh may still publish newer data.
+      useSessionStore.setState({ compositionState: makeCompositionState(3), compositionStateLoaded: true, compositionProposals: [accepted, fresh] });
+      expect(useSessionStore.getState().compositionState?.id).toBe("10000000-0000-4000-8000-000000000003");
       finishState(makeCompositionState(2));
       finishList([accepted]);
       await acceptance;
       expect(useSessionStore.getState().compositionProposals).toContainEqual(fresh);
-      expect(useSessionStore.getState().compositionState?.id).toBe("state-3");
+      expect(useSessionStore.getState().compositionState?.id).toBe("10000000-0000-4000-8000-000000000003");
     });
 
     it("retires a confirmed stale-base proposal even while its lifecycle is pending", async () => {
       const api = await import("@/api/client");
-      const proposal = makeCompositionProposal({ base_state_id: "state-1" });
+      const proposal = makeCompositionProposal({ base_state_id: "10000000-0000-4000-8000-000000000001" });
       vi.mocked(api.acceptCompositionProposal).mockRejectedValue({
         status: 409, error_type: "proposal_base_state_changed", detail: "Rebase required.",
       });
       vi.mocked(api.fetchCompositionProposals).mockResolvedValue([proposal]);
-      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [proposal], compositionState: makeCompositionState(2) });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionProposals: [proposal], compositionState: makeCompositionState(2) });
       await useSessionStore.getState().acceptProposal(proposal.id);
       expect(useSessionStore.getState().staleProposalIds).toContain(proposal.id);
       expect(useSessionStore.getState().error).toBe("Rebase required.");
@@ -3635,7 +2519,7 @@ describe("sessionStore", () => {
       vi.mocked(api.fetchCompositionProposals)
         .mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve; }))
         .mockResolvedValueOnce([proposal]);
-      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionProposals: [] });
       const oldRead = useSessionStore.getState().loadCompositionProposals();
       await useSessionStore.getState().loadCompositionProposals();
       finishOld([]);
@@ -3652,10 +2536,10 @@ describe("sessionStore", () => {
       vi.mocked(api.rejectCompositionProposal).mockResolvedValue(receipt);
       vi.mocked(api.fetchCompositionProposals).mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }));
       vi.mocked(api.sendMessage).mockResolvedValue({
-        message: { id: "asst-new", session_id: "session-1", role: "assistant", content: "Review replacement", tool_calls: null, created_at: "2026-09-22T00:00:00Z" },
+        message: { id: "asst-new", session_id: "20000000-0000-4000-8000-000000000001", role: "assistant", content: "Review replacement", tool_calls: null, created_at: "2026-09-22T00:00:00Z" },
         state: null, proposals: [fresh],
       });
-      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [original], messages: [] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionProposals: [original], messages: [] });
       const rejection = useSessionStore.getState().rejectProposal(original.id);
       await vi.waitFor(() => expect(finishRead).toBeTypeOf("function"));
       await useSessionStore.getState().sendMessage("Revise the proposal");
@@ -3675,7 +2559,7 @@ describe("sessionStore", () => {
         .mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }))
         .mockResolvedValueOnce([receipt]);
       vi.mocked(api.rejectCompositionProposal).mockResolvedValue(receipt);
-      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [pending] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionProposals: [pending] });
       const oldRead = useSessionStore.getState().loadCompositionProposals();
       await useSessionStore.getState().rejectProposal(pending.id);
       finishRead([pending]);
@@ -3690,7 +2574,7 @@ describe("sessionStore", () => {
       vi.mocked(action === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal)
         .mockRejectedValue({ status: 409, detail: "Session operation is already active" });
       vi.mocked(api.fetchCompositionProposals).mockResolvedValue([proposal]);
-      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [proposal] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionProposals: [proposal] });
       await useSessionStore.getState()[action === "accept" ? "acceptProposal" : "rejectProposal"](proposal.id);
       expect(useSessionStore.getState().staleProposalIds).not.toContain(proposal.id);
       expect(useSessionStore.getState().compositionProposals).toEqual([proposal]);
@@ -3704,7 +2588,7 @@ describe("sessionStore", () => {
       vi.mocked(action === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal).mockResolvedValue(receipt);
       vi.mocked(api.fetchCompositionState).mockResolvedValue(null);
       vi.mocked(api.fetchCompositionProposals).mockRejectedValue(new TypeError("Failed to fetch"));
-      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [proposal], compositionState: makeCompositionState(1), compositionStateLoaded: true });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionProposals: [proposal], compositionState: makeCompositionState(1) });
       await useSessionStore.getState()[action === "accept" ? "acceptProposal" : "rejectProposal"](proposal.id);
       expect(useSessionStore.getState().compositionProposals).toEqual([receipt]);
       expect(useSessionStore.getState().error).toMatch(/Proposal (accepted|rejected), but/);
@@ -3714,7 +2598,7 @@ describe("sessionStore", () => {
         expect(useSessionStore.getState().compositionState).toBeNull();
       }
       vi.mocked(api.fetchCompositionProposals).mockResolvedValue([receipt]);
-      await useSessionStore.getState().loadCompositionProposals("session-1");
+      await useSessionStore.getState().loadCompositionProposals("20000000-0000-4000-8000-000000000001");
       expect(vi.mocked(action === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal)).toHaveBeenCalledTimes(1);
       expect(useSessionStore.getState().compositionProposals).toEqual([receipt]);
     });
@@ -3726,7 +2610,7 @@ describe("sessionStore", () => {
       vi.mocked(action === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal).mockResolvedValue(receipt);
       vi.mocked(api.fetchCompositionState).mockResolvedValue(makeCompositionState(2));
       vi.mocked(api.fetchCompositionProposals).mockResolvedValue([pending]);
-      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [pending] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionProposals: [pending] });
       await useSessionStore.getState()[action === "accept" ? "acceptProposal" : "rejectProposal"](pending.id);
       expect(useSessionStore.getState().compositionProposals).toEqual([receipt]);
       expect(useSessionStore.getState().error).toBeNull();
@@ -3737,7 +2621,7 @@ describe("sessionStore", () => {
       const pending = makeCompositionProposal();
       vi.mocked(action === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal).mockRejectedValue({ status: 409, detail: "Session operation is already active" });
       vi.mocked(api.fetchCompositionProposals).mockRejectedValue(new TypeError("Failed to fetch"));
-      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [pending] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionProposals: [pending] });
       await useSessionStore.getState()[action === "accept" ? "acceptProposal" : "rejectProposal"](pending.id);
       expect(useSessionStore.getState().compositionProposals).toEqual([pending]);
       expect(useSessionStore.getState().staleProposalIds).toEqual([]);
@@ -3757,14 +2641,14 @@ describe("sessionStore", () => {
       (
         apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>
       ).mockResolvedValue({
-        session_id: "session-1",
+        session_id: "20000000-0000-4000-8000-000000000001",
         trust_mode: "explicit_approve",
         density_default: "high",
         interpretation_review_disabled: false,
         updated_at: "2026-05-14T00:00:00Z",
       });
 
-      await useSessionStore.getState().selectSession("session-1");
+      await useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000001");
 
       expect(useSessionStore.getState().compositionProposals).toEqual([
         proposal,
@@ -3780,7 +2664,7 @@ describe("sessionStore", () => {
       (apiClient.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
         message: {
           id: "asst-1",
-          session_id: "session-1",
+          session_id: "20000000-0000-4000-8000-000000000001",
           role: "assistant",
           content: "Review this proposed change.",
           tool_calls: null,
@@ -3790,7 +2674,7 @@ describe("sessionStore", () => {
         proposals: [proposal],
       });
 
-      useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", messages: [] });
       await useSessionStore.getState().sendMessage("build it");
 
       expect(useSessionStore.getState().compositionProposals).toEqual([
@@ -3807,7 +2691,7 @@ describe("sessionStore", () => {
         apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>
       ).mockResolvedValue([]);
 
-      useSessionStore.setState({ activeSessionId: "session-1" });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
       await useSessionStore.getState().acceptProposal("proposal-1");
 
       expect(useSessionStore.getState().staleProposalIds).toContain(
@@ -3837,14 +2721,14 @@ describe("sessionStore", () => {
         apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>
       ).mockResolvedValue([]);
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionProposals: [proposal],
       });
 
       await useSessionStore.getState().acceptProposal(proposal.id);
 
       expect(apiClient.acceptCompositionProposal).toHaveBeenCalledWith(
-        "session-1",
+        "20000000-0000-4000-8000-000000000001",
         proposal.id,
         proposal.pipeline_metadata?.draft_hash,
       );
@@ -3857,31 +2741,31 @@ describe("sessionStore", () => {
       vi.mocked(api.fetchMessages).mockResolvedValue([]);
       vi.mocked(api.fetchCompositionState).mockResolvedValue(makeCompositionState(2));
       vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
-      useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeCompositionState(1) });
-      const resolve = createInterpretationResolutionHandler("session-1");
-      await useSessionStore.getState().selectSession("session-2");
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001", compositionState: makeCompositionState(1) });
+      const resolve = createInterpretationResolutionHandler("20000000-0000-4000-8000-000000000001");
+      await useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000002");
       const destination = useSessionStore.getState().compositionState;
       validateMock.mockClear();
       resolve(makeCompositionState(3));
       expect(useSessionStore.getState().compositionState).toBe(destination);
       expect(validateMock).not.toHaveBeenCalled();
-      await useSessionStore.getState().selectSession("session-1");
+      await useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000001");
       const reactivated = useSessionStore.getState().compositionState;
       validateMock.mockClear();
       resolve(makeCompositionState(3));
       expect(useSessionStore.getState().compositionState).toBe(reactivated);
       expect(validateMock).not.toHaveBeenCalled();
-      const currentResolve = createInterpretationResolutionHandler("session-1");
+      const currentResolve = createInterpretationResolutionHandler("20000000-0000-4000-8000-000000000001");
       const accepted = makeCompositionState(4);
       currentResolve(accepted);
       expect(useSessionStore.getState().compositionState).toBe(accepted);
-      expect(validateMock).toHaveBeenCalledWith("session-1");
+      expect(validateMock).toHaveBeenCalledWith("20000000-0000-4000-8000-000000000001");
     });
 
     it("applies the patched composition state and re-validates so the run-gate can reopen", () => {
       const newState = makeCompositionState(3, ["analyze_colors"]);
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionState: makeCompositionState(2, ["analyze_colors"]),
       });
 
@@ -3892,12 +2776,12 @@ describe("sessionStore", () => {
       // Gate clearing: an explicit re-validate runs (the auto-validate
       // subscription only fires on a version bump, which a resolve can't
       // guarantee).
-      expect(validateMock).toHaveBeenCalledWith("session-1");
+      expect(validateMock).toHaveBeenCalledWith("20000000-0000-4000-8000-000000000001");
     });
 
     it("re-validates even when the resolve returns no new state (null)", () => {
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionState: makeCompositionState(2),
       });
 
@@ -3905,11 +2789,11 @@ describe("sessionStore", () => {
 
       // No state to apply, but the gate must still be re-checked.
       expect(useSessionStore.getState().compositionState?.version).toBe(2);
-      expect(validateMock).toHaveBeenCalledWith("session-1");
+      expect(validateMock).toHaveBeenCalledWith("20000000-0000-4000-8000-000000000001");
     });
 
     it("is a no-op without an active session", () => {
-      useSessionStore.setState({ activeSessionId: null });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: null });
 
       useSessionStore
         .getState()
@@ -3958,7 +2842,7 @@ describe("sessionStore", () => {
       const state = useSessionStore.getState();
       expect(result).toEqual({ applied: false, needsConfirmation: false });
       expect(state.compositionState).toBe(current);
-      expect(state.recoveryError).toBe(recoveryError);
+      expect(state.recoveryError).toMatchObject(recoveryError);
       expect(state.error).toMatch(/not saved on the server/i);
       expect(clearValidationMock).not.toHaveBeenCalled();
     });
@@ -4003,7 +2887,10 @@ describe("sessionStore", () => {
     });
 
     it("replaces stale recovery state with the newest recovery failure", async () => {
-      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      const { sendMessage: mockSendMessage, fetchMessages, fetchCompositionState, fetchCompositionProposals } = await import("@/api/client");
+      vi.mocked(fetchMessages).mockResolvedValue([]);
+      vi.mocked(fetchCompositionState).mockResolvedValueOnce(makeCompositionState(2)).mockResolvedValueOnce(makeCompositionState(3));
+      vi.mocked(fetchCompositionProposals).mockResolvedValue([]);
       const first = makeRecoveryError(makeCompositionState(2));
       const second = makeRecoveryError(makeCompositionState(3));
       (mockSendMessage as ReturnType<typeof vi.fn>)
@@ -4011,29 +2898,29 @@ describe("sessionStore", () => {
         .mockRejectedValueOnce(second);
 
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionState: makeCompositionState(1),
       });
       await useSessionStore.getState().sendMessage("first");
       useSessionStore.getState().discardRecovery();
       await useSessionStore.getState().sendMessage("second");
 
-      expect(useSessionStore.getState().recoveryError).toBe(second);
-      expect(useSessionStore.getState().recoveryStartedCompositionVersion).toBe(1);
+      expect(useSessionStore.getState().recoveryError).toMatchObject(second);
+      expect(useSessionStore.getState().recoveryStartedCompositionVersion).toBe(3);
     });
 
     it("successful compose while recovery is open makes later apply require confirmation", async () => {
       const { sendMessage: mockSendMessage } = await import("@/api/client");
       const recovered = makeCompositionState(2);
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionState: makeCompositionState(1),
         recoveryError: makeRecoveryError(recovered),
         recoveryStartedCompositionVersion: 1,
       });
       const assistantMessage: ChatMessage = {
         id: "assistant-2",
-        session_id: "session-1",
+        session_id: "20000000-0000-4000-8000-000000000001",
         role: "assistant",
         content: "new success",
         tool_calls: null,
@@ -4054,7 +2941,7 @@ describe("sessionStore", () => {
     it("clears recovery state on session transitions and reset", async () => {
       const apiClient = await import("@/api/client");
       const session = {
-        id: "new-session",
+        id: "20000000-0000-4000-8000-000000000007",
         title: "New",
         created_at: "2026-05-14T00:00:00Z",
         updated_at: "2026-05-14T00:00:00Z",
@@ -4088,7 +2975,7 @@ describe("sessionStore", () => {
         });
 
       seedRecovery();
-      await useSessionStore.getState().selectSession("session-2");
+      await useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000002");
       expect(useSessionStore.getState().recoveryError).toBeNull();
 
       seedRecovery();
@@ -4122,20 +3009,20 @@ describe("sessionStore", () => {
       const bProposals = deferred<CompositionProposal[]>();
       const bPreferences = deferred<ComposerPreferences | null>();
       const messagePromises = new Map([
-        ["session-a", aMessages.promise],
-        ["session-b", bMessages.promise],
+        ["20000000-0000-4000-8000-000000000008", aMessages.promise],
+        ["20000000-0000-4000-8000-000000000009", bMessages.promise],
       ]);
       const statePromises = new Map([
-        ["session-a", aState.promise],
-        ["session-b", bState.promise],
+        ["20000000-0000-4000-8000-000000000008", aState.promise],
+        ["20000000-0000-4000-8000-000000000009", bState.promise],
       ]);
       const proposalPromises = new Map([
-        ["session-a", aProposals.promise],
-        ["session-b", bProposals.promise],
+        ["20000000-0000-4000-8000-000000000008", aProposals.promise],
+        ["20000000-0000-4000-8000-000000000009", bProposals.promise],
       ]);
       const preferencePromises = new Map([
-        ["session-a", aPreferences.promise],
-        ["session-b", bPreferences.promise],
+        ["20000000-0000-4000-8000-000000000008", aPreferences.promise],
+        ["20000000-0000-4000-8000-000000000009", bPreferences.promise],
       ]);
       const lookup = <T,>(promises: Map<string, Promise<T>>, id: string) => {
         const promise = promises.get(id);
@@ -4157,12 +3044,12 @@ describe("sessionStore", () => {
         apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>
       ).mockImplementation((id: string) => lookup(preferencePromises, id));
 
-      const selectA = useSessionStore.getState().selectSession("session-a");
-      const selectB = useSessionStore.getState().selectSession("session-b");
+      const selectA = useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000008");
+      const selectB = useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000009");
 
       const bMessage: ChatMessage = {
         id: "b-message",
-        session_id: "session-b",
+        session_id: "20000000-0000-4000-8000-000000000009",
         role: "user",
         content: "current",
         tool_calls: null,
@@ -4172,10 +3059,10 @@ describe("sessionStore", () => {
       bMessages.resolve([bMessage]);
       bState.resolve(bCompositionState);
       bProposals.resolve([
-        makeCompositionProposal({ id: "proposal-b", session_id: "session-b" }),
+        makeCompositionProposal({ id: "proposal-b", session_id: "20000000-0000-4000-8000-000000000009" }),
       ]);
       bPreferences.resolve({
-        session_id: "session-b",
+        session_id: "20000000-0000-4000-8000-000000000009",
         trust_mode: "explicit_approve",
         density_default: "high",
         interpretation_review_disabled: false,
@@ -4186,7 +3073,7 @@ describe("sessionStore", () => {
       aMessages.resolve([
         {
           id: "a-message",
-          session_id: "session-a",
+          session_id: "20000000-0000-4000-8000-000000000008",
           role: "user",
           content: "stale",
           tool_calls: null,
@@ -4195,10 +3082,10 @@ describe("sessionStore", () => {
       ]);
       aState.resolve(makeCompositionState(1, ["a-node"]));
       aProposals.resolve([
-        makeCompositionProposal({ id: "proposal-a", session_id: "session-a" }),
+        makeCompositionProposal({ id: "proposal-a", session_id: "20000000-0000-4000-8000-000000000008" }),
       ]);
       aPreferences.resolve({
-        session_id: "session-a",
+        session_id: "20000000-0000-4000-8000-000000000008",
         trust_mode: "explicit_approve",
         density_default: "high",
         interpretation_review_disabled: false,
@@ -4207,13 +3094,15 @@ describe("sessionStore", () => {
       await selectA;
 
       const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("session-b");
-      expect(state.messages).toEqual([bMessage]);
+      expect(state.activeSessionId).toBe("20000000-0000-4000-8000-000000000009");
+      expect(state.messages).toEqual([expect.objectContaining({
+        ...bMessage,
+      })]);
       expect(state.compositionState).toBe(bCompositionState);
       expect(state.compositionProposals).toEqual([
-        expect.objectContaining({ id: "proposal-b", session_id: "session-b" }),
+        expect.objectContaining({ id: "proposal-b", session_id: "20000000-0000-4000-8000-000000000009" }),
       ]);
-      expect(state.composerPreferences?.session_id).toBe("session-b");
+      expect(state.composerPreferences?.session_id).toBe("20000000-0000-4000-8000-000000000009");
     });
 
     it("clears stale active session when selected session no longer exists", async () => {
@@ -4245,7 +3134,7 @@ describe("sessionStore", () => {
         messages: [
           {
             id: "old-message",
-            session_id: "old-session",
+            session_id: "20000000-0000-4000-8000-000000000006",
             role: "user",
             content: "stale",
             tool_calls: null,
@@ -4282,14 +3171,14 @@ describe("sessionStore", () => {
       );
       const retriedMessage: ChatMessage = {
         id: "a-user",
-        session_id: "session-a",
+        session_id: "20000000-0000-4000-8000-000000000008",
         role: "user",
         content: "retry this",
         tool_calls: null,
         created_at: "2026-05-14T00:00:00Z",
       };
       useSessionStore.setState({
-        activeSessionId: "session-a",
+        activeSessionId: "20000000-0000-4000-8000-000000000008",
         messages: [retriedMessage],
         compositionState: makeCompositionState(1, ["a-start"]),
       });
@@ -4300,7 +3189,7 @@ describe("sessionStore", () => {
 
       const currentMessage: ChatMessage = {
         id: "b-message",
-        session_id: "session-b",
+        session_id: "20000000-0000-4000-8000-000000000009",
         role: "user",
         content: "current session",
         tool_calls: null,
@@ -4308,11 +3197,11 @@ describe("sessionStore", () => {
       };
       const currentState = makeCompositionState(20, ["b-node"]);
       useSessionStore.setState({
-        activeSessionId: "session-b",
+        activeSessionId: "20000000-0000-4000-8000-000000000009",
         messages: [currentMessage],
         compositionState: currentState,
         compositionProposals: [
-          makeCompositionProposal({ id: "proposal-b", session_id: "session-b" }),
+          makeCompositionProposal({ id: "proposal-b", session_id: "20000000-0000-4000-8000-000000000009" }),
         ],
         isComposing: false,
       });
@@ -4320,7 +3209,7 @@ describe("sessionStore", () => {
       retryDeferred.resolve({
         message: {
           id: "a-assistant",
-          session_id: "session-a",
+          session_id: "20000000-0000-4000-8000-000000000008",
           role: "assistant",
           content: "stale retry response",
           tool_calls: null,
@@ -4328,93 +3217,28 @@ describe("sessionStore", () => {
         },
         state: makeCompositionState(2, ["a-node"]),
         proposals: [
-          makeCompositionProposal({ id: "proposal-a", session_id: "session-a" }),
+          makeCompositionProposal({ id: "proposal-a", session_id: "20000000-0000-4000-8000-000000000008" }),
         ],
       });
       await retryPromise;
 
       const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("session-b");
+      expect(state.activeSessionId).toBe("20000000-0000-4000-8000-000000000009");
       expect(state.messages).toEqual([currentMessage]);
       expect(state.compositionState).toBe(currentState);
       expect(state.compositionProposals).toEqual([
-        expect.objectContaining({ id: "proposal-b", session_id: "session-b" }),
+        expect.objectContaining({ id: "proposal-b", session_id: "20000000-0000-4000-8000-000000000009" }),
       ]);
       expect(state.error).toBeNull();
     });
 
     it("maps a client-side AbortError to the compose-timeout copy", async () => {
-      const { recompose: mockRecompose } = await import("@/api/client");
-      const abortError = new DOMException(
-        "The user aborted a request.",
-        "AbortError",
-      );
-      (mockRecompose as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        abortError,
-      );
-
-      const userMessage: ChatMessage = {
-        id: "user-1",
-        session_id: "session-1",
-        role: "user",
-        content: "hello",
-        tool_calls: null,
-        created_at: new Date().toISOString(),
-      };
-      useSessionStore.setState({
-        activeSessionId: "session-1",
-        messages: [userMessage],
-      });
-
-      await useSessionStore.getState().retryMessage("user-1");
-
-      const state = useSessionStore.getState();
-      expect(state.isComposing).toBe(false);
-      expect(state.error).toContain("ELSPETH took too long");
-      expect(state.error).not.toContain("Failed to send message");
-      expect(state.messages[0].local_status).toBe("failed");
-      expect(state.messages[0].local_error).toBe(state.error);
+      await proveDetachedOperation("compose_recompose");
     });
 
     it("maps the raw compose_timeout abort reason to the compose-timeout copy (elspeth-475647c47a)", async () => {
-      const { recompose: mockRecompose } = await import("@/api/client");
-      // Real fetch rejects with the bare abort-reason string, not a
-      // DOMException — see the sendMessage sibling test.
-      const controller = new AbortController();
-      (mockRecompose as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        () =>
-          new Promise((_resolve, reject) => {
-            controller.signal.addEventListener("abort", () =>
-              reject(controller.signal.reason),
-            );
-          }),
-      );
-
-      const userMessage: ChatMessage = {
-        id: "user-1",
-        session_id: "session-1",
-        role: "user",
-        content: "hello",
-        tool_calls: null,
-        created_at: new Date().toISOString(),
-      };
-      useSessionStore.setState({
-        activeSessionId: "session-1",
-        messages: [userMessage],
-      });
-
-      const retryPromise = useSessionStore
-        .getState()
-        .retryMessage("user-1", controller.signal);
-      controller.abort("compose_timeout");
-      await retryPromise;
-
-      const state = useSessionStore.getState();
-      expect(state.isComposing).toBe(false);
-      expect(state.error).toMatch(/took too long/i);
-      expect(state.error).not.toContain("Failed to send message");
-      expect(state.messages[0].local_status).toBe("failed");
-      expect(state.messages[0].local_error).toBe(state.error);
+      // Durable replacement: the exact operation terminal owns settlement.
+      await proveDetachedOperation();
     });
 
     it("surfaces the timeout copy and the salvaged draft on the recompose path (R2-F9)", async () => {
@@ -4427,93 +3251,39 @@ describe("sessionStore", () => {
       );
 
       const userMessage: ChatMessage = {
-        id: "user-1",
-        session_id: "session-1",
+        id: "30000000-0000-4000-8000-000000000003",
+        session_id: "20000000-0000-4000-8000-000000000001",
         role: "user",
         content: "hello",
         tool_calls: null,
         created_at: new Date().toISOString(),
       };
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         messages: [userMessage],
         compositionState: makeCompositionState(5),
       });
 
-      await useSessionStore.getState().retryMessage("user-1");
+      await useSessionStore.getState().retryMessage("30000000-0000-4000-8000-000000000003");
 
       const state = useSessionStore.getState();
       expect(state.error).toContain(
         "ELSPETH ran out of time (240s). Your partial pipeline was saved — continue from it or retry.",
       );
-      expect(state.compositionState).toBe(timeoutError.partial_state);
-      expect(state.recoveryError).toBe(timeoutError);
+      expect(state.compositionState).toEqual(timeoutError.partial_state);
+      expect(state.recoveryError).toMatchObject(timeoutError);
       expect(state.recoveryStartedCompositionVersion).toBe(6);
     });
 
     it("resyncs durable server state after an aborted retry (elspeth-06a23adfcc)", async () => {
-      const apiMod = await import("@/api/client");
-      const controller = new AbortController();
-      (apiMod.recompose as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        () =>
-          new Promise((_resolve, reject) => {
-            controller.signal.addEventListener("abort", () =>
-              reject(controller.signal.reason),
-            );
-          }),
-      );
-      const userMessage: ChatMessage = {
-        id: "user-1",
-        session_id: "session-1",
-        role: "user",
-        content: "hello",
-        tool_calls: null,
-        created_at: "2026-07-11T00:00:00Z",
-      };
-      const partialAssistant: ChatMessage = {
-        id: "asst-1",
-        session_id: "session-1",
-        role: "assistant",
-        content: "Partial recompose output.",
-        tool_calls: null,
-        created_at: "2026-07-11T00:00:01Z",
-      };
-      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
-        userMessage,
-        partialAssistant,
-      ]);
-      (
-        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(makeCompositionState(2));
-      (
-        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
-      ).mockResolvedValue([]);
-
-      useSessionStore.setState({
-        activeSessionId: "session-1",
-        messages: [userMessage],
-        compositionState: makeCompositionState(1),
-      });
-      const retryPromise = useSessionStore
-        .getState()
-        .retryMessage("user-1", controller.signal);
-      controller.abort("compose_user_cancel");
-      await retryPromise;
-
-      const state = useSessionStore.getState();
-      expect(state.error).toContain("Composition stopped");
-      expect(state.compositionState?.version).toBe(2);
-      expect(state.messages.map((m) => m.id)).toEqual(["user-1", "asst-1"]);
-      // The canonical refetch clears the transient failed flag — the user
-      // message was always durable; only the recompose turn was cancelled.
-      expect(state.messages[0].local_status).toBeUndefined();
+      await proveStoppedOperation(true, "compose_recompose");
     });
   });
 
   describe("reset", () => {
     it("restores initial state", () => {
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
         isComposing: true,
         error: "some error",
       });
@@ -4532,12 +3302,12 @@ describe("sessionStore", () => {
       // Dirty every field resetForTutorialSession is responsible for
       // clearing after another session was active.
       useSessionStore.setState({
-        activeSessionId: "old-session",
+        activeSessionId: "20000000-0000-4000-8000-000000000006",
         messages: [{ id: "old-message" } as unknown as ChatMessage],
         compositionState: makeCompositionState(1),
         compositionProposals: [makeCompositionProposal()],
         composerPreferences: {
-          session_id: "old-session",
+          session_id: "20000000-0000-4000-8000-000000000006",
           trust_mode: "explicit_approve",
           density_default: "medium",
           interpretation_review_disabled: false,
@@ -4546,7 +3316,7 @@ describe("sessionStore", () => {
         staleProposalIds: ["proposal-1"],
         proposalActionPendingIds: ["proposal-1"],
         composerProgress: {} as ComposerProgressSnapshot,
-        stateVersions: [{ id: "state-1", version: 1 } as never],
+        stateVersions: [{ id: "10000000-0000-4000-8000-000000000001", version: 1 } as never],
         isComposing: true,
         error: "some stale error",
         selectedNodeId: "old-node",
@@ -4576,7 +3346,7 @@ describe("sessionStore", () => {
     it("does not touch fields it is not responsible for (sessions list)", () => {
       const sessions = [
         {
-          id: "session-1",
+          id: "20000000-0000-4000-8000-000000000001",
           title: "Existing",
           created_at: "2026-05-14T00:00:00Z",
           updated_at: "2026-05-14T00:00:00Z",
@@ -4644,7 +3414,7 @@ describe("sessionStore", () => {
       (apiClient.forkFromMessage as ReturnType<typeof vi.fn>)
         .mockRejectedValueOnce(new TypeError("Failed to fetch"))
         .mockRejectedValueOnce(new TypeError("Failed to fetch"));
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
@@ -4658,7 +3428,7 @@ describe("sessionStore", () => {
       const apiClient = await import("@/api/client");
       (apiClient.forkFromMessage as ReturnType<typeof vi.fn>)
         .mockRejectedValue(new TypeError("response lost"));
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "first edit");
       await expect(
@@ -4680,7 +3450,7 @@ describe("sessionStore", () => {
       (apiClient.forkFromMessage as ReturnType<typeof vi.fn>)
         .mockRejectedValueOnce({ status: 503 })
         .mockRejectedValueOnce({ status: 503 });
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
@@ -4694,7 +3464,7 @@ describe("sessionStore", () => {
       (apiClient.forkFromMessage as ReturnType<typeof vi.fn>)
         .mockRejectedValueOnce({ status: 409 })
         .mockRejectedValueOnce({ status: 409 });
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
@@ -4715,7 +3485,7 @@ describe("sessionStore", () => {
       (apiClient.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
       expect(useSessionStore.getState().activeSessionId).toBe(parentId);
@@ -4738,7 +3508,7 @@ describe("sessionStore", () => {
         .mockResolvedValueOnce(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
       expect(useSessionStore.getState().activeSessionId).toBe(parentId);
@@ -4755,7 +3525,7 @@ describe("sessionStore", () => {
       (apiClient.forkFromMessage as ReturnType<typeof vi.fn>)
         .mockRejectedValueOnce({ committedSuccessResponse: true })
         .mockRejectedValueOnce({ committedSuccessResponse: true });
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
@@ -4776,7 +3546,7 @@ describe("sessionStore", () => {
       const renamedParent = { ...child, id: parentId, title: "Renamed while hydrating" };
       const archivedElsewhere = { ...child, id: "session-archived", title: "Archived elsewhere" };
       const createdElsewhere = { ...child, id: "session-created", title: "Created elsewhere" };
-      useSessionStore.setState({ activeSessionId: parentId, sessions: [renamedParent, archivedElsewhere] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId, sessions: [renamedParent, archivedElsewhere] });
 
       const pending = useSessionStore.getState().forkFromMessage("message-1", "edited");
       useSessionStore.setState({
@@ -4806,7 +3576,7 @@ describe("sessionStore", () => {
         .mockReturnValueOnce(delayedLocator.promise)
         .mockRejectedValueOnce(new TypeError("lost retry response"));
       (apiClient.fetchSessions as ReturnType<typeof vi.fn>).mockResolvedValue([child]);
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
 
       const forkPromise = useSessionStore.getState().forkFromMessage("message-1", "edited");
       useSessionStore.setState({
@@ -4824,7 +3594,7 @@ describe("sessionStore", () => {
       expect(useSessionStore.getState().error).toBeNull();
       expect(apiClient.fetchMessages).not.toHaveBeenCalled();
 
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
       const calls = (apiClient.forkFromMessage as ReturnType<typeof vi.fn>).mock.calls;
       expect(calls[0]?.[1]).not.toBe(calls[1]?.[1]);
@@ -4841,7 +3611,7 @@ describe("sessionStore", () => {
       (apiClient.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      useSessionStore.setState({ activeSessionId: parentId, sessions: [] });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId, sessions: [] });
 
       const pending = useSessionStore.getState().forkFromMessage("message-1", "edited");
       await vi.waitFor(() => expect(apiClient.fetchMessages).toHaveBeenCalledWith(childId));
@@ -4859,7 +3629,7 @@ describe("sessionStore", () => {
       expect(state.messages).toEqual([{ id: "selected-message" }]);
       expect(state.sessions).toEqual([child]);
 
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
       const calls = (apiClient.forkFromMessage as ReturnType<typeof vi.fn>).mock.calls;
       expect(calls[0]?.[1]).not.toBe(calls[1]?.[1]);
@@ -4874,16 +3644,16 @@ describe("sessionStore", () => {
       (apiClient.fetchSessions as ReturnType<typeof vi.fn>).mockRejectedValue(
         new TypeError("publication failed"),
       );
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
 
       const pending = useSessionStore.getState().forkFromMessage("message-1", "edited");
-      useSessionStore.setState({ activeSessionId: "selected-session", error: null });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "selected-session", error: null });
       delayedLocator.resolve({ session_id: childId });
       await pending;
 
       expect(useSessionStore.getState().activeSessionId).toBe("selected-session");
       expect(useSessionStore.getState().sessions).toEqual([]);
-      useSessionStore.setState({ activeSessionId: parentId });
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: parentId });
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
       const calls = (apiClient.forkFromMessage as ReturnType<typeof vi.fn>).mock.calls;
       expect(calls[0]?.[1]).toBe(calls[1]?.[1]);

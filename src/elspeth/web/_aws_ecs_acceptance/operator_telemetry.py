@@ -9,6 +9,7 @@ import math
 import re
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -26,7 +27,16 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS
 from elspeth.telemetry.serialization import derive_trace_id
 from elspeth.web.config import settings_from_env
-from elspeth.web.operator_telemetry import bootstrap_operator_telemetry
+from elspeth.web.operator_telemetry import OperatorTelemetryRuntime, bootstrap_operator_telemetry
+from elspeth.web.operator_telemetry_custody import OperatorTelemetryCleanupOwner, TelemetryCompletionWitness, TelemetryCustodyUnresolved
+from elspeth.web.process_watchdog import (
+    BootstrapCompletionWitness,
+    ProcessCompletionWitness,
+    ProcessWatchdogControl,
+    ProcessWatchdogFactory,
+    create_process_watchdog,
+)
+from elspeth.web.process_watchdog_codec import RecoveryReason
 
 from .capture import capture
 from .contracts import (
@@ -628,23 +638,60 @@ def _read_landscape_started_at(settings: Any, run_id: str) -> datetime | None:
     return started_at.replace(tzinfo=UTC) if started_at.tzinfo is None else _durable_landscape_started_at(started_at)
 
 
+class _OperatorRuntimeFactory(Protocol):
+    def __call__(self, settings: Any, *, cleanup_owner: OperatorTelemetryCleanupOwner) -> OperatorTelemetryRuntime: ...
+
+
 class AWSOperatorMetricEmitter:
-    """Emit and synchronously flush one metric through the production provider."""
+    """Own the production metric provider and its supervised physical cleanup."""
 
     def __init__(
         self,
         settings: Any,
         *,
-        runtime_factory: Callable[[Any], Any] = bootstrap_operator_telemetry,
+        runtime_factory: _OperatorRuntimeFactory = bootstrap_operator_telemetry,
+        cleanup_owner_factory: Callable[[], OperatorTelemetryCleanupOwner] = OperatorTelemetryCleanupOwner.create_for_application,
+        process_watchdog_factory: ProcessWatchdogFactory | None = None,
     ) -> None:
+        draining = threading.Event()
+        factory = create_process_watchdog if process_watchdog_factory is None else process_watchdog_factory
+        watchdog = factory(draining)
+        if not isinstance(watchdog, ProcessWatchdogControl):
+            raise TypeError("Operator metric emitter requires an owned process watchdog")
+        self._watchdog = watchdog
+        self._closed = False
+        self._close_lock = threading.Lock()
+        self._close_error: BaseException | None = None
+        owner: OperatorTelemetryCleanupOwner | None = None
+        constructor_entered = False
         try:
-            self._runtime = runtime_factory(settings)
-        except Exception:
-            raise OperatorTelemetryAcceptanceError("operator metric runtime initialization failed") from None
-        # Transport-level delivery failures recorded per attempt (cause class
-        # only); a False emit_web_metric return is always backed by a record
-        # here, so a swallowed first-party defect can never masquerade as
-        # collector degradation.
+            watchdog.assert_watching()
+            owner = cleanup_owner_factory()
+            if not isinstance(owner, OperatorTelemetryCleanupOwner):
+                raise TypeError("Operator metric emitter requires an owned telemetry cleanup owner")
+            self._cleanup_owner = owner
+            constructor_entered = True
+            runtime = runtime_factory(settings, cleanup_owner=owner)
+            if not isinstance(runtime, OperatorTelemetryRuntime) or runtime.cleanup_owner is not owner:
+                raise TelemetryCustodyUnresolved("Operator metric runtime ownership mismatch")
+            self._runtime = runtime
+        except BaseException as original:
+            errors: list[BaseException] = [original]
+            try:
+                if constructor_entered:
+                    watchdog.abort_bootstrap(RecoveryReason.FAILED_STARTUP)
+                else:
+                    watchdog.complete_bootstrap(BootstrapCompletionWitness(watchdog.target))
+            except BaseException as fault:
+                errors.append(fault)
+            if constructor_entered and owner is not None:
+                try:
+                    owner.shutdown_sync()
+                except BaseException as fault:
+                    errors.append(fault)
+            if len(errors) == 1:
+                raise
+            raise BaseExceptionGroup("Operator metric initialization and cleanup failed", errors) from None
         self._failures: list[CheckFailureRecord] = []
 
     @property
@@ -652,10 +699,12 @@ class AWSOperatorMetricEmitter:
         return tuple(self._failures)
 
     def emit_web_metric(self, sentinel_value: int, *, acceptance_namespace: str) -> bool:
+        self._cleanup_owner.assert_process()
+        self._watchdog.assert_watching()
         if type(acceptance_namespace) is not str or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", acceptance_namespace) is None:
             raise OperatorTelemetryAcceptanceError("operator metric acceptance namespace is invalid")
         get_meter = self._runtime.provider.get_meter
-        meter = get_meter("elspeth.web.aws_ecs_acceptance")
+        meter = get_meter("elspeth.web.aws_ecs_acceptance", "")
         counter = meter.create_counter(
             _METRIC_NAME,
             description="Unique non-content AWS ECS acceptance sentinel.",
@@ -685,10 +734,40 @@ class AWSOperatorMetricEmitter:
             raise OperatorTelemetryAcceptanceError("operator telemetry health projection failed") from None
 
     def close(self) -> None:
+        self._cleanup_owner.assert_process()
+        with self._close_lock:
+            if self._close_error is not None:
+                raise self._close_error
+            if self._closed:
+                return
+            try:
+                asyncio.run(self._close_owned())
+            except BaseException as original:
+                self._close_error = original
+                raise
+            self._closed = True
+
+    async def _close_owned(self) -> None:
+        errors: list[BaseException] = []
         try:
-            asyncio.run(self._runtime.shutdown())
-        except Exception:
-            raise OperatorTelemetryAcceptanceError("operator metric runtime shutdown failed") from None
+            await self._watchdog.begin_recovery(RecoveryReason.NORMAL_SHUTDOWN)
+        except BaseException as original:
+            errors.append(original)
+        try:
+            witness = self._runtime.shutdown_sync()
+            if (
+                type(witness) is not TelemetryCompletionWitness
+                or witness.owner is not self._cleanup_owner
+                or witness is not self._cleanup_owner.witness
+            ):
+                raise TelemetryCustodyUnresolved("Operator metric cleanup lacks exact completion ownership")
+        except BaseException as original:
+            errors.append(original)
+        if errors:
+            if len(errors) == 1:
+                raise errors[0]
+            raise BaseExceptionGroup("Operator metric shutdown failed", errors)
+        await self._watchdog.complete(ProcessCompletionWitness(self._watchdog.target))
 
 
 def _build_aws_observability_client(service: str, region: str) -> Any:

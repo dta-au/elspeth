@@ -1,3 +1,6 @@
+import { installComposeTurnDouble } from "@/test/composeTurnDouble";
+import recoveryProducerFixtures from "@/test/composerRecoveryProducerFixtures.json";
+import { authenticateComposerCustody, purgeComposerCustody } from "@/stores/composerOperationCustody";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   act,
@@ -31,11 +34,6 @@ import type {
   UserProfile,
   ValidationResult,
 } from "./types/index";
-import {
-  COMPOSE_CLIENT_GRACE_MS,
-  getComposeTimeoutMs,
-  resetComposeTimeoutForTests,
-} from "@/config/composer";
 import {
   compositionStateAuthorityFields,
   EXECUTION_BLOCKED_VALIDATION_READINESS,
@@ -246,7 +244,10 @@ vi.mock("./hooks/useAuth", () => ({
 // default resolved value (backend up, composer available) so the no-banner
 // state is the default.  Individual tests override with vi.spyOn.
 
-vi.mock("./api/client", () => ({
+vi.mock("./api/client", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/api/client")>(),
+  submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(),
+  fetchComposerOperationStream: vi.fn(), cancelComposerOperation: vi.fn(),
   fetchSystemStatus: vi.fn().mockResolvedValue({
     composer_available: true,
     composer_model: "gpt-4o",
@@ -569,7 +570,7 @@ describe("App banner roles", () => {
         lastRunOutcome: {
           runId: "run-app-1",
           status: "failed",
-          sessionId: "session-1",
+          sessionId: "11111111-1111-4111-8111-111111111111",
         },
       });
     });
@@ -613,24 +614,24 @@ describe("App banner roles", () => {
   });
 
   it("silently canonicalizes stale Runs hashes", async () => {
-    useSessionStore.setState({ activeSessionId: "session-1" });
-    window.history.replaceState(null, "", "#/session-1/runs");
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
+    window.history.replaceState(null, "", "#/11111111-1111-4111-8111-111111111111/runs");
 
     render(<App />);
 
     await waitFor(() => {
-      expect(window.location.hash).toBe("#/session-1");
+      expect(window.location.hash).toBe("#/11111111-1111-4111-8111-111111111111");
     });
   });
 
   it("silently canonicalizes stale Spec hashes", async () => {
-    useSessionStore.setState({ activeSessionId: "session-1" });
-    window.history.replaceState(null, "", "#/session-1/spec");
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
+    window.history.replaceState(null, "", "#/11111111-1111-4111-8111-111111111111/spec");
 
     render(<App />);
 
     await waitFor(() => {
-      expect(window.location.hash).toBe("#/session-1");
+      expect(window.location.hash).toBe("#/11111111-1111-4111-8111-111111111111");
     });
   });
 
@@ -646,7 +647,7 @@ describe("App banner roles", () => {
   it("mounts one common workspace with authoring, artifact, and actions", async () => {
     // An active session keeps the composer shell mounted — with no sessions
     // at all App now renders the empty landing instead (elspeth-e69642fede).
-    useSessionStore.setState({ activeSessionId: "session-1" });
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
     render(<App />);
 
     await waitFor(() => {
@@ -667,9 +668,9 @@ describe("App banner roles", () => {
 
   it("moves skip-link focus to the stable main workspace without changing session routing", async () => {
     const user = userEvent.setup();
-    useSessionStore.setState({ activeSessionId: "session-1" });
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
     render(<App />);
-    await waitFor(() => expect(window.location.hash).toBe("#/session-1"));
+    await waitFor(() => expect(window.location.hash).toBe("#/11111111-1111-4111-8111-111111111111"));
 
     const main = screen.getByRole("main");
     expect(main).toHaveAttribute("id", "composer-main");
@@ -680,8 +681,8 @@ describe("App banner roles", () => {
     await user.click(skipLink);
 
     expect(main).toHaveFocus();
-    expect(window.location.hash).toBe("#/session-1");
-    expect(useSessionStore.getState().activeSessionId).toBe("session-1");
+    expect(window.location.hash).toBe("#/11111111-1111-4111-8111-111111111111");
+    expect(useSessionStore.getState().activeSessionId).toBe("11111111-1111-4111-8111-111111111111");
   });
 
   it.each([
@@ -691,7 +692,7 @@ describe("App banner roles", () => {
     "renders the real App-owned collapsed status projection with %s tone",
     async (tone, state) => {
       useSessionStore.setState({
-        activeSessionId: "session-1",
+        activeSessionId: "11111111-1111-4111-8111-111111111111",
         ...state,
       });
       render(<App />);
@@ -723,7 +724,7 @@ describe("App banner roles", () => {
   });
 
   it("resets execution state and loads runs for the active session on startup", async () => {
-    useSessionStore.setState({ activeSessionId: "session-1" });
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
     useExecutionStore.setState({
       activeRunId: "stale-run",
       runs: [{ id: "stale-run", status: "running" } as never],
@@ -733,7 +734,7 @@ describe("App banner roles", () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(api.fetchRuns).toHaveBeenCalledWith("session-1");
+      expect(api.fetchRuns).toHaveBeenCalledWith("11111111-1111-4111-8111-111111111111");
     });
     expect(useExecutionStore.getState().activeRunId).toBeNull();
   });
@@ -772,7 +773,7 @@ describe("App banner roles", () => {
     // Ctrl+Shift+Y is content-gated (elspeth-bff8043d33 residual): seed a
     // non-empty composition so the YAML dispatch fires.
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: {
         ...makeState(1),
         sources: { source: { plugin: "csv", options: {} } },
@@ -798,8 +799,8 @@ describe("App banner roles", () => {
     });
 
     expect(artifactRequests).toEqual([
-      { tab: "graph", focusMode: false, sessionId: "session-1" },
-      { tab: "yaml", focusMode: false, sessionId: "session-1" },
+      { tab: "graph", focusMode: false, sessionId: "11111111-1111-4111-8111-111111111111" },
+      { tab: "yaml", focusMode: false, sessionId: "11111111-1111-4111-8111-111111111111" },
     ]);
     expect(onOpenGraph).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
@@ -817,12 +818,12 @@ describe("App banner roles", () => {
     window.addEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     useSessionStore.setState({
-      activeSessionId: "session-1",
-      sessions: [{ id: "session-1", title: "Session 1" } as never],
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      sessions: [{ id: "11111111-1111-4111-8111-111111111111", title: "Session 1" } as never],
       compositionStateLoaded: false,
       compositionState: makeState(1),
     } as never);
-    window.history.replaceState(null, "", "#/session-1/spec");
+    window.history.replaceState(null, "", "#/11111111-1111-4111-8111-111111111111/spec");
     render(<App />);
     await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
 
@@ -843,7 +844,7 @@ describe("App banner roles", () => {
     const onRequestRun = vi.fn();
     window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
     render(<App />);
@@ -867,7 +868,7 @@ describe("App banner roles", () => {
     const onRequestRun = vi.fn();
     window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
 
@@ -896,7 +897,7 @@ describe("App banner roles", () => {
     const onRequestRun = vi.fn();
     window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
     render(<App />);
@@ -930,7 +931,7 @@ describe("App banner roles", () => {
     };
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
     render(<App />);
@@ -944,7 +945,7 @@ describe("App banner roles", () => {
           summary: "LLM fanout needs confirmation.",
           risks: [],
         },
-        pendingFanoutSessionId: "session-1",
+        pendingFanoutSessionId: "11111111-1111-4111-8111-111111111111",
         confirmFanoutExecution,
       } as never);
     });
@@ -953,7 +954,7 @@ describe("App banner roles", () => {
 
     await waitFor(() =>
       expect(artifactRequests).toEqual([
-        { tab: "run", focusMode: false, sessionId: "session-1" },
+        { tab: "run", focusMode: false, sessionId: "11111111-1111-4111-8111-111111111111" },
       ]),
     );
     expect(confirmFanoutExecution).toHaveBeenCalledTimes(1);
@@ -969,7 +970,7 @@ describe("App banner roles", () => {
     };
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
     render(<App />);
@@ -984,7 +985,7 @@ describe("App banner roles", () => {
           summary: "LLM fanout needs confirmation.",
           risks: [],
         },
-        pendingFanoutSessionId: "session-1",
+        pendingFanoutSessionId: "11111111-1111-4111-8111-111111111111",
         confirmFanoutExecution,
       } as never);
     });
@@ -999,7 +1000,7 @@ describe("App banner roles", () => {
 
   it("renders the secret guard's summary and disclosed wirings", async () => {
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
     render(<App />);
@@ -1026,7 +1027,7 @@ describe("App banner roles", () => {
             },
           ],
         },
-        pendingSecretSessionId: "session-1",
+        pendingSecretSessionId: "11111111-1111-4111-8111-111111111111",
       } as never);
     });
 
@@ -1056,7 +1057,7 @@ describe("App banner roles", () => {
     };
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
     render(<App />);
@@ -1069,7 +1070,7 @@ describe("App banner roles", () => {
           summary: "This run uses 1 stored secret.",
           wirings: [],
         },
-        pendingSecretSessionId: "session-1",
+        pendingSecretSessionId: "11111111-1111-4111-8111-111111111111",
         confirmSecretExecution,
       } as never);
     });
@@ -1078,7 +1079,7 @@ describe("App banner roles", () => {
 
     await waitFor(() =>
       expect(artifactRequests).toEqual([
-        { tab: "run", focusMode: false, sessionId: "session-1" },
+        { tab: "run", focusMode: false, sessionId: "11111111-1111-4111-8111-111111111111" },
       ]),
     );
     expect(confirmSecretExecution).toHaveBeenCalledTimes(1);
@@ -1094,7 +1095,7 @@ describe("App banner roles", () => {
     };
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
     render(<App />);
@@ -1109,7 +1110,7 @@ describe("App banner roles", () => {
           summary: "This run uses 1 stored secret.",
           wirings: [],
         },
-        pendingSecretSessionId: "session-1",
+        pendingSecretSessionId: "11111111-1111-4111-8111-111111111111",
         confirmSecretExecution,
       } as never);
     });
@@ -1144,8 +1145,9 @@ describe("App banner roles", () => {
 
 function makeState(version: number): CompositionState {
   return {
-    id: `state-${version}`,
+    id: `22222222-2222-4222-8222-${String(version).padStart(12, "0")}`,
     ...compositionStateAuthorityFields,
+    session_id: "11111111-1111-4111-8111-111111111111",
     version,
     sources: {},
     nodes: [],
@@ -1158,7 +1160,7 @@ function makeState(version: number): CompositionState {
 function makeAssistantMessage(): ChatMessage {
   return {
     id: "assistant-1",
-    session_id: "session-1",
+    session_id: "11111111-1111-4111-8111-111111111111",
     role: "assistant",
     content: "done",
     tool_calls: null,
@@ -1166,11 +1168,10 @@ function makeAssistantMessage(): ChatMessage {
   };
 }
 
-describe("App compose timeout readiness (bootstrap race)", () => {
+describe("App informational health and authoring readiness", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStore(useSessionStore);
-    resetComposeTimeoutForTests();
     useExecutionStore.getState().reset();
     useAuthStore.setState({
       token: "test-token",
@@ -1189,111 +1190,13 @@ describe("App compose timeout readiness (bootstrap race)", () => {
     vi.spyOn(api, "fetchRuns").mockResolvedValue([]);
   });
 
-  it("marks the composer ready and adopts the backend ceiling once system status lands", async () => {
-    // A deployment configured ABOVE the checked-in default (300s wall clock)
-    // is the exact case the stale 295s default would abort early. Readiness
-    // must flip only after applyServerComposerTimeout adopts 300s → 325s.
-    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
-      composer_available: true,
-      composer_model: "gpt-4o",
-      composer_advisor_model: "anthropic/claude-sonnet-4-6",
-      composer_provider: "openai",
-      composer_reason: null,
-      composer_missing_keys: [],
-      composer_timeout_seconds: 300,
-    } satisfies SystemStatus);
+  it("does not open authoring readiness when informational system status lands", async () => { vi.spyOn(api, "fetchSystemStatus").mockResolvedValue(GOOD_STATUS); render(<App />); await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled()); expect(useSessionStore.getState().compositionStateLoaded).toBe(false); });
 
-    render(<App />);
+  it("keeps the backend unavailable banner independent of selected-session readiness", async () => { vi.spyOn(api, "fetchSystemStatus").mockRejectedValue(new Error("down")); const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {}); render(<App />); await screen.findByText(/Backend unavailable/i); expect(useSessionStore.getState().compositionStateLoaded).toBe(false); errorSpy.mockRestore(); });
 
-    await waitFor(() =>
-      expect(useSessionStore.getState().composeTimeoutReady).toBe(true),
-    );
-    expect(getComposeTimeoutMs()).toBe(300_000 + COMPOSE_CLIENT_GRACE_MS);
-    expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(false);
-  });
+  it("does not invent composer unavailability when informational timeout is absent", async () => { vi.spyOn(api, "fetchSystemStatus").mockResolvedValue(PARTIAL_STATUS); const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {}); render(<App />); await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled()); expect(useSessionStore.getState().compositionStateLoaded).toBe(false); expect(errorSpy.mock.calls.filter((call) => String(call[0]).includes("no usable"))).toHaveLength(0); errorSpy.mockRestore(); });
 
-  it("leaves the composer unready when system status fails, so no send starts against the unsafe default", async () => {
-    vi.spyOn(api, "fetchSystemStatus").mockRejectedValue(new Error("down"));
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    render(<App />);
-
-    await screen.findByText(/Backend unavailable/i);
-    expect(useSessionStore.getState().composeTimeoutReady).toBe(false);
-    // Backend down → the banner owns the signal; the composer-specific
-    // diagnostic must not latch.
-    expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(false);
-    errorSpy.mockRestore();
-  });
-
-  it("flags the composer unavailable when the backend is up but reports no compose timeout", async () => {
-    // Backend reachable (health 200) but composer_timeout_seconds omitted: the
-    // gate stays closed (no send against the stale default) AND a distinct
-    // stuck-state diagnostic latches so the Send stops reading as "connecting".
-    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
-      composer_available: true,
-      composer_model: "gpt-4o",
-      composer_advisor_model: "anthropic/claude-sonnet-4-6",
-      composer_provider: "openai",
-      composer_reason: null,
-      composer_missing_keys: [],
-    } satisfies SystemStatus);
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    render(<App />);
-
-    await waitFor(() =>
-      expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(true),
-    );
-    expect(useSessionStore.getState().composeTimeoutReady).toBe(false);
-    errorSpy.mockRestore();
-  });
-
-  it("a partial poll AFTER a good ceiling keeps ready and does not re-flag or re-log (else-guard)", async () => {
-    // The else-guard (!composeTimeoutReady) across two polls: once a real
-    // ceiling latches, a later partial/absent response is a transient — it must
-    // not un-ready, flag unavailable, or spam a false "no usable timeout" error.
-    vi.useFakeTimers();
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    vi.spyOn(api, "fetchSystemStatus")
-      .mockResolvedValueOnce({
-        composer_available: true,
-        composer_model: "gpt-4o",
-        composer_advisor_model: "anthropic/claude-sonnet-4-6",
-        composer_provider: "openai",
-        composer_reason: null,
-        composer_missing_keys: [],
-        composer_timeout_seconds: 300,
-      } satisfies SystemStatus)
-      .mockResolvedValue({
-        composer_available: true,
-        composer_model: "gpt-4o",
-        composer_advisor_model: "anthropic/claude-sonnet-4-6",
-        composer_provider: "openai",
-        composer_reason: null,
-        composer_missing_keys: [],
-      } satisfies SystemStatus);
-
-    render(<App />);
-
-    // First poll (mount) latches ready off the 300s ceiling.
-    await vi.waitFor(() =>
-      expect(useSessionStore.getState().composeTimeoutReady).toBe(true),
-    );
-
-    // Second poll (30s interval) returns a partial response with no timeout.
-    await vi.advanceTimersByTimeAsync(30_000);
-
-    expect(useSessionStore.getState().composeTimeoutReady).toBe(true);
-    expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(false);
-    const falseAlarms = errorSpy.mock.calls.filter((c) =>
-      String(c[0]).includes("no usable"),
-    );
-    expect(falseAlarms).toHaveLength(0);
-
-    vi.useRealTimers();
-    errorSpy.mockRestore();
-  });
+  it("preserves loaded session readiness across a partial health poll", async () => { vi.useFakeTimers(); useSessionStore.setState({ compositionStateLoaded: true }); const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {}); vi.spyOn(api, "fetchSystemStatus").mockResolvedValueOnce(GOOD_STATUS).mockResolvedValue(PARTIAL_STATUS); render(<App />); await vi.waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalledTimes(1)); await vi.advanceTimersByTimeAsync(30000); expect(api.fetchSystemStatus).toHaveBeenCalledTimes(2); expect(useSessionStore.getState().compositionStateLoaded).toBe(true); expect(errorSpy.mock.calls.filter((call) => String(call[0]).includes("no usable"))).toHaveLength(0); vi.useRealTimers(); errorSpy.mockRestore(); });
 
   const GOOD_STATUS = {
     composer_available: true,
@@ -1313,73 +1216,30 @@ describe("App compose timeout readiness (bootstrap race)", () => {
     composer_missing_keys: [],
   } satisfies SystemStatus;
 
-  it("recovers from unavailable to ready when a later poll supplies a valid timeout", async () => {
-    vi.useFakeTimers();
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    vi.spyOn(api, "fetchSystemStatus")
-      .mockResolvedValueOnce(PARTIAL_STATUS)
-      .mockResolvedValue(GOOD_STATUS);
+  it("does not bypass session loading when a later health poll supplies a timeout", async () => { vi.useFakeTimers(); vi.spyOn(api, "fetchSystemStatus").mockResolvedValueOnce(PARTIAL_STATUS).mockResolvedValue(GOOD_STATUS); render(<App />); await vi.waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalledTimes(1)); await vi.advanceTimersByTimeAsync(30000); expect(api.fetchSystemStatus).toHaveBeenCalledTimes(2); expect(useSessionStore.getState().compositionStateLoaded).toBe(false); vi.useRealTimers(); });
 
-    render(<App />);
-    await vi.waitFor(() =>
-      expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(true),
-    );
-    expect(useSessionStore.getState().composeTimeoutReady).toBe(false);
+  it("does not log a stale timeout diagnostic across repeated informational polls", async () => { vi.useFakeTimers(); const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {}); vi.spyOn(api, "fetchSystemStatus").mockResolvedValue(PARTIAL_STATUS); render(<App />); await vi.waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalledTimes(1)); await vi.advanceTimersByTimeAsync(30000); expect(api.fetchSystemStatus).toHaveBeenCalledTimes(2); expect(errorSpy.mock.calls.filter((call) => String(call[0]).includes("no usable"))).toHaveLength(0); vi.useRealTimers(); errorSpy.mockRestore(); });
 
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(useSessionStore.getState().composeTimeoutReady).toBe(true);
-    expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(false);
-
-    vi.useRealTimers();
-    errorSpy.mockRestore();
-  });
-
-  it("logs the missing-timeout diagnostic once across repeated partial polls, not every poll", async () => {
-    vi.useFakeTimers();
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue(PARTIAL_STATUS);
-
-    render(<App />);
-    await vi.waitFor(() =>
-      expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(true),
-    );
-    // A second poll while still stuck must NOT re-log (false→true guard).
-    await vi.advanceTimersByTimeAsync(30_000);
-
-    const noUsable = errorSpy.mock.calls.filter((c) =>
-      String(c[0]).includes("no usable"),
-    );
-    expect(noUsable).toHaveLength(1);
-
-    vi.useRealTimers();
-    errorSpy.mockRestore();
-  });
-
-  it("clears the unavailable diagnostic when the backend later goes unreachable (banner owns it)", async () => {
-    vi.useFakeTimers();
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    vi.spyOn(api, "fetchSystemStatus")
-      .mockResolvedValueOnce(PARTIAL_STATUS)
-      .mockRejectedValue(new Error("down"));
-
-    render(<App />);
-    await vi.waitFor(() =>
-      expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(true),
-    );
-
-    // Backend goes down on the next poll → catch resets the composer diagnostic.
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(useSessionStore.getState().composerTimeoutUnavailable).toBe(false);
-
-    vi.useRealTimers();
-    errorSpy.mockRestore();
-  });
+  it("shows backend loss without replacing loaded-session authority with timeout state", async () => { vi.useFakeTimers(); useSessionStore.setState({ compositionStateLoaded: true }); const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {}); vi.spyOn(api, "fetchSystemStatus").mockResolvedValueOnce(PARTIAL_STATUS).mockRejectedValue(new Error("down")); render(<App />); await vi.waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalledTimes(1)); await vi.advanceTimersByTimeAsync(30000); expect(screen.getByText(/Backend unavailable/i)).toBeInTheDocument(); expect(useSessionStore.getState().compositionStateLoaded).toBe(true); vi.useRealTimers(); errorSpy.mockRestore(); });
 });
 
 describe("App composer recovery panel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStore(useSessionStore);
+    purgeComposerCustody();
+    authenticateComposerCustody({ principalId: "test-001", authProvider: "local" });
+    installComposeTurnDouble({
+      sendMessage: vi.spyOn(api, "sendMessage"), recompose: vi.spyOn(api, "recompose"),
+      submitComposerOperation: vi.spyOn(api, "submitComposerOperation"),
+      fetchComposerOperation: vi.spyOn(api, "fetchComposerOperation"),
+      fetchComposerOperationStream: vi.spyOn(api, "fetchComposerOperationStream"),
+      cancelComposerOperation: vi.spyOn(api, "cancelComposerOperation"),
+    });
+    vi.spyOn(api, "fetchMessages").mockRejectedValue(new Error("Reload unavailable"));
+    vi.spyOn(api, "fetchCompositionState").mockRejectedValue(new Error("Reload unavailable"));
+    vi.spyOn(api, "fetchCompositionProposals").mockRejectedValue(new Error("Reload unavailable"));
+    useSessionStore.setState({ compositionStateLoaded: true });
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
@@ -1388,10 +1248,12 @@ describe("App composer recovery panel", () => {
       composer_reason: null,
       composer_missing_keys: [],
     } satisfies SystemStatus);
+    const recoveryAssistantId = recoveryProducerFixtures.recovery[1].assistant_message_id;
+    if (recoveryAssistantId === null) throw new Error("Expected the persisted-assistant producer fixture");
     vi.spyOn(api, "fetchRecoveryTranscript").mockResolvedValue([
       {
-        id: "assistant-failed",
-        session_id: "session-1",
+        id: recoveryAssistantId,
+        session_id: "11111111-1111-4111-8111-111111111111",
         role: "assistant",
         content: "calling tools",
         raw_content: null,
@@ -1413,14 +1275,14 @@ describe("App composer recovery panel", () => {
       error_type: "composer_plugin_crash",
       partial_state: recovered,
       failed_turn: {
-        assistant_message_id: "assistant-failed",
+        ...recoveryProducerFixtures.recovery[1],
         tool_calls_attempted: 1,
         tool_responses_persisted: 1,
         transcript_url: null,
       },
     });
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
 
@@ -1436,20 +1298,23 @@ describe("App composer recovery panel", () => {
     const user = userEvent.setup();
     const recovered = makeState(3);
     const original = makeState(1);
+    vi.mocked(api.fetchMessages).mockResolvedValue([]);
+    vi.mocked(api.fetchCompositionState).mockResolvedValue(recovered);
+    vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
     vi.spyOn(api, "sendMessage").mockRejectedValue({
       status: 500,
       detail: "compose failed",
       error_type: "composer_plugin_crash",
       partial_state: recovered,
       failed_turn: {
-        assistant_message_id: "assistant-failed",
+        ...recoveryProducerFixtures.recovery[1],
         tool_calls_attempted: 1,
         tool_responses_persisted: 1,
         transcript_url: null,
       },
     });
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: original,
     });
 
@@ -1458,10 +1323,10 @@ describe("App composer recovery panel", () => {
     await screen.findByRole("dialog", { name: "Recover partial composer draft" });
     await user.click(screen.getByRole("button", { name: "Apply partial draft" }));
 
-    expect(useSessionStore.getState().compositionState).toBe(recovered);
+    expect(useSessionStore.getState().compositionState).toEqual(recovered);
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
     expect(api.recompose).not.toHaveBeenCalled();
-    expect(api.fetchMessages).not.toHaveBeenCalled();
+    expect(api.fetchMessages).toHaveBeenCalled();
 
     vi.mocked(api.sendMessage).mockRejectedValueOnce({
       status: 500,
@@ -1469,7 +1334,7 @@ describe("App composer recovery panel", () => {
       error_type: "composer_plugin_crash",
       partial_state: makeState(4),
       failed_turn: {
-        assistant_message_id: "assistant-failed",
+        ...recoveryProducerFixtures.recovery[1],
         tool_calls_attempted: 1,
         tool_responses_persisted: 1,
         transcript_url: null,
@@ -1479,10 +1344,10 @@ describe("App composer recovery panel", () => {
     await screen.findByRole("dialog", { name: "Recover partial composer draft" });
     await user.click(screen.getByRole("button", { name: "Discard recovery" }));
 
-    expect(useSessionStore.getState().compositionState).toBe(recovered);
+    expect(useSessionStore.getState().compositionState).toEqual(makeState(4));
     expect(api.sendMessage).toHaveBeenCalledTimes(2);
     expect(api.recompose).not.toHaveBeenCalled();
-    expect(api.fetchMessages).not.toHaveBeenCalled();
+    expect(api.fetchMessages).toHaveBeenCalled();
   });
 
   it("keeps non-recovery convergence errors on the existing chat error path", async () => {
@@ -1492,7 +1357,7 @@ describe("App composer recovery panel", () => {
       detail: "ignored",
     });
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
 
@@ -1512,7 +1377,7 @@ describe("App composer recovery panel", () => {
       proposals: [],
     });
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1),
     });
 
@@ -1521,7 +1386,7 @@ describe("App composer recovery panel", () => {
 
     await waitFor(() => expect(api.sendMessage).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(useSessionStore.getState().compositionState?.version).toBe(2);
+    await waitFor(() => expect(useSessionStore.getState().compositionState?.version).toBe(2));
   });
 });
 
@@ -1605,6 +1470,41 @@ describe("App preferences bootstrap (Phase 1B)", () => {
       );
       expect(surfaced).toBe(true);
     });
+  });
+
+  it("does not offer a tutorial or a false preferences save to an admin without the user role", async () => {
+    vi.mocked(api.fetchUserComposerPreferences).mockRejectedValueOnce({
+      status: 403,
+      error_type: "user_role_required",
+      detail: "A live user role is required",
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(usePreferencesStore.getState().unavailableForRole).toBe(true));
+    expect(usePreferencesStore.getState().loaded).toBe(false);
+    expect(screen.queryByTestId("tutorial-stub")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Couldn't load your preferences/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    expect(screen.queryByRole("button", { name: /composer preferences/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /switch to light theme/i })).toBeInTheDocument();
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
+  });
+
+  it("unmounts an already-open Composer preferences panel when the owned role refusal arrives", async () => {
+    let rejectFetch!: (reason: unknown) => void;
+    vi.mocked(api.fetchUserComposerPreferences).mockImplementationOnce(
+      () => new Promise<Awaited<ReturnType<typeof api.fetchUserComposerPreferences>>>((_, reject) => { rejectFetch = reject; }),
+    );
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    await userEvent.click(screen.getByRole("button", { name: /composer preferences/i }));
+    expect(screen.getByRole("dialog", { name: /composer preferences/i })).toBeInTheDocument();
+
+    rejectFetch({ status: 403, error_type: "user_role_required", detail: "User role required" });
+    await waitFor(() => expect(usePreferencesStore.getState().unavailableForRole).toBe(true));
+    expect(screen.queryByRole("dialog", { name: /composer preferences/i })).not.toBeInTheDocument();
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
   });
 
   it("renders the tutorial instead of the composer layout before completion", async () => {
@@ -1806,7 +1706,7 @@ describe("App shared-route Layout suppression (Phase 6B Task 8)", () => {
     // shell mounted (no sessions at all → empty landing instead,
     // elspeth-e69642fede).
     window.history.replaceState(null, "", "/");
-    useSessionStore.setState({ activeSessionId: "session-1" });
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
 
     render(<App />);
 
@@ -1892,7 +1792,7 @@ describe("App empty landing and auto-resume", () => {
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     vi.spyOn(api, "fetchSessions").mockResolvedValue([]);
     useSessionStore.setState({
-      activeSessionId: "session-1",
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
       compositionState: makeState(1), // no sources/nodes/outputs
     });
 

@@ -1,45 +1,31 @@
-"""Compose request heartbeat: bounded retry, server-fault labelling, no DB error over the cancel.
+"""Detached worker lifecycle: metrics, lease renewal and durable observation.
 
-Finding #28 (wf2): ``_track_compose_inflight``'s renewal loop cancelled the
-owning compose request on the FIRST exception of any kind from
-``renew_request`` — including a transient ``OperationalError`` with ~45 s of
-lease left — and teardown then re-raised that database error over the
-``CancelledError``, while the route published ``client_cancelled`` ("Stopped")
-and metrics recorded ``cancelled``.
-
-The fake route below runs in its own task because the dependency captures
-``asyncio.current_task()`` as the request owner: driving ``anext()`` from the
-test coroutine would let the heartbeat cancel the test itself. Progression is
-driven by registry call counts and events, never by wall-clock assertions.
+Legacy test identifiers remain stable; scopes are worker-owned, and HTTP
+admission/GET never owns provider cancellation. Scripted clocks control retry
+headroom; real-file SQLite cases exercise202→worker→GET and explicit Stop.
 """
 
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 from collections import deque
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any, cast
-from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
-from fastapi import Depends, FastAPI, HTTPException
+import pytest_asyncio
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeoutError
-from starlette.requests import Request
 
-from elspeth.contracts.composer_progress import ComposerProgressEvent
-from elspeth.web.auth.middleware import get_current_user
-from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.progress import ComposerRequestLease
-from elspeth.web.config import WebSettings
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost, SessionComposerProgressAuthority
 from elspeth.web.sessions.routes import _helpers
-from tests.fixtures.identities import wire_test_pipeline_user_authority
-from tests.unit.web.sessions.test_routes import _make_progress_route_app
 
 _INSTANT_FAILURES_TO_CANCEL = 3
 """Instant transient failures, at 15 s, 30 s and 45 s after admission, that cancel.
@@ -116,8 +102,6 @@ class _RouteOutcome:
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, registry: _ScriptedRegistry) -> list[tuple[str, BaseException | None]]:
-    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership))
-    monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
     # The production interval and lease stand; only the clock and the wait
     # between renewals are fake, so no test sleeps for real.
     monkeypatch.setattr(
@@ -136,18 +120,14 @@ def _install(monkeypatch: pytest.MonkeyPatch, registry: _ScriptedRegistry) -> li
     return finished
 
 
-async def _run_fake_route(*, until: asyncio.Event, extra_cancel: bool = False) -> _RouteOutcome:
+async def _run_fake_route(*, registry, until: asyncio.Event, extra_cancel: bool = False) -> _RouteOutcome:
     """Play the route: enter the dependency, park on ``until``, settle teardown."""
     outcome = _RouteOutcome()
 
     async def route() -> None:
         dependency = cast(
             "AsyncGenerator[None, None]",
-            _helpers._track_compose_inflight(
-                uuid4(),
-                Request({"type": "http", "method": "POST", "path": "/api/sessions/1/messages", "headers": []}),
-                UserIdentity(user_id="user", username="user"),
-            ),
+            _owned_lifecycle(registry),
         )
         await anext(dependency)
         try:
@@ -191,7 +171,7 @@ async def test_one_transient_renew_failure_then_success_keeps_the_turn_alive(mon
     registry = _ScriptedRegistry(script=deque([transient(), None]), succeed_after=2)
     finished = _install(monkeypatch, registry)
 
-    outcome = await _run_fake_route(until=registry.renewed)
+    outcome = await _run_fake_route(registry=registry, until=registry.renewed)
 
     assert outcome.completed is True
     assert outcome.cancelled_seen is False
@@ -210,7 +190,7 @@ async def test_transient_failures_within_headroom_are_retried(monkeypatch: pytes
     registry = _ScriptedRegistry(script=script, succeed_after=2 * bound)
     finished = _install(monkeypatch, registry)
 
-    outcome = await _run_fake_route(until=registry.renewed)
+    outcome = await _run_fake_route(registry=registry, until=registry.renewed)
 
     assert outcome.completed is True
     assert outcome.cancelled_seen is False
@@ -236,7 +216,7 @@ async def test_repeated_transient_failures_past_headroom_cancel_as_server_fault(
     registry = _ScriptedRegistry(script=deque(_operational_error() for _ in range(bound + 5)))
     finished = _install(monkeypatch, registry)
 
-    outcome = await _run_fake_route(until=asyncio.Event())
+    outcome = await _run_fake_route(registry=registry, until=asyncio.Event())
 
     assert outcome.cancelled_seen is True
     assert registry.renew_calls == bound
@@ -269,7 +249,7 @@ async def test_lease_lost_cancels_immediately_as_server_fault(monkeypatch: pytes
     registry = _ScriptedRegistry(script=deque([failure] * (bound + 5)))
     finished = _install(monkeypatch, registry)
 
-    outcome = await _run_fake_route(until=asyncio.Event())
+    outcome = await _run_fake_route(registry=registry, until=asyncio.Event())
 
     assert registry.renew_calls == 1
     cancel = _helpers._composer_heartbeat_cancel_of(asyncio.CancelledError(outcome.heartbeat_cancel))
@@ -292,7 +272,7 @@ async def test_renewal_defect_cancels_immediately_and_surfaces_the_defect(monkey
     registry = _ScriptedRegistry(script=deque([defect]))
     finished = _install(monkeypatch, registry)
 
-    outcome = await _run_fake_route(until=asyncio.Event())
+    outcome = await _run_fake_route(registry=registry, until=asyncio.Event())
 
     assert registry.renew_calls == 1
     cancel = _helpers._composer_heartbeat_cancel_of(asyncio.CancelledError(outcome.heartbeat_cancel))
@@ -310,7 +290,7 @@ async def test_external_cancel_racing_the_heartbeat_keeps_unwinding_cancelled(mo
     registry = _ScriptedRegistry(script=deque([ComposerRequestLeaseLost("gone")] * (bound + 5)))
     finished = _install(monkeypatch, registry)
 
-    outcome = await _run_fake_route(until=asyncio.Event(), extra_cancel=True)
+    outcome = await _run_fake_route(registry=registry, until=asyncio.Event(), extra_cancel=True)
 
     assert isinstance(outcome.dependency_error, asyncio.CancelledError)
     assert [status for status, _ in finished] == ["cancelled"]
@@ -322,102 +302,13 @@ def test_plain_cancelled_error_is_not_a_heartbeat_cancel() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dependency_teardown_503_reaches_the_http_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Routes that re-raise the heartbeat cancel still answer with the structured 503."""
-    # Keep failing so a heartbeat that wrongly retried a lost lease still ends.
-    bound = _INSTANT_FAILURES_TO_CANCEL
-    registry = _ScriptedRegistry(script=deque([ComposerRequestLeaseLost("gone")] * (bound + 5)))
-    finished = _install(monkeypatch, registry)
-    app = FastAPI()
-    app.state.settings = WebSettings(
-        composer_max_composition_turns=15,
-        composer_max_discovery_turns=10,
-        composer_timeout_seconds=85.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
-    wire_test_pipeline_user_authority(app, identity_id="user")
-
-    async def mock_user() -> UserIdentity:
-        return UserIdentity(user_id="user", username="user")
-
-    app.dependency_overrides[get_current_user] = mock_user
-
-    @app.post("/api/sessions/{session_id}/messages")
-    async def hanging_route(_tally: None = Depends(_helpers._track_compose_inflight)) -> dict[str, str]:
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(f"/api/sessions/{uuid4()}/messages")
-
-    assert response.status_code == 503
-    assert response.headers["content-type"].startswith("application/json")
-    assert response.json() == {
-        "detail": {
-            "error_type": "composer_request_lease_lost",
-            "detail": "The server lost this composer request's lease before it finished. Please resubmit.",
-        }
-    }
-    assert [status for status, _ in finished] == ["failed"]
+async def test_dependency_teardown_503_reaches_the_http_client(tmp_path, monkeypatch):
+    await _durable_heartbeat(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_send_message_heartbeat_cancel_publishes_server_fault_not_client_cancelled(
-    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app, service = _make_progress_route_app(tmp_path)
-    registry = app.state.composer_progress_registry
-    compose_started = asyncio.Event()
-    original_renew = registry.renew_request
-
-    async def renew_request(lease: ComposerRequestLease) -> None:
-        # Claim-time renewal succeeds; heartbeat renewal fails once the
-        # provider call is in flight.
-        if compose_started.is_set():
-            raise ComposerRequestLeaseLost("Composer request lease cannot be renewed")
-        await original_renew(lease)
-
-    monkeypatch.setattr(registry, "renew_request", renew_request)
-    monkeypatch.setattr(_helpers, "_COMPOSER_HEARTBEAT_SECONDS", 0)
-
-    class _HangingComposer:
-        cancelled = False
-
-        async def compose(self, *args: Any, **kwargs: Any) -> None:
-            del args, kwargs
-            compose_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                _HangingComposer.cancelled = True
-                raise
-
-    app.state.composer_service = _HangingComposer()
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(
-            f"/api/sessions/{service.session.id}/messages",
-            json={"content": "Heartbeat will lose the lease", "client_request_id": str(uuid4())},
-        )
-
-    assert _HangingComposer.cancelled is True
-    assert response.status_code == 503
-    assert response.json()["detail"]["error_type"] == "composer_request_lease_lost"
-    snapshot = await registry.get_latest(str(service.session.id))
-    assert snapshot.phase == "failed"
-    assert snapshot.reason == "service_setup_failed"
-    assert snapshot.reason != "client_cancelled"
-    assert (
-        ComposerProgressEvent(
-            phase=snapshot.phase,
-            headline=snapshot.headline,
-            evidence=snapshot.evidence,
-            likely_next=snapshot.likely_next,
-            reason=snapshot.reason,
-        )
-        == _helpers._composer_heartbeat_failed_progress_event()
-    )
+async def test_send_message_heartbeat_cancel_publishes_server_fault_not_client_cancelled(tmp_path, monkeypatch):
+    await _durable_heartbeat(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
@@ -439,7 +330,7 @@ async def test_slow_failing_renewals_cancel_before_the_lease_lapses(
     )
     finished = _install(monkeypatch, registry)
 
-    outcome = await _run_fake_route(until=asyncio.Event())
+    outcome = await _run_fake_route(registry=registry, until=asyncio.Event())
 
     assert registry.renew_calls == expected_calls
     # Admission is the last good renewal (t=0): the cancel lands with lease left.
@@ -487,7 +378,7 @@ async def test_hung_renewal_is_abandoned_when_the_lease_runs_out(monkeypatch: py
     monkeypatch.setattr(_helpers, "_COMPOSER_REQUEST_LEASE_SECONDS", _helpers._COMPOSER_HEARTBEAT_SECONDS + 0.05)
 
     async with asyncio.timeout(10):
-        outcome = await _run_fake_route(until=asyncio.Event())
+        outcome = await _run_fake_route(registry=registry, until=asyncio.Event())
 
     assert registry.renew_calls == 1
     assert registry.abandoned is True
@@ -512,7 +403,7 @@ async def test_timeout_error_raised_by_the_renewal_itself_stays_a_renewal_defect
     registry = _ScriptedRegistry(script=deque([defect] * 10))
     finished = _install(monkeypatch, registry)
 
-    outcome = await _run_fake_route(until=asyncio.Event())
+    outcome = await _run_fake_route(registry=registry, until=asyncio.Event())
 
     assert registry.renew_calls == 1
     cancel = _helpers._composer_heartbeat_cancel_of(asyncio.CancelledError(outcome.heartbeat_cancel))
@@ -520,3 +411,136 @@ async def test_timeout_error_raised_by_the_renewal_itself_stays_a_renewal_defect
     assert cancel.kind == "renewal_defect"
     assert outcome.dependency_error is defect
     assert finished == [("failed", defect)]
+
+
+async def _owned_lifecycle(registry):
+    """Drive the owned worker scope without an HTTP dependency or Request."""
+    owner = asyncio.current_task()
+    assert owner is not None
+    async with _helpers.composer_request_lifecycle(
+        registry,
+        session_id=str(uuid4()),
+        user_id="user",
+        owner_task=owner,
+    ):
+        yield None
+
+
+async def _durable_heartbeat(tmp_path, monkeypatch, *, recompose=False, explicit_stop=False):
+    from tests.helpers.composer_operations import build_composer_operation_app, install_composer_async_worker, message_body, recompose_body
+
+    harness = await build_composer_operation_app(tmp_path)
+    app = harness.app
+    install_composer_async_worker(app)
+    registry = app.state.composer_progress_registry
+    original_renew = registry.renew_request
+
+    async def renew(lease):
+        if harness.composer.entered.is_set() and not explicit_stop:
+            raise ComposerRequestLeaseLost("lost exact worker progress lease")
+        await original_renew(lease)
+
+    async def wait(seconds):
+        while not harness.composer.entered.is_set():
+            await asyncio.sleep(0)
+        if explicit_stop:
+            await asyncio.Event().wait()
+
+    observed_metrics = []
+    monkeypatch.setattr(_helpers, "begin_composer_request_metrics", lambda *, surface: object())
+
+    def finish_metrics(token, *, status, primary_error):
+        observed_metrics.append((status, primary_error))
+
+    monkeypatch.setattr(_helpers, "finish_composer_request_metrics", finish_metrics)
+    monkeypatch.setattr(registry, "renew_request", renew)
+    monkeypatch.setattr(_helpers, "_COMPOSER_HEARTBEAT_TIMER", _helpers._ComposerHeartbeatTimer(now=lambda: 0.0, wait=wait))
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": f"Bearer {harness.token}"}
+    ) as client:
+        route = "messages"
+        body = message_body("One detached provider call")
+        if recompose:
+            from tests.helpers.session_fences import acquire_compose_context
+
+            async with acquire_compose_context(app.state.session_service, harness.session_id) as context:
+                user = await app.state.session_service.add_message(
+                    harness.session_id,
+                    "user",
+                    "Retry the same user",
+                    writer_principal="route_user_message",
+                    session_operation_context=context,
+                )
+            route = "recompose"
+            body = recompose_body(user.id)
+        accepted = await client.post(f"/api/sessions/{harness.session_id}/{route}", json=body)
+        assert accepted.status_code == 202, accepted.text
+        assert harness.composer.calls == 0
+        poll = f"/api/sessions/{harness.session_id}/operations/{body['operation_id']}"
+        assert (await client.get(poll)).json()["status"] == "queued"
+        drive = asyncio.create_task(app.state.composer_async_worker.run_until_idle())
+        try:
+            async with asyncio.timeout(10):
+                while not harness.composer.entered.is_set():
+                    await asyncio.sleep(0.001)
+                if explicit_stop:
+                    from elspeth.web.sessions.routes.composer import operations
+
+                    original_ownership = operations._verify_session_ownership
+                    observer_entered = asyncio.Event()
+
+                    async def held_observation(*args, **kwargs):
+                        await original_ownership(*args, **kwargs)
+                        observer_entered.set()
+                        await asyncio.Event().wait()
+
+                    with monkeypatch.context() as observer_patch:
+                        observer_patch.setattr(operations, "_verify_session_ownership", held_observation)
+                        observer = asyncio.create_task(client.get(poll))
+                        await observer_entered.wait()
+                        observer.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await observer
+                    assert not drive.done()
+                    running = await client.get(poll)
+                    assert running.json()["status"] == "running"
+                    assert running.json()["cancel_requested"] is False
+                    assert harness.composer.calls == 1
+                    cancelled = await client.post(f"{poll}/cancel")
+                    assert cancelled.status_code == 202, cancelled.text
+                await drive
+            final = await client.get(poll)
+            assert final.status_code == 200, final.text
+            snapshot = final.json()
+            assert snapshot["status"] == "failed"
+            assert snapshot["error"]["failure_code"] == ("request_cancelled" if explicit_stop else "worker_lost")
+            assert snapshot["error"]["http_status"] == (499 if explicit_stop else 503)
+            assert harness.composer.calls == 1
+            again = await client.get(poll)
+            assert again.json() == snapshot
+            assert harness.composer.calls == 1
+            progress = await registry.get_latest(str(harness.session_id))
+            assert progress.inflight_requests == 0
+            assert len(observed_metrics) == 1
+            assert observed_metrics[0][0] == ("cancelled" if explicit_stop else "failed")
+            assert progress.reason == ("client_cancelled" if explicit_stop else "service_setup_failed")
+        finally:
+            if not drive.done():
+                await client.post(f"{poll}/cancel")
+                await drive
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _assert_joined_lifecycle_children():
+    """A passing HTTP result must also retrieve every failed owned child."""
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    unobserved = []
+    loop.set_exception_handler(lambda active_loop, context: unobserved.append(context))
+    try:
+        yield
+        gc.collect()
+        await asyncio.sleep(0)
+        assert unobserved == [], unobserved
+    finally:
+        loop.set_exception_handler(previous)

@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import inspect
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
-from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import (
     HistogramDataPoint,
-    InMemoryMetricReader,
     MetricExporter,
     MetricExportResult,
     MetricsData,
@@ -26,7 +24,9 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.telemetry.manager import TelemetryManager
 from elspeth.web import operator_telemetry
 from elspeth.web.config import WebSettings
-from elspeth.web.operator_telemetry import OperatorTelemetryFactories
+from elspeth.web.operator_telemetry import OwnedTestOperatorTelemetryFactories
+from elspeth.web.operator_telemetry_custody import OperatorTelemetryCleanupOwner
+from elspeth.web.operator_telemetry_installation import OwnedTestTelemetryInstallation
 from tests.fixtures.telemetry import MockTelemetryConfig, TelemetryTestExporter
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -41,6 +41,10 @@ def _reset_operator_runtime() -> Iterator[None]:
 
 
 class _NoopMetricExporter(MetricExporter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.data: MetricsData | None = None
+
     def export(
         self,
         _metrics_data: MetricsData,
@@ -48,6 +52,7 @@ class _NoopMetricExporter(MetricExporter):
         **_kwargs: object,
     ) -> MetricExportResult:
         del timeout_millis
+        self.data = _metrics_data
         return MetricExportResult.SUCCESS
 
     def force_flush(self, timeout_millis: float = 10_000) -> bool:
@@ -76,33 +81,14 @@ def _aws_settings() -> WebSettings:
     )
 
 
-def _metric_factories(reader: InMemoryMetricReader) -> OperatorTelemetryFactories:
-    secondary_reader = InMemoryMetricReader()
-
-    def provider(
-        readers: Sequence[object],
-        *,
-        resource: object,
-        views: tuple[object, ...],
-    ) -> MeterProvider:
-        del views
-        return MeterProvider(
-            metric_readers=readers,  # type: ignore[arg-type]
-            resource=resource,  # type: ignore[arg-type]
-            shutdown_on_exit=False,
-        )
-
-    return OperatorTelemetryFactories(
-        prometheus_reader=lambda: reader,
-        otlp_exporter=lambda **_kwargs: _NoopMetricExporter(),
-        periodic_reader=lambda _exporter, **_kwargs: secondary_reader,
-        meter_provider=provider,
-        set_meter_provider=lambda _provider: None,
-    )
+def _metric_factories(reader: _NoopMetricExporter) -> OwnedTestOperatorTelemetryFactories:
+    return OwnedTestOperatorTelemetryFactories(exporter_factory=lambda **kwargs: reader)
 
 
-def _metrics_by_name(reader: InMemoryMetricReader) -> dict[str, Any]:
-    data = reader.get_metrics_data()
+def _metrics_by_name(runtime: operator_telemetry.OperatorTelemetryRuntime, reader: _NoopMetricExporter) -> dict[str, Any]:
+    assert runtime.provider.force_flush(timeout_millis=5_000)
+    data = reader.data
+    assert data is not None
     return {
         metric.name: metric
         for resource_metric in data.resource_metrics
@@ -169,9 +155,10 @@ def test_aws_operator_projects_audited_run_call_and_token_metrics_without_dimens
         "llm.completion_tokens",
     }
 
-    reader = InMemoryMetricReader()
+    reader = _NoopMetricExporter()
     runtime = operator_telemetry.bootstrap_operator_telemetry(
         _aws_settings(),
+        cleanup_owner=OperatorTelemetryCleanupOwner(installation=OwnedTestTelemetryInstallation()),
         factories=_metric_factories(reader),
     )
     try:
@@ -192,7 +179,7 @@ def test_aws_operator_projects_audited_run_call_and_token_metrics_without_dimens
             )
         )
 
-        collected = _metrics_by_name(reader)
+        collected = _metrics_by_name(runtime, reader)
 
         assert _single_point_value(collected["run.failure"]) == 1
         assert _single_point_value(collected["run.duration"]) == 301
@@ -205,7 +192,7 @@ def test_aws_operator_projects_audited_run_call_and_token_metrics_without_dimens
             for point in collected[name].data.data_points:
                 assert point.attributes == {}
     finally:
-        runtime.provider.shutdown()
+        runtime.shutdown_sync()
         operator_telemetry.reset_operator_telemetry_for_tests()
 
 
@@ -236,9 +223,10 @@ def test_pipeline_metric_observer_runs_before_lifecycle_granularity_filter() -> 
 def test_llm_token_projection_retains_partial_provider_usage_without_fabrication() -> None:
     record_event = operator_telemetry.record_operator_pipeline_event
 
-    reader = InMemoryMetricReader()
+    reader = _NoopMetricExporter()
     runtime = operator_telemetry.bootstrap_operator_telemetry(
         _aws_settings(),
+        cleanup_owner=OperatorTelemetryCleanupOwner(installation=OwnedTestTelemetryInstallation()),
         factories=_metric_factories(reader),
     )
     try:
@@ -251,12 +239,12 @@ def test_llm_token_projection_retains_partial_provider_usage_without_fabrication
             )
         )
 
-        collected = _metrics_by_name(reader)
+        collected = _metrics_by_name(runtime, reader)
 
         assert "llm.prompt_tokens" not in collected
         assert _single_point_value(collected["llm.completion_tokens"]) == 3
     finally:
-        runtime.provider.shutdown()
+        runtime.shutdown_sync()
         operator_telemetry.reset_operator_telemetry_for_tests()
 
 
@@ -278,9 +266,10 @@ def test_operator_metric_projection_failure_cannot_replace_the_audited_outcome()
         def record(self, _event: object) -> None:
             raise RuntimeError("metric recorder unavailable")
 
-    reader = InMemoryMetricReader()
+    reader = _NoopMetricExporter()
     runtime = operator_telemetry.bootstrap_operator_telemetry(
         _aws_settings(),
+        cleanup_owner=OperatorTelemetryCleanupOwner(installation=OwnedTestTelemetryInstallation()),
         factories=_metric_factories(reader),
     )
     try:
@@ -288,5 +277,5 @@ def test_operator_metric_projection_failure_cannot_replace_the_audited_outcome()
 
         assert record_event(_run_finished()) is None
     finally:
-        runtime.provider.shutdown()
+        runtime.shutdown_sync()
         operator_telemetry.reset_operator_telemetry_for_tests()

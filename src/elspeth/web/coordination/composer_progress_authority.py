@@ -16,7 +16,7 @@ from uuid import uuid4
 from sqlalchemy import Engine, Row, Select, delete, func, insert, select, update
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
-from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.async_workers import run_stream_read_in_worker, run_sync_in_worker
 from elspeth.web.composer.progress import ComposerProgressSnapshot, ComposerRequestLease
 from elspeth.web.coordination.membership_authority import _database_clock_value, _ensure_utc, _require_nonblank
 from elspeth.web.sessions.models import (
@@ -47,10 +47,23 @@ def _identity_query(user_id: str, *, lock: bool = True) -> Select[Any]:
     return query
 
 
-def _snapshot(session_id: str, request_id: str | None, event: ComposerProgressEvent, now: datetime) -> ComposerProgressSnapshot:
+def _snapshot(
+    session_id: str,
+    request_id: str | None,
+    event: ComposerProgressEvent,
+    now: datetime,
+    operation_id: str | None = None,
+    session_operation_id: str | None = None,
+    session_operation_epoch: int | None = None,
+    request_token: str | None = None,
+) -> ComposerProgressSnapshot:
     return ComposerProgressSnapshot(
         session_id=session_id,
         request_id=request_id,
+        operation_id=operation_id,
+        session_operation_id=session_operation_id,
+        session_operation_epoch=session_operation_epoch,
+        request_token=request_token,
         updated_at=now,
         phase=event.phase,
         headline=event.headline,
@@ -91,6 +104,8 @@ def _read_snapshot(row: Row[Any] | None, session_id: str, user_id: str, now: dat
             raise RuntimeError("Composer progress snapshot contains a persisted live count")
         if snapshot.session_id != session_id or snapshot.request_id != row.request_id:
             raise RuntimeError("Composer progress snapshot identity is corrupt")
+        if snapshot.request_token != row.request_token:
+            raise RuntimeError("Composer progress snapshot lifecycle token is corrupt")
         if snapshot.updated_at != _ensure_utc(row.updated_at):
             raise RuntimeError("Composer progress snapshot timestamp is corrupt")
         if _ensure_utc(row.expires_at) > now:
@@ -335,7 +350,16 @@ class SessionComposerProgressAuthority:
             )
         return generation
 
-    def publish(self, lease: ComposerRequestLease, generation: str, request_id: str | None, event: ComposerProgressEvent) -> None:
+    def publish(
+        self,
+        lease: ComposerRequestLease,
+        generation: str,
+        request_id: str | None,
+        event: ComposerProgressEvent,
+        operation_id: str | None = None,
+        session_operation_id: str | None = None,
+        session_operation_epoch: int | None = None,
+    ) -> None:
         with self._engine.begin() as conn:
             if conn.execute(_ownership_query(lease.session_id, lease.user_id)).one_or_none() is None:
                 raise ComposerProgressSessionUnavailable("Composer progress session is unavailable")
@@ -353,7 +377,9 @@ class SessionComposerProgressAuthority:
             ).one_or_none()
             if active is None:
                 raise ComposerRequestLeaseLost("Composer request cannot publish progress")
-            snapshot = _snapshot(lease.session_id, request_id, event, now)
+            snapshot = _snapshot(
+                lease.session_id, request_id, event, now, operation_id, session_operation_id, session_operation_epoch, lease.request_token
+            )
             conn.execute(
                 update(composer_progress_snapshots_table)
                 .where(
@@ -534,14 +560,24 @@ class DatabaseComposerProgressRegistry:
         await run_sync_in_worker(self._authority.heartbeat_request, lease)
 
     async def claim_request(
-        self, *, session_id: str, request_id: str | None, user_id: str, lease: ComposerRequestLease
+        self,
+        *,
+        session_id: str,
+        request_id: str | None,
+        user_id: str,
+        lease: ComposerRequestLease,
+        operation_id: str | None = None,
+        session_operation_id: str | None = None,
+        session_operation_epoch: int | None = None,
     ) -> ComposerProgressSink:
         if lease.session_id != session_id or lease.user_id != user_id:
             raise ValueError("Composer request lease does not match the request")
         generation = await run_sync_in_worker(self._authority.bind_request, lease, request_id)
 
         async def publish(event: ComposerProgressEvent) -> None:
-            await run_sync_in_worker(self._authority.publish, lease, generation, request_id, event)
+            await run_sync_in_worker(
+                self._authority.publish, lease, generation, request_id, event, operation_id, session_operation_id, session_operation_epoch
+            )
 
         return publish
 
@@ -558,6 +594,25 @@ class DatabaseComposerProgressRegistry:
 
     async def get_latest(self, session_id: str, user_id: str) -> ComposerProgressSnapshot:
         return await run_sync_in_worker(self._authority.get_latest, session_id, user_id)
+
+    async def get_for_operation(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        operation_id: str,
+        session_operation_id: str | None,
+        session_operation_epoch: int | None,
+    ) -> ComposerProgressSnapshot | None:
+        """Read only progress published under this exact durable action fence."""
+        snapshot = await run_stream_read_in_worker(self._authority.get_latest, session_id, user_id)
+        if (
+            snapshot.operation_id != operation_id
+            or snapshot.session_operation_id != session_operation_id
+            or snapshot.session_operation_epoch != session_operation_epoch
+        ):
+            return None
+        return snapshot
 
     async def list_active(self, *, user_id: str) -> tuple[ComposerProgressSnapshot, ...]:
         return await run_sync_in_worker(self._authority.list_active, user_id)

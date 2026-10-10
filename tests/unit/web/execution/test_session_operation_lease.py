@@ -20,17 +20,24 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import json
 import operator
+import os
 import re
+import subprocess
+import sys
 import textwrap
 import threading
+import time
+import traceback
 from asyncio.tasks import run_coroutine_threadsafe
 from asyncio.threads import to_thread
-from collections.abc import Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Coroutine, Iterator
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -47,18 +54,25 @@ from starlette.requests import Request
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.core.events import EventBus
 from elspeth.engine.orchestrator.core import Orchestrator
+from elspeth.web import async_workers
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.coordination import lifecycle as lifecycle_module
 from elspeth.web.coordination.contracts import (
     FenceLossReason,
     SessionOperationContext,
     SessionOperationFence,
     SessionOperationFenceLost,
     SessionOperationKind,
+    StartPermitState,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.coordination.repository import SessionDerivedCustodyError, SessionOperationConflictError
+from elspeth.web.coordination.repository import (
+    CanonicalExecutionReleaseLoss,
+    SessionDerivedCustodyError,
+    SessionOperationConflictError,
+)
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution import service as execution_service_module
 from elspeth.web.execution.envelope import restore_execution_envelope
@@ -68,11 +82,27 @@ from elspeth.web.execution.routes import create_execution_router
 from elspeth.web.execution.schemas import ProgressData, RunEvent, ValidationReadiness, ValidationResult
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.sessions.models import run_events_table
-from elspeth.web.sessions.protocol import CompositionStateData, SessionOperationAuthority, SessionServiceProtocol
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    RunRecord,
+    RunStartPermitRecord,
+    SessionOperationAuthority,
+    SessionServiceProtocol,
+)
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import (
+    ActualPrivatePipelineExecutorControl,
+    CanonicalExecutionAuthorityObservation,
+    ExecutionTestCustody,
+    PhysicalPipelineCompletionControl,
+)
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
+
+execution_fixture = execution_custody.execution_fixture
+
 
 _USER_ID = "execution-lease-user"
 
@@ -234,7 +264,9 @@ class _YamlGenerator:
         return "source:\n  plugin: csv\n  options: {}\n"
 
 
-def _execution_service(loop: asyncio.AbstractEventLoop) -> tuple[ExecutionServiceImpl, Any, _ControllableExecutor]:
+def _execution_service(
+    loop: asyncio.AbstractEventLoop, execution_fixture: ExecutionTestCustody
+) -> tuple[ExecutionServiceImpl, Any, ActualPrivatePipelineExecutorControl]:
     session_service = create_autospec(SessionServiceProtocol, instance=True)
     session_id = uuid4()
     state = SimpleNamespace(
@@ -258,17 +290,67 @@ def _execution_service(loop: asyncio.AbstractEventLoop) -> tuple[ExecutionServic
     session_service.get_current_state.return_value = state
     session_service.create_run.return_value = run
     session_service.update_run_status.return_value = None
-    service = ExecutionServiceImpl.for_trained_operator(
-        loop=loop,
-        broadcaster=ProgressBroadcaster(loop),
-        settings=cast(Any, _ExecutionSettings()),
-        session_service=session_service,
-        yaml_generator=_YamlGenerator(),
-        telemetry=build_sessions_telemetry(),
+    service = execution_fixture.bind(
+        ExecutionServiceImpl.for_trained_operator(
+            loop=loop,
+            broadcaster=ProgressBroadcaster(loop),
+            settings=cast(Any, _ExecutionSettings()),
+            session_service=session_service,
+            yaml_generator=_YamlGenerator(),
+            telemetry=build_sessions_telemetry(),
+            execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+        )
     )
-    executor = _ControllableExecutor()
-    service._executor = cast(Any, executor)
+    executor = ActualPrivatePipelineExecutorControl(service._executor, execution_fixture)
     return service, session_service, executor
+
+
+async def _submit_terminal_callback(
+    service: ExecutionServiceImpl,
+    lease: SessionOperationLease,
+    executor: ActualPrivatePipelineExecutorControl,
+    *,
+    error: BaseException | None = None,
+) -> tuple[asyncio.Task[None], Future[object]]:
+    obligation = lease.execution_obligation
+    assert obligation is not None
+    watcher = service._create_loss_watcher(lease, threading.Event(), run_id=uuid4())
+    service._submit_owned_pipeline(obligation, lease, watcher, partial(lambda: None))
+    actual = obligation.pipeline
+    assert actual is not None and actual is executor.future.actual
+    if error is None:
+        executor.future.set_result(None)
+    else:
+        executor.future.set_exception(error)
+    for _ in range(200):
+        if obligation.completion is not None:
+            break
+        await asyncio.sleep(0.01)
+    completion = obligation.completion
+    assert completion is not None, "source callback did not bind its actual completion wrapper"
+    # Genuine exact duplicate after the production observer's first handoff.
+    service._on_pipeline_done(actual, session_operation_lease=lease, loss_watcher=watcher)
+    return watcher, completion
+
+
+async def _canonical_execute_lease(
+    service: ExecutionServiceImpl,
+    execution_fixture: ExecutionTestCustody,
+    *,
+    session_id: UUID,
+    renew_interval_seconds: float = 10.0,
+) -> tuple[SessionOperationLease, CanonicalExecutionAuthorityObservation]:
+    observed = execution_fixture.observe_authority(session_id)
+    observed.release_allowed.clear()
+    lease = await execution_fixture.acquire(
+        service.execution_lease_release_registry,
+        observed.authority,
+        session_id=session_id,
+        owner_instance_id="execution-lease-test",
+        lease_seconds=30,
+        renew_interval_seconds=renew_interval_seconds,
+    )
+    return lease, observed
 
 
 async def _real_lease(
@@ -288,13 +370,83 @@ async def _real_lease(
     return lease, authority
 
 
+class _CanonicalRouteSignal:
+    """Observe actual producer state; this Event-like API grants no receipt."""
+
+    def __init__(self, predicate):
+        self.predicate = predicate
+
+    def is_set(self):
+        return self.predicate()
+
+    async def wait(self):
+        while not self.predicate():
+            await asyncio.sleep(0.001)
+        return True
+
+
+class _CanonicalRouteLeaseControl:
+    """Test driver only: the route always receives the actual nominal lease."""
+
+    def __init__(self, sessions: _RouteSessionService, execution_fixture: ExecutionTestCustody):
+        self.observation = sessions.observation
+        self.execution_fixture = execution_fixture
+        self.actual: SessionOperationLease | None = None
+        self.close_allowed = self.observation.release_allowed
+        self.close_allowed.clear()
+        self.close_started = _CanonicalRouteSignal(self.observation.release_called.is_set)
+        self.close_finished = _CanonicalRouteSignal(self._actual_close_finished)
+
+    def bind(self, actual: SessionOperationLease) -> None:
+        assert type(actual) is SessionOperationLease and self.actual is None
+        assert actual.execution_obligation is not None
+        assert actual.execution_obligation.authority is self.observation.authority
+        self.actual = actual
+        self.execution_fixture.track_route_lease(actual)
+
+    def _actual_close_finished(self):
+        actual = self.actual
+        if actual is None:
+            return False
+        obligation = actual.execution_obligation
+        assert obligation is not None
+        task = obligation.lifecycle_task
+        return actual.closed and task is not None and task.done() and obligation.lifecycle_outcome_recorded
+
+    @property
+    def context(self):
+        assert self.actual is not None
+        return self.actual.context
+
+    @property
+    def close_calls(self):
+        return len(self.observation.release_calls)
+
+    @property
+    def close_cancelled(self):
+        if self.actual is None:
+            return False
+        obligation = self.actual.execution_obligation
+        assert obligation is not None
+        return isinstance(obligation.lifecycle_original_error, asyncio.CancelledError)
+
+    @property
+    def close_error(self):
+        return self.observation.release_error
+
+    @close_error.setter
+    def close_error(self, original):
+        self.observation.release_error = original
+
+
 class _RouteSessionService:
-    def __init__(self, session_id: UUID, *, trace: list[str] | None = None) -> None:
-        self.session_operation_authority = cast("SessionOperationAuthority", object())
+    def __init__(self, session_id: UUID, *, execution_fixture: ExecutionTestCustody, trace: list[str] | None = None) -> None:
+        self.observation = execution_fixture.observe_authority(session_id)
+        self.session_operation_authority = self.observation.authority
         self.session_operation_owner_instance_id = "execution-route-test"
         self.session_operation_lease_seconds = 41
-        self._session_id = session_id
-        self._trace = trace
+        self.registry = execution_fixture.registry(asyncio.get_running_loop())
+        self._session_id, self._trace = session_id, trace
         self.authorized = True
 
     async def get_session(self, session_id: UUID) -> SimpleNamespace:
@@ -302,10 +454,7 @@ class _RouteSessionService:
         if self._trace is not None:
             self._trace.append("ownership")
         return SimpleNamespace(
-            id=session_id,
-            user_id=_USER_ID if self.authorized else "different-user",
-            auth_provider_type="local",
-            archived_at=None,
+            id=session_id, user_id=_USER_ID if self.authorized else "different-user", auth_provider_type="local", archived_at=None
         )
 
 
@@ -315,6 +464,7 @@ class _RouteExecutionService:
         self.started = asyncio.Event()
         self.allowed = asyncio.Event()
         self.error: BaseException | None = None
+        self.cancellation_originals: list[asyncio.CancelledError] = []
         self.calls: list[dict[str, object]] = []
         self._trace = trace
 
@@ -323,10 +473,42 @@ class _RouteExecutionService:
         if self._trace is not None:
             self._trace.append("execute")
         self.started.set()
-        await self.allowed.wait()
+        try:
+            await self.allowed.wait()
+        except asyncio.CancelledError as original:
+            self.cancellation_originals.append(original)
+            raise
         if self.error is not None:
             raise self.error
         return self.run_id
+
+
+class _ExactCloseWaitCancellationObserver:
+    """Observe the request's delivered cancellation at the real close join."""
+
+    def __init__(self, lease: _CanonicalRouteLeaseControl) -> None:
+        self.lease = lease
+        self.request_task: asyncio.Task[object] | None = None
+        self.delivered: list[asyncio.CancelledError] = []
+        self.original_wait = asyncio.wait
+
+    async def __call__(self, fs: set[asyncio.Task[object]], *args: object, **kwargs: object) -> object:
+        try:
+            return await self.original_wait(fs, *args, **kwargs)
+        except asyncio.CancelledError as original:
+            if asyncio.current_task() is self.request_task and len(fs) == 1:
+                close_task = next(iter(fs))
+                coroutine = close_task.get_coro()
+                frame = coroutine.cr_frame
+                if (
+                    close_task.get_name() == "execution-pretransfer-lease-close"
+                    and coroutine.cr_code is SessionOperationLease.close.__code__
+                    and frame is not None
+                    and self.lease.actual is not None
+                    and frame.f_locals["self"] is self.lease.actual
+                ):
+                    self.delivered.append(original)
+            raise
 
 
 @dataclass
@@ -337,10 +519,11 @@ class _RouteHarness:
     session_service: _RouteSessionService
 
 
-def _route_harness(session_id: UUID) -> _RouteHarness:
+def _route_harness(session_id: UUID, execution_fixture: ExecutionTestCustody) -> _RouteHarness:
     app = FastAPI()
-    session_service = _RouteSessionService(session_id)
+    session_service = _RouteSessionService(session_id, execution_fixture=execution_fixture)
     app.state.session_service = session_service
+    app.state.execution_lease_release_registry = session_service.registry
     app.state.settings = SimpleNamespace(auth_provider="local")
     wire_test_pipeline_user_authority(app, identity_id=_USER_ID)
     request = Request(
@@ -362,18 +545,18 @@ def _route_harness(session_id: UUID) -> _RouteHarness:
 
 
 def _install_acquire(
-    monkeypatch: pytest.MonkeyPatch,
-    lease: _ControllableLease,
-    *,
-    trace: list[str] | None = None,
+    monkeypatch: pytest.MonkeyPatch, lease: _CanonicalRouteLeaseControl, *, trace: list[str] | None = None
 ) -> list[dict[str, object]]:
     calls: list[dict[str, object]] = []
+    canonical_acquire = SessionOperationLease.acquire
 
-    async def acquire(_cls: type[SessionOperationLease], authority: object, **kwargs: object) -> _ControllableLease:
+    async def acquire(_cls: type[SessionOperationLease], authority: object, **kwargs: object) -> SessionOperationLease:
         if trace is not None:
             trace.append("acquire")
         calls.append({"authority": authority, **kwargs})
-        return lease
+        actual = await canonical_acquire(authority, **kwargs)
+        lease.bind(actual)
+        return actual
 
     monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
     return calls
@@ -386,6 +569,7 @@ def _http_route_app(
 ) -> FastAPI:
     app = FastAPI()
     app.state.session_service = session_service
+    app.state.execution_lease_release_registry = session_service.registry
     app.state.execution_service = execution_service
     app.state.settings = SimpleNamespace(auth_provider="local")
     wire_test_pipeline_user_authority(app, identity_id=_USER_ID)
@@ -416,11 +600,13 @@ async def _invoke_execute_route(
 
 
 @pytest.mark.asyncio
-async def test_execute_route_acquires_exact_execute_lease_and_transfers_it(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_execute_route_acquires_exact_execute_lease_and_transfers_it(
+    monkeypatch: pytest.MonkeyPatch, execution_fixture: ExecutionTestCustody
+) -> None:
     session_id = uuid4()
     run_id = uuid4()
-    harness = _route_harness(session_id)
-    lease = _ControllableLease(_context(session_id))
+    harness = _route_harness(session_id, execution_fixture)
+    lease = _CanonicalRouteLeaseControl(harness.session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease)
     service = _RouteExecutionService(run_id)
     service.allowed.set()
@@ -428,6 +614,15 @@ async def test_execute_route_acquires_exact_execute_lease_and_transfers_it(monke
     response = await _invoke_execute_route(harness, service, session_id=session_id)
 
     assert response == {"run_id": str(run_id)}
+    assert lease.actual is not None
+    obligation = lease.actual.execution_obligation
+    assert obligation is not None
+    assert obligation.lease is lease.actual
+    assert obligation.registry is harness.session_service.registry
+    assert obligation.authority is harness.session_service.session_operation_authority
+    assert obligation.session_id == session_id
+    assert obligation.owner_instance_id == "execution-route-test"
+    assert obligation.lease_seconds == 41
     assert acquired == [
         {
             "authority": harness.session_service.session_operation_authority,
@@ -435,23 +630,25 @@ async def test_execute_route_acquires_exact_execute_lease_and_transfers_it(monke
             "operation_kind": SessionOperationKind.EXECUTE,
             "owner_instance_id": "execution-route-test",
             "lease_seconds": 41,
+            "execution_obligation": obligation,
         }
     ]
     assert len(service.calls) == 1
-    assert service.calls[0]["session_operation_lease"] is lease
+    assert service.calls[0]["session_operation_lease"] is lease.actual
     assert lease.close_calls == 0, "successful submission transfers ownership to background completion"
 
 
 @pytest.mark.asyncio
 async def test_fastapi_execute_orders_ownership_before_acquire_before_exact_service_handoff(
     monkeypatch: pytest.MonkeyPatch,
+    execution_fixture: ExecutionTestCustody,
 ) -> None:
     session_id = uuid4()
     trace: list[str] = []
-    session_service = _RouteSessionService(session_id, trace=trace)
+    session_service = _RouteSessionService(session_id, execution_fixture=execution_fixture, trace=trace)
     execution_service = _RouteExecutionService(uuid4(), trace=trace)
     execution_service.allowed.set()
-    lease = _ControllableLease(_context(session_id))
+    lease = _CanonicalRouteLeaseControl(session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease, trace=trace)
     app = _http_route_app(session_service=session_service, execution_service=execution_service)
 
@@ -461,11 +658,13 @@ async def test_fastapi_execute_orders_ownership_before_acquire_before_exact_serv
     assert response.status_code == 202
     assert trace == ["ownership", "acquire", "execute"]
     assert len(acquired) == 1
+    assert lease.actual is not None
+    assert acquired[0]["execution_obligation"] is lease.actual.execution_obligation
     assert execution_service.calls == [
         {
             "session_id": session_id,
             "state_id": None,
-            "session_operation_lease": lease,
+            "session_operation_lease": lease.actual,
             "user_id": _USER_ID,
             "auth_provider_type": "local",
             "fanout_ack_token": None,
@@ -477,13 +676,14 @@ async def test_fastapi_execute_orders_ownership_before_acquire_before_exact_serv
 @pytest.mark.asyncio
 async def test_fastapi_denied_ownership_never_acquires_or_invokes_execution(
     monkeypatch: pytest.MonkeyPatch,
+    execution_fixture: ExecutionTestCustody,
 ) -> None:
     session_id = uuid4()
     trace: list[str] = []
-    session_service = _RouteSessionService(session_id, trace=trace)
+    session_service = _RouteSessionService(session_id, execution_fixture=execution_fixture, trace=trace)
     session_service.authorized = False
     execution_service = _RouteExecutionService(uuid4(), trace=trace)
-    lease = _ControllableLease(_context(session_id))
+    lease = _CanonicalRouteLeaseControl(session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease, trace=trace)
     app = _http_route_app(session_service=session_service, execution_service=execution_service)
 
@@ -497,10 +697,12 @@ async def test_fastapi_denied_ownership_never_acquires_or_invokes_execution(
 
 
 @pytest.mark.asyncio
-async def test_execute_route_pretransfer_failure_closes_and_joins_exact_lease(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_execute_route_pretransfer_failure_closes_and_joins_exact_lease(
+    monkeypatch: pytest.MonkeyPatch, execution_fixture: ExecutionTestCustody
+) -> None:
     session_id = uuid4()
-    harness = _route_harness(session_id)
-    lease = _ControllableLease(_context(session_id))
+    harness = _route_harness(session_id, execution_fixture)
+    lease = _CanonicalRouteLeaseControl(harness.session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease)
     lease.close_allowed.set()
     service = _RouteExecutionService(uuid4())
@@ -511,7 +713,9 @@ async def test_execute_route_pretransfer_failure_closes_and_joins_exact_lease(mo
         await _invoke_execute_route(harness, service, session_id=session_id)
 
     assert len(acquired) == 1
-    assert service.calls[0]["session_operation_lease"] is lease
+    assert lease.actual is not None
+    assert acquired[0]["execution_obligation"] is lease.actual.execution_obligation
+    assert service.calls[0]["session_operation_lease"] is lease.actual
     assert lease.close_calls == 1
     assert lease.close_finished.is_set()
 
@@ -519,31 +723,295 @@ async def test_execute_route_pretransfer_failure_closes_and_joins_exact_lease(mo
 @pytest.mark.asyncio
 async def test_cancelled_execute_request_before_transfer_cannot_interrupt_lease_join(
     monkeypatch: pytest.MonkeyPatch,
+    execution_fixture: ExecutionTestCustody,
 ) -> None:
     session_id = uuid4()
-    harness = _route_harness(session_id)
-    lease = _ControllableLease(_context(session_id))
+    harness = _route_harness(session_id, execution_fixture)
+    lease = _CanonicalRouteLeaseControl(harness.session_service, execution_fixture)
     acquired = _install_acquire(monkeypatch, lease)
     service = _RouteExecutionService(uuid4())
-    task = asyncio.create_task(_invoke_execute_route(harness, service, session_id=session_id))
-    await asyncio.wait_for(service.started.wait(), timeout=2)
+    observer = _ExactCloseWaitCancellationObserver(lease)
+    with patch("elspeth.web.execution.service.asyncio.wait", new=observer):
+        task = asyncio.create_task(_invoke_execute_route(harness, service, session_id=session_id))
+        observer.request_task = task
+        await asyncio.wait_for(service.started.wait(), timeout=2)
 
-    task.cancel()
-    await asyncio.wait_for(lease.close_started.wait(), timeout=2)
-    task.cancel()  # A second cancellation must not cancel close()/renewal-task join.
-    await asyncio.sleep(0)
-    assert not task.done()
-    lease.close_allowed.set()
+        try:
+            task.cancel()
+            await asyncio.wait_for(lease.close_started.wait(), timeout=2)
+            assert task.cancel()  # A second cancellation must not cancel close()/renewal-task join.
+            await asyncio.sleep(0)
+            assert not task.done()
+        finally:
+            lease.close_allowed.set()
+            service.allowed.set()
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=2)
+        with pytest.raises(BaseExceptionGroup) as retained:
+            await asyncio.wait_for(task, timeout=2)
+    assert len(service.cancellation_originals) == 1
+    assert len(observer.delivered) == 1
+    _assert_exact_cancellation_originals(retained.value, [service.cancellation_originals[0], observer.delivered[0]])
+    assert len(_original_leaves(retained.value)) == 2
     assert len(acquired) == 1
     assert lease.close_calls == 1
     assert not lease.close_cancelled
     assert lease.close_finished.is_set()
 
 
-@pytest.mark.asyncio
+def _original_leaves(original: BaseException) -> list[BaseException]:
+    if isinstance(original, BaseExceptionGroup):
+        return [leaf for child in original.exceptions for leaf in _original_leaves(child)]
+    return [original]
+
+
+def _assert_exact_cancellation_originals(original: BaseException, delivered: list[asyncio.CancelledError]) -> None:
+    cancellations = [leaf for leaf in _original_leaves(original) if isinstance(leaf, asyncio.CancelledError)]
+    assert len(cancellations) == len(delivered)
+    assert len({id(leaf) for leaf in cancellations}) == len(cancellations)
+    assert all(actual is expected for actual, expected in zip(cancellations, delivered, strict=True))
+
+
+def _atomic_child_checkpoint(path: Path, proof: dict[str, object]) -> None:
+    from tests.unit.web.execution.test_canonical_execution_fixture import _publish_checkpoint
+
+    _publish_checkpoint(path, proof)
+
+
+async def _child_with_failure_checkpoint(root: Path, child: Coroutine[object, object, None]) -> None:
+    try:
+        await child
+    except BaseException as original:
+        _atomic_child_checkpoint(
+            root / "failure.json",
+            {
+                "type": type(original).__name__,
+                "message": str(original),
+                "traceback": "".join(traceback.format_exception(original)),
+            },
+        )
+        raise
+
+
+def _assert_child_checkpoint_or_failure(checkpoint: Path, failure: Path, log: Path) -> dict[str, object]:
+    assert not failure.exists() or not checkpoint.exists(), "child published both success and failure checkpoints"
+    if failure.exists():
+        evidence = json.loads(failure.read_text())
+        raise AssertionError(
+            "actual owned custody child assertion failed: " + evidence["type"] + ": " + evidence["message"] + "\n" + evidence["traceback"]
+        )
+    assert checkpoint.exists(), "actual custody child failed before checkpoint: " + log.read_text()
+    return json.loads(checkpoint.read_text())
+
+
+async def _failed_http_release_child(
+    root: Path, cleanup_error_type: type[Exception], logger_error_type: type[Exception] | None, repeat_cancellation: bool
+) -> None:
+    custody = ExecutionTestCustody(asyncio.get_running_loop(), root)
+    session_id = uuid4()
+    session_service = _RouteSessionService(session_id, execution_fixture=custody)
+    lease = _CanonicalRouteLeaseControl(session_service, custody)
+    cleanup_error = (
+        SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
+        if cleanup_error_type is SessionOperationFenceLost
+        else cleanup_error_type("private lease failure detail")
+    )
+    lease.close_error = cleanup_error
+    monkeypatch = pytest.MonkeyPatch()
+    acquired = _install_acquire(monkeypatch, lease)
+    execution_service = _RouteExecutionService(uuid4())
+    app = _http_route_app(session_service=session_service, execution_service=execution_service)
+    logger_error = None if logger_error_type is None else logger_error_type("private logger failure detail")
+    observer = _ExactCloseWaitCancellationObserver(lease)
+    with (
+        patch("elspeth.web.execution.routes.slog.error", side_effect=logger_error) as log_error,
+        patch("elspeth.web.execution.service.asyncio.wait", new=observer),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            request_task = asyncio.create_task(client.post(f"/api/sessions/{session_id}/execute"))
+            observer.request_task = request_task
+            try:
+                await asyncio.wait_for(execution_service.started.wait(), timeout=2)
+                assert request_task.cancel("initial request cancellation")
+                await asyncio.wait_for(lease.close_started.wait(), timeout=2)
+                if repeat_cancellation:
+                    assert request_task.cancel("repeated request cancellation")
+                    await asyncio.sleep(0)
+                assert not request_task.done()
+            finally:
+                lease.close_allowed.set()
+                execution_service.allowed.set()
+            completed, _ = await asyncio.wait({request_task}, timeout=2)
+            assert request_task in completed, "actual request remained pending after both gates opened"
+            with pytest.raises(BaseExceptionGroup) as retained:
+                request_task.result()
+    leaves = _original_leaves(retained.value)
+    assert len(execution_service.cancellation_originals) == 1
+    primary = execution_service.cancellation_originals[0]
+    assert leaves[0] is primary
+    assert cleanup_error in leaves and sum(leaf is cleanup_error for leaf in leaves) == 1
+    assert len(observer.delivered) == int(repeat_cancellation)
+    _assert_exact_cancellation_originals(retained.value, [primary, *observer.delivered])
+    assert len({id(leaf) for leaf in leaves}) == len(leaves)
+    assert len(leaves) == 2 + int(repeat_cancellation)
+    log_error.assert_not_called()
+    assert len(acquired) == 1 and lease.actual is not None
+    obligation = lease.actual.execution_obligation
+    assert obligation is not None and acquired[0]["execution_obligation"] is obligation
+    assert obligation.lease is lease.actual and obligation.registry is session_service.registry
+    assert lease.close_calls == 1 and lease.close_finished.is_set() and not lease.close_cancelled
+    assert obligation.lifecycle_original_error is cleanup_error
+    release = obligation.release_submission
+    assert release is not None and release.future is not None and release.reservation is not None
+    session_service.registry.observe_ready()
+    receipt = release.reservation.witness.snapshot()
+    assert release.future.done() and release.future.exception() is cleanup_error
+    assert release.original_error is cleanup_error and release.observed
+    assert release.reservation.released and release.callback_return_observed
+    assert receipt.callable_finished and receipt.exited and not receipt.impossible
+    assert session_service.observation.release_calls == [lease.actual.context]
+    assert not obligation.release_succeeded and not obligation.release_lost and not obligation.retired
+    assert release.domain_refusal is None, "a pre-SQL exception cannot issue canonical terminal loss"
+    assert session_service.registry.has_pending_physical_owners()
+    assert session_service.registry.executor_finalizer is None
+    assert not session_service.registry._executor_allocation_declared
+    assert session_service.registry._execution_executor is None
+    assert not session_service.registry.executor_join_succeeded
+    custody.witness_cleanup_original(cleanup_error)
+    shutdown = asyncio.create_task(custody.close())
+    await asyncio.sleep(0)
+    assert not shutdown.done()
+    with pytest.raises(BaseExceptionGroup) as refused:
+        session_service.registry.assert_completed()
+    assert any(leaf is cleanup_error for leaf in _original_leaves(refused.value))
+    assert not custody.recovery.watchdog.completed
+    _atomic_child_checkpoint(
+        root / "checkpoint.json",
+        {
+            "exact_primary_and_release_originals": True,
+            "actual_failed_release_future_exited": True,
+            "actual_registry_retained_pending": True,
+            "no_private_executor_allocated": True,
+            "shutdown_pending_and_complete_refused": True,
+            "watchdog_completion_unsent": True,
+        },
+    )
+    await asyncio.Event().wait()
+
+
+def _run_failed_http_release_child(
+    root: Path,
+    cleanup_error_type: type[Exception],
+    logger_error_type: type[Exception] | None,
+    repeat_cancellation: bool,
+    *,
+    setup_after_arm: bool = False,
+) -> None:
+    from tests.unit.web.execution.test_canonical_execution_fixture import _project_reaping_failures, _reap_owned_child
+
+    repo = Path(__file__).resolve().parents[4]
+    environment = {
+        "PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin",
+        "PYTHONPATH": os.pathsep.join((str(repo / "src"), str(repo / "elspeth-lints/src"), str(repo))),
+        "PYTHONUNBUFFERED": "1",
+        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+    }
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--failed-http-release-child",
+        str(root),
+        cleanup_error_type.__name__,
+        logger_error_type.__name__ if logger_error_type is not None else "None",
+        str(repeat_cancellation),
+    ]
+    if setup_after_arm:
+        command.append("--setup-after-arm")
+    primary = None
+    log = root / "failed-http-release-child.log"
+    with log.open("wb") as stream:
+        process = subprocess.Popen(command, cwd=repo, env=environment, stdout=stream, stderr=subprocess.STDOUT)
+        try:
+            checkpoint = root / "checkpoint.json"
+            failure = root / "failure.json"
+            deadline = time.monotonic() + 15
+            while not checkpoint.exists() and not failure.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            expected = {
+                "exact_primary_and_release_originals": True,
+                "actual_failed_release_future_exited": True,
+                "actual_registry_retained_pending": True,
+                "no_private_executor_allocated": True,
+                "shutdown_pending_and_complete_refused": True,
+                "watchdog_completion_unsent": True,
+            }
+            if setup_after_arm:
+                expected = {
+                    "actual_armed_setup_and_sql_originals": True,
+                    "actual_release_future_callback_exited": True,
+                    "mixed_lifecycle_group_not_flattened": True,
+                    "faulty_receipt_refused_pending_retained": True,
+                    "successor_authority_unchanged": True,
+                    "watchdog_completion_unsent": True,
+                }
+            assert _assert_child_checkpoint_or_failure(checkpoint, failure, log) == expected
+            assert process.poll() is None, "failed release silently reported completed custody"
+        except BaseException as original:
+            primary = original
+            raise
+        finally:
+            originals = _reap_owned_child(process)
+            if process.returncode is None:
+                originals.append(AssertionError("exact owned route child was not waited"))
+            _project_reaping_failures(primary, originals)
+
+
+def _run_failed_shutdown_release_child(root: Path, error_type: type[Exception], peer_fails: bool) -> None:
+    from tests.unit.web.execution.test_canonical_execution_fixture import _project_reaping_failures, _reap_owned_child
+
+    repo = Path(__file__).resolve().parents[4]
+    environment = {
+        "PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin",
+        "PYTHONPATH": os.pathsep.join((str(repo / "src"), str(repo / "elspeth-lints/src"), str(repo))),
+        "PYTHONUNBUFFERED": "1",
+        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+    }
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--failed-shutdown-release-child",
+        str(root),
+        error_type.__name__,
+        str(peer_fails),
+    ]
+    primary = None
+    log = root / "failed-shutdown-release-child.log"
+    with log.open("wb") as stream:
+        process = subprocess.Popen(command, cwd=repo, env=environment, stdout=stream, stderr=subprocess.STDOUT)
+        try:
+            checkpoint = root / "checkpoint.json"
+            failure = root / "failure.json"
+            deadline = time.monotonic() + 15
+            while not checkpoint.exists() and not failure.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert _assert_child_checkpoint_or_failure(checkpoint, failure, log) == {
+                "exact_failed_completion_original": True,
+                "failed_release_retained_pending": True,
+                "peer_release_observed": True,
+                "private_executor_joined": True,
+                "shutdown_pending_and_complete_refused": True,
+                "watchdog_completion_unsent": True,
+            }
+            assert process.poll() is None, "failed release silently reported completed custody"
+        except BaseException as original:
+            primary = original
+            raise
+        finally:
+            originals = _reap_owned_child(process)
+            if process.returncode is None:
+                originals.append(AssertionError("exact owned shutdown child was not waited"))
+            _project_reaping_failures(primary, originals)
+
+
 @pytest.mark.parametrize(
     ("cleanup_error_type", "logger_error_type"),
     [
@@ -553,67 +1021,17 @@ async def test_cancelled_execute_request_before_transfer_cannot_interrupt_lease_
         (OSError, FrameworkBugError),
         (AuditIntegrityError, None),
         (FrameworkBugError, None),
+        (SessionOperationFenceLost, None),
     ],
 )
 @pytest.mark.parametrize("repeat_cancellation", [False, True])
-async def test_cancelled_http_execute_observes_cleanup_failure_without_losing_primary(
-    monkeypatch: pytest.MonkeyPatch,
+def test_cancelled_http_execute_observes_cleanup_failure_without_losing_primary(
+    tmp_path: Path,
     cleanup_error_type: type[Exception],
     logger_error_type: type[Exception] | None,
     repeat_cancellation: bool,
 ) -> None:
-    session_id = uuid4()
-    lease = _ControllableLease(_context(session_id))
-    cleanup_error = cleanup_error_type("private lease failure detail")
-    lease.close_error = cleanup_error
-    _install_acquire(monkeypatch, lease)
-    session_service = _RouteSessionService(session_id)
-    execution_service = _RouteExecutionService(uuid4())
-    app = _http_route_app(session_service=session_service, execution_service=execution_service)
-    logger_error = None if logger_error_type is None else logger_error_type("private logger failure detail")
-    expected_integrity_error = (
-        cleanup_error
-        if cleanup_error_type in (AuditIntegrityError, FrameworkBugError)
-        else logger_error
-        if logger_error_type in (AuditIntegrityError, FrameworkBugError)
-        else None
-    )
-
-    with patch("elspeth.web.execution.routes.slog.error", side_effect=logger_error) as log_error:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            request_task = asyncio.create_task(client.post(f"/api/sessions/{session_id}/execute"))
-            await asyncio.wait_for(execution_service.started.wait(), timeout=2)
-            request_task.cancel("initial request cancellation")
-            await asyncio.wait_for(lease.close_started.wait(), timeout=2)
-            if repeat_cancellation:
-                request_task.cancel("repeated request cancellation")
-                await asyncio.sleep(0)
-            assert not request_task.done()
-            lease.close_allowed.set()
-            if expected_integrity_error is not None:
-                with pytest.raises(type(expected_integrity_error)) as raised_integrity:
-                    await asyncio.wait_for(request_task, timeout=2)
-                assert raised_integrity.value is expected_integrity_error
-            else:
-                with pytest.raises(asyncio.CancelledError) as raised_cancellation:
-                    await asyncio.wait_for(request_task, timeout=2)
-                assert raised_cancellation.value.args == ("initial request cancellation",)
-
-    assert lease.close_calls == 1
-    assert lease.close_finished.is_set()
-    assert not lease.close_cancelled
-    if cleanup_error_type is OSError:
-        log_error.assert_called_once_with(
-            "execution_pretransfer_lease_close_failed",
-            session_id=str(session_id),
-            operation_id=lease.context.fence.operation_id,
-            operation_epoch=lease.context.fence.operation_epoch,
-            error_type="OSError",
-            primary_error_type="CancelledError",
-        )
-        assert "private" not in repr(log_error.call_args)
-    else:
-        log_error.assert_not_called()
+    _run_failed_http_release_child(tmp_path, cleanup_error_type, logger_error_type, repeat_cancellation)
 
 
 @pytest.mark.asyncio
@@ -622,12 +1040,12 @@ async def test_cancelled_http_execute_observes_cleanup_failure_without_losing_pr
     ["success", "failure", "graceful_cancel", "cancelled_future", "already_done"],
 )
 async def test_submitted_worker_retains_exact_lease_until_every_terminal_outcome(
-    worker_outcome: str,
+    worker_outcome: str, execution_fixture: ExecutionTestCustody
 ) -> None:
     loop = asyncio.get_running_loop()
-    service, session_service, executor = _execution_service(loop)
+    service, session_service, executor = _execution_service(loop, execution_fixture=execution_fixture)
     session_id = session_service.get_current_state.return_value.session_id
-    lease, authority = await _real_lease(_context(session_id))
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=session_id)
     authority.release_allowed.set()
     validation = ValidationResult(
         is_valid=True,
@@ -677,15 +1095,15 @@ async def test_submitted_worker_retains_exact_lease_until_every_terminal_outcome
         await asyncio.sleep(0.01)
     assert lease.closed
     assert authority.release_calls == [lease.context]
-    await asyncio.wait_for(service.shutdown(), timeout=2)
+    await asyncio.wait_for(execution_fixture.shutdown_service(service), timeout=2)
 
 
 @pytest.mark.asyncio
-async def test_execute_rejects_lease_subclass_before_any_effect() -> None:
+async def test_execute_rejects_lease_subclass_before_any_effect(execution_fixture: ExecutionTestCustody) -> None:
     class _LeaseSubclass(SessionOperationLease):
         pass
 
-    service, session_service, executor = _execution_service(asyncio.get_running_loop())
+    service, session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
     session_id = session_service.get_current_state.return_value.session_id
     forged = object.__new__(_LeaseSubclass)
 
@@ -708,14 +1126,68 @@ def _durable_effect_call_counts(session_service: Any) -> dict[str, int]:
 
 
 @pytest.mark.asyncio
-async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_retains_lease() -> None:
-    service, session_service, executor = _execution_service(asyncio.get_running_loop())
+async def test_recovery_missing_yaml_rejects_before_watcher_or_shutdown_map(
+    execution_fixture: ExecutionTestCustody,
+) -> None:
+    service, sessions, executor = _execution_service(asyncio.get_running_loop(), execution_fixture)
+    session_id = uuid4()
+    run_id = uuid4()
+    run = RunRecord(
+        id=run_id,
+        session_id=session_id,
+        state_id=uuid4(),
+        status="running",
+        started_at=datetime.now(UTC),
+        finished_at=None,
+        rows_processed=0,
+        rows_succeeded=0,
+        rows_failed=0,
+        rows_routed_success=0,
+        rows_routed_failure=0,
+        rows_quarantined=0,
+        error=None,
+        landscape_run_id=None,
+        pipeline_yaml=None,
+    )
+    sessions.assess_run_start_admission.return_value = RunStartPermitRecord(
+        run_id=str(run_id),
+        state=StartPermitState.START_PERMITTED,
+        permit_id=str(uuid4()),
+        permit_epoch=1,
+        subject_hash="recover-missing-yaml",
+        issued_at=datetime.now(UTC),
+        cancelled_at=None,
+    )
+    sessions.get_session.return_value = SimpleNamespace(
+        archived_at=None,
+        user_id=_USER_ID,
+        auth_provider_type="local",
+    )
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=session_id)
+    authority.release_allowed.set()
+    try:
+        with (
+            patch.object(service, "_restore_admitted_run", return_value=SimpleNamespace(settings=object())) as restore,
+            patch.object(service, "_create_loss_watcher", wraps=service._create_loss_watcher) as create_watcher,
+            pytest.raises(AssertionError),
+        ):
+            await service.recover_run(run, lease, resume_existing=False)
+        restore.assert_awaited_once()
+        sessions.assess_run_start_admission.assert_awaited_once()
+        create_watcher.assert_not_called()
+        assert str(run_id) not in service._shutdown_events
+        assert executor.submit_calls == []
+        assert not lease.closed
+    finally:
+        await lease.close()
+
+
+@pytest.mark.asyncio
+async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_retains_lease(execution_fixture: ExecutionTestCustody) -> None:
+    service, session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
     session_id = session_service.get_current_state.return_value.session_id
     loss = SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
-    lease, authority = await _real_lease(
-        _context(session_id),
-        renew_interval_seconds=0.01,
-    )
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=session_id, renew_interval_seconds=0.01)
     validation = ValidationResult(
         is_valid=True,
         checks=[],
@@ -754,23 +1226,29 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
         lease.raise_if_lost()
     assert raised.value is loss
 
+    authority.release_allowed.set()
     executor.future.set_result(None)
     for _ in range(100):
         if lease.closed:
             break
         await asyncio.sleep(0.01)
     assert lease.closed
-    assert authority.release_calls == [], "a proven-lost lease closes without releasing a successor's authority"
-    with pytest.raises(ExceptionGroup) as cleanup_failure:
-        await asyncio.wait_for(service.shutdown(), timeout=2)
-    assert cleanup_failure.value.exceptions == (loss,)
+    assert authority.release_calls == [lease.context], "completion must join the original context's canonical release"
+    obligation = lease.execution_obligation
+    assert obligation is not None
+    assert obligation.release_succeeded and not obligation.release_lost
+    assert any(original is loss for original in service.execution_lease_release_registry._failures)
+    with pytest.raises(SessionOperationFenceLost) as cleanup_failure:
+        await asyncio.wait_for(execution_fixture.shutdown_service(service), timeout=2)
+    assert cleanup_failure.value is loss
+    execution_fixture.witness_cleanup_original(loss)
 
 
 @pytest.mark.asyncio
-async def test_submit_failure_after_run_creation_terminalizes_before_return() -> None:
-    service, session_service, executor = _execution_service(asyncio.get_running_loop())
+async def test_submit_failure_after_run_creation_retains_unknown_until_executor_join(execution_fixture: ExecutionTestCustody) -> None:
+    service, session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
     session_id = session_service.get_current_state.return_value.session_id
-    lease, authority = await _real_lease(_context(session_id))
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=session_id)
     authority.release_allowed.set()
     trace: list[str] = []
     run = session_service.create_run.return_value
@@ -785,7 +1263,8 @@ async def test_submit_failure_after_run_creation_terminalizes_before_return() ->
     session_service.create_run.side_effect = create_run
     session_service.update_run_status.side_effect = update_run_status
     executor.trace = trace
-    executor.submit_error = RuntimeError("executor unavailable")
+    submission_error = RuntimeError("executor unavailable")
+    executor.submit_error = submission_error
     validation = ValidationResult(
         is_valid=True,
         checks=[],
@@ -800,50 +1279,53 @@ async def test_submit_failure_after_run_creation_terminalizes_before_return() ->
 
     with (
         patch("elspeth.web.execution.validation.validate_pipeline", return_value=validation),
-        pytest.raises(RuntimeError, match="executor unavailable"),
+        pytest.raises(RuntimeError, match="executor unavailable") as caught,
     ):
         await service.execute(session_id, session_operation_lease=lease)
 
-    assert trace == ["create_run", "submit", "terminalize"]
-    terminal = session_service.update_run_status.await_args
-    assert terminal.args == (run.id,)
-    assert terminal.kwargs["status"] == "failed"
-    assert terminal.kwargs["session_operation_context"] is lease.context
-    assert authority.release_calls == [], "route still owns a failed pre-transfer lease"
-    await lease.close()
+    assert caught.value is submission_error
+    assert trace == ["create_run", "submit"]
+    session_service.update_run_status.assert_not_awaited()
+    obligation = lease.execution_obligation
+    assert obligation is not None and obligation.lease is lease
+    assert obligation.completion_required
+    assert obligation.pipeline_submission_unknown is submission_error
+    assert obligation.pipeline is None and obligation.completion is None
+    assert not obligation.unknown_pipeline_cleanup_declared
+    assert not lease.closed and authority.release_calls == []
+    assert service.execution_lease_release_registry.has_pending_physical_owners()
+    with pytest.raises(BaseExceptionGroup) as refused:
+        service.execution_lease_release_registry.assert_completed()
+    assert any(leaf is submission_error for leaf in _original_leaves(refused.value))
+    # The failed submit has no Future receipt. Only the actual executor join
+    # permits cleanup; the fixture will join it and the retained original.
+    execution_fixture.witness_cleanup_original(submission_error)
 
 
 @pytest.mark.asyncio
-async def test_completion_cancellation_still_joins_exact_close_once() -> None:
-    service, _session_service, executor = _execution_service(asyncio.get_running_loop())
-    lease, authority = await _real_lease(_context(uuid4()))
+async def test_completion_cancellation_still_joins_exact_close_once(execution_fixture: ExecutionTestCustody) -> None:
+    service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=uuid4())
     watcher_cancelled = asyncio.Event()
     watcher_allowed = asyncio.Event()
 
-    async def stubborn_watcher() -> None:
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            watcher_cancelled.set()
-            await watcher_allowed.wait()
-            raise
+    actual_signal = service._signal_shutdown_on_operation_loss
 
-    watcher = asyncio.create_task(stubborn_watcher())
-    await asyncio.sleep(0)
-    worker: Future[object] = Future()
-    worker.set_result(None)
-    service._on_pipeline_done(
-        cast(Any, worker),
-        session_operation_lease=lease,
-        loss_watcher=watcher,
-    )
-    await asyncio.wait_for(watcher_cancelled.wait(), timeout=2)
-    with service._shutdown_events_lock:
-        completion = next(iter(service._lease_completion_futures))
+    async def stubborn_watcher(current_lease, shutdown_event, *, run_id, close_requested) -> None:
+        assert current_lease is lease and close_requested is not None
+        await close_requested.wait()
+        watcher_cancelled.set()  # Historical name: now the source cooperative-close request.
+        await watcher_allowed.wait()
+        await actual_signal(current_lease, shutdown_event, run_id=run_id, close_requested=close_requested)
+
+    with patch.object(service, "_signal_shutdown_on_operation_loss", side_effect=stubborn_watcher):
+        watcher, completion = await _submit_terminal_callback(service, lease, executor)
+        await asyncio.wait_for(watcher_cancelled.wait(), timeout=2)
+    assert watcher is service._loss_watcher_owner(watcher, lease).task
     completion.cancel()
     completion.cancel()  # Repeated observer cancellation must not retire the underlying join.
 
-    shutdown = asyncio.create_task(service.shutdown())
+    shutdown = asyncio.create_task(execution_fixture.shutdown_service(service))
     try:
         await asyncio.wait_for(run_sync_in_worker(executor.shutdown_started.wait, 2), timeout=2)
         await asyncio.sleep(0)
@@ -851,23 +1333,27 @@ async def test_completion_cancellation_still_joins_exact_close_once() -> None:
     finally:
         watcher_allowed.set()
         authority.release_allowed.set()
-        await asyncio.wait_for(shutdown, timeout=2)
+        with pytest.raises(asyncio.CancelledError) as shutdown_failure:
+            await asyncio.wait_for(shutdown, timeout=2)
 
-    await asyncio.wait_for(run_sync_in_worker(authority.release_called.wait, 2), timeout=2)
+    obligation = lease.execution_obligation
+    assert obligation is not None and obligation.completion_outcome_recorded
+    assert shutdown_failure.value is obligation.completion_original_error
+
+    assert authority.release_called.is_set()
     assert authority.release_calls == [lease.context]
     assert lease.closed
+    execution_fixture.witness_cleanup_original(shutdown_failure.value)
 
 
 @pytest.mark.asyncio
-async def test_runtime_shutdown_waits_for_blocked_lease_completion() -> None:
-    service, _session_service, executor = _execution_service(asyncio.get_running_loop())
-    lease, authority = await _real_lease(_context(uuid4()))
-    worker: Future[object] = Future()
-    worker.set_result(None)
-    service._on_pipeline_done(cast(Any, worker), session_operation_lease=lease)
+async def test_runtime_shutdown_waits_for_blocked_lease_completion(execution_fixture: ExecutionTestCustody) -> None:
+    service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=uuid4())
+    _watcher, _completion = await _submit_terminal_callback(service, lease, executor)
     await asyncio.wait_for(run_sync_in_worker(authority.release_called.wait, 2), timeout=2)
 
-    shutdown = asyncio.create_task(service.shutdown())
+    shutdown = asyncio.create_task(execution_fixture.shutdown_service(service))
     await asyncio.wait_for(run_sync_in_worker(executor.shutdown_started.wait, 2), timeout=2)
     await asyncio.sleep(0)
     assert not shutdown.done()
@@ -880,12 +1366,13 @@ async def test_runtime_shutdown_waits_for_blocked_lease_completion() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [OSError, AuditIntegrityError, FrameworkBugError])
-async def test_done_callback_logger_failure_is_tracked_after_exact_lease_close(error_type: type[Exception]) -> None:
-    service, _session_service, _executor = _execution_service(asyncio.get_running_loop())
-    lease, authority = await _real_lease(_context(uuid4()))
+async def test_done_callback_logger_failure_is_tracked_after_exact_lease_close(
+    error_type: type[Exception], execution_fixture: ExecutionTestCustody
+) -> None:
+    service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=uuid4())
     authority.release_allowed.set()
-    worker: Future[object] = Future()
-    worker.set_exception(RuntimeError("pipeline failed"))
+    pipeline_error = RuntimeError("pipeline failed")
     logging_error = error_type("diagnostic unavailable")
 
     def fail_diagnostic(event: str, **kwargs: object) -> None:
@@ -894,55 +1381,155 @@ async def test_done_callback_logger_failure_is_tracked_after_exact_lease_close(e
             raise logging_error
 
     with patch("elspeth.web.execution.service.slog.error", side_effect=fail_diagnostic):
-        service._on_pipeline_done(cast(Any, worker), session_operation_lease=lease)
-        completion = next(iter(service._lease_completion_futures))
+        _watcher, completion = await _submit_terminal_callback(service, lease, executor, error=pipeline_error)
         with pytest.raises(error_type) as caught:
             await asyncio.wait_for(asyncio.wrap_future(completion), timeout=2)
         assert caught.value is logging_error
         assert authority.release_calls == [lease.context]
         assert completion in service._lease_completion_futures
-        with pytest.raises(ExceptionGroup) as shutdown_failure:
-            await asyncio.wait_for(service.shutdown(), timeout=2)
-        assert shutdown_failure.value.exceptions == (logging_error,)
+        with pytest.raises(error_type) as shutdown_failure:
+            await asyncio.wait_for(execution_fixture.shutdown_service(service), timeout=2)
+        assert shutdown_failure.value is logging_error
+        execution_fixture.witness_cleanup_original(logging_error)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error_type", [RuntimeError, AuditIntegrityError, FrameworkBugError])
-@pytest.mark.parametrize("peer_fails", [False, True])
-async def test_shutdown_preserves_completed_lease_failure_and_joins_peer(error_type: type[Exception], peer_fails: bool) -> None:
-    service, _session_service, executor = _execution_service(asyncio.get_running_loop())
-    failed_lease, failed_authority = await _real_lease(_context(uuid4()))
+async def _await_owned_thread_signal(signal: threading.Event, *, name: str, timeout: float) -> None:
+    """Observe a producer's thread event without making another worker admission."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not signal.is_set() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    assert signal.is_set(), f"actual {name} did not occur before its bounded deadline"
+
+
+async def _failed_shutdown_release_child(root: Path, error_type: type[Exception], peer_fails: bool) -> None:
+    custody = ExecutionTestCustody(asyncio.get_running_loop(), root)
+    service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=custody)
+    failed_lease, failed_authority = await _canonical_execute_lease(service, custody, session_id=uuid4())
     cleanup_error = error_type("authority release failure")
     failed_authority.release_error = cleanup_error
     failed_authority.release_allowed.set()
-    worker: Future[object] = Future()
-    worker.set_result(None)
-    service._on_pipeline_done(cast(Any, worker), session_operation_lease=failed_lease)
-    with service._shutdown_events_lock:
-        failed_completion = next(iter(service._lease_completion_futures))
-    with pytest.raises(error_type) as completed_failure:
-        await asyncio.wait_for(asyncio.wrap_future(failed_completion), timeout=2)
-    assert completed_failure.value is cleanup_error
-
-    peer_lease, peer_authority = await _real_lease(_context(uuid4()))
+    peer_lease, peer_authority = await _canonical_execute_lease(service, custody, session_id=uuid4())
     peer_error = OSError("peer authority release unavailable")
     if peer_fails:
         peer_authority.release_error = peer_error
-    service._on_pipeline_done(cast(Any, worker), session_operation_lease=peer_lease)
-    await asyncio.wait_for(run_sync_in_worker(peer_authority.release_called.wait, 2), timeout=2)
-    shutdown = asyncio.create_task(service.shutdown())
+    failed_obligation = failed_lease.execution_obligation
+    peer_obligation = peer_lease.execution_obligation
+    assert failed_obligation is not None and peer_obligation is not None
+    failed_watcher = service._create_loss_watcher(failed_lease, threading.Event(), run_id=uuid4())
+    peer_watcher = service._create_loss_watcher(peer_lease, threading.Event(), run_id=uuid4())
+    failed_physical = executor.future
+    service._submit_owned_pipeline(failed_obligation, failed_lease, failed_watcher, partial(lambda: None))
+    executor.future = PhysicalPipelineCompletionControl(custody)
+    peer_physical = executor.future
+    service._submit_owned_pipeline(peer_obligation, peer_lease, peer_watcher, partial(lambda: None))
+    failed_physical.set_result(None)
+    deadline = asyncio.get_running_loop().time() + 5
+    while failed_obligation.completion is None and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    failed_completion = failed_obligation.completion
+    assert failed_completion is not None
+    completed, _ = await asyncio.wait({asyncio.wrap_future(failed_completion)}, timeout=2)
+    assert completed, "actual failed completion did not finish"
+    with pytest.raises(error_type) as completed_failure:
+        failed_completion.result()
+    assert completed_failure.value is cleanup_error
+    assert async_workers._INSTANCE_DRAINING is custody.recovery.instance_draining
+    await _await_owned_thread_signal(custody.recovery.instance_draining, name="selected process drain", timeout=3)
+    peer_physical.set_result(None)
     try:
-        await asyncio.wait_for(run_sync_in_worker(executor.shutdown_started.wait, 2), timeout=2)
-        await asyncio.sleep(0)
-        assert not shutdown.done(), "a failed cleanup must not abandon a peer's authority release"
+        await _await_owned_thread_signal(peer_authority.release_called, name="peer SQL release entry", timeout=3)
+        shutdown = asyncio.create_task(custody.shutdown_service(service))
+        await _await_owned_thread_signal(executor.shutdown_started, name="private executor shutdown entry", timeout=3)
+        assert not shutdown.done(), "failed release cannot produce registry completion"
     finally:
         peer_authority.release_allowed.set()
-        with pytest.raises(ExceptionGroup) as shutdown_failure:
-            await asyncio.wait_for(shutdown, timeout=2)
+    registry = service.execution_lease_release_registry
+    deadline = asyncio.get_running_loop().time() + 5
+    while not registry.executor_join_succeeded and asyncio.get_running_loop().time() < deadline:
+        registry.observe_ready()
+        await asyncio.sleep(0.01)
+    assert registry.executor_join_succeeded
+    peer_completion = peer_obligation.completion
+    assert peer_completion is not None
+    peer_completed, _ = await asyncio.wait({asyncio.wrap_future(peer_completion)}, timeout=2)
+    assert peer_completed, "actual peer completion did not finish"
+    if peer_fails:
+        with pytest.raises(OSError) as completed_peer_failure:
+            peer_completion.result()
+        assert completed_peer_failure.value is peer_error
+    else:
+        assert peer_completion.result() is None
+    deadline = asyncio.get_running_loop().time() + 5
+    while asyncio.get_running_loop().time() < deadline:
+        registry.observe_ready()
+        observed_peer_release = peer_obligation.release_submission
+        if observed_peer_release is not None and observed_peer_release.future is not None and observed_peer_release.reservation is not None:
+            peer_receipt = observed_peer_release.reservation.witness.snapshot()
+            if (
+                observed_peer_release.future.done()
+                and observed_peer_release.observed
+                and observed_peer_release.callback_return_observed
+                and observed_peer_release.reservation.released
+                and peer_receipt.callable_finished
+                and peer_receipt.exited
+                and peer_lease.closed
+                and peer_obligation.completion_outcome_recorded
+                and peer_obligation.completion_observed
+                and peer_obligation.lifecycle_outcome_recorded
+                and peer_obligation.lifecycle_observed
+                and (peer_fails or peer_obligation.retired)
+            ):
+                break
+        await asyncio.sleep(0.01)
+    assert peer_lease.closed and peer_authority.release_calls == [peer_lease.context]
+    assert peer_obligation.completion_outcome_recorded and peer_obligation.completion_observed
+    assert peer_obligation.lifecycle_outcome_recorded and peer_obligation.lifecycle_observed
+    assert peer_obligation.completion_original_error is (peer_error if peer_fails else None)
+    assert peer_obligation.lifecycle_original_error is (peer_error if peer_fails else None)
+    failed_release = failed_obligation.release_submission
+    peer_release = peer_obligation.release_submission
+    assert failed_release is not None and failed_release.future is not None and failed_release.reservation is not None
+    assert peer_release is not None and peer_release.future is not None and peer_release.reservation is not None
+    registry.observe_ready()
+    assert failed_release.future.done() and failed_release.future.exception() is cleanup_error
+    assert failed_release.original_error is cleanup_error and failed_release.observed
+    failed_trace = failed_release.reservation.witness.snapshot()
+    assert failed_trace.callable_finished and failed_trace.exited and not failed_trace.impossible
+    assert not failed_obligation.release_succeeded and not failed_obligation.retired
+    assert peer_release.future.done() and peer_release.observed
+    peer_trace = peer_release.reservation.witness.snapshot()
+    assert peer_trace.callable_finished and peer_trace.exited and not peer_trace.impossible
+    if peer_fails:
+        assert peer_release.future.exception() is peer_error and peer_release.original_error is peer_error
+        assert not peer_obligation.release_succeeded and not peer_obligation.retired
+    else:
+        assert peer_release.future.exception() is None
+        assert peer_obligation.release_succeeded and peer_obligation.retired
     expected_errors = {cleanup_error, peer_error} if peer_fails else {cleanup_error}
-    assert set(shutdown_failure.value.exceptions) == expected_errors
-    assert peer_lease.closed
-    assert peer_authority.release_calls == [peer_lease.context]
+    assert {leaf for original in registry._failures for leaf in _original_leaves(original)} == expected_errors
+    assert registry.has_pending_physical_owners() and not shutdown.done()
+    with pytest.raises(BaseExceptionGroup) as refused:
+        registry.assert_completed()
+    assert expected_errors <= set(_original_leaves(refused.value))
+    assert not custody.recovery.watchdog.completed
+    _atomic_child_checkpoint(
+        root / "checkpoint.json",
+        {
+            "exact_failed_completion_original": True,
+            "failed_release_retained_pending": True,
+            "peer_release_observed": True,
+            "private_executor_joined": True,
+            "shutdown_pending_and_complete_refused": True,
+            "watchdog_completion_unsent": True,
+        },
+    )
+    await asyncio.Event().wait()
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, AuditIntegrityError, FrameworkBugError])
+@pytest.mark.parametrize("peer_fails", [False, True])
+def test_shutdown_preserves_completed_lease_failure_and_joins_peer(tmp_path: Path, error_type: type[Exception], peer_fails: bool) -> None:
+    _run_failed_shutdown_release_child(tmp_path, error_type, peer_fails)
 
 
 def _function_node(owner: type[object], name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
@@ -1848,8 +2435,715 @@ class _ExecutionEffectFindings:
     escaped_class_helpers: tuple[str, ...]
 
 
+def _stable_ast_bytes(node: ast.AST) -> bytes:
+    """Serialize every AST field, including empty ones, across Python 3.12/3.13."""
+
+    def encode(value: object) -> object:
+        if isinstance(value, ast.AST):
+            return [type(value).__name__, [[name, encode(child)] for name, child in ast.iter_fields(value)]]
+        if isinstance(value, list):
+            return [encode(child) for child in value]
+        return value
+
+    return json.dumps(encode(node), ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def _exact_recovery_lease_owner_edges(member: _FunctionNode) -> frozenset[int]:
+    """Prove recover_run's bound submit and awaited no-completion cleanup."""
+    if member.name != "recover_run":
+        return frozenset()
+    parents = {child: node for node in ast.walk(member) for child in ast.iter_child_nodes(node)}
+    calls = [node for node in ast.walk(member) if isinstance(node, ast.Call)]
+
+    def one(target: str) -> ast.Call | None:
+        matching = [call for call in calls if ast.unparse(call.func) == target]
+        return matching[0] if len(matching) == 1 else None
+
+    obligation = one("self._execution_obligation")
+    watcher = one("self._create_loss_watcher")
+    submit = one("self._submit_owned_pipeline")
+    join = one("self._join_loss_watcher")
+    if any(call is None for call in (obligation, watcher, submit, join)):
+        return frozenset()
+    assert obligation is not None and watcher is not None and submit is not None and join is not None
+
+    def assigned_once(call: ast.Call, name: str) -> bool:
+        parent = parents[call]
+        return (
+            isinstance(parent, ast.Assign)
+            and len(parent.targets) == 1
+            and isinstance(parent.targets[0], ast.Name)
+            and parent.targets[0].id == name
+            and sum(isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Store) for node in ast.walk(member)) == 1
+            and not any(isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Del) for node in ast.walk(member))
+        )
+
+    if not (
+        assigned_once(obligation, "obligation")
+        and assigned_once(watcher, "watcher")
+        and len(obligation.args) == 1
+        and ast.unparse(obligation.args[0]) == "session_operation_lease"
+        and not obligation.keywords
+        and tuple(ast.unparse(arg) for arg in watcher.args) == ("session_operation_lease", "shutdown_event")
+        and len(watcher.keywords) == 1
+        and watcher.keywords[0].arg == "run_id"
+        and ast.unparse(watcher.keywords[0].value) == "run.id"
+        and tuple(ast.unparse(arg) for arg in submit.args[:3]) == ("obligation", "session_operation_lease", "watcher")
+        and len(submit.args) == 4
+        and not submit.keywords
+        and tuple(ast.unparse(arg) for arg in join.args) == ("watcher", "session_operation_lease")
+        and not join.keywords
+    ):
+        return frozenset()
+    partial_call = submit.args[3]
+    if not (
+        isinstance(partial_call, ast.Call)
+        and isinstance(partial_call.func, ast.Name)
+        and partial_call.func.id == "partial"
+        and tuple(ast.unparse(arg) for arg in partial_call.args)
+        == (
+            "self._run_pipeline",
+            "str(run.id)",
+            "run.pipeline_yaml",
+            "shutdown_event",
+            "restored.settings",
+            "session.user_id",
+            "session.auth_provider_type",
+        )
+        and [keyword.arg for keyword in partial_call.keywords]
+        == ["session_operation_lease", "durable_admission", "resume_existing", "restored_envelope"]
+        and tuple(ast.unparse(keyword.value) for keyword in partial_call.keywords)
+        == ("session_operation_lease", "True", "resume_existing", "restored")
+    ):
+        return frozenset()
+
+    # The nominal obligation contains the exact lease. Account for its every
+    # read, not just loads of the raw lease parameter. The watcher likewise
+    # remains only on the physical submit/join edges.
+    submit_obligation = submit.args[0]
+    submit_watcher = submit.args[2]
+    join_watcher = join.args[0]
+    if not (
+        isinstance(parents[submit], ast.Expr) and isinstance(parents[join], ast.Await) and isinstance(parents[parents[join]], ast.Assign)
+    ):
+        return frozenset()
+    submit_statement = parents[submit]
+    submit_try = parents[submit_statement]
+    if not (
+        isinstance(submit_try, ast.Try)
+        and parents[submit_try] is member
+        and submit_try.body == [submit_statement]
+        and len(submit_try.handlers) == 1
+        and not submit_try.orelse
+        and not submit_try.finalbody
+        and len(member.body) >= 2
+        and member.body[-2] is submit_try
+        and isinstance(member.body[-1], ast.Return)
+        and isinstance(member.body[-1].value, ast.Constant)
+        and member.body[-1].value.value is True
+    ):
+        return frozenset()
+    # The lease owner is created on the method's executed path. A lexical
+    # assignment nested under a skipped branch is not an initialized owner.
+    obligation_statement = parents[obligation]
+    watcher_statement = parents[watcher]
+    if parents[obligation_statement] is not member or parents[watcher_statement] is not member:
+        return frozenset()
+    obligation_index = member.body.index(obligation_statement)
+    watcher_index = member.body.index(watcher_statement)
+    submit_index = member.body.index(submit_try)
+    if not (obligation_index < watcher_index < submit_index):
+        return frozenset()
+    # Before the first owner is acquired, only the docstring and imports may
+    # execute. In particular no branch can skip its assignment and continue.
+    if any(
+        not (
+            isinstance(statement, (ast.ImportFrom, ast.Import))
+            or (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str))
+        )
+        for statement in member.body[:obligation_index]
+    ):
+        return frozenset()
+    # Before the watcher exists, the caller may still retain a refused lease,
+    # but it must not report a successful transfer without a submission.
+    if any(
+        isinstance(node, ast.Return) and not (isinstance(node.value, ast.Constant) and node.value.value is False)
+        for statement in member.body[obligation_index + 1 : watcher_index]
+        for node in ast.walk(statement)
+    ):
+        return frozenset()
+    # The optional YAML assertion must precede both shutdown-map registration
+    # and watcher creation, so a failed assertion cannot strand either owner.
+    if watcher_index < 3:
+        return frozenset()
+    expected_assert = ast.parse("assert run.pipeline_yaml is not None").body[0]
+    expected_event = ast.parse("shutdown_event = threading.Event()").body[0]
+    map_statement = member.body[watcher_index - 1]
+    expected_map = ast.parse("with self._shutdown_events_lock:\n    self._shutdown_events[str(run.id)] = shutdown_event\n").body[0]
+    if any(
+        ast.dump(actual, include_attributes=False) != ast.dump(expected, include_attributes=False)
+        for actual, expected in zip(
+            member.body[watcher_index - 3 : watcher_index], (expected_assert, expected_event, expected_map), strict=True
+        )
+    ):
+        return frozenset()
+
+    # Once the watcher exists, only inert, fresh diagnostic facts may precede
+    # the checked submission. They cannot return, raise, await, call, branch,
+    # rebind a consumed name, or strand the watcher outside the handler.
+    def inert_fact(statement: ast.stmt) -> bool:
+        if isinstance(statement, ast.Assign):
+            if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+                return False
+            target = statement.targets[0]
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            if (
+                not isinstance(statement.target, ast.Name)
+                or statement.simple != 1
+                or not isinstance(statement.annotation, ast.Name)
+                or statement.annotation.id != "int"
+            ):
+                return False
+            target = statement.target
+            value = statement.value
+        else:
+            return False
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, (str, int, float, bool, type(None))):
+            return False
+        return sum(isinstance(node, ast.Name) and node.id == target.id for node in ast.walk(member)) == 1
+
+    if any(not inert_fact(statement) for statement in member.body[watcher_index + 1 : submit_index]):
+        return frozenset()
+    handler = submit_try.handlers[0]
+    if not (
+        isinstance(handler.type, ast.Name)
+        and handler.type.id == "BaseException"
+        and handler.name is not None
+        and len(handler.body) == 2
+        and isinstance(handler.body[0], ast.If)
+        and isinstance(handler.body[1], ast.Raise)
+        and handler.body[1].exc is None
+    ):
+        return frozenset()
+    no_completion = handler.body[0]
+    condition = no_completion.test
+    if not (
+        isinstance(condition, ast.UnaryOp)
+        and isinstance(condition.op, ast.Not)
+        and isinstance(condition.operand, ast.Attribute)
+        and condition.operand.attr == "completion_required"
+        and isinstance(condition.operand.value, ast.Name)
+        and condition.operand.value.id == "obligation"
+        and not no_completion.orelse
+        and no_completion.body
+        and parents[parents[join]] is no_completion.body[0]
+    ):
+        return frozenset()
+    join_assignment = parents[parents[join]]
+    if not (
+        len(join_assignment.targets) == 1
+        and isinstance(join_assignment.targets[0], ast.Tuple)
+        and len(join_assignment.targets[0].elts) == 2
+        and all(isinstance(item, ast.Name) for item in join_assignment.targets[0].elts)
+    ):
+        return frozenset()
+    cancellation_name, watcher_error_name = (item.id for item in join_assignment.targets[0].elts)
+    if cancellation_name == watcher_error_name:
+        return frozenset()
+    # This is the entire no-completion arm. No unproved middle statement may
+    # return success, erase retained errors, or bypass shutdown-map cleanup.
+    if len(no_completion.body) != 5:
+        return frozenset()
+    failures_assignment = no_completion.body[1]
+    if not (
+        isinstance(failures_assignment, ast.AnnAssign)
+        and isinstance(failures_assignment.target, ast.Name)
+        and ast.unparse(failures_assignment.annotation) == "list[BaseException]"
+        and isinstance(failures_assignment.value, ast.List)
+        and len(failures_assignment.value.elts) == 1
+        and isinstance(failures_assignment.value.elts[0], ast.Name)
+        and failures_assignment.value.elts[0].id == handler.name
+    ):
+        return frozenset()
+    failure_name = failures_assignment.target.id
+    watcher_error_arm = no_completion.body[2]
+    if not (
+        isinstance(watcher_error_arm, ast.If)
+        and ast.unparse(watcher_error_arm.test) == f"{watcher_error_name} is not None"
+        and len(watcher_error_arm.body) == 1
+        and isinstance(watcher_error_arm.body[0], ast.Expr)
+        and ast.unparse(watcher_error_arm.body[0].value) == f"{failure_name}.append({watcher_error_name})"
+        and not watcher_error_arm.orelse
+        and isinstance(no_completion.body[4], ast.Expr)
+        and ast.unparse(no_completion.body[4].value) == f"_raise_lifecycle_originals({cancellation_name}, {failure_name})"
+    ):
+        return frozenset()
+    cleanup_try = no_completion.body[3]
+    if not (isinstance(cleanup_try, ast.Try) and len(cleanup_try.handlers) == 1 and cleanup_try.handlers[0].name is not None):
+        return frozenset()
+    cleanup_original_name = cleanup_try.handlers[0].name
+    expected_cleanup = ast.parse(
+        "try:\n"
+        "    with self._shutdown_events_lock:\n"
+        "        del self._shutdown_events[str(run.id)]\n"
+        f"except BaseException as {cleanup_original_name}:\n"
+        f"    {failure_name}.append({cleanup_original_name})\n"
+    ).body[0]
+    if ast.dump(cleanup_try, include_attributes=False) != ast.dump(expected_cleanup, include_attributes=False):
+        return frozenset()
+    # Bound callable lookups must still resolve on the proven receiver. In
+    # this reviewed method the only attribute/subscript mutations are the
+    # exact shutdown-map registration and deletion already checked above.
+    # Any other store/delete can replace an owned callable, carrier or input.
+    mutating_targets = [
+        node for node in ast.walk(member) if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    map_targets = [
+        node
+        for node in ast.walk(map_statement)
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    cleanup_targets = [
+        node
+        for node in ast.walk(cleanup_try)
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    if (
+        len(map_targets) != 1
+        or len(cleanup_targets) != 1
+        or not isinstance(map_targets[0], ast.Subscript)
+        or not isinstance(map_targets[0].ctx, ast.Store)
+        or not isinstance(cleanup_targets[0], ast.Subscript)
+        or not isinstance(cleanup_targets[0].ctx, ast.Del)
+        or {id(node) for node in mutating_targets} != {id(map_targets[0]), id(cleanup_targets[0])}
+    ):
+        return frozenset()
+    # Dynamic mutation or reflection can replace the checked method lookup
+    # without a direct AST store. This method uses none of those operations;
+    # fail closed rather than attempting to interpret arbitrary aliases.
+    reflective_names = {"setattr", "delattr", "vars", "getattr", "globals", "locals", "eval", "exec"}
+    reflective_methods = {"__setattr__", "__delattr__", "__getattribute__"}
+    if any(
+        (isinstance(node, ast.Attribute) and node.attr in reflective_names | reflective_methods | {"__dict__"})
+        or (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in reflective_names)
+        or (isinstance(node, ast.alias) and node.name.split(".")[-1] in reflective_names)
+        for node in ast.walk(member)
+    ):
+        return frozenset()
+    # A lexical ledger proves where every protected value is bound and read.
+    # Name(Store) alone misses Python's exception, import, match and definition
+    # bindings; a global declaration changes where an otherwise exact store
+    # writes. Walk nested scopes too and reject extra bindings conservatively.
+    bindings: dict[str, set[int]] = {}
+
+    def bind(name: str, node: ast.AST) -> None:
+        bindings.setdefault(name, set()).add(id(node))
+
+    declarations: set[str] = set()
+    deleted: set[str] = set()
+    for node in ast.walk(member):
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store):
+                bind(node.id, node)
+            elif isinstance(node.ctx, ast.Del):
+                deleted.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            bind(node.name, node)
+        elif isinstance(node, ast.arg):
+            bind(node.arg, node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node is not member:
+            bind(node.name, node)
+        elif isinstance(node, ast.alias):
+            bind(node.asname if node.asname is not None else node.name.split(".")[0], node)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+            bind(node.name, node)
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            bind(node.rest, node)
+        elif isinstance(node, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)):
+            bind(node.name, node)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            declarations.update(node.names)
+
+    watcher_test = watcher_error_arm.test
+    watcher_append = watcher_error_arm.body[0].value
+    cleanup_append = cleanup_try.handlers[0].body[0].value
+    lifecycle_raise = no_completion.body[4].value
+    if not (
+        isinstance(watcher_test, ast.Compare)
+        and isinstance(watcher_test.left, ast.Name)
+        and isinstance(watcher_append, ast.Call)
+        and isinstance(watcher_append.func, ast.Attribute)
+        and isinstance(watcher_append.func.value, ast.Name)
+        and len(watcher_append.args) == 1
+        and isinstance(watcher_append.args[0], ast.Name)
+        and isinstance(cleanup_append, ast.Call)
+        and isinstance(cleanup_append.func, ast.Attribute)
+        and isinstance(cleanup_append.func.value, ast.Name)
+        and len(cleanup_append.args) == 1
+        and isinstance(cleanup_append.args[0], ast.Name)
+        and isinstance(lifecycle_raise, ast.Call)
+        and len(lifecycle_raise.args) == 2
+        and all(isinstance(arg, ast.Name) for arg in lifecycle_raise.args)
+    ):
+        return frozenset()
+    # The event is a local owner carrier, while the receiver, run, lease and
+    # resume input are roots of the checked physical graph. Derive the root
+    # parameter set from actual checked call arguments, not example mutation
+    # names. Every such name must retain its original ast.arg binding.
+    event_assignment = member.body[watcher_index - 2]
+    if not (
+        isinstance(event_assignment, ast.Assign)
+        and len(event_assignment.targets) == 1
+        and isinstance(event_assignment.targets[0], ast.Name)
+        and isinstance(obligation.func, ast.Attribute)
+        and isinstance(obligation.func.value, ast.Name)
+        and isinstance(obligation.args[0], ast.Name)
+        and isinstance(watcher.keywords[0].value, ast.Attribute)
+        and isinstance(watcher.keywords[0].value.value, ast.Name)
+        and isinstance(partial_call.keywords[2].value, ast.Name)
+        and isinstance(watcher.args[1], ast.Name)
+        and isinstance(partial_call.args[3], ast.Name)
+    ):
+        return frozenset()
+    event_name = ast.unparse(event_assignment.targets[0])
+    event_reads_in_map = [
+        node for node in ast.walk(map_statement) if isinstance(node, ast.Name) and node.id == event_name and isinstance(node.ctx, ast.Load)
+    ]
+    if len(event_reads_in_map) != 1 or ast.unparse(watcher.args[1]) != event_name or ast.unparse(partial_call.args[3]) != event_name:
+        return frozenset()
+    root_uses = (
+        obligation.func.value,
+        obligation.args[0],
+        watcher.keywords[0].value.value,
+        partial_call.keywords[2].value,
+    )
+    root_names = {ast.unparse(node) for node in root_uses}
+    parameter_nodes = (
+        member.args.posonlyargs
+        + member.args.args
+        + member.args.kwonlyargs
+        + ([member.args.vararg] if member.args.vararg is not None else [])
+        + ([member.args.kwarg] if member.args.kwarg is not None else [])
+    )
+    parameter_origins = {arg.arg: {id(arg)} for arg in parameter_nodes}
+    if len(root_names) != len(root_uses) or root_names != parameter_origins.keys():
+        return frozenset()
+    # Stable origin is insufficient if a new consumer receives the receiver
+    # or one of the bound methods as a first-class value. Every receiver read
+    # must remain an attribute receiver in the reviewed method-use graph.
+    receiver_name = ast.unparse(root_uses[0])
+    receiver_counts: dict[str, int] = {}
+    for node in ast.walk(member):
+        if isinstance(node, ast.Name) and node.id == receiver_name and isinstance(node.ctx, ast.Load):
+            parent = parents[node]
+            if not isinstance(parent, ast.Attribute) or parent.value is not node:
+                return frozenset()
+            receiver_counts[parent.attr] = receiver_counts.get(parent.attr, 0) + 1
+    # This is the reviewed receiver-use inventory, not a list of forbidden
+    # examples. A new use of even an existing attribute changes the graph.
+    expected_receiver_counts = {
+        "_approval_inputs_from_frozen": 1,
+        "_create_loss_watcher": 1,
+        "_execution_obligation": 1,
+        "_join_loss_watcher": 1,
+        "_materialize_durable_cancellation": 1,
+        "_principal_is_active": 2,
+        "_record_recovery_refusal": 2,
+        "_restore_admitted_run": 2,
+        "_run_pipeline": 1,
+        "_session_service": 6,
+        "_settings": 1,
+        "_settle_admission_refusal": 1,
+        "_shutdown_events": 2,
+        "_shutdown_events_lock": 2,
+        "_submit_owned_pipeline": 1,
+        "_trained_operator_mode": 2,
+    }
+    if receiver_counts != expected_receiver_counts:
+        return frozenset()
+    # Check the complete in-method consumer path for each reviewed receiver
+    # and receiver-derived local read. A bound method, collaborator, settings
+    # object or restore result must reach only its original AST consumer.
+    # The path records each ancestor's field/index and the exact call function;
+    # one-for-one wrappers, inline captures, and new aliases all change it.
+    derived_names = {"session", "active", "approval_inputs", "permit", "restored"}
+    owned_roles = {"obligation", "watcher"}
+    derived_origins: dict[str, set[int]] = {name: set() for name in derived_names}
+    for assignment in ast.walk(member):
+        if isinstance(assignment, ast.Assign) and len(assignment.targets) == 1 and isinstance(assignment.targets[0], ast.Name):
+            target = assignment.targets[0]
+            value = assignment.value
+        elif isinstance(assignment, ast.AnnAssign) and isinstance(assignment.target, ast.Name):
+            target = assignment.target
+            value = assignment.value
+        else:
+            continue
+        if (
+            value is not None
+            and any(isinstance(part, ast.Name) and part.id == receiver_name and isinstance(part.ctx, ast.Load) for part in ast.walk(value))
+            and target.id not in owned_roles
+        ):
+            if target.id not in derived_names:
+                return frozenset()
+            derived_origins[target.id].add(id(target))
+        elif target.id in derived_names and isinstance(value, ast.Constant) and value.value is None:
+            derived_origins[target.id].add(id(target))
+    if {name: len(origins) for name, origins in derived_origins.items()} != {
+        "session": 3,
+        "active": 2,
+        "approval_inputs": 2,
+        "permit": 2,
+        "restored": 3,
+    }:
+        return frozenset()
+
+    def consumer_path(node: ast.AST) -> str:
+        segments: list[str] = []
+        while node is not member:
+            parent = parents[node]
+            position = None
+            for field, value in ast.iter_fields(parent):
+                if value is node:
+                    position = field
+                    break
+                if isinstance(value, list):
+                    for index, item in enumerate(value):
+                        if item is node:
+                            position = f"{field}[{index}]"
+                            break
+                    if position is not None:
+                        break
+            if position is None:
+                return "<unknown>"
+            label = type(parent).__name__
+            if isinstance(parent, ast.Attribute):
+                label += f"[{parent.attr}]"
+            if isinstance(parent, ast.Call):
+                label += f"[{ast.unparse(parent.func)}]"
+            segments.append(f"{label}.{position}")
+            node = parent
+            if isinstance(parent, ast.stmt):
+                break
+        return "/".join(segments)
+
+    actual_paths: dict[str, dict[str, int]] = {}
+    for node in ast.walk(member):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in derived_names | {receiver_name}:
+            by_path = actual_paths.setdefault(node.id, {})
+            path = consumer_path(node)
+            by_path[path] = by_path.get(path, 0) + 1
+    expected_paths = {
+        "active": {
+            "Call[run_sync_in_worker].args[0]/Await.value/UnaryOp.operand/BoolOp.values[1]/BoolOp.values[1]/BoolOp.values[1]/If.test": 2,
+            "Compare.left/BoolOp.values[0]/BoolOp.values[1]/BoolOp.values[1]/If.test": 2,
+        },
+        "approval_inputs": {
+            "Compare.left/If.test": 1,
+            "keyword.value/Call[self._session_service.assess_run_start_admission].keywords[1]/Await.value/Assign.value": 1,
+        },
+        "permit": {
+            "Attribute[execution_refusal].value/Compare.left/BoolOp.values[1]/If.test": 1,
+            "Attribute[state].value/Compare.left/BoolOp.values[0]/If.test": 1,
+            "Attribute[state].value/Compare.left/If.test": 1,
+        },
+        "restored": {
+            "Attribute[settings].value/Call[partial].args[4]/Call[self._submit_owned_pipeline].args[3]/Expr.value": 1,
+            "Attribute[settings].value/Call[run_sync_in_worker].args[1]/Await.value/Assign.value": 1,
+            "Compare.left/If.test": 1,
+            "keyword.value/Call[partial].keywords[3]/Call[self._submit_owned_pipeline].args[3]/Expr.value": 1,
+        },
+        "self": {
+            "Attribute[_approval_inputs_from_frozen].value/Call[run_sync_in_worker].args[0]/Await.value/Assign.value": 1,
+            "Attribute[_create_loss_watcher].value/Call[self._create_loss_watcher].func/Assign.value": 1,
+            "Attribute[_execution_obligation].value/Call[self._execution_obligation].func/Assign.value": 1,
+            "Attribute[_join_loss_watcher].value/Call[self._join_loss_watcher].func/Await.value/Assign.value": 1,
+            "Attribute[_materialize_durable_cancellation].value/Call[self._materialize_durable_cancellation].func/Await.value/Expr.value": 1,
+            "Attribute[_principal_is_active].value/Assign.value": 2,
+            "Attribute[_record_recovery_refusal].value/Call[self._record_recovery_refusal].func/Await.value/Expr.value": 2,
+            "Attribute[_restore_admitted_run].value/Call[self._restore_admitted_run].func/Await.value/Assign.value": 2,
+            "Attribute[_run_pipeline].value/Call[partial].args[0]/Call[self._submit_owned_pipeline].args[3]/Expr.value": 1,
+            "Attribute[_session_service].value/Attribute[assess_run_start_admission].value/Call[self._session_service.assess_run_start_admission].func/Await.value/Assign.value": 2,
+            "Attribute[_session_service].value/Attribute[get_session].value/Call[self._session_service.get_session].func/Await.value/Assign.value": 2,
+            "Attribute[_session_service].value/Attribute[session_operation_authority].value/Attribute[mutate].value/Call[run_sync_in_worker].args[0]/Await.value/Expr.value": 2,
+            "Attribute[_settings].value/Attribute[workflow_governance].value/Compare.left/If.test": 1,
+            "Attribute[_settle_admission_refusal].value/Call[self._settle_admission_refusal].func/Await.value/Expr.value": 1,
+            "Attribute[_shutdown_events].value/Subscript.value/Assign.targets[0]": 1,
+            "Attribute[_shutdown_events].value/Subscript.value/Delete.targets[0]": 1,
+            "Attribute[_shutdown_events_lock].value/withitem.context_expr/With.items[0]": 2,
+            "Attribute[_submit_owned_pipeline].value/Call[self._submit_owned_pipeline].func/Expr.value": 1,
+            "Attribute[_trained_operator_mode].value/UnaryOp.operand/BoolOp.values[0]/BoolOp.values[1]/If.test": 2,
+        },
+        "session": {
+            "Attribute[archived_at].value/Compare.left/BoolOp.values[0]/If.test": 2,
+            "Attribute[auth_provider_type].value/Call[partial].args[6]/Call[self._submit_owned_pipeline].args[3]/Expr.value": 1,
+            "Attribute[auth_provider_type].value/keyword.value/Call[self._restore_admitted_run].keywords[1]/Await.value/Assign.value": 2,
+            "Attribute[user_id].value/Call[partial].args[5]/Call[self._submit_owned_pipeline].args[3]/Expr.value": 1,
+            "Attribute[user_id].value/Call[run_sync_in_worker].args[1]/Await.value/UnaryOp.operand/BoolOp.values[1]/BoolOp.values[1]/BoolOp.values[1]/If.test": 2,
+            "Attribute[user_id].value/keyword.value/Call[run_sync_in_worker].keywords[0]/Await.value/Assign.value": 1,
+            "Attribute[user_id].value/keyword.value/Call[self._restore_admitted_run].keywords[0]/Await.value/Assign.value": 2,
+            "Compare.left/If.test": 1,
+        },
+    }
+    if actual_paths != expected_paths:
+        return frozenset()
+    protected_callable_lookups = (obligation.func, watcher.func, submit.func, join.func, partial_call.args[0])
+    if not all(
+        isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == receiver_name
+        for node in protected_callable_lookups
+    ):
+        return frozenset()
+    lookup_names = {node.attr for node in protected_callable_lookups if isinstance(node, ast.Attribute)}
+    if len(lookup_names) != len(protected_callable_lookups):
+        return frozenset()
+    seen_lookups = {
+        id(node)
+        for node in ast.walk(member)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == receiver_name
+        and node.attr in lookup_names
+        and isinstance(node.ctx, ast.Load)
+    }
+    if seen_lookups != {id(node) for node in protected_callable_lookups}:
+        return frozenset()
+    protected_origins = {
+        "obligation": {id(parents[obligation].targets[0])},
+        "watcher": {id(parents[watcher].targets[0])},
+        event_name: {id(event_assignment.targets[0])},
+        handler.name: {id(handler)},
+        cancellation_name: {id(join_assignment.targets[0].elts[0])},
+        watcher_error_name: {id(join_assignment.targets[0].elts[1])},
+        failure_name: {id(failures_assignment.target)},
+        cleanup_original_name: {id(cleanup_try.handlers[0])},
+    }
+    if len(protected_origins) != 8 or protected_origins.keys() & root_names:
+        return frozenset()
+    protected_reads = {
+        "obligation": {id(submit_obligation), id(condition.operand.value)},
+        "watcher": {id(submit_watcher), id(join_watcher)},
+        event_name: {id(event_reads_in_map[0]), id(watcher.args[1]), id(partial_call.args[3])},
+        handler.name: {id(failures_assignment.value.elts[0])},
+        cancellation_name: {id(lifecycle_raise.args[0])},
+        watcher_error_name: {id(watcher_test.left), id(watcher_append.args[0])},
+        failure_name: {id(watcher_append.func.value), id(cleanup_append.func.value), id(lifecycle_raise.args[1])},
+        cleanup_original_name: {id(cleanup_append.args[0])},
+    }
+    if len(protected_reads) != 8:
+        return frozenset()
+
+    # These names are taken from helper calls, exception types and the list
+    # annotation in the *verified* graph. None may become a local binding or
+    # be captured by an owned role. This protects partial/str/raiser/type
+    # lookup without maintaining a list of sample collision strings.
+    dependency_names = {call.func.id for call in ast.walk(submit_try) if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)}
+    dependency_names.update(
+        node.id
+        for expression in (handler.type, cleanup_try.handlers[0].type, failures_assignment.annotation)
+        for node in ast.walk(expression)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    )
+    if dependency_names & (protected_origins.keys() | root_names):
+        return frozenset()
+    if any(name in bindings or name in declarations or name in deleted for name in dependency_names):
+        return frozenset()
+    # Check the ledger against Python's own lexical scope classification.
+    # A newly supported binding form that changes a helper into a local must
+    # not be silently treated as the original module/built-in dependency.
+    import symtable
+
+    try:
+        module_symbols = symtable.symtable(ast.unparse(member), "<recovery-lease-proof>", "exec")
+        function_symbols = module_symbols.get_children()
+        if len(function_symbols) != 1 or function_symbols[0].get_name() != member.name:
+            return frozenset()
+        lexical_scope = function_symbols[0]
+        for name in protected_origins:
+            symbol = lexical_scope.lookup(name)
+            if not symbol.is_local() or symbol.is_global() or symbol.is_nonlocal() or symbol.is_parameter():
+                return frozenset()
+        for name in root_names:
+            symbol = lexical_scope.lookup(name)
+            if not symbol.is_local() or symbol.is_global() or symbol.is_nonlocal() or not symbol.is_parameter():
+                return frozenset()
+        for name in dependency_names:
+            symbol = lexical_scope.lookup(name)
+            if symbol.is_local() or symbol.is_parameter() or symbol.is_nonlocal():
+                return frozenset()
+    except (KeyError, SyntaxError, ValueError):
+        return frozenset()
+    for name, origins in protected_origins.items():
+        reads = {id(node) for node in ast.walk(member) if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)}
+        if bindings.get(name) != origins or reads != protected_reads[name] or name in declarations or name in deleted:
+            return frozenset()
+    for name, origins in derived_origins.items():
+        if bindings.get(name) != origins or name in declarations or name in deleted:
+            return frozenset()
+    for name, origins in parameter_origins.items():
+        if bindings.get(name) != origins or name in declarations or name in deleted:
+            return frozenset()
+    # The semantic owner proof above checks the five physical edges, live
+    # bindings, cleanup and exact consumer paths. Close the remaining
+    # in-method effect surface by comparing the entire executed source shape
+    # with the reviewed method. Only independently proved inert fresh facts
+    # and collision-free cleanup role alpha-renames are canonicalized. Thus a
+    # new class/global consumer, call, with statement, comprehension or alias
+    # cannot ride on the fact that it avoids the receiver-use inventory.
+    import copy
+    import hashlib
+
+    inert_indices: set[int] = set()
+    for index in range(obligation_index + 1, submit_index):
+        statement = member.body[index]
+        if not inert_fact(statement):
+            continue
+        target = statement.targets[0] if isinstance(statement, ast.Assign) else statement.target
+        assert isinstance(target, ast.Name)
+        if (
+            target.id in declarations
+            or target.id in deleted
+            or target.id in parameter_origins
+            or target.id in protected_origins
+            or target.id in derived_origins
+            or target.id in dependency_names
+            or bindings.get(target.id) != {id(target)}
+        ):
+            return frozenset()
+        inert_indices.add(index)
+    canonical = copy.deepcopy(member)
+    canonical.body = [statement for index, statement in enumerate(canonical.body) if index not in inert_indices]
+    alpha_roles = {
+        handler.name: "primary",
+        cancellation_name: "cancellations",
+        watcher_error_name: "watcher_error",
+        failure_name: "failures",
+        cleanup_original_name: "original",
+    }
+    if len(alpha_roles) != 5:
+        return frozenset()
+    for node in ast.walk(canonical):
+        if isinstance(node, ast.Name) and node.id in alpha_roles:
+            node.id = alpha_roles[node.id]
+        elif isinstance(node, ast.ExceptHandler) and node.name in alpha_roles:
+            node.name = alpha_roles[node.name]
+    reviewed_shape = "4bc769cd586408eead0c595fa8225cca0f0013bd981e8c1dd52b50cc6a9e73ea"
+    if hashlib.sha256(_stable_ast_bytes(canonical)).hexdigest() != reviewed_shape:
+        return frozenset()
+    return frozenset(
+        id(node)
+        for node in (
+            obligation.args[0],
+            watcher.args[0],
+            submit.args[1],
+            partial_call.keywords[0].value,
+            join.args[1],
+        )
+    )
+
+
 def _caller_lease_escapes(member: _FunctionNode) -> bool:
     """Keep the transferred lease within the reviewed execution consumers."""
+    recovery_edges = _exact_recovery_lease_owner_edges(member)
     parents = {child: node for node in ast.walk(member) for child in ast.iter_child_nodes(node)}
     positional_consumers = {
         "self._signal_shutdown_on_operation_loss": 0,
@@ -1869,6 +3163,8 @@ def _caller_lease_escapes(member: _FunctionNode) -> bool:
     }
     for node in ast.walk(member):
         if not (isinstance(node, ast.Name) and node.id == "session_operation_lease" and isinstance(node.ctx, ast.Load)):
+            continue
+        if id(node) in recovery_edges:
             continue
         consumer = parents[node]
         if isinstance(consumer, ast.Attribute) and consumer.value is node and isinstance(consumer.ctx, ast.Load):
@@ -2792,45 +4088,128 @@ def test_loss_watcher_signals_shutdown_without_becoming_a_lease_owned_task() -> 
     assert "create_task" not in call_names, "a lease-owned watcher can be cancelled before it signals loss"
 
 
-def test_done_callback_is_nonblocking_and_async_cleanup_closes_exactly_once() -> None:
-    callback = _function_node(ExecutionServiceImpl, "_on_pipeline_done")
+def _assert_async_completion_close_owner(owner: ast.ClassDef, helper: ast.AsyncFunctionDef) -> None:
+    import hashlib
+
+    callback = next(member for member in owner.body if isinstance(member, ast.FunctionDef) and member.name == "_on_pipeline_done")
     callback_body = _walk_function_body_without_nested_functions(callback)
     callback_calls = [_call_name(node) for node in callback_body if isinstance(node, ast.Call)]
     assert "run_coroutine_threadsafe" in callback_calls
     assert callback_calls.count("exception") + callback_calls.count("result") == 1, "worker Future must be consumed exactly once"
     assert not any(isinstance(node, ast.Await) for node in callback_body)
 
-    owner = _class_node(ExecutionServiceImpl)
-    close_sites: list[ast.AsyncFunctionDef] = []
-    for member in ast.walk(owner):
+    close_sites: list[tuple[ast.AsyncFunctionDef, ast.Call]] = []
+    for member in owner.body:
         if not isinstance(member, ast.AsyncFunctionDef):
             continue
         closes = [
             node
             for node in ast.walk(member)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "close"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "session_operation_lease"
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "close_execute_lease_before_transfer"
         ]
         if closes:
-            close_sites.extend([member] * len(closes))
-    assert len(close_sites) == 1, "one async completion path must own the sole execution-lease close"
-    close_function = close_sites[0]
-    finally_closes = [
-        call
-        for try_node in ast.walk(close_function)
-        if isinstance(try_node, ast.Try)
-        for statement in try_node.finalbody
-        for call in ast.walk(statement)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "close"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "session_operation_lease"
+            close_sites.extend((member, call) for call in closes)
+    assert len(close_sites) == 1, "one async completion path must own the sole lease-close handoff"
+    close_function, close_call = close_sites[0]
+    assert close_function.name == "_close_execution_authority"
+    assert [ast.unparse(arg) for arg in close_call.args] == ["session_operation_lease"] and close_call.keywords == []
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "close"
+        and ast.unparse(node.func.value) == "session_operation_lease"
+        for node in ast.walk(owner)
+    ), "completion must not close the lease again outside its owned helper"
+
+    finish = next(
+        member for member in owner.body if isinstance(member, ast.AsyncFunctionDef) and member.name == "_finish_execution_authority"
+    )
+    scheduled = [
+        node for node in callback_body if isinstance(node, ast.Call) and ast.unparse(node.func) == "asyncio.run_coroutine_threadsafe"
     ]
-    assert len(finally_closes) == 1, "the exact lease close must be structurally inside cleanup finally"
+    assert len(scheduled) == 1
+    assert ast.unparse(scheduled[0].args[0]) == "self._finish_execution_authority(obligation, session_operation_lease, loss_watcher, exc)"
+    finish_calls = [
+        node
+        for node in ast.walk(finish)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func) == "self._close_execution_authority"
+    ]
+    assert len(finish_calls) == 1
+    assert [ast.unparse(arg) for arg in finish_calls[0].value.args] == ["session_operation_lease", "loss_watcher", "exc"]
+
+    join = next(statement for statement in close_function.body if isinstance(statement, ast.If))
+    assert ast.unparse(join.test) == "loss_watcher is not None"
+    join_try = join.body[0]
+    assert isinstance(join_try, ast.Try) and len(join_try.handlers) == 1
+    handler = join_try.handlers[0]
+    assert handler.type is not None and ast.unparse(handler.type) == "BaseException"
+    assert len(handler.body) == 1 and ast.unparse(handler.body[0]) == "failed_loss_watcher = original"
+    close_try = close_function.body[close_function.body.index(join) + 1]
+    assert isinstance(close_try, ast.Try) and len(close_try.body) == 1
+    close_edge = close_try.body[0]
+    assert isinstance(close_edge, ast.Expr) and isinstance(close_edge.value, ast.Await) and close_edge.value.value is close_call
+    helper_closes = [node for node in ast.walk(helper) if isinstance(node, ast.Call) and ast.unparse(node.func) == "lease.close"]
+    assert len(helper_closes) == 1
+    create_tasks = [node for node in ast.walk(helper) if isinstance(node, ast.Call) and ast.unparse(node.func) == "asyncio.create_task"]
+    assert len(create_tasks) == 1 and create_tasks[0].args == [helper_closes[0]]
+
+    # Catch-all watcher settlement followed by the unconditional owned close has
+    # finally semantics. Pin these producer bodies after proving the exact edges:
+    # an early return, narrowed handler, lease substitution or unjoined close
+    # requires review rather than a syntactically convincing helper reference.
+    shapes = {
+        "_close_execution_authority": "62563bc01a2af20846053d30bb70583462c71eb3ac76ad49a7cf910bd33859f2",
+        "_finish_execution_authority": "e749535b4ff010c0b4063ce9a3d4f55f15f10633e42f5a09a7b91ff5760a89ec",
+        "close_execute_lease_before_transfer": "2b58bf6b6eecb7aa94745bc0506939eb778cf4de1cfe95a9ae3fbb28cd13afda",
+    }
+    assert {node.name: hashlib.sha256(_stable_ast_bytes(node)).hexdigest() for node in (close_function, finish, helper)} == shapes
+
+
+def test_done_callback_is_nonblocking_and_async_cleanup_closes_exactly_once() -> None:
+    helper = ast.parse(textwrap.dedent(inspect.getsource(execution_service_module.close_execute_lease_before_transfer))).body[0]
+    assert isinstance(helper, ast.AsyncFunctionDef)
+    _assert_async_completion_close_owner(_class_node(ExecutionServiceImpl), helper)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["duplicate_handoff", "removed_handoff", "wrong_owner", "duplicate_close", "early_return", "narrowed_handler", "unjoined_close"],
+)
+def test_async_completion_close_owner_rejects_broken_handoff(mutation: str) -> None:
+    import copy
+
+    owner = _class_node(ExecutionServiceImpl)
+    helper = ast.parse(textwrap.dedent(inspect.getsource(execution_service_module.close_execute_lease_before_transfer))).body[0]
+    assert isinstance(helper, ast.AsyncFunctionDef)
+    close = next(
+        member for member in owner.body if isinstance(member, ast.AsyncFunctionDef) and member.name == "_close_execution_authority"
+    )
+    handoff = next(
+        node for node in ast.walk(close) if isinstance(node, ast.Call) and _call_name(node) == "close_execute_lease_before_transfer"
+    )
+    if mutation == "duplicate_handoff":
+        close.body.append(ast.Expr(value=ast.Await(value=copy.deepcopy(handoff))))
+    elif mutation == "removed_handoff":
+        handoff.func = ast.Name(id="unrelated_helper", ctx=ast.Load())
+    elif mutation == "wrong_owner":
+        handoff.args[0] = ast.Name(id="other_lease", ctx=ast.Load())
+    elif mutation == "duplicate_close":
+        helper.body.append(ast.parse("lease.close()").body[0])
+    elif mutation == "early_return":
+        close.body.insert(0, ast.Return(value=None))
+    elif mutation == "narrowed_handler":
+        join = next(statement for statement in close.body if isinstance(statement, ast.If))
+        assert isinstance(join.body[0], ast.Try)
+        join.body[0].handlers[0].type = ast.Name(id="Exception", ctx=ast.Load())
+    else:
+        edge = next(node for node in ast.walk(close) if isinstance(node, ast.Await) and node.value is handoff)
+        edge.value = ast.Call(func=ast.Name(id="unrelated_helper", ctx=ast.Load()), args=[], keywords=[])
+    ast.fix_missing_locations(owner)
+    ast.fix_missing_locations(helper)
+    with pytest.raises(AssertionError):
+        _assert_async_completion_close_owner(owner, helper)
 
 
 def test_submit_failure_terminalizes_under_same_context_before_authority_returns() -> None:
@@ -2847,23 +4226,150 @@ def test_submit_failure_terminalizes_under_same_context_before_authority_returns
     assert all(_exact_context_keyword(call) for call in terminal_calls)
 
 
+def _assert_shutdown_join_graph(method_sources: dict[str, str] | None = None) -> None:
+    import hashlib
+
+    def owner_node(name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+        if method_sources is None:
+            return _function_node(ExecutionServiceImpl, name)
+        tree = ast.parse(textwrap.dedent(method_sources[name]))
+        return next(node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name)
+
+    node = owner_node("shutdown")
+    calls = [call for call in ast.walk(node) if isinstance(call, ast.Call)]
+    executor_joins = [call for call in calls if ast.unparse(call.func) == "self._join_executor_owner"]
+    registry_joins = [call for call in calls if ast.unparse(call.func) == "self._join_registry_owner"]
+    assert len(executor_joins) == len(registry_joins) == 1
+    for join in (*executor_joins, *registry_joins):
+        assert any(
+            isinstance(parent, ast.Call) and ast.unparse(parent.func) == "asyncio.create_task" and join in ast.walk(parent)
+            for parent in calls
+        )
+    assert any(ast.unparse(call.func) == "registry.observe_ready" for call in calls)
+    completed_guards = [
+        guard
+        for guard in ast.walk(node)
+        if isinstance(guard, ast.If)
+        and isinstance(guard.test, ast.BoolOp)
+        and isinstance(guard.test.op, ast.And)
+        and {"executor_task in observed", "registry_task in observed"} <= {ast.unparse(term) for term in guard.test.values}
+        and any(isinstance(statement, ast.Break) for statement in guard.body)
+    ]
+    assert len(completed_guards) == 1
+    assert sum(isinstance(candidate, ast.Break) for candidate in ast.walk(node)) == 1
+    executor_task_owner = owner_node("_join_executor_owner")
+    executor_owner_tries = [statement for statement in executor_task_owner.body if isinstance(statement, ast.Try)]
+    assert len(executor_owner_tries) == 1
+    assert len(executor_owner_tries[0].body) == 1
+    executor_edge = executor_owner_tries[0].body[0]
+    assert isinstance(executor_edge, ast.Expr)
+    assert isinstance(executor_edge.value, ast.Await)
+    assert isinstance(executor_edge.value.value, ast.Call)
+    assert ast.unparse(executor_edge.value.value.func) == "self._finish_executor_join"
+    executor_owner = owner_node("_finish_executor_join")
+    finalizer_tries = [statement for statement in executor_owner.body if isinstance(statement, ast.Try)]
+    assert len(finalizer_tries) == 1 and len(finalizer_tries[0].body) == 1
+    finalizer_edge = finalizer_tries[0].body[0]
+    assert isinstance(finalizer_edge, ast.Expr)
+    assert isinstance(finalizer_edge.value, ast.Await)
+    assert isinstance(finalizer_edge.value.value, ast.Call)
+    assert ast.unparse(finalizer_edge.value.value.func) == "run_application_finalizer_in_worker"
+    assert [ast.unparse(arg) for arg in finalizer_edge.value.value.args] == ["self._shutdown_finalizer"]
+    physical_join = owner_node("join_executor_shutdown")
+    assert len(physical_join.body) == 3
+    selected_executor = physical_join.body[1]
+    assert isinstance(selected_executor, ast.If)
+    assert ast.unparse(selected_executor.test) == "executor is not None"
+    assert len(selected_executor.body) == 1 and selected_executor.orelse == []
+    physical_edge = selected_executor.body[0]
+    assert isinstance(physical_edge, ast.Expr) and isinstance(physical_edge.value, ast.Call)
+    assert ast.unparse(physical_edge.value.func) == "executor.shutdown"
+    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in physical_edge.value.keywords] == [("wait", "True")]
+    registry_owner = owner_node("_join_registry_owner")
+    registry_tries = [statement for statement in registry_owner.body if isinstance(statement, ast.Try)]
+    assert len(registry_tries) == 1 and len(registry_tries[0].body) == 1
+    registry_edge = registry_tries[0].body[0]
+    assert isinstance(registry_edge, ast.Expr)
+    assert isinstance(registry_edge.value, ast.Await)
+    assert isinstance(registry_edge.value.value, ast.Call)
+    assert ast.unparse(registry_edge.value.value.func) == "self.execution_lease_release_registry.join_all"
+
+    # The direct edges above give the digest its meaning. Pin these five
+    # reviewed producer bodies so an inserted return or conditional cannot
+    # make a direct-looking edge unreachable without deliberate re-review.
+    reviewed_shapes = {
+        "shutdown": "dd521edd9cea565be1bfa2dd235cbd7fee7aff89d46e4b8dea79878c751fa7ae",
+        "_join_executor_owner": "e585d33cab53810ae0d3ee97aa27c2ae38e4af5e509ae002a121ed9bf6d851d8",
+        "_finish_executor_join": "3bd5602d6adcf3a3ee7b4726bd25f708fcd8a96df58b67292370bf6c35d8b9b1",
+        "_join_registry_owner": "7dbbfa9300fe6712c96bdd5ff1d2dc87e29a2c61b03598137226a2ce607b70a3",
+        "join_executor_shutdown": "427f99347964a622320f3b27643f7ceeca2469a9d382a6a53058f5dea8d145de",
+    }
+    assert {name: hashlib.sha256(_stable_ast_bytes(owner_node(name))).hexdigest() for name in reviewed_shapes} == reviewed_shapes
+
+
 def test_shutdown_drains_executor_then_awaits_all_lease_completions() -> None:
-    node = _function_node(ExecutionServiceImpl, "shutdown")
-    executor_statements = [
-        index
-        for index, statement in enumerate(node.body)
-        if any(isinstance(call, ast.Call) and _call_name(call) == "shutdown" for call in ast.walk(statement))
-        or any(isinstance(attribute, ast.Attribute) and attribute.attr == "shutdown" for attribute in ast.walk(statement))
-    ]
-    completion_statements = [
-        index
-        for index, statement in enumerate(node.body)
-        if any(isinstance(attribute, ast.Attribute) and attribute.attr == "_lease_completion_futures" for attribute in ast.walk(statement))
-    ]
-    assert len(executor_statements) == 1
-    assert completion_statements and min(completion_statements) > executor_statements[0]
-    completion_nodes = node.body[min(completion_statements) :]
-    assert any(isinstance(candidate, ast.Await) for statement in completion_nodes for candidate in ast.walk(statement))
+    _assert_shutdown_join_graph()
+
+
+@pytest.mark.parametrize(
+    "method,before,after",
+    [
+        ("_join_executor_owner", "await self._finish_executor_join()", "pass"),
+        (
+            "_finish_executor_join",
+            "await run_application_finalizer_in_worker(self._shutdown_finalizer)",
+            "run_application_finalizer_in_worker(self._shutdown_finalizer)",
+        ),
+        (
+            "_join_registry_owner",
+            "await self.execution_lease_release_registry.join_all()",
+            "self.execution_lease_release_registry.join_all()",
+        ),
+        ("shutdown", "and registry_task in observed", "or registry_task in observed"),
+        ("join_executor_shutdown", "wait=True", "wait=False"),
+    ],
+)
+def test_shutdown_join_graph_rejects_unjoined_owner_or_early_exit(method: str, before: str, after: str) -> None:
+    sources = {
+        "shutdown": inspect.getsource(ExecutionServiceImpl.shutdown),
+        "_join_executor_owner": inspect.getsource(ExecutionServiceImpl._join_executor_owner),
+        "_finish_executor_join": inspect.getsource(ExecutionServiceImpl._finish_executor_join),
+        "_join_registry_owner": inspect.getsource(ExecutionServiceImpl._join_registry_owner),
+        "join_executor_shutdown": inspect.getsource(ExecutionServiceImpl.join_executor_shutdown),
+    }
+    assert before in sources[method]
+    _assert_shutdown_join_graph(sources)
+    sources[method] = sources[method].replace(before, after)
+    with pytest.raises(AssertionError):
+        _assert_shutdown_join_graph(sources)
+
+
+@pytest.mark.parametrize(
+    "method,required_statement",
+    [
+        ("_join_executor_owner", "await self._finish_executor_join()"),
+        ("_finish_executor_join", "await run_application_finalizer_in_worker(self._shutdown_finalizer)"),
+        ("_join_registry_owner", "await self.execution_lease_release_registry.join_all()"),
+        ("join_executor_shutdown", "executor.shutdown(wait=True)"),
+    ],
+)
+def test_shutdown_join_graph_rejects_unreachable_owner_edge(method: str, required_statement: str) -> None:
+    sources = {
+        "shutdown": inspect.getsource(ExecutionServiceImpl.shutdown),
+        "_join_executor_owner": inspect.getsource(ExecutionServiceImpl._join_executor_owner),
+        "_finish_executor_join": inspect.getsource(ExecutionServiceImpl._finish_executor_join),
+        "_join_registry_owner": inspect.getsource(ExecutionServiceImpl._join_registry_owner),
+        "join_executor_shutdown": inspect.getsource(ExecutionServiceImpl.join_executor_shutdown),
+    }
+    _assert_shutdown_join_graph(sources)
+    original_lines = [line for line in sources[method].splitlines() if line.strip() == required_statement]
+    assert len(original_lines) == 1
+    line = original_lines[0]
+    indent = line[: len(line) - len(line.lstrip())]
+    sources[method] = sources[method].replace(line, indent + "if False:\n" + indent + "    " + required_statement)
+    ast.parse(textwrap.dedent(sources[method]))
+    with pytest.raises(AssertionError):
+        _assert_shutdown_join_graph(sources)
 
 
 def _real_session_service(
@@ -3136,8 +4642,7 @@ class _RecordingBroadcaster:
 
 @pytest.mark.asyncio
 async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_any_stale_effect(
-    engine: Engine,
-    tmp_path: Path,
+    engine: Engine, tmp_path: Path, execution_fixture: ExecutionTestCustody
 ) -> None:
     """A queued worker may clean local state after takeover, but may publish nothing."""
     authority = SQLiteLocalSessionOperationAuthority(engine)
@@ -3147,27 +4652,31 @@ async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_an
         authority,
         title="queued worker takeover",
     )
-    stale_context = authority.acquire(
+    service, _mock_sessions, executor_control = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    blocked_authority = execution_fixture.observe_existing_authority(authority, session_id)
+    blocked_authority.renew_allowed.clear()
+    lease = await execution_fixture.acquire(
+        service.execution_lease_release_registry,
+        authority,
         session_id=session_id,
-        operation_kind=SessionOperationKind.EXECUTE,
         owner_instance_id="queued-worker-a",
-        lease_seconds=1,
-    )
-    blocked_authority = _BlockedRenewalAuthority(authority)
-    lease = await SessionOperationLease.adopt(
-        cast(Any, blocked_authority),
-        stale_context,
         lease_seconds=1,
         renew_interval_seconds=0.05,
     )
-
-    service, _mock_sessions, _executor_double = _execution_service(asyncio.get_running_loop())
     service._session_service = real_sessions
     broadcaster = _RecordingBroadcaster()
     service._broadcaster = cast(Any, broadcaster)
     worker_release = threading.Event()
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stale-execute-worker")
-    service._executor = pool
+    execution_fixture.gates.append(worker_release)
+    pool = service._executor
+    assert pool is executor_control.pool
+    # This actor runs the original production stale-fence worker, unlike the
+    # endpoint-only completion controls. Keep the original registered pool and
+    # its real submit; release/join the control's initial queued blockers first.
+    executor_control.future.queue_allowed.set()
+    await asyncio.gather(*(asyncio.to_thread(blocker.result, 5) for blocker in executor_control.blockers))
+    pool.submit = executor_control._submit
+    pool.shutdown = executor_control._shutdown
     blocker = pool.submit(worker_release.wait, 5)
     prepared = execution_service_module._PreparedPipelineExecution(
         run_id=run_id,
@@ -3193,7 +4702,7 @@ async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_an
                 session_operation_lease=lease,
             )
             assert returned_run_id == run_id
-            assert await asyncio.to_thread(blocked_authority.renew_started.wait, 2)
+            assert await asyncio.to_thread(blocked_authority.renew_called.wait, 2)
 
             deadline = asyncio.get_running_loop().time() + 4
             while successor is None:
@@ -3224,6 +4733,78 @@ async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_an
 
             assert lease.closed
             assert stale_event_dml == []
+            obligation = lease.execution_obligation
+            assert obligation is not None
+            for _ in range(200):
+                if obligation.retired:
+                    break
+                await asyncio.sleep(0.01)
+            assert obligation.retired, "known lost authority must retire only after its actual cleanup owners join"
+            release = obligation.release_submission
+            assert release is not None and release.observed and release.callback_return_observed
+            assert type(release.original_error) is CanonicalExecutionReleaseLoss
+            assert release.original_error is release.domain_refusal
+            assert release.original_error.context is lease.context
+            assert obligation.release_lost and obligation.release_settled and not obligation.release_succeeded
+            canonical_loss = release.original_error
+            try:
+                canonical_loss.context = _context(uuid4())
+                assert not obligation.release_lost, "a receipt for another context must not settle this lease"
+            finally:
+                canonical_loss.context = lease.context
+            actual_future = release.future
+            try:
+                release.future = cast(Any, obligation.pipeline)
+                assert not obligation.release_lost, "a different completed Future cannot reuse the captured receipt"
+            finally:
+                release.future = actual_future
+            actual_generation = obligation.generation
+            try:
+                obligation.generation = cast(Any, object())
+                assert not obligation.release_lost, "a receipt from another generation cannot settle current custody"
+            finally:
+                obligation.generation = actual_generation
+            assert obligation.release_lost
+            assert release.reservation is not None
+            reservation = release.reservation
+            injected = OSError("reservation setup or observation failed")
+            try:
+                reservation.submission_error = injected
+                assert not obligation.release_lost
+            finally:
+                reservation.submission_error = None
+            try:
+                reservation.setup_error = injected
+                assert not obligation.release_lost
+            finally:
+                reservation.setup_error = None
+            try:
+                reservation.setup_outcome_error = injected
+                assert not obligation.release_lost
+            finally:
+                reservation.setup_outcome_error = None
+            try:
+                reservation.integrity_error = cast(Any, injected)
+                assert not obligation.release_lost
+            finally:
+                reservation.integrity_error = None
+            try:
+                reservation.semantic_observation_error = injected
+                assert not obligation.release_lost
+            finally:
+                reservation.semantic_observation_error = None
+            assert obligation.release_lost
+            assert blocked_authority.release_calls == [lease.context]
+            assert not service.execution_lease_release_registry.has_pending_physical_owners()
+            assert not async_workers._INSTANCE_DRAINING.is_set()
+            assert not async_workers._GENERATION_UNAVAILABLE.is_set()
+            assert lease.renewal_error is loss
+            assert lease.disposition.value == "lost"
+            assert obligation.pipeline is not None and obligation.pipeline.exception() is loss
+            assert obligation.lifecycle_original_error is None and obligation.completion_original_error is None
+            assert service.execution_lease_release_registry._failures == []
+            assert successor is not None
+            authority.compare_and_swap(successor)
             assert (await real_sessions.get_run(run_id)).status == "pending"
             assert not canonical_output.exists()
             assert broadcaster.events == []
@@ -3231,10 +4812,37 @@ async def test_expired_execute_lease_takeover_stops_queued_real_worker_before_an
     finally:
         worker_release.set()
         blocked_authority.renew_allowed.set()
-        await asyncio.to_thread(blocker.result, 5)
-        await asyncio.to_thread(pool.shutdown, True)
-        if successor is not None:
-            authority.release(successor)
+        primary = sys.exception()
+        cleanup_failures: list[BaseException] = []
+        try:
+            if successor is not None:
+                authority.release(successor)
+        except BaseException as original:
+            cleanup_failures.append(original)
+        try:
+            await asyncio.to_thread(blocker.result, 5)
+        except BaseException as original:
+            cleanup_failures.append(original)
+        pool_join = asyncio.create_task(asyncio.to_thread(pool.shutdown, True))
+        completed, _ = await asyncio.wait({pool_join}, timeout=5)
+        if pool_join not in completed:
+            cleanup_failures.append(TimeoutError("Real executor join remains physically unresolved after successor release"))
+        else:
+            try:
+                pool_join.result()
+            except BaseException as original:
+                cleanup_failures.append(original)
+        if cleanup_failures:
+            if primary is not None:
+                raise BaseExceptionGroup("Takeover assertion and physical cleanup failed", [primary, *cleanup_failures]) from None
+            if len(cleanup_failures) == 1:
+                raise cleanup_failures[0]
+            raise BaseExceptionGroup("Takeover physical cleanup failed", cleanup_failures) from None
+
+
+def test_canonical_execution_release_loss_rejects_unissued_constructor() -> None:
+    with pytest.raises(AuditIntegrityError, match="canonical release issuance"):
+        CanonicalExecutionReleaseLoss(object(), _context(uuid4()))
 
 
 @pytest.mark.asyncio
@@ -3389,3 +4997,257 @@ def _envelope_blob_verifier_case(
 )
 def test_envelope_blob_verifier_callback_requires_exact_worker_and_restore_consumer(case_id: str, case: _EdgeControlCase) -> None:
     _assert_edge_control(case)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    ["pure", "pure_no_renewal", "child", "cancel", "renewal_join", "setup_group", "outer_close", "outer_helper"],
+)
+async def test_canonical_release_loss_retains_mixed_cleanup_originals(
+    execution_fixture: ExecutionTestCustody,
+    fault: str,
+) -> None:
+    """Real canonical refusal; controlled mixed producer outcomes remain intact."""
+    service, sessions, _executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    session_id = sessions.get_current_state.return_value.session_id
+    independent = OSError(f"independent {fault} cleanup fault")
+    delivered_cancel = asyncio.CancelledError("deferred release cancellation")
+    original_renew = SessionOperationLease._renew_forever
+
+    async def renew_then_fault(lease: SessionOperationLease) -> None:
+        await original_renew(lease)
+        if fault == "renewal_join":
+            raise independent
+
+    with patch.object(SessionOperationLease, "_renew_forever", renew_then_fault):
+        lease, observed = await _canonical_execute_lease(
+            service,
+            execution_fixture,
+            session_id=session_id,
+            renew_interval_seconds=20 if fault == "pure_no_renewal" else 0.01,
+        )
+    observed.renew_allowed.clear()
+    observed.release_allowed.set()
+    await asyncio.to_thread(observed.authority.release, lease.context)
+    successor = await asyncio.to_thread(
+        observed.authority.acquire,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id="mixed-loss-successor",
+        lease_seconds=30,
+    )
+    observed.renew_allowed.set()
+    renewal = None if fault == "pure_no_renewal" else await asyncio.wait_for(lease.wait_until_lost(), timeout=2)
+    if renewal is not None:
+        assert type(renewal) is SessionOperationFenceLost and renewal.reason is FenceLossReason.STALE_EPOCH
+    if fault == "child":
+
+        async def fail_child() -> None:
+            raise independent
+
+        child = lease.create_task(fail_child())
+        with pytest.raises(OSError) as child_error:
+            await child
+        assert child_error.value is independent
+
+    original_bridge = lifecycle_module.run_execution_lease_sql_finish_once
+    returned: list[BaseException] = []
+
+    async def release_then_project(submission):
+        outcome = await original_bridge(submission)
+        assert type(outcome) is async_workers.RequiredSQLRaised
+        returned.append(outcome.error)
+        if fault == "setup_group":
+            # This is the bridge's setup-after-arm outcome shape, with the
+            # actual canonical SQL original retained as a nested member.
+            # It does not claim to inject a real executor setup failure.
+            grouped = BaseExceptionGroup("setup and actual SQL originals", [independent, outcome.error])
+            returned.append(grouped)
+            return async_workers.RequiredSQLRaised(grouped, outcome.deferred_cancellations)
+        if fault == "cancel":
+            return async_workers.RequiredSQLRaised(outcome.error, (delivered_cancel,))
+        return outcome
+
+    observed.release_called.clear()
+    observed.release_allowed.clear()
+    caught: BaseException | None = None
+    try:
+        with patch.object(lifecycle_module, "run_execution_lease_sql_finish_once", release_then_project):
+            closer = execution_service_module.close_execute_lease_before_transfer(lease) if fault == "outer_helper" else lease.close()
+            close_task = asyncio.create_task(closer)
+            assert await asyncio.to_thread(observed.release_called.wait, 2)
+            if fault in ("outer_close", "outer_helper"):
+                close_task.cancel("outer close caller cancellation")
+                await asyncio.sleep(0)
+            observed.release_allowed.set()
+            try:
+                await close_task
+            except BaseException as original:
+                caught = original
+        obligation = lease.execution_obligation
+        assert obligation is not None and obligation.release_lost and not obligation.release_succeeded
+        release = obligation.release_submission
+        assert release is not None and release.original_error is returned[0]
+        canonical = returned[0]
+        if fault in ("pure", "pure_no_renewal"):
+            assert caught is None and obligation.lifecycle_original_error is None
+            assert service.execution_lease_release_registry._failures == []
+            if fault == "pure_no_renewal":
+                assert lease.renewal_error is None
+                assert not observed.renew_called.is_set()
+        else:
+            assert caught is not None
+            leaves = _original_leaves(caught)
+            assert sum(original is canonical for original in leaves) == 1
+            assert sum(original is renewal for original in leaves) == 1
+            if fault in ("child", "renewal_join", "setup_group"):
+                assert sum(original is independent for original in leaves) == 1
+            if fault == "setup_group":
+                assert isinstance(caught, BaseExceptionGroup)
+                assert caught.exceptions == (returned[1], renewal)
+            elif fault == "cancel":
+                assert isinstance(caught, BaseExceptionGroup)
+                assert caught.exceptions == (delivered_cancel, canonical, renewal)
+            elif fault in ("child", "renewal_join"):
+                assert isinstance(caught, BaseExceptionGroup)
+                assert caught.exceptions == (independent, canonical, renewal)
+            else:
+                assert isinstance(caught, BaseExceptionGroup)
+                assert isinstance(caught.exceptions[0], asyncio.CancelledError)
+                assert caught.exceptions[1:] == (canonical, renewal)
+                assert obligation.lifecycle_original_error is None
+            for original in leaves:
+                if not isinstance(original, asyncio.CancelledError):
+                    execution_fixture.witness_cleanup_original(original)
+            if fault == "cancel":
+                execution_fixture.witness_cleanup_original(delivered_cancel)
+        # Lost release never mutates or releases the successor's authority.
+        await asyncio.to_thread(observed.authority.compare_and_swap, successor)
+    finally:
+        observed.release_allowed.set()
+        observed.renew_allowed.set()
+        await asyncio.to_thread(observed.authority.release, successor)
+
+
+async def _setup_after_arm_canonical_loss_child(root: Path) -> None:
+    from elspeth.web.required_executor import InvocationGate, RequiredInvocationWitness
+
+    custody = ExecutionTestCustody(asyncio.get_running_loop(), root)
+    service, sessions, _executor = _execution_service(asyncio.get_running_loop(), execution_fixture=custody)
+    session_id = sessions.get_current_state.return_value.session_id
+    lease, observed = await _canonical_execute_lease(
+        service,
+        custody,
+        session_id=session_id,
+        renew_interval_seconds=0.01,
+    )
+    observed.renew_allowed.clear()
+    observed.release_allowed.set()
+    await asyncio.to_thread(observed.authority.release, lease.context)
+    successor = await asyncio.to_thread(
+        observed.authority.acquire,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id="setup-arm-successor",
+        lease_seconds=30,
+    )
+    observed.renew_allowed.set()
+    renewal = await asyncio.wait_for(lease.wait_until_lost(), timeout=2)
+    obligation = lease.execution_obligation
+    assert obligation is not None
+    setup_error = OSError("actual RELEASE setup failed after publishing ARMED")
+    original_arm = RequiredInvocationWitness.arm
+    armed: list[RequiredInvocationWitness] = []
+
+    def arm_then_fail(witness: RequiredInvocationWitness) -> None:
+        original_arm(witness)
+        release = obligation.release_submission
+        if release is not None and release.reservation is not None and witness is release.reservation.witness:
+            assert witness.snapshot().gate is InvocationGate.ARMED
+            armed.append(witness)
+            raise setup_error
+
+    with patch.object(RequiredInvocationWitness, "arm", arm_then_fail), pytest.raises(BaseExceptionGroup) as caught:
+        await lease.close()
+    release = obligation.release_submission
+    assert release is not None and release.reservation is not None and release.future is not None
+    canonical = release.original_error
+    assert type(canonical) is CanonicalExecutionReleaseLoss and canonical.context is lease.context
+    assert release.domain_refusal is canonical and release.future.exception() is canonical
+    assert release.reservation.setup_error is setup_error
+    assert armed == [release.reservation.witness]
+    trace = release.reservation.witness.snapshot()
+    assert trace.exited and trace.callable_finished and not trace.impossible
+    assert release.reservation.released and release.callback_return_observed and release.observed
+    assert caught.value is obligation.lifecycle_original_error
+    assert len(caught.value.exceptions) == 2
+    bridge_group, retained_renewal = caught.value.exceptions
+    assert isinstance(bridge_group, BaseExceptionGroup)
+    assert bridge_group.exceptions == (setup_error, canonical) and retained_renewal is renewal
+    assert _original_leaves(caught.value) == [setup_error, canonical, renewal]
+    assert not obligation.release_lost and not obligation.release_succeeded and not obligation.retired
+    assert service.execution_lease_release_registry.has_pending_physical_owners()
+    assert async_workers._INSTANCE_DRAINING.is_set() and async_workers._GENERATION_UNAVAILABLE.is_set()
+    for original in (setup_error, canonical, renewal):
+        custody.witness_cleanup_original(original)
+    await asyncio.to_thread(observed.authority.compare_and_swap, successor)
+    await asyncio.to_thread(observed.authority.release, successor)
+    shutdown = asyncio.create_task(custody.close())
+    await asyncio.sleep(0)
+    assert not shutdown.done()
+    with pytest.raises(BaseExceptionGroup) as refused:
+        service.execution_lease_release_registry.assert_completed()
+    assert any(original is setup_error for original in _original_leaves(refused.value))
+    assert not custody.recovery.watchdog.completed
+    _atomic_child_checkpoint(
+        root / "checkpoint.json",
+        {
+            "actual_armed_setup_and_sql_originals": True,
+            "actual_release_future_callback_exited": True,
+            "mixed_lifecycle_group_not_flattened": True,
+            "faulty_receipt_refused_pending_retained": True,
+            "successor_authority_unchanged": True,
+            "watchdog_completion_unsent": True,
+        },
+    )
+    # Intentionally unresolved failed setup stays owned until the existing
+    # exact child reaper observes termination and physically waits it.
+    await asyncio.Event().wait()
+
+
+def test_actual_setup_after_arm_retains_canonical_loss_group_and_pending_owner(tmp_path: Path) -> None:
+    _run_failed_http_release_child(tmp_path, OSError, None, False, setup_after_arm=True)
+
+
+if __name__ == "__main__":
+    failure_types = {
+        "OSError": OSError,
+        "AuditIntegrityError": AuditIntegrityError,
+        "FrameworkBugError": FrameworkBugError,
+        "SessionOperationFenceLost": SessionOperationFenceLost,
+    }
+    if len(sys.argv) == 7 and sys.argv[1] == "--failed-http-release-child" and sys.argv[6] == "--setup-after-arm":
+        assert sys.argv[3:6] == ["OSError", "None", "False"]
+        child_root = Path(sys.argv[2])
+        asyncio.run(_child_with_failure_checkpoint(child_root, _setup_after_arm_canonical_loss_child(child_root)))
+    elif len(sys.argv) == 6 and sys.argv[1] == "--failed-http-release-child":
+        cleanup_type = failure_types[sys.argv[3]]
+        logger_type = None if sys.argv[4] == "None" else failure_types[sys.argv[4]]
+        assert sys.argv[5] in {"True", "False"}
+        child_root = Path(sys.argv[2])
+        asyncio.run(
+            _child_with_failure_checkpoint(
+                child_root, _failed_http_release_child(child_root, cleanup_type, logger_type, sys.argv[5] == "True")
+            )
+        )
+    elif len(sys.argv) == 5 and sys.argv[1] == "--failed-shutdown-release-child":
+        assert sys.argv[3] in {"RuntimeError", "AuditIntegrityError", "FrameworkBugError"}
+        assert sys.argv[4] in {"True", "False"}
+        shutdown_type = RuntimeError if sys.argv[3] == "RuntimeError" else failure_types[sys.argv[3]]
+        child_root = Path(sys.argv[2])
+        asyncio.run(
+            _child_with_failure_checkpoint(child_root, _failed_shutdown_release_child(child_root, shutdown_type, sys.argv[4] == "True"))
+        )
+    else:
+        raise AssertionError("unknown exact owned execution child")

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from elspeth.web._azure_container_apps_acceptance.evidence import connection_budget_details
+from elspeth.web.sessions.schemas import SendMessageRequest
 
 DRIVER = Path(__file__).resolve().parents[4] / "deploy/azure-container-apps/scripts/acceptance.sh"
 SHA = "a" * 40
@@ -139,6 +140,36 @@ elif name == "curl":
     if args[-1].endswith("/api/sessions") or args[-1].endswith("/blobs/inline"):
         import uuid
         target.write_text(json.dumps({"id": str(uuid.uuid4())}))
+    elif args[-1].endswith("/state/yaml"):
+        import uuid
+        target.write_text(json.dumps({"id": str(uuid.uuid4()), "session_id": args[-1].split("/")[-3]}))
+    elif args[-1].endswith("/messages"):
+        from elspeth.web.sessions.schemas import SendMessageRequest
+        from pydantic import ValidationError
+        body = json.loads(pathlib.Path(option("--data-binary")[1:]).read_text())
+        status = os.environ.get("MESSAGE_HTTP_STATUS", "202")
+        try:
+            parsed = SendMessageRequest.model_validate(body)
+        except ValidationError:
+            status = "422"
+        else:
+            session_id = args[-1].split("/")[-2]
+            heads = [json.loads(path.read_text()) for path in target.parent.glob("prepared-*-state.json")]
+            head = next(item["id"] for item in heads if item["session_id"] == session_id)
+            if str(parsed.state_id) != head:
+                status = "409"
+        if status != "202":
+            target.write_text('{"detail":{"error_type":"request_rejected"}}')
+            if "--write-out" in args:
+                print(status)
+            sys.exit(22 if int(status) >= 400 and "--fail-with-body" in args else 0)
+        operation_id = body["operation_id"]
+        if os.environ.get("MESSAGE_WRONG_OPERATION"):
+            operation_id = "00000000-0000-4000-8000-000000000000"
+        target.write_text(json.dumps({"operation_id": operation_id, "kind": "compose_message", "status": "queued", "poll_after_ms": 100}))
+        if "--write-out" in args:
+            print(status)
+        sys.exit(0)
     else:
         target.write_text('{"ready":true}')
     if "--write-out" in args:
@@ -302,6 +333,47 @@ def command_index(commands: list[list[str]], prefix: list[str]) -> int:
     return next(index for index, command in enumerate(commands) if command[: len(prefix)] == prefix)
 
 
+def test_p4_preparation_uses_fresh_operation_ids_and_imported_heads(driver: DriverRun) -> None:
+    template = Path(driver.environment["P4_MESSAGE_BODY"]).read_text()
+    for stage in ("environment", "bootstrap", "prepare", "single-revision"):
+        result = driver.run(stage)
+        assert result.returncode == 0, result.stderr
+    operations: set[str] = set()
+    for name in ("p4", "single-p4"):
+        request = SendMessageRequest.model_validate_json((driver.evidence / f"prepared-{name}-message-request.json").read_text())
+        head = json.loads((driver.evidence / f"prepared-{name}-state.json").read_text())["id"]
+        accepted = json.loads((driver.evidence / f"prepared-{name}-message.json").read_text())
+        assert request.state_id is not None and str(request.state_id) == head
+        assert request.content == json.loads(template)["content"]
+        assert accepted["operation_id"] == request.operation_id
+        assert request.operation_id not in operations
+        operations.add(request.operation_id)
+    assert Path(driver.environment["P4_MESSAGE_BODY"]).read_text() == template
+
+
+@pytest.mark.parametrize("stage", ["prepare", "single-revision"])
+@pytest.mark.parametrize("status", ["200", "409", "422", "429", "500"])
+def test_rejected_p4_message_stops_before_probe(driver: DriverRun, stage: str, status: str) -> None:
+    for prerequisite in ("environment", "bootstrap"):
+        assert driver.run(prerequisite).returncode == 0
+    driver.environment["MESSAGE_HTTP_STATUS"] = status
+    result = driver.run(stage)
+    assert result.returncode != 0
+    assert "http_status_unexpected" in result.stderr if status == "200" else "http_request_failed" in result.stderr
+    assert not (driver.evidence / "prepared-sessions.json").exists()
+    assert not any("elspeth.web.azure_container_apps_single_revision" in command for command in driver.commands())
+
+
+def test_p4_acknowledgement_for_another_operation_is_refused(driver: DriverRun) -> None:
+    for stage in ("environment", "bootstrap"):
+        assert driver.run(stage).returncode == 0
+    driver.environment["MESSAGE_WRONG_OPERATION"] = "1"
+    result = driver.run("prepare")
+    assert result.returncode != 0
+    assert "p4_message_admission_invalid" in result.stderr
+    assert not (driver.evidence / "prepared-sessions.json").exists()
+
+
 def test_complete_driver_orders_jobs_probes_receipts_and_cleanup(driver: DriverRun) -> None:
     result = driver.run("all")
     assert result.returncode == 0, result.stderr
@@ -328,7 +400,8 @@ def test_complete_driver_orders_jobs_probes_receipts_and_cleanup(driver: DriverR
     assert p2[p2.index("--trials") + 1] == "20"
     p1_requests = json.loads((driver.evidence / "p1-trial-requests.json").read_text())
     assert len(p1_requests) == len({trial["session_id"] for trial in p1_requests}) == 20
-    assert len({trial["body"]["client_request_id"] for trial in p1_requests}) == 20
+    assert len({trial["body"]["operation_id"] for trial in p1_requests}) == 20
+    assert all(trial["body"]["state_id"] is None for trial in p1_requests)
     assert all(trial["body"]["content"] == "Inspect the acceptance fixture" for trial in p1_requests)
     single_requests = json.loads((driver.evidence / "single-p1-trial-requests.json").read_text())
     single_sessions = {trial["session_id"] for trial in single_requests}

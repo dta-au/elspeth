@@ -82,6 +82,11 @@ require_p1_body() {
   jq -e 'type == "object" and (keys == ["content"]) and (.content | type == "string" and length > 0)' \
     "$P1_BODY" >/dev/null || fail p1_message_template_invalid
 }
+require_p4_body() {
+  require_file "${P4_MESSAGE_BODY:?set Composer message content template JSON}"
+  jq -e 'type == "object" and (keys == ["content"]) and (.content | type == "string" and length > 0 and length <= 65536)' \
+    "$P4_MESSAGE_BODY" >/dev/null || fail p4_message_template_invalid
+}
 require_parameters() {
   require_file "$1"
   # The concrete resolved files, not checked-in examples, reach what-if/create.
@@ -119,7 +124,7 @@ preflight_all() {
   require_file "${PROBE_YAML:?set P2/P4 pipeline YAML}"
   require_file "${P3_YAML:?set long-running pipeline YAML}"
   require_file "${PROBE_SOURCE_BLOB:?set source blob request JSON}"
-  require_file "${P4_MESSAGE_BODY:?set normal Composer message JSON}"
+  require_p4_body
   require_p1_body
   require_file "${COMPATIBILITY_RECORD:?set operator compatibility record}"
   : "${P3_SINK_PATH:?set physical CSV path template}"
@@ -449,15 +454,20 @@ prepare_auth() (
   jq -er 'select(.token_type == "bearer") | .access_token | select(type == "string" and length > 0)' "$scratch/response.json"
 )
 api_post() (
-  local path="$1" body="$2" out="$3" scratch cleanup
+  local path="$1" body="$2" out="$3" expected_status="${4:-}" scratch cleanup status
   : "${ELSPETH_ACCEPTANCE_BEARER_TOKEN:?set acceptance bearer token}"
   [[ "$ELSPETH_ACCEPTANCE_BEARER_TOKEN" != *$'\n'* && "$ELSPETH_ACCEPTANCE_BEARER_TOKEN" != *$'\r'* ]] || exit 1
   scratch=$(mktemp -d -p /tmp elspeth-http.XXXXXX)
   printf -v cleanup 'rm -rf -- %q' "$scratch"
   trap "$cleanup" EXIT
   printf 'Authorization: Bearer %s\n' "$ELSPETH_ACCEPTANCE_BEARER_TOKEN" >"$scratch/header"
-  curl_capture --header "@$scratch/header" --header 'Content-Type: application/json' \
-    --data-binary "@$body" --output "$out" "${PREPARATION_ORIGIN:-https://${APP_NAME}---a.${APP_DOMAIN}}${path}"
+  status=$(curl_capture --header "@$scratch/header" --header 'Content-Type: application/json' \
+    --data-binary "@$body" --output "$out" --write-out '%{http_code}' \
+    "${PREPARATION_ORIGIN:-https://${APP_NAME}---a.${APP_DOMAIN}}${path}") || exit "$?"
+  if test -n "$expected_status" && test "$status" != "$expected_status"; then
+    fail http_status_unexpected
+    exit 1
+  fi
 )
 prepare_session() {
   local name="$1" yaml="${2:-}" session blob
@@ -481,16 +491,32 @@ prepare_freeform_trials() {
     session=$(prepare_session "${prefix}-${index}")
     request_key=$(cat /proc/sys/kernel/random/uuid)
     jq -c --arg session "$session" --arg request_key "$request_key" \
-      '{session_id:$session,body:(. + {client_request_id:$request_key})}' "$P1_BODY" >>"$EVIDENCE_DIR/${prefix}-trial-requests.jsonl"
+      '{session_id:$session,body:(. + {operation_id:$request_key,state_id:null})}' "$P1_BODY" >>"$EVIDENCE_DIR/${prefix}-trial-requests.jsonl"
   done
   jq -s '.' "$EVIDENCE_DIR/${prefix}-trial-requests.jsonl" >"$EVIDENCE_DIR/${prefix}-trial-requests.json"
+}
+prepare_p4_message() {
+  local name="$1" session="$2" state_id operation_id request_body="$EVIDENCE_DIR/prepared-${1}-message-request.json"
+  state_id=$(jq -er '.id | select(type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))' \
+    "$EVIDENCE_DIR/prepared-${name}-state.json") || return 1
+  operation_id=$(cat /proc/sys/kernel/random/uuid) || return 1
+  # Persist the immutable request for intentional retries of this operation.
+  jq -c --arg operation_id "$operation_id" --arg state_id "$state_id" \
+    '. + {operation_id:$operation_id,state_id:$state_id}' "$P4_MESSAGE_BODY" >"$request_body" || return 1
+  api_post "/api/sessions/${session}/messages" "$request_body" "$EVIDENCE_DIR/prepared-${name}-message.json" 202 || return "$?"
+  jq -e --arg operation_id "$operation_id" '
+    type == "object" and (keys == ["kind", "operation_id", "poll_after_ms", "status"])
+    and .operation_id == $operation_id and .kind == "compose_message"
+    and (.status | IN("queued", "running", "completed", "failed"))
+    and (.poll_after_ms | type == "number" and floor == . and . >= 100 and . <= 60000)
+  ' "$EVIDENCE_DIR/prepared-${name}-message.json" >/dev/null || fail p4_message_admission_invalid
 }
 stage_prepare() {
   PREPARATION_ORIGIN="https://${APP_NAME}---a.${APP_DOMAIN}"
   require_file "${PROBE_YAML:?set executable P2/P4 pipeline YAML}"
   require_file "${P3_YAML:?set long-running physical CSV sink pipeline YAML}"
   require_file "${PROBE_SOURCE_BLOB:?set inline source blob request JSON}"
-  require_file "${P4_MESSAGE_BODY:?set a normal Composer message JSON to observe}"
+  require_p4_body
   require_p1_body
   local trials="${PROBE_TRIALS:-20}" index token
   positive_integer "$trials"
@@ -503,7 +529,7 @@ stage_prepare() {
   printf '{}\n' >"$EVIDENCE_DIR/empty-body.json"
   P3_SESSION_ID=$(prepare_session p3 "$P3_YAML")
   P4_SESSION_ID=$(prepare_session p4 "$PROBE_YAML")
-  api_post "/api/sessions/${P4_SESSION_ID}/messages" "$P4_MESSAGE_BODY" "$EVIDENCE_DIR/prepared-p4-message.json"
+  prepare_p4_message p4 "$P4_SESSION_ID"
   : >"$EVIDENCE_DIR/p2-session-ids.txt"
   prepare_freeform_trials p1
   for ((index=0; index<trials; index++)); do
@@ -592,7 +618,7 @@ stage_single_revision() {
   require_p1_body
   require_file "${PROBE_YAML:?set executable P4 pipeline YAML}"
   require_file "${PROBE_SOURCE_BLOB:?set inline source blob request JSON}"
-  require_file "${P4_MESSAGE_BODY:?set normal Composer message JSON}"
+  require_p4_body
   printf '{}\n' >"$EVIDENCE_DIR/empty-body.json"
   stage_rollout "${REVISION_SUFFIX}-single"
   az_capture containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" >"$EVIDENCE_DIR/app.json"
@@ -600,7 +626,7 @@ stage_single_revision() {
   prepare_freeform_trials single-p1
   local session
   session=$(prepare_session single-p4 "$PROBE_YAML")
-  api_post "/api/sessions/${session}/messages" "$P4_MESSAGE_BODY" "$EVIDENCE_DIR/prepared-single-p4-message.json"
+  prepare_p4_message single-p4 "$session"
   single_revision_receipt P1 single-revision-fence-conflict single-p1 \
     --trial-requests "$EVIDENCE_DIR/single-p1-trial-requests.json" --trials "${PROBE_TRIALS:-20}"
   single_revision_receipt P4a single-revision-progress single-p4 --session-id "$session"

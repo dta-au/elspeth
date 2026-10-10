@@ -1,6 +1,7 @@
 // Account-level preferences. Completion persistence and local publication are separate.
 
 import { create } from "zustand";
+import { currentAuthGeneration, isCurrentAuthGeneration } from "@/api/authSession";
 import {
   fetchUserComposerPreferences,
   updateUserComposerPreferences,
@@ -12,7 +13,7 @@ import type {
 } from "@/types/api";
 
 const FREEFORM_INTRO_DISMISSED_STORAGE_KEY =
-  "elspeth_prefs_freeform_intro_dismissed_v1";
+  "elspeth_prefs_freeform_intro_dismissed_v2";
 
 /**
  * In-progress tutorial resume state (elspeth-918f4434b3), server-persisted
@@ -28,6 +29,54 @@ export interface TutorialProgress {
   sourceDataHash: string | null;
 }
 
+/** The caller may publish this completion only while its saved account view
+ * still owns the result. A deferred tutorial departure carries this receipt
+ * across subsequent session-loading awaits. */
+export interface PreferenceWriteReceipt {
+  assertCurrent: () => void;
+}
+
+export interface TutorialGraduationReceipt extends PreferenceWriteReceipt {
+  completedAt: string | null;
+  publish: () => void;
+}
+
+export class PreferencesRequestSuperseded extends Error {
+  constructor() {
+    super("The account changed while saving preferences. Reload before retrying.");
+  }
+}
+
+let preferenceRevision = 0;
+let publicationRevision = 0;
+let bootstrapIntent = 0;
+
+// Principal keys namespace cross-tab hints; the auth generation and revision
+// own async work. Backend live authorization remains the authority.
+let preferencePrincipal: string | null = null;
+
+export function capturePreferenceOwner(): () => boolean {
+  const revision = preferenceRevision;
+  const authGeneration = currentAuthGeneration();
+  return () => revision === preferenceRevision && isCurrentAuthGeneration(authGeneration);
+}
+
+export function requirePreferenceOwner(owns: () => boolean): void {
+  if (!owns()) throw new PreferencesRequestSuperseded();
+}
+
+function captureRequestOwner(): () => boolean {
+  const ownsScope = capturePreferenceOwner();
+  const request = ++publicationRevision;
+  return () => ownsScope() && request === publicationRevision;
+}
+
+function isUnavailableForRole(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const apiError = err as Partial<ApiError>;
+  return apiError.status === 403 && apiError.error_type === "user_role_required";
+}
+
 interface PreferencesState {
   freeformIntroDismissedAt: string | null;
   tutorialCompletedAt: string | null;
@@ -40,23 +89,27 @@ interface PreferencesState {
   // through useShowAdvanced()/selectShowAdvanced so consumers cannot drift.
   showAdvanced: boolean;
   loaded: boolean;
+  // A 403 user_role_required is an expected composer boundary for an
+  // authenticated administrator. It is not a loaded preference or a failed
+  // persistence attempt.
+  unavailableForRole: boolean;
   writing: boolean;
   // Most-recent error from a preference write. Components
   // render this as an accessible role="alert" region (Panel a11y F2).
   // Cleared on the next successful write or by explicit clearError().
   writeError: string | null;
   bootstrapError: string | null;
-  bootstrap: () => Promise<void>;
+  bootstrap: (options?: { publishTutorialCompletion?: boolean }) => Promise<void>;
   saveTutorialProgress: (progress: TutorialProgress) => Promise<void>;
   setShowAdvanced: (value: boolean) => Promise<void>;
   markTutorialGraduated: (options: {
     publishLocally?: boolean;
     via: "complete" | "skip" | "exit";
-  }) => Promise<string | null>;
-  publishTutorialGraduation: (completedAt: string | null) => void;
-  resetTutorial: () => Promise<void>;
+  }) => Promise<TutorialGraduationReceipt>;
+  resetTutorial: () => Promise<PreferenceWriteReceipt>;
   dismissFreeformIntro: () => Promise<void>;
   clearError: () => void;
+  bindPrincipal: (principalId: string, authProvider: string) => void;
   reset: () => void;
 }
 
@@ -91,6 +144,7 @@ const INITIAL_STATE = {
   tutorialSourceDataHash: null as string | null,
   showAdvanced: false,
   loaded: false,
+  unavailableForRole: false,
   writing: false,
   writeError: null as string | null,
   bootstrapError: null as string | null,
@@ -99,22 +153,50 @@ const INITIAL_STATE = {
 export const usePreferencesStore = create<PreferencesState>((set, get) => ({
   ...INITIAL_STATE,
 
-  bootstrap: async () => {
+  bootstrap: async (options) => {
+    const ownsScope = capturePreferenceOwner();
+    const intent = ++bootstrapIntent;
+    // Read after the current writer settles, so a refresh cannot discard a
+    // legitimate save or replace its state with a pre-write GET snapshot.
+    for (let waitedMs = 0; get().writing && waitedMs < 5000; waitedMs += 50) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      if (!ownsScope() || intent !== bootstrapIntent) return;
+    }
+    if (!ownsScope() || intent !== bootstrapIntent) return;
+    if (get().writing) {
+      set({ bootstrapError: "A preference save is still pending. Reload preferences after it finishes." });
+      return;
+    }
+    const ownsRequest = captureRequestOwner();
+    const owns = () => ownsRequest() && intent === bootstrapIntent;
     try {
       const payload = await fetchUserComposerPreferences();
+      if (!owns()) return;
       set({
         freeformIntroDismissedAt: payload.freeform_intro_dismissed_at,
         tutorialCompletedAt: payload.tutorial_completed_at,
-        tutorialCompleted: tutorialCompletedFrom(payload.tutorial_completed_at),
+        tutorialCompleted: (options?.publishTutorialCompletion ?? true)
+          ? tutorialCompletedFrom(payload.tutorial_completed_at)
+          : get().tutorialCompleted && tutorialCompletedFrom(payload.tutorial_completed_at),
         tutorialStage: payload.tutorial_stage,
         tutorialSessionId: payload.tutorial_session_id,
         tutorialRunId: payload.tutorial_run_id,
         tutorialSourceDataHash: payload.tutorial_source_data_hash,
         showAdvanced: payload.show_advanced,
         loaded: true,
+        unavailableForRole: false,
         bootstrapError: null,
       });
     } catch (err) {
+      if (!owns()) return;
+      const apiError = err as Partial<ApiError>;
+      if (isUnavailableForRole(err)) {
+        // R8 forbids an admin from also holding the pipeline-user role. Keep
+        // the backend refusal and clear any previous principal's local view.
+        preferenceRevision += 1;
+        set({ ...INITIAL_STATE, unavailableForRole: true });
+        return;
+      }
       // No-fabrication shape: leave tutorialCompletedAt null because
       // absence is evidence, not a completion verdict.
       //
@@ -123,7 +205,6 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
       // session at all — strictly worse than presenting them with an
       // accurate "we couldn't load your preferences" banner).
       //
-      const apiError = err as Partial<ApiError>;
       const isCorrupt = apiError?.error_type === "corrupt_preferences";
       const message = isCorrupt
         ? "Your saved preferences are corrupted. Contact your administrator to restore them."
@@ -132,24 +213,30 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
           : "Couldn't load your preferences.";
       set({
         loaded: true,
+        unavailableForRole: false,
         bootstrapError: message,
       });
     }
   },
 
   saveTutorialProgress: async (progress) => {
+    let owns = capturePreferenceOwner();
+    if (get().unavailableForRole) throw new PreferencesRequestSuperseded();
     // Completion clears these same fields, so progress participates in the
     // write lock. A queued transition becomes obsolete once completion lands,
     // even when its local publication is intentionally deferred.
     for (let waitedMs = 0; get().writing && waitedMs < 5000; waitedMs += 50) {
       await new Promise((resolve) => setTimeout(resolve, 50));
+      requirePreferenceOwner(owns);
     }
+    requirePreferenceOwner(owns);
     if (get().writing) {
       const error = new Error("Another preference save is still pending. Please try again.");
       set({ writeError: error.message });
       throw error;
     }
     if (get().tutorialCompletedAt !== null) return;
+    owns = captureRequestOwner();
     set({ writing: true, writeError: null });
     try {
       const payload = await updateUserComposerPreferences({
@@ -158,6 +245,7 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         tutorial_run_id: progress.runId,
         tutorial_source_data_hash: progress.sourceDataHash,
       });
+      requirePreferenceOwner(owns);
       set({
         tutorialStage: payload.tutorial_stage,
         tutorialSessionId: payload.tutorial_session_id,
@@ -167,6 +255,12 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         writeError: null,
       });
     } catch (err) {
+      requirePreferenceOwner(owns);
+      if (isUnavailableForRole(err)) {
+        preferenceRevision += 1;
+        set({ ...INITIAL_STATE, unavailableForRole: true });
+        throw new PreferencesRequestSuperseded();
+      }
       set({
         writing: false,
         writeError: err instanceof Error
@@ -178,13 +272,23 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
   },
 
   setShowAdvanced: async (value) => {
-    if (get().writing) return;
+    let owns = capturePreferenceOwner();
+    if (get().unavailableForRole) throw new PreferencesRequestSuperseded();
+    if (get().writing) throw new Error("Another preference save is still pending. Please try again.");
     const previous = get().showAdvanced;
+    owns = captureRequestOwner();
     set({ showAdvanced: value, writing: true, writeError: null });
     try {
       const payload = await updateUserComposerPreferences({ show_advanced: value });
+      requirePreferenceOwner(owns);
       set({ showAdvanced: payload.show_advanced, writing: false });
     } catch (err) {
+      requirePreferenceOwner(owns);
+      if (isUnavailableForRole(err)) {
+        preferenceRevision += 1;
+        set({ ...INITIAL_STATE, unavailableForRole: true });
+        throw new PreferencesRequestSuperseded();
+      }
       set({
         showAdvanced: previous,
         writing: false,
@@ -198,11 +302,24 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
   },
 
   markTutorialGraduated: async (options) => {
+    let owns = capturePreferenceOwner();
+    if (get().unavailableForRole) throw new PreferencesRequestSuperseded();
+    const receipt = (completedAt: string | null): TutorialGraduationReceipt => ({
+      completedAt,
+      assertCurrent: () => requirePreferenceOwner(owns),
+      publish: () => {
+        requirePreferenceOwner(owns);
+        if (get().tutorialCompletedAt !== completedAt) throw new PreferencesRequestSuperseded();
+        set({ tutorialCompletedAt: completedAt, tutorialCompleted: tutorialCompletedFrom(completedAt) });
+      },
+    });
     // Wait for the current writer, then re-read the durable timestamp. A
     // timeout must not overlap writes or report an unsaved completion.
     for (let waitedMs = 0; get().writing && waitedMs < 5000; waitedMs += 50) {
       await new Promise((resolve) => setTimeout(resolve, 50));
+      requirePreferenceOwner(owns);
     }
+    requirePreferenceOwner(owns);
     if (get().writing) {
       const error = new Error("Another preference save is still pending. Please try again.");
       set({ writeError: error.message });
@@ -211,15 +328,18 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     const settled = get();
     const publishLocally = options.publishLocally ?? true;
     if (settled.tutorialCompletedAt !== null) {
+      owns = captureRequestOwner();
       set({ writeError: null });
-      if (publishLocally) get().publishTutorialGraduation(settled.tutorialCompletedAt);
-      return settled.tutorialCompletedAt;
+      const currentReceipt = receipt(settled.tutorialCompletedAt);
+      if (publishLocally) currentReceipt.publish();
+      return currentReceipt;
     }
     const stamp = new Date().toISOString();
     const previous = {
       tutorialCompletedAt: get().tutorialCompletedAt,
       tutorialCompleted: get().tutorialCompleted,
     };
+    owns = captureRequestOwner();
     set({
       writing: true,
       writeError: null,
@@ -233,6 +353,7 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
       try {
         payload = await updateUserComposerPreferences(patchBody);
       } catch (err) {
+        requirePreferenceOwner(owns);
         // One delayed retry for a rate-limited save: the tutorial's own
         // stage-persist burst can transiently exhaust the write bucket,
         // and completion is the one write that must not be dropped (it
@@ -248,8 +369,10 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
           throw err;
         }
         await new Promise((resolve) => setTimeout(resolve, waitMs));
+        requirePreferenceOwner(owns);
         payload = await updateUserComposerPreferences(patchBody);
       }
+      requirePreferenceOwner(owns);
       set({
         tutorialCompletedAt: payload.tutorial_completed_at,
         tutorialCompleted: publishLocally && tutorialCompletedFrom(payload.tutorial_completed_at),
@@ -264,8 +387,14 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         writing: false,
         writeError: null,
       });
-      return payload.tutorial_completed_at;
+      return receipt(payload.tutorial_completed_at);
     } catch (err) {
+      requirePreferenceOwner(owns);
+      if (isUnavailableForRole(err)) {
+        preferenceRevision += 1;
+        set({ ...INITIAL_STATE, unavailableForRole: true });
+        throw new PreferencesRequestSuperseded();
+      }
       set({
         tutorialCompletedAt: previous.tutorialCompletedAt,
         tutorialCompleted: previous.tutorialCompleted,
@@ -284,19 +413,15 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     }
   },
 
-  publishTutorialGraduation: (completedAt) => {
-    set({
-      tutorialCompletedAt: completedAt,
-      tutorialCompleted: tutorialCompletedFrom(completedAt),
-    });
-  },
-
   resetTutorial: async () => {
-    if (get().writing) return;
+    let owns = capturePreferenceOwner();
+    if (get().unavailableForRole) throw new PreferencesRequestSuperseded();
+    if (get().writing) throw new Error("Another preference save is still pending. Please try again.");
     const previous = {
       tutorialCompletedAt: get().tutorialCompletedAt,
       tutorialCompleted: get().tutorialCompleted,
     };
+    owns = captureRequestOwner();
     set({
       writing: true,
       writeError: null,
@@ -314,6 +439,7 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         tutorial_run_id: null,
         tutorial_source_data_hash: null,
       });
+      requirePreferenceOwner(owns);
       set({
         tutorialCompletedAt: payload.tutorial_completed_at,
         tutorialCompleted: tutorialCompletedFrom(payload.tutorial_completed_at),
@@ -326,7 +452,14 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         tutorialSourceDataHash: payload.tutorial_source_data_hash,
         writing: false,
       });
+      return { assertCurrent: () => requirePreferenceOwner(owns) };
     } catch (err) {
+      requirePreferenceOwner(owns);
+      if (isUnavailableForRole(err)) {
+        preferenceRevision += 1;
+        set({ ...INITIAL_STATE, unavailableForRole: true });
+        throw new PreferencesRequestSuperseded();
+      }
       set({
         tutorialCompletedAt: previous.tutorialCompletedAt,
         tutorialCompleted: previous.tutorialCompleted,
@@ -341,26 +474,30 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
   },
 
   dismissFreeformIntro: async () => {
+    let owns = capturePreferenceOwner();
+    if (get().unavailableForRole) throw new PreferencesRequestSuperseded();
     if (get().writing) {
       throw new Error(
         "preferencesStore: dismissFreeformIntro called while a write was in flight",
       );
     }
     const stamp = new Date().toISOString();
+    owns = captureRequestOwner();
     set({ writing: true, writeError: null });
     try {
       const payload = await updateUserComposerPreferences({
         freeform_intro_dismissed_at: stamp,
       });
+      requirePreferenceOwner(owns);
       const resolved = payload.freeform_intro_dismissed_at;
       set({
         freeformIntroDismissedAt: resolved,
         writing: false,
       });
-      if (typeof window !== "undefined" && resolved !== null) {
+      if (typeof window !== "undefined" && resolved !== null && preferencePrincipal !== null) {
         try {
           window.localStorage.setItem(
-            FREEFORM_INTRO_DISMISSED_STORAGE_KEY,
+            `${FREEFORM_INTRO_DISMISSED_STORAGE_KEY}:${preferencePrincipal}`,
             resolved,
           );
         } catch {
@@ -369,6 +506,12 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         }
       }
     } catch (err) {
+      requirePreferenceOwner(owns);
+      if (isUnavailableForRole(err)) {
+        preferenceRevision += 1;
+        set({ ...INITIAL_STATE, unavailableForRole: true });
+        throw new PreferencesRequestSuperseded();
+      }
       set({
         writing: false,
         writeError:
@@ -382,7 +525,17 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
 
   clearError: () => set({ writeError: null }),
 
-  reset: () => set(INITIAL_STATE),
+  bindPrincipal: (principalId, authProvider) => {
+    preferenceRevision += 1;
+    preferencePrincipal = JSON.stringify([authProvider, principalId]);
+    set(INITIAL_STATE);
+  },
+
+  reset: () => {
+    preferenceRevision += 1;
+    preferencePrincipal = null;
+    set(INITIAL_STATE);
+  },
 }));
 
 // ── Cross-tab sync wiring ────────────────────────────────────────────────
@@ -398,12 +551,13 @@ export function initCrossTabSync(): void {
 
   window.addEventListener("storage", (event: StorageEvent) => {
     if (event.newValue === null) return;
-    if (event.key === FREEFORM_INTRO_DISMISSED_STORAGE_KEY) {
-      usePreferencesStore.setState({
-        freeformIntroDismissedAt: event.newValue,
-      });
-      return;
-    }
+    if (preferencePrincipal === null) return;
+    if (event.key !== `${FREEFORM_INTRO_DISMISSED_STORAGE_KEY}:${preferencePrincipal}`) return;
+    const state = usePreferencesStore.getState();
+    if (!state.loaded || state.unavailableForRole) return;
+    // Storage is a refresh hint, never an account preference authority. The
+    // owned GET discards a late event/read after reset or account replacement.
+    void state.bootstrap({ publishTutorialCompletion: false });
   });
 }
 

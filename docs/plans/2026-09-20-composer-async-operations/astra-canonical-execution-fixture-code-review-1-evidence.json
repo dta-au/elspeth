@@ -1,0 +1,438 @@
+{
+  "scope": "stdlib source/hash/AST only; no project or candidate execution",
+  "files": [
+    {
+      "path": "tests/e2e/recovery/test_sink_effect_deployment_profiles.py",
+      "preimage_sha256": "b1c64bdf5553248711524c74234fd466bef5fe5d1cdc18c3df89be74429a9f00",
+      "replacement_sha256": "49046298467e1c348941b92e5f8560804652d168b80277373bf04410b76ab52b",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/integration/cli/test_state_engine_lifecycle_profiles.py",
+      "preimage_sha256": "356b5af314a25dc7f99a941423ff78cdd9c7d5d2caad3007356b4a7ac193190f",
+      "replacement_sha256": "f70fa969db149679037b7ca034fbfab80e262cff3c4075dbcbfa1208c969ab94",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/integration/pipeline/test_composer_runtime_agreement.py",
+      "preimage_sha256": "69dc2cbf281d27de65dcf739dca2fe176e53e9c31316bf988267607549082756",
+      "replacement_sha256": "f3ebf7455be22f456a88b3f033f20ef2f50c21a21449f83285de1a8a3934e951",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/integration/web/composer/parity/test_readiness_preflight_profile_lowering.py",
+      "preimage_sha256": "1473e62bea2580a5462a7a44d68b6a003c0ecd6cc84fcf5117062382eaf7016a",
+      "replacement_sha256": "6b8966bf228b296046a327253005f512185e886ca697b38a5fd9ec78febf8802",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/integration/web/composer/test_interpretation_run_backstop.py",
+      "preimage_sha256": "28cd39d498857fb93593859d74949e1cc1662c278d014e4fe0deecfc0879bbe1",
+      "replacement_sha256": "8a5840714f0d34731d3c3ab1c4d75b11af3b282d5593512b128e0fa8f5e5d8e1",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/integration/web/test_plugin_policy_end_to_end.py",
+      "preimage_sha256": "d9aa6312a8160ab62b277a0dbb2f5eaff48520bd1a411b4dda0a4438181dadc6",
+      "replacement_sha256": "f25027dc2ed364a5f9b326ffac4af14bacbd3634c0688f8e9ad9baac73a78192",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/integration/web/test_preflight_per_class.py",
+      "preimage_sha256": "d9ea00813996d456a4db207b026370d2735c36fd9c3f78335e2828ae914b46b2",
+      "replacement_sha256": "9f88b3ea1801b57388d1a0fdf4c3267edb000d5c41f3a8d6ae42998713007a27",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/testcontainer/web/test_cross_process_execution_handoff_postgres.py",
+      "preimage_sha256": "b6179faa779946fc88cd9b55712704f8416f230a0572db17d095a228d7596695",
+      "replacement_sha256": "5db40d6112211067934d1f7464aff6636f3d84a28bfab338810dcde44ee7d289",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/testcontainer/web/test_cross_process_run_reconciliation_postgres.py",
+      "preimage_sha256": "5eed9a7667dc4e379c392fb2f4a895a4765db75bde9861f44f4902aabfafdf19",
+      "replacement_sha256": "feaa8e011a00c36990bc9807f7f6a15a378b18fe8a2766b3f8ae16b17aacc9dd",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_loss_watcher_backoff.py",
+      "preimage_sha256": "162b2cc7946983dab0024e64f7e628de6b993489a83ddc05401711f1abcea4f3",
+      "replacement_sha256": "209548a4d34d5b0c3183979c52a6658dc5bd7d55f79d44d3aa5adcb5be58a714",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_service.py",
+      "preimage_sha256": "7e09bb3692bcb2012c4746dcf51ac3dacdd46e6e71a9d7a4403efe1cfab5dc1d",
+      "replacement_sha256": "a2c26f153c19ff56c533b8cccc4fd5afc629ea681c27359d81ab8c2f46a0e02b",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [
+        "Assert(test=Call(func=Attribute(value=Name(id='watcher', ctx=Load()), attr='cancelled', ctx=Load()), args=[], keywords=[]))"
+      ],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_session_operation_lease.py",
+      "preimage_sha256": "886dfe0a282de12f3cd8b9db7ee029ce9db88016343824b3c0949b273ce70c45",
+      "replacement_sha256": "9caf3da9e3c6ecd21d3cab0a8168008587c186e938e2c33b8bcdc80c02fd3da0",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [
+        "Assert(test=Await(value=Call(func=Attribute(value=Name(id='asyncio', ctx=Load()), attr='to_thread', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='blocked_authority', ctx=Load()), attr='renew_started', ctx=Load()), attr='wait', ctx=Load()), Constant(value=2)], keywords=[])))"
+      ],
+      "ast_parse": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_validate_blob_inline.py",
+      "preimage_sha256": "3cada68497b5d99c69a27397dbfa9ea862ed39c651a4cd7a94024aaf35198dc0",
+      "replacement_sha256": "6dfa73b4d05bc363eca76c3200801f386db0c0dc93fcceed32dd22cce9848b92",
+      "guard_matches": true,
+      "live_preimage_equal": true,
+      "registrations_equal": true,
+      "mock_assert_calls_equal": true,
+      "original_raises_calls_retained": true,
+      "removed_assert_AST": [],
+      "ast_parse": true
+    }
+  ],
+  "new_files": [
+    {
+      "path": "tests/helpers/execution_custody.py",
+      "sha256": "c144e7cb4136af6833d5c976e47325d68825fa58b9f67660b674d773121f721e",
+      "ast_parse": true,
+      "live_absent": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_canonical_execution_fixture.py",
+      "sha256": "a7657f2afac74f82ee14a936549d8387abf16378e0bc153fb9a8342a7dfe693e",
+      "ast_parse": true,
+      "live_absent": true
+    }
+  ],
+  "constructor6_delta": [
+    {
+      "path": "tests/e2e/recovery/test_sink_effect_deployment_profiles.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/integration/cli/test_state_engine_lifecycle_profiles.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/integration/pipeline/test_composer_runtime_agreement.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/integration/web/composer/parity/test_readiness_preflight_profile_lowering.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/integration/web/composer/test_interpretation_run_backstop.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/integration/web/test_plugin_policy_end_to_end.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/integration/web/test_preflight_per_class.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/testcontainer/web/test_cross_process_execution_handoff_postgres.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/testcontainer/web/test_cross_process_run_reconciliation_postgres.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_loss_watcher_backoff.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_service.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_session_operation_lease.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/unit/web/execution/test_validate_blob_inline.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    },
+    {
+      "path": "tests/helpers/execution_custody.py",
+      "preimage_matches_guard": true,
+      "replacement_matches_guard": true,
+      "constructor6_exact": true
+    }
+  ],
+  "unchanged_constructor_control": [
+    {
+      "path": "tests/unit/web/execution/test_execution_constructor_custody.py",
+      "sha256": "4045c31f53787b1e21c8ce41bd014023577621c959b77c9a43ca3b2ebaab02b0",
+      "guard_matches": true
+    }
+  ],
+  "complete_patch_sha256": "5751c386821f2634bc5ad742db5257924d0cf379bfcafcfc9da832af689eb0b8",
+  "complete_patch_reconstructed_exact": true,
+  "constructor6_delta_reconstructed_exact": true,
+  "source_instrument_controls": {
+    "positive": true,
+    "registration_negative_detected": true,
+    "assert_negative_detected": true,
+    "mock_negative_detected": true,
+    "raises_negative_detected": true
+  },
+  "six_boundary_inventory": [
+    {
+      "node_base": "tests/unit/web/execution/test_session_operation_lease.py::test_completion_cancellation_still_joins_exact_close_once",
+      "complete_body_exact": true,
+      "decorator_dump_literal_equal": true,
+      "decorator_dump_equal_after_empty_keywords_serialization_normalization": true
+    },
+    {
+      "node_base": "tests/unit/web/execution/test_session_operation_lease.py::test_done_callback_logger_failure_is_tracked_after_exact_lease_close",
+      "complete_body_exact": true,
+      "decorator_dump_literal_equal": false,
+      "decorator_dump_equal_after_empty_keywords_serialization_normalization": true
+    },
+    {
+      "node_base": "tests/unit/web/execution/test_session_operation_lease.py::test_shutdown_preserves_completed_lease_failure_and_joins_peer",
+      "complete_body_exact": true,
+      "decorator_dump_literal_equal": false,
+      "decorator_dump_equal_after_empty_keywords_serialization_normalization": true
+    },
+    {
+      "node_base": "tests/unit/web/execution/test_session_operation_lease.py::test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_retains_lease",
+      "complete_body_exact": true,
+      "decorator_dump_literal_equal": true,
+      "decorator_dump_equal_after_empty_keywords_serialization_normalization": true
+    },
+    {
+      "node_base": "tests/unit/web/execution/test_session_operation_lease.py::test_expired_execute_lease_takeover_stops_queued_real_worker_before_any_stale_effect",
+      "complete_body_exact": true,
+      "decorator_dump_literal_equal": true,
+      "decorator_dump_equal_after_empty_keywords_serialization_normalization": true
+    },
+    {
+      "node_base": "tests/unit/web/execution/test_session_operation_lease.py::test_submit_failure_after_run_creation_terminalizes_before_return",
+      "complete_body_exact": true,
+      "decorator_dump_literal_equal": true,
+      "decorator_dump_equal_after_empty_keywords_serialization_normalization": true
+    }
+  ],
+  "runtime": false,
+  "instrument_notes": [
+    "First attempt stopped on literal decorator dump serialization: local AST dump emits empty keywords=[] omitted by author dump; source-to-source decorators independently equal. Normalization applies only to inventory serialization comparison.",
+    "One exploratory command had a mistyped nonexistent cwd and did not start."
+  ],
+  "finding_source_evidence": {
+    "C1": {
+      "path": "<private-workspace>/frontend-execute-constructor-fixture-migration-1/canonical-execution-fixture-package-1/new-tests/tests/unit/web/execution/test_canonical_execution_fixture.py",
+      "line": 280,
+      "end_line": 340,
+      "source": "def test_actual_failed_release_stays_pending_while_independent_release_and_private_join_complete(tmp_path: Path):\n    repo = Path(__file__).resolve().parents[4]\n    env = {\n        \"PATH\": str(Path(sys.executable).parent) + \":/usr/bin:/bin\",\n        \"PYTHONPATH\": os.pathsep.join((str(repo / \"src\"), str(repo / \"elspeth-lints/src\"), str(repo))),\n        \"PYTHONUNBUFFERED\": \"1\",\n        \"LITELLM_LOCAL_MODEL_COST_MAP\": \"True\",\n    }\n    primary = None\n    log = tmp_path / \"failed-release-child.log\"\n    with log.open(\"wb\") as stream:\n        process = subprocess.Popen(\n            [sys.executable, str(Path(__file__).resolve()), \"--failed-release-child\", str(tmp_path)],\n            cwd=repo,\n            env=env,\n            stdout=stream,\n            stderr=subprocess.STDOUT,\n            start_new_session=False,\n        )\n        try:\n            checkpoint = tmp_path / \"checkpoint.json\"\n            deadline = time.monotonic() + 15\n            while not checkpoint.exists() and process.poll() is None and time.monotonic() < deadline:\n                time.sleep(0.01)\n            assert checkpoint.exists(), \"actual SQL custody child failed before its oracle: \" + log.read_text()\n            proof = json.loads(checkpoint.read_bytes())\n            assert proof == {\n                \"actual_failed_SQL_Future_original\": True,\n                \"actual_invocation_finished_exited\": True,\n                \"actual_counter_and_callback_return\": True,\n                \"exact_captured_generation\": True,\n                \"successful_independent_release\": True,\n                \"failed_release_retained_pending\": True,\n                \"private_executor_actual_joined\": True,\n                \"shutdown_remains_pending\": True,\n                \"COMPLETE_refused\": True,\n                \"watchdog_completion_unsent\": True,\n            }\n            assert process.poll() is None, \"failed release silently completed its actual pending custody\"\n        except BaseException as original:\n            primary = original\n            raise\n        finally:\n            try:\n                if process.poll() is None:\n                    with suppress(ProcessLookupError):\n                        process.terminate()\n                    try:\n                        process.wait(timeout=1)\n                    except subprocess.TimeoutExpired:\n                        with suppress(ProcessLookupError):\n                            process.kill()\n                        process.wait(timeout=2)\n                else:\n                    process.wait(timeout=2)\n            except BaseException as cleanup:\n                if primary is not None and cleanup is not primary:\n                    raise BaseExceptionGroup(\"SQL custody assertion and owned child cleanup failed\", [primary, cleanup]) from None\n                raise\n            (tmp_path / \"failed-release-child.exit\").write_text(str(process.returncode) + \"\\n\")\n            assert process.poll() is not None"
+    },
+    "C2": {
+      "_route_harness": {
+        "path": "<private-workspace>/frontend-execute-constructor-fixture-migration-1/canonical-execution-fixture-package-1/replacements/tests/unit/web/execution/test_session_operation_lease.py",
+        "line": 403,
+        "end_line": 424,
+        "source": "def _route_harness(session_id: UUID) -> _RouteHarness:\n    app = FastAPI()\n    session_service = _RouteSessionService(session_id)\n    app.state.session_service = session_service\n    app.state.settings = SimpleNamespace(auth_provider=\"local\")\n    wire_test_pipeline_user_authority(app, identity_id=_USER_ID)\n    request = Request(\n        {\n            \"type\": \"http\",\n            \"method\": \"POST\",\n            \"path\": f\"/api/sessions/{session_id}/execute\",\n            \"headers\": [],\n            \"app\": app,\n        }\n    )\n    endpoint = next(route.endpoint for route in create_execution_router().routes if route.name == \"execute_pipeline\")\n    return _RouteHarness(\n        endpoint=endpoint,\n        request=request,\n        user=UserIdentity(user_id=_USER_ID, username=\"execution-lease-user\"),\n        session_service=session_service,\n    )"
+      },
+      "_http_route_app": {
+        "path": "<private-workspace>/frontend-execute-constructor-fixture-migration-1/canonical-execution-fixture-package-1/replacements/tests/unit/web/execution/test_session_operation_lease.py",
+        "line": 445,
+        "end_line": 461,
+        "source": "def _http_route_app(\n    *,\n    session_service: _RouteSessionService,\n    execution_service: _RouteExecutionService,\n) -> FastAPI:\n    app = FastAPI()\n    app.state.session_service = session_service\n    app.state.execution_service = execution_service\n    app.state.settings = SimpleNamespace(auth_provider=\"local\")\n    wire_test_pipeline_user_authority(app, identity_id=_USER_ID)\n\n    async def authenticated_user() -> UserIdentity:\n        return UserIdentity(user_id=_USER_ID, username=\"execution-lease-user\")\n\n    app.dependency_overrides[get_current_user] = authenticated_user\n    app.include_router(create_execution_router())\n    return app"
+      },
+      "_install_acquire": {
+        "path": "<private-workspace>/frontend-execute-constructor-fixture-migration-1/canonical-execution-fixture-package-1/replacements/tests/unit/web/execution/test_session_operation_lease.py",
+        "line": 427,
+        "end_line": 442,
+        "source": "def _install_acquire(\n    monkeypatch: pytest.MonkeyPatch,\n    lease: _ControllableLease,\n    *,\n    trace: list[str] | None = None,\n) -> list[dict[str, object]]:\n    calls: list[dict[str, object]] = []\n\n    async def acquire(_cls: type[SessionOperationLease], authority: object, **kwargs: object) -> _ControllableLease:\n        if trace is not None:\n            trace.append(\"acquire\")\n        calls.append({\"authority\": authority, **kwargs})\n        return lease\n\n    monkeypatch.setattr(SessionOperationLease, \"acquire\", classmethod(acquire))\n    return calls"
+      },
+      "test_execute_route_acquires_exact_execute_lease_and_transfers_it": {
+        "path": "<private-workspace>/frontend-execute-constructor-fixture-migration-1/canonical-execution-fixture-package-1/replacements/tests/unit/web/execution/test_session_operation_lease.py",
+        "line": 482,
+        "end_line": 505,
+        "source": "async def test_execute_route_acquires_exact_execute_lease_and_transfers_it(monkeypatch: pytest.MonkeyPatch) -> None:\n    session_id = uuid4()\n    run_id = uuid4()\n    harness = _route_harness(session_id)\n    lease = _ControllableLease(_context(session_id))\n    acquired = _install_acquire(monkeypatch, lease)\n    service = _RouteExecutionService(run_id)\n    service.allowed.set()\n\n    response = await _invoke_execute_route(harness, service, session_id=session_id)\n\n    assert response == {\"run_id\": str(run_id)}\n    assert acquired == [\n        {\n            \"authority\": harness.session_service.session_operation_authority,\n            \"session_id\": session_id,\n            \"operation_kind\": SessionOperationKind.EXECUTE,\n            \"owner_instance_id\": \"execution-route-test\",\n            \"lease_seconds\": 41,\n        }\n    ]\n    assert len(service.calls) == 1\n    assert service.calls[0][\"session_operation_lease\"] is lease\n    assert lease.close_calls == 0, \"successful submission transfers ownership to background completion\""
+      }
+    },
+    "C3": {
+      "hook": {
+        "path": "<private-workspace>/frontend-execute-constructor-fixture-migration-1/canonical-execution-fixture-package-1/replacements/tests/testcontainer/web/test_cross_process_execution_handoff_postgres.py",
+        "line": 178,
+        "end_line": 179,
+        "source": "def die_before_submit(function, run_id, *args, **kwargs):\n                die(run_id)"
+      },
+      "production_submit": {
+        "path": "<private-workspace>/frontend-execute-cleanup-consumer-implementation-3/replacements/src/elspeth/web/execution/service.py",
+        "line": 1971,
+        "end_line": 2006,
+        "source": "def _submit_owned_pipeline(\n        self,\n        obligation: ExecutionAcquisitionObligation,\n        lease: SessionOperationLease,\n        loss_watcher: asyncio.Task[None],\n        invocation: Callable[[], _RunPipelineOutcome],\n    ) -> None:\n        \"\"\"Keep the actual generation/registry decision through physical submit.\"\"\"\n        executor = self._executor\n        if executor is None:\n            raise AuditIntegrityError(\"Execution executor was not allocated\")\n        with self._shutdown_events_lock:\n            if obligation in self._pipeline_watchers:\n                raise AuditIntegrityError(\"Execution obligation attempted another pipeline submission\")\n            self._pipeline_watchers[obligation] = loss_watcher\n        try:\n            with obligation.pipeline_submission_decision(lease.context):\n                try:\n                    future = executor.submit(invocation)\n                except BaseException as original:\n                    obligation.record_pipeline_submission_unknown(original)\n                    raise\n                obligation.bind_pipeline_future(future)\n                with self._shutdown_events_lock:\n                    self._pipeline_completion_owners[future] = obligation\n        except BaseException as original:\n            if obligation.completion_required:\n                obligation.registry.record_failure(original)\n            raise\n        # Future may already be done: add_done_callback can execute inline. Neither\n        # the generation nor registry decision lock is held at this boundary.\n        try:\n            future.add_done_callback(partial(self._observe_pipeline_done, session_operation_lease=lease, loss_watcher=loss_watcher))\n        except BaseException as original:\n            obligation.registry.record_failure(original)\n            raise"
+      }
+    },
+    "C4": {
+      "test_setup_failure_cleanup_slog_uses_exc_class_not_str": {
+        "path": "<private-workspace>/frontend-execute-constructor-fixture-migration-1/canonical-execution-fixture-package-1/replacements/tests/unit/web/execution/test_service.py",
+        "line": 6963,
+        "end_line": 7009,
+        "source": "async def test_setup_failure_cleanup_slog_uses_exc_class_not_str(\n        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody\n    ) -> None:\n        \"\"\"When a setup failure triggers cleanup and cleanup's own\n        ``update_run_status`` raises a ``SQLAlchemyError``, the slog\n        record must carry ``cleanup_exc_class`` + ``original_exc_class``\n        (class names) \u2014 not the legacy ``cleanup_error``/``original_error``\n        string fields.\"\"\"\n        from sqlalchemy.exc import OperationalError\n\n        session_id = uuid4()\n        run_id = uuid4()\n        mock_session_service.create_run.return_value = _run_record_stub(id=run_id)\n\n        # First update_run_status call (in cleanup) raises OperationalError.\n        mock_session_service.update_run_status.side_effect = OperationalError(\n            \"UPDATE runs ...\",\n            {\"id\": str(run_id), \"error\": \"Setup failed: SuperSecretDSN://u:p@h/d\"},\n            Exception(\"lock wait timeout exceeded \u2014 __cause__ carries DSN\"),\n        )\n\n        # Force the setup path to fail so the cleanup catch fires.\n        # _executor.submit raising is the simplest route.\n        def submit_raises(*_args: Any, **_kwargs: Any) -> Future[Any]:\n            raise RuntimeError(\"pool shutdown\")\n\n        service._executor.submit = submit_raises  # type: ignore[method-assign]\n\n        with (\n            patch(\"elspeth.web.execution.service.slog\") as mock_slog,\n            pytest.raises(RuntimeError, match=\"pool shutdown\"),\n        ):\n            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)\n\n        # slog.error was called for the cleanup failure.\n        slog_calls = [c for c in mock_slog.error.call_args_list if c[0] and c[0][0] == \"run_cleanup_status_update_failed\"]\n        assert len(slog_calls) == 1, mock_slog.error.call_args_list\n        kwargs = slog_calls[0][1]\n\n        # The narrow-catch kwargs are class names, not strings.\n        assert kwargs[\"cleanup_exc_class\"] == \"OperationalError\"\n        assert kwargs[\"original_exc_class\"] == \"RuntimeError\"\n\n        # Legacy string-valued fields are GONE \u2014 this is the redaction\n        # regression guard. Any reintroduction re-opens the str(exc) leak.\n        assert \"cleanup_error\" not in kwargs\n        assert \"original_error\" not in kwargs"
+      },
+      "test_setup_cleanup_narrow_catch_lets_runtimeerror_escape": {
+        "path": "<private-workspace>/frontend-execute-constructor-fixture-migration-1/canonical-execution-fixture-package-1/replacements/tests/unit/web/execution/test_service.py",
+        "line": 7012,
+        "end_line": 7040,
+        "source": "async def test_setup_cleanup_narrow_catch_lets_runtimeerror_escape(\n        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody\n    ) -> None:\n        \"\"\"Narrow catch semantics: a RuntimeError from update_run_status\n        (programmer bug, not a DB/filesystem failure) MUST propagate\n        instead of being swallowed. Pre-narrowing, the broad\n        ``except Exception`` masked such bugs.\"\"\"\n        session_id = uuid4()\n        run_id = uuid4()\n        mock_session_service.create_run.return_value = _run_record_stub(id=run_id)\n\n        # First update_run_status (in cleanup) raises RuntimeError \u2014 outside\n        # the narrow (SQLAlchemyError, OSError) catch. It must escape.\n        mock_session_service.update_run_status.side_effect = RuntimeError(\"dataclass contract violated inside update_run_status\")\n\n        # Force setup to fail so cleanup fires.\n        def submit_raises(*_args: Any, **_kwargs: Any) -> Future[Any]:\n            raise RuntimeError(\"pool shutdown\")\n\n        service._executor.submit = submit_raises  # type: ignore[method-assign]\n\n        # The RuntimeError from update_run_status escapes the narrow catch.\n        # The outer `raise` is bypassed \u2014 the cleanup RuntimeError wins\n        # (Python's implicit exception chaining preserves both via\n        # __context__, but the foreground exception is the cleanup one).\n        # We accept either RuntimeError here \u2014 the key invariant is that\n        # a RuntimeError propagates rather than being swallowed.\n        with pytest.raises(RuntimeError):\n            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)"
+      },
+      "dependency_execute": {
+        "path": "frontend-execute-cleanup-consumer-implementation-3/replacements/src/elspeth/web/execution/service.py",
+        "line": 2008,
+        "source": "async def execute(\n        self,\n        session_id: UUID,\n        state_id: UUID | None = None,\n        *,\n        session_operation_lease: SessionOperationLease,\n        user_id: str | None = None,\n        auth_provider_type: str | None = None,\n        fanout_ack_token: str | None = None,\n        secret_ack_token: str | None = None,\n    ) -> UUID:\n        \"\"\"Start a background pipeline run.\n\n        B6 enforcement: raises RunAlreadyActiveError if a pending or running\n        run already exists for this session.\n\n        Returns the run_id immediately.\n\n        Args:\n            session_id: Session to execute.\n            state_id: Specific state to execute (latest if None).\n            user_id: Authenticated user's ID for scoped secret resolution.\n            auth_provider_type: Auth provider namespace for Landscape run attribution.\n            fanout_ack_token: Optional launch acknowledgement for high-fanout\n                LLM/provider-call risk.\n            secret_ack_token: Optional out-of-band approval of the run's\n                wired secret\u2192destination set (elspeth-f3c1aafd25).\n\n        Note: async because SessionService methods are async. The pipeline\n        itself runs in a background thread \u2014 only setup is async.\n        \"\"\"\n        if type(session_operation_lease) is not SessionOperationLease:\n            raise TypeError(\"session_operation_lease must be an exact SessionOperationLease\")\n        session_operation_context = session_operation_lease.context\n        if session_operation_context.operation_kind is not SessionOperationKind.EXECUTE:\n            raise ValueError(\"session_operation_lease must carry EXECUTE authority\")\n        if session_operation_context.fence.session_id != str(session_id):\n            raise ValueError(\"session_operation_lease belongs to a different session\")\n\n        obligation = self._execution_obligation(session_operation_lease)\n\n        # TOCTOU fix: per-session asyncio lock serialises the\n        # get_active_run \u2192 create_run window so two concurrent execute()\n        # calls cannot both pass the check before either creates a run.\n        session_key = str(session_id)\n        lock = self.get_session_lock(session_key)\n        async with lock:\n            prepared = await self._execute_locked(\n                session_id,\n                state_id,\n                session_operation_lease=session_operation_lease,\n                user_id=user_id,\n                auth_provider_type=auth_provider_type,\n                fanout_ack_token=fanout_ack_token,\n                secret_ack_token=secret_ack_token,\n            )\n            loss_watcher = self._create_loss_watcher(\n                session_operation_lease,\n                prepared.shutdown_event,\n                run_id=prepared.run_id,\n            )\n            try:\n                self._submit_owned_pipeline(\n                    obligation,\n                    session_operation_lease,\n                    loss_watcher,\n                    partial(\n                        self._run_pipeline,\n                        str(prepared.run_id),\n                        prepared.pipeline_yaml,\n                        prepared.shutdown_event,\n                        prepared.frozen_run_settings,\n                        prepared.user_id,\n                        prepared.auth_provider_type,\n                        session_operation_lease=session_operation_lease,\n                        durable_admission=True,\n                    ),\n                )\n            except BaseException as exc:\n                if not obligation.completion_required:\n                    cancellations, watcher_error = await self._join_loss_watcher(loss_watcher, session_operation_lease)\n                    failures: list[BaseException] = [exc]\n                    if watcher_error is not None:\n                        failures.append(watcher_error)\n                    try:\n                        await self._handle_pipeline_submission_failure(\n                            prepared.run_id,\n                            exc,\n                            session_operation_lease=session_operation_lease,\n                        )\n                    except BaseException as original:\n                        failures.append(original)\n                    _raise_lifecycle_originals(cancellations, failures)\n                raise\n            return prepared.run_id"
+      },
+      "dependency_pipeline_submission_decision": {
+        "path": "transport-cleanup-observation-implementation-1/execute-core4-app-failed-exit-layer/replacements/src/elspeth/web/execution_lease_cleanup.py",
+        "line": 394,
+        "source": "def pipeline_submission_decision(self, context: SessionOperationContext) -> Iterator[None]:\n        from elspeth.web.async_workers import _assert_execution_generation\n\n        with self.generation.submission_lock:\n            _assert_execution_generation(self.acquire_submission)\n            with self.registry._lock:\n                self.assert_business_dispatch(context)\n                self.completion_required = True\n                yield"
+      },
+      "dependency_record_pipeline_submission_unknown": {
+        "path": "transport-cleanup-observation-implementation-1/execute-core4-app-failed-exit-layer/replacements/src/elspeth/web/execution_lease_cleanup.py",
+        "line": 404,
+        "source": "def record_pipeline_submission_unknown(self, original: BaseException) -> None:\n        with self.registry._lock:\n            self.registry._require_obligation(self)\n            if not self.completion_required or self.pipeline is not None:\n                raise AuditIntegrityError(\"EXECUTE unknown pipeline submit lost declared ownership\")\n            self.pipeline_submission_unknown = original\n        self.registry.record_failure(original)"
+      }
+    }
+  },
+  "dependency_hashes": {
+    "frontend-execute-cleanup-consumer-implementation-3/replacements/src/elspeth/web/execution/service.py": "ebb3b1622fa6c3d8bf07cf35ab43deb366adae1f11aef1ca13b3dea740cad5e9",
+    "frontend-execute-cleanup-consumer-implementation-3/replacements/src/elspeth/web/execution/routes.py": "2f91459ea1c65782810c894a3628b798aab22afb2b49fba79b60833683f7463d"
+  },
+  "metadata_hashes": {
+    "assertion-migration-inventory.json": "37181f6232991e04b7ac73f67ce39a44922cc5544e5a98788b9a69e526407b7a",
+    "authored-native-control-nodes.json": "ad8dd29ebf450b3217b7ac816ed4ec6dc1fa8821407271dfc603f45228a4b83f",
+    "complete.patch": "5751c386821f2634bc5ad742db5257924d0cf379bfcafcfc9da832af689eb0b8",
+    "constructor6-delta-guards.json": "39e49f23c560c5295d73e04624209c15ab39340a5d2cbe79c10dee00ccffa99e",
+    "constructor6-to-canonical.patch": "08f8150ae3d1799b1ba5d3235ed74f21c01349e31c27b862a5255678dce9f867",
+    "controlled-static-inventory.json": "9ca8d47a59f232e439b874bce35e08890b96f9c3fca25c321ff6f960615100a8",
+    "exact-assertion-migration-controls.json": "12d6ea9fdf6e5c1ee379aaf660194235478cc2670d1ecee3c6ea86c06e6a6a2c",
+    "final-static-verification.json": "2f98fef3e11a9169e148ef1eb0a1b5b512c499afb5af379405511347ca8e27c5",
+    "guards.json": "c7fe1d80c47c03575a2cecd3db4b408448d6ac6bcc882f58cba17dc165f93259",
+    "original-normal-shutdown-golden.py": "e69f22ca9d49f0b9c49757511e0143a1a4089bc3d1e5e43b04d257e9ac7dcd86",
+    "remaining-native-boundary-nodes.json": "e877119e6b26a2e08cf9cbf87f8f021ed78cada33595156163eba1bc06b3580e",
+    "remaining-standalone-boundaries.json": "657fb97617809c3d4d59f5f03ea8d3a10fdaf727d81390b470732dd15f965b5e",
+    "report.md": "55fae4ca1c9e695ed40a02962108c0a9d23439ecc79fb151858330833299f86d"
+  },
+  "physical_exit_AST_preservation_not_reachability": [
+    {
+      "path": "tests/testcontainer/web/test_cross_process_execution_handoff_postgres.py",
+      "call_AST_equal": true,
+      "source_calls": 1
+    },
+    {
+      "path": "tests/testcontainer/web/test_cross_process_run_reconciliation_postgres.py",
+      "call_AST_equal": true,
+      "source_calls": 2
+    }
+  ],
+  "independent_source_check_script": {
+    "path": "astra-canonical-execution-fixture-code-review-1-source-check.py",
+    "sha256": "0f6d4181f93b0e92815718e5b4705cc0ae465141506dd84d59c57e2cde668632",
+    "warning": "Re-running reconstructs the base evidence file; findings were appended separately. No candidate source is executed."
+  }
+}

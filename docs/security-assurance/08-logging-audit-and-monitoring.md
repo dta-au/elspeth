@@ -234,8 +234,8 @@ Detail on roles and account lifecycle is in
 
 ### 1.4 Session, composer and workflow audit
 
-The sessions database (47 tables at session schema epoch 71) holds the
-authoring record ([guarantees § 13.3](../release/guarantees.md#133-session-mutation-is-audited),
+The sessions database (session schema epoch 72 in the 0.8.3 candidate)
+holds the authoring record ([guarantees § 13.3](../release/guarantees.md#133-session-mutation-is-audited),
 [§ 14.2](../release/guarantees.md#142-composer-transcript-is-preserved))
 [EV-306].
 

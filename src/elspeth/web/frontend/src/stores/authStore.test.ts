@@ -12,6 +12,7 @@ import { SESSION_OPERATION_RETRY_STORAGE_KEY } from "./sessionOperationRetry";
 
 vi.mock("@/api/client", () => ({
   fetchCurrentUser: vi.fn(),
+  fetchAuthConfig: vi.fn().mockResolvedValue({ provider: "local", registration_mode: "closed", sso_start_url: null }),
   login: vi.fn(),
   fetchUserComposerPreferences: vi.fn(),
   updateUserComposerPreferences: vi.fn(),
@@ -91,6 +92,31 @@ describe("authStore account-scoped store reset", () => {
     useShareableReviewStore.getState().reset();
     localStorage.clear();
     vi.clearAllMocks();
+  });
+
+  it("clears cached preferences at direct token replacement before the new profile settles", async () => {
+    usePreferencesStore.setState({
+      loaded: true,
+      showAdvanced: true,
+      tutorialCompletedAt: "2026-10-08T00:00:00Z",
+      tutorialCompleted: true,
+      writeError: "Old account error",
+    });
+    let resolveProfile!: (profile: Awaited<ReturnType<typeof apiClient.fetchCurrentUser>>) => void;
+    vi.mocked(apiClient.fetchCurrentUser).mockImplementationOnce(
+      () => new Promise<Awaited<ReturnType<typeof apiClient.fetchCurrentUser>>>((resolve) => { resolveProfile = resolve; }),
+    );
+
+    const replacing = useAuthStore.getState().loginWithToken("new-account-token");
+    expect(usePreferencesStore.getState()).toMatchObject({
+      loaded: false, unavailableForRole: false, showAdvanced: false,
+      tutorialCompletedAt: null, tutorialCompleted: false, writeError: null,
+    });
+    resolveProfile({
+      user_id: "new-account", username: "new-account", display_name: null,
+      email: null, groups: [], dev_admin: false,
+    });
+    await replacing;
   });
 
   it("logout clears account-scoped cached stores before another account can reuse them", async () => {

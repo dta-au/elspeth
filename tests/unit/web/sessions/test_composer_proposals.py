@@ -541,8 +541,10 @@ async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_r
         "private_arguments_hash",
         "provenance_hash",
         "audit_payload_hash",
+        "composer_operation",
     }
-    assert events[0].payload["schema"] == "pipeline_proposal_created.v2"
+    assert events[0].payload["schema"] == "pipeline_proposal_created.v3"
+    assert events[0].payload["composer_operation"] is None
     assert events[0].payload["base"] == {"kind": "absent"}
 
     restored = await service.get_authoritative_pipeline_proposal(

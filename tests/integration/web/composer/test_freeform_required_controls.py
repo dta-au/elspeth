@@ -46,6 +46,7 @@ from elspeth.web.sessions.models import (
     composition_proposals_table,
     composition_states_table,
 )
+from tests.fixtures.composer_fakes import StaticPluginSnapshotFactory
 from tests.helpers.session_fences import fenced_operation_context
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import (
     _clean_advisor_checkpoint,
@@ -777,7 +778,7 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
     view, snapshot = _required_textract_policy(tmp_path)
     app.state.catalog_service = view._full
     app.state.operator_profile_registry = view._profiles
-    app.state.plugin_snapshot_factory = lambda _user: snapshot
+    app.state.plugin_snapshot_factory = StaticPluginSnapshotFactory(snapshot)
     harness = SimpleNamespace(engine=sessions._engine, session_id=str(session.id))
     initial_state, output = await _incremental_named_blob_state(
         tmp_path,

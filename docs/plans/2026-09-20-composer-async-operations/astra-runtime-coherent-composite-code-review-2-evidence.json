@@ -1,0 +1,605 @@
+{
+  "C1": {
+    "src/elspeth/web/execution/recovery.py": {
+      "actual_acquire_line": 247,
+      "forwards_exact_local_obligation": true,
+      "old_call_missing_and_mutant_rejected": true
+    },
+    "src/elspeth/web/execution/routes.py": {
+      "actual_acquire_line": 1011,
+      "forwards_exact_local_obligation": true,
+      "old_call_missing_and_mutant_rejected": true
+    }
+  },
+  "artifacts": {
+    "runtime-coherent-composite-sol-2": {
+      "changed_byte_negative_for_every_file": true,
+      "checked_files": 62,
+      "manifest_sha256": "757f31d5592616d29fbb38e2fbe50e306770ece0a9af006140b4c66e2e0dbe38"
+    },
+    "runtime-live-application-preview-sol-2": {
+      "changed_byte_negative_for_every_file": true,
+      "checked_files": 29,
+      "manifest_sha256": "ad29d331529670bc97c686a26a91200d332800ec362e3fc2d538f1ff7dc9d2e0"
+    }
+  },
+  "complete_definition_comparison": {
+    "src/elspeth/web/app.py": {
+      "added": [
+        "_ExecutionShutdownObserver",
+        "_ExecutionShutdownObserver.bind",
+        "_ExecutionShutdownObserver.run",
+        "_join_execution_lifecycle"
+      ],
+      "changed": [
+        "_create_app",
+        "_service_lifespan",
+        "lifespan"
+      ],
+      "removed": [],
+      "unchanged_count": 26
+    },
+    "src/elspeth/web/application_finalizers.py": {
+      "added": [
+        "ApplicationFinalizerCapability._bind_physical_future",
+        "ApplicationFinalizerCapability._bind_physical_reservation",
+        "ApplicationFinalizerCapability._observe_physical_admission_release_return",
+        "ApplicationFinalizerCapability._observe_physical_callback_failure_exit",
+        "ApplicationFinalizerCapability._observe_physical_callback_return",
+        "ApplicationFinalizerCapability._retain_physical_failure",
+        "ApplicationFinalizerCapability.physical_completion_known",
+        "ApplicationFinalizerCapability.physical_completion_succeeded",
+        "ApplicationFinalizerCapability.physical_failure_completion_known",
+        "ApplicationFinalizerCapability.physical_failure_originals",
+        "ApplicationFinalizerCapability.physical_submission_failure_completion_known",
+        "ApplicationFinalizerOwner.owns_registered"
+      ],
+      "changed": [
+        "ApplicationFinalizerCapability",
+        "ApplicationFinalizerCapability.__init__",
+        "ApplicationFinalizerOwner"
+      ],
+      "removed": [],
+      "unchanged_count": 7
+    },
+    "src/elspeth/web/async_workers.py": {
+      "added": [
+        "_acquire_watch_admission",
+        "_assert_current_watch_generation",
+        "_assert_execution_generation",
+        "_finish_joined_shared_future",
+        "run_execution_lease_sql_finish_once"
+      ],
+      "changed": [
+        "_submit_shared",
+        "run_application_finalizer_in_worker",
+        "run_required_sql_finish_once"
+      ],
+      "removed": [],
+      "unchanged_count": 32
+    },
+    "src/elspeth/web/composer/planning_application.py": {
+      "added": [],
+      "changed": [
+        "PlanningApplication",
+        "PlanningApplication._stage_pipeline_plan"
+      ],
+      "removed": [],
+      "unchanged_count": 10
+    },
+    "src/elspeth/web/composer/provider_quota.py": {
+      "added": [],
+      "changed": [
+        "ProviderCallCustody"
+      ],
+      "removed": [],
+      "unchanged_count": 33
+    },
+    "src/elspeth/web/coordination/lifecycle.py": {
+      "added": [
+        "SessionOperationLease._acquire_execution",
+        "SessionOperationLease._close_execution",
+        "SessionOperationLease.execution_obligation"
+      ],
+      "changed": [
+        "SessionOperationLease",
+        "SessionOperationLease.__aexit__",
+        "SessionOperationLease.__init__",
+        "SessionOperationLease._close",
+        "SessionOperationLease._release_current",
+        "SessionOperationLease._renew_forever",
+        "SessionOperationLease._stop_and_join_renewal",
+        "SessionOperationLease.acquire",
+        "SessionOperationLease.close",
+        "SessionOperationLease.wait_until_lost"
+      ],
+      "removed": [],
+      "unchanged_count": 46
+    },
+    "src/elspeth/web/execution/recovery.py": {
+      "added": [],
+      "changed": [
+        "RunRecoveryCoordinator",
+        "RunRecoveryCoordinator._recover_candidate"
+      ],
+      "removed": [],
+      "unchanged_count": 8
+    },
+    "src/elspeth/web/execution/routes.py": {
+      "added": [],
+      "changed": [
+        "_close_execute_lease_before_transfer",
+        "create_execution_router"
+      ],
+      "removed": [],
+      "unchanged_count": 46
+    },
+    "src/elspeth/web/execution/service.py": {
+      "added": [
+        "ExecutionServiceImpl._close_execution_authority",
+        "ExecutionServiceImpl._create_loss_watcher",
+        "ExecutionServiceImpl._execution_obligation",
+        "ExecutionServiceImpl._execution_retirement_ready",
+        "ExecutionServiceImpl._finish_execution_authority",
+        "ExecutionServiceImpl._finish_executor_join",
+        "ExecutionServiceImpl._join_executor_owner",
+        "ExecutionServiceImpl._join_loss_watcher",
+        "ExecutionServiceImpl._join_registry_owner",
+        "ExecutionServiceImpl._loss_watcher_owner",
+        "ExecutionServiceImpl._observe_execution_completion",
+        "ExecutionServiceImpl._observe_pipeline_done",
+        "ExecutionServiceImpl._retire_settled_execution",
+        "ExecutionServiceImpl._run_loss_watcher",
+        "ExecutionServiceImpl._submit_owned_pipeline",
+        "ExecutionServiceImpl.executor_join_task",
+        "ExecutionServiceImpl.shutdown_finalizer",
+        "_ExecutionLossWatcherOwner",
+        "close_execute_lease_before_transfer"
+      ],
+      "changed": [
+        "ExecutionServiceImpl",
+        "ExecutionServiceImpl.__init__",
+        "ExecutionServiceImpl._on_pipeline_done",
+        "ExecutionServiceImpl._signal_shutdown_on_operation_loss",
+        "ExecutionServiceImpl.execute",
+        "ExecutionServiceImpl.join_executor_shutdown",
+        "ExecutionServiceImpl.recover_run",
+        "ExecutionServiceImpl.shutdown"
+      ],
+      "removed": [
+        "ExecutionServiceImpl.set_shutdown_finalizer",
+        "_LeaseCompletionFuture",
+        "_LeaseCompletionFuture.cancel"
+      ],
+      "unchanged_count": 68
+    },
+    "src/elspeth/web/operator_telemetry.py": {
+      "added": [],
+      "changed": [
+        "bootstrap_operator_telemetry"
+      ],
+      "removed": [],
+      "unchanged_count": 39
+    },
+    "src/elspeth/web/operator_telemetry_custody.py": {
+      "added": [],
+      "changed": [
+        "OperatorTelemetryCleanupOwner"
+      ],
+      "removed": [],
+      "unchanged_count": 51
+    },
+    "src/elspeth/web/operator_telemetry_installation.py": {
+      "added": [],
+      "changed": [
+        "OwnedTestTelemetryInstallation",
+        "TelemetryInstallation",
+        "TelemetryInstallation.__init__"
+      ],
+      "removed": [],
+      "unchanged_count": 13
+    },
+    "src/elspeth/web/required_work.py": {
+      "added": [
+        "RejectionProjectionUnusedDisposition",
+        "RejectionProjectionUnusedMetadata",
+        "RequiredWorkCoordinator.issue_rejection_projection_unused",
+        "RequiredWorkCoordinator.validate_creation_work",
+        "RequiredWorkCoordinator.validate_proposal_rejection_work",
+        "RequiredWorkCoordinator.verify_creation_outcome",
+        "RequiredWorkCoordinator.verify_rejection_returned",
+        "RequiredWorkTicket.observe_finish_once_handoff",
+        "_project_composer_failure_witnesses",
+        "_source_for_ordinal",
+        "project_composer_failure_witnesses"
+      ],
+      "changed": [
+        "ComposerFailureReduction",
+        "ComposerFailureReduction._project",
+        "ComposerFailureReduction.project",
+        "RequiredAuthorityKind",
+        "RequiredWorkBinding",
+        "RequiredWorkCoordinator",
+        "RequiredWorkCoordinator.__init__",
+        "RequiredWorkCoordinator.begin_proposal_child",
+        "RequiredWorkCoordinator.complete_unused",
+        "RequiredWorkKey",
+        "RequiredWorkKey.__post_init__",
+        "RequiredWorkKey.source",
+        "RequiredWorkSource",
+        "RequiredWorkTicket",
+        "RequiredWorkTicket.__init__",
+        "RequiredWorkTicket.complete_unused",
+        "make_required_work_key"
+      ],
+      "removed": [],
+      "unchanged_count": 68
+    },
+    "src/elspeth/web/sessions/composer_async_worker.py": {
+      "added": [
+        "_OperationLossWatchOwner",
+        "_OperationLossWatchOwner.bind_returned_task",
+        "_OperationLossWatchOwner.observe_producer_entry"
+      ],
+      "changed": [
+        "ComposerAsyncWorker",
+        "ComposerAsyncWorker._run_started",
+        "ComposerAsyncWorker._run_started_under_lease",
+        "ComposerAsyncWorker._watch",
+        "_OperationWatchObservation",
+        "_finish_operation_watcher"
+      ],
+      "removed": [],
+      "unchanged_count": 25
+    },
+    "src/elspeth/web/sessions/composer_turn.py": {
+      "added": [],
+      "changed": [
+        "_run_composer_turn"
+      ],
+      "removed": [],
+      "unchanged_count": 20
+    },
+    "src/elspeth/web/sessions/protocol.py": {
+      "added": [
+        "SessionServiceProtocol.create_pipeline_composition_proposal_finish_once",
+        "SessionServiceProtocol.reject_pipeline_composition_proposal_finish_once"
+      ],
+      "changed": [
+        "SessionServiceProtocol"
+      ],
+      "removed": [],
+      "unchanged_count": 330
+    },
+    "src/elspeth/web/sessions/routes/_helpers.py": {
+      "added": [],
+      "changed": [
+        "_handle_convergence_error",
+        "_handle_plugin_crash",
+        "_handle_runtime_preflight_failure"
+      ],
+      "removed": [],
+      "unchanged_count": 87
+    },
+    "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py": {
+      "added": [],
+      "changed": [
+        "_proposal_chat_ingress_inputs",
+        "_proposal_user_message_content",
+        "_settle_pipeline_proposal_under_compose_lock",
+        "settle_auto_commit_intent",
+        "settle_pipeline_proposal_under_compose_lock"
+      ],
+      "removed": [],
+      "unchanged_count": 13
+    },
+    "src/elspeth/web/sessions/routes/composer/proposals.py": {
+      "added": [],
+      "changed": [
+        "accept_composition_proposal",
+        "reject_composition_proposal"
+      ],
+      "removed": [],
+      "unchanged_count": 10
+    },
+    "src/elspeth/web/sessions/service.py": {
+      "added": [
+        "SessionServiceImpl._create_pipeline_composition_proposal",
+        "SessionServiceImpl._reject_pipeline_composition_proposal",
+        "SessionServiceImpl.create_pipeline_composition_proposal_finish_once",
+        "SessionServiceImpl.reject_pipeline_composition_proposal_finish_once"
+      ],
+      "changed": [
+        "SessionServiceImpl",
+        "SessionServiceImpl.create_pipeline_composition_proposal",
+        "SessionServiceImpl.reject_pipeline_composition_proposal"
+      ],
+      "removed": [],
+      "unchanged_count": 168
+    }
+  },
+  "current-live-to-composite.patch": {
+    "changed_patch_rejected": true,
+    "complete_reconstruction": true,
+    "sha256": "e3a160337cce40139cd57225f255910d37f57c5c7d5fa91be600e042c07342a2"
+  },
+  "current-live-to-selected.patch": {
+    "changed_patch_rejected": true,
+    "complete_reconstruction": true,
+    "sha256": "0225844e0481392f78c5bd537a08f4c5e523f3677a9eecf0ffe8e3054b9db1ce"
+  },
+  "full_protocol_ast_reverse_projection": true,
+  "head": "d2b73990d137e9725200c897544eebc5b958fdf4",
+  "lineage": {
+    "src/elspeth/web/app.py": {
+      "replacement_sha256": "145a21bf0ccdbda295f7f0da6be4b6af3b37e688da7e1542c63cc5d2bfbead29",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/application_finalizers.py": {
+      "replacement_sha256": "6df51b4177b72e072862f407fc77eb53162790783b4724b844c9c73a84277ab0",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/async_workers.py": {
+      "replacement_sha256": "4ba4114d208517255750712a0036b5a082315de8951e8997c9d1aefa7bf8f517",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/composer/planning_application.py": {
+      "replacement_sha256": "83595117a064284017cd53ca7c763693bf687ea1758fb50711f51b8c66f0b762",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/composer/provider_quota.py": {
+      "replacement_sha256": "bef5ca0ba886c999910ac201fd448d96f50a334443605df4f5153b4f7a1cd5b2",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/composer_watch_reads.py": {
+      "replacement_sha256": "9941dab9ddf5b72ab9f04cfc9ed24450e64a859137b4a952031c8ffb411ef16b",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/coordination/lifecycle.py": {
+      "replacement_sha256": "b20314c1ab30c2bf9bb858a7680753d2d65b490d9018484dfd5cbc2495f4d1a3",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/execution/recovery.py": {
+      "replacement_sha256": "33a837822149e283d4da30b02b85c128c3391638e374be7fc8deba57e0186415",
+      "source": "frontend-execute-cleanup-consumer-implementation-3"
+    },
+    "src/elspeth/web/execution/routes.py": {
+      "replacement_sha256": "2f91459ea1c65782810c894a3628b798aab22afb2b49fba79b60833683f7463d",
+      "source": "frontend-execute-cleanup-consumer-implementation-3"
+    },
+    "src/elspeth/web/execution/service.py": {
+      "replacement_sha256": "566a107c62e7cfe61fef4310bf76cf84c4cb9711d03f7e4b6d87fd3edcf44ca5",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/execution_lease_cleanup.py": {
+      "replacement_sha256": "49cc0c0235dc9e0b30dbeef4ca9a7ef029cf01358514d6f28f19add72692e9f4",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/operator_telemetry.py": {
+      "replacement_sha256": "bd94719a6dc80883974675d79e87dbf119a8b19d47245095573029e224a0bb45",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/operator_telemetry_custody.py": {
+      "replacement_sha256": "804c2c9122b2657e5157a4ffa8a292f0dc2bf8ab0affaf22bccc38efb0f17fd1",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/operator_telemetry_dispatch.py": {
+      "replacement_sha256": "3d77f1b4c36e8505be3efd9b6dd85172fab3c2eaf3933ce236c9a9e9d4638035",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/operator_telemetry_installation.py": {
+      "replacement_sha256": "82d90eaed114b614fb1ef7f3d3b328a612ec025ddfa8738cb2bca08cc9f837a1",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/required_work.py": {
+      "replacement_sha256": "4cf916455dac2577c3a2c886dd7dc26c9fef8a2065eaa15200fd5968967976dc",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/composer_async_worker.py": {
+      "replacement_sha256": "d6a9323ef2e455d86e848cb28073ef3a7d4c7533dee0d94028985486dfaa259b",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/composer_turn.py": {
+      "replacement_sha256": "52b167d070ae13ed6ccc83ef2a92c7fff8bad23eed5dfbb29db07da43b3a72b5",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/manual_proposal_failure.py": {
+      "replacement_sha256": "01ce0dc5cb6cfab61586d7e0581f360fe11a742cbaf7bc820266e63c80071678",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/pipeline_rejection.py": {
+      "replacement_sha256": "b34a1c868d395ec7713dd5f7a7e67bcb9d7132d9ef701e8cc9d4e852098676a3",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/pipeline_rejection_custody.py": {
+      "replacement_sha256": "f8d9ce083fbb1c43c36271013c8c941fec2476d0c6c8d37f32ca2405e23bacf8",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/pipeline_rejection_finish_once.py": {
+      "replacement_sha256": "590c0be357cfb2926acbf60db0826789e05dc0b7db13a95bd8d1e1e6ffc05c5c",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/protocol.py": {
+      "replacement_sha256": "897c4201badf2113cb0985937d48cbc7f9b0ee6f5d505dc4917fefe60050098e",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/routes/_helpers.py": {
+      "replacement_sha256": "d085d9791bde25511796a00ece58482107801980a200d6c3c6728040d544508d",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py": {
+      "replacement_sha256": "e5a82fc1c363337b2ac12889010f79082ab395cb0807dd9f00bb5846467961ec",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/routes/composer/proposals.py": {
+      "replacement_sha256": "4ca2af8af07e685f58b402b3c7ff681e368992bd028f43ae5be099dfe491f027",
+      "source": "runtime-coherent-composite-sol-1"
+    },
+    "src/elspeth/web/sessions/service.py": {
+      "replacement_sha256": "3eb30b312800558408a54ad02894839cad18a8774b1ea080ab775b7f0afdd257",
+      "source": "runtime-coherent-composite-sol-1"
+    }
+  },
+  "live": {
+    "src/elspeth/web/app.py": {
+      "exists": true,
+      "sha256": "de6b6bef766380c7e629f7f86fdf0dea5188fed3dbd6379e65c4634b985da05e"
+    },
+    "src/elspeth/web/application_finalizers.py": {
+      "exists": true,
+      "sha256": "9ffc4cbd00347d8fc434703ecd12f6845e232b61e71fa4458566ee89673480f2"
+    },
+    "src/elspeth/web/async_workers.py": {
+      "exists": true,
+      "sha256": "f8cddc9cf9a40a29e30cad478d082247a165ad6a1b6f254e65c42079d444f6ad"
+    },
+    "src/elspeth/web/composer/planning_application.py": {
+      "exists": true,
+      "sha256": "35c286a9e8ac8b2c3c6cb5df7c1536e0357dd0595205f2608f5e25c3cb625770"
+    },
+    "src/elspeth/web/composer/provider_quota.py": {
+      "exists": true,
+      "sha256": "4eec3d68b52640d668bf5209fe8543e468a22d4a32484caa9ff1dfbee7b6d0be"
+    },
+    "src/elspeth/web/composer_watch_reads.py": {
+      "exists": false,
+      "sha256": null
+    },
+    "src/elspeth/web/coordination/lifecycle.py": {
+      "exists": true,
+      "sha256": "ea886eb34723985206b2076ec8e24f51af5ddb72440a3d2c13df055fd822038e"
+    },
+    "src/elspeth/web/execution/recovery.py": {
+      "exists": true,
+      "sha256": "eb8a8df8b80e6ae610ba31d53abecfda79bfe756974a5d268183d8097cae8c7a"
+    },
+    "src/elspeth/web/execution/routes.py": {
+      "exists": true,
+      "sha256": "82108abdde9ef9cf528cee70fc5123cd548a19fe5ec58d402124fc93d6b517e1"
+    },
+    "src/elspeth/web/execution/service.py": {
+      "exists": true,
+      "sha256": "b60e065f00031f593be3b13adbb339b61218b2d66a4d9013aa373c77ff0e8916"
+    },
+    "src/elspeth/web/execution_lease_cleanup.py": {
+      "exists": false,
+      "sha256": null
+    },
+    "src/elspeth/web/operator_telemetry.py": {
+      "exists": true,
+      "sha256": "f34993dd02c0d71b050206d817a8f481fd8098d9853c13e7b435f942f603ea9f"
+    },
+    "src/elspeth/web/operator_telemetry_custody.py": {
+      "exists": true,
+      "sha256": "c9fdd9b564598cb785a742eda37b6e006aeee63a3dff43c1c3bee149a30d14a2"
+    },
+    "src/elspeth/web/operator_telemetry_dispatch.py": {
+      "exists": false,
+      "sha256": null
+    },
+    "src/elspeth/web/operator_telemetry_installation.py": {
+      "exists": true,
+      "sha256": "bac63dfb0a29f419282e8a065da46a4bdab8d110e2526a81807c8d876df5943c"
+    },
+    "src/elspeth/web/required_work.py": {
+      "exists": true,
+      "sha256": "2fcd5106419050301a9cd5ad7d432755932a34f932ca956dd78ad7fde94ea154"
+    },
+    "src/elspeth/web/sessions/composer_async_worker.py": {
+      "exists": true,
+      "sha256": "e218f621564261b3d259fd729731c424c94d9b2d45bdfd54d3c77923eef20619"
+    },
+    "src/elspeth/web/sessions/composer_turn.py": {
+      "exists": true,
+      "sha256": "a1df26eeae4fc5baa607f728a86b8c2992be8c693987204d52ee4bf121b486c0"
+    },
+    "src/elspeth/web/sessions/manual_proposal_failure.py": {
+      "exists": false,
+      "sha256": null
+    },
+    "src/elspeth/web/sessions/pipeline_rejection.py": {
+      "exists": false,
+      "sha256": null
+    },
+    "src/elspeth/web/sessions/pipeline_rejection_custody.py": {
+      "exists": false,
+      "sha256": null
+    },
+    "src/elspeth/web/sessions/pipeline_rejection_finish_once.py": {
+      "exists": false,
+      "sha256": null
+    },
+    "src/elspeth/web/sessions/protocol.py": {
+      "exists": true,
+      "sha256": "f1d47aa870afbc934de97cc5d5c66383484fa61673dfcd1c740c2cb5384d11f8"
+    },
+    "src/elspeth/web/sessions/routes/_helpers.py": {
+      "exists": true,
+      "sha256": "84ce8034585c414453047b43e72a0c54d34a120de83450b15dcc5b133f3c7189"
+    },
+    "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py": {
+      "exists": true,
+      "sha256": "debbf1d1c017c5fd3f37cbdbd57f0096378928bfc77e0d60141689d06134f7dc"
+    },
+    "src/elspeth/web/sessions/routes/composer/proposals.py": {
+      "exists": true,
+      "sha256": "370a507a90dbbe2a1e8db096bd9b3b179dcabcf7ebcc467a01a357fcc2e09b95"
+    },
+    "src/elspeth/web/sessions/service.py": {
+      "exists": true,
+      "sha256": "000b9fb97b87585c695b81428a34e22484c3e4e3734dfbeb0c4f9d7c53c13d92"
+    }
+  },
+  "negative_controls": [],
+  "prior_live_preimages": {
+    "src/elspeth/web/app.py": {
+      "anchor": "coherent-app-assembly-1/app.preimage.py",
+      "sha256": "de6b6bef766380c7e629f7f86fdf0dea5188fed3dbd6379e65c4634b985da05e"
+    },
+    "src/elspeth/web/async_workers.py": {
+      "anchor": "transport-cleanup-observation-implementation-1/combined-core4-observer5-v7-1/preimages/src/elspeth/web/async_workers.py",
+      "sha256": "f8cddc9cf9a40a29e30cad478d082247a165ad6a1b6f254e65c42079d444f6ad"
+    },
+    "src/elspeth/web/composer/planning_application.py": {
+      "anchor": "proposal-rejection-implementation-7/preimages/src/elspeth/web/composer/planning_application.py",
+      "sha256": "35c286a9e8ac8b2c3c6cb5df7c1536e0357dd0595205f2608f5e25c3cb625770"
+    },
+    "src/elspeth/web/coordination/lifecycle.py": {
+      "anchor": "transport-cleanup-observation-implementation-1/combined-core4-observer5-v7-1/preimages/src/elspeth/web/coordination/lifecycle.py",
+      "sha256": "ea886eb34723985206b2076ec8e24f51af5ddb72440a3d2c13df055fd822038e"
+    },
+    "src/elspeth/web/execution/service.py": {
+      "anchor": "frontend-execute-cleanup-consumer-implementation-3/preimages/src/elspeth/web/execution/service.py",
+      "sha256": "b60e065f00031f593be3b13adbb339b61218b2d66a4d9013aa373c77ff0e8916"
+    },
+    "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py": {
+      "anchor": "proposal-rejection-implementation-7/preimages/src/elspeth/web/sessions/routes/composer/pipeline_settlement.py",
+      "sha256": "debbf1d1c017c5fd3f37cbdbd57f0096378928bfc77e0d60141689d06134f7dc"
+    },
+    "src/elspeth/web/sessions/routes/composer/proposals.py": {
+      "anchor": "proposal-rejection-implementation-7/preimages/src/elspeth/web/sessions/routes/composer/proposals.py",
+      "sha256": "370a507a90dbbe2a1e8db096bd9b3b179dcabcf7ebcc467a01a357fcc2e09b95"
+    },
+    "src/elspeth/web/sessions/service.py": {
+      "anchor": "proposal-rejection-implementation-7/preimages/src/elspeth/web/sessions/service.py",
+      "sha256": "000b9fb97b87585c695b81428a34e22484c3e4e3734dfbeb0c4f9d7c53c13d92"
+    }
+  },
+  "proposal_integrity_complete_sequence": {
+    "ast_sha256": "ff6cbcaa9ec42c6ed2f9162bf21934879f7476d059d2ebaca1263d81f987dbf6",
+    "inverted_integrity_comparison_rejected": true,
+    "statement_count": 11
+  },
+  "provider_quota_live_equals_prior_selected": true,
+  "scope": "source-only; no candidate import, runtime, collection, SQL, provider, or repository writes",
+  "selected-to-composite.patch": {
+    "changed_patch_rejected": true,
+    "complete_reconstruction": true,
+    "sha256": "da795a2dd22a5c3dd7f13e93221cdfacab23bd68195f04fc451d0b8ea7a741d8"
+  },
+  "source38_and_failure_selection_preserved": true,
+  "staged_empty": true,
+  "static_graph_not_semantic_audit": true,
+  "static_unselected_hashes_checked": 304,
+  "turn_exact_two_edit_reverse_projection": true
+}

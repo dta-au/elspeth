@@ -1,0 +1,126 @@
+{
+  "scope": "source, byte hashing and stdlib AST only; no candidate or project imports, tests, child processes or guard execution",
+  "files": {
+    "control.preimage.py": {
+      "expected": "be63b7e8baa0c5a64324e7ff4f4b5a21f022922f2b1bee00d774ab825e5685c2",
+      "actual": "be63b7e8baa0c5a64324e7ff4f4b5a21f022922f2b1bee00d774ab825e5685c2",
+      "matches": true,
+      "ast_parse": true,
+      "lines": 130
+    },
+    "registry.dependency.py": {
+      "expected": "49cc0c0235dc9e0b30dbeef4ca9a7ef029cf01358514d6f28f19add72692e9f4",
+      "actual": "49cc0c0235dc9e0b30dbeef4ca9a7ef029cf01358514d6f28f19add72692e9f4",
+      "matches": true,
+      "ast_parse": true,
+      "lines": 839
+    },
+    "execute_failed_physical_join_child.py": {
+      "expected": "07e654106156f8e9d51280c79b8e5559c05691346301c29e564a4202ecb046b0",
+      "actual": "07e654106156f8e9d51280c79b8e5559c05691346301c29e564a4202ecb046b0",
+      "matches": true,
+      "ast_parse": true,
+      "lines": 259
+    },
+    "test_execute_failed_physical_join_bounded.py": {
+      "expected": "e0716490c52296a1dbb60f494dafa957bd409072942f815d603b62ebeb9e063b",
+      "actual": "e0716490c52296a1dbb60f494dafa957bd409072942f815d603b62ebeb9e063b",
+      "matches": true,
+      "ast_parse": true,
+      "lines": 296
+    },
+    "guard.py": {
+      "expected": "53334a6bff9b360b322dae1ea844f949776f2240a2652028bb6f73a764e51b0d",
+      "actual": "53334a6bff9b360b322dae1ea844f949776f2240a2652028bb6f73a764e51b0d",
+      "matches": true,
+      "ast_parse": true,
+      "lines": 99
+    }
+  },
+  "frozen_predecessor_identity": {
+    "control.preimage.py": {
+      "path": "<private-workspace>/transport-cleanup-observation-implementation-1/execute-core4-app-failed-exit-layer/new-tests/tests/unit/web/test_execute_failed_physical_join.py",
+      "byte_equal": true
+    },
+    "registry.dependency.py": {
+      "path": "<private-workspace>/transport-cleanup-observation-implementation-1/execute-core4-app-failed-exit-layer/replacements/src/elspeth/web/execution_lease_cleanup.py",
+      "byte_equal": true
+    }
+  },
+  "parser_instrument_calls": [
+    {
+      "line": 142,
+      "argument_source": "_TERMINAL_PREFIX + json.dumps(healthy)",
+      "newline_literal_in_argument": false
+    },
+    {
+      "line": 144,
+      "argument_source": "_TERMINAL_PREFIX + json.dumps(dict(healthy, getter='true'))",
+      "newline_literal_in_argument": false
+    }
+  ],
+  "classifier_drain_error_key_present": false,
+  "repository_head": "d2b73990d137e9725200c897544eebc5b958fdf4",
+  "guard_executed": false,
+  "runtime_executed": false,
+  "package_metadata_sha256": {
+    "REPORT.md": "5c8a1473d9183f0ad47ea2d119803f86c23b540a79c6500ea4908529b8084414",
+    "manifest.json": "9a1e96a666363d4526c6559df1711f0c5cddf6cbcaa57144588574937a240827"
+  },
+  "root_supplied_instrument_execution": {
+    "files_sha256": {
+      "getter1-instrument-tests-1.log": "53d2a0ed06edeb1490710e3b05bae38dbcfbf1f4c8a62d6a320f3e79c52bb52f",
+      "getter1-instrument-tests-1.exit": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865",
+      "getter1-instrument-tests-1.xml": "14803d87bfdd6eacd07adaa2d1b56a3c1d0b1af692dce01ded523b9e2b2d9160"
+    },
+    "exit": "1",
+    "xml_suite_attributes": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "1",
+      "skipped": "0",
+      "tests": "4",
+      "time": "0.141",
+      "timestamp": "2026-10-07T13:35:24.806628+11:00",
+      "hostname": "nyx.foundryside.dev"
+    },
+    "testcases": [
+      {
+        "name": "test_source_hash_guard_accepts_exact_bytes_and_rejects_mutation",
+        "failure": false
+      },
+      {
+        "name": "test_snapshot_classifier_rejects_missing_prerequisites_and_identifies_receipts",
+        "failure": true
+      },
+      {
+        "name": "test_reaper_waits_after_exit_race_and_retains_wait_fault",
+        "failure": false
+      },
+      {
+        "name": "test_reaper_retains_unexpected_signal_and_wait_faults",
+        "failure": false
+      }
+    ],
+    "scope": "Root-supplied parent instruments only, reviewed full raw log/exit/XML; not reviewer execution or production/child proof",
+    "warning": "Unknown config option: env_files"
+  },
+  "root_supplied_classifier_diagnostic": {
+    "files_sha256": {
+      "diagnose_getter1_drain_error_classification.py": "fdbcf071ec34ee60a30819c9f98082062c133e819454504299f141e4eadf0439",
+      "diagnose_getter1_drain_error_classification.json": "f8f6013c2d8ace647c353d1b780045cf3196fff9c9a653405dce984917cb7535",
+      "getter1-drain-error-diagnostic-1.log": "a52f6a1f25db1a72ed259438c8a83b225bb93350ac4d293e216bcdc6ee1f4900",
+      "getter1-drain-error-diagnostic-1.exit": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+    },
+    "result": {
+      "frozen_parent_sha256": "e0716490c52296a1dbb60f494dafa957bd409072942f815d603b62ebeb9e063b",
+      "healthy_positive": null,
+      "clean_missing_receipt_control": "generation",
+      "generic_failed_drain_result": "generation",
+      "project_imports": false,
+      "child_or_production_runtime": false
+    },
+    "exit": "1",
+    "scope": "Root execution of exact AST-isolated classifier; no project, child or real drain runtime; full source/raw/exit/JSON read by reviewer"
+  }
+}

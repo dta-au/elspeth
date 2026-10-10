@@ -71,6 +71,7 @@ from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
     _install_short_sink_lease,
     _wait_until_run_is_resumable,
 )
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 from tests.helpers.web_cli_profile import create_profile_session
 
@@ -372,110 +373,132 @@ def _web_composition_state(*, session_id: UUID, state_id: UUID) -> CompositionSt
 
 
 async def _execute_web_leader(run_id: str, settings_path: str) -> None:
-    settings = load_settings_from_yaml_string(Path(settings_path).read_text(encoding="utf-8"))
-    session_id = uuid4()
-    state_record = _web_composition_state(session_id=session_id, state_id=uuid4())
-    run_uuid = UUID(run_id)
-    tmp_path = Path(settings_path).parent
-    web_settings = SimpleNamespace(
-        deployment_target="default",
-        deployment_state_mode="sqlite-single",
-        workflow_governance="off",
-        landscape_url=settings.landscape.url,
-        landscape_passphrase=None,
-        payload_store_path=settings.payload_store.base_path,
-        data_dir=tmp_path,
-        execution_rate_limit=RateLimitSettings(),
-        get_landscape_url=lambda: settings.landscape.url,
-        get_payload_store_path=lambda: settings.payload_store.base_path,
-        get_session_db_url=lambda: f"sqlite:///{tmp_path / 'sessions.db'}",
-        secret_wiring_allowlist=(),
-    )
-    catalog = create_catalog_service()
-    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    session_engine, session_service, session_id = await create_profile_session(
-        tmp_path,
-        state=state_record,
-        run_id=run_uuid,
-        snapshot=snapshot,
-        user_id="task9-web-user",
-    )
-    web_policy = WebPluginPolicy(
-        schema_version=1,
-        required=snapshot.available,
-        configured_optional=frozenset(),
-        authorized=snapshot.available,
-        preferences=(),
-        control_modes=snapshot.control_modes,
-        plugin_code_identities=(),
-        power_automate_allowed_origins=snapshot.power_automate_allowed_origins,
-        policy_hash=snapshot.policy_hash,
-    )
-    loop = asyncio.get_running_loop()
-    service = ExecutionServiceImpl(
-        loop=loop,
-        broadcaster=ProgressBroadcaster(loop),
-        settings=cast(Any, web_settings),
-        session_service=session_service,
-        yaml_generator=SimpleNamespace(generate_yaml=lambda _state: Path(settings_path).read_text(encoding="utf-8")),
-        telemetry=build_sessions_telemetry(),
-        blob_service=None,
-        secret_service=None,
-        plugin_snapshot_factory=lambda _user_id: snapshot,
-        operator_profile_registry=MagicMock(spec=OperatorProfileRegistry),
-        web_plugin_policy=web_policy,
-        catalog=catalog,
-    )
-    service.set_openrouter_catalog_snapshot(sha256="0" * 64, source="bundled")
-    valid_preflight = ValidationResult(
-        is_valid=True,
-        checks=[],
-        errors=[],
-        readiness=ValidationReadiness(
-            authoring_valid=True,
-            execution_ready=True,
-            completion_ready=True,
-            blockers=[],
-        ),
-    )
-
-    async def accept_state_preflight(*_args: Any, **_kwargs: Any) -> ValidationResult:
-        return valid_preflight
-
-    service._authoritative_state_preflight = accept_state_preflight  # type: ignore[method-assign]
-    submitted: list[Future[Any]] = []
-    real_submit = service._executor.submit
-
-    def capture_submit(*args: Any, **kwargs: Any) -> Future[Any]:
-        future = real_submit(*args, **kwargs)
-        submitted.append(future)
-        return future
-
-    service._executor.submit = capture_submit  # type: ignore[method-assign]
-    # Use the same real session authority for admission, permits and status.
-    lease = await SessionOperationLease.acquire(
-        session_service.session_operation_authority,
-        session_id=session_id,
-        operation_kind=SessionOperationKind.EXECUTE,
-        owner_instance_id=session_service.session_operation_owner_instance_id,
-        lease_seconds=300,
-    )
+    execution_fixture = ExecutionTestCustody(asyncio.get_running_loop(), Path(settings_path).parent)
+    primary: BaseException | None = None
     try:
-        launched = await service.execute(
-            session_id,
-            session_operation_lease=lease,
-            user_id="task9-web-user",
-            auth_provider_type="local",
+        settings = load_settings_from_yaml_string(Path(settings_path).read_text(encoding="utf-8"))
+        session_id = uuid4()
+        state_record = _web_composition_state(session_id=session_id, state_id=uuid4())
+        run_uuid = UUID(run_id)
+        tmp_path = Path(settings_path).parent
+        web_settings = SimpleNamespace(
+            deployment_target="default",
+            deployment_state_mode="sqlite-single",
+            workflow_governance="off",
+            landscape_url=settings.landscape.url,
+            landscape_passphrase=None,
+            payload_store_path=settings.payload_store.base_path,
+            data_dir=tmp_path,
+            execution_rate_limit=RateLimitSettings(),
+            get_landscape_url=lambda: settings.landscape.url,
+            get_payload_store_path=lambda: settings.payload_store.base_path,
+            get_session_db_url=lambda: f"sqlite:///{tmp_path / 'sessions.db'}",
+            secret_wiring_allowlist=(),
         )
-        assert launched == run_uuid
-        assert len(submitted) == 1
-        await asyncio.wrap_future(submitted[0])
+        catalog = create_catalog_service()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        session_engine, session_service, session_id = await create_profile_session(
+            tmp_path,
+            state=state_record,
+            run_id=run_uuid,
+            snapshot=snapshot,
+            user_id="task9-web-user",
+        )
+        web_policy = WebPluginPolicy(
+            schema_version=1,
+            required=snapshot.available,
+            configured_optional=frozenset(),
+            authorized=snapshot.available,
+            preferences=(),
+            control_modes=snapshot.control_modes,
+            plugin_code_identities=(),
+            power_automate_allowed_origins=snapshot.power_automate_allowed_origins,
+            policy_hash=snapshot.policy_hash,
+        )
+        loop = asyncio.get_running_loop()
+        service = execution_fixture.bind(
+            ExecutionServiceImpl(
+                loop=loop,
+                broadcaster=ProgressBroadcaster(loop),
+                settings=cast(Any, web_settings),
+                session_service=session_service,
+                yaml_generator=SimpleNamespace(generate_yaml=lambda _state: Path(settings_path).read_text(encoding="utf-8")),
+                telemetry=build_sessions_telemetry(),
+                blob_service=None,
+                secret_service=None,
+                plugin_snapshot_factory=lambda _user_id: snapshot,
+                operator_profile_registry=MagicMock(spec=OperatorProfileRegistry),
+                web_plugin_policy=web_policy,
+                catalog=catalog,
+                execution_lease_release_registry=execution_fixture.registry(asyncio.get_running_loop()),
+            )
+        )
+        service.set_openrouter_catalog_snapshot(sha256="0" * 64, source="bundled")
+        valid_preflight = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=True,
+                completion_ready=True,
+                blockers=[],
+            ),
+        )
+
+        async def accept_state_preflight(*_args: Any, **_kwargs: Any) -> ValidationResult:
+            return valid_preflight
+
+        service._authoritative_state_preflight = accept_state_preflight  # type: ignore[method-assign]
+        submitted: list[Future[Any]] = []
+        real_submit = service._executor.submit
+
+        def capture_submit(*args: Any, **kwargs: Any) -> Future[Any]:
+            future = real_submit(*args, **kwargs)
+            submitted.append(future)
+            return future
+
+        service._executor.submit = capture_submit  # type: ignore[method-assign]
+        # Use the same real session authority for admission, permits and status.
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=300,
+            execution_obligation=service.execution_lease_release_registry.admit(
+                session_service.session_operation_authority,
+                session_id=session_id,
+                owner_instance_id=session_service.session_operation_owner_instance_id,
+                lease_seconds=300,
+            ),
+        )
+        try:
+            launched = await service.execute(
+                session_id,
+                session_operation_lease=lease,
+                user_id="task9-web-user",
+                auth_provider_type="local",
+            )
+            assert launched == run_uuid
+            assert len(submitted) == 1
+            await asyncio.wrap_future(submitted[0])
+        finally:
+            try:
+                await lease.close()
+                await execution_fixture.shutdown_service(service)
+            finally:
+                session_engine.dispose()
+    except BaseException as original:
+        primary = original
+        raise
     finally:
         try:
-            await lease.close()
-            await service.shutdown()
-        finally:
-            session_engine.dispose()
+            await execution_fixture.close()
+        except BaseException as cleanup:
+            if primary is not None and cleanup is not primary:
+                raise BaseExceptionGroup("Child execution and owned cleanup failed", [primary, cleanup]) from None
+            raise
 
 
 def _run_web_leader_to_sink_seam(

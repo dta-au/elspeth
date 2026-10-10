@@ -5,12 +5,14 @@ the declared serializer, not a claim that every caller invokes it. Richer
 operator, audit and retry obligations use actual production consumers.
 """
 
+import asyncio
 import json
 from collections.abc import Mapping
 from contextlib import redirect_stderr
 from functools import partial
 from io import StringIO
 from typing import Any
+from uuid import uuid4
 
 from elspeth.composer_mcp import session
 from elspeth.contracts import errors
@@ -19,7 +21,20 @@ from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.coordination import RegisteredWorker
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.field_spelling import HeaderSpelling
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.core.checkpoint import recovery
+from elspeth.web.required_executor import RequiredGenerationUnavailable
+from elspeth.web.required_work import (
+    ComposerFailureReceipt,
+    OwnedCompletionWitness,
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkSource,
+    make_required_work_key,
+    reduce_composer_failures,
+    required_failure_leaves,
+)
+from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
 from tests.fixtures.abandon_refusal_diagnostics import assert_abandon_refusal_cause_reaches_cli
 from tests.fixtures.exception_diagnostic_consumers import (
     exercise_audit_failed_turn,
@@ -243,6 +258,59 @@ def _exercise_inherited_contract(exception: type[BaseException]) -> None:
     )
 
 
+def _exercise_owned_settlement_failure() -> None:
+    context = SessionOperationContext(
+        SessionOperationFence(str(uuid4()), str(uuid4()), "diagnostic-token", 1), SessionOperationKind.COMPOSE
+    )
+    authority = RequiredWorkAuthority(RequiredAuthorityKind.DURABLE_COMPOSE, context, str(uuid4()), 1)
+
+    def receipt(root: BaseException, source: RequiredWorkSource) -> ComposerFailureReceipt:
+        key = make_required_work_key(authority, source)
+        return ComposerFailureReceipt(key, root, required_failure_leaves(root), OwnedCompletionWitness(key))
+
+    stop = asyncio.CancelledError("private stop")
+    stop_receipt = receipt(stop, RequiredWorkSource.DURABLE_STOP_SIGNAL)
+    for secret in ("private-settlement-alpha", "private-settlement-omega"):
+        marker = errors.ComposerOwnedSettlementFailure()
+        marker.__cause__ = RuntimeError(secret)
+        assert str(marker) == "Composer owned settlement did not complete"
+        assert marker.__cause__.args == (secret,)
+        assert required_failure_leaves(marker) == (marker,)
+        reduction = reduce_composer_failures((stop_receipt, receipt(marker, RequiredWorkSource.PROVIDER_SETTLEMENT_SQL)))
+        assert reduction.category_rank == 50
+        assert reduction.winner.original_root is marker
+        assert reduction.witnesses == (marker,)
+        projected = reduction.project(request_id="diagnostic-correlation", timeout_seconds=5)
+        assert projected.http_status == 500
+        assert projected.error_type == "operation_failed"
+        detail = projected.body["detail"]
+        assert isinstance(detail, dict)
+        assert detail["request_id"] == "diagnostic-correlation"
+        assert secret not in json.dumps(projected.body)
+
+    known = RequiredGenerationUnavailable("private-generation-diagnostic")
+    owned = errors.ComposerOwnedSettlementFailure()
+    owned.__cause__ = known
+    assert required_failure_leaves(owned) == (known,)
+    recognized = reduce_composer_failures((receipt(owned, RequiredWorkSource.PROVIDER_SETTLEMENT_SQL),))
+    assert recognized.category_rank == 20
+    assert recognized.winner.original_root is owned
+    assert recognized.witnesses == (known,)
+    safe = recognized.project(request_id="diagnostic-correlation", timeout_seconds=5)
+    assert safe.http_status == 503
+    assert safe.body == {
+        "detail": "Database is currently unavailable. Please retry in a moment.",
+        "error_type": "database_unavailable",
+        "request_id": "diagnostic-correlation",
+    }
+    assert "private-generation-diagnostic" not in json.dumps(safe.body)
+
+    unowned = RuntimeError("private unowned wrapper")
+    unowned.__cause__ = known
+    assert required_failure_leaves(unowned) == (unowned,)
+    assert project_composer_operation_error(unowned, request_id="diagnostic-correlation").http_status == 500
+
+
 def _inherited_cases() -> tuple[DiagnosticCase, ...]:
     explanation = "No locally owned constructor fields; execute the inherited renderer. Imported-base fields are outside discovery scope."
     cases = [
@@ -318,6 +386,13 @@ _TYPE_MISMATCH = {"normalized_name": "field", "original_name": "Field", "expecte
 
 
 DIAGNOSTIC_CASES = (
+    DiagnosticCase(
+        errors.ComposerOwnedSettlementFailure,
+        frozenset(),
+        "control",
+        "An owned no-argument settlement marker preserves its cause, precedence, and safe public projection.",
+        _exercise_owned_settlement_failure,
+    ),
     *_text_cases(errors.GracefulShutdownError, {"rows_processed": 7, "run_id": "fixed-run"}, "run_id"),
     DiagnosticCase(
         errors.GracefulShutdownError,

@@ -1,0 +1,57 @@
+<!-- Durable copy: machine-specific prefixes normalized; private original retained. -->
+
+# Actual Astra constructor fixture review 5
+
+**Narrow source GO for the helper's F1/F2 repairs and unchanged constructor migration. Native control execution and combined application remain HOLD.** The control checkpoint publication has a reliability race that should be repaired before using the authored process controls as a dependable gate. Package 4 and its NO-GO remain preserved.
+
+Evidence: [astra-execute-constructor-fixture-code-review-5-evidence.json](astra-execute-constructor-fixture-code-review-5-evidence.json).
+
+Reviewed immutable package: `frontend-execute-constructor-fixture-migration-1/constructor-only-package-5/report.md`; complete patch `8d2651fb4b2bbddfbb28424fbd8df37635a779d84270bf0f9cda73c1a649f318`; helper `93808a65d9b7af2bdce63d27a4a09fe1f6b44fa39bfc60b114cc36f404f15ce0`; new control `e8176fa6a73d30f40c3e2c1b949431c228bbae92d92dc116802f82d57e0be2f8`.
+
+The full new helper and control, both mutation source variants, complete runner and its companion delta, cases, parser evidence, guards and report were read. All existing preimages/replacements were parsed and compared byte-for-byte with reviewed package 4 and current worktree preimages; their substantive constructor paths remain the prior review's unchanged source. Core4/consumer3 constructor and lifecycle dependencies were rechecked where partial-failure ownership mattered. No candidate was imported, applied or run; no child, SQL, provider or network action occurred.
+
+## F1 resolved in source
+
+`shutdown_service()` and `close()` now invoke `_begin_selected_shutdown()` before the finalizer await or any cleanup Task issuance. It calls the exact selected ProcessRecovery once, including the borrowed child owner. The real method synchronously sets its draining Event before its own escalation Task allocation, satisfying core4 finalizer admission. The helper retains a transition error and continues issuing already-owned cleanup instead of replacing the original or skipping all later owners.
+
+Actual owner and registries are sealed. Standalone custody schedules actual recovery join and shared executor shutdown; borrowed custody leaves shared teardown to the existing outer child lifecycle. No synthetic physical receipt, reset generation, public capability or new finalizer kind is introduced. Failure before actual draining can still produce retained cleanup failures; the helper does not falsely promise successful finalization after every recovery fault.
+
+## F2 resolved in source
+
+A slotted `_ExecutionFixtureJoin` is rooted before creating the coroutine or calling create_task. Producer entry binds the actual current Task and records its actual outcome before rethrow/return. Allocation failure retains the owner, coroutine and original while allowing later independent issuance. An allocated hidden Task can bind itself on entry; an absent or cancelled-before-entry owner cannot satisfy the join predicate.
+
+The helper waits until every declared owner has an actual done Task, producer entry and recorded outcome. It consumes Task.result while preferring the producer's captured original. Outer cancellation is retained by identity without cancelling owned children. Re-observation can append the same outcome internally, but final identity deduplication preserves the original set. Repeated close does not reissue previously declared service/lifecycle joins.
+
+The missing-owner case intentionally remains Unknown. The existing nominal no-signal watchdog alone does not turn that into finite completion; root's owned process boundary remains necessary. No new multi-service finalizer authority is claimed: the additional test registry is real but empty and registers no second executor finalizer.
+
+## Authored control and mutation assessment
+
+Seven source modes cover standalone, borrowed, direct shutdown_service, partial constructor, recovery-transition fault, allocation before return and allocation after actual Task allocation. These are parametrized source cases, not measured collected/passed tests.
+
+The before/after cases target a real registry join while an earlier actual private-executor shutdown is held, then require a later empty real registry to finish independently. Actual outer cancellations are observed at the forwarding asyncio.wait catch on the exact close Task and compared by identity with helper-retained originals. The after-allocation case checks the producer-bound Task is the hidden actual Task and verifies completion. The before-allocation case publishes a specific Unknown checkpoint after other physical work joined, keeps the helper pending and lets the parent terminate/wait that exact child. It never treats cancellation-retaining wait_for as a physical bound.
+
+Partial construction forwards the actual registry/executor bind before injecting its original. The consumer constructor catches that error and calls `registry.record_failure(original)` before rethrowing. Thus actual registry join/assert_completed can carry that same original into custody.close even though no service was returned. An initial review concern that the constructor error was not passed to custody was withdrawn after checking this dependency; it is not a finding. Recovery-fault mode likewise delegates to the real transition before raising its controlled original.
+
+The two mutants are narrow: late-selected-draining moves the real transition after join issuance/observation; allocation-error-abandons-later-join rethrows the exact caught allocation error. Their control fallback paths physically release/join resources before publishing the targeted false oracle. The parent then fails at the named healthy-finalizer or later-registry assertion, rather than accepting a random child exit as causal evidence. Native behavior remains unmeasured.
+
+The test's parent owns its exact subprocess, uses a minimal environment and preserves process identity. Unknown mode stays live at its checkpoint and is deliberately terminated, then waited. `_finish_process` handles exit races, escalating from terminate to kill and always attempting wait. Parent combines a cleanup failure with its primary instead of silently replacing it. Children share the mutation runner's owned group, so outer interruption cleanup reaches their physical threads.
+
+The mutation runner is dry-run unless explicitly executed, checks exact source/test hashes, requires a clean exact baseline registration and native exit 0, applies one mutant only after a source recheck, and requires native exit 1 with the exact marked assertion. It rejects empty, duplicate, wrong-name/classname, error, skip and wrong-assertion XML. Timeout maps to 124 and cannot count as RED. It kills/joins its owned process group on interrupted waits and guards restoration against a changed source or unjoined direct runtime. Root must still measure successful baseline/mutation/process-join/restoration on the coherent tree.
+
+## C1 — checkpoint existence is not complete JSON publication
+
+Control reliability issue in `test_execution_constructor_custody.py` checkpoint writers and parent checkpoint reader.
+
+Each child writes checkpoint.json directly with `Path.write_text`. The parent polls `checkpoint.exists()` then immediately calls json.loads(read_text()). Creating/truncating the file precedes writing the complete document; if the child is descheduled between those operations, the parent can read empty or partial JSON and fail before reaching the intended oracle. This is a source-level race, not a measured failure.
+
+Use atomic publication of the complete checkpoint or an explicit complete-document protocol. Keep child failures/unknown state visible; do not blanket-ignore malformed JSON or invent a success proof. This does not invalidate the helper's F1/F2 source repair, but stable native causal controls should use a separately frozen correction.
+
+## Verification and limits
+
+Independent stdlib byte/AST checks matched all final hashes, reconstructed the complete patch exactly and verified both mutant preimages/hashes. All 13 existing replacements remain byte-identical to package 4; current full preimages match the live worktree. Original source-order assertion ASTs and test name/decorator ASTs remain equal. Existing physical `os._exit` seams are therefore unchanged. New helper/control targets remain absent from the repository. The earlier measured 25 AST constructor sites are not test collection evidence.
+
+The runners' pure XML parser/assertion functions and literal expected registrations were isolated by AST into a stdlib-only namespace. Their positive and negative controls were independently executed successfully. No runner main, source mutation, subprocess, pytest or project code was executed. Static parser success says nothing about native constructor or child behavior.
+
+No mypy/whole-tree contract, masquerade, trust-tier, runtime or provider clearance is inferred. The helper's new record/annotations and the two test sources must be checked on the actual coherent tree; no suppressions or nominal fakes were added to avoid that obligation. Legacy recorded authorities, adopted leases, fake Futures/executors and old callback/cancellation fixtures remain outside this constructor-only package. The original normal-shutdown golden is unchanged and its separate proposal remains unselected.
+
+This report approves the bounded helper source repair, not an unfinished canonical fixture package or broad test selection. Address C1, freeze any correction, then root owns actual controls and combined gates. App successor-2 control A1–A3, coherent app/consumer/core/observer composition, original 102 obligations/four collection obligations/two UNKNOWNs, John local testing/manual Daybreak and merge decision remain held.

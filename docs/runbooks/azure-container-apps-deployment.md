@@ -12,7 +12,7 @@ fact, the receipt records a sanitized projection of it.
 > **Status.** The implemented ACA slice received desktop acceptance:
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This executable procedure can produce a future receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.2.json`. Steps marked
+> at `docs/operator/evidence/azure-container-apps/0.8.3.json`. Steps marked
 > **LIVE** require measurements from that operator run. Neither a live run nor
 > a receipt is an outstanding closure condition. See
 > [Deployment Platforms](../reference/deployment-platforms.md) for support scope.
@@ -106,7 +106,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The epoch-71 image (session epoch 71, Landscape epoch 49) in the registry.
+- The exact published candidate image digest (session epoch 72, Landscape epoch 49), once available, in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -322,7 +322,7 @@ Keep the configured SSO provider throughout these stages. Neither local
 registration credentials nor an anonymous readiness response establishes an
 admitted acceptance user.
 
-### 0.8.2 fix-on-fail cycle
+### 0.8.3 fix-on-fail cycle
 
 Run each acceptance attempt against an exact candidate commit and published
 image digest. Give each attempt a fresh `ACCEPTANCE_RUN_ID` and private
@@ -471,7 +471,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   `/mnt/elspeth/data`, `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads`
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
-  with the schema-owner URLs and initializes both schemas at session epoch 71
+  with the schema-owner URLs and initializes both schemas at session epoch 72
   and Landscape epoch 49.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
@@ -483,8 +483,8 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   cases inside the environment, the one auth mode whose truth depends on
   where the process runs.
 
-> **LIVE:** for 0.8.2 acceptance, run the Jobs with the candidate digest and
-> require both schema checks to pass after initialization at session epoch 71
+> **LIVE:** for 0.8.3 acceptance, run the Jobs with the candidate digest and
+> require both schema checks to pass after initialization at session epoch 72
 > and Landscape epoch 49. Record the execution names. Any no-schema dry run
 > against a `release/0.8.0` image is predecessor-only wiring evidence; it
 > cannot establish the candidate's schema compatibility or acceptance.
@@ -551,14 +551,14 @@ parity test feeds one corpus through both).
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_revision_sha256": "64-lowercase-hex",
   "candidate_doctor_job_sha256": "64-lowercase-hex",
-  "candidate_package_version": "0.8.2",
+  "candidate_package_version": "0.8.3",
   "previous_source_sha": "",
   "previous_image_digest": "",
   "previous_revision_sha256": "",
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 71, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 72, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",
@@ -933,7 +933,7 @@ run). The driver captures the `bundle-validate` verdict in private
 `$EVIDENCE_DIR/bundle.json` and exits nonzero when validation fails. It does
 not create a public receipt. Review the protected receipts and publish a
 sanitized account of measured facts at
-`docs/operator/evidence/azure-container-apps/0.8.2.json` only after the live
+`docs/operator/evidence/azure-container-apps/0.8.3.json` only after the live
 procedure completes and the bundle passes. Never create a receipt from desktop
 analysis or treat skipped or failed probes as passes. If a run fails, retain
 its diagnostics, fix the defect and rerun before claiming live acceptance.

@@ -69,10 +69,11 @@ accept this trade-off.
 
 ## First-deploy operator action
 
-For 0.8.1, shareable-review state is part of the broader web session database
-contract. The candidate currently expects `SESSION_SCHEMA_EPOCH=71` and
-`SQLITE_SCHEMA_EPOCH=49`; confirm both against the deployed service's live
-schema constants before recreating a store. Landscape epoch 30 adds durable
+Since 0.8.1, shareable-review state is part of the broader web session
+database contract. The 0.8.3 candidate expects `SESSION_SCHEMA_EPOCH=72`
+and `SQLITE_SCHEMA_EPOCH=49`; confirm both against the deployed service's
+live schema constants before recreating a stale store. From 0.8.1 or 0.8.2,
+recreate only the session store when Landscape is already at epoch 49. Landscape epoch 30 adds durable
 row_union barrier
 attribution, and epoch 31 closes scheduler work-item status over the public
 six-state vocabulary. Epoch 32 adds atomic, durable aggregation result receipts
@@ -287,9 +288,10 @@ passphrase or a hex string is refused outright. Regenerate with
 ### Service refuses to start with a `SESSION_SCHEMA_EPOCH` mismatch
 
 The sessions DB predates the running code. Archive/export evidence when
-required, stop and uninstall the deployment, recreate both stale databases,
-then reinstall. Writable, read-only, and inspection opens do not migrate any
-predecessor Landscape epoch. PostgreSQL recreation requires the schema-owner
+required, stop and uninstall the deployment, recreate the stale session
+database, and reinstall. Preserve Landscape when it is already at epoch 49;
+recreate it in the same stop window only when its own epoch is stale. Writable,
+read-only, and inspection opens do not migrate any predecessor Landscape epoch. PostgreSQL recreation requires the schema-owner
 path. Do not roll older code over a database initialized by newer code; restore
 is not a supported repair path. Keep the service drained, repair the current
 release forward, recreate fresh state, and retry.

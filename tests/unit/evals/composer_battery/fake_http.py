@@ -68,7 +68,46 @@ def happy_responders(
             {"id": "state-2", "session_id": session_id, "version": 2, "is_valid": True, "created_at": "2026-08-17T00:00:00Z", **state}
         )
 
+    operations: dict[str, dict[str, Any]] = {}
+
+    def child(call: Call):
+        if call.path.endswith("/messages"):
+            operation_id = call.json["operation_id"]
+            result = {"message": {}, "state": None, "proposals": []}
+            operations[operation_id] = {
+                "session_id": session_id,
+                "operation_id": operation_id,
+                "kind": "message",
+                "status": "completed",
+                "cancel_requested": False,
+                "deadline_remaining_ms": 0,
+                "poll_after_ms": 10,
+                "result": result,
+                "error": None,
+            }
+            return ok(
+                {
+                    "operation_id": operation_id,
+                    "session_id": session_id,
+                    "kind": "message",
+                    "status": "queued",
+                    "poll_path": f"/api/sessions/{session_id}/operations/{operation_id}",
+                    "stream_path": f"/api/sessions/{session_id}/operations/{operation_id}/stream",
+                    "deadline_remaining_ms": 600000,
+                    "poll_after_ms": 10,
+                },
+                202,
+            )
+        return _session_child(call, messages, session_id)
+
+    def operation(call: Call):
+        operation_id = call.path.rsplit("/", 1)[-1]
+        if operation_id not in operations:
+            return ok({"detail": "Operation not found"}, 404)
+        return ok(operations[operation_id])
+
     return {
+        "GET /api/sessions/" + session_id + "/operations/": operation,
         "POST /api/auth/login": lambda c: ok({"access_token": "tok", "token_type": "bearer"}),
         "GET /api/system/status": lambda c: ok(
             {
@@ -84,7 +123,7 @@ def happy_responders(
                 "plugin_policy_readiness": {},
             }
         ),
-        "POST /api/sessions/": lambda c: _session_child(c, messages, session_id),
+        "POST /api/sessions/": child,
         "POST /api/sessions": lambda c: ok(
             {"id": session_id, "user_id": "u", "title": "Session — 17 Aug 2026", "created_at": "t", "updated_at": "t", "archived": False},
             201,

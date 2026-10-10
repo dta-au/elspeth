@@ -17,23 +17,25 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
+import litellm
 import pytest
 import structlog
 from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import func, select
 
+from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.pipeline_planner import _PROSE_NUDGE_BUDGET
 from elspeth.web.composer.progress import ComposerProgressRegistry
-from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
@@ -48,7 +50,9 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.composer_fakes import StaticPluginSnapshotFactory
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.composer_operations import install_composer_async_worker, settle_sync
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -155,6 +159,18 @@ def _malformed_completion() -> Any:
     return completion
 
 
+def _conversational_completion() -> Any:
+    """Offline SDK reply; real ComposerServiceImpl still owns the turn and audit."""
+
+    async def completion(**_kwargs: Any) -> _Response:
+        return _Response(
+            choices=[_Choice(message=_Message(content="No pipeline changes were requested."))],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+        )
+
+    return completion
+
+
 def _cost_unavailable_completion() -> Any:
     async def completion(**_kwargs: Any) -> _Response:
         return _Response(
@@ -192,6 +208,8 @@ def _build_app(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     completion: Any,
+    *,
+    pending_llm_review: bool = False,
 ) -> tuple[SyncASGITestClient, Any, SessionServiceImpl]:
     """Wire a minimal real FastAPI app whose composer is a real ComposerServiceImpl.
 
@@ -216,6 +234,15 @@ def _build_app(
         data_dir=tmp_path,
         composer_model="test/planner",
         composer_boot_probe_enabled=False,
+        llm_profiles={
+            "offline-review": {
+                "provider": "bedrock",
+                "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                "region_name": "us-east-1",
+            }
+        }
+        if pending_llm_review
+        else {},
         composer_max_composition_turns=3,
         composer_max_discovery_turns=2,
         composer_timeout_seconds=20.0,
@@ -244,6 +271,7 @@ def _build_app(
 
     app.dependency_overrides[get_current_user] = mock_user
     app.state.session_service = sessions
+    app.state.sessions_telemetry = build_sessions_telemetry()
     app.state.session_engine = engine
     app.state.scoped_secret_resolver = None
     app.state.settings = settings
@@ -277,16 +305,32 @@ def _build_app(
         def user_generation(self, principal: str, name: str) -> str | None:
             return None
 
-    app.state.plugin_snapshot_factory = lambda user: build_plugin_snapshot(
-        policy=app.state.web_plugin_policy,
-        catalog=app.state.catalog_service,
-        profiles=app.state.operator_profile_registry,
-        principal_scope=f"local:{user.user_id}",
-        secret_inventory=_EmptyInventory(),
-        generation_key=b"freeform-planner-failure-policy-key",
+    app.state.plugin_snapshot_factory = StaticPluginSnapshotFactory(
+        build_plugin_snapshot(
+            policy=app.state.web_plugin_policy,
+            catalog=app.state.catalog_service,
+            profiles=app.state.operator_profile_registry,
+            principal_scope="local:alice",
+            secret_inventory=_EmptyInventory(),
+            generation_key=b"freeform-planner-failure-policy-key",
+        )
     )
+    if pending_llm_review:
+        # The real Web profile root is required for a profile-authored LLM
+        # candidate; the legacy unrestricted root has no profile registry.
+        composer = ComposerServiceImpl(
+            app.state.catalog_service,
+            settings,
+            sessions_service=sessions,
+            session_engine=engine,
+            plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+        app.state.composer_service = composer
+        app.state.interpretation_surfacing = composer._interpretation_surfacing
     app.state.composer_progress_registry = ComposerProgressRegistry()
     app.include_router(create_session_router())
+    install_composer_async_worker(app)
 
     # A truly unhandled route exception must surface as a 500 response (not be
     # re-raised into the test) so the pre-fix regression asserts on the wrong
@@ -493,22 +537,85 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
     message: str,
 ) -> None:
     """The HTTP route must keep non-authorizing requests conversational."""
-    client, engine, sessions = _build_app(tmp_path, monkeypatch, _timeout_completion())
+    # Fixed expectations for the five measured information-only controls.
+    # This table selects test expectations; the offline SDK never routes content.
+    single_transition_requests = {
+        "Read the CSV documentation and explain how transforms work.",
+        "Read customers.csv and explain how transforms work.",
+        "Read customers.csv and explain the password policy.",
+        "Read customers.csv and explain: write is a pipeline operation.",
+        "Read customers.csv and summarize the data, then write a summary in this chat.",
+    }
+    expected_calls = 1 if message in single_transition_requests else 2
+    completion = AsyncMock(spec=litellm.acompletion, side_effect=_conversational_completion())
+    reconciliation_completion = AsyncMock(spec=litellm.acompletion, side_effect=_conversational_completion())
+    requests = []
+
+    async def physical_completion(**kwargs):
+        requests.append(deepcopy({key: kwargs[key] for key in ("model", "messages", "tools")}))
+        if len(requests) == 1:
+            return await completion(**kwargs)
+        if len(requests) == 2:
+            return await reconciliation_completion(**kwargs)
+        raise AssertionError("An unbudgeted third provider transition must not occur")
+
+    physical_sdk = AsyncMock(spec=litellm.acompletion, side_effect=physical_completion)
+    client, engine, sessions = _build_app(tmp_path, monkeypatch, physical_sdk)
     session_id = client.post("/api/sessions", json={"title": "negated build"}).json()["id"]
     composer = client.app.state.composer_service
     ordinary_loop = AsyncMock(
         spec=composer._compose_loop,
-        return_value=ComposerResult(message="No pipeline changes were requested.", state=_empty_state()),
+        wraps=composer._compose_loop,
     )
     monkeypatch.setattr(composer, "_compose_loop", ordinary_loop)
 
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": message, "client_request_id": str(uuid4())},
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={"content": message, "operation_id": str(uuid4()), "state_id": None},
     )
 
-    assert response.status_code == 200, response.text
+    assert settled.final.status_code == 200, settled.final.text
+    settled.result()
     ordinary_loop.assert_awaited_once()
+    completion.assert_awaited_once()
+    assert physical_sdk.await_count == expected_calls
+    assert len(requests) == expected_calls
+    assert requests[0]["messages"][-1] == {"role": "user", "content": message}
+    if expected_calls == 2:
+        reconciliation_completion.assert_awaited_once()
+        assert requests[1]["model"] == requests[0]["model"]
+        assert requests[1]["tools"] == requests[0]["tools"]
+        assert requests[1]["messages"][:-2] == requests[0]["messages"]
+        assert requests[1]["messages"][-2] == {
+            "role": "assistant",
+            "content": "No pipeline changes were requested.",
+        }
+        assert requests[1]["messages"][-1] == {
+            "role": "user",
+            "content": (
+                "[composer-system] No tool has run this turn, and the pipeline has no source or nodes. "
+                "Re-check the user's request against that state. If the user requested construction or generated "
+                "source data, carry out that authorized work using the declared tools before claiming it is complete. "
+                "If a required product fact is missing, ask the concrete question. If the user asked only for "
+                "explanation or revoked construction, answer that request without building. Do not describe data "
+                "as saved, bound, or reviewed until tool results establish it."
+            ),
+        }
+    else:
+        reconciliation_completion.assert_not_awaited()
+    audit_rows = _llm_audit_rows(engine)
+    assert len(audit_rows) == expected_calls
+    actual_calls = [row.tool_calls[0]["call"] for row in audit_rows]
+    assert len({call["call_id"] for call in actual_calls}) == expected_calls
+    assert {call["messages_hash"] for call in actual_calls} == {stable_hash(request["messages"]) for request in requests}
+    for request in requests:
+        matching = [call for call in actual_calls if call["messages_hash"] == stable_hash(request["messages"])]
+        assert len(matching) == 1
+        assert matching[0]["tools_spec_hash"] == stable_hash(request["tools"])
+        assert matching[0]["model_requested"] == request["model"]
+        assert matching[0]["status"] == "success"
     assert asyncio.run(sessions.list_composition_proposals(UUID(session_id))) == []
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
@@ -526,15 +633,21 @@ def test_complete_multi_clause_request_enters_empty_pipeline_planner(
     composer = client.app.state.composer_service
     ordinary_loop = AsyncMock(
         spec=composer._compose_loop,
-        return_value=ComposerResult(message="ordinary conversational response", state=_empty_state()),
+        wraps=composer._compose_loop,
     )
     monkeypatch.setattr(composer, "_compose_loop", ordinary_loop)
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": message, "client_request_id": str(uuid4())})
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={"content": message, "operation_id": str(uuid4()), "state_id": None},
+    )
 
-    assert response.status_code == 504, response.text
+    status, body = settled.error()
+    assert status == 504, settled.final.text
     ordinary_loop.assert_not_awaited()
-    assert response.json()["detail"]["failure_code"] == "provider_timeout"
+    assert body["detail"]["failure_code"] == "provider_timeout"
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
         assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
@@ -579,11 +692,16 @@ def test_send_message_freeform_planner_failure_is_translated(
     client, engine, sessions = _build_app(tmp_path, monkeypatch, completion_factory())
     session_id = client.post("/api/sessions", json={"title": "freeform planner failure"}).json()["id"]
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={"content": _EMPTY_INTENT, "operation_id": str(uuid4()), "state_id": None},
+    )
 
     # (a) deliberate safe response, not an unhandled 500.
-    assert response.status_code == expected_status, response.text
-    body = response.json()
+    status, body = settled.error()
+    assert status == expected_status, settled.final.text
     assert body["detail"]["error_type"] == "composer_planner_failure"
     assert body["detail"]["failure_code"] == expected_failure_code
     # The raw planner code reaches the CLIENT, not just the durable audit row below.
@@ -615,7 +733,7 @@ def test_send_message_freeform_planner_failure_is_translated(
     assert len(_llm_audit_rows(engine)) == expected_llm_audit_rows
 
     # (d) refused prose is recoverable only in its dedicated audit envelope.
-    _assert_no_sentinel_leak(engine, response.text, expected_withheld_replies=expected_withheld_replies)
+    _assert_no_sentinel_leak(engine, settled.final.text, expected_withheld_replies=expected_withheld_replies)
     _assert_withheld_prose_is_not_visible_or_replayed(client, sessions, session_id)
     captured = capsys.readouterr()
     assert _PROVIDER_LEAK_SENTINEL not in captured.out + captured.err + caplog.text
@@ -631,7 +749,7 @@ def test_send_message_freeform_planner_failure_is_translated(
         )
     )
     with pytest.raises(AssertionError):
-        _assert_no_sentinel_leak(engine, response.text, expected_withheld_replies=expected_withheld_replies)
+        _assert_no_sentinel_leak(engine, settled.final.text, expected_withheld_replies=expected_withheld_replies)
 
 
 def test_recompose_freeform_planner_failure_is_translated(
@@ -655,10 +773,15 @@ def test_recompose_freeform_planner_failure_is_translated(
         )
     )
 
-    response = client.post(f"/api/sessions/{session_id}/recompose", json={"expected_user_message_id": str(user_message.id)})
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/recompose",
+        body={"expected_user_message_id": str(user_message.id), "operation_id": str(uuid4()), "state_id": None},
+    )
 
-    assert response.status_code == 502, response.text
-    body = response.json()
+    status, body = settled.error()
+    assert status == 502, settled.final.text
     assert body["detail"]["error_type"] == "composer_planner_failure"
     assert body["detail"]["failure_code"] == "invalid_provider_response"
 
@@ -669,7 +792,7 @@ def test_recompose_freeform_planner_failure_is_translated(
     assert len(disposition_rows) == 1
     assert disposition_rows[0].tool_calls[0]["failure_code"] == "invalid_provider_response"
 
-    _assert_no_sentinel_leak(engine, response.text, expected_withheld_replies=3)
+    _assert_no_sentinel_leak(engine, settled.final.text, expected_withheld_replies=3)
     _assert_withheld_prose_is_not_visible_or_replayed(client, sessions, session_id)
     captured = capsys.readouterr()
     assert _PROVIDER_LEAK_SENTINEL not in captured.out + captured.err + caplog.text
@@ -846,11 +969,17 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
     client, engine, _sessions = _build_app(tmp_path, monkeypatch, _decline_after_exhaustion_completion())
     session_id = client.post("/api/sessions", json={"title": "freeform planner decline"}).json()["id"]
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={"content": _EMPTY_INTENT, "operation_id": str(uuid4()), "state_id": None},
+    )
 
-    assert response.status_code == 200, response.text
-    assert _DECLINE_TEXT in response.text
-    assert "unusable pipeline plan" not in response.text
+    assert settled.final.status_code == 200, settled.final.text
+    settled.result()
+    assert _DECLINE_TEXT in settled.final.text
+    assert "unusable pipeline plan" not in settled.final.text
 
     # Not a failure: no disposition row, and progress is not "failed".
     assert _disposition_rows(engine) == []
@@ -891,11 +1020,17 @@ def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message
     client, engine, _sessions = _build_app(tmp_path, monkeypatch, _marker_decline_completion())
     session_id = client.post("/api/sessions", json={"title": "ordinary turn decline"}).json()["id"]
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={"content": _EMPTY_INTENT, "operation_id": str(uuid4()), "state_id": None},
+    )
 
-    assert response.status_code == 200, response.text
-    assert _DECLINE_TEXT in response.text
-    assert "DECLINE:" not in response.json()["message"]["content"]
+    assert settled.final.status_code == 200, settled.final.text
+    body = settled.result()
+    assert _DECLINE_TEXT in settled.final.text
+    assert "DECLINE:" not in body["message"]["content"]
 
     # Not a failure: no disposition row, and progress is not "failed".
     assert _disposition_rows(engine) == []
@@ -981,13 +1116,15 @@ def test_later_explicit_imperative_reaches_planner_and_auto_commits(
     session_id = client.post("/api/sessions", json={"title": "later explicit build"}).json()["id"]
     session_id_holder["id"] = session_id
 
-    response = client.post(
-        f"/api/sessions/{session_id}/messages",
-        json={"content": "How does this work? Now build it.", "client_request_id": str(uuid4())},
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={"content": "How does this work? Now build it.", "operation_id": str(uuid4()), "state_id": None},
     )
 
-    assert response.status_code == 200, response.text
-    body = response.json()
+    assert settled.final.status_code == 200, settled.final.text
+    body = settled.result()
     assert body["state"] is not None
     assert body["proposals"] == []
     with engine.connect() as conn:
@@ -999,34 +1136,397 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pipeline-proposal settlement must run the interpretation-review
-    surfacer against the committed state. The planner path mints proposals
-    without the compose loop's request_interpretation_review dispatch, so
-    skipping the surfacer leaves committed states whose pending
-    interpretation_requirements have NO resolvable event row — the run gate
-    then 422s (interpretation_placeholder_unresolved) with nothing the user
-    can resolve (live: first planner-authored llm pipeline, session ff368dcb).
-    """
-    from unittest.mock import AsyncMock
+    """Planner-authored LLM requirements must have durable resolvable events.
 
+    Historical intent: the first planner-authored LLM pipeline in session
+    ff368dcb committed pending requirements without resolvable events. Keep
+    this registration as the regression. Current admission deliberately stages
+    pending-review candidates. This normal Web request uses the registered
+    compose-loop set_pipeline dialect: an actual explicit-approval preference
+    change and subsequent HTTP acceptance exercise atomic publication/evidence.
+    The separate later-imperative test retains the green auto-commit witness.
+    """
+    import socket
+
+    from elspeth.web.composer.pipeline_proposal import composition_content_hash
+    from elspeth.web.interpretation_state import approved_prompt_artifact_hash_from_options, interpretation_sites
+    from elspeth.web.sessions.models import (
+        composer_async_operations_table,
+        interpretation_events_table,
+        proposal_events_table,
+        quota_provider_attempts_table,
+        token_usage_ledger_table,
+    )
+    from elspeth.web.sessions.pending_interpretation import _interpretation_hash_domain_v2
+
+    # This test scripts only the physical planner SDK boundary. No provider
+    # bootstrap, credential discovery, socket connect, or row execution is
+    # authorized. A surprising network/runtime-provider path fails the test.
+    def denied_connection(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("offline interpretation fixture attempted a socket connection")
+
+    def denied_runtime_completion(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("authoring fixture unexpectedly executed the row provider")
+
+    monkeypatch.setattr(socket.socket, "connect", denied_connection)
+    monkeypatch.setattr(socket.socket, "connect_ex", denied_connection)
+    monkeypatch.setattr(litellm, "completion", denied_runtime_completion)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     (tmp_path / "outputs").mkdir(exist_ok=True)
     session_id_holder: dict[str, str] = {}
-    client, _engine, _sessions = _build_app(
+    baseline_completion = _valid_pipeline_completion(tmp_path, session_id_holder)
+    physical_requests: list[dict[str, Any]] = []
+
+    async def pending_completion(**kwargs: Any) -> _Response:
+        physical_requests.append(deepcopy(kwargs))
+        ordinal = len(physical_requests)
+        assert ordinal <= 3, "only the authored mutation, post-tool reply, and actual canary reconciliation are allowed"
+        names = [tool["function"]["name"] for tool in kwargs["tools"]]
+        assert "set_pipeline" in names
+        assert "emit_pipeline_proposal" not in names
+        (declaration,) = [tool["function"] for tool in kwargs["tools"] if tool["function"]["name"] == "set_pipeline"]
+        parameters = declaration["parameters"]
+        assert parameters["type"] == "object"
+        assert set(parameters["properties"]) == {"pipeline"}
+        assert parameters["required"] == ["pipeline"]
+        assert parameters["additionalProperties"] is False
+        assert parameters["properties"]["pipeline"]["type"] == "object"
+        if ordinal == 3:
+            assert kwargs["model"] == physical_requests[1]["model"]
+            assert kwargs["tools"] == physical_requests[1]["tools"]
+            assert kwargs["messages"][:-2] == physical_requests[1]["messages"]
+            assert kwargs["messages"][-2] == {
+                "role": "assistant",
+                "content": "The proposed pipeline is waiting for your approval.",
+            }
+            assert kwargs["messages"][-1] == {
+                "role": "user",
+                "content": (
+                    "[composer-system] No composition-state mutation completed successfully this turn, "
+                    "and the pipeline has no source or nodes. Re-check the user's request against that state. "
+                    "If the user requested construction or generated source data, carry out that authorized work "
+                    "using the declared tools before claiming it is complete. If a required product fact is missing, "
+                    "ask the concrete question. If the user asked only for explanation or revoked construction, "
+                    "answer that request without building. Do not describe data as saved, bound, or reviewed "
+                    "until tool results establish it."
+                ),
+            }
+            return _Response(
+                choices=[
+                    _Choice(message=_Message(content="The pipeline proposal awaits your approval; no pipeline state has been committed."))
+                ],
+                usage={"prompt_tokens": 14, "completion_tokens": 7, "total_tokens": 21, "cost": 0.03},
+                model="provider/canary-reply-v1",
+                id="canary-request-3",
+            )
+        if ordinal == 2:
+            assert kwargs["model"] == physical_requests[0]["model"]
+            assert kwargs["tools"] == physical_requests[0]["tools"]
+            assert kwargs["messages"][:-2] == physical_requests[0]["messages"]
+            authored = kwargs["messages"][-2]
+            assert authored["role"] == "assistant"
+            (tool_call,) = authored["tool_calls"]
+            assert tool_call["id"] == "call-1"
+            assert tool_call["function"]["name"] == "set_pipeline"
+            feedback = kwargs["messages"][-1]
+            assert feedback["role"] == "tool"
+            assert feedback["tool_call_id"] == "call-1"
+            tool_result = json.loads(feedback["content"])
+            assert "error" not in tool_result, tool_result
+            assert tool_result["success"] is True
+            assert tool_result["data"]["status"] == "APPROVAL_REQUIRED"
+            assert tool_result["data"]["tool_name"] == "set_pipeline"
+            return _Response(
+                choices=[_Choice(message=_Message(content="The proposed pipeline is waiting for your approval."))],
+                usage={"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18, "cost": 0.02},
+                model="provider/post-tool-v1",
+                id="post-tool-request-2",
+            )
+        assert ordinal == 1
+        response = await baseline_completion(**kwargs)
+        function = response.choices[0].message.tool_calls[0].function
+        pipeline = json.loads(function.arguments)["pipeline"]
+        pipeline["source"]["on_success"] = "input_rows"
+        pipeline["nodes"] = [
+            {
+                "id": "interpret_text",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "input_rows",
+                "on_success": "rows",
+                "on_error": "discard",
+                "options": {
+                    "profile": "offline-review",
+                    "system_prompt": "Describe the supplied name. Reply with one short factual description.",
+                    "prompt_template": "Describe {{ row.name }} using Use a concise factual tone.",
+                    "prompt_template_parts": [
+                        {"kind": "text", "text": "Describe {{ row.name }} using "},
+                        {"kind": "interpretation_ref", "requirement_id": "tone:interpret_text"},
+                    ],
+                    "required_input_fields": ["name"],
+                    "response_field": "summary",
+                    "schema": {"mode": "observed", "guaranteed_fields": ["summary"]},
+                    "interpretation_requirements": [
+                        {
+                            "kind": "vague_term",
+                            "user_term": "tone",
+                            "draft": "Use a concise factual tone.",
+                        }
+                    ],
+                },
+            }
+        ]
+        # The physical Web dialect wraps the canonical object in the
+        # declared pipeline field; the wire decoder unwraps it before dispatch.
+        # The provider authors the object; backend validation remains unchanged.
+        function.name = "set_pipeline"
+        function.arguments = json.dumps({"pipeline": pipeline})
+        return response
+
+    physical_sdk = AsyncMock(spec=litellm.acompletion, side_effect=pending_completion)
+    client, engine, _sessions = _build_app(
         tmp_path,
         monkeypatch,
-        _valid_pipeline_completion(tmp_path, session_id_holder),
+        physical_sdk,
+        pending_llm_review=True,
     )
-    composer = client.app.state.composer_service
-    spy = AsyncMock(wraps=composer._interpretation_surfacing.surface_pending_interpretation_reviews)
-    monkeypatch.setattr(composer._interpretation_surfacing, "surface_pending_interpretation_reviews", spy)
+    surfacing = client.app.state.composer_service._interpretation_surfacing
+    original_prepare = surfacing.prepare_pending_interpretation_reviews
+    prepared_calls = []
 
+    def record_preparation(state: CompositionState):
+        drafts = original_prepare(state)
+        prepared_calls.append((state, drafts))
+        return drafts
+
+    monkeypatch.setattr(surfacing, "prepare_pending_interpretation_reviews", record_preparation)
     session_id = client.post("/api/sessions", json={"title": "auto-commit surfacer"}).json()["id"]
     session_id_holder["id"] = session_id
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
-
-    assert response.status_code == 200, response.text
-    assert "prepared and validated" in response.text
-    assert spy.await_count == 1, "settlement must surface interpretation reviews for the committed state"
-    kwargs = spy.await_args.kwargs
-    assert kwargs["session_id"] == session_id
-    assert kwargs["current_state_id"] is not None
+    preferences = client.get(f"/api/sessions/{session_id}/composer/preferences")
+    assert preferences.status_code == 200, preferences.text
+    assert preferences.json()["trust_mode"] == "auto_commit"
+    changed_preferences = client.patch(
+        f"/api/sessions/{session_id}/composer/preferences",
+        json={"trust_mode": "explicit_approve", "density_default": preferences.json()["density_default"]},
+    )
+    assert changed_preferences.status_code == 200, changed_preferences.text
+    assert changed_preferences.json()["session_id"] == session_id
+    assert changed_preferences.json()["trust_mode"] == "explicit_approve"
+    assert changed_preferences.json()["density_default"] == preferences.json()["density_default"]
+    source_dir = tmp_path / "blobs" / session_id
+    source_dir.mkdir(parents=True)
+    (source_dir / "input.csv").write_text("name\nAlice\n", encoding="utf-8")
+    settled = settle_sync(
+        client,
+        client.app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={
+            "content": "Build a CSV to JSONL pipeline with an LLM description of each name.",
+            "operation_id": str(uuid4()),
+            "state_id": None,
+        },
+    )
+    assert settled.final.status_code == 200, settled.final.text
+    result = settled.result()
+    assert result["state"] is None, "explicit approval must not obtain automatic commit authority"
+    (proposal,) = result["proposals"]
+    assert proposal["status"] == "pending"
+    assert proposal["tool_name"] == "set_pipeline"
+    assert prepared_calls == [], "atomic cohort preparation belongs to publication"
+    accepted = client.post(
+        f"/api/sessions/{session_id}/proposals/{proposal['id']}/accept",
+        json={"draft_hash": proposal["pipeline_metadata"]["draft_hash"]},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == "committed"
+    ((prepared_state, drafts),) = prepared_calls
+    sites = interpretation_sites(prepared_state)
+    assert ("interpret_text", "vague_term", "tone") in {(site.component_id, site.kind.value, site.user_term) for site in sites}
+    assert len(sites) == len(drafts) > 0
+    assert {(site.component_id, site.kind.value, site.user_term) for site in sites} == {
+        (draft.affected_node_id, draft.kind.value, draft.user_term) for draft in drafts
+    }
+    current = client.get(f"/api/sessions/{session_id}/state")
+    assert current.status_code == 200, current.text
+    state = current.json()
+    assert accepted.json()["committed_state_id"] == state["id"]
+    composition = CompositionState.from_dict({key: state[key] for key in ("sources", "nodes", "edges", "outputs", "metadata", "version")})
+    assert composition_content_hash(composition) == composition_content_hash(prepared_state)
+    pending = client.get(f"/api/sessions/{session_id}/interpretations?status=pending")
+    assert pending.status_code == 200, pending.text
+    events = pending.json()["events"]
+    assert {event["id"] for event in events} == {str(draft.event_id) for draft in drafts}
+    assert all(event["composition_state_id"] == state["id"] and event["choice"] == "pending" for event in events)
+    with engine.connect() as conn:
+        actual_rows = conn.execute(select(interpretation_events_table)).mappings().all()
+        accepted_payload = conn.execute(
+            select(proposal_events_table.c.payload).where(
+                proposal_events_table.c.proposal_id == proposal["id"],
+                proposal_events_table.c.event_type == "proposal.accepted",
+            )
+        ).scalar_one()
+    assert {row["id"] for row in actual_rows} == {str(draft.event_id) for draft in drafts}
+    cohort = accepted_payload["review_cohort"]
+    assert {member["event_id"] for member in cohort} == {event["id"] for event in events}
+    assert len(cohort) == len(drafts)
+    assert accepted_payload["committed_state_content_hash"] == composition_content_hash(composition)
+    assert accepted_payload["final_state_content_hash"] == composition_content_hash(composition)
+    by_event = {event["id"]: event for event in events}
+    for ordinal, (member, draft) in enumerate(zip(cohort, drafts, strict=True)):
+        event = by_event[member["event_id"]]
+        material = member["semantic_material"]
+        assert member["ordinal"] == material["ordinal"] == ordinal
+        assert member["candidate_state_id"] == material["candidate_state_id"] == state["id"]
+        assert member["event_id"] == str(draft.event_id)
+        assert member["tool_call_id"] == event["tool_call_id"] == draft.tool_call_id
+        assert material["affected_node_id"] == event["affected_node_id"] == draft.affected_node_id
+        assert material["kind"] == event["kind"] == draft.kind.value
+        assert material["user_term"] == event["user_term"] == draft.user_term
+        assert material["llm_draft"] == event["llm_draft"] == draft.llm_draft
+        assert material["surface_origin"] == event["surface_origin"] == draft.surface_origin.value
+        for field_name in ("model_identifier", "model_version", "provider", "composer_skill_hash"):
+            assert material[field_name] == event[field_name]
+        assert member["semantic_hash"] == stable_hash({"schema": "composer.pipeline-review-semantic.v1", "material": material})
+        assert member["initial_disposition"] == "pending"
+        assert member["initial_resolution_hash"] == stable_hash(member["initial_resolution"])
+    (tone_event,) = [event for event in events if event["kind"] == "vague_term" and event["user_term"] == "tone"]
+    resolved = client.post(
+        f"/api/sessions/{session_id}/interpretations/{tone_event['id']}/resolve",
+        json={"choice": "amended", "amended_value": "Use a precise formal tone."},
+    )
+    assert resolved.status_code == 200, resolved.text
+    resolution = resolved.json()
+    event = resolution["event"]
+    assert event["id"] == tone_event["id"]
+    assert event["composition_state_id"] == state["id"]
+    assert event["choice"] == "amended"
+    assert event["llm_draft"] == tone_event["llm_draft"] == "Use a concise factual tone."
+    assert event["accepted_value"] == "Use a precise formal tone."
+    assert event["hash_domain_version"] == "v2"
+    assert event["arguments_hash"] == stable_hash(
+        _interpretation_hash_domain_v2(
+            **{
+                key: event[key]
+                for key in (
+                    "session_id",
+                    "composition_state_id",
+                    "affected_node_id",
+                    "tool_call_id",
+                    "user_term",
+                    "kind",
+                    "llm_draft",
+                    "accepted_value",
+                    "actor",
+                    "model_identifier",
+                    "model_version",
+                    "provider",
+                    "composer_skill_hash",
+                )
+            },
+            context="offline planner interpretation regression",
+        )
+    )
+    (resolved_node,) = resolution["new_state"]["nodes"]
+    assert "{{interpretation:tone}}" not in resolved_node["options"]["prompt_template"]
+    assert "Use a precise formal tone." in resolved_node["options"]["prompt_template"]
+    assert resolved_node["options"]["prompt_template"] != prepared_state.nodes[0].options["prompt_template"]
+    expected_artifact_hash = approved_prompt_artifact_hash_from_options(resolved_node["options"])
+    assert expected_artifact_hash is not None
+    assert event["approved_prompt_artifact_hash"] == resolved_node["options"]["approved_prompt_artifact_hash"] == expected_artifact_hash
+    (resolved_requirement,) = [
+        requirement
+        for requirement in resolved_node["options"]["interpretation_requirements"]
+        if requirement["kind"] == "vague_term" and requirement["user_term"] == "tone"
+    ]
+    assert resolved_requirement["status"] == "resolved"
+    assert resolved_requirement["event_id"] == event["id"]
+    assert resolved_requirement["accepted_value"] == event["accepted_value"]
+    assert resolved_requirement["resolved_prompt_template_hash"] == stable_hash(event["accepted_value"])
+    reloaded = client.get(f"/api/sessions/{session_id}/interpretations")
+    assert reloaded.status_code == 200, reloaded.text
+    assert next(item for item in reloaded.json()["events"] if item["id"] == event["id"]) == event
+    resolved_current = client.get(f"/api/sessions/{session_id}/state")
+    assert resolved_current.status_code == 200, resolved_current.text
+    assert resolved_current.json()["id"] == resolution["new_state"]["id"]
+    assert composition_content_hash(
+        CompositionState.from_dict(
+            {key: resolved_current.json()[key] for key in ("sources", "nodes", "edges", "outputs", "metadata", "version")}
+        )
+    ) == composition_content_hash(
+        CompositionState.from_dict(
+            {key: resolution["new_state"][key] for key in ("sources", "nodes", "edges", "outputs", "metadata", "version")}
+        )
+    )
+    with engine.connect() as conn:
+        resolved_row = (
+            conn.execute(
+                select(interpretation_events_table).where(
+                    interpretation_events_table.c.id == event["id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert resolved_row["arguments_hash"] == event["arguments_hash"]
+    assert resolved_row["approved_prompt_artifact_hash"] == expected_artifact_hash
+    assert physical_sdk.await_count == len(physical_requests) == 3
+    audits = _llm_audit_rows(engine)
+    assert len(audits) == 3
+    calls = [audit.tool_calls[0]["call"] for audit in audits]
+    assert len({call["call_id"] for call in calls}) == 3
+    assert {call["messages_hash"] for call in calls} == {stable_hash(request["messages"]) for request in physical_requests}
+    assert {call["provider_request_id"] for call in calls} == {"planner-request-1", "post-tool-request-2", "canary-request-3"}
+    assert {call["model_returned"] for call in calls} == {"provider/planner-v1", "provider/post-tool-v1", "provider/canary-reply-v1"}
+    for physical in physical_requests:
+        (call,) = [call for call in calls if call["messages_hash"] == stable_hash(physical["messages"])]
+        assert call["status"] == "success"
+        assert call["model_requested"] == physical["model"]
+        assert call["tools_spec_hash"] == stable_hash(physical["tools"])
+    with engine.connect() as conn:
+        operation = (
+            conn.execute(
+                select(composer_async_operations_table).where(
+                    composer_async_operations_table.c.session_id == session_id,
+                    composer_async_operations_table.c.operation_id == settled.accepted.json()["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+        attempts = (
+            conn.execute(
+                select(quota_provider_attempts_table).where(
+                    quota_provider_attempts_table.c.session_id == session_id,
+                )
+            )
+            .mappings()
+            .all()
+        )
+        ledger = (
+            conn.execute(
+                select(token_usage_ledger_table).where(
+                    token_usage_ledger_table.c.session_id == session_id,
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert operation["status"] == "completed"
+    assert len(attempts) == len(ledger) == 3
+    assert {attempt["attempt_id"] for attempt in attempts} == {call["call_id"] for call in calls}
+    assert len({attempt["ledger_entry_id"] for attempt in attempts}) == 3
+    assert {attempt["ledger_entry_id"] for attempt in attempts} == {entry["entry_id"] for entry in ledger}
+    for attempt in attempts:
+        assert attempt["settled_at"] is not None
+        assert attempt["identity_id"] == operation["actor_user_id"] == "alice"
+        assert attempt["source"] == "composer"
+        assert attempt["operation_id"] == operation["session_operation_id"]
+        assert attempt["operation_epoch"] == operation["session_operation_epoch"]
+        assert attempt["lease_token"] == operation["session_operation_lease_token"]
+        (entry,) = [entry for entry in ledger if entry["entry_id"] == attempt["ledger_entry_id"]]
+        (call,) = [call for call in calls if call["call_id"] == attempt["attempt_id"]]
+        assert entry["identity_id"] == "alice"
+        assert entry["source"] == "composer"
+        assert entry["model"] == call["model_returned"]
+        assert entry["prompt_tokens"] == call["prompt_tokens"]
+        assert entry["completion_tokens"] == call["completion_tokens"]

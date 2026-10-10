@@ -8,6 +8,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import ExitStack, asynccontextmanager
@@ -31,8 +32,10 @@ from elspeth.web.coordination.membership_lifecycle import RegisteredWebInstanceM
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.operator_telemetry import OperatorTelemetryRuntime
 from elspeth.web.process_recovery import ProcessRecovery
+from elspeth.web.process_watchdog_codec import RecoveryReason
 from elspeth.web.sessions.models import web_instances_table
 from elspeth.web.sessions.protocol import WebInstanceRecord
+from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 from tests.unit.web.test_app import _settings
 
 
@@ -50,6 +53,8 @@ def _run_host() -> None:
             lease_seconds=30,
             interval_seconds=1,
             process_recovery=app.state.process_recovery,
+            instance_draining=app.state.instance_draining,
+            finalizer_owner=app.state.application_finalizer_owner,
         )
         app.state.web_instance_membership = membership
         app.state.instance_draining = membership.draining
@@ -172,24 +177,32 @@ def test_fatal_worker_exits_uvicorn_process(tmp_path: Path, mode: str) -> None:
             process.wait(timeout=10)
 
 
-def test_repeated_worker_failures_send_one_host_signal(monkeypatch: pytest.MonkeyPatch) -> None:
-    signals: list[tuple[int, int]] = []
-    monkeypatch.setattr("elspeth.web.process_recovery.os.kill", lambda pid, sig: signals.append((pid, sig)))
-    recovery = ProcessRecovery()
+@pytest.mark.asyncio
+async def test_repeated_worker_failures_send_one_host_signal() -> None:
+    draining = threading.Event()
+    watchdog = OwnedTestProcessWatchdog(draining)
+    recovery = ProcessRecovery(watchdog=watchdog, instance_draining=draining)
     recovery.request_shutdown()
     recovery.request_shutdown()
     recovery.begin_shutdown()
     recovery.request_shutdown()
-    assert signals == [(os.getpid(), signal.SIGTERM)]
+    await recovery.join_escalation()
+    assert draining.is_set()
+    assert watchdog.reasons == [RecoveryReason.REQUIRED_WORKER_LOST]
+    assert watchdog.signals == [signal.SIGTERM]
 
 
-def test_worker_failure_during_normal_shutdown_does_not_signal_again(monkeypatch: pytest.MonkeyPatch) -> None:
-    signals: list[tuple[int, int]] = []
-    monkeypatch.setattr("elspeth.web.process_recovery.os.kill", lambda pid, sig: signals.append((pid, sig)))
-    recovery = ProcessRecovery()
+@pytest.mark.asyncio
+async def test_worker_failure_during_normal_shutdown_does_not_signal_again() -> None:
+    draining = threading.Event()
+    watchdog = OwnedTestProcessWatchdog(draining)
+    recovery = ProcessRecovery(watchdog=watchdog, instance_draining=draining)
     recovery.begin_shutdown()
     recovery.request_shutdown()
-    assert signals == []
+    await recovery.join_escalation()
+    assert draining.is_set()
+    assert watchdog.reasons == [RecoveryReason.NORMAL_SHUTDOWN]
+    assert watchdog.signals == []
 
 
 @pytest.mark.asyncio
@@ -203,33 +216,43 @@ async def test_simultaneous_membership_and_orphan_failures_share_one_shutdown_re
         web_instance_identity_from_settings(settings, instance_id="simultaneous-failure"),
         lease_seconds=30,
         process_recovery=app.state.process_recovery,
+        instance_draining=app.state.instance_draining,
+        finalizer_owner=app.state.application_finalizer_owner,
     )
     app.state.web_instance_membership = membership
     app.state.instance_draining = membership.draining
     fail = asyncio.Event()
-    signals: list[tuple[int, int]] = []
+    watchdog = app.state.process_watchdog
+    assert isinstance(watchdog, OwnedTestProcessWatchdog)
+    membership_original = WebInstanceMembershipLost()
+    orphan_original = OSError("injected simultaneous orphan failure")
     failures: set[str] = set()
 
     async def heartbeat_failure(_membership: RegisteredWebInstanceMembership) -> None:
         await fail.wait()
         failures.add("membership")
-        raise WebInstanceMembershipLost()
+        raise membership_original
 
     async def orphan_failure(*_args: object, **_kwargs: object) -> None:
         await fail.wait()
         failures.add("orphan")
-        raise OSError("injected simultaneous orphan failure")
+        raise orphan_original
 
     monkeypatch.setattr(RegisteredWebInstanceMembership, "_heartbeat_loop", heartbeat_failure)
     monkeypatch.setattr("elspeth.web.app._periodic_orphan_cleanup", orphan_failure)
-    monkeypatch.setattr("elspeth.web.process_recovery.os.kill", lambda pid, sig: signals.append((pid, sig)))
-    with pytest.raises(WebInstanceMembershipLost):
+    with pytest.raises(BaseExceptionGroup, match="Application lifecycle obligations failed") as grouped:
         async with lifespan(app):
             fail.set()
             # One turn runs both failing workers; the next runs their callbacks.
             await asyncio.sleep(0)
             await asyncio.sleep(0)
             assert failures == {"membership", "orphan"}
-            assert signals == [(os.getpid(), signal.SIGTERM)]
+            await app.state.process_recovery.join_escalation()
+            assert watchdog.reasons == [RecoveryReason.REQUIRED_WORKER_LOST]
+            assert watchdog.signals == [signal.SIGTERM]
             assert membership.draining.is_set()
-    assert signals == [(os.getpid(), signal.SIGTERM)]
+    assert len(grouped.value.exceptions) == 2
+    assert grouped.value.exceptions[0] is orphan_original
+    assert grouped.value.exceptions[1] is membership_original
+    assert watchdog.reasons == [RecoveryReason.REQUIRED_WORKER_LOST]
+    assert watchdog.signals == [signal.SIGTERM]

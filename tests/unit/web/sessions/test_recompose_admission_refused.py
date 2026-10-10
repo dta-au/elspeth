@@ -18,6 +18,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
+from tests.helpers.composer_operations import settle_sync, strip_request_id
 from tests.unit.web.sessions.test_routes import TestClient, _make_app
 
 _REFUSAL_TEXT = "Composer admission refused: identity_disabled."
@@ -38,9 +39,11 @@ def _post_after_compose_failure(tmp_path: Path, failure: ComposerServiceError, *
     session_id = client.post("/api/sessions", json={"title": "Admission"}).json()["id"]
 
     if route == "messages":
-        response = client.post(
-            f"/api/sessions/{session_id}/messages",
-            json={"content": "Build a pipeline", "client_request_id": str(uuid.uuid4())},
+        settled = settle_sync(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body={"content": "Build a pipeline", "operation_id": str(uuid.uuid4()), "state_id": None},
         )
     else:
         # recompose precondition: the conversation ends at the failed user turn.
@@ -51,13 +54,25 @@ def _post_after_compose_failure(tmp_path: Path, failure: ComposerServiceError, *
             )
         finally:
             loop.close()
-        response = client.post(
-            f"/api/sessions/{session_id}/recompose",
-            json={"expected_user_message_id": str(user_message.id)},
+        settled = settle_sync(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/recompose",
+            body={"expected_user_message_id": str(user_message.id), "operation_id": str(uuid.uuid4()), "state_id": None},
         )
 
     progress = client.get(f"/api/sessions/{session_id}/composer-progress").json()
-    return response.status_code, response.json()["detail"], progress
+    status, body = settled.error()
+    detail = body["detail"]
+    admission_request_id = settled.accepted.headers["X-Request-ID"]
+    observation_request_id = settled.final.headers["X-Request-ID"]
+    assert str(uuid.UUID(admission_request_id)) == admission_request_id
+    assert str(uuid.UUID(observation_request_id)) == observation_request_id
+    assert detail["request_id"] == admission_request_id
+    assert observation_request_id != admission_request_id
+    composer.compose.assert_awaited_once()
+    # Compare exact refusal semantics after proving original admission provenance.
+    return status, strip_request_id(detail), progress
 
 
 def test_recompose_admission_refusal_is_403_with_permanent_failure_code(tmp_path: Path) -> None:

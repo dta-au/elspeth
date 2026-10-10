@@ -35,13 +35,15 @@ interface Fixture {
 
 function chatMessage(role: "user" | "assistant", content: string): Record<string, unknown> {
   return {
-    id: role === "user" ? "user-1" : "assistant-1", session_id: sid, role, content,
+    id: role === "user" ? "22222222-2222-4222-8222-222222222222" : "33333333-3333-4333-8333-333333333333", session_id: sid, role, content,
+    segments: [{ kind: "text", content }], raw_content: null, rejection: null, operation_id: null,
     tool_calls: null, created_at: stamp, composition_state_id: role === "assistant" ? stateId : null,
     tool_call_id: null, parent_assistant_id: null, sequence_no: role === "assistant" ? 1 : 0,
   };
 }
 
 async function installRoutes(page: Page, fixture: Fixture): Promise<void> {
+  let operationId: string | null = null;
   const prefs: Record<string, unknown> = {
     freeform_intro_dismissed_at: null,
     tutorial_completed_at: null, tutorial_stage: null, tutorial_session_id: null,
@@ -114,7 +116,8 @@ async function installRoutes(page: Page, fixture: Fixture): Promise<void> {
     }
     if (path === `/api/sessions/${sid}/messages`) {
       if (method === "POST") {
-        const body = req.postDataJSON() as { content: string };
+        const body = req.postDataJSON() as { content: string; operation_id: string };
+        operationId = body.operation_id;
         expect(body.content).toContain("project-3.html");
         fixture.requests.push("freeform-compose");
         if (fixture.holdCompose === true) {
@@ -126,11 +129,17 @@ async function installRoutes(page: Page, fixture: Fixture): Promise<void> {
           chatMessage("assistant", "I built the pipeline for review."),
         ];
         fixture.composed = true;
-        await fulfill({ message: fixture.messages[1], state, proposals: [] });
+        await route.fulfill({ status: 202, json: { operation_id: operationId, kind: "compose_message", status: "queued", poll_after_ms: 1000 } });
       } else {
         await fulfill(fixture.messages);
       }
       return;
+    }
+    if (operationId !== null && path === `/api/sessions/${sid}/operations/${operationId}/stream`) {
+      await route.fulfill({ status: 503, json: { detail: "stream unavailable" } }); return;
+    }
+    if (operationId !== null && path === `/api/sessions/${sid}/operations/${operationId}`) {
+      await fulfill({ operation_id: operationId, kind: "compose_message", status: "completed", poll_after_ms: 1000, cancel_requested: false, deadline_at: stamp, deadline_remaining_ms: 0, result: { message: fixture.messages[1], state, proposals: [] }, error: null }); return;
     }
     if (path === `/api/sessions/${sid}/state` && method === "GET") {
       await fulfill(fixture.composed ? state : null);

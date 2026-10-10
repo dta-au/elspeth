@@ -9,6 +9,7 @@ import {
 import { Button } from "@/components/ui";
 import { useTheme } from "@/hooks/useTheme";
 import { useAuthStore } from "@/stores/authStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 import type { UserProfile } from "@/types/index";
 
 interface UserMenuProps {
@@ -84,6 +85,7 @@ export function UserMenu({
   // via GET /api/auth/me — so no props flow through AppHeader and no new
   // fetch consumer is added (elspeth-312238838a).
   const user = useAuthStore((s) => s.user);
+  const preferencesUnavailableForRole = usePreferencesStore((s) => s.unavailableForRole);
   const themeLabel =
     resolvedTheme === "dark" ? "Switch to light theme" : "Switch to dark theme";
 
@@ -243,15 +245,17 @@ export function UserMenu({
               {themeLabel}
             </Button>
           </li>
-          <li className="user-menu-item">
-            <Button
-              variant="bare"
-              onClick={onSettings}
-              className="user-menu-action"
-            >
-              Composer preferences
-            </Button>
-          </li>
+          {!preferencesUnavailableForRole && (
+            <li className="user-menu-item">
+              <Button
+                variant="bare"
+                onClick={onSettings}
+                className="user-menu-action"
+              >
+                Composer preferences
+              </Button>
+            </li>
+          )}
           {user !== null && onOpenMailbox !== undefined && <li className="user-menu-item">
             <Button variant="bare" onClick={onMailbox} className="user-menu-action">Mailbox</Button>
           </li>}

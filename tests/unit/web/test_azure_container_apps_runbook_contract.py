@@ -257,6 +257,13 @@ def test_transport_ceiling_is_bound_below_the_ingress_timeout() -> None:
     assert "the example parameter file uses 210" in " ".join(acceptance.split())
 
 
+def test_cold_install_describes_independent_durable_job_budget_and_sync_headroom() -> None:
+    text = _text(COLD_INSTALL_RUNBOOK)
+    assert "independent of the transport idle ceiling" in text
+    assert "ceiling above 30 seconds for synchronous request headroom" in text
+    assert "package and image from the same commit" in text
+
+
 def test_runbooks_cite_the_measured_facts_and_the_bundle_and_declare_their_status() -> None:
     assert PLATFORM_FACTS.is_file()
     for runbook in RUNBOOKS:

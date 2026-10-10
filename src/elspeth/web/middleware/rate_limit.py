@@ -1,7 +1,7 @@
-"""Explicit local and PostgreSQL shared sliding-window rate limit adapters.
+"""Explicit local and SQL shared sliding-window rate limit adapters.
 
-Local SQLite deployments use the process-local adapter. PostgreSQL deployments
-use a repository authority so replicas consume one shared budget.
+Composer quotas are SQL-backed on both supported databases. Other SQLite
+scopes retain the local adapter; PostgreSQL replicas share every SQL budget.
 
 Layer: L3 (application).
 """
@@ -15,7 +15,7 @@ from fastapi import HTTPException, Request
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_sync_in_worker
-from elspeth.web.coordination.rate_limit_authority import RateLimitScope, RepositoryRateLimitAuthority
+from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission, RateLimitScope, RepositoryRateLimitAuthority
 
 
 class ComposerRateLimiter:
@@ -148,6 +148,13 @@ class SharedRateLimiter:
         self._limit = limit
         self._authority = authority
         self._scope = scope
+
+    @property
+    def composer_admission(self) -> ComposerQuotaAdmission:
+        """Carry this same composer budget into the job's SQL transaction."""
+        if self._scope != "composer":
+            raise ValueError("Durable composer admission requires the composer quota scope")
+        return ComposerQuotaAdmission(self._authority, self._limit)
 
     async def check(self, user_id: str) -> None:
         """Refuse database errors without exposing SQL diagnostics or subjects."""

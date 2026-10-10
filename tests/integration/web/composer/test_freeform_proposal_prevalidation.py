@@ -29,6 +29,8 @@ from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.authority_hashing import composer_authority_hash
+from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
@@ -37,6 +39,7 @@ from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as real_build_set_pipeline_candidate
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.validation import ProfileAwareValidationResult
 from elspeth.web.sessions.engine import create_session_engine
@@ -557,7 +560,7 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
     assert UUID(safe_arguments["source"]["blob_id"]).version == 5
     assert safe_redacted_arguments["source"]["blob_id"] == safe_arguments["source"]["blob_id"]
     assert proposals[0].tool_arguments_hash == stable_hash(safe_arguments)
-    assert builder.call_count == 2
+    assert builder.call_count == 3
     assert result.state is state
     assert _count_rows(harness.engine, blobs_table) == 1
     assert _count_rows(harness.engine, composition_states_table) == 0
@@ -731,6 +734,86 @@ async def test_inline_proposal_gap_retry_reuses_one_custody_blob_and_quota_charg
     assert Path(retried_blob.storage_path).read_bytes() == raw_content.encode("utf-8")
 
 
+def _assert_context_authority_retained(left: Any, right: Any) -> None:
+    """Shallow context replacement must retain all 24 non-stage fields."""
+    assert left.catalog is right.catalog
+    assert left.plugin_snapshot is right.plugin_snapshot
+    assert left.session_engine is right.session_engine
+    assert left.session_operation_context is right.session_operation_context
+    assert left.session_operation_authority is right.session_operation_authority
+    assert left.secret_service is right.secret_service
+    assert left.secret_wiring_policy is right.secret_wiring_policy
+    assert left.baseline is right.baseline
+    assert left.current_validation is right.current_validation
+    assert left.runtime_preflight is right.runtime_preflight
+    assert left.structural_preflight is right.structural_preflight
+    assert left.reviewed_source_authority is right.reviewed_source_authority
+    assert left.data_dir == right.data_dir
+    assert left.require_data_dir_for_paths == right.require_data_dir_for_paths
+    assert left.session_id == right.session_id
+    assert left.user_id == right.user_id
+    assert left.max_blob_storage_per_session_bytes == right.max_blob_storage_per_session_bytes
+    assert left.user_message_id == right.user_message_id
+    assert left.user_message_content == right.user_message_content
+    assert left.composer_model_identifier == right.composer_model_identifier
+    assert left.composer_model_version == right.composer_model_version
+    assert left.composer_provider == right.composer_provider
+    assert left.composer_skill_hash == right.composer_skill_hash
+    assert left.executing_proposal_id == right.executing_proposal_id
+
+
+def _assert_repaired_inline_builder_stages(builder: Any, *, first_valid_call: int, state: CompositionState) -> str:
+    """Prove public draft, canonical review and physical blob-backed rebuild."""
+    calls = builder.call_args_list[first_valid_call:]
+    assert len(calls) == 3
+    assert all(not call.kwargs and len(call.args) == 3 and call.args[1] is state for call in calls)
+    initial, canonical, custody = calls
+    initial_arguments, _initial_state, initial_context = initial.args
+    canonical_arguments, _canonical_state, canonical_context = canonical.args
+    custody_arguments, _custody_state, custody_context = custody.args
+    assert initial_context is not canonical_context and canonical_context is not custody_context
+    assert initial_context._interpretation_requirements_are_internal is False
+    assert canonical_context._interpretation_requirements_are_internal is True
+    assert custody_context._interpretation_requirements_are_internal is True
+    _assert_context_authority_retained(initial_context, canonical_context)
+    _assert_context_authority_retained(canonical_context, custody_context)
+    assert initial_context.tool_arguments_hash == composer_authority_hash(inline_custody_audit_projection(initial_arguments))
+    assert canonical_context.tool_arguments_hash == composer_authority_hash(inline_custody_audit_projection(canonical_arguments))
+    assert custody_context.tool_arguments_hash == composer_authority_hash(custody_arguments)
+
+    assert "inline_blob" in initial_arguments["source"]
+    assert INTERPRETATION_REQUIREMENTS_KEY not in initial_arguments["source"]["options"]
+    assert "inline_blob" in canonical_arguments["source"]
+    (source_review,) = canonical_arguments["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY]
+    assert source_review["id"] == "source_review:inline_source_data"
+    assert source_review["user_term"] == "inline_source_data"
+    assert source_review["kind"] == "invented_source"
+    assert source_review["status"] == "pending"
+    assert source_review["draft"] == initial_arguments["source"]["inline_blob"]["content"]
+    assert source_review["event_id"] is None
+    assert source_review["accepted_value"] is None
+    assert source_review["accepted_artifact_hash"] is None
+    assert source_review["resolved_prompt_template_hash"] is None
+    expected_canonical = deepcopy(initial_arguments)
+    expected_canonical["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY] = deepcopy(
+        canonical_arguments["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY]
+    )
+    assert canonical_arguments == expected_canonical
+
+    assert "inline_blob" not in custody_arguments["source"]
+    blob_id = custody_arguments["source"]["blob_id"]
+    assert str(UUID(blob_id)) == blob_id
+    expected_custody = deepcopy(canonical_arguments)
+    del expected_custody["source"]["inline_blob"]
+    expected_custody["source"]["blob_id"] = blob_id
+    assert custody_arguments == expected_custody
+    assert (
+        custody_arguments["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY]
+        == canonical_arguments["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY]
+    )
+    return blob_id
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("case", "expected_error_fragment", "rejected_fragment", "expected_invalid_builder_calls"),
@@ -802,7 +885,10 @@ async def test_inline_candidate_argument_error_is_audited_once_and_repairable(
     assert len(proposals) == 1
     assert proposals[0].tool_call_id == f"call_{case}_repaired"
     assert result.state is state
-    assert builder.call_count == expected_invalid_builder_calls + 2
+    repaired_blob_id = _assert_repaired_inline_builder_stages(builder, first_valid_call=expected_invalid_builder_calls, state=state)
+    assert deep_thaw(proposals[0].arguments_json)["source"]["blob_id"] == repaired_blob_id
+    with harness.engine.connect() as conn:
+        assert str(conn.execute(select(blobs_table.c.id)).scalar_one()) == repaired_blob_id
     assert _count_rows(harness.engine, blobs_table) == 1
     assert _count_rows(harness.engine, composition_states_table) == 0
 
@@ -937,7 +1023,10 @@ async def test_surrogate_inline_content_fails_closed_at_canonicalization_and_is_
     assert len(proposals) == 1
     assert proposals[0].tool_call_id == "call_surrogate_repaired"
     assert result.state is state
-    assert builder.call_count == 2
+    repaired_blob_id = _assert_repaired_inline_builder_stages(builder, first_valid_call=0, state=state)
+    assert deep_thaw(proposals[0].arguments_json)["source"]["blob_id"] == repaired_blob_id
+    with harness.engine.connect() as conn:
+        assert str(conn.execute(select(blobs_table.c.id)).scalar_one()) == repaired_blob_id
     assert _count_rows(harness.engine, blobs_table) == 1
     assert _count_rows(harness.engine, composition_states_table) == 0
 
@@ -1010,7 +1099,17 @@ async def test_unexpected_candidate_finalizer_exception_uses_plugin_crash_audit_
     assert exc_info.value.original_exc is unexpected
     assert exc_info.value.__cause__ is unexpected
     assert exc_info.value.partial_state is None
-    assert builder.call_count == 1
+    assert builder.call_count == 2
+    initial_call, canonical_call = builder.call_args_list
+    initial_arguments, initial_state, initial_context = initial_call.args
+    canonical_arguments, canonical_state, canonical_context = canonical_call.args
+    assert initial_state is canonical_state is state
+    assert initial_context._interpretation_requirements_are_internal is False
+    assert canonical_context._interpretation_requirements_are_internal is True
+    assert INTERPRETATION_REQUIREMENTS_KEY not in initial_arguments["source"]["options"]
+    (source_review,) = canonical_arguments["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY]
+    assert source_review["kind"] == "invented_source"
+    assert source_review["status"] == "pending"
     assert finalizer.call_count == 1
     assert len(llm.message_snapshots) == 1
     assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
@@ -1070,7 +1169,16 @@ async def test_preproposal_base_exception_is_audited_once_and_propagated_unchang
 
     assert exc_info.value is signal
     assert not isinstance(exc_info.value, ComposerPluginCrashError)
-    assert builder.call_count == 1
+    assert builder.call_count == 2
+    initial_call, canonical_call = builder.call_args_list
+    initial_arguments, _initial_state, initial_context = initial_call.args
+    canonical_arguments, _canonical_state, canonical_context = canonical_call.args
+    assert INTERPRETATION_REQUIREMENTS_KEY not in initial_arguments["source"]["options"]
+    (source_review,) = canonical_arguments["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY]
+    assert source_review["kind"] == "invented_source"
+    assert source_review["status"] == "pending"
+    assert initial_context._interpretation_requirements_are_internal is False
+    assert canonical_context._interpretation_requirements_are_internal is True
     assert finalizer.call_count == 1
     assert len(llm.message_snapshots) == 1
     assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []

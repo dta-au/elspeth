@@ -1,0 +1,21 @@
+<!-- Durable copy: machine paths normalized; exact private original retained. -->
+
+# Actual Astra getter watchdog-contract source review 1
+
+**Bounded source GO for the one-line child correction, matching parent hash and complete 45-entry source map.** This fixes the measured fixture-only attribute error using the real public watchdog contract. It does not convert the failed native baseline into a pass; root must apply the exact two guarded files, verify the selected map and rerun its finite owned baseline.
+
+Evidence: `astra-getter-watchdog-contract-code-review-1-evidence.json`.
+
+I read the full replacement child, both patches, full contract control and completed log/exit, the real complete `process_watchdog.py`, the root's complete failed parent log/exit and child log. The parent behavior is retained by complete byte projection against the previously reviewed parent. I imported no candidate/project code and executed no test, SQL, watchdog, provider or child runtime.
+
+Exact child replacement: `a362457d380ffcb5ececa6f3472288626798177e7c32ce8e90f8bde52d5a5497`. Exact parent replacement: `8c34e1d35797ec44f59180fff572114d45fb1d54093062d73f90e8b1461a9c76`. Package manifest: `8b5c242092d9064926d2394c955d25c1e7cb452ea1484a915d66fb04e610d0b4`. All 13 manifest entries matched. Both live preimages matched; the child differs at exactly its watchdog assertion and the parent only at `_CHILD_SHA`. The 45-entry map retains its exact key set and changes exactly those two values; every other current live hash matched. The smaller changed-entries JSON is not an acceptable replacement environment map.
+
+The root's earlier native result is a genuine failure: parent pytest exit 1, one failed test and one retained unknown-env_files warning. Its child produced the actual terminal record with eleven true physical booleans and null drain error, reached the final watchdog assertion, and raised `AttributeError` on `.completed`. Those observations remain evidence of the reached paths, not a successful control completion. The original child and parent results are preserved.
+
+The actual `ProcessWatchdogControl` exposes `assert_watching()`, not `.completed`. The real implementation at lines 151–153 rejects a disarmed watchdog, absent helper or exited helper. Successful `complete()` sets `_disarmed=True` after DISARM acknowledgement, before joining the helper. Therefore replacing the double-only field read with the actual public assertion retains the intended observation that the watchdog has not successfully disarmed and is still watching with a live helper. It additionally rejects lost helper supervision. It does not prove that no COMPLETE attempt ever occurred and failed; the report states that limit correctly.
+
+No factory is substituted, capability manufactured, release requirement removed or original replaced. The child's physical barriers, actual private/generation joins, original callback and three cancellation identity assertions, strict false-success check, empty-handoff assertion, zero outstanding admissions, and `registry.assert_completed()` refusal remain byte-identical. Parent finite ownership, expected-cause classification, clean-drain prerequisite, complete snapshot parser and reaping remain unchanged, including their previously documented limits.
+
+The source control compiles only the exact current `assert_watching` method body against instrument-owned state and an isolated failure class. Its positive has an undisarmed watchdog and pending helper; disarmed, absent-helper and exited-helper cases each raise. The completed exit-0 record is an author-run contract instrument, not construction/execution of a real watchdog or a new native baseline. I inspected the real completion path separately to support why the disarmed negative corresponds to successful completion. Full-byte and map checks were independently repeated without imports.
+
+No new blocking defect was found in this minimal correction. The old baseline remains failed until a new exact-epoch finite run exits successfully after the corrected assertion and cleanup. Nonempty handoff, PostgreSQL, canonical/global/source51/52 admission, broader gates, the original obligations and John's local/manual Daybreak/merge decision remain held.

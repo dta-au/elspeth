@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { resetStore } from "@/test/store-helpers";
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -56,6 +56,35 @@ describe("TutorialTurn7Graduation", () => {
         updated_at: "2026-05-19T12:35:00Z",
       }),
     );
+  });
+
+  it("does not create a skipped session or publish completion after the save loses account ownership", async () => {
+    let resolve!: (payload: Awaited<ReturnType<typeof api.updateUserComposerPreferences>>) => void;
+    vi.mocked(api.updateUserComposerPreferences).mockReturnValueOnce(new Promise((yes) => { resolve = yes; }));
+    render(<TutorialTurn7Graduation sessionId={null} skipped={true} cancelled={false} />);
+    await userEvent.click(screen.getByRole("button", { name: "Take me to the composer" }));
+    expect(api.updateUserComposerPreferences).toHaveBeenCalledTimes(1);
+    act(() => usePreferencesStore.getState().bindPrincipal("new-user", "local"));
+    await act(async () => {
+      resolve({ freeform_intro_dismissed_at: null, tutorial_completed_at: "old completion", tutorial_stage: null, tutorial_session_id: null, tutorial_run_id: null, tutorial_source_data_hash: null, show_advanced: false, updated_at: null });
+    });
+    expect(api.createSession).not.toHaveBeenCalled();
+    expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not publish a non-skipped departure after unmount during its PATCH", async () => {
+    let resolve!: (payload: Awaited<ReturnType<typeof api.updateUserComposerPreferences>>) => void;
+    vi.mocked(api.updateUserComposerPreferences).mockReturnValueOnce(new Promise((yes) => { resolve = yes; }));
+    const view = render(<TutorialTurn7Graduation sessionId="tutorial" skipped={false} cancelled={false} />);
+    await userEvent.click(screen.getByRole("button", { name: "Take me to the composer" }));
+    await waitFor(() => expect(api.updateUserComposerPreferences).toHaveBeenCalledTimes(1));
+    view.unmount();
+    await act(async () => {
+      resolve({ freeform_intro_dismissed_at: null, tutorial_completed_at: "persisted completion", tutorial_stage: null, tutorial_session_id: null, tutorial_run_id: null, tutorial_source_data_hash: null, show_advanced: false, updated_at: null });
+    });
+    expect(usePreferencesStore.getState().tutorialCompletedAt).toBe("persisted completion");
+    expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
   });
 
   it("focuses the heading, emits the graduation event, and renders the learning bullets", async () => {

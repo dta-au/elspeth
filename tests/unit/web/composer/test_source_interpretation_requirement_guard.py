@@ -17,6 +17,8 @@ source arm. Symmetric with the LLM-node guard covered in test_tools.py.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from hashlib import sha256
 from typing import Any
 
 import pytest
@@ -38,7 +40,7 @@ from elspeth.web.composer.tools import (
     execute_tool as _execute_tool,
 )
 from elspeth.web.composer.tools._common import _SERVER_OWNED_SOURCE_OPTION_KEYS, ToolContext
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, reconcile_authoritative_reviews
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 
@@ -395,3 +397,275 @@ def test_public_dispatch_rejects_every_server_owned_root_on_every_source_writer(
     assert result.updated_state is state
     assert result.data is None
     assert field_name in result.validation.errors[0].message
+
+
+_GENERATED_CSV = "url\nhttps://example.gov.au/brief\n"
+_GENERATED_HASH = sha256(_GENERATED_CSV.encode("utf-8")).hexdigest()
+
+
+def _generated_requirement(*, status: str = "pending", event_id: str | None = None) -> dict[str, Any]:
+    resolved = status == "resolved"
+    return {
+        "id": "source_review:inline_source_url_list",
+        "kind": "invented_source",
+        "user_term": "inline_source_url_list",
+        "status": status,
+        "draft": _GENERATED_CSV,
+        "event_id": event_id,
+        "accepted_value": _GENERATED_CSV if resolved else None,
+        "accepted_artifact_hash": _GENERATED_HASH if resolved else None,
+        "resolved_prompt_template_hash": None,
+    }
+
+
+def _generated_source(*, blob_ref: str = "blob-one", requirement: dict[str, Any] | None = None) -> SourceSpec:
+    return SourceSpec(
+        plugin="csv",
+        on_success="rows",
+        on_validation_failure="discard",
+        options={
+            "path": f"/app/state/blobs/session/{blob_ref}.csv",
+            "blob_ref": blob_ref,
+            "schema": {"mode": "observed"},
+            "source_authoring": {
+                "modality": "llm_generated",
+                "content_hash": _GENERATED_HASH,
+                "review_event_id": None,
+                "resolved_kind": None,
+            },
+            INTERPRETATION_REQUIREMENTS_KEY: [requirement if requirement is not None else _generated_requirement()],
+        },
+    )
+
+
+def test_ordinary_patch_preserves_pending_generated_review() -> None:
+    source = _generated_source()
+    state = _empty_state().with_source(source)
+
+    result = _execute_patch_source_options({"patch": {"schema": {"mode": "flexible", "fields": ["url: str"]}}}, state, _ctx())
+
+    assert result.success
+    assert result.updated_state.sources["source"].options["schema"] == {"mode": "flexible", "fields": ("url: str",)}
+    review = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert review == source.options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert review[0]["status"] == "pending"
+    assert review[0]["event_id"] is None
+
+
+def test_empty_list_patch_rejects_generated_review_removal_without_versioning() -> None:
+    state = _empty_state().with_source(_generated_source())
+
+    result = _execute_patch_source_options({"patch": {INTERPRETATION_REQUIREMENTS_KEY: []}}, state, _ctx())
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.updated_state.version == state.version
+    assert "invented_source" in result.validation.errors[0].message
+
+
+def test_one_required_row_cannot_be_dropped_while_another_remains() -> None:
+    source = _generated_source()
+    contract = {
+        "id": "source_review:source_data_contract",
+        "kind": "source_data_contract",
+        "user_term": "source_data_contract",
+        "status": "pending",
+        "draft": "Confirm the source fields.",
+        "event_id": None,
+        "accepted_value": None,
+        "accepted_artifact_hash": None,
+        "resolved_prompt_template_hash": None,
+    }
+    state = _empty_state().with_source(
+        replace(
+            source,
+            options={
+                **source.options,
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    _generated_requirement(),
+                    contract,
+                ],
+            },
+        )
+    )
+    proposed = state.with_source(replace(source, options={**source.options, INTERPRETATION_REQUIREMENTS_KEY: [contract]}))
+
+    with pytest.raises(ValueError, match="requires an invented_source"):
+        reconcile_authoritative_reviews(state, proposed)
+
+
+def test_unchanged_binding_preserves_resolved_source_review() -> None:
+    requirement = _generated_requirement(status="resolved", event_id="accepted-event")
+    source = _generated_source(requirement=requirement)
+    state = _empty_state().with_source(source)
+    proposed = state.with_source(replace(source, options={**source.options, "delimiter": ","}))
+
+    reconciled = reconcile_authoritative_reviews(state, proposed)
+
+    review = reconciled.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert review == requirement
+    assert review["status"] == "resolved"
+    assert review["event_id"] == "accepted-event"
+
+
+def test_new_blob_binding_with_same_bytes_preserves_resolved_review() -> None:
+    requirement = _generated_requirement(status="resolved", event_id="accepted-event")
+    source = _generated_source(requirement=requirement)
+    state = _empty_state().with_source(source)
+    rebound = _generated_source(blob_ref="blob-two")
+    proposed = state.with_source(rebound)
+
+    reconciled = reconcile_authoritative_reviews(state, proposed)
+
+    source_options = reconciled.sources["source"].options
+    assert source_options[INTERPRETATION_REQUIREMENTS_KEY][0] == requirement
+    assert source_options["source_authoring"] == source.options["source_authoring"]
+    assert source_options["blob_ref"] == "blob-two"
+    assert source_options["path"] == rebound.options["path"]
+
+
+def test_new_blob_binding_with_same_bytes_does_not_carry_pending_event() -> None:
+    requirement = _generated_requirement(event_id="pending-event")
+    source = _generated_source(requirement=requirement)
+    state = _empty_state().with_source(source)
+    rebound = _generated_source(blob_ref="blob-two")
+
+    reconciled = reconcile_authoritative_reviews(state, state.with_source(rebound))
+
+    review = reconciled.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert review["status"] == "pending"
+    assert review["event_id"] is None
+    assert review["draft"] == _GENERATED_CSV
+
+
+def test_changed_artifact_content_invalidates_accepted_review() -> None:
+    requirement = _generated_requirement(status="resolved", event_id="accepted-event")
+    source = _generated_source(requirement=requirement)
+    state = _empty_state().with_source(source)
+    new_content = "url\nhttps://example.gov.au/changed\n"
+    new_hash = sha256(new_content.encode("utf-8")).hexdigest()
+    new_requirement = {**_generated_requirement(), "draft": new_content}
+    rebound = replace(
+        source,
+        options={
+            **source.options,
+            "source_authoring": {**source.options["source_authoring"], "content_hash": new_hash},
+            INTERPRETATION_REQUIREMENTS_KEY: [new_requirement],
+        },
+    )
+
+    reconciled = reconcile_authoritative_reviews(state, state.with_source(rebound))
+
+    review = reconciled.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert review["status"] == "pending"
+    assert review["event_id"] is None
+
+
+def test_full_source_replacement_cannot_strip_generated_provenance() -> None:
+    source = _generated_source()
+    state = _empty_state().with_source(source)
+    unbound = replace(source, options={"path": source.options["path"], "schema": {"mode": "observed"}})
+
+    with pytest.raises(ValueError, match="cannot lose generated-source provenance"):
+        reconcile_authoritative_reviews(state, state.with_source(unbound))
+
+
+def test_set_source_replacement_refuses_provenance_downgrade() -> None:
+    source = _generated_source()
+    state = _empty_state().with_source(source)
+
+    result = _execute_set_source(
+        {
+            "plugin": "csv",
+            "on_success": "rows",
+            "on_validation_failure": "discard",
+            "options": {"path": source.options["path"], "schema": {"mode": "observed"}},
+        },
+        state,
+        _ctx(),
+    )
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert "cannot lose generated-source provenance" in result.validation.errors[0].message
+
+
+def test_set_pipeline_full_replacement_refuses_provenance_downgrade() -> None:
+    source = _generated_source()
+    state = _empty_state().with_source(source)
+    args = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+                "options": {"path": source.options["path"], "schema": {"mode": "observed"}},
+            }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+
+    result = execute_tool("set_pipeline", args, state, _catalog())
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert "cannot lose generated-source provenance" in result.validation.errors[0].message
+
+
+def test_authoritative_user_uploaded_rebind_can_change_provenance() -> None:
+    source = _generated_source()
+    state = _empty_state().with_source(source)
+    uploaded = replace(
+        source,
+        options={
+            "path": "/app/state/blobs/session/uploaded.csv",
+            "blob_ref": "user-uploaded-blob",
+            "schema": {"mode": "observed"},
+        },
+    )
+
+    reconciled = reconcile_authoritative_reviews(state, state.with_source(uploaded))
+
+    assert "source_authoring" not in reconciled.sources["source"].options
+    assert INTERPRETATION_REQUIREMENTS_KEY not in reconciled.sources["source"].options
+
+
+def test_existing_orphan_can_restage_exact_review_and_source_can_be_removed() -> None:
+    source = _generated_source()
+    orphan = replace(source, options={key: value for key, value in source.options.items() if key != INTERPRETATION_REQUIREMENTS_KEY})
+    state = _empty_state().with_source(orphan)
+
+    restaged = reconcile_authoritative_reviews(state, state.with_source(source))
+    removed = reconcile_authoritative_reviews(state, replace(state, sources={}))
+
+    assert restaged.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]["status"] == "pending"
+    assert removed.sources == {}
+
+
+def test_two_unchanged_legacy_orphans_can_be_repaired_sequentially() -> None:
+    orders = _generated_source(blob_ref="orders-blob")
+    refunds = _generated_source(blob_ref="refunds-blob")
+
+    def orphan(source: SourceSpec) -> SourceSpec:
+        return replace(source, options={key: value for key, value in source.options.items() if key != INTERPRETATION_REQUIREMENTS_KEY})
+
+    state = replace(_empty_state(), sources={"orders": orphan(orders), "refunds": orphan(refunds)})
+    after_orders = reconcile_authoritative_reviews(state, state.with_named_source("orders", orders))
+    after_refunds = reconcile_authoritative_reviews(after_orders, after_orders.with_named_source("refunds", refunds))
+
+    assert INTERPRETATION_REQUIREMENTS_KEY in after_orders.sources["orders"].options
+    assert INTERPRETATION_REQUIREMENTS_KEY not in after_orders.sources["refunds"].options
+    assert all(INTERPRETATION_REQUIREMENTS_KEY in source.options for source in after_refunds.sources.values())
+
+
+def test_unchanged_orphan_exception_does_not_admit_new_row_removal() -> None:
+    source = _generated_source()
+    state = _empty_state().with_source(source)
+    removed_review = replace(
+        source, options={key: value for key, value in source.options.items() if key != INTERPRETATION_REQUIREMENTS_KEY}
+    )
+
+    with pytest.raises(ValueError, match="requires an invented_source"):
+        reconcile_authoritative_reviews(state, state.with_source(removed_review))

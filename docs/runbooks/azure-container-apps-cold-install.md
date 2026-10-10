@@ -14,7 +14,7 @@ the web app and its Jobs.
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This is an executable operator procedure; steps marked
 > **LIVE** require measurements during execution. A future acceptance receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.2.json` is no longer a tracker
+> `docs/operator/evidence/azure-container-apps/0.8.3.json` is no longer a tracker
 > closure or documentation-promotion condition.
 
 The supported configuration retains `Single` revision mode, `sticky` session
@@ -83,7 +83,7 @@ A successful install has:
   `/api/health` and `/api/ready`;
 - both databases (`elspeth_sessions`, `elspeth_landscape`) on one Flexible
   Server behind a private endpoint, one schema-owner role and one runtime role,
-  session epoch 71 and Landscape epoch 49 initialized;
+  session epoch 72 and Landscape epoch 49 initialized;
 - one NFS 4.1 Azure Files share mounted at `/mnt/elspeth` on the app and every
   Job with `data`, `data/blobs` and `payloads` owned `1654:1654`. SMB Azure
   Files is not supported for this target; **Azure Files carries no database**
@@ -396,7 +396,7 @@ flat JSON object mapping Bicep parameter names to values, without an ARM
 
 - `composerMaxCompositionTurns`, `composerMaxDiscoveryTurns`,
   `composerTimeoutSeconds`, `composerRateLimitPerMinute`: select actual limits.
-  The timeout must fit below the transport ceiling with the configured headroom.
+  The durable job timeout is independent of the transport idle ceiling. Keep the ceiling above 30 seconds for synchronous request headroom. Use package and image from the same commit: older images reject a job budget above the socket-safe cap.
   These parameters flow to web **and both doctor Jobs**; web-only
   `extraEnvironment` cannot fix doctor startup.
 - `composerModel` and `composerAdvisorModel`, plus paired

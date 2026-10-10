@@ -2,10 +2,10 @@ import { expect, type Page, test } from "@playwright/test";
 import type { CompositionState } from "../../src/types";
 import { ComposerPage } from "./page-objects/composer-page";
 
-const sessionId = "proposal-session-1";
+const sessionId = "11111111-1111-4111-8111-111111111111";
 
 const baseState = {
-  id: "state-1",
+  id: "22222222-2222-4222-8222-222222222222",
   session_id: sessionId,
   version: 1,
   is_valid: true,
@@ -49,7 +49,7 @@ const baseState = {
 
 const committedState = {
   ...baseState,
-  id: "state-2",
+  id: "33333333-3333-4333-8333-333333333333",
   version: 2,
   nodes: [
     {
@@ -61,7 +61,7 @@ const committedState = {
 };
 
 const pendingProposal = {
-  id: "proposal-1",
+  id: "44444444-4444-4444-8444-444444444444",
   session_id: sessionId,
   tool_call_id: "call-1",
   tool_name: "set_pipeline",
@@ -70,9 +70,10 @@ const pendingProposal = {
   rationale: "Requested by the current composer turn.",
   affects: ["graph", "validation", "yaml"],
   arguments_redacted_json: { source: { plugin: "csv" } },
-  base_state_id: "state-1",
+  base_state_id: "22222222-2222-4222-8222-222222222222",
   committed_state_id: null,
-  audit_event_id: "event-created-1",
+  audit_event_id: "55555555-5555-4555-8555-555555555555",
+  pipeline_metadata: null,
   created_at: "2026-05-14T00:00:00Z",
   updated_at: "2026-05-14T00:00:00Z",
 };
@@ -80,13 +81,15 @@ const pendingProposal = {
 const committedProposal = {
   ...pendingProposal,
   status: "committed",
-  committed_state_id: "state-2",
-  audit_event_id: "event-accepted-1",
+  committed_state_id: "33333333-3333-4333-8333-333333333333",
+  audit_event_id: "66666666-6666-4666-8666-666666666666",
   updated_at: "2026-05-14T00:00:02Z",
 };
 
 async function installDeterministicComposerRoutes(page: Page): Promise<void> {
   let accepted = false;
+  let operationId: string | null = null;
+  let terminalResult: unknown = null;
   const sessions: unknown[] = [];
 
   await page.route("**/api/system/status", async (route) => {
@@ -170,12 +173,16 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
     }
 
     if (path === `/api/sessions/${sessionId}/messages` && method === "POST") {
-      await route.fulfill({
-        json: {
+      operationId = (request.postDataJSON() as { operation_id: string }).operation_id;
+      terminalResult = {
           message: {
-            id: "assistant-1",
+            id: "77777777-7777-4777-8777-777777777777",
             session_id: sessionId,
             role: "assistant",
+            raw_content: null,
+            operation_id: null,
+            segments: [{ kind: "text", content: "I found one pipeline change that needs approval." }],
+            rejection: null,
             content: "I found one pipeline change that needs approval.",
             tool_calls: [
               {
@@ -195,9 +202,14 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
           },
           state: baseState,
           proposals: [pendingProposal],
-        },
-      });
-      return;
+        };
+      await route.fulfill({ status: 202, json: { operation_id: operationId, kind: "compose_message", status: "queued", poll_after_ms: 1000 } }); return;
+    }
+    if (operationId !== null && path === `/api/sessions/${sessionId}/operations/${operationId}/stream`) {
+      await route.fulfill({ status: 503, json: { detail: "stream unavailable" } }); return;
+    }
+    if (operationId !== null && path === `/api/sessions/${sessionId}/operations/${operationId}`) {
+      await route.fulfill({ json: { operation_id: operationId, kind: "compose_message", status: "completed", poll_after_ms: 1000, cancel_requested: false, deadline_at: "2026-05-14T00:00:00Z", deadline_remaining_ms: 0, result: terminalResult, error: null } }); return;
     }
 
     if (path === `/api/sessions/${sessionId}/state` && method === "GET") {
@@ -222,7 +234,7 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
       return;
     }
 
-    if (path === `/api/sessions/${sessionId}/proposals/proposal-1/accept` && method === "POST") {
+    if (path === `/api/sessions/${sessionId}/proposals/44444444-4444-4444-8444-444444444444/accept` && method === "POST") {
       accepted = true;
       await route.fulfill({ json: committedProposal });
       return;
@@ -277,6 +289,6 @@ test("explicit approve tool call is visible before commit", async ({ page }) => 
   await expect(
     // Accessible name updated with the keyboard-focusable conversation region
     // (elspeth-5e43a0c8b2).
-    page.getByRole("log", { name: "Conversation" }).getByText("audit event-ac"),
+    page.getByRole("log", { name: "Conversation" }).getByText("audit 66666666"),
   ).toBeVisible();
 });

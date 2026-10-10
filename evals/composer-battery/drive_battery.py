@@ -229,7 +229,15 @@ def should_abort(verdicts: Sequence[str | None]) -> str | None:
     return None
 
 
+def _write_operation_capture(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(path.name + "." + str(uuid4()) + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2))
+    temporary.replace(path)
+
+
 def run_dir_is_complete(run_dir: Path) -> bool:
+    if (run_dir / "composer_request.json").exists() and not (run_dir / "composer_terminal.json").exists():
+        return False
     for name in ("messages.json", "meta.json", "reviews.json"):
         p = run_dir / name
         if not p.exists():
@@ -349,8 +357,17 @@ class Battery:
                 instrument["http_unrecovered"] = instrument["http_unrecovered"] or f"429 rate limited at {name}"
             return r
 
-        # 1. session
-        r = step("create_session", "POST", "/api/sessions", json={}, timeout=30)
+        # An interrupted submitted action resumes its original session and body.
+        request_capture = run_dir / "composer_request.json"
+        retained = json.loads(request_capture.read_text()) if request_capture.exists() else None
+        if retained is not None and (retained["base"] != self.base or retained["request"]["content"] != prompt):
+            raise ValueError("Retained Composer action differs from this substrate or prompt")
+        # 1. session: the local carrier avoids fabricating a second HTTP creation.
+        r = (
+            HttpResponse(201, {"id": retained["session_id"]})
+            if retained is not None
+            else step("create_session", "POST", "/api/sessions", json={}, timeout=30)
+        )
         if r is None or r.status_code != 201:
             instrument["http_unrecovered"] = f"POST /api/sessions {r.status_code if r else 'timeout'}"
             (run_dir / "reviews.json").write_text("[]")
@@ -381,25 +398,75 @@ class Battery:
             preferences = {k: pr_.body.get(k) for k in PINNED_PREFERENCES}
         if preferences != dict(PINNED_PREFERENCES):
             instrument["http_unrecovered"] = instrument["http_unrecovered"] or f"preferences not pinned: read back {preferences!r}"
-        # 3. compose
-        r = step(
-            "post_message",
-            "POST",
-            f"/api/sessions/{sid}/messages",
-            json={"content": prompt, "client_request_id": str(uuid4())},
-            timeout=CLIENT_TIMEOUT_S,
+        # 3. Bind one action to the actual current head and retain that exact body.
+        operation_id = retained["request"]["operation_id"] if retained is not None else str(uuid4())
+        head = (
+            HttpResponse(200, {"id": retained["request"]["state_id"]})
+            if retained is not None
+            else step("get_composition_head", "GET", f"/api/sessions/{sid}/state", timeout=30)
         )
+        if head is None or head.status_code != 200:
+            instrument["http_unrecovered"] = instrument["http_unrecovered"] or (
+                "get_composition_head timeout" if head is None else f"get_composition_head {head.status_code}"
+            )
+            r = head
+        else:
+            request_body = (
+                retained["request"]
+                if retained is not None
+                else {"content": prompt, "operation_id": operation_id, "state_id": head.body["id"] if head.body is not None else None}
+            )
+            if retained is None:
+                _write_operation_capture(request_capture, {"base": self.base, "session_id": sid, "request": request_body})
+            operation_path = f"/api/sessions/{sid}/operations/{operation_id}"
+            r = (
+                None
+                if retained is not None
+                else step("post_message", "POST", f"/api/sessions/{sid}/messages", json=request_body, timeout=30)
+            )
+            if r is not None and r.status_code == 200:
+                instrument["http_unrecovered"] = "Composer operation admission unexpectedly returned synchronous HTTP 200"
+                r = HttpResponse(502, {"detail": "Composer operation admission did not return 202"}, "")
+            if r is not None and 400 <= r.status_code < 500:
+                _write_operation_capture(run_dir / "composer_terminal.json", {"admission_status": r.status_code, "body": r.body})
+            ambiguous = r is None
+            if ambiguous or r.status_code == 202:
+                observation_deadline = self._clock() + CLIENT_TIMEOUT_S
+                while self._clock() < observation_deadline:
+                    observed = step("composer_operation", "GET", operation_path, timeout=30)
+                    if observed is None:
+                        self._sleep(1)
+                        continue
+                    if ambiguous and observed.status_code == 404 and observed.body == {"detail": "Operation not found"}:
+                        replay = step("replay_message", "POST", f"/api/sessions/{sid}/messages", json=request_body, timeout=30)
+                        if replay is not None and replay.status_code == 202:
+                            ambiguous = False
+                        self._sleep(1)
+                        continue
+                    if observed.status_code != 200:
+                        r = observed
+                        break
+                    if observed.body["status"] == "completed":
+                        _write_operation_capture(run_dir / "composer_terminal.json", observed.body)
+                        result_body = observed.body["result"]
+                        http[-1]["terminal_status"] = 200
+                        r = HttpResponse(200, result_body, json.dumps(result_body))
+                        break
+                    if observed.body["status"] == "failed":
+                        _write_operation_capture(run_dir / "composer_terminal.json", observed.body)
+                        operation_error = observed.body["error"]
+                        http[-1]["terminal_status"] = operation_error["http_status"]
+                        r = HttpResponse(operation_error["http_status"], operation_error["body"], json.dumps(operation_error["body"]))
+                        break
+                    observation_deadline = min(observation_deadline, self._clock() + observed.body["deadline_remaining_ms"] / 1000 + 30)
+                    self._sleep(observed.body["poll_after_ms"] / 1000)
+                else:
+                    step("cancel_composer_operation", "POST", f"{operation_path}/cancel", timeout=30)
+                    r = None
         if r is None:
-            pr = step("composer_progress", "GET", f"/api/sessions/{sid}/composer-progress", timeout=30)
-            reason = pr.body.get("reason") if pr is not None and isinstance(pr.body, dict) else None
-            terminal = {
-                "budget_exhausted": PROGRESS_BUDGETS.get(str(reason)) if reason is not None else None,
-                "reason": reason,
-                # no reason means no snapshot (progress endpoint non-200/empty): the scorer's terminal_missing
-                # keys on `source`, so claiming composer_progress here would hide a missing terminal.
-                "source": "composer_progress" if reason is not None else "none",
-            }
-            self._settle(sid, step)
+            # Progress and stable message counts cannot substitute for a durable terminal.
+            terminal = {"budget_exhausted": None, "reason": None, "source": "none"}
+            instrument["http_unrecovered"] = instrument["http_unrecovered"] or "composer operation terminal unresolved"
         elif r.status_code != 200:
             detail = r.body.get("detail") if isinstance(r.body, dict) else None
             http[-1]["detail"] = detail

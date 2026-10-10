@@ -8,6 +8,7 @@ import json
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, ClassVar, Literal, cast
@@ -55,6 +56,7 @@ from elspeth.web.composer.tools import (
     execute_tool as _execute_tool,
 )
 from elspeth.web.composer.tools._common import rejected_component_prefix
+from elspeth.web.composer.tools.sources import _options_with_source_blob_review
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.credential_guard import CredentialMaterialRefused
@@ -8176,21 +8178,28 @@ class TestPatchSourceOptions:
         """An LLM-authored blob's bytes are content-hash-bound: the author's
         schema claim stands (the same lane ``_options_with_derived_guarantees``
         serves), so the guard must not over-reach."""
+        authored_csv = "colour\nred\n"
+        authored_hash = sha256(authored_csv.encode("utf-8")).hexdigest()
+        authored_options = _options_with_source_blob_review(
+            {
+                "blob_ref": "abc123",
+                "path": "/canon/abc123_x.csv",
+                "schema": {"mode": "observed"},
+                SOURCE_AUTHORING_KEY: {
+                    "modality": "llm_generated",
+                    "content_hash": authored_hash,
+                    "review_event_id": None,
+                    "resolved_kind": None,
+                },
+            },
+            mime_type="text/csv",
+            content=authored_csv,
+        )
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
                 on_success="t1",
-                options={
-                    "blob_ref": "abc123",
-                    "path": "/canon/abc123_x.csv",
-                    "schema": {"mode": "observed"},
-                    "source_authoring": {
-                        "modality": "llm_generated",
-                        "content_hash": "0" * 64,
-                        "review_event_id": None,
-                        "resolved_kind": None,
-                    },
-                },
+                options=authored_options,
                 on_validation_failure="quarantine",
             ),
             nodes=(),
@@ -8206,9 +8215,14 @@ class TestPatchSourceOptions:
             state,
             catalog,
         )
-        assert result.success is True
+        assert result.success is True, result.validation.errors
         opts = deep_thaw(_default_source(result.updated_state).options)
         assert opts["schema"]["guaranteed_fields"] == ["colour"]
+        assert opts[SOURCE_AUTHORING_KEY]["content_hash"] == authored_hash
+        (review,) = opts[INTERPRETATION_REQUIREMENTS_KEY]
+        assert review["status"] == "pending"
+        assert review["event_id"] is None
+        assert review["draft"] == authored_csv
 
 
 # ---------------------------------------------------------------------------

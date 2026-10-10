@@ -131,12 +131,12 @@ async def test_supplying_both_max_tokens_spellings_is_rejected(gateway_client, c
 async def test_configured_max_tokens_bound_is_enforced_on_the_alias_spelling(gateway_client, chat_headers, chat_body_factory):
     """The cap must not be escapable by choosing the other spelling.
 
-    ``32768`` is the ``max_max_tokens`` default (``Bounds``); the
-    conformance stack does not override it, so ``32769`` is over the bound
+    ``64000`` is the ``max_max_tokens`` default (``Bounds``); the
+    conformance stack does not override it, so ``64001`` is over the bound
     without needing any deployment-specific fixture. A derived image that
     lowers the bound rejects this too, so the assertion holds either way.
     """
-    body = chat_body_factory("hello", max_completion_tokens=32769)
+    body = chat_body_factory("hello", max_completion_tokens=64001)
 
     response = await gateway_client.post(_CHAT_URL, json=body, headers=chat_headers)
 

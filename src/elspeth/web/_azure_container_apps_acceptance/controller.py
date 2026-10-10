@@ -55,7 +55,13 @@ FENCE_EPOCH_SQL: Final = "SELECT operation_epoch FROM session_operation_fences W
 FENCE_OWNER_SQL: Final = "SELECT owner_instance_id FROM session_operation_fences WHERE session_id = :session_id"
 DATABASE_NOW_SQL: Final = "SELECT clock_timestamp()"
 MESSAGE_INGRESS_RECEIPT_ROWS_SQL: Final = (
-    "SELECT count(*) FROM message_ingress_receipts WHERE session_id = :session_id AND client_request_id = :client_request_id"
+    "SELECT count(*) FROM message_ingress_receipts WHERE session_id = :session_id AND operation_id = :operation_id"
+)
+COMPOSER_OPERATION_ROWS_SQL: Final = (
+    "SELECT count(*) FROM composer_async_operations WHERE session_id = :session_id AND operation_id = :operation_id"
+)
+COMPOSER_OPERATION_CLAIM_OWNER_SQL: Final = (
+    "SELECT claim_owner_instance_id FROM composer_async_operations WHERE session_id = :session_id AND operation_id = :operation_id"
 )
 RUN_IDS_SQL: Final = "SELECT id FROM runs WHERE session_id = :session_id ORDER BY id"
 LANDSCAPE_RUN_IDS_OF_SESSION_SQL: Final = (
@@ -293,15 +299,27 @@ class PostgresEvidenceObserver(EvidenceObserver):
             raise AcceptanceCheckError("probe_observation")
         return owner
 
-    def message_ingress_receipt_rows(self, session_id: str, *, client_request_id: str) -> int:
+    def message_ingress_receipt_rows(self, session_id: str, *, operation_id: str) -> int:
         count = self._sessions.scalar(
             MESSAGE_INGRESS_RECEIPT_ROWS_SQL,
             session_id=session_id,
-            client_request_id=client_request_id,
+            operation_id=operation_id,
         )
         if type(count) is not int or count < 0:
             raise AcceptanceCheckError("probe_observation")
         return count
+
+    def composer_operation_rows(self, session_id: str, *, operation_id: str) -> int:
+        count = self._sessions.scalar(COMPOSER_OPERATION_ROWS_SQL, session_id=session_id, operation_id=operation_id)
+        if type(count) is not int or count < 0:
+            raise AcceptanceCheckError("probe_observation")
+        return count
+
+    def composer_operation_claim_owner(self, session_id: str, *, operation_id: str) -> str | None:
+        owner = self._sessions.scalar(COMPOSER_OPERATION_CLAIM_OWNER_SQL, session_id=session_id, operation_id=operation_id)
+        if owner is not None and type(owner) is not str:
+            raise AcceptanceCheckError("probe_observation")
+        return owner
 
     def _ids(self, reader: SqlReader, statement: str, **parameters: object) -> tuple[str, ...]:
         ids: list[str] = []

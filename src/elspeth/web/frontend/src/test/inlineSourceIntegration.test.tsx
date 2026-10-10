@@ -1,3 +1,5 @@
+import { installComposeTurnDouble } from "@/test/composeTurnDouble";
+import { authenticateComposerCustody, purgeComposerCustody } from "@/stores/composerOperationCustody";
 // ============================================================================
 // inlineSourceIntegration.test.tsx — Phase 5a Task 6
 //
@@ -155,7 +157,10 @@ vi.mock("../api/auditReadiness", () => ({
   fetchAuditReadinessExplain: vi.fn(),
 }));
 
-vi.mock("../api/client", () => ({
+vi.mock("../api/client", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/api/client")>(),
+  submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(),
+  fetchComposerOperationStream: vi.fn(), cancelComposerOperation: vi.fn(),
   fetchSystemStatus: vi.fn().mockResolvedValue({
     composer_available: true,
     composer_model: "gpt-4o",
@@ -213,7 +218,7 @@ vi.mock("../api/client", () => ({
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-const SESSION_ID = "session-1";
+const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const BLOB_ID = "blob-1";
 const USER_MESSAGE_ID = "msg-user-1";
 const ASSISTANT_MESSAGE_ID = "msg-asst-1";
@@ -232,8 +237,9 @@ const LLM_INLINE_SOURCE_HASH =
  */
 function makeCompositionStateWithInlineBlob(): CompositionState {
   return {
-    id: "state-2",
+    id: "22222222-2222-4222-8222-000000000002",
     ...compositionStateAuthorityFields,
+    session_id: SESSION_ID,
     version: 2,
     sources: {
       source: {
@@ -340,6 +346,19 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
   beforeEach(() => {
     vi.stubGlobal("ResizeObserver", PassiveResizeObserver);
     vi.clearAllMocks();
+    purgeComposerCustody();
+    authenticateComposerCustody({ principalId: "test-001", authProvider: "local" });
+    installComposeTurnDouble({
+      sendMessage: vi.spyOn(api, "sendMessage"), recompose: vi.spyOn(api, "recompose"),
+      submitComposerOperation: vi.spyOn(api, "submitComposerOperation"),
+      fetchComposerOperation: vi.spyOn(api, "fetchComposerOperation"),
+      fetchComposerOperationStream: vi.spyOn(api, "fetchComposerOperationStream"),
+      cancelComposerOperation: vi.spyOn(api, "cancelComposerOperation"),
+    });
+    vi.spyOn(api, "fetchMessages").mockRejectedValue(new Error("Reload unavailable"));
+    vi.spyOn(api, "fetchCompositionState").mockRejectedValue(new Error("Reload unavailable"));
+    vi.spyOn(api, "fetchCompositionProposals").mockRejectedValue(new Error("Reload unavailable"));
+
     // jsdom does not implement Element.prototype.scrollIntoView, but
     // ChatPanel calls it on every render via its auto-scroll effect.
     // Without this stub the chat panel crashes inside its ErrorBoundary
@@ -380,7 +399,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
       activeSessionId: SESSION_ID,
       // Post-boot: the backend wall clock has landed, so the compose-timeout
       // readiness gate is open and the freeform Send drives a real request.
-      composeTimeoutReady: true,
+      compositionStateLoaded: true,
       sessions: [
         {
           id: SESSION_ID,
@@ -390,8 +409,9 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
         },
       ],
       compositionState: {
-        id: "state-1",
+        id: "22222222-2222-4222-8222-000000000001",
         ...compositionStateAuthorityFields,
+    session_id: SESSION_ID,
         version: 1,
         sources: {},
         nodes: [],
@@ -460,8 +480,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
       SESSION_ID,
       userText,
       expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
-      "state-1",
-      expect.any(AbortSignal),
+      "22222222-2222-4222-8222-000000000001",
     );
 
     // (b) The dispatched payload mentions the URL.

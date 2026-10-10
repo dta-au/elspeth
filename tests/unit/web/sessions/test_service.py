@@ -23,6 +23,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
+from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.execution.schemas import (
     RunAccounting,
@@ -33,6 +34,12 @@ from elspeth.web.execution.schemas import (
     RunStatusResponse,
 )
 from elspeth.web.sessions.archive_quarantine import archive_quarantine_paths, list_archive_quarantine_manifests
+from elspeth.web.sessions.composer_operations import (
+    ComposerOperationConflictError,
+    ComposerOperationPreconditionRefused,
+    ComposerOperationRunning,
+    composer_operation_request_hash,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import (
@@ -52,8 +59,6 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
     CompositionValidationError,
-    MessageIngressAccepted,
-    MessageIngressConflict,
     MessageIngressFresh,
     RunAlreadyActiveError,
     RunDiagnosticsAuditAuthority,
@@ -63,6 +68,7 @@ from elspeth.web.sessions.protocol import (
     SessionRecord,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth.web.sessions.schemas import SendMessageRequest
 from elspeth.web.sessions.service import QuarantineCleanupError
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
@@ -1849,6 +1855,84 @@ class TestPagination:
         assert versions[1].version == 5
 
 
+def _admit_durable_ingress(service, session_id, *, operation_id, content, requested_state_id):
+    from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission, RepositoryRateLimitAuthority
+
+    authority = ComposerAsyncOperationAuthority(
+        service._engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
+    )
+    request = SendMessageRequest(operation_id=str(operation_id), content=content, state_id=requested_state_id)
+    record, fresh = authority.admit(
+        quota=ComposerQuotaAdmission(
+            RepositoryRateLimitAuthority(service._engine, signing_key=b"service-test-quota-key-32-bytes!!"), 10000
+        ),
+        session_id=session_id,
+        operation_id=request.operation_id,
+        kind="compose_message",
+        request_hash=composer_operation_request_hash(session_id=session_id, kind="compose_message", request=request),
+        actor_user_id="alice",
+        request_id=None,
+        base_state_id=requested_state_id,
+        request_json=request.model_dump_json(),
+        deadline_seconds=180,
+        max_nonterminal=64,
+        auth_provider_type="local",
+    )
+    return authority, record, fresh
+
+
+async def _durable_ingress(
+    service, session_id, role, content, *, operation_id, requested_state_id, writer_principal, composition_state_id=None
+):
+    authority, _record, fresh = _admit_durable_ingress(
+        service, session_id, operation_id=operation_id, content=content, requested_state_id=requested_state_id
+    )
+    if fresh:
+        (claim,) = authority.claim_next(limit=1)
+        context = service.session_operation_authority.start_composer_async_operation(
+            claim, owner_instance_id=service.session_operation_owner_instance_id, lease_seconds=30, auth_provider_type="local"
+        )
+        running = ComposerOperationRunning(claim=claim, session_operation_context=context)
+    else:
+        # A failed ingress transaction leaves the same running identity with
+        # no bound user, so its owner can retry this write without starting a job.
+        from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence
+        from elspeth.web.sessions.composer_operations import ComposerOperationClaim
+        from elspeth.web.sessions.models import composer_async_operations_table
+
+        with service._engine.connect() as conn:
+            row = conn.execute(
+                select(composer_async_operations_table).where(
+                    composer_async_operations_table.c.session_id == str(session_id),
+                    composer_async_operations_table.c.operation_id == str(operation_id),
+                )
+            ).one()
+        claim = ComposerOperationClaim(
+            session_id=session_id, operation_id=str(operation_id), claim_token=row.claim_token, attempt=row.attempt
+        )
+        context = SessionOperationContext(
+            fence=SessionOperationFence(
+                session_id=str(session_id),
+                operation_id=row.session_operation_id,
+                lease_token=row.session_operation_lease_token,
+                operation_epoch=row.session_operation_epoch,
+            ),
+            operation_kind=SessionOperationKind.COMPOSE,
+        )
+        running = ComposerOperationRunning(claim=claim, session_operation_context=context)
+    return await service.add_message_with_transcript(
+        session_id,
+        role,
+        content,
+        operation_id=operation_id,
+        requested_state_id=requested_state_id,
+        writer_principal=writer_principal,
+        composition_state_id=composition_state_id,
+        session_operation_context=context,
+        running=running,
+    )
+
+
 class TestAddMessageWithTranscript:
     """Single-transaction write+read for the freeform send snapshot (F-1).
 
@@ -1862,6 +1946,44 @@ class TestAddMessageWithTranscript:
     """
 
     @pytest.mark.asyncio
+    async def test_durable_admission_replays_original_binding_after_head_advance(self, service) -> None:
+        session = await service.create_session("alice", "Durable replay", "local")
+        operation_id = uuid.uuid4()
+        result = await _durable_ingress(
+            service,
+            session.id,
+            "user",
+            "same text",
+            operation_id=operation_id,
+            requested_state_id=None,
+            writer_principal="route_user_message",
+        )
+        from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence
+        from elspeth.web.sessions.models import session_operation_fences_table
+
+        with service._engine.connect() as conn:
+            row = conn.execute(
+                select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(session.id))
+            ).one()
+        context = SessionOperationContext(
+            fence=SessionOperationFence(
+                session_id=str(session.id), operation_id=row.operation_id, lease_token=row.lease_token, operation_epoch=row.operation_epoch
+            ),
+            operation_kind=SessionOperationKind.COMPOSE,
+        )
+        await service.save_composition_state(
+            session.id, CompositionStateData(is_valid=True), provenance="session_seed", session_operation_context=context
+        )
+        _, replay, fresh = _admit_durable_ingress(
+            service, session.id, operation_id=operation_id, content="same text", requested_state_id=None
+        )
+        assert not fresh and replay.base_state_id is None and replay.user_message_id == result.message.id
+        for content, state_id in (("changed", None), ("same text", uuid.uuid4())):
+            with pytest.raises(ComposerOperationConflictError):
+                _admit_durable_ingress(service, session.id, operation_id=operation_id, content=content, requested_state_id=state_id)
+        assert len(await service.get_messages(session.id, limit=None)) == 1
+
+    @pytest.mark.asyncio
     async def test_ingress_receipt_writer_requires_same_connection_lock_and_live_compose_fence(self, engine, service) -> None:
         session = await service.create_session("alice", "Receipt authority", "local")
         message = await service.add_message(session.id, "user", "canonical", writer_principal="route_user_message")
@@ -1871,7 +1993,7 @@ class TestAddMessageWithTranscript:
             service._insert_message_ingress_receipt(
                 conn,
                 session_id=sid,
-                client_request_id=str(uuid.uuid4()),
+                operation_id=str(uuid.uuid4()),
                 user_message_id=str(message.id),
                 requested_state_id=None,
                 created_at=datetime.now(UTC),
@@ -1922,11 +2044,12 @@ class TestAddMessageWithTranscript:
         await service.add_message(session.id, "user", "First", writer_principal="route_user_message")
         await service.add_message(session.id, "assistant", "Second", writer_principal="compose_loop")
 
-        result = await service.add_message_with_transcript(
+        result = await _durable_ingress(
+            service,
             session.id,
             "user",
             "Third",
-            client_request_id=uuid.uuid4(),
+            operation_id=uuid.uuid4(),
             requested_state_id=None,
             writer_principal="route_user_message",
         )
@@ -1945,126 +2068,6 @@ class TestAddMessageWithTranscript:
         assert tuple(await service.get_messages(session.id, limit=None)) == transcript
 
     @pytest.mark.asyncio
-    async def test_exact_retry_after_head_advance_preserves_original_null_state_and_sequence(self, engine, service) -> None:
-        session = await service.create_session("alice", "Replay", "local")
-        request_id = uuid.uuid4()
-        fresh = await service.add_message_with_transcript(
-            session.id,
-            "user",
-            "same text",
-            client_request_id=request_id,
-            requested_state_id=None,
-            writer_principal="route_user_message",
-        )
-        assert isinstance(fresh, MessageIngressFresh)
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-
-        accepted = await service.add_message_with_transcript(
-            session.id,
-            "user",
-            "same text",
-            client_request_id=request_id,
-            requested_state_id=None,
-            writer_principal="route_user_message",
-        )
-        assert accepted == MessageIngressAccepted(client_request_id=request_id, user_message_id=fresh.message.id)
-        with engine.connect() as conn:
-            rows = conn.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id))).all()
-            receipts = conn.execute(
-                select(message_ingress_receipts_table).where(message_ingress_receipts_table.c.session_id == str(session.id))
-            ).all()
-        assert len(rows) == len(receipts) == 1
-        messages = await service.get_messages(session.id, limit=None)
-        assert messages[0].client_request_id == request_id
-
-        distinct_key = await service.add_message_with_transcript(
-            session.id,
-            "user",
-            "same text",
-            client_request_id=uuid.uuid4(),
-            requested_state_id=None,
-            writer_principal="route_user_message",
-        )
-        assert isinstance(distinct_key, MessageIngressFresh)
-        assert distinct_key.message.id != fresh.message.id
-        assert distinct_key.message.sequence_no == fresh.message.sequence_no + 1
-
-    @pytest.mark.asyncio
-    async def test_same_key_changed_content_or_original_state_is_conflict(self, service) -> None:
-        session = await service.create_session("alice", "Conflict", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        request_id = uuid.uuid4()
-        fresh = await service.add_message_with_transcript(
-            session.id,
-            "user",
-            "original",
-            client_request_id=request_id,
-            requested_state_id=None,
-            writer_principal="route_user_message",
-        )
-        assert isinstance(fresh, MessageIngressFresh)
-        for changed_content, changed_state in (("changed", None), ("original", state.id)):
-            conflict = await service.add_message_with_transcript(
-                session.id,
-                "user",
-                changed_content,
-                client_request_id=request_id,
-                requested_state_id=changed_state,
-                writer_principal="route_user_message",
-            )
-            assert conflict == MessageIngressConflict(client_request_id=request_id, user_message_id=fresh.message.id)
-        assert len(await service.get_messages(session.id, limit=None)) == 1
-
-    @pytest.mark.asyncio
-    async def test_fenced_lookup_returns_prior_conflict_before_invalid_state_preflight(self, service) -> None:
-        session = await service.create_session("alice", "Lookup", "local")
-        request_id = uuid.uuid4()
-        fresh = await service.add_message_with_transcript(
-            session.id,
-            "user",
-            "accepted",
-            client_request_id=request_id,
-            requested_state_id=None,
-            writer_principal="route_user_message",
-        )
-        assert isinstance(fresh, MessageIngressFresh)
-        context = service.session_operation_authority.acquire(
-            session_id=session.id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=service.session_operation_owner_instance_id,
-            lease_seconds=service.session_operation_lease_seconds,
-        )
-        try:
-            unknown_state_id = uuid.uuid4()
-            result = await service.lookup_message_ingress(
-                session.id,
-                client_request_id=request_id,
-                content="accepted",
-                requested_state_id=unknown_state_id,
-                session_operation_context=context,
-            )
-            assert result == MessageIngressConflict(client_request_id=request_id, user_message_id=fresh.message.id)
-            assert await service.lookup_message_ingress(
-                session.id,
-                client_request_id=request_id,
-                content="accepted",
-                requested_state_id=None,
-                session_operation_context=context,
-            ) == MessageIngressAccepted(client_request_id=request_id, user_message_id=fresh.message.id)
-            assert (
-                await service.lookup_message_ingress(
-                    session.id,
-                    client_request_id=uuid.uuid4(),
-                    content="accepted",
-                    requested_state_id=None,
-                    session_operation_context=context,
-                )
-                is None
-            )
-        finally:
-            service.session_operation_authority.release(context)
-
-    @pytest.mark.asyncio
     async def test_receipt_insert_failure_rolls_back_message_and_same_key_can_retry(self, engine, service) -> None:
         session = await service.create_session("alice", "Rollback", "local")
         request_id = uuid.uuid4()
@@ -2076,22 +2079,24 @@ class TestAddMessageWithTranscript:
         event.listen(engine, "before_cursor_execute", reject_receipt)
         try:
             with pytest.raises(RuntimeError, match="controlled receipt failure"):
-                await service.add_message_with_transcript(
+                await _durable_ingress(
+                    service,
                     session.id,
                     "user",
                     "retry me",
-                    client_request_id=request_id,
+                    operation_id=request_id,
                     requested_state_id=None,
                     writer_principal="route_user_message",
                 )
         finally:
             event.remove(engine, "before_cursor_execute", reject_receipt)
         assert await service.get_messages(session.id, limit=None) == []
-        retry = await service.add_message_with_transcript(
+        retry = await _durable_ingress(
+            service,
             session.id,
             "user",
             "retry me",
-            client_request_id=request_id,
+            operation_id=request_id,
             requested_state_id=None,
             writer_principal="route_user_message",
         )
@@ -2103,11 +2108,12 @@ class TestAddMessageWithTranscript:
         first = await service.create_session("alice", "First", "local")
         second = await service.create_session("alice", "Second", "local")
         request_id = uuid.uuid4()
-        fresh = await service.add_message_with_transcript(
+        fresh = await _durable_ingress(
+            service,
             first.id,
             "user",
             "first",
-            client_request_id=request_id,
+            operation_id=request_id,
             requested_state_id=None,
             writer_principal="route_user_message",
         )
@@ -2117,7 +2123,7 @@ class TestAddMessageWithTranscript:
                 conn.execute(
                     insert(message_ingress_receipts_table).values(
                         session_id=str(second.id),
-                        client_request_id=str(uuid.uuid4()),
+                        operation_id=str(uuid.uuid4()),
                         user_message_id=str(fresh.message.id),
                         requested_state_id=None,
                         created_at=datetime.now(UTC),
@@ -2144,76 +2150,25 @@ class TestAddMessageWithTranscript:
             )
 
     @pytest.mark.asyncio
-    async def test_file_backed_sqlite_two_service_instances_share_one_acceptance(self, tmp_path) -> None:
-        engine = create_session_engine(f"sqlite:///{tmp_path / 'ingress-race.db'}")
-        initialize_session_schema(engine)
-        with engine.begin() as conn:
-            ensure_test_identity(conn, identity_id="alice")
-        first = FencedSessionServiceHarness(
-            engine,
-            telemetry=build_sessions_telemetry(),
-            log=structlog.get_logger("test.ingress-race.first"),
-        )
-        second = FencedSessionServiceHarness(
-            engine,
-            telemetry=build_sessions_telemetry(),
-            log=structlog.get_logger("test.ingress-race.second"),
-            session_operation_authority=first.session_operation_authority,
-            owner_instance_id=first.session_operation_owner_instance_id,
-        )
-        session = await first.create_session("alice", "Race", "local")
-        context = first.session_operation_authority.acquire(
-            session_id=session.id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=first.session_operation_owner_instance_id,
-            lease_seconds=first.session_operation_lease_seconds,
-        )
-        request_id = uuid.uuid4()
-        try:
-            results = await asyncio.gather(
-                first.add_message_with_transcript(
-                    session.id,
-                    "user",
-                    "one",
-                    client_request_id=request_id,
-                    requested_state_id=None,
-                    writer_principal="route_user_message",
-                    session_operation_context=context,
-                ),
-                second.add_message_with_transcript(
-                    session.id,
-                    "user",
-                    "one",
-                    client_request_id=request_id,
-                    requested_state_id=None,
-                    writer_principal="route_user_message",
-                    session_operation_context=context,
-                ),
-            )
-            assert sorted(type(result).__name__ for result in results) == ["MessageIngressAccepted", "MessageIngressFresh"]
-            assert len(await first.get_messages(session.id, limit=None)) == 1
-        finally:
-            first.session_operation_authority.release(context)
-            engine.dispose()
-
-    @pytest.mark.asyncio
     async def test_same_client_key_is_scoped_to_session(self, service) -> None:
         first = await service.create_session("alice", "First", "local")
         second = await service.create_session("alice", "Second", "local")
         request_id = uuid.uuid4()
-        first_result = await service.add_message_with_transcript(
+        first_result = await _durable_ingress(
+            service,
             first.id,
             "user",
             "first content",
-            client_request_id=request_id,
+            operation_id=request_id,
             requested_state_id=None,
             writer_principal="route_user_message",
         )
-        second_result = await service.add_message_with_transcript(
+        second_result = await _durable_ingress(
+            service,
             second.id,
             "user",
             "second content",
-            client_request_id=request_id,
+            operation_id=request_id,
             requested_state_id=None,
             writer_principal="route_user_message",
         )
@@ -2226,11 +2181,12 @@ class TestAddMessageWithTranscript:
         session = await service.create_session("alice", "Provenance", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
 
-        result = await service.add_message_with_transcript(
+        result = await _durable_ingress(
+            service,
             session.id,
             "user",
             "hello",
-            client_request_id=uuid.uuid4(),
+            operation_id=uuid.uuid4(),
             requested_state_id=state.id,
             composition_state_id=state.id,
             writer_principal="route_user_message",
@@ -2248,12 +2204,13 @@ class TestAddMessageWithTranscript:
         s2 = await service.create_session("alice", "Two", "local")
         foreign_state = await service.save_composition_state(s2.id, CompositionStateData(is_valid=True), provenance="session_seed")
 
-        with pytest.raises(RuntimeError, match="add_message_with_transcript"):
-            await service.add_message_with_transcript(
+        with pytest.raises(ComposerOperationPreconditionRefused):
+            await _durable_ingress(
+                service,
                 s1.id,
                 "user",
                 "hello",
-                client_request_id=uuid.uuid4(),
+                operation_id=uuid.uuid4(),
                 requested_state_id=foreign_state.id,
                 composition_state_id=foreign_state.id,
                 writer_principal="route_user_message",
@@ -2265,11 +2222,12 @@ class TestAddMessageWithTranscript:
     async def test_bumps_session_updated_at(self, service) -> None:
         session = await service.create_session("alice", "Updated", "local")
 
-        await service.add_message_with_transcript(
+        await _durable_ingress(
+            service,
             session.id,
             "user",
             "hello",
-            client_request_id=uuid.uuid4(),
+            operation_id=uuid.uuid4(),
             requested_state_id=None,
             writer_principal="route_user_message",
         )
@@ -2313,11 +2271,12 @@ class TestAddMessageWithTranscript:
                 # WAL snapshot at one seed row.
                 assert _count(stale_reader) == 1
 
-                result = await service.add_message_with_transcript(
+                result = await _durable_ingress(
+                    service,
                     session.id,
                     "user",
                     "hello",
-                    client_request_id=uuid.uuid4(),
+                    operation_id=uuid.uuid4(),
                     requested_state_id=None,
                     writer_principal="route_user_message",
                 )
@@ -2375,11 +2334,12 @@ class TestAddMessageWithTranscript:
             event.listen(engine, "before_cursor_execute", record_statement)
             event.listen(engine, "commit", record_commit)
             try:
-                result = await service.add_message_with_transcript(
+                result = await _durable_ingress(
+                    service,
                     session.id,
                     "user",
                     "hello",
-                    client_request_id=uuid.uuid4(),
+                    operation_id=uuid.uuid4(),
                     requested_state_id=None,
                     writer_principal="route_user_message",
                 )

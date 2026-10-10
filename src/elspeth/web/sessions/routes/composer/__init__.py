@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .._helpers import APIRouter
-from . import compose, proposals, state
+from . import compose, operations, proposals, state
 
 __all__ = ["register_composer_routes"]
 
@@ -16,3 +16,4 @@ def register_composer_routes(router: APIRouter) -> None:
     router.include_router(state.router)
     router.include_router(proposals.router)
     router.include_router(compose.router)
+    router.include_router(operations.router)

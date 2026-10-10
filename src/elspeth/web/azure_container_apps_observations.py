@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceInputError
 from elspeth.web._acceptance_common.http_client import AcceptanceCredentials, AcceptanceHttpClient
 from elspeth.web._acceptance_common.replica_probes import (
+    P1_OPERATION_POLL_GRACE_SECONDS,
     TERMINAL_RUN_STATUSES,
     CrossReplicaProgressObservation,
     LeaseTakeoverObservation,
@@ -52,6 +53,7 @@ from elspeth.web.azure_container_apps_acceptance import (
     _SqlAlchemyReader,
     acceptance_error_envelope,
 )
+from elspeth.web.sessions.schemas import ComposerOperationStatusResponse, CompositionStateResponse
 
 _FENCE_SQL = (
     "SELECT owner_instance_id, lease_expires_at FROM session_operation_fences "
@@ -304,6 +306,11 @@ def _fresh_message_visibility(
     polling: Polling,
 ) -> float:
     path = f"/api/sessions/{session_id}/messages"
+    head = _exchange(owner, "a", f"/api/sessions/{session_id}/state", capture, clock=polling.clock)
+    if head.response.instance_id != owner_id or head.response.status != 200:
+        raise AcceptanceCheckError("probe_message_head")
+    state_id = None if head.body is None else CompositionStateResponse.model_validate(head.body).id
+    operation_id = str(uuid4())
     content = f"Keep the current pipeline unchanged. Briefly acknowledge this visibility check: {uuid4()}."
     written = _exchange(
         owner,
@@ -311,12 +318,35 @@ def _fresh_message_visibility(
         path,
         capture,
         post=True,
-        body={"content": content, "client_request_id": str(uuid4())},
+        body={"content": content, "operation_id": operation_id, "state_id": state_id},
         clock=polling.clock,
     )
-    if written.response.status != 200 or written.response.instance_id != owner_id:
+    if written.response.status != 202 or written.response.instance_id != owner_id or written.response.operation_id != operation_id:
         raise AcceptanceCheckError("probe_message_write")
-    message = _MessageWrite.model_validate(written.body).message
+    terminal: ComposerOperationStatusResponse | None = None
+    completed_at: float | None = None
+    operation_poll_deadline: float | None = None
+
+    def completed() -> bool:
+        nonlocal terminal, completed_at, operation_poll_deadline
+        observed = _exchange(owner, "a", f"/api/sessions/{session_id}/operations/{operation_id}", capture, clock=polling.clock)
+        terminal = ComposerOperationStatusResponse.model_validate_json(json.dumps(observed.body))
+        if observed.response.instance_id != owner_id or terminal.operation_id != operation_id:
+            raise AcceptanceCheckError("probe_operation_identity")
+        remaining = observed.received_at + terminal.deadline_remaining_ms / 1000 + P1_OPERATION_POLL_GRACE_SECONDS
+        operation_poll_deadline = remaining if operation_poll_deadline is None else min(operation_poll_deadline, remaining)
+        if terminal.status == "failed":
+            raise AcceptanceCheckError("probe_message_write")
+        if terminal.status == "completed":
+            completed_at = observed.received_at
+            return True
+        if observed.received_at >= operation_poll_deadline:
+            raise AcceptanceCheckError("probe_operation_terminal_timeout")
+        return False
+
+    polling.until(completed)
+    assert terminal is not None and terminal.result is not None and completed_at is not None
+    message = terminal.result.message
     message_id = str(UUID(message.id))
     if message.role != "assistant":
         raise AcceptanceCheckError("probe_message_write")
@@ -337,7 +367,7 @@ def _fresh_message_visibility(
 
     polling.until(visible)
     assert seen_at is not None
-    return seen_at - written.received_at
+    return seen_at - completed_at
 
 
 def _status_visibility(

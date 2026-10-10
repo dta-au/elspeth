@@ -15,6 +15,7 @@ import heapq
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from difflib import get_close_matches
+from hashlib import sha256
 from typing import Any, Final, Literal, NotRequired, TypedDict
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
@@ -3297,6 +3298,69 @@ def _reconcile_source_options(
 ) -> Mapping[str, Any]:
     proposed_index = _validated_review_index(proposed.options)
     previous_index = _validated_review_index(previous.options) if previous is not None and previous.plugin == proposed.plugin else {}
+    proposed_authoring = _source_authoring_metadata(proposed.options)
+    previous_authoring = _source_authoring_metadata(previous.options) if previous is not None else None
+    proposed_invented = _requirement_for_kind(tuple(proposed_index.values()), InterpretationKind.INVENTED_SOURCE)
+    previous_invented = _requirement_for_kind(tuple(previous_index.values()), InterpretationKind.INVENTED_SOURCE)
+    if proposed_authoring is not None and _is_llm_authored_modality(proposed_authoring["modality"]):
+        # A historical orphan may be present on another source while this
+        # mutation repairs one source at a time. Carry that exact untouched
+        # source through; the read-side orphan gate still blocks execution.
+        # Any new source or edit to the orphan must stage its missing row.
+        unchanged_existing_orphan = previous is not None and previous == proposed and previous_invented is None
+        if proposed_invented is None and not unchanged_existing_orphan:
+            raise ValueError(
+                f"LLM-authored source {component_id!r} requires an invented_source interpretation_requirements row. "
+                "Keep the existing row, or rebind the source blob to stage its exact content before requesting review."
+            )
+    previous_blob_ref = previous.options["blob_ref"] if previous is not None and "blob_ref" in previous.options else None
+    proposed_blob_ref = proposed.options["blob_ref"] if "blob_ref" in proposed.options else None
+    if (
+        previous_authoring is not None
+        and _is_llm_authored_modality(previous_authoring["modality"])
+        and proposed_authoring is None
+        and not (
+            (type(proposed_blob_ref) is str and proposed_blob_ref != previous_blob_ref)
+            or (proposed.plugin == "blob_rows" and bool(proposed.options.get("blobs")))
+        )
+    ):
+        raise ValueError(
+            f"LLM-authored source {component_id!r} cannot lose generated-source provenance through a source-options replacement. "
+            "Rebind a different user-uploaded blob through set_source_from_blob or set_source_from_blobs, "
+            "or remove the source if that graph edit is intended."
+        )
+    same_reviewed_content = (
+        previous is not None
+        and previous.plugin == proposed.plugin
+        and previous_authoring is not None
+        and proposed_authoring is not None
+        and previous_authoring["modality"] == proposed_authoring["modality"]
+        and previous_authoring["content_hash"] == proposed_authoring["content_hash"]
+    )
+    same_artifact_binding = (
+        same_reviewed_content
+        and previous is not None
+        and type(previous_blob_ref) is str
+        and previous_blob_ref == proposed_blob_ref
+        and previous.options.get("path") == proposed.options.get("path")
+    )
+    if (
+        proposed_authoring is not None
+        and _is_llm_authored_modality(proposed_authoring["modality"])
+        and proposed_invented is not None
+        and (not same_artifact_binding or previous_invented is None)
+    ):
+        draft = proposed_invented["draft"]
+        if type(draft) is not str or sha256(draft.encode("utf-8")).hexdigest() != proposed_authoring["content_hash"]:
+            raise ValueError(
+                f"LLM-authored source {component_id!r} invented_source draft does not match its bound content hash. "
+                "Rebind the source blob to stage the exact artifact bytes before requesting review."
+            )
+    if same_artifact_binding and proposed_invented is not None:
+        if previous_invented is not None and _review_identity(previous_invented) != _review_identity(proposed_invented):
+            raise ValueError(f"LLM-authored source {component_id!r} cannot change its invented_source review identity without rebinding")
+        if previous_invented is not None and previous_invented["draft"] != proposed_invented["draft"]:
+            raise ValueError(f"LLM-authored source {component_id!r} cannot change its invented_source draft without rebinding")
     options = dict(proposed.options)
     reconciled: list[Mapping[str, Any]] = []
     for identity, proposed_requirement in proposed_index.items():
@@ -3335,13 +3399,17 @@ def _reconcile_source_options(
                 raise ValueError(f"review kind {kind.value!r} cannot target source {component_id!r}")
             reconciled.append(shell)
             continue
+        if same_artifact_binding and previous_requirement is not None and previous_requirement["status"] != "resolved":
+            # Preserve the event link along with the exact pending draft. A
+            # harmless options edit must not turn a requestable card into an
+            # orphan while the source artifact is unchanged.
+            reconciled.append(dict(previous_requirement))
+            continue
         if previous is None or previous_requirement is None or previous_requirement["status"] != "resolved":
             reconciled.append(shell)
             continue
 
         _require_resolved_review_coherence(previous_requirement)
-        previous_authoring = _source_authoring_metadata(previous.options)
-        proposed_authoring = _source_authoring_metadata(proposed.options)
         if previous_authoring is None or proposed_authoring is None:
             raise ValueError("invented_source review requires reconstructible source_authoring metadata")
         stored_artifact = _resolved_review_hash(previous_requirement, kind)
@@ -3352,7 +3420,10 @@ def _reconcile_source_options(
                 component_type="source",
                 kind=InterpretationKind.INVENTED_SOURCE,
             )
-        if proposed_authoring["content_hash"] == previous_authoring["content_hash"]:
+        # Accepted invented-source review follows coherent authored bytes for
+        # this named source and plugin. Pending drafts still require the exact
+        # blob/path binding above, because they have no accepted proof to carry.
+        if same_reviewed_content:
             reconciled.append(dict(previous_requirement))
             options[SOURCE_AUTHORING_KEY] = dict(previous_authoring)
         else:

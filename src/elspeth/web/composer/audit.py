@@ -49,7 +49,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import rfc8785
 from pydantic import BaseModel, ValidationError
@@ -71,6 +71,10 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
 from elspeth.web.composer.protocol import SchemaViolation, ToolArgumentError
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.provider_quota import ProviderCallCustody
+
 
 __all__ = [
     "BufferingRecorder",
@@ -243,10 +247,10 @@ class BufferingRecorder(
         with self._lock:
             self._invocations.append(invocation)
 
-    def record_llm_call(self, call: ComposerLLMCall) -> None:
+    def record_llm_call(self, call: ComposerLLMCall, *, provider_custody: ProviderCallCustody | None = None) -> None:
         from elspeth.web.composer.provider_quota import retain_provider_audit
 
-        if not retain_provider_audit(call):
+        if not (provider_custody.retain_audit(call) if provider_custody is not None else retain_provider_audit(call)):
             return
         with self._lock:
             self._llm_calls.append(call)

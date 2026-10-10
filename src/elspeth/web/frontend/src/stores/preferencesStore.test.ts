@@ -12,7 +12,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { selectShowAdvanced, selectTutorialCompleted, usePreferencesStore } from "./preferencesStore";
+import { PreferencesRequestSuperseded, selectShowAdvanced, selectTutorialCompleted, usePreferencesStore } from "./preferencesStore";
 import { resetStore } from "@/test/store-helpers";
 import {
   fetchUserComposerPreferences,
@@ -30,6 +30,27 @@ vi.mock("@/api/client", () => ({
 
 const mockFetch = vi.mocked(fetchUserComposerPreferences);
 const mockUpdate = vi.mocked(updateUserComposerPreferences);
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+
+const savedPreferences = {
+  freeform_intro_dismissed_at: null,
+  tutorial_completed_at: null,
+  tutorial_stage: null,
+  tutorial_session_id: null,
+  tutorial_run_id: null,
+  tutorial_source_data_hash: null,
+  show_advanced: true,
+  updated_at: "2026-10-08T00:00:00Z",
+} as const;
 
 describe("preferencesStore", () => {
   beforeEach(() => {
@@ -56,6 +77,149 @@ describe("preferencesStore", () => {
     expect(state.tutorialCompletedAt).toBeNull();
     expect(selectTutorialCompleted(state)).toBe(false);
     expect(state.loaded).toBe(true);
+  });
+
+  it("treats only the pipeline-role refusal as unavailable without inventing saved state", async () => {
+    usePreferencesStore.setState({ loaded: true, showAdvanced: true });
+    mockFetch.mockRejectedValueOnce({
+      status: 403,
+      error_type: "user_role_required",
+      detail: "A live user role is required",
+    });
+
+    await usePreferencesStore.getState().bootstrap();
+
+    const state = usePreferencesStore.getState();
+    expect(state.unavailableForRole).toBe(true);
+    expect(state.loaded).toBe(false);
+    expect(state.showAdvanced).toBe(false);
+    expect(state.tutorialCompletedAt).toBeNull();
+    expect(state.bootstrapError).toBeNull();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("continues to surface an unrelated 403 and restores ordinary user preferences on a later successful bootstrap", async () => {
+    mockFetch.mockRejectedValueOnce({ status: 403, error_type: "other_refusal", detail: "Denied" });
+    await usePreferencesStore.getState().bootstrap();
+    expect(usePreferencesStore.getState().unavailableForRole).toBe(false);
+    expect(usePreferencesStore.getState().bootstrapError).not.toBeNull();
+
+    mockFetch.mockRejectedValueOnce({
+      status: 403,
+      error_type: "user_role_required",
+      detail: "A live user role is required",
+    });
+    await usePreferencesStore.getState().bootstrap();
+    expect(usePreferencesStore.getState().unavailableForRole).toBe(true);
+
+    mockFetch.mockResolvedValueOnce({
+      freeform_intro_dismissed_at: null,
+      tutorial_completed_at: "2026-10-08T00:00:00Z",
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+      show_advanced: true,
+      updated_at: "2026-10-08T00:00:01Z",
+    });
+    await usePreferencesStore.getState().bootstrap();
+    expect(usePreferencesStore.getState().unavailableForRole).toBe(false);
+    expect(usePreferencesStore.getState().loaded).toBe(true);
+    expect(usePreferencesStore.getState().showAdvanced).toBe(true);
+    expect(usePreferencesStore.getState().tutorialCompletedAt).toBe("2026-10-08T00:00:00Z");
+  });
+
+  it("ignores an old user's delayed success after reset and the admin role refusal", async () => {
+    const oldGet = deferred<Awaited<ReturnType<typeof fetchUserComposerPreferences>>>();
+    mockFetch.mockReturnValueOnce(oldGet.promise);
+    const oldBootstrap = usePreferencesStore.getState().bootstrap();
+    usePreferencesStore.getState().reset();
+    mockFetch.mockRejectedValueOnce({ status: 403, error_type: "user_role_required", detail: "User role required" });
+    await usePreferencesStore.getState().bootstrap();
+    oldGet.resolve(savedPreferences);
+    await oldBootstrap;
+    expect(usePreferencesStore.getState()).toMatchObject({
+      unavailableForRole: true, loaded: false, showAdvanced: false,
+      tutorialCompleted: false, bootstrapError: null, writeError: null,
+    });
+  });
+
+  it("ignores an old admin refusal after reset and a new user's successful load", async () => {
+    const oldGet = deferred<Awaited<ReturnType<typeof fetchUserComposerPreferences>>>();
+    mockFetch.mockReturnValueOnce(oldGet.promise);
+    const oldBootstrap = usePreferencesStore.getState().bootstrap();
+    usePreferencesStore.getState().reset();
+    mockFetch.mockResolvedValueOnce(savedPreferences);
+    await usePreferencesStore.getState().bootstrap();
+    oldGet.reject({ status: 403, error_type: "user_role_required", detail: "User role required" });
+    await oldBootstrap;
+    expect(usePreferencesStore.getState()).toMatchObject({
+      unavailableForRole: false, loaded: true, showAdvanced: true,
+      bootstrapError: null,
+    });
+  });
+
+  it("lets only the latest same-account bootstrap decide role availability", async () => {
+    const oldGet = deferred<Awaited<ReturnType<typeof fetchUserComposerPreferences>>>();
+    mockFetch.mockReturnValueOnce(oldGet.promise);
+    const oldBootstrap = usePreferencesStore.getState().bootstrap();
+    mockFetch.mockRejectedValueOnce({ status: 403, error_type: "user_role_required", detail: "User role required" });
+    await usePreferencesStore.getState().bootstrap();
+    oldGet.resolve(savedPreferences);
+    await oldBootstrap;
+    expect(usePreferencesStore.getState().unavailableForRole).toBe(true);
+    expect(usePreferencesStore.getState().loaded).toBe(false);
+  });
+
+  it.each(["saveTutorialProgress", "setShowAdvanced", "markTutorialGraduated", "resetTutorial", "dismissFreeformIntro"] as const)(
+    "does not publish a late %s result into an admin view",
+    async (action) => {
+      const oldWrite = deferred<Awaited<ReturnType<typeof updateUserComposerPreferences>>>();
+      mockUpdate.mockReturnValueOnce(oldWrite.promise);
+      const state = usePreferencesStore.getState();
+      const pending = action === "saveTutorialProgress"
+        ? state.saveTutorialProgress({ stage: "build", sessionId: "old-session", runId: null, sourceDataHash: null })
+        : action === "setShowAdvanced"
+          ? state.setShowAdvanced(true)
+          : action === "markTutorialGraduated"
+            ? state.markTutorialGraduated({ via: "skip", publishLocally: false })
+            : action === "resetTutorial"
+              ? state.resetTutorial()
+              : state.dismissFreeformIntro();
+      const rejection = expect(pending).rejects.toThrow(/account changed/i);
+      usePreferencesStore.getState().reset();
+      mockFetch.mockRejectedValueOnce({ status: 403, error_type: "user_role_required", detail: "User role required" });
+      await usePreferencesStore.getState().bootstrap();
+      oldWrite.resolve({ ...savedPreferences, tutorial_completed_at: "2026-10-08T01:00:00Z" });
+      await rejection;
+      expect(usePreferencesStore.getState()).toMatchObject({
+        unavailableForRole: true, loaded: false, showAdvanced: false,
+        tutorialCompletedAt: null, freeformIntroDismissedAt: null, writeError: null,
+      });
+    },
+  );
+
+  it("does not publish a late write failure as the new admin's error banner", async () => {
+    const oldWrite = deferred<Awaited<ReturnType<typeof updateUserComposerPreferences>>>();
+    mockUpdate.mockReturnValueOnce(oldWrite.promise);
+    const pending = usePreferencesStore.getState().setShowAdvanced(true);
+    const rejection = expect(pending).rejects.toBeInstanceOf(PreferencesRequestSuperseded);
+    usePreferencesStore.getState().reset();
+    mockFetch.mockRejectedValueOnce({ status: 403, error_type: "user_role_required", detail: "User role required" });
+    await usePreferencesStore.getState().bootstrap();
+    oldWrite.reject(new Error("Old account failed"));
+    await rejection;
+    expect(usePreferencesStore.getState().writeError).toBeNull();
+  });
+
+  it("rejects deferred tutorial publication after the account changes", async () => {
+    mockUpdate.mockResolvedValueOnce({ ...savedPreferences, tutorial_completed_at: "2026-10-08T01:00:00Z" });
+    const completion = await usePreferencesStore.getState().markTutorialGraduated({ via: "skip", publishLocally: false });
+    usePreferencesStore.getState().reset();
+    mockFetch.mockResolvedValueOnce(savedPreferences);
+    await usePreferencesStore.getState().bootstrap();
+    expect(completion.publish).toThrow(/account changed/i);
+    expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
   });
 
   it("dismisses the freeform introduction only after the server confirms", async () => {
@@ -146,19 +310,19 @@ describe("preferencesStore", () => {
       updated_at: "2026-05-19T12:30:00Z",
     });
 
-    const completedAt = await usePreferencesStore
+    const completion = await usePreferencesStore
       .getState()
       .markTutorialGraduated({ via: "skip", publishLocally: false });
 
-    expect(completedAt).toBe("2026-05-19T12:30:00Z");
+    expect(completion.completedAt).toBe("2026-05-19T12:30:00Z");
     expect(mockUpdate.mock.calls[0][0]).toEqual({
       tutorial_completed_at: expect.any(String),
       tutorial_completed_via: "skip",
     });
-    expect(usePreferencesStore.getState().tutorialCompletedAt).toBe(completedAt);
+    expect(usePreferencesStore.getState().tutorialCompletedAt).toBe(completion.completedAt);
     expect(selectTutorialCompleted(usePreferencesStore.getState())).toBe(false);
 
-    usePreferencesStore.getState().publishTutorialGraduation(completedAt);
+    completion.publish();
 
     expect(usePreferencesStore.getState().tutorialCompletedAt).toBe(
       "2026-05-19T12:30:00Z",
@@ -216,11 +380,11 @@ describe("preferencesStore", () => {
       });
     }, 120);
 
-    const completedAt = await usePreferencesStore
+    const completion = await usePreferencesStore
       .getState()
       .markTutorialGraduated({ via: "exit" });
 
-    expect(completedAt).toBe("2026-07-09T00:00:00Z");
+    expect(completion.completedAt).toBe("2026-07-09T00:00:00Z");
     expect(mockUpdate).not.toHaveBeenCalled();
   });
 
@@ -263,8 +427,8 @@ describe("preferencesStore", () => {
     const [a, b] = await Promise.all([first, second]);
 
     expect(mockUpdate).toHaveBeenCalledTimes(1);
-    expect(a).toBe("2026-07-09T00:00:00Z");
-    expect(b).toBe("2026-07-09T00:00:00Z");
+    expect(a.completedAt).toBe("2026-07-09T00:00:00Z");
+    expect(b.completedAt).toBe("2026-07-09T00:00:00Z");
   });
 
   it("markTutorialGraduated sends the exit discriminator when asked", async () => {
@@ -565,7 +729,7 @@ describe("preferencesStore — markTutorialGraduated 429 retry", () => {
       .mockResolvedValueOnce(completedPayload); // reuse the file's payload fixture
     const promise = usePreferencesStore.getState().markTutorialGraduated({ via: "complete" });
     await vi.advanceTimersByTimeAsync(2_000);
-    await expect(promise).resolves.toBe(completedPayload.tutorial_completed_at);
+    await expect(promise).resolves.toMatchObject({ completedAt: completedPayload.tutorial_completed_at });
     expect(mockUpdate).toHaveBeenCalledTimes(2);
     expect(usePreferencesStore.getState().writeError).toBeNull();
     vi.useRealTimers();
@@ -612,9 +776,9 @@ describe("atomic tutorial completion", () => {
   beforeEach(() => { resetStore(usePreferencesStore); vi.resetAllMocks(); });
   it("persists provenance once while deferring publication", async () => {
     mockUpdate.mockResolvedValue({ tutorial_completed_at: "2026-09-20T00:00:00Z", tutorial_stage: null, tutorial_session_id: null, tutorial_run_id: null, tutorial_source_data_hash: null, freeform_intro_dismissed_at: null, show_advanced: false, updated_at: null });
-    const stamp = await usePreferencesStore.getState().markTutorialGraduated({ via: "skip", publishLocally: false });
+    const completion = await usePreferencesStore.getState().markTutorialGraduated({ via: "skip", publishLocally: false });
     expect(mockUpdate).toHaveBeenCalledWith({ tutorial_completed_at: expect.any(String), tutorial_completed_via: "skip" });
-    expect(usePreferencesStore.getState().tutorialCompletedAt).toBe(stamp);
+    expect(usePreferencesStore.getState().tutorialCompletedAt).toBe(completion.completedAt);
     expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
     await usePreferencesStore.getState().markTutorialGraduated({ via: "complete" });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
@@ -685,12 +849,26 @@ describe("preferences publication boundaries", () => {
     expect(usePreferencesStore.getState().writeError).toBeNull();
   });
 
-  it("keeps freeform-introduction cross-tab dismissal without a second PATCH", () => {
+  it("uses a same-principal dismissal event as an authoritative GET hint without a second PATCH", async () => {
+    usePreferencesStore.getState().bindPrincipal("alice", "local");
+    usePreferencesStore.setState({ loaded: true, tutorialCompletedAt: stamp, tutorialCompleted: false });
+    mockFetch.mockResolvedValueOnce({ ...completed, freeform_intro_dismissed_at: stamp });
+    window.dispatchEvent(new StorageEvent("storage", {
+      key: `elspeth_prefs_freeform_intro_dismissed_v2:${JSON.stringify(["local", "alice"])}`, newValue: "untrusted hint",
+    }));
+    await Promise.resolve();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(usePreferencesStore.getState().freeformIntroDismissedAt).toBe(stamp);
+    expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not publish a browser-global intro event into an unavailable account", () => {
+    usePreferencesStore.setState({ unavailableForRole: true, loaded: false });
     window.dispatchEvent(new StorageEvent("storage", {
       key: "elspeth_prefs_freeform_intro_dismissed_v1", newValue: stamp,
     }));
-    expect(usePreferencesStore.getState().freeformIntroDismissedAt).toBe(stamp);
-    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(usePreferencesStore.getState().freeformIntroDismissedAt).toBeNull();
   });
 
   it("does not erase a bootstrap failure when a preference write succeeds", async () => {
@@ -780,4 +958,147 @@ describe("tutorial progress and completion ordering", () => {
       expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
     } finally { vi.useRealTimers(); }
   });
+});
+
+
+describe("principal and request ownership for every preference writer", () => {
+  beforeEach(() => {
+    usePreferencesStore.getState().reset();
+    vi.resetAllMocks();
+  });
+  const writers = [
+    () => usePreferencesStore.getState().setShowAdvanced(true),
+    () => usePreferencesStore.getState().saveTutorialProgress({ stage: "run", sessionId: "old", runId: null, sourceDataHash: null }),
+    () => usePreferencesStore.getState().markTutorialGraduated({ via: "complete" }),
+    () => usePreferencesStore.getState().resetTutorial(),
+    () => usePreferencesStore.getState().dismissFreeformIntro(),
+  ];
+
+  it.each(writers)("discards a late failure and does not publish into a newly loaded user", async (write) => {
+    const old = deferred<Awaited<ReturnType<typeof updateUserComposerPreferences>>>();
+    mockUpdate.mockReturnValueOnce(old.promise);
+    const pending = write();
+    const failed = expect(pending).rejects.toBeInstanceOf(PreferencesRequestSuperseded);
+    usePreferencesStore.getState().bindPrincipal("new-user", "local");
+    mockFetch.mockResolvedValueOnce(savedPreferences);
+    await usePreferencesStore.getState().bootstrap();
+    old.reject(new Error("old failure"));
+    await failed;
+    expect(usePreferencesStore.getState()).toMatchObject({ loaded: true, unavailableForRole: false, showAdvanced: true, writeError: null, writing: false });
+  });
+
+  it.each(writers)("makes a current exact PATCH role refusal unavailable without a save banner", async (write) => {
+    mockUpdate.mockRejectedValueOnce({ status: 403, error_type: "user_role_required" });
+    await expect(write()).rejects.toBeInstanceOf(PreferencesRequestSuperseded);
+    expect(usePreferencesStore.getState()).toMatchObject({ loaded: false, unavailableForRole: true, writeError: null, writing: false });
+  });
+
+  it.each(writers)("keeps unrelated current PATCH errors actionable", async (write) => {
+    mockUpdate.mockRejectedValueOnce({ status: 403, error_type: "other_refusal" });
+    await expect(write()).rejects.toMatchObject({ status: 403, error_type: "other_refusal" });
+    expect(usePreferencesStore.getState().unavailableForRole).toBe(false);
+    expect(usePreferencesStore.getState().writeError).not.toBeNull();
+    expect(usePreferencesStore.getState().writing).toBe(false);
+  });
+
+  it("does not let an old same-principal GET replace a newer saved preference", async () => {
+    const old = deferred<Awaited<ReturnType<typeof fetchUserComposerPreferences>>>();
+    mockFetch.mockReturnValueOnce(old.promise);
+    const loading = usePreferencesStore.getState().bootstrap();
+    mockUpdate.mockResolvedValueOnce(savedPreferences);
+    await usePreferencesStore.getState().setShowAdvanced(true);
+    old.resolve({ ...savedPreferences, show_advanced: false });
+    await loading;
+    expect(usePreferencesStore.getState().showAdvanced).toBe(true);
+  });
+
+  it("waits for the active writer before fetching a refresh", async () => {
+    vi.useFakeTimers();
+    try {
+      const old = deferred<Awaited<ReturnType<typeof updateUserComposerPreferences>>>();
+      mockUpdate.mockReturnValueOnce(old.promise);
+      const saving = usePreferencesStore.getState().setShowAdvanced(true);
+      mockFetch.mockResolvedValueOnce(savedPreferences);
+      const loading = usePreferencesStore.getState().bootstrap();
+      expect(mockFetch).not.toHaveBeenCalled();
+      old.resolve(savedPreferences);
+      await saving;
+      await vi.advanceTimersByTimeAsync(50);
+      await loading;
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(usePreferencesStore.getState()).toMatchObject({ writing: false, loaded: true, showAdvanced: true });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("does not retry a 429 completion under a replacement account", async () => {
+    vi.useFakeTimers();
+    try {
+      mockUpdate.mockRejectedValueOnce({ status: 429, retry_after: 2 });
+      const pending = usePreferencesStore.getState().markTutorialGraduated({ via: "complete" });
+      const failed = expect(pending).rejects.toBeInstanceOf(PreferencesRequestSuperseded);
+      await vi.advanceTimersByTimeAsync(1);
+      usePreferencesStore.getState().bindPrincipal("admin", "local");
+      mockFetch.mockRejectedValueOnce({ status: 403, error_type: "user_role_required" });
+      await usePreferencesStore.getState().bootstrap();
+      await vi.advanceTimersByTimeAsync(2000);
+      await failed;
+      expect(mockUpdate).toHaveBeenCalledTimes(1);
+      expect(usePreferencesStore.getState()).toMatchObject({ unavailableForRole: true, writeError: null, writing: false });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["saveTutorialProgress", "markTutorialGraduated"] as const)("discards queued %s before sending a PATCH under replacement credentials", async (action) => {
+    vi.useFakeTimers();
+    try {
+      usePreferencesStore.setState({ writing: true });
+      const pending = action === "saveTutorialProgress"
+        ? usePreferencesStore.getState().saveTutorialProgress({ stage: "run", sessionId: "old", runId: null, sourceDataHash: null })
+        : usePreferencesStore.getState().markTutorialGraduated({ via: "complete" });
+      const failed = expect(pending).rejects.toBeInstanceOf(PreferencesRequestSuperseded);
+      usePreferencesStore.getState().bindPrincipal("new-user", "local");
+      await vi.advanceTimersByTimeAsync(50);
+      await failed;
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(usePreferencesStore.getState().writeError).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("ignores another principal's and the retired browser-global storage key", () => {
+    usePreferencesStore.getState().bindPrincipal("bob", "local");
+    usePreferencesStore.setState({ loaded: true });
+    for (const key of ["elspeth_prefs_freeform_intro_dismissed_v1", `elspeth_prefs_freeform_intro_dismissed_v2:${JSON.stringify(["local", "alice"])}`]) {
+      window.dispatchEvent(new StorageEvent("storage", { key, newValue: "old value" }));
+    }
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(usePreferencesStore.getState().freeformIntroDismissedAt).toBeNull();
+  });
+
+  it("discards an in-flight cross-tab refresh after account replacement", async () => {
+    usePreferencesStore.getState().bindPrincipal("alice", "local");
+    usePreferencesStore.setState({ loaded: true });
+    const old = deferred<Awaited<ReturnType<typeof fetchUserComposerPreferences>>>();
+    mockFetch.mockReturnValueOnce(old.promise);
+    window.dispatchEvent(new StorageEvent("storage", { key: `elspeth_prefs_freeform_intro_dismissed_v2:${JSON.stringify(["local", "alice"])}`, newValue: "hint" }));
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    usePreferencesStore.getState().bindPrincipal("bob", "local");
+    old.resolve({ ...savedPreferences, freeform_intro_dismissed_at: "old dismissal" });
+    await Promise.resolve();
+    expect(usePreferencesStore.getState().freeformIntroDismissedAt).toBeNull();
+    expect(usePreferencesStore.getState().loaded).toBe(false);
+  });
+});
+
+
+it("does not publish a reused completion after a newer reset starts", async () => {
+  usePreferencesStore.getState().reset();
+  vi.resetAllMocks();
+  usePreferencesStore.setState({ tutorialCompletedAt: "saved completion", tutorialCompleted: false });
+  const receipt = await usePreferencesStore.getState().markTutorialGraduated({ via: "skip", publishLocally: false });
+  const reset = deferred<Awaited<ReturnType<typeof updateUserComposerPreferences>>>();
+  mockUpdate.mockReturnValueOnce(reset.promise);
+  const resetting = usePreferencesStore.getState().resetTutorial();
+  expect(receipt.publish).toThrow(/account changed/i);
+  expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
+  reset.resolve({ ...savedPreferences, tutorial_completed_at: null });
+  await resetting;
 });

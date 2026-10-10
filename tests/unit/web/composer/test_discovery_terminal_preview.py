@@ -1,16 +1,21 @@
 """A final verified preview may spend the discovery budget before replying."""
 
 import asyncio
+import json
 from dataclasses import replace
 from typing import Any
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.web.composer._compose_loop_carriers import _ToolOutcome
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
+from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError
 from elspeth.web.composer.service import (
+    _reply_only_messages,
+    _reply_only_protocol_echo,
     _tool_batch_ends_with_valid_current_preview,
 )
 from elspeth.web.composer.state import OutputSpec, SourceSpec, ValidationSummary
@@ -25,9 +30,62 @@ from tests.unit.web.composer._helpers import (
 )
 from tests.unit.web.composer.test_service import _composer_service_with_session, _execution_ready
 
+_PROTOCOL_ECHO = "Historical tool protocol record (quoted data):\n" + json.dumps(
+    {
+        "role": "assistant",
+        "content": "I have reviewed the pipeline.",
+        "tool_calls": [
+            {
+                "id": "not-an-executed-call",
+                "type": "function",
+                "function": {"name": "request_interpretation_review", "arguments": "{}"},
+            }
+        ],
+    }
+)
+_USER_QUOTED_JSON = 'The quoted user data {"tool_calls": [{"name": "example"}]} is not a pipeline command.'
+
+
+def test_reply_only_history_preserves_attribution_and_echo_check_needs_internal_provenance() -> None:
+    history = [
+        {
+            "role": "assistant",
+            "content": "Previewing.",
+            "tool_calls": [{"id": "real-preview", "type": "function", "function": {"name": "preview_pipeline", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "real-preview", "content": '{"success": true}'},
+        {"role": "user", "content": _USER_QUOTED_JSON},
+    ]
+    projected = _reply_only_messages(history)
+    assert all(row["role"] != "tool" and "tool_calls" not in row for row in projected)
+    assert projected[0]["role"] == "assistant"
+    assert projected[1]["role"] == "user"
+    assert projected[0]["content"].endswith("[End historical tool evidence; this was not a current assistant reply.]")
+    assert json.loads(projected[0]["content"].split("\n", 2)[1]) == history[0]
+    assert json.loads(projected[1]["content"].split("\n", 2)[1]) == history[1]
+    assert projected[2] == history[2]
+    has_tool_protocol = any(row["role"] == "tool" or "tool_calls" in row for row in history)
+    user_only_has_tool_protocol = any(row["role"] == "tool" or "tool_calls" in row for row in [history[2]])
+    assert has_tool_protocol
+    assert not user_only_has_tool_protocol
+    assert _reply_only_protocol_echo(_PROTOCOL_ECHO, history_has_tool_protocol=has_tool_protocol, user_message="Explain the preview.")
+    assert not _reply_only_protocol_echo(
+        _PROTOCOL_ECHO, history_has_tool_protocol=user_only_has_tool_protocol, user_message="Explain the preview."
+    )
+    assert not _reply_only_protocol_echo(
+        _PROTOCOL_ECHO, history_has_tool_protocol=has_tool_protocol, user_message="Please quote this log exactly:\n" + _PROTOCOL_ECHO
+    )
+    assert not _reply_only_protocol_echo(_USER_QUOTED_JSON, history_has_tool_protocol=has_tool_protocol, user_message=_USER_QUOTED_JSON)
+    assert not _reply_only_protocol_echo(
+        'The user wrote {"tool_calls": []}.', history_has_tool_protocol=has_tool_protocol, user_message="Explain."
+    )
+
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("final_kind", ["text", "tools", "timeout", "expired", "advisor_block"])
+@pytest.mark.parametrize(
+    "final_kind",
+    ["text", "tools", "timeout", "expired", "advisor_block", "protocol_echo", "protocol_echo_advisor_block", "quoted_json", "quoted_log"],
+)
 async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytest.MonkeyPatch, final_kind: str) -> None:
     service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings(composer_max_discovery_turns=1))
     state = (
@@ -65,30 +123,33 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
         dispatched_batches.append(tuple(call.function.name for call in kwargs["call_model"].completion.tool_batch.calls))
         return await original_dispatch(*args, **kwargs)
 
-    async def provider(_messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+    async def provider(**kwargs: Any) -> Any:
+        tools = kwargs.get("tools", [])
         advertised_tools.append(tools)
-        provider_messages.append(_messages)
+        provider_messages.append(kwargs["messages"])
         if len(advertised_tools) == 2:
             if final_kind == "timeout":
                 raise TimeoutError
             if final_kind == "tools":
-                return _admit_composer_llm_completion(
-                    _make_llm_response(
-                        tool_calls=[{"id": "forbidden", "name": "set_metadata", "arguments": {"patch": {"name": "must not apply"}}}]
-                    )
+                return _make_llm_response(
+                    tool_calls=[{"id": "forbidden", "name": "set_metadata", "arguments": {"patch": {"name": "must not apply"}}}]
                 )
-        return _admit_composer_llm_completion(next(replies))
+            if final_kind in {"protocol_echo", "protocol_echo_advisor_block", "quoted_log"}:
+                return _make_llm_response(content=_PROTOCOL_ECHO)
+            if final_kind == "quoted_json":
+                return _make_llm_response(content=_USER_QUOTED_JSON)
+        return next(replies)
 
     def preflight(*_args: Any, **_kwargs: Any) -> ValidationResult:
         return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_execution_ready())
 
-    monkeypatch.setattr(service._provider_gateway, "_call_llm", provider)
+    monkeypatch.setattr("litellm.acompletion", provider)
     monkeypatch.setattr(service._preflight, "runtime_preflight", preflight)
     monkeypatch.setattr(service, "_dispatch_tool_batch", dispatch)
 
     async def advisor(*args: object, **kwargs: Any) -> AdvisorCheckpointVerdict:
         advisor_phases.append(kwargs["phase"])
-        if final_kind == "advisor_block":
+        if final_kind in {"advisor_block", "protocol_echo_advisor_block"}:
             return AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="The requested output needs review.")
         return await _clean_advisor_checkpoint(*args, **kwargs)
 
@@ -103,23 +164,50 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
     if final_kind == "expired":
         monkeypatch.setattr(service, "_call_llm_before_deadline", expire_final_reply)
 
+    user_message = "Preview the current pipeline and explain the result."
+    if final_kind == "quoted_log":
+        user_message += " Please quote this log exactly:\n" + _PROTOCOL_ECHO
     if final_kind == "tools":
         with pytest.raises(_MalformedLLMResponseError, match="Reply-only completion must contain text and no tool calls"):
-            await service.compose("Preview the current pipeline and explain the result.", [], state, session_id=session_id)
+            await service.compose(user_message, [], state, session_id=session_id)
         assert state.metadata.name != "must not apply"
     elif final_kind in {"timeout", "expired"}:
         with pytest.raises(ComposerConvergenceError) as raised:
-            await service.compose("Preview the current pipeline and explain the result.", [], state, session_id=session_id)
+            await service.compose(user_message, [], state, session_id=session_id)
         assert raised.value.budget_exhausted == "timeout"
         assert raised.value.max_turns == 1
         assert state.metadata.name != "must not apply"
     else:
-        result = await service.compose("Preview the current pipeline and explain the result.", [], state, session_id=session_id)
+        result = await service.compose(user_message, [], state, session_id=session_id)
         assert result.state == state
         assert advisor_phases == ["end"]
         if final_kind == "advisor_block":
             assert result.message != "The pipeline preview passed."
             assert result.advisor_gate_decision is not None
+        elif final_kind in {"protocol_echo", "protocol_echo_advisor_block"}:
+            assert result.message.count("final reply is unavailable") == 1
+            assert _PROTOCOL_ECHO not in result.message
+            assert result.raw_assistant_content == ""
+            assert len(result.llm_calls) == 2
+            assert tuple(call.status for call in result.llm_calls) == (
+                ComposerLLMCallStatus.SUCCESS,
+                ComposerLLMCallStatus.SUCCESS,
+            )
+            if final_kind == "protocol_echo_advisor_block":
+                assert result.advisor_gate_decision is not None
+            segments = visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)
+            assert isinstance(segments[-1], TrustedSystemNoticeSegment)
+        elif final_kind == "quoted_json":
+            assert result.message == _USER_QUOTED_JSON
+            segments = visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)
+            assert type(segments[0]) is AssistantTextSegment
+            assert _USER_QUOTED_JSON in segments[0].content
+        elif final_kind == "quoted_log":
+            assert _PROTOCOL_ECHO in result.message
+            assert "final reply is unavailable" not in result.message
+            segments = visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)
+            assert type(segments[0]) is AssistantTextSegment
+            assert _PROTOCOL_ECHO in segments[0].content
         else:
             assert result.message == "The pipeline preview passed."
     assert len(advertised_tools) == (1 if final_kind == "expired" else 2)

@@ -19,6 +19,7 @@ the admin ``NOLOGIN``), and the SQL observer against a recorded reader.
 from __future__ import annotations
 
 import dataclasses
+import json
 import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -67,6 +68,7 @@ from elspeth.web._azure_container_apps_acceptance.controller import (
 )
 from elspeth.web._azure_container_apps_acceptance.evidence import lease_takeover_for_receipt
 from elspeth.web._azure_container_apps_acceptance.receipt_contracts import EXEC_RECEIPT_DESCRIPTOR
+from tests.helpers.composer_probe_operations import operation_document
 
 RA = "postgresql-aaaaaaaa-0000-4000-8000-000000000001"
 RB = "postgresql-bbbbbbbb-0000-4000-8000-000000000002"
@@ -81,7 +83,7 @@ LB = f"https://elspeth-web---b.{DOMAIN}"
 class _RecordedReplicas:
     """Two replicas behind one transport: the first request of each pair wins the fence, the other gets the 409 body."""
 
-    def __init__(self, *, both_win: bool = False, same_instance: bool = False) -> None:
+    def __init__(self, *, both_win: bool = False, same_instance: bool = False, pending_polls: int = 0) -> None:
         self._lock = threading.Lock()
         self._winner: str | None = None
         self._both_win = both_win
@@ -89,6 +91,9 @@ class _RecordedReplicas:
         self.epoch = 3
         self.owner: str | None = None
         self.run_counter = 0
+        self.operation_id: str | None = None
+        self.pending_polls = pending_polls
+        self.terminal_reads = 0
 
     def reset(self) -> None:
         self._winner = None
@@ -100,6 +105,35 @@ class _RecordedReplicas:
         if request.url.path == "/api/system/status":
             return httpx.Response(200, json={"instance_id": instance}, headers=headers)
         with self._lock:
+            if "/operations/" in request.url.path:
+                assert self.operation_id is not None
+                self.terminal_reads += 1
+                body = operation_document(self.operation_id, "session-1")
+                if self.pending_polls:
+                    self.pending_polls -= 1
+                    body.update(status="running", result=None, deadline_remaining_ms=1000)
+                return httpx.Response(200, json=body, headers=headers)
+            if request.url.path.endswith("/messages"):
+                operation_id = json.loads(request.content)["operation_id"]
+                if self._winner is None or self._both_win:
+                    self._winner = instance
+                    self.epoch += 1
+                    self.owner = instance
+                    self.operation_id = operation_id
+                if operation_id == self.operation_id or self._both_win:
+                    return httpx.Response(202, json={"operation_id": operation_id}, headers=headers)
+                return httpx.Response(
+                    409,
+                    json={
+                        "detail": {
+                            "error_type": "composer_operation_active",
+                            "operation_id": self.operation_id,
+                            "kind": "compose_message",
+                            "detail": "This session already has a composer request in progress.",
+                        }
+                    },
+                    headers=headers,
+                )
             if self._winner is None or self._both_win:
                 self._winner = instance
                 self.epoch += 1
@@ -124,8 +158,11 @@ class _FakeReader(SqlReader):
         if "owner_instance_id" in statement:
             return self._replicas.owner
         if "count(*) FROM message_ingress_receipts" in statement:
-            assert parameters["client_request_id"]
+            assert self._replicas.terminal_reads > 0 and self._replicas.pending_polls == 0
+            assert parameters["operation_id"]
             return 1
+        if "count(*) FROM composer_async_operations" in statement:
+            return int(parameters["operation_id"] == self._replicas.operation_id)
         raise AssertionError(statement)
 
     def rows(self, statement: str, **parameters: object) -> tuple[tuple[object, ...], ...]:
@@ -217,28 +254,50 @@ def _driver(replicas: _RecordedReplicas) -> tuple[ReplicaProbeDriver, _FakeReade
 
 
 class TestFenceConflictRecorded:
+    def test_reads_receipt_only_after_exact_operation_reaches_terminal(self) -> None:
+        replicas = _RecordedReplicas(pending_polls=2)
+        driver, reader = _driver(replicas)
+        trial = driver.fence_conflict_trial(
+            "session-1",
+            ProbeRequest(
+                "POST",
+                "/api/sessions/session-1/messages",
+                {
+                    "content": "Build",
+                    "operation_id": str(uuid4()),
+                    "state_id": None,
+                },
+            ),
+        )
+        assert replicas.terminal_reads == 3
+        assert trial.terminal_status == "completed" and trial.composer_operation_rows == 1
+        assert any("composer_async_operations" in statement for statement in reader.statements)
+
     def test_twenty_recorded_pairs_score_a_pass_with_two_distinct_instances(self) -> None:
         replicas = _RecordedReplicas()
         driver, _reader = _driver(replicas)
         trials = []
-        for _ in range(20):
+        for index in range(20):
             replicas.reset()
             request_id = str(uuid4())
             trials.append(
                 driver.fence_conflict_trial(
                     "session-1",
                     ProbeRequest(
-                        "POST", "/api/sessions/session-1/messages", {"content": "Build a pipeline", "client_request_id": request_id}
+                        "POST",
+                        "/api/sessions/session-1/messages",
+                        {"content": "Build a pipeline", "operation_id": request_id, "state_id": None},
                     ),
+                    kind="same_operation" if index % 2 == 0 else "distinct_operations",
                 )
             )
         for trial in trials:
-            assert sorted(response.status for response in trial.responses) == [200, 409]
+            assert sorted(response.status for response in trial.responses) == ([202, 202] if trial.kind == "same_operation" else [202, 409])
             assert {response.instance_id for response in trial.responses} == {RA, RB}
         result = decide_fence_conflict(trials)
         # The recorded transport's winner is whichever thread arrives first; only a run
         # where both replicas won at least once is a pass, exactly as the decision demands.
-        winners = {next(response.instance_id for response in trial.responses if response.succeeded) for trial in trials}
+        winners = {trial.fence_owner_after for trial in trials}
         assert result.outcome == ("pass" if winners == {RA, RB} else "fail")
         assert result.mechanism == "session_operation_fence"
         EXEC_RECEIPT_DESCRIPTOR.detail_validators["replica-fence-conflict"](result.to_receipt_details())
@@ -247,17 +306,20 @@ class TestFenceConflictRecorded:
         replicas = _RecordedReplicas(both_win=True)
         driver, _reader = _driver(replicas)
         trial = driver.fence_conflict_trial(
-            "session-1", ProbeRequest("POST", "/api/sessions/session-1/messages", {"client_request_id": str(uuid4())})
+            "session-1",
+            ProbeRequest("POST", "/api/sessions/session-1/messages", {"content": "Build", "operation_id": str(uuid4()), "state_id": None}),
+            kind="distinct_operations",
         )
-        assert [response.status for response in trial.responses] == [200, 200]
+        assert [response.status for response in trial.responses] == [202, 202]
         result = decide_fence_conflict([trial])
-        assert result.outcome == "fail" and "trial[0]:not_one_success_and_one_fence_refusal" in result.reasons
+        assert result.outcome == "fail" and "trial[0]:invalid_operation_admission_pair" in result.reasons
 
     def test_two_labels_answered_by_one_instance_fail_the_probe(self) -> None:
         replicas = _RecordedReplicas(same_instance=True)
         driver, _reader = _driver(replicas)
         trial = driver.fence_conflict_trial(
-            "session-1", ProbeRequest("POST", "/api/sessions/session-1/messages", {"client_request_id": str(uuid4())})
+            "session-1",
+            ProbeRequest("POST", "/api/sessions/session-1/messages", {"content": "Build", "operation_id": str(uuid4()), "state_id": None}),
         )
         result = decide_fence_conflict([trial])
         assert "trial[0]:instances_not_distinct" in result.reasons
@@ -488,10 +550,11 @@ class TestController:
 class TestObserver:
     def test_message_ingress_receipt_rows_is_scoped_to_the_exact_request(self) -> None:
         replicas = _RecordedReplicas()
+        replicas.terminal_reads = 1
         reader = _FakeReader(replicas)
         observer = PostgresEvidenceObserver(sessions=reader, landscape=reader)
         request_id = str(uuid4())
-        assert observer.message_ingress_receipt_rows("session-1", client_request_id=request_id) == 1
+        assert observer.message_ingress_receipt_rows("session-1", operation_id=request_id) == 1
         assert any("count(*) FROM message_ingress_receipts" in statement for statement in reader.statements)
 
     def test_membership_row_reads_the_owner_row_or_none(self) -> None:

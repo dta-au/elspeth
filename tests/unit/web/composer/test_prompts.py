@@ -638,7 +638,7 @@ class TestBuildSystemPrompt:
         flattened = " ".join(result.split())
 
         assert "create, choose, draft, generate, or otherwise supply source rows" in result
-        assert "stage an `invented_source` interpretation requirement on the source" in flattened
+        assert "bind the source blob, keep its backend-staged" in flattened
         assert 'request_interpretation_review(kind="invented_source")' in result
         assert 'use `affected_node_id="source"`' in result
         assert "the source is not listed in `nodes[]`, and that is expected" in flattened

@@ -97,54 +97,60 @@ async def _seed_run(service: SessionServiceImpl, identity_id: str) -> tuple[RunR
 
 
 def _writer_process(url: str, identity_id: str, pipe: Connection) -> None:
-    engine = create_session_engine(url)
-    service = SessionServiceImpl(
-        engine,
-        telemetry=build_sessions_telemetry(),
-        log=structlog.get_logger("test.pg-progress-writer"),
-        owner_instance_id=f"progress-writer-{uuid4()}",
-    )
-    try:
-        run, context = asyncio.run(_seed_run(service, identity_id))
-        pipe.send((str(run.id), str(run.session_id)))
-        while True:
-            command = pipe.recv()
-            if command is None:
-                break
-            event_type: SessionRunEventType = command
-            record = asyncio.run(
-                service.append_run_event(
-                    run_id=run.id,
-                    timestamp=datetime.now(UTC),
-                    event_type=event_type,
-                    data=_event_data(event_type),
-                    session_operation_context=context,
+    from tests.helpers.child_executor_lifecycle import child_executor_lifecycle
+
+    with child_executor_lifecycle():
+        engine = create_session_engine(url)
+        service = SessionServiceImpl(
+            engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.pg-progress-writer"),
+            owner_instance_id=f"progress-writer-{uuid4()}",
+        )
+        try:
+            run, context = asyncio.run(_seed_run(service, identity_id))
+            pipe.send((str(run.id), str(run.session_id)))
+            while True:
+                command = pipe.recv()
+                if command is None:
+                    break
+                event_type: SessionRunEventType = command
+                record = asyncio.run(
+                    service.append_run_event(
+                        run_id=run.id,
+                        timestamp=datetime.now(UTC),
+                        event_type=event_type,
+                        data=_event_data(event_type),
+                        session_operation_context=context,
+                    )
                 )
-            )
-            pipe.send(record.sequence)
-    finally:
-        engine.dispose()
-        pipe.close()
+                pipe.send(record.sequence)
+        finally:
+            engine.dispose()
+            pipe.close()
 
 
 def _reader_process(url: str, identity_id: str, run_id: str, pipe: Connection) -> None:
-    engine = create_session_engine(url)
-    reader = RepositoryRunProgressReader(engine)
-    try:
-        pipe.send("ready")
-        while True:
-            request = pipe.recv()
-            if request is None:
-                break
-            after_sequence, limit = request
-            try:
-                records = reader.read_after(identity_id=identity_id, run_id=UUID(run_id), after_sequence=after_sequence, limit=limit)
-                pipe.send(None if records is None else [(row.sequence, row.event_type, dict(row.data)) for row in records])
-            except AuditIntegrityError:
-                pipe.send("audit-integrity-error")
-    finally:
-        engine.dispose()
-        pipe.close()
+    from tests.helpers.child_executor_lifecycle import child_executor_lifecycle
+
+    with child_executor_lifecycle():
+        engine = create_session_engine(url)
+        reader = RepositoryRunProgressReader(engine)
+        try:
+            pipe.send("ready")
+            while True:
+                request = pipe.recv()
+                if request is None:
+                    break
+                after_sequence, limit = request
+                try:
+                    records = reader.read_after(identity_id=identity_id, run_id=UUID(run_id), after_sequence=after_sequence, limit=limit)
+                    pipe.send(None if records is None else [(row.sequence, row.event_type, dict(row.data)) for row in records])
+                except AuditIntegrityError:
+                    pipe.send("audit-integrity-error")
+        finally:
+            engine.dispose()
+            pipe.close()
 
 
 def _receive(pipe: Connection) -> Any:
@@ -176,45 +182,48 @@ class _RouteStatusService:
 
 
 def _websocket_route_process(url: str, identity_id: str, run_id: str, pipe: Connection) -> None:
-    from elspeth.web.execution.routes import create_execution_router
+    from tests.helpers.child_executor_lifecycle import child_executor_lifecycle
 
-    engine = create_session_engine(url)
-    broadcaster = FakeBroadcaster()
-    app = FastAPI()
-    app.state.run_progress_reader = RepositoryRunProgressReader(engine)
-    app.state.broadcaster = broadcaster
-    app.state.execution_service = _RouteStatusService(pipe)
-    app.state.session_service = SessionServiceImpl(
-        engine,
-        telemetry=build_sessions_telemetry(),
-        log=structlog.get_logger("test.pg-progress-route"),
-        owner_instance_id=f"progress-route-{uuid4()}",
-    )
-    app.state.identity_authority = RepositoryIdentityAuthority(
-        engine,
-        lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply,
-    )
-    app.state.settings = FakeSettings(auth_provider="vanguard")
-    app.state.websocket_ticket_store = WebSocketTicketStore()
-    app.include_router(create_execution_router())
-    ticket = app.state.websocket_ticket_store.issue(run_id=run_id, user=UserIdentity(user_id=identity_id, username=identity_id)).ticket
-    try:
-        sent_count = 0
-        with TestClient(app) as client, client.websocket_connect(f"/ws/runs/{run_id}?ticket={ticket}&after_sequence=0") as websocket:
-            while True:
-                try:
-                    event = websocket.receive_json()
-                except WebSocketDisconnect as exc:
-                    close_code = exc.code
-                    break
-                pipe.send(event)
-                sent_count += 1
-        assert broadcaster.subscribe_calls == []
-        assert broadcaster.unsubscribe_calls == []
-        pipe.send(("closed", close_code, sent_count))
-    finally:
-        engine.dispose()
-        pipe.close()
+    with child_executor_lifecycle():
+        from elspeth.web.execution.routes import create_execution_router
+
+        engine = create_session_engine(url)
+        broadcaster = FakeBroadcaster()
+        app = FastAPI()
+        app.state.run_progress_reader = RepositoryRunProgressReader(engine)
+        app.state.broadcaster = broadcaster
+        app.state.execution_service = _RouteStatusService(pipe)
+        app.state.session_service = SessionServiceImpl(
+            engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.pg-progress-route"),
+            owner_instance_id=f"progress-route-{uuid4()}",
+        )
+        app.state.identity_authority = RepositoryIdentityAuthority(
+            engine,
+            lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply,
+        )
+        app.state.settings = FakeSettings(auth_provider="vanguard")
+        app.state.websocket_ticket_store = WebSocketTicketStore()
+        app.include_router(create_execution_router())
+        ticket = app.state.websocket_ticket_store.issue(run_id=run_id, user=UserIdentity(user_id=identity_id, username=identity_id)).ticket
+        try:
+            sent_count = 0
+            with TestClient(app) as client, client.websocket_connect(f"/ws/runs/{run_id}?ticket={ticket}&after_sequence=0") as websocket:
+                while True:
+                    try:
+                        event = websocket.receive_json()
+                    except WebSocketDisconnect as exc:
+                        close_code = exc.code
+                        break
+                    pipe.send(event)
+                    sent_count += 1
+            assert broadcaster.subscribe_calls == []
+            assert broadcaster.unsubscribe_calls == []
+            pipe.send(("closed", close_code, sent_count))
+        finally:
+            engine.dispose()
+            pipe.close()
 
 
 @contextmanager

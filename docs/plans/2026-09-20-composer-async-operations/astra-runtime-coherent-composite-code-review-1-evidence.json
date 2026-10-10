@@ -1,0 +1,292 @@
+{
+  "all_coordinator_stores_covered": true,
+  "artifacts": {
+    "complete.patch": "80a6947028053267d0a57d7beec57368e7209a2123e0751199e5e9f6d60d2742",
+    "compose_source.py": "5e0d9e90785d18a9b799cf141deb5ec69e0077746c5a8190c2c2cd42f10cc559",
+    "manifest.json": "9460637da1dd757bf0e6e7ee4114138543187dd707ac9e0388f033159113b528",
+    "report.md": "7920a07239d92d1476a647f8efe4428c552858b22200cd81c2e14f4bc5209aec",
+    "source-controls.json": "4df69aaf20867ebd9311a0d38083410a30ce7fa3279ee95f031744249d11824b",
+    "validate_source.py": "cf0d952c7a5c97e5201542308eb08880899b995342f9133f6a7d031b369bf3bc"
+  },
+  "changed_byte_negatives": true,
+  "complete_patch_reconstructed": true,
+  "coordinator_slot_names": [
+    "_authority",
+    "_child_outcomes",
+    "_child_registrations",
+    "_invocations",
+    "_lock",
+    "_manual_proposal_carrier",
+    "_manual_proposal_close",
+    "_proposal_children",
+    "_release_prepared",
+    "_tickets",
+    "_unused_metadata",
+    "__weakref__"
+  ],
+  "files": {
+    "src/elspeth/web/app.py": {
+      "changed": false,
+      "lines": 2857,
+      "origin": "<private-workspace>/coherent-app-assembly-1/app.replacement.py",
+      "preimage_ast_sha256": "7069432bdf3162894aa0f14735b37065ae1d27befbd83a837e5cb1be3365e726",
+      "preimage_sha256": "145a21bf0ccdbda295f7f0da6be4b6af3b37e688da7e1542c63cc5d2bfbead29",
+      "replacement_ast_sha256": "7069432bdf3162894aa0f14735b37065ae1d27befbd83a837e5cb1be3365e726",
+      "replacement_sha256": "145a21bf0ccdbda295f7f0da6be4b6af3b37e688da7e1542c63cc5d2bfbead29"
+    },
+    "src/elspeth/web/application_finalizers.py": {
+      "changed": false,
+      "lines": 278,
+      "origin": "<private-workspace>/transport-cleanup-observation-implementation-1/execute-core-package-4/replacements/src/elspeth/web/application_finalizers.py",
+      "preimage_ast_sha256": "a8a5bb9c293792f92446f349901149fb634ee810560d085c3174060755bdd674",
+      "preimage_sha256": "6df51b4177b72e072862f407fc77eb53162790783b4724b844c9c73a84277ab0",
+      "replacement_ast_sha256": "a8a5bb9c293792f92446f349901149fb634ee810560d085c3174060755bdd674",
+      "replacement_sha256": "6df51b4177b72e072862f407fc77eb53162790783b4724b844c9c73a84277ab0"
+    },
+    "src/elspeth/web/async_workers.py": {
+      "changed": false,
+      "lines": 974,
+      "origin": "<private-workspace>/transport-cleanup-observation-implementation-1/combined-core4-observer5-v7-1/replacements/src/elspeth/web/async_workers.py",
+      "preimage_ast_sha256": "59a4039d17a7f4c0933fc2ce39c8bcf11a248f3a0fc124d97ad16305ca2241dc",
+      "preimage_sha256": "4ba4114d208517255750712a0036b5a082315de8951e8997c9d1aefa7bf8f517",
+      "replacement_ast_sha256": "59a4039d17a7f4c0933fc2ce39c8bcf11a248f3a0fc124d97ad16305ca2241dc",
+      "replacement_sha256": "4ba4114d208517255750712a0036b5a082315de8951e8997c9d1aefa7bf8f517"
+    },
+    "src/elspeth/web/composer/planning_application.py": {
+      "changed": false,
+      "lines": 940,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/composer/planning_application.py",
+      "preimage_ast_sha256": "0714ee7ad10c8b3d6c25fbbe711a533e1dc35812064625eb84dd247ded68e1e3",
+      "preimage_sha256": "83595117a064284017cd53ca7c763693bf687ea1758fb50711f51b8c66f0b762",
+      "replacement_ast_sha256": "0714ee7ad10c8b3d6c25fbbe711a533e1dc35812064625eb84dd247ded68e1e3",
+      "replacement_sha256": "83595117a064284017cd53ca7c763693bf687ea1758fb50711f51b8c66f0b762"
+    },
+    "src/elspeth/web/composer/provider_quota.py": {
+      "changed": true,
+      "lines": 536,
+      "origin": "<private-workspace>/contracts-reserve-proof/final-coherent-epoch-1/replacements/src/elspeth/web/composer/provider_quota.py",
+      "preimage_ast_sha256": "baeddc5d7d0fe074b59db0ea9e58dbc06b008db78ce19b354b61e728b3e3b45c",
+      "preimage_sha256": "4eec3d68b52640d668bf5209fe8543e468a22d4a32484caa9ff1dfbee7b6d0be",
+      "replacement_ast_sha256": "f05604e7a4d07ebc707bcdf37d2c1fbf07d7d41ba330e48d991d6ca7a45b7d3d",
+      "replacement_sha256": "bef5ca0ba886c999910ac201fd448d96f50a334443605df4f5153b4f7a1cd5b2"
+    },
+    "src/elspeth/web/composer_watch_reads.py": {
+      "changed": false,
+      "lines": 277,
+      "origin": "<private-workspace>/transport-cleanup-observation-implementation-1/observer-package-5/replacements/src/elspeth/web/composer_watch_reads.py",
+      "preimage_ast_sha256": "15dc85fa5c87c624f01418bd7182917bf518e8cf2c7c4311872a6433927ce3af",
+      "preimage_sha256": "9941dab9ddf5b72ab9f04cfc9ed24450e64a859137b4a952031c8ffb411ef16b",
+      "replacement_ast_sha256": "15dc85fa5c87c624f01418bd7182917bf518e8cf2c7c4311872a6433927ce3af",
+      "replacement_sha256": "9941dab9ddf5b72ab9f04cfc9ed24450e64a859137b4a952031c8ffb411ef16b"
+    },
+    "src/elspeth/web/coordination/lifecycle.py": {
+      "changed": false,
+      "lines": 1517,
+      "origin": "<private-workspace>/transport-cleanup-observation-implementation-1/combined-core4-observer5-v7-1/replacements/src/elspeth/web/coordination/lifecycle.py",
+      "preimage_ast_sha256": "97d57ed2951fdd2994ab6bdf219dc97bada1e49df3a1a54d90eba662f3b9c81a",
+      "preimage_sha256": "b20314c1ab30c2bf9bb858a7680753d2d65b490d9018484dfd5cbc2495f4d1a3",
+      "replacement_ast_sha256": "97d57ed2951fdd2994ab6bdf219dc97bada1e49df3a1a54d90eba662f3b9c81a",
+      "replacement_sha256": "b20314c1ab30c2bf9bb858a7680753d2d65b490d9018484dfd5cbc2495f4d1a3"
+    },
+    "src/elspeth/web/execution/service.py": {
+      "changed": false,
+      "lines": 5315,
+      "origin": "<private-workspace>/frontend-execute-known-failed-handoff-layer-1/service-replacement.py",
+      "preimage_ast_sha256": "0f17b1139395304aa019ea9ee856ea32b844c9839d25195c4e468a3910031795",
+      "preimage_sha256": "566a107c62e7cfe61fef4310bf76cf84c4cb9711d03f7e4b6d87fd3edcf44ca5",
+      "replacement_ast_sha256": "0f17b1139395304aa019ea9ee856ea32b844c9839d25195c4e468a3910031795",
+      "replacement_sha256": "566a107c62e7cfe61fef4310bf76cf84c4cb9711d03f7e4b6d87fd3edcf44ca5"
+    },
+    "src/elspeth/web/execution_lease_cleanup.py": {
+      "changed": false,
+      "lines": 839,
+      "origin": "<private-workspace>/transport-cleanup-observation-implementation-1/execute-core4-app-failed-exit-layer/replacements/src/elspeth/web/execution_lease_cleanup.py",
+      "preimage_ast_sha256": "6bced9569c5a49bd1b9166d3157a9924d4d5cba4b68057148a54ee29146802a6",
+      "preimage_sha256": "49cc0c0235dc9e0b30dbeef4ca9a7ef029cf01358514d6f28f19add72692e9f4",
+      "replacement_ast_sha256": "6bced9569c5a49bd1b9166d3157a9924d4d5cba4b68057148a54ee29146802a6",
+      "replacement_sha256": "49cc0c0235dc9e0b30dbeef4ca9a7ef029cf01358514d6f28f19add72692e9f4"
+    },
+    "src/elspeth/web/operator_telemetry.py": {
+      "changed": true,
+      "lines": 581,
+      "origin": "<private-workspace>/contracts-reserve-proof/worker-entry-revision-8/telemetry-integrity-patch/operator_telemetry.replacement.py",
+      "preimage_ast_sha256": "6dd9f706ad9945f6dc9c6d452915b32964bba60a25b928718ab47eed67389eec",
+      "preimage_sha256": "f34993dd02c0d71b050206d817a8f481fd8098d9853c13e7b435f942f603ea9f",
+      "replacement_ast_sha256": "a2da74380079e4e8933894850c2648b982f306b1edc82b01788fe588f820579d",
+      "replacement_sha256": "bd94719a6dc80883974675d79e87dbf119a8b19d47245095573029e224a0bb45"
+    },
+    "src/elspeth/web/operator_telemetry_custody.py": {
+      "changed": true,
+      "lines": 614,
+      "origin": "<private-workspace>/contracts-reserve-proof/final-coherent-epoch-1/replacements/src/elspeth/web/operator_telemetry_custody.py",
+      "preimage_ast_sha256": "b0f1f6f93638af91e200d56c67ae4e8c4d63844f722cf55f8690f58350fd5cb9",
+      "preimage_sha256": "c9fdd9b564598cb785a742eda37b6e006aeee63a3dff43c1c3bee149a30d14a2",
+      "replacement_ast_sha256": "92cfc3cdde7b232e7ab98cd578d025354f1359a143344d5a8b856a97043ba1a6",
+      "replacement_sha256": "804c2c9122b2657e5157a4ffa8a292f0dc2bf8ab0affaf22bccc38efb0f17fd1"
+    },
+    "src/elspeth/web/operator_telemetry_dispatch.py": {
+      "changed": true,
+      "lines": 80,
+      "origin": "<private-workspace>/contracts-reserve-proof/fixed-storage-revision-9/telemetry-storage-patch/operator_telemetry_dispatch.py",
+      "preimage_ast_sha256": null,
+      "preimage_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "replacement_ast_sha256": "f05c2041550da40370c27bdccc6d406b2609b1eb4e52da25b689cde0de086fd5",
+      "replacement_sha256": "3d77f1b4c36e8505be3efd9b6dd85172fab3c2eaf3933ce236c9a9e9d4638035"
+    },
+    "src/elspeth/web/operator_telemetry_installation.py": {
+      "changed": true,
+      "lines": 183,
+      "origin": "<private-workspace>/contracts-reserve-proof/final-coherent-epoch-1/replacements/src/elspeth/web/operator_telemetry_installation.py",
+      "preimage_ast_sha256": "8ab8c4396394c12185a6f327d760dd41b52b95802c7e91a849c20f2aadc023d7",
+      "preimage_sha256": "bac63dfb0a29f419282e8a065da46a4bdab8d110e2526a81807c8d876df5943c",
+      "replacement_ast_sha256": "a8b21cd689b68909ce9b349a2356ea1f712209d5d20a7249a0834feadd327625",
+      "replacement_sha256": "82d90eaed114b614fb1ef7f3d3b328a612ec025ddfa8738cb2bca08cc9f837a1"
+    },
+    "src/elspeth/web/required_work.py": {
+      "changed": true,
+      "lines": 1474,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/required_work.py",
+      "preimage_ast_sha256": "0dc49b24dcbe47e9dd570869d4dd6dfaa79340ca663aaea41399212f23531d59",
+      "preimage_sha256": "cd1bd11b47cd1b7c01d6a1e1b428d8190c2e08d27496730131d56600a1ea3b2a",
+      "replacement_ast_sha256": "6dc176999fa5f6a8688ebfda0679bcf81e0640d91ed6ddfb97ed289423953dc2",
+      "replacement_sha256": "4cf916455dac2577c3a2c886dd7dc26c9fef8a2065eaa15200fd5968967976dc"
+    },
+    "src/elspeth/web/sessions/composer_async_worker.py": {
+      "changed": true,
+      "lines": 1176,
+      "origin": "<private-workspace>/transport-cleanup-observation-implementation-1/observer-package-5/replacements/src/elspeth/web/sessions/composer_async_worker.py",
+      "preimage_ast_sha256": "4f2a8a6865fd323192ffa6020e12798ea110db50fb4aec1afc93f71a83d181ca",
+      "preimage_sha256": "7800ae53df28e18a718b38d3444a3192cb79faf4030fe9404937c2d2c309ad0e",
+      "replacement_ast_sha256": "257b1e49b2430e7413553e84c229c0a9e0af777b2000031cea3b55b94fd3dc7c",
+      "replacement_sha256": "d6a9323ef2e455d86e848cb28073ef3a7d4c7533dee0d94028985486dfaa259b"
+    },
+    "src/elspeth/web/sessions/composer_turn.py": {
+      "changed": true,
+      "lines": 1607,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/sessions/composer_turn.py",
+      "preimage_ast_sha256": "20321c7cc714f757c3c79552f5d42b6d65ecd31f33631f06eba1b9b292effcab",
+      "preimage_sha256": "50db5c921b371f06cbf2560ec62f81dd8f0b6fdf44dbea8b624db838f1eb15d0",
+      "replacement_ast_sha256": "8effc82717e2b78151df8ee7ac11a37884ad465b1e6197ab0c6bc3064f88cbd1",
+      "replacement_sha256": "52b167d070ae13ed6ccc83ef2a92c7fff8bad23eed5dfbb29db07da43b3a72b5"
+    },
+    "src/elspeth/web/sessions/manual_proposal_failure.py": {
+      "changed": false,
+      "lines": 350,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/sessions/manual_proposal_failure.py",
+      "preimage_ast_sha256": "77a8699599b8de54e75748a36680622a6009fe31e176ef1c37100c93df5138a6",
+      "preimage_sha256": "01ce0dc5cb6cfab61586d7e0581f360fe11a742cbaf7bc820266e63c80071678",
+      "replacement_ast_sha256": "77a8699599b8de54e75748a36680622a6009fe31e176ef1c37100c93df5138a6",
+      "replacement_sha256": "01ce0dc5cb6cfab61586d7e0581f360fe11a742cbaf7bc820266e63c80071678"
+    },
+    "src/elspeth/web/sessions/pipeline_rejection.py": {
+      "changed": false,
+      "lines": 43,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/sessions/pipeline_rejection.py",
+      "preimage_ast_sha256": "7d6e007553ec26d84f58570ab706da03bb8acf8e17e6749ef8850403013ab751",
+      "preimage_sha256": "b34a1c868d395ec7713dd5f7a7e67bcb9d7132d9ef701e8cc9d4e852098676a3",
+      "replacement_ast_sha256": "7d6e007553ec26d84f58570ab706da03bb8acf8e17e6749ef8850403013ab751",
+      "replacement_sha256": "b34a1c868d395ec7713dd5f7a7e67bcb9d7132d9ef701e8cc9d4e852098676a3"
+    },
+    "src/elspeth/web/sessions/pipeline_rejection_custody.py": {
+      "changed": false,
+      "lines": 238,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/sessions/pipeline_rejection_custody.py",
+      "preimage_ast_sha256": "0dec8765f72b8d5caafa61bc41b9651a9d3b87e977e354aed08b4879c0abbe7c",
+      "preimage_sha256": "f8d9ce083fbb1c43c36271013c8c941fec2476d0c6c8d37f32ca2405e23bacf8",
+      "replacement_ast_sha256": "0dec8765f72b8d5caafa61bc41b9651a9d3b87e977e354aed08b4879c0abbe7c",
+      "replacement_sha256": "f8d9ce083fbb1c43c36271013c8c941fec2476d0c6c8d37f32ca2405e23bacf8"
+    },
+    "src/elspeth/web/sessions/pipeline_rejection_finish_once.py": {
+      "changed": false,
+      "lines": 128,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/sessions/pipeline_rejection_finish_once.py",
+      "preimage_ast_sha256": "c9629caac9b59e43a6804dfbe4437c9ccc085f8a4e0d239124983791ab0fe5e1",
+      "preimage_sha256": "590c0be357cfb2926acbf60db0826789e05dc0b7db13a95bd8d1e1e6ffc05c5c",
+      "replacement_ast_sha256": "c9629caac9b59e43a6804dfbe4437c9ccc085f8a4e0d239124983791ab0fe5e1",
+      "replacement_sha256": "590c0be357cfb2926acbf60db0826789e05dc0b7db13a95bd8d1e1e6ffc05c5c"
+    },
+    "src/elspeth/web/sessions/protocol.py": {
+      "changed": false,
+      "lines": 3495,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/sessions/protocol.py",
+      "preimage_ast_sha256": "d00714ed455669724d61c84de50a225b5f8c2823e2d64b80ffd11ced17f861c7",
+      "preimage_sha256": "897c4201badf2113cb0985937d48cbc7f9b0ee6f5d505dc4917fefe60050098e",
+      "replacement_ast_sha256": "d00714ed455669724d61c84de50a225b5f8c2823e2d64b80ffd11ced17f861c7",
+      "replacement_sha256": "897c4201badf2113cb0985937d48cbc7f9b0ee6f5d505dc4917fefe60050098e"
+    },
+    "src/elspeth/web/sessions/routes/_helpers.py": {
+      "changed": true,
+      "lines": 4069,
+      "origin": "<private-workspace>/contracts-reserve-proof/worker-entry-revision-8/helper-nominal-entry-guards/helpers.replacement.py",
+      "preimage_ast_sha256": "353f7a1d45cd2d3609b47e981919c9455701c2c41249089d93b701aac13c21c3",
+      "preimage_sha256": "84ce8034585c414453047b43e72a0c54d34a120de83450b15dcc5b133f3c7189",
+      "replacement_ast_sha256": "2990d8308a212383e9b111c2b27ebcaffbc26988f182b7349adb06cf3ba62d83",
+      "replacement_sha256": "d085d9791bde25511796a00ece58482107801980a200d6c3c6728040d544508d"
+    },
+    "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py": {
+      "changed": false,
+      "lines": 787,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/sessions/routes/composer/pipeline_settlement.py",
+      "preimage_ast_sha256": "978d7a756825ec2fa4f07318e9ea53875a9ca5bf3ad6a960ff62ae81aaf3d7f5",
+      "preimage_sha256": "e5a82fc1c363337b2ac12889010f79082ab395cb0807dd9f00bb5846467961ec",
+      "replacement_ast_sha256": "978d7a756825ec2fa4f07318e9ea53875a9ca5bf3ad6a960ff62ae81aaf3d7f5",
+      "replacement_sha256": "e5a82fc1c363337b2ac12889010f79082ab395cb0807dd9f00bb5846467961ec"
+    },
+    "src/elspeth/web/sessions/routes/composer/proposals.py": {
+      "changed": false,
+      "lines": 827,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/sessions/routes/composer/proposals.py",
+      "preimage_ast_sha256": "900e889a4e876331e3222e6876b39ab31876577339441b848e285c0cac50ae73",
+      "preimage_sha256": "4ca2af8af07e685f58b402b3c7ff681e368992bd028f43ae5be099dfe491f027",
+      "replacement_ast_sha256": "900e889a4e876331e3222e6876b39ab31876577339441b848e285c0cac50ae73",
+      "replacement_sha256": "4ca2af8af07e685f58b402b3c7ff681e368992bd028f43ae5be099dfe491f027"
+    },
+    "src/elspeth/web/sessions/service.py": {
+      "changed": false,
+      "lines": 8921,
+      "origin": "<private-workspace>/proposal-rejection-implementation-7/replacements/src/elspeth/web/sessions/service.py",
+      "preimage_ast_sha256": "2acc4cdb3530f0ef8aba415ab964a8f54a4288ccf3e777b32824956d271cb03c",
+      "preimage_sha256": "3eb30b312800558408a54ad02894839cad18a8774b1ea080ab775b7f0afdd257",
+      "replacement_ast_sha256": "2acc4cdb3530f0ef8aba415ab964a8f54a4288ccf3e777b32824956d271cb03c",
+      "replacement_sha256": "3eb30b312800558408a54ad02894839cad18a8774b1ea080ab775b7f0afdd257"
+    }
+  },
+  "full_file_expected_ast_parity": true,
+  "omitted_consumer_dependencies": {
+    "src/elspeth/web/execution/recovery.py": {
+      "live_call_line": 238,
+      "live_missing_obligation": true,
+      "live_sha256": "eb8a8df8b80e6ae610ba31d53abecfda79bfe756974a5d268183d8097cae8c7a",
+      "not_selected": true,
+      "reviewed_call_line": 247,
+      "reviewed_positive_forwards_obligation": true,
+      "reviewed_sha256": "33a837822149e283d4da30b02b85c128c3391638e374be7fc8deba57e0186415"
+    },
+    "src/elspeth/web/execution/routes.py": {
+      "live_call_line": 1034,
+      "live_missing_obligation": true,
+      "live_sha256": "82108abdde9ef9cf528cee70fc5123cd548a19fe5ec58d402124fc93d6b517e1",
+      "not_selected": true,
+      "reviewed_call_line": 1011,
+      "reviewed_positive_forwards_obligation": true,
+      "reviewed_sha256": "2f91459ea1c65782810c894a3628b798aab22afb2b49fba79b60833683f7463d"
+    }
+  },
+  "reviewed_supplier_parity": {
+    "src/elspeth/web/composer/provider_quota.py": "<private-workspace>/contracts-reserve-proof/fixed-storage-revision-9/owned-storage-patch/provider_quota.replacement.py",
+    "src/elspeth/web/operator_telemetry_custody.py": "<private-workspace>/contracts-reserve-proof/fixed-storage-revision-9/telemetry-storage-patch/src__elspeth__web__operator_telemetry_custody.py.replacement.py",
+    "src/elspeth/web/operator_telemetry_dispatch.py": "<private-workspace>/contracts-reserve-proof/fixed-storage-revision-9/telemetry-storage-patch/operator_telemetry_dispatch.py",
+    "src/elspeth/web/operator_telemetry_installation.py": "<private-workspace>/contracts-reserve-proof/fixed-storage-revision-9/native-lock-followon/src__elspeth__web__operator_telemetry_installation.py.replacement.py"
+  },
+  "runtime_executed": false,
+  "scope": "source-only composition review; no candidate execution; coherent application NO-GO for omitted dependencies",
+  "semantic_ast_negatives": {
+    "changed_ordinal_supplier": true,
+    "helper_guard_body_pass": true,
+    "omitted_manual_slot": true,
+    "omitted_retained_forward": true,
+    "unrelated_module_statement": true,
+    "worker_guard_body_pass": true
+  },
+  "source_import_inventory_matches": true
+}

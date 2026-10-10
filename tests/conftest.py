@@ -635,3 +635,69 @@ def _restore_runtime_val_registries_after_each_test() -> None:
 
     if leaked:
         pytest.fail(f"Runtime-VAL registry state leaked from test: {', '.join(leaked)}")
+
+
+@pytest.fixture(autouse=True)
+def explicit_required_executor_recovery(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Every standalone harness names a safe recovery owner before submission."""
+    import threading
+
+    from elspeth.web import async_workers
+    from tests.fixtures.required_executor import RecordingRequiredGenerationRecovery, assert_owned_executor_fixture_settled
+
+    assert_owned_executor_fixture_settled(async_workers._GENERATION_CUSTODIAN)
+    monkeypatch.setattr(async_workers, "_APPLICATION_FINALIZER_OWNER", None)
+    monkeypatch.setattr(async_workers, "_SHARED_SHUTDOWN_STARTED", False)
+    monkeypatch.setattr(async_workers, "_GENERATION_CUSTODIAN", None)
+    monkeypatch.setattr(async_workers, "_RECOVERY_CALLBACK", RecordingRequiredGenerationRecovery())
+    monkeypatch.setattr(async_workers, "_GENERATION_UNAVAILABLE", threading.Event())
+    monkeypatch.setattr(async_workers, "_INSTANCE_DRAINING", threading.Event())
+    monkeypatch.setattr(async_workers, "_CAPTURED_DRAIN_SECONDS", 10.0)
+    yield
+    assert_owned_executor_fixture_settled(async_workers._GENERATION_CUSTODIAN)
+
+
+@pytest.fixture(autouse=True)
+def explicit_owned_process_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace only the factory dependency before any ordinary test app boots."""
+    import elspeth.web.app as web_app
+    from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
+
+    monkeypatch.setattr(web_app, "create_process_watchdog", OwnedTestProcessWatchdog)
+    monkeypatch.setattr(web_app, "_FAILED_BOOTSTRAP_RECOVERY", None)
+
+
+@pytest.fixture(autouse=True)
+def explicit_owned_test_telemetry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Every ordinary app owns an isolated SDK provider with no exporter I/O."""
+    from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult, MetricsData
+
+    from elspeth.web import operator_telemetry
+    from elspeth.web.operator_telemetry_custody import OperatorTelemetryCleanupOwner
+    from elspeth.web.operator_telemetry_installation import OwnedTestTelemetryInstallation
+
+    class OfflineExporter(MetricExporter):
+        def export(self, metrics_data: MetricsData, timeout_millis: float = 10_000, **kwargs: object) -> MetricExportResult:
+            return MetricExportResult.SUCCESS
+
+        def force_flush(self, timeout_millis: float = 10_000) -> bool:
+            return True
+
+        def shutdown(self, timeout_millis: float = 30_000, **kwargs: object) -> None:
+            return None
+
+    owners: list[OperatorTelemetryCleanupOwner] = []
+
+    def create_owner(cls: type[OperatorTelemetryCleanupOwner]) -> OperatorTelemetryCleanupOwner:
+        owner = cls(installation=OwnedTestTelemetryInstallation())
+        owners.append(owner)
+        return owner
+
+    def factories() -> operator_telemetry.OwnedTestOperatorTelemetryFactories:
+        return operator_telemetry.OwnedTestOperatorTelemetryFactories(exporter_factory=lambda **kwargs: OfflineExporter())
+
+    monkeypatch.setattr(OperatorTelemetryCleanupOwner, "create_for_application", classmethod(create_owner))
+    monkeypatch.setattr(operator_telemetry, "_production_factories", factories)
+    yield
+    for owner in owners:
+        owner.shutdown_sync()

@@ -86,7 +86,13 @@ from elspeth.plugins.infrastructure.runtime_factory import (
     validate_sink_effect_eligibility_from_raw_config,
 )
 from elspeth.plugins.sources.blob_rows import BlobRowsEntry
-from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.application_finalizers import ApplicationFinalizerCapability, ApplicationFinalizerKind
+from elspeth.web.async_workers import (
+    _raise_lifecycle_originals,
+    _retain_cancellation,
+    run_application_finalizer_in_worker,
+    run_sync_in_worker,
+)
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import (
     AllowedMimeType,
@@ -181,6 +187,7 @@ from elspeth.web.execution.secret_guard import (
     annotate_pipeline_yaml_with_secret_guard,
     evaluate_execution_secret_guard,
 )
+from elspeth.web.execution_lease_cleanup import ExecutionAcquisitionObligation, ExecutionLeaseReleaseRegistry
 from elspeth.web.interpretation_state import InterpretationReviewPending, materialize_state_for_execution
 from elspeth.web.landscape_access import open_landscape_db
 from elspeth.web.plugin_policy.coverage import node_has_capability
@@ -536,11 +543,43 @@ def _discover_blob_rows_sources(config: Mapping[str, Any]) -> list[tuple[str, An
     return found
 
 
-class _LeaseCompletionFuture(Future[None]):
-    """Join handle whose lease cleanup cannot be cancelled by observers."""
-
-    def cancel(self) -> bool:
-        return False
+async def close_execute_lease_before_transfer(
+    lease: SessionOperationLease,
+    *,
+    primary: BaseException | None = None,
+) -> None:
+    """Join actual EXECUTE close, retaining every caller cancel and close fault."""
+    obligation = lease.execution_obligation
+    if type(obligation) is not ExecutionAcquisitionObligation or obligation.lease is not lease:
+        raise AuditIntegrityError("EXECUTE close lost actual acquisition ownership")
+    cancellations: list[asyncio.CancelledError] = []
+    if isinstance(primary, asyncio.CancelledError):
+        _retain_cancellation(cancellations, primary)
+    failures: list[BaseException] = []
+    try:
+        task = asyncio.create_task(lease.close(), name="execution-pretransfer-lease-close")
+    except BaseException as original:
+        obligation.registry.record_failure(original)
+        failures.append(original)
+    else:
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError as original:
+                _retain_cancellation(cancellations, original)
+        try:
+            task.result()
+        except BaseException as original:
+            obligation.registry.record_failure(original)
+            failures.append(original)
+        else:
+            if cancellations:
+                lease._retain_execution_loss_originals(failures)
+                for retained_failure in failures:
+                    obligation.registry.record_failure(retained_failure)
+    if (failures or cancellations) and primary is not None and not isinstance(primary, asyncio.CancelledError):
+        failures.insert(0, primary)
+    _raise_lifecycle_originals(cancellations, failures)
 
 
 def _sanitize_error_for_client(exc: BaseException) -> str:
@@ -976,6 +1015,14 @@ def _load_most_recent_failed_node_id(landscape_db: LandscapeDB, *, run_id: str) 
 _TRAINED_OPERATOR_COMPOSITION_ROOT = object()
 
 
+@dataclass(eq=False, slots=True)
+class _ExecutionLossWatcherOwner:
+    lease: SessionOperationLease
+    close_requested: asyncio.Event
+    task: asyncio.Task[None] | None = None
+    outcome: tuple[asyncio.Task[None], BaseException | None] | None = None
+
+
 class ExecutionServiceImpl:
     """Pipeline execution service with ThreadPoolExecutor backend.
 
@@ -1003,6 +1050,7 @@ class ExecutionServiceImpl:
         session_service: SessionServiceProtocol,
         yaml_generator: YamlGenerator,
         telemetry: _SessionsTelemetry,
+        execution_lease_release_registry: ExecutionLeaseReleaseRegistry,
         blob_service: BlobServiceProtocol | None = None,
         secret_service: WebSecretResolver | None = None,
         plugin_snapshot_factory: Callable[[str], PluginAvailabilitySnapshot] | None,
@@ -1012,6 +1060,9 @@ class ExecutionServiceImpl:
         principal_is_active: Callable[[str], bool] | None = None,
         _composition_root: object | None = None,
     ) -> None:
+        if type(execution_lease_release_registry) is not ExecutionLeaseReleaseRegistry:
+            raise AuditIntegrityError("Execution service lacks exact application cleanup registry")
+        self.execution_lease_release_registry = execution_lease_release_registry
         trained_operator_mode = _composition_root is _TRAINED_OPERATOR_COMPOSITION_ROOT
         if plugin_snapshot_factory is None:
             raise TypeError("plugin_snapshot_factory must be provided")
@@ -1040,7 +1091,17 @@ class ExecutionServiceImpl:
         # via create_run(), update_run_status(), get_active_run(), get_run().
         # R6 expanded params: landscape_run_id, pipeline_yaml, rows_processed,
         # rows_failed.
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._executor: ThreadPoolExecutor | None = None
+        self._executor_join_task: asyncio.Task[None] | None = None
+        self._registry_join_task: asyncio.Task[None] | None = None
+        self._shutdown_join_declared = False
+        self._executor_join_outcome: tuple[asyncio.Task[None], BaseException | None] | None = None
+        self._registry_join_outcome: tuple[asyncio.Task[None], BaseException | None] | None = None
+        self._pipeline_completion_owners: dict[Future[_RunPipelineOutcome], ExecutionAcquisitionObligation] = {}
+        self._pipeline_completion_started: set[Future[_RunPipelineOutcome]] = set()
+        self._pipeline_watchers: dict[ExecutionAcquisitionObligation, asyncio.Task[None]] = {}
+        self._loss_watcher_owners: list[_ExecutionLossWatcherOwner] = []
+        self._failed_submission_cleanup_started: set[ExecutionAcquisitionObligation] = set()
         self._shutdown_events: dict[str, threading.Event] = {}
         self._shutdown_events_lock = threading.Lock()
         self._lease_completion_futures: set[Future[None]] = set()
@@ -1058,6 +1119,19 @@ class ExecutionServiceImpl:
         # dropping the audit field.
         self._openrouter_catalog_sha256: str | None = None
         self._openrouter_catalog_source: Literal["live", "bundled"] | None = None
+        # The application retains this exact bound owner even if construction
+        # fails after allocation and the service never reaches app.state.
+        self._shutdown_finalizer = execution_lease_release_registry.owner.register(
+            ApplicationFinalizerKind.EXECUTION_EXECUTOR_JOIN, self.join_executor_shutdown
+        )
+        execution_lease_release_registry.bind_executor_finalizer(self._shutdown_finalizer)
+        execution_lease_release_registry.declare_executor_allocation(self._shutdown_finalizer)
+        try:
+            self._executor = ThreadPoolExecutor(max_workers=1)
+            execution_lease_release_registry.bind_execution_executor(self._shutdown_finalizer, self._executor)
+        except BaseException as original:
+            execution_lease_release_registry.record_failure(original)
+            raise
 
     @classmethod
     def for_trained_operator(cls, **kwargs: Any) -> ExecutionServiceImpl:
@@ -1556,40 +1630,385 @@ class ExecutionServiceImpl:
         """Return the per-session lock shared by execute() and deletion."""
         return self._session_locks.setdefault(session_id, asyncio.Lock())
 
+    @property
+    def shutdown_finalizer(self) -> ApplicationFinalizerCapability:
+        return self._shutdown_finalizer
+
+    @property
+    def executor_join_task(self) -> asyncio.Task[None] | None:
+        return self._executor_join_task
+
+    def join_executor_shutdown(self) -> None:
+        executor = self._executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+        self.execution_lease_release_registry.record_executor_join_return(self._shutdown_finalizer, executor)
+
+    async def _join_executor_owner(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise AuditIntegrityError("Execution executor join lacks actual Task")
+        if self._executor_join_task is not None and self._executor_join_task is not task:
+            raise AuditIntegrityError("Execution executor join replaced its actual owner")
+        self._executor_join_task = task
+        try:
+            await self._finish_executor_join()
+        except BaseException as original:
+            self._executor_join_outcome = (task, original)
+            raise
+        else:
+            self._executor_join_outcome = (task, None)
+
+    async def _finish_executor_join(self) -> None:
+        registry = self.execution_lease_release_registry
+        failures: list[BaseException] = []
+        try:
+            await run_application_finalizer_in_worker(self._shutdown_finalizer)
+        except BaseException as original:
+            failures.append(original)
+        # The bridge can retain a caller cancellation after actual physical success.
+        # Only the exact source/bridge receipt can authorize cleanup, never the
+        # exception class or whether the await happened to return normally.
+        joined_failures = registry.joined_pipeline_submission_failures() if registry.executor_join_physically_observed else ()
+        for obligation in joined_failures:
+            if obligation in self._failed_submission_cleanup_started:
+                continue
+            # This branch is issued only for the literal submit-no-return catch,
+            # after the exact private executor's actual joined receipt. Callback
+            # allocation Unknown cannot use it and no pipeline Future is invented.
+            try:
+                obligation.declare_unknown_pipeline_cleanup()
+                self._failed_submission_cleanup_started.add(obligation)
+                lease = obligation.lease
+                if lease is None:
+                    raise AuditIntegrityError("Joined submission failure lost exact acquired lease")
+                watcher = self._pipeline_watchers[obligation]
+                cleanup = asyncio.create_task(
+                    self._finish_execution_authority(obligation, lease, watcher, None),
+                    name=f"execution-joined-submit-failure-{obligation.session_id}",
+                )
+                obligation.bind_completion_task(cleanup)
+            except BaseException as original:
+                registry.record_failure(original)
+                failures.append(original)
+        _raise_lifecycle_originals([], failures)
+
+    async def _join_registry_owner(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise AuditIntegrityError("Execution registry join lacks actual Task")
+        if self._registry_join_task is not None and self._registry_join_task is not task:
+            raise AuditIntegrityError("Execution registry join replaced its actual owner")
+        self._registry_join_task = task
+        try:
+            await self.execution_lease_release_registry.join_all()
+        except BaseException as original:
+            self._registry_join_outcome = (task, original)
+            raise
+        else:
+            self._registry_join_outcome = (task, None)
+
     async def shutdown(self) -> None:
-        """Shut down the thread pool without blocking the event loop.
-
-        Sets all active shutdown events first so running pipelines can
-        terminate gracefully, then drains the executor in a helper thread.
-        Worker shutdown paths still use _call_async() to persist terminal
-        state on the main event loop, so blocking the loop here can strand
-        those final updates.
-
-        Join every lease cleanup before surfacing failures, including failures
-        that completed before shutdown began. The lifespan caller propagates
-        the group after its own resource cleanup.
-        """
+        """Join independent physical owners before projecting any original fault."""
+        registry = self.execution_lease_release_registry
+        registry.seal()
         with self._shutdown_events_lock:
-            events = list(self._shutdown_events.values())
+            events = tuple(self._shutdown_events.values())
         for event in events:
             event.set()
-
-        def _shutdown_executor() -> None:
-            self._executor.shutdown(wait=True)
-
-        await run_sync_in_worker(_shutdown_executor)
+        for watcher_owner in self._loss_watcher_owners:
+            watcher_owner.close_requested.set()
+        failures: list[BaseException] = []
+        cancellations: list[asyncio.CancelledError] = []
+        if not self._shutdown_join_declared:
+            self._shutdown_join_declared = True
+            # An allocation-after-side-effect fault must not cause another invoke.
+            # Each coroutine binds its actual Task on entry even if create_task
+            # failed to return it. An absent owner remains Unknown under supervision.
+            try:
+                task = asyncio.create_task(self._join_executor_owner(), name="execution-executor-join")
+                self._executor_join_task = task
+            except BaseException as original:
+                registry.record_failure(original)
+                failures.append(original)
+            try:
+                task = asyncio.create_task(self._join_registry_owner(), name="execution-registry-join")
+                self._registry_join_task = task
+            except BaseException as original:
+                registry.record_failure(original)
+                failures.append(original)
+        observed: set[asyncio.Task[None]] = set()
+        observation_failures: dict[asyncio.Task[None], BaseException] = {}
         while True:
-            with self._shutdown_events_lock:
-                completion_futures = tuple(self._lease_completion_futures)
-            if not completion_futures:
+            registry.observe_ready()
+            for watcher_owner in self._loss_watcher_owners:
+                watcher_task, watcher_outcome = watcher_owner.task, watcher_owner.outcome
+                if watcher_task is not None and watcher_task.done() and watcher_outcome is not None and watcher_task not in observed:
+                    if watcher_outcome[0] is not watcher_task:
+                        if watcher_task not in observation_failures:
+                            integrity_error = AuditIntegrityError("Execution loss watcher replaced its actual outcome owner")
+                            observation_failures[watcher_task] = integrity_error
+                            registry.record_failure(integrity_error)
+                            failures.append(integrity_error)
+                        continue
+                    observed.add(watcher_task)
+                    try:
+                        watcher_task.result()
+                    except BaseException as projected:
+                        if watcher_outcome[1] is None:
+                            registry.record_failure(projected)
+                            failures.append(projected)
+                    if watcher_outcome[1] is not None:
+                        registry.record_failure(watcher_outcome[1])
+                        failures.append(watcher_outcome[1])
+                elif watcher_task is not None and watcher_task.done() and watcher_outcome is None:
+                    if watcher_task not in observation_failures:
+                        integrity_error = AuditIntegrityError("Execution loss watcher lacks actual producer outcome")
+                        observation_failures[watcher_task] = integrity_error
+                        registry.record_failure(integrity_error)
+                        failures.append(integrity_error)
+            executor_task, registry_task = self._executor_join_task, self._registry_join_task
+            for owned_task in (executor_task, registry_task):
+                if owned_task is not None and owned_task.done() and owned_task not in observed:
+                    outcome = self._executor_join_outcome if owned_task is executor_task else self._registry_join_outcome
+                    if outcome is None:
+                        # Cancellation before actual coroutine entry has no producer
+                        # receipt. Task.done alone cannot retire this join owner.
+                        if owned_task not in observation_failures:
+                            integrity_error = AuditIntegrityError("Execution join lacks actual producer outcome")
+                            observation_failures[owned_task] = integrity_error
+                            registry.record_failure(integrity_error)
+                            failures.append(integrity_error)
+                        continue
+                    if outcome[0] is not owned_task:
+                        if owned_task not in observation_failures:
+                            integrity_error = AuditIntegrityError("Execution join outcome replaced its actual Task")
+                            observation_failures[owned_task] = integrity_error
+                            registry.record_failure(integrity_error)
+                            failures.append(integrity_error)
+                        continue
+                    observed.add(owned_task)
+                    try:
+                        owned_task.result()
+                    except BaseException as projected:
+                        # Consume the Task projection, but use the exact original
+                        # captured by its producer before Task cancellation settled.
+                        if outcome[1] is None:
+                            registry.record_failure(projected)
+                            failures.append(projected)
+                    source_original = outcome[1]
+                    if source_original is not None:
+                        registry.record_failure(source_original)
+                        failures.append(source_original)
+            if (
+                executor_task is not None
+                and registry_task is not None
+                and executor_task in observed
+                and registry_task in observed
+                and all(owner.task is not None and owner.task in observed for owner in self._loss_watcher_owners)
+            ):
                 break
-            outcomes = await asyncio.gather(
-                *(asyncio.wrap_future(completion) for completion in completion_futures),
-                return_exceptions=True,
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError as original:
+                _retain_cancellation(cancellations, original)
+        _raise_lifecycle_originals(cancellations, failures)
+        registry.assert_completed()
+        if not registry.executor_join_succeeded:
+            raise AuditIntegrityError("Execution executor lacks joined physical finalizer receipt")
+
+    def _execution_obligation(self, lease: SessionOperationLease) -> ExecutionAcquisitionObligation:
+        if type(lease) is not SessionOperationLease:
+            raise AuditIntegrityError("Execution dispatch lacks actual lease")
+        obligation = lease.execution_obligation
+        if type(obligation) is not ExecutionAcquisitionObligation or obligation.registry is not self.execution_lease_release_registry:
+            raise AuditIntegrityError("Execution dispatch lost pre-admitted application ownership")
+        if obligation.lease is not lease:
+            raise AuditIntegrityError("Execution dispatch replaced its exact acquired lease")
+        obligation.assert_business_dispatch(lease.context)
+        return obligation
+
+    def _execution_retirement_ready(self, obligation: ExecutionAcquisitionObligation) -> bool:
+        """Require consumed physical receipts, never a done wrapper alone."""
+        if type(obligation) is not ExecutionAcquisitionObligation or obligation.registry is not self.execution_lease_release_registry:
+            raise AuditIntegrityError("Execution retirement lost exact application obligation")
+        pipeline, completion, wrapper, release, lease = (
+            obligation.pipeline,
+            obligation.completion_task,
+            obligation.completion,
+            obligation.release_submission,
+            obligation.lease,
+        )
+        if (
+            pipeline is None
+            or not pipeline.done()
+            or wrapper is None
+            or not wrapper.done()
+            or completion is None
+            or not completion.done()
+            or not obligation.completion_outcome_recorded
+            or obligation.completion_original_error is not None
+            or not obligation.completion_observed
+            or not obligation.lifecycle_required
+            or not obligation.lifecycle_observed
+            or not obligation.lifecycle_outcome_recorded
+            or obligation.lifecycle_original_error is not None
+            or obligation.lifecycle_task is None
+            or not obligation.lifecycle_task.done()
+            or release is None
+            or not release.observed
+            or (release.original_error is not None and not obligation.release_lost)
+            or release.future is None
+            or not release.future.done()
+            or not obligation.release_settled
+            or lease is None
+            or not lease.closed
+            or obligation.pipeline_submission_unknown is not None
+            or obligation.construction_error is not None
+            or obligation.observation_failures
+        ):
+            return False
+        if not wrapper.cancelled() and wrapper.exception() is not None:
+            return False
+        # This nominal public method validates the exact registration/submission
+        # and its canonical retirement witness before returning False. Core2's
+        # observation also requires the actual callback-return release receipt.
+        return not obligation.registry.owns_submission(release)
+
+    def _retire_settled_execution(self, obligation: ExecutionAcquisitionObligation) -> None:
+        if not self._execution_retirement_ready(obligation):
+            return
+        pipeline, lease = obligation.pipeline, obligation.lease
+        if pipeline is None or lease is None:
+            raise AuditIntegrityError("Execution retirement lost its actual pipeline or lease")
+        with self._shutdown_events_lock:
+            retained = self._pipeline_completion_owners.get(pipeline)
+            if retained is None and obligation not in self._pipeline_watchers:
+                # A second actual done callback can follow the first retirement.
+                return
+            if retained is not obligation:
+                raise AuditIntegrityError("Execution retirement replaced its actual pipeline owner")
+            watcher = self._pipeline_watchers[obligation]
+            owner = self._loss_watcher_owner(watcher, lease)
+            if not watcher.done() or owner.outcome is None or owner.outcome[0] is not watcher or owner.outcome[1] is not None:
+                return
+            del self._pipeline_completion_owners[pipeline]
+            self._pipeline_completion_started.discard(pipeline)
+            del self._pipeline_watchers[obligation]
+            self._failed_submission_cleanup_started.discard(obligation)
+            self._loss_watcher_owners.remove(owner)
+            if obligation.completion is not None:
+                self._lease_completion_futures.discard(obligation.completion)
+
+    def _observe_execution_completion(
+        self,
+        obligation: ExecutionAcquisitionObligation,
+        task: asyncio.Task[None] | None = None,
+    ) -> None:
+        try:
+            if task is not None and task is not obligation.completion_task:
+                raise AuditIntegrityError("Execution retirement observer replaced actual completion Task")
+            obligation.registry.observe_ready()
+            self._retire_settled_execution(obligation)
+        except BaseException as original:
+            obligation.registry.record_failure(original)
+
+    def _loss_watcher_owner(self, task: asyncio.Task[None], lease: SessionOperationLease) -> _ExecutionLossWatcherOwner:
+        for owner in self._loss_watcher_owners:
+            if owner.task is task and owner.lease is lease:
+                return owner
+        raise AuditIntegrityError("Execution cleanup lacks its actual loss watcher owner")
+
+    def _create_loss_watcher(self, lease: SessionOperationLease, shutdown_event: threading.Event, *, run_id: UUID) -> asyncio.Task[None]:
+        owner = _ExecutionLossWatcherOwner(lease, asyncio.Event())
+        self._loss_watcher_owners.append(owner)
+        try:
+            task = asyncio.create_task(
+                self._run_loss_watcher(owner, shutdown_event, run_id=run_id), name=f"execution-operation-loss-{run_id}"
             )
-            failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
-            if failures:
-                raise BaseExceptionGroup("Execution lease cleanup failed", failures)
+        except BaseException as original:
+            self.execution_lease_release_registry.record_failure(original)
+            raise
+        if owner.task is not None and owner.task is not task:
+            raise AuditIntegrityError("Execution loss watcher factory replaced its actual Task")
+        owner.task = task
+        return task
+
+    async def _run_loss_watcher(self, owner: _ExecutionLossWatcherOwner, shutdown_event: threading.Event, *, run_id: UUID) -> None:
+        task = asyncio.current_task()
+        if task is None or not any(owner is retained for retained in self._loss_watcher_owners):
+            raise AuditIntegrityError("Execution loss watcher lacks preallocated ownership")
+        if owner.task is not None and owner.task is not task:
+            raise AuditIntegrityError("Execution loss watcher replaced its actual Task")
+        owner.task = task
+        try:
+            await self._signal_shutdown_on_operation_loss(owner.lease, shutdown_event, run_id=run_id, close_requested=owner.close_requested)
+        except BaseException as original:
+            owner.outcome = (task, original)
+            raise
+        else:
+            owner.outcome = (task, None)
+
+    async def _join_loss_watcher(
+        self,
+        task: asyncio.Task[None],
+        lease: SessionOperationLease,
+    ) -> tuple[list[asyncio.CancelledError], BaseException | None]:
+        owner = self._loss_watcher_owner(task, lease)
+        owner.close_requested.set()
+        cancellations: list[asyncio.CancelledError] = []
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError as original:
+                _retain_cancellation(cancellations, original)
+        outcome = owner.outcome
+        if outcome is None or outcome[0] is not task:
+            return cancellations, AuditIntegrityError("Execution loss watcher lacks actual producer outcome")
+        source_original = outcome[1]
+        try:
+            task.result()
+        except BaseException as projected:
+            if source_original is None:
+                source_original = projected
+        return cancellations, source_original
+
+    def _submit_owned_pipeline(
+        self,
+        obligation: ExecutionAcquisitionObligation,
+        lease: SessionOperationLease,
+        loss_watcher: asyncio.Task[None],
+        invocation: Callable[[], _RunPipelineOutcome],
+    ) -> None:
+        """Keep the actual generation/registry decision through physical submit."""
+        executor = self._executor
+        if executor is None:
+            raise AuditIntegrityError("Execution executor was not allocated")
+        with self._shutdown_events_lock:
+            if obligation in self._pipeline_watchers:
+                raise AuditIntegrityError("Execution obligation attempted another pipeline submission")
+            self._pipeline_watchers[obligation] = loss_watcher
+        try:
+            with obligation.pipeline_submission_decision(lease.context):
+                try:
+                    future = executor.submit(invocation)
+                except BaseException as original:
+                    obligation.record_pipeline_submission_unknown(original)
+                    raise
+                obligation.bind_pipeline_future(future)
+                with self._shutdown_events_lock:
+                    self._pipeline_completion_owners[future] = obligation
+        except BaseException as original:
+            if obligation.completion_required:
+                obligation.registry.record_failure(original)
+            raise
+        # Future may already be done: add_done_callback can execute inline. Neither
+        # the generation nor registry decision lock is held at this boundary.
+        try:
+            future.add_done_callback(partial(self._observe_pipeline_done, session_operation_lease=lease, loss_watcher=loss_watcher))
+        except BaseException as original:
+            obligation.registry.record_failure(original)
+            raise
 
     async def execute(
         self,
@@ -1630,6 +2049,8 @@ class ExecutionServiceImpl:
         if session_operation_context.fence.session_id != str(session_id):
             raise ValueError("session_operation_lease belongs to a different session")
 
+        obligation = self._execution_obligation(session_operation_lease)
+
         # TOCTOU fix: per-session asyncio lock serialises the
         # get_active_run → create_run window so two concurrent execute()
         # calls cannot both pass the check before either creates a run.
@@ -1645,42 +2066,44 @@ class ExecutionServiceImpl:
                 fanout_ack_token=fanout_ack_token,
                 secret_ack_token=secret_ack_token,
             )
-            loss_watcher = asyncio.create_task(
-                self._signal_shutdown_on_operation_loss(
-                    session_operation_lease,
-                    prepared.shutdown_event,
-                    run_id=prepared.run_id,
-                ),
-                name=f"execution-operation-loss-{prepared.run_id}",
+            loss_watcher = self._create_loss_watcher(
+                session_operation_lease,
+                prepared.shutdown_event,
+                run_id=prepared.run_id,
             )
             try:
-                future = self._executor.submit(
-                    self._run_pipeline,
-                    str(prepared.run_id),
-                    prepared.pipeline_yaml,
-                    prepared.shutdown_event,
-                    prepared.frozen_run_settings,
-                    prepared.user_id,
-                    prepared.auth_provider_type,
-                    session_operation_lease=session_operation_lease,
-                    durable_admission=True,
+                self._submit_owned_pipeline(
+                    obligation,
+                    session_operation_lease,
+                    loss_watcher,
+                    partial(
+                        self._run_pipeline,
+                        str(prepared.run_id),
+                        prepared.pipeline_yaml,
+                        prepared.shutdown_event,
+                        prepared.frozen_run_settings,
+                        prepared.user_id,
+                        prepared.auth_provider_type,
+                        session_operation_lease=session_operation_lease,
+                        durable_admission=True,
+                    ),
                 )
             except BaseException as exc:
-                loss_watcher.cancel()
-                await asyncio.gather(loss_watcher, return_exceptions=True)
-                await self._handle_pipeline_submission_failure(
-                    prepared.run_id,
-                    exc,
-                    session_operation_lease=session_operation_lease,
-                )
+                if not obligation.completion_required:
+                    cancellations, watcher_error = await self._join_loss_watcher(loss_watcher, session_operation_lease)
+                    failures: list[BaseException] = [exc]
+                    if watcher_error is not None:
+                        failures.append(watcher_error)
+                    try:
+                        await self._handle_pipeline_submission_failure(
+                            prepared.run_id,
+                            exc,
+                            session_operation_lease=session_operation_lease,
+                        )
+                    except BaseException as original:
+                        failures.append(original)
+                    _raise_lifecycle_originals(cancellations, failures)
                 raise
-            future.add_done_callback(
-                partial(
-                    self._on_pipeline_done,
-                    session_operation_lease=session_operation_lease,
-                    loss_watcher=loss_watcher,
-                )
-            )
             return prepared.run_id
 
     async def _execute_locked(
@@ -2270,6 +2693,9 @@ class ExecutionServiceImpl:
         """Rehydrate one admitted run and transfer its renewable web lease."""
         from elspeth.web.coordination.contracts import RecoveryRequiredReason, StartPermitState
 
+        obligation = self._execution_obligation(session_operation_lease)
+        if session_operation_lease.context.fence.session_id != str(run.session_id):
+            raise AuditIntegrityError("Recovered execution lease belongs to another session")
         if run.cancel_requested_at is not None:
             try:
                 await self._materialize_durable_cancellation(run, session_operation_lease)
@@ -2345,35 +2771,43 @@ class ExecutionServiceImpl:
             except ExecutionEnvelopeRefused as exc:
                 await self._record_recovery_refusal(run.id, session_operation_lease, exc)
                 return False
+        assert run.pipeline_yaml is not None
         shutdown_event = threading.Event()
         with self._shutdown_events_lock:
             self._shutdown_events[str(run.id)] = shutdown_event
-        watcher = asyncio.create_task(
-            self._signal_shutdown_on_operation_loss(session_operation_lease, shutdown_event, run_id=run.id),
-            name=f"recovered-execution-control-{run.id}",
-        )
-        assert run.pipeline_yaml is not None
+        watcher = self._create_loss_watcher(session_operation_lease, shutdown_event, run_id=run.id)
         try:
-            future = self._executor.submit(
-                self._run_pipeline,
-                str(run.id),
-                run.pipeline_yaml,
-                shutdown_event,
-                restored.settings,
-                session.user_id,
-                session.auth_provider_type,
-                session_operation_lease=session_operation_lease,
-                durable_admission=True,
-                resume_existing=resume_existing,
-                restored_envelope=restored,
+            self._submit_owned_pipeline(
+                obligation,
+                session_operation_lease,
+                watcher,
+                partial(
+                    self._run_pipeline,
+                    str(run.id),
+                    run.pipeline_yaml,
+                    shutdown_event,
+                    restored.settings,
+                    session.user_id,
+                    session.auth_provider_type,
+                    session_operation_lease=session_operation_lease,
+                    durable_admission=True,
+                    resume_existing=resume_existing,
+                    restored_envelope=restored,
+                ),
             )
-        except BaseException:
-            watcher.cancel()
-            await asyncio.gather(watcher, return_exceptions=True)
-            with self._shutdown_events_lock:
-                del self._shutdown_events[str(run.id)]
+        except BaseException as primary:
+            if not obligation.completion_required:
+                cancellations, watcher_error = await self._join_loss_watcher(watcher, session_operation_lease)
+                failures: list[BaseException] = [primary]
+                if watcher_error is not None:
+                    failures.append(watcher_error)
+                try:
+                    with self._shutdown_events_lock:
+                        del self._shutdown_events[str(run.id)]
+                except BaseException as original:
+                    failures.append(original)
+                _raise_lifecycle_originals(cancellations, failures)
             raise
-        future.add_done_callback(partial(self._on_pipeline_done, session_operation_lease=session_operation_lease, loss_watcher=watcher))
         return True
 
     async def _settle_admission_refusal(self, run_id: UUID, lease: SessionOperationLease) -> None:
@@ -2608,10 +3042,13 @@ class ExecutionServiceImpl:
         shutdown_event: threading.Event,
         *,
         run_id: UUID,
+        close_requested: asyncio.Event | None = None,
     ) -> None:
         """Bridge durable cancellation and loss of the exact web owner."""
         consecutive_poll_failures = 0
         while True:
+            if close_requested is not None and close_requested.is_set():
+                return
             # Exponent capped so a long outage cannot overflow the float; the
             # interval itself is capped by _LOSS_WATCHER_MAX_BACKOFF_SECONDS.
             poll_seconds = min(
@@ -2621,6 +3058,8 @@ class ExecutionServiceImpl:
             try:
                 await asyncio.wait_for(session_operation_lease.wait_until_lost(), timeout=poll_seconds)
             except TimeoutError:
+                if close_requested is not None and close_requested.is_set():
+                    return
                 try:
                     run = await self._session_service.get_run(run_id)
                 except _LOSS_WATCHER_TRANSIENT_DB_ERRORS as exc:
@@ -4653,6 +5092,99 @@ class ExecutionServiceImpl:
             return False
         return True
 
+    async def _finish_execution_authority(
+        self,
+        obligation: ExecutionAcquisitionObligation,
+        session_operation_lease: SessionOperationLease,
+        loss_watcher: asyncio.Task[None] | None,
+        exc: BaseException | None,
+    ) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise AuditIntegrityError("Pipeline completion lacks actual Task")
+        obligation.bind_completion_task(task)
+        try:
+            failures: list[BaseException] = []
+            try:
+                task.add_done_callback(partial(self._observe_execution_completion, obligation))
+            except BaseException as original:
+                failures.append(original)
+            try:
+                await self._close_execution_authority(session_operation_lease, loss_watcher, exc)
+            except BaseException as original:
+                failures.append(original)
+            else:
+                if failures:
+                    session_operation_lease._retain_execution_loss_originals(failures)
+                    for retained_failure in failures:
+                        obligation.registry.record_failure(retained_failure)
+            _raise_lifecycle_originals([], failures)
+        except BaseException as original:
+            obligation.record_completion_outcome(original)
+            raise
+        else:
+            obligation.record_completion_outcome(None)
+
+    async def _close_execution_authority(
+        self,
+        session_operation_lease: SessionOperationLease,
+        loss_watcher: asyncio.Task[None] | None,
+        exc: BaseException | None,
+    ) -> None:
+        failures: list[BaseException] = []
+        cancellations: list[asyncio.CancelledError] = []
+        failed_loss_watcher: BaseException | None = None
+        if loss_watcher is not None:
+            try:
+                cancellations, failed_loss_watcher = await self._join_loss_watcher(loss_watcher, session_operation_lease)
+            except BaseException as original:
+                failed_loss_watcher = original
+            if failed_loss_watcher is not None:
+                failures.append(failed_loss_watcher)
+        try:
+            await close_execute_lease_before_transfer(session_operation_lease)
+        except BaseException as original:
+            failures.append(original)
+            close_succeeded = False
+        else:
+            close_succeeded = True
+        try:
+            if failed_loss_watcher is not None and loss_watcher is not None:
+                slog.error(
+                    "execution_loss_watcher_failed",
+                    watcher_task=loss_watcher.get_name(),
+                    exc_class_chain=_exception_class_chain(failed_loss_watcher),
+                )
+            if exc is not None and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                # The actual pipeline Future retains the business outcome.
+                # A failed run is not a fabricated release failure.
+                slog.error("pipeline_done_callback_exception", exc_type=type(exc).__name__, exc_class_chain=_exception_class_chain(exc))
+        except BaseException as original:
+            failures.append(original)
+        if close_succeeded and (cancellations or failures):
+            session_operation_lease._retain_execution_loss_originals(failures)
+            obligation = session_operation_lease.execution_obligation
+            if type(obligation) is not ExecutionAcquisitionObligation:
+                raise AuditIntegrityError("EXECUTE completion lost actual acquisition ownership")
+            for retained_failure in failures:
+                obligation.registry.record_failure(retained_failure)
+        _raise_lifecycle_originals(cancellations, failures)
+
+    def _observe_pipeline_done(
+        self,
+        future: Future[_RunPipelineOutcome],
+        *,
+        session_operation_lease: SessionOperationLease,
+        loss_watcher: asyncio.Task[None],
+    ) -> None:
+        # concurrent.Future logs escaping callback exceptions with traceback
+        # text. Custody goes to the actual registry; private SQL/provider
+        # payloads never go to that unredacted library diagnostic.
+        try:
+            self._on_pipeline_done(future, session_operation_lease=session_operation_lease, loss_watcher=loss_watcher)
+        except BaseException as original:
+            self.execution_lease_release_registry.record_failure(original)
+
     def _on_pipeline_done(
         self,
         future: Future[_RunPipelineOutcome],
@@ -4660,107 +5192,57 @@ class ExecutionServiceImpl:
         session_operation_lease: SessionOperationLease,
         loss_watcher: asyncio.Task[None] | None = None,
     ) -> None:
-        """B7 Layer 2: Safety net callback.
-
-        Fires when the Future completes. Retrieves (and suppresses) any
-        exception so the thread pool doesn't log it to stderr.
-
-        Normal case: _run_pipeline() already recorded the operator diagnostic
-        (class chain, scrubbed message, failing node, structural frames) to
-        both ``runs.error`` and the ``run_pipeline_failed`` log — this
-        callback adds only the class chain on top.
-
-        Edge case: if _run_pipeline's own except-BaseException handler
-        failed (e.g. update_run_status raised), the audit trail write
-        never completed. In that case this callback is the ONLY place
-        the failure surfaces, so we log as a last-resort safety net.
-
-        Class names only, deliberately. This callback runs off the Future
-        with no run_id, no Landscape handle, and no failing-node context, so
-        it cannot correlate a message to a run; and pipeline exceptions may
-        chain SQLAlchemyError (``[SQL: ...]`` / ``[parameters: ...]``),
-        Tier-3 sanitizer output, or source-rendering fragments through
-        ``__cause__`` / ``__context__``. Censor-by-length (``[:200]``) is not
-        redaction — the prefix still carries Tier-3 material. Where a message
-        IS wanted it is scrubbed through ``scrub_text_for_audit`` at the
-        ``run_pipeline_failed`` site, which is a redaction mechanism rather
-        than a truncation; this site keeps the class chain alone.
-        """
+        registry = self.execution_lease_release_registry
+        obligation = session_operation_lease.execution_obligation
         try:
-            exc = future.exception()
-        except FutureCancelledError:
-            exc = None
-
-        async def _finish_execution_authority() -> None:
-            failed_loss_watcher: tuple[str, BaseException] | None = None
-            try:
-                if loss_watcher is not None:
-                    loss_watcher.cancel()
-                    await asyncio.gather(loss_watcher, return_exceptions=True)
-                    # The task is done here. A watcher that died before this
-                    # cancel ended its cancel and lease-loss signalling early;
-                    # that must be visible, not discarded. Our own cancel is
-                    # the normal outcome and is not reported.
-                    if not loss_watcher.cancelled():
-                        watcher_exception = loss_watcher.exception()
-                        if watcher_exception is not None:
-                            failed_loss_watcher = (loss_watcher.get_name(), watcher_exception)
-            finally:
-                await session_operation_lease.close()
-            if failed_loss_watcher is not None:
-                # Class names only, for the reason given in this callback's
-                # docstring; logged after the mandatory authority release.
-                watcher_task, watcher_exc = failed_loss_watcher
-                slog.error(
-                    "execution_loss_watcher_failed",
-                    watcher_task=watcher_task,
-                    exc_class_chain=_exception_class_chain(watcher_exc),
-                )
-            if exc is not None and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                # Diagnose only after mandatory authority release. A logger
-                # failure belongs to this tracked completion future so that
-                # shutdown observes it without abandoning the lease.
-                slog.error(
-                    "pipeline_done_callback_exception",
-                    exc_type=type(exc).__name__,
-                    exc_class_chain=_exception_class_chain(exc),
-                )
-
-        scheduled_completion = asyncio.run_coroutine_threadsafe(
-            _finish_execution_authority(),
-            self._loop,
-        )
-        completion = _LeaseCompletionFuture()
-
-        def _settle_completion(done: Future[None]) -> None:
-            try:
-                completion_error = done.exception()
-            except FutureCancelledError as error:
-                completion.set_exception(error)
+            if type(obligation) is not ExecutionAcquisitionObligation or obligation.registry is not registry:
+                raise AuditIntegrityError("Pipeline callback lacks exact application obligation")
+            if obligation.lease is not session_operation_lease or obligation.pipeline is not future or not future.done():
+                raise AuditIntegrityError("Pipeline callback replaced actual terminal owner")
+            # Retired receipt validation preserves exact duplicate identity without
+            # keeping every settled Future alive in service-owned history.
+            if self._execution_retirement_ready(obligation):
                 return
-            if completion_error is None:
-                completion.set_result(None)
-            else:
-                completion.set_exception(completion_error)
+            with self._shutdown_events_lock:
+                if self._pipeline_completion_owners.get(future) is not obligation:
+                    raise AuditIntegrityError("Pipeline callback lacks retained actual Future")
+                if future in self._pipeline_completion_started:
+                    return
+                self._pipeline_completion_started.add(future)
+            try:
+                exc = future.exception()
+            except FutureCancelledError as original:
+                exc = original
 
-        scheduled_completion.add_done_callback(_settle_completion)
-        with self._shutdown_events_lock:
-            self._lease_completion_futures.add(completion)
+            scheduled = asyncio.run_coroutine_threadsafe(
+                self._finish_execution_authority(obligation, session_operation_lease, loss_watcher, exc),
+                self._loop,
+            )
+            obligation.bind_completion_future(scheduled)
+            with self._shutdown_events_lock:
+                self._lease_completion_futures.add(scheduled)
 
-        def _retire_completion(done: Future[None]) -> None:
-            # _LeaseCompletionFuture cannot be cancelled. Failed completions
-            # remain owned until shutdown observes their original exceptions.
-            completion_error = done.exception()
-            if completion_error is None:
-                with self._shutdown_events_lock:
-                    self._lease_completion_futures.discard(done)
-            else:
-                slog.error(
-                    "execution_lease_completion_failed",
-                    exc_type=type(completion_error).__name__,
-                )
+            def observe_wrapper(done: Future[None]) -> None:
+                try:
+                    self._loop.call_soon_threadsafe(self._observe_execution_completion, obligation)
+                except BaseException as original:
+                    registry.record_failure(original)
+                try:
+                    error = done.exception()
+                except FutureCancelledError:
+                    # This handle is not physical completion authority. The actual
+                    # Task continues owning close and is observed by the registry.
+                    return
+                if error is None:
+                    with self._shutdown_events_lock:
+                        self._lease_completion_futures.discard(done)
+                else:
+                    registry.record_failure(error)
 
-        completion.add_done_callback(_retire_completion)
+            scheduled.add_done_callback(observe_wrapper)
+        except BaseException as original:
+            registry.record_failure(original)
+            raise
 
     def _to_run_event(self, run_id: str, progress: ProgressEvent) -> RunEvent:
         """Translate engine ProgressEvent to web RunEvent.

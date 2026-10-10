@@ -12,7 +12,7 @@ _RUNBOOK = Path("docs/runbooks/staging-session-db-recreation.md")
 
 def test_current_cutover_and_verification_use_live_schema_epochs() -> None:
     runbook = _RUNBOOK.read_text(encoding="utf-8")
-    current_cutover = runbook.split("## Current Cutover:", maxsplit=1)[1].split("## Historical Cutover:", maxsplit=1)[0]
+    current_cutover = runbook.split("## Current Cutover:", maxsplit=1)[1].split("## Prior Cutover:", maxsplit=1)[0]
     current_procedure = runbook.split("### Procedure", maxsplit=1)[1].split(
         "#### Current epoch + Composer smoke verification",
         maxsplit=1,
@@ -45,9 +45,10 @@ def test_replica_schema_cutover_belongs_to_0_8_1() -> None:
     release_0_8_1, release_0_8_0 = changelog.split("## 0.8.1 -", maxsplit=1)[1].split("## 0.8.0 -", maxsplit=1)
     release_0_8_0 = release_0_8_0.split("\n## ", maxsplit=1)[0]
 
-    assert "## Current Cutover: 0.8.1" in runbook
+    assert "## Current Cutover: 0.8.3 candidate" in runbook
+    assert "## Prior Cutover: 0.8.1" in runbook
     assert "install 0.8.1" in runbook
-    assert f"`SESSION_SCHEMA_EPOCH` advances from 53\nto {SESSION_SCHEMA_EPOCH}" in release_0_8_1
+    assert "`SESSION_SCHEMA_EPOCH` advances from 53\nto 71" in release_0_8_1
     assert f"`SQLITE_SCHEMA_EPOCH` advances from 38 to {SQLITE_SCHEMA_EPOCH}" in release_0_8_1
     assert "then install 0.8.1" in release_0_8_1
     assert "`SESSION_SCHEMA_EPOCH` advances from 35\nto 53" in release_0_8_0

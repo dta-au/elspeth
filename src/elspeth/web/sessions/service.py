@@ -8,20 +8,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import threading
 import uuid
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 from uuid import UUID
 
 import structlog
 from opentelemetry import metrics
+from pydantic import ValidationError
 from sqlalchemy import ColumnElement, Connection, Engine, case, delete, desc, exists, func, insert, or_, select, update
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
@@ -47,8 +49,13 @@ from elspeth.contracts.composer_interpretation import (
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.hashing import stable_hash
-from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.web.async_workers import (
+    run_required_sql_finish_once,
+    run_required_sql_in_worker,
+    run_stream_read_in_worker,
+    run_sync_in_worker,
+)
 from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
@@ -83,6 +90,19 @@ from elspeth.web.coordination.approval_authority import (
     ApprovalSupersession,
     refuse_unrecorded_approval_supersession,
     supersede_open_approvals,
+)
+from elspeth.web.coordination.composer_operation_authority import (
+    ComposerAsyncOperationAuthority,
+    _read,
+    _record_from_row,
+    _select_failure_on_connection,
+    bind_composer_operation_user_message_on_connection,
+    derive_proposal_composer_binding_on_connection,
+    prove_revocation_composer_binding_on_connection,
+    require_composer_operation_mutation_on_connection,
+    require_composer_settlement_actor_on_connection,
+    settle_composer_operation_on_connection,
+    verify_historical_proposal_composer_binding_on_connection,
 )
 from elspeth.web.coordination.contracts import (
     ArchiveManifestRelation,
@@ -119,6 +139,16 @@ from elspeth.web.coordination.run_cancellation_authority import RepositoryRunCan
 from elspeth.web.coordination.run_diagnostics_authority import RepositoryRunDiagnosticsAuditAuthority
 from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
+from elspeth.web.required_work import (
+    PublicationProjectionDisposition,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+    RequiredWorkSource,
+    RequiredWorkTicket,
+)
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions._persist_payload import AuditMessageDraft, AuditOutcome, RedactedToolRow, RejectionRecord, StatePayload
 from elspeth.web.sessions.archive_quarantine import (
@@ -134,6 +164,13 @@ from elspeth.web.sessions.archive_quarantine import (
     stage_archive_quarantine,
 )
 from elspeth.web.sessions.audit_checkpoint import uncheckpointed_envelopes
+from elspeth.web.sessions.composer_operations import (
+    ComposerOperationAssistantWrite,
+    ComposerOperationError,
+    ComposerOperationFenceLost,
+    ComposerOperationRecord,
+    ComposerOperationRunning,
+)
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.dead_site_supersession import supersede_dead_site_pending_interpretation_events
 from elspeth.web.sessions.fork_custody import (
@@ -201,6 +238,40 @@ from elspeth.web.sessions.pending_interpretation import (
 from elspeth.web.sessions.pending_interpretation import (
     _patch_llm_transform_prompt as _patch_llm_transform_prompt,
 )
+from elspeth.web.sessions.pipeline_finish_once import (
+    ComposerPipelineBusinessReturned,
+    ComposerPipelineFinishOnce,
+    ComposerPipelineRaised,
+    ComposerPipelineRevocationCompleted,
+    ComposerRevocationExpected,
+    ComposerRevocationSQLResult,
+    PipelineFinishOnceWork,
+    PipelinePublicationSQLResult,
+    _ComposerRevocationRequired,
+    decode_composer_revocation_result,
+)
+from elspeth.web.sessions.pipeline_rejection import PipelineRejectionExpected, PipelineRejectionSQLResult, PipelineRejectionWriteResult
+from elspeth.web.sessions.pipeline_rejection_finish_once import (
+    PipelineCreationFinishOnce,
+    PipelineCreationRaised,
+    PipelineCreationReturned,
+    PipelineRejectionFinishOnce,
+    PipelineRejectionRaised,
+    PipelineRejectionReturned,
+)
+from elspeth.web.sessions.pipeline_review_evidence import (
+    review_cohort_member,
+    review_semantic_material,
+    verify_opt_out_transformation,
+    verify_review_event_material,
+)
+from elspeth.web.sessions.pipeline_settlement_payloads import (
+    ComposerRevocationEvidence,
+    PipelineAcceptedEvidence,
+    PipelineDispatchEvidence,
+    ReviewCohortMember,
+    TransitionAssistantBinding,
+)
 from elspeth.web.sessions.proposal_authority import (
     _assert_assistant_row_has_audit_content,
     _assert_parent_assistant_message,
@@ -250,8 +321,6 @@ from elspeth.web.sessions.protocol import (
     InterpretationPlaceholderConsumedError,
     InterpretationSourceDataContractDriftError,
     InterpretationUnsupportedChoiceError,
-    MessageIngressAccepted,
-    MessageIngressConflict,
     MessageIngressFresh,
     OperationReceiptActive,
     OperationReceiptCompleted,
@@ -270,6 +339,7 @@ from elspeth.web.sessions.protocol import (
     ProposalEventRecord,
     ProposalLifecycleStatus,
     ProposalStateConflictError,
+    RedactedPipelineArguments,
     RunDiagnosticsAuditAuthority,
     RunDiagnosticsAuditDraft,
     RunDiagnosticsAuditMutationAuthority,
@@ -305,6 +375,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.protocol import (
     InterpretationResolveError as InterpretationResolveError,
 )
+from elspeth.web.sessions.schemas import MessageWithStateResponse
 from elspeth.web.sessions.skill_markdown_history import (
     RepositorySkillMarkdownHistoryAuthority,
     SkillMarkdownHistoryAuthority,
@@ -318,7 +389,6 @@ if TYPE_CHECKING:
     from elspeth.web.catalog.protocol import CatalogService
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.execution.envelope import RunExecutionInput
-    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
 
@@ -553,6 +623,93 @@ def _refuse_unrecorded_quota_exceeded(outcome: QuotaExceeded) -> None:
     raise AuditIntegrityError(f"quota_exceeded refusal for identity {outcome.identity_id} has no auth audit writer wired")
 
 
+class ComposerTerminalSQLCompletionUnknown(AuditIntegrityError):
+    """The SQL worker completion witness is unavailable; settlement must wait."""
+
+
+class ComposerRequiredAuditPersistenceError(AuditIntegrityError):
+    """Required atomic audit SQL failed; preserves the canonical public envelope."""
+
+    def __init__(self, message: str, *, helper: Literal["llm_calls", "turn_audit_cohort"]) -> None:
+        if helper not in ("llm_calls", "turn_audit_cohort"):
+            raise ValueError("required audit helper must name a closed producer seam")
+        self.helper = helper
+        super().__init__(message)
+
+
+class _ComposerTerminalRetryStateChanged(RuntimeError):
+    """Locked retry refuses an ordinary change to terminal-driving state."""
+
+
+def _refuse_required_sql(ticket: RequiredWorkTicket | None, error: BaseException) -> NoReturn:
+    if ticket is not None:
+        ticket.complete_without_submission(error)
+    raise error
+
+
+@contextlib.contextmanager
+def _required_sql_preflight(ticket: RequiredWorkTicket | None) -> Iterator[None]:
+    """Observe only preparation that has not submitted its SQL callable."""
+    try:
+        yield
+    except BaseException as error:
+        _refuse_required_sql(ticket, error)
+
+
+def _validate_required_sql_ticket(
+    ticket: RequiredWorkTicket | None,
+    *,
+    sources: tuple[RequiredWorkSource, ...],
+    session_id: str,
+    context: SessionOperationContext | None = None,
+    running: ComposerOperationRunning | None = None,
+    proposal_id: str | None = None,
+    tool_call_id: str | None = None,
+) -> None:
+    """Refuse a mismatched preallocated receipt before executor submission."""
+    if ticket is None:
+        return
+    if type(ticket) is not RequiredWorkTicket:
+        raise TypeError("required SQL receipt must be an exact RequiredWorkTicket")
+    scope = ticket.key.authority
+    try:
+        if ticket.key.source not in sources or ticket.key.session_id != session_id:
+            raise AuditIntegrityError("required SQL receipt source/session mismatch")
+        if context is not None and scope.context != context:
+            raise AuditIntegrityError("required SQL receipt fence mismatch")
+        if running is not None and (
+            scope.durable_operation_id != running.claim.operation_id
+            or scope.claim_attempt != running.claim.attempt
+            or scope.context != running.session_operation_context
+        ):
+            raise AuditIntegrityError("required SQL receipt claim mismatch")
+        if proposal_id is not None and scope.proposal_id != proposal_id:
+            raise AuditIntegrityError("required SQL receipt proposal mismatch")
+        if tool_call_id is not None and scope.tool_call_id != tool_call_id:
+            raise AuditIntegrityError("required SQL receipt tool identity mismatch")
+    except BaseException as error:
+        ticket.complete_without_submission(error)
+        raise
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderAdmissionRefused:
+    refusal: ChargeableAdmissionRefused
+
+
+def _validate_principal_snapshot(value: tuple[str | None, PluginAvailabilitySnapshot | None]) -> None:
+    if type(value) is not tuple or len(value) != 2:
+        raise AuditIntegrityError("preparation principal read returned an invalid owned tuple")
+    user_id, snapshot = value
+    if (user_id is not None and type(user_id) is not str) or (snapshot is not None and type(snapshot) is not PluginAvailabilitySnapshot):
+        raise AuditIntegrityError("preparation principal read returned invalid owned values")
+
+
+def _validate_inline_snapshot(value: SessionInlineBlobSnapshot | None) -> None:
+    if value is not None and type(value) is not SessionInlineBlobSnapshot:
+        raise AuditIntegrityError("preparation inline read returned an invalid owned snapshot")
+
+
 class SessionServiceImpl:
     """Concrete async session service backed by worker-dispatched SQLAlchemy Core."""
 
@@ -646,6 +803,7 @@ class SessionServiceImpl:
         *,
         session_id: UUID,
         session_operation_context: SessionOperationContext,
+        preparation_work: RequiredWorkBinding | None = None,
     ) -> SessionInlineBlobSnapshot | None:
         """Read custody-verified bytes before entering any SESSIONS lock."""
         reader = self._inline_blob_read
@@ -664,6 +822,18 @@ class SessionServiceImpl:
                 ).one_or_none()
                 return (row.status, row.content_hash, row.size_bytes) if row is not None else None
 
+        if preparation_work is not None:
+            preparation_work.validate_context(session_operation_context)
+            return await self._run_required_preparation_read(
+                preparation_work,
+                lambda: prepare_session_inline_blob_snapshot(
+                    config,
+                    session_id=session_id,
+                    read_blob=lambda blob_id: reader(session_operation_context, blob_id),
+                    metadata_hint=_metadata_hint,
+                ),
+                project=_validate_inline_snapshot,
+            )
         return cast(
             SessionInlineBlobSnapshot | None,
             await self._run_sync(
@@ -969,6 +1139,7 @@ class SessionServiceImpl:
         session_id: str,
         expected_kind: SessionOperationKind,
         now: datetime,
+        audit_only: bool = False,
     ) -> None:
         """Validate one exact current session authority in the caller transaction."""
         if (
@@ -992,6 +1163,9 @@ class SessionServiceImpl:
         if exact is None:
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
 
+        if not audit_only:
+            require_composer_operation_mutation_on_connection(conn, context)
+
     @contextlib.contextmanager
     def _session_composer_mutation_transaction(
         self,
@@ -1000,6 +1174,7 @@ class SessionServiceImpl:
         session_id: str,
         session_operation_context: SessionOperationContext,
         expected_kind: SessionOperationKind,
+        audit_only: bool = False,
     ) -> Iterator[_SessionComposerMutationTransaction]:
         """Yield a lifetime-checked ordinary Composer mutation capability."""
         if type(session_operation_context) is not SessionOperationContext:
@@ -1011,6 +1186,7 @@ class SessionServiceImpl:
             session_id=session_id,
             expected_kind=expected_kind,
             now=now,
+            audit_only=audit_only,
         )
         transaction = _SessionComposerMutationTransaction(
             self,
@@ -1018,6 +1194,7 @@ class SessionServiceImpl:
             session_id=session_id,
             session_operation_context=session_operation_context,
             expected_kind=expected_kind,
+            audit_only=audit_only,
         )
         try:
             yield transaction
@@ -1298,6 +1475,7 @@ class SessionServiceImpl:
         created_at: datetime,
         session_operation_context: SessionOperationContext,
         message_id: str | None = None,
+        audit_only: bool = False,
     ) -> str:
         """Single-row insert into ``chat_messages`` with the supplied fields.
 
@@ -1351,7 +1529,9 @@ class SessionServiceImpl:
             session_id,
             caller="_insert_chat_message",
         )
-        self._require_session_write_authority_on_connection(conn, session_operation_context, session_id=session_id)
+        if audit_only and role not in ("audit", "tool"):
+            raise ValueError("audit_only writes carry only audit or tool rows")
+        self._require_session_write_authority_on_connection(conn, session_operation_context, session_id=session_id, audit_only=audit_only)
         if role == "tool":
             if parent_assistant_id is None:
                 raise RuntimeError(f"_insert_chat_message: tool row requires parent_assistant_id (session={session_id!r})")
@@ -1393,7 +1573,7 @@ class SessionServiceImpl:
         /,
         *,
         session_id: str,
-        client_request_id: str,
+        operation_id: str,
         user_message_id: str,
         requested_state_id: str | None,
         created_at: datetime,
@@ -1409,7 +1589,7 @@ class SessionServiceImpl:
         conn.execute(
             insert(message_ingress_receipts_table).values(
                 session_id=session_id,
-                client_request_id=client_request_id,
+                operation_id=operation_id,
                 user_message_id=user_message_id,
                 requested_state_id=requested_state_id,
                 created_at=created_at,
@@ -2020,14 +2200,14 @@ class SessionServiceImpl:
         writer_principal: ChatMessageWriterPrincipal,
         plugin_crash_pending: bool,
         session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket | None = None,
     ) -> AuditOutcome:
         """Async dispatcher for :meth:`persist_compose_turn`.
 
-        Bridges to the sync primitive via ``_run_sync``, which dispatches
-        to a worker thread. A running worker is shielded from caller
-        cancellation: a ``CancelledError`` raised in the awaiter does NOT
-        interrupt the in-flight sync transaction (see
-        ``elspeth.web.async_workers.run_sync_in_worker``). A submission the
+        Bridges to the sync primitive via ``_run_composer_sql``. Caller
+        cancellation joins the actual executor future before propagating
+        ``CancelledError``, retaining the lease owner until the transaction
+        has completed (see ``run_stream_read_in_worker``). A submission the
         pool has not yet started when the awaiter is cancelled is dropped
         and never begins — the "rolled back" arm below, reached without a
         transaction (elspeth-5269b43bca).
@@ -2051,10 +2231,13 @@ class SessionServiceImpl:
 
         Pinned by ``test_persist_compose_turn_async_caller_cancellation_commits_anyway``.
         """
-        return cast(
-            AuditOutcome,
-            await self._run_sync(
-                self.persist_compose_turn,
+
+        _validate_required_sql_ticket(
+            required_work, sources=(RequiredWorkSource.COMPOSE_CHECKPOINT_SQL,), session_id=session_id, context=session_operation_context
+        )
+
+        def _sync() -> AuditOutcome:
+            return self.persist_compose_turn(
                 session_id=session_id,
                 assistant_content=assistant_content,
                 raw_content=raw_content,
@@ -2066,8 +2249,9 @@ class SessionServiceImpl:
                 writer_principal=writer_principal,
                 plugin_crash_pending=plugin_crash_pending,
                 session_operation_context=session_operation_context,
-            ),
-        )
+            )
+
+        return await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
 
     async def create_session(
         self,
@@ -2101,6 +2285,14 @@ class SessionServiceImpl:
             forked_from_message_id=UUID(row.forked_from_message_id) if row.forked_from_message_id else None,
         )
 
+    def get_session_for_stream(self, session_id: UUID) -> SessionRecord:
+        """Read owned session scope synchronously for joined observer SQL custody."""
+        with self._engine.begin() as conn:
+            row = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session_id))).one_or_none()
+            if row is None:
+                raise SessionNotFoundError(session_id)
+            return self._row_to_session_record(row)
+
     async def get_session(self, session_id: UUID) -> SessionRecord:
         """Fetch a session by ID. Raises SessionNotFoundError if not found."""
 
@@ -2121,11 +2313,18 @@ class SessionServiceImpl:
         title: str,
         *,
         session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket | None = None,
     ) -> SessionRecord:
         """Update a session title under the caller's COMPOSE operation and return the refreshed record."""
         if type(session_operation_context) is not SessionOperationContext:
             raise TypeError("session_operation_context must be an exact SessionOperationContext")
         sid = str(session_id)
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.TITLE_ACCOUNTING_SQL,),
+            session_id=sid,
+            context=session_operation_context,
+        )
         now = self._now()
 
         def _write(conn: Connection) -> Any:
@@ -2148,7 +2347,7 @@ class SessionServiceImpl:
             ):
                 return _write(conn)
 
-        row = await self._run_sync(_sync)
+        row = await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync)
         return SessionRecord(
             id=UUID(row.id),
             user_id=row.user_id,
@@ -2752,46 +2951,146 @@ class SessionServiceImpl:
         composer_provider: str,
         user_message_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket | None = None,
     ) -> CompositionProposalRecord:
-        """Atomically create one canonical pipeline row + bound event."""
-        if type(plan) is not PipelinePlanResult:
-            raise TypeError("plan must be an exact PipelinePlanResult")
-
-        private_pipeline_arguments = deep_thaw(plan.proposal.pipeline)
-        review_arguments = (
-            owned_composition_state_review_arguments(private_pipeline_arguments)
-            if is_owned_composition_state_authority(private_pipeline_arguments)
-            else private_pipeline_arguments
-        )
-        expected_redacted_arguments = redact_tool_call_arguments(
-            "set_pipeline",
-            cast(dict[str, Any], review_arguments),
-            telemetry=NoopRedactionTelemetry(),
-        )
-        supplied_redacted_arguments = deep_thaw(arguments_redacted_json)
-        if supplied_redacted_arguments != expected_redacted_arguments:
-            raise AuditIntegrityError("pipeline proposal redacted arguments do not match the manifest projection")
-        arguments_redacted_json = supplied_redacted_arguments
-        proposal = plan.proposal
-        normalized = _normalize_proposal_composer_provenance(
+        with _required_sql_preflight(required_work):
+            redacted_pipeline_arguments = RedactedPipelineArguments(arguments_redacted_json)
+        result = await self._create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=plan,
+            summary=summary,
+            rationale=rationale,
+            affects=affects,
+            arguments_redacted_json=redacted_pipeline_arguments,
+            actor=actor,
             composer_model_identifier=composer_model_identifier,
             composer_model_version=composer_model_version,
             composer_provider=composer_provider,
-            composer_skill_hash=proposal.skill_hash,
-            tool_arguments_hash=composer_authority_hash(proposal.pipeline),
-        )
-        assert all(value is not None for value in normalized.values())
-        payload = _pipeline_created_payload(
-            plan=plan,
             user_message_id=user_message_id,
-            composer_model_identifier=cast(str, normalized["composer_model_identifier"]),
-            composer_model_version=cast(str, normalized["composer_model_version"]),
-            composer_provider=cast(str, normalized["composer_provider"]),
+            session_operation_context=session_operation_context,
+            required_work=required_work,
+        )
+        if type(result) is not CompositionProposalRecord:
+            raise AuditIntegrityError("legacy creation returned a required handoff")
+        return result
+
+    async def create_pipeline_composition_proposal_finish_once(
+        self,
+        *,
+        session_id: UUID,
+        plan: PipelinePlanResult,
+        summary: str,
+        rationale: str,
+        affects: Sequence[str],
+        arguments_redacted_json: RedactedPipelineArguments,
+        actor: str,
+        composer_model_identifier: str,
+        composer_model_version: str,
+        composer_provider: str,
+        user_message_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket,
+        running: ComposerOperationRunning | None = None,
+    ) -> PipelineCreationFinishOnce:
+        result = await self._create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=plan,
             summary=summary,
             rationale=rationale,
             affects=affects,
             arguments_redacted_json=arguments_redacted_json,
+            actor=actor,
+            composer_model_identifier=composer_model_identifier,
+            composer_model_version=composer_model_version,
+            composer_provider=composer_provider,
+            user_message_id=user_message_id,
+            session_operation_context=session_operation_context,
+            required_work=required_work,
+            finish_once=True,
+            running=running,
         )
+        if isinstance(result, (PipelineCreationReturned, PipelineCreationRaised)):
+            return result
+        raise AuditIntegrityError("required creation returned a legacy row")
+
+    async def _create_pipeline_composition_proposal(
+        self,
+        *,
+        session_id: UUID,
+        plan: PipelinePlanResult,
+        summary: str,
+        rationale: str,
+        affects: Sequence[str],
+        arguments_redacted_json: RedactedPipelineArguments,
+        actor: str,
+        composer_model_identifier: str,
+        composer_model_version: str,
+        composer_provider: str,
+        user_message_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket | None = None,
+        finish_once: bool = False,
+        running: ComposerOperationRunning | None = None,
+    ) -> CompositionProposalRecord | PipelineCreationFinishOnce:
+        """Atomically create one canonical pipeline row + bound event."""
+        try:
+            _validate_required_sql_ticket(
+                required_work,
+                sources=(RequiredWorkSource.PROPOSAL_CREATION_SQL,),
+                session_id=str(session_id),
+                context=session_operation_context,
+                running=running,
+            )
+            with _required_sql_preflight(required_work):
+                if finish_once and required_work is not None:
+                    if required_work.key.authority.durable_operation_id is not None and running is None:
+                        raise AuditIntegrityError("durable creation handoff omitted actual running claim")
+                    if running is not None and type(running) is not ComposerOperationRunning:
+                        raise AuditIntegrityError("creation handoff supplied foreign running claim")
+                if type(plan) is not PipelinePlanResult:
+                    raise TypeError("plan must be an exact PipelinePlanResult")
+                if type(arguments_redacted_json) is not RedactedPipelineArguments:
+                    raise TypeError("arguments_redacted_json must be exact RedactedPipelineArguments")
+                private_pipeline_arguments = deep_thaw(plan.proposal.pipeline)
+                review_arguments = (
+                    owned_composition_state_review_arguments(private_pipeline_arguments)
+                    if is_owned_composition_state_authority(private_pipeline_arguments)
+                    else private_pipeline_arguments
+                )
+                expected_redacted_arguments = redact_tool_call_arguments(
+                    "set_pipeline",
+                    cast(dict[str, Any], review_arguments),
+                    telemetry=NoopRedactionTelemetry(),
+                )
+                supplied_redacted_arguments = deep_thaw(arguments_redacted_json.value)
+                if supplied_redacted_arguments != expected_redacted_arguments:
+                    raise AuditIntegrityError("pipeline proposal redacted arguments do not match the manifest projection")
+                proposal = plan.proposal
+                normalized = _normalize_proposal_composer_provenance(
+                    composer_model_identifier=composer_model_identifier,
+                    composer_model_version=composer_model_version,
+                    composer_provider=composer_provider,
+                    composer_skill_hash=proposal.skill_hash,
+                    tool_arguments_hash=composer_authority_hash(proposal.pipeline),
+                )
+                assert all(value is not None for value in normalized.values())
+                payload = _pipeline_created_payload(
+                    plan=plan,
+                    user_message_id=user_message_id,
+                    composer_model_identifier=cast(str, normalized["composer_model_identifier"]),
+                    composer_model_version=cast(str, normalized["composer_model_version"]),
+                    composer_provider=cast(str, normalized["composer_provider"]),
+                    summary=summary,
+                    rationale=rationale,
+                    affects=affects,
+                    arguments_redacted_json=supplied_redacted_arguments,
+                )
+        except BaseException as error:
+            if not finish_once or required_work is None or not required_work.complete:
+                raise
+            refused = RequiredSQLRaised(error, ())
+            required_work.observe_finish_once_handoff(refused)
+            return PipelineCreationRaised(refused)
         sid = str(session_id)
         proposal_id = str(uuid.uuid4())
         event_id = str(uuid.uuid4())
@@ -2807,6 +3106,30 @@ class SessionServiceImpl:
                     expected_kind=SessionOperationKind.COMPOSE,
                 ) as transaction,
             ):
+                binding = derive_proposal_composer_binding_on_connection(
+                    conn,
+                    session_operation_context,
+                    user_message_id=user_message_id,
+                    actor=actor,
+                    running=running,
+                )
+                if required_work is not None:
+                    scope = required_work.key.authority
+                    if binding is None:
+                        if scope.durable_operation_id is not None or scope.claim_attempt is not None:
+                            raise AuditIntegrityError("proposal creation receipt invents durable claim custody")
+                    elif scope.durable_operation_id != binding.operation_id or scope.claim_attempt != binding.attempt:
+                        raise AuditIntegrityError("proposal creation receipt claim differs from locked authority")
+                payload["composer_operation"] = (
+                    {
+                        "operation_id": binding.operation_id,
+                        "session_operation_id": binding.session_operation_id,
+                        "session_operation_epoch": binding.session_operation_epoch,
+                        "attempt": binding.attempt,
+                    }
+                    if binding is not None
+                    else None
+                )
                 return transaction.composer.create_pipeline_composition_proposal(
                     proposal_id=proposal_id,
                     event_id=event_id,
@@ -2814,14 +3137,29 @@ class SessionServiceImpl:
                     summary=summary,
                     rationale=rationale,
                     affects=affects,
-                    arguments_redacted_json=arguments_redacted_json,
+                    arguments_redacted_json=supplied_redacted_arguments,
                     actor=actor,
                     normalized_provenance=normalized,
                     payload=payload,
                     user_message_id=user_message_id,
                 )
 
-        record = cast(CompositionProposalRecord, await self._run_sync(_sync))
+        if finish_once:
+            if required_work is None:
+                raise AuditIntegrityError("creation finish-once requires its registered SQL ticket")
+            outcome = await run_required_sql_finish_once(required_work, _sync)
+            if type(outcome) is RequiredSQLRaised:
+                return PipelineCreationRaised(outcome)
+            post_sql_failures: tuple[BaseException, ...] = ()
+            try:
+                _PIPELINE_PLANNER_COUNTER.add(1, {"surface": "freeform", "result": "proposal_created"})
+                _PIPELINE_CUSTODY_COUNTER.add(1, {"surface": "freeform", "result": plan.custody_result})
+            except BaseException as error:
+                post_sql_failures = (error,)
+            return PipelineCreationReturned(cast(RequiredSQLReturned[CompositionProposalRecord], outcome), post_sql_failures)
+        record = (
+            await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+        )
         _PIPELINE_PLANNER_COUNTER.add(1, {"surface": "freeform", "result": "proposal_created"})
         _PIPELINE_CUSTODY_COUNTER.add(1, {"surface": "freeform", "result": plan.custody_result})
         return record
@@ -2831,11 +3169,13 @@ class SessionServiceImpl:
         *,
         session_id: UUID,
         proposal_id: UUID,
+        required_work: RequiredWorkTicket | None = None,
     ) -> AuthoritativePipelineProposal:
         """Load one canonical pipeline authority, rejecting current tool proposals."""
         authority = await self.get_authoritative_composition_proposal(
             session_id=session_id,
             proposal_id=proposal_id,
+            required_work=required_work,
         )
         if authority.pipeline is None:
             raise ValueError("proposal uses the current tool-proposal lifecycle contract")
@@ -2846,10 +3186,16 @@ class SessionServiceImpl:
         *,
         session_id: UUID,
         proposal_id: UUID,
+        required_work: RequiredWorkTicket | None = None,
     ) -> AuthoritativeCompositionProposal:
         """Load exactly one row and one event, then classify without fallback."""
         sid = str(session_id)
         pid = str(proposal_id)
+        _validate_required_sql_ticket(required_work, sources=(RequiredWorkSource.PREPARATION_READ_SQL,), session_id=sid)
+        if required_work is not None and required_work.key.authority.proposal_id is not None:
+            _validate_required_sql_ticket(
+                required_work, sources=(RequiredWorkSource.PREPARATION_READ_SQL,), session_id=sid, proposal_id=pid
+            )
 
         def _sync() -> AuthoritativeCompositionProposal:
             with self._engine.begin() as conn:
@@ -2880,9 +3226,144 @@ class SessionServiceImpl:
                     )
                 return authority
 
-        return cast(AuthoritativeCompositionProposal, await self._run_sync(_sync))
+        return cast(
+            AuthoritativeCompositionProposal,
+            await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync),
+        )
 
     async def settle_pipeline_composition_proposal(
+        self,
+        *,
+        session_id: UUID,
+        proposal_id: UUID,
+        draft_hash: str,
+        state: CompositionStateData,
+        candidate_content_hash: str,
+        executor_content_hash: str,
+        final_composer_metadata: Mapping[str, Any] | None,
+        dispatch: PipelineDispatchAuditBinding,
+        actor: str,
+        session_operation_context: SessionOperationContext,
+        transition_assistant: TransitionAssistantDraft | None = None,
+        required_trust_mode: ComposerTrustMode | None = None,
+        prepared_interpretations: tuple[PreparedInterpretationEventDraft, ...] = (),
+        running: ComposerOperationRunning | None = None,
+        required_work: RequiredWorkTicket | None = None,
+    ) -> PipelineProposalSettlementResult:
+        result = await self._settle_pipeline_composition_proposal(
+            session_id=session_id,
+            proposal_id=proposal_id,
+            draft_hash=draft_hash,
+            state=state,
+            candidate_content_hash=candidate_content_hash,
+            executor_content_hash=executor_content_hash,
+            final_composer_metadata=final_composer_metadata,
+            dispatch=dispatch,
+            actor=actor,
+            session_operation_context=session_operation_context,
+            transition_assistant=transition_assistant,
+            required_trust_mode=required_trust_mode,
+            prepared_interpretations=prepared_interpretations,
+            running=running,
+            required_work=required_work,
+        )
+        if type(result) is not PipelineProposalSettlementResult:
+            raise AuditIntegrityError("legacy pipeline settlement returned a required handoff")
+        return result
+
+    async def settle_pipeline_composition_proposal_finish_once(
+        self,
+        *,
+        session_id: UUID,
+        proposal_id: UUID,
+        draft_hash: str,
+        state: CompositionStateData,
+        candidate_content_hash: str,
+        executor_content_hash: str,
+        final_composer_metadata: Mapping[str, Any] | None,
+        dispatch: PipelineDispatchAuditBinding,
+        actor: str,
+        session_operation_context: SessionOperationContext,
+        coordinator: RequiredWorkCoordinator,
+        required_work: RequiredWorkTicket,
+        publication_projection_work: RequiredWorkTicket,
+        revocation_required_work: RequiredWorkTicket,
+        revocation_projection_work: RequiredWorkTicket,
+        transition_assistant: TransitionAssistantDraft | None = None,
+        required_trust_mode: ComposerTrustMode | None = None,
+        prepared_interpretations: tuple[PreparedInterpretationEventDraft, ...] = (),
+        running: ComposerOperationRunning | None = None,
+    ) -> ComposerPipelineFinishOnce:
+        if type(coordinator) is not RequiredWorkCoordinator:
+            raise AuditIntegrityError("required pipeline handoff needs its registered coordinator")
+        coordinator.validate_pipeline_publication_work(
+            publication_ticket=required_work,
+            projection_ticket=publication_projection_work,
+            revocation_ticket=revocation_required_work,
+            revocation_projection_ticket=revocation_projection_work,
+        )
+        work = PipelineFinishOnceWork(
+            coordinator, required_work, publication_projection_work, revocation_required_work, revocation_projection_work
+        )
+        for ticket, source in (
+            (publication_projection_work, RequiredWorkSource.PIPELINE_PUBLICATION_PROJECTION),
+            (revocation_required_work, RequiredWorkSource.TRUST_REVOCATION_SQL),
+            (revocation_projection_work, RequiredWorkSource.TRUST_REVOCATION_PROJECTION),
+        ):
+            _validate_required_sql_ticket(
+                ticket,
+                sources=(source,),
+                session_id=str(session_id),
+                context=session_operation_context,
+                running=running,
+                proposal_id=str(proposal_id),
+                tool_call_id=dispatch.tool_call_id,
+            )
+        try:
+            result = await self._settle_pipeline_composition_proposal(
+                session_id=session_id,
+                proposal_id=proposal_id,
+                draft_hash=draft_hash,
+                state=state,
+                candidate_content_hash=candidate_content_hash,
+                executor_content_hash=executor_content_hash,
+                final_composer_metadata=final_composer_metadata,
+                dispatch=dispatch,
+                actor=actor,
+                session_operation_context=session_operation_context,
+                transition_assistant=transition_assistant,
+                required_trust_mode=required_trust_mode,
+                prepared_interpretations=prepared_interpretations,
+                running=running,
+                required_work=required_work,
+                finish_once_work=work,
+            )
+        except BaseException as error:
+            if not required_work.complete:
+                raise
+            outcome = RequiredSQLRaised(error, ())
+            try:
+                metadata = coordinator.issue_publication_projection_unused(
+                    publication_ticket=required_work, projection_ticket=publication_projection_work, actual_outcome=outcome
+                )
+            except BaseException:
+                # A downstream unknown outcome is not a publication preflight
+                # failure. Preserve its actual custody signal and issue no arm.
+                raise error from error.__cause__
+            if metadata is None:
+                raise AuditIntegrityError("pipeline preflight failure lacks unused projection evidence") from error
+            for target in (revocation_required_work, revocation_projection_work):
+                target.complete_unused(
+                    coordinator.issue_revocation_work_unused(
+                        target_ticket=target, publication_ticket=required_work, publication_outcome=outcome
+                    )
+                )
+            return ComposerPipelineRaised(error, (), metadata.disposition, metadata)
+        if isinstance(result, (ComposerPipelineBusinessReturned, ComposerPipelineRevocationCompleted, ComposerPipelineRaised)):
+            return result
+        raise AuditIntegrityError("required pipeline settlement returned a legacy result")
+
+    async def _settle_pipeline_composition_proposal(
         self,
         *,
         session_id: UUID,
@@ -2897,7 +3378,11 @@ class SessionServiceImpl:
         transition_assistant: TransitionAssistantDraft | None = None,
         required_trust_mode: ComposerTrustMode | None = None,
         session_operation_context: SessionOperationContext,
-    ) -> PipelineProposalSettlementResult:
+        prepared_interpretations: tuple[PreparedInterpretationEventDraft, ...] = (),
+        running: ComposerOperationRunning | None = None,
+        required_work: RequiredWorkTicket | None = None,
+        finish_once_work: PipelineFinishOnceWork | None = None,
+    ) -> PipelineProposalSettlementResult | ComposerPipelineFinishOnce:
         """Atomically publish state and settle a verified pipeline proposal.
 
         ``required_trust_mode`` is the commit-boundary trust check
@@ -2912,28 +3397,80 @@ class SessionServiceImpl:
         retries are never stranded by a later downgrade. Manual review
         approval passes ``None``.
         """
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PIPELINE_PUBLICATION_SQL,),
+            session_id=str(session_id),
+            context=session_operation_context,
+            running=running,
+            proposal_id=str(proposal_id),
+            tool_call_id=dispatch.tool_call_id if type(dispatch) is PipelineDispatchAuditBinding else None,
+        )
         if type(dispatch) is not PipelineDispatchAuditBinding:
-            raise TypeError("dispatch must be an exact PipelineDispatchAuditBinding")
-        state_content_hash = _composition_state_data_content_hash(state)
+            _refuse_required_sql(required_work, TypeError("dispatch must be an exact PipelineDispatchAuditBinding"))
+        try:
+            state_content_hash = _composition_state_data_content_hash(state)
+            settled_state = replace(state, composer_meta=final_composer_metadata)
+            operation_kind = self._pipeline_settlement_operation_kind(session_operation_context)
+        except BaseException as error:
+            _refuse_required_sql(required_work, error)
         if candidate_content_hash != executor_content_hash or candidate_content_hash != state_content_hash:
-            raise AuditIntegrityError("pipeline candidate/executor/state content hash mismatch")
-        settled_state = replace(state, composer_meta=final_composer_metadata)
+            _refuse_required_sql(required_work, AuditIntegrityError("pipeline candidate/executor/state content hash mismatch"))
         if transition_assistant is not None and type(transition_assistant) is not TransitionAssistantDraft:
-            raise TypeError("transition_assistant must be an exact TransitionAssistantDraft")
+            _refuse_required_sql(required_work, TypeError("transition_assistant must be an exact TransitionAssistantDraft"))
         sid = str(session_id)
         pid = str(proposal_id)
-        operation_kind = self._pipeline_settlement_operation_kind(session_operation_context)
+        if type(prepared_interpretations) is not tuple or any(
+            type(item) is not PreparedInterpretationEventDraft for item in prepared_interpretations
+        ):
+            _refuse_required_sql(required_work, TypeError("pipeline interpretation cohort must be an exact prepared tuple"))
+        if len({item.event_id for item in prepared_interpretations}) != len(prepared_interpretations) or len(
+            {item.tool_call_id for item in prepared_interpretations}
+        ) != len(prepared_interpretations):
+            _refuse_required_sql(required_work, AuditIntegrityError("pipeline prepared cohort identities are duplicated"))
+        candidate_state_id = str(uuid.uuid4())
+        prepared_events: list[_PreparedPendingInterpretation] = []
+        for draft in prepared_interpretations:
+            try:
+                prepared = await self._prepare_or_create_pending_interpretation_event(
+                    session_id=session_id,
+                    composition_state_id=UUID(candidate_state_id),
+                    affected_node_id=draft.affected_node_id,
+                    tool_call_id=draft.tool_call_id,
+                    user_term=draft.user_term,
+                    kind=draft.kind,
+                    llm_draft=draft.llm_draft,
+                    model_identifier=draft.model_identifier,
+                    model_version=draft.model_version,
+                    provider=draft.provider,
+                    composer_skill_hash=draft.composer_skill_hash,
+                    surface_origin=draft.surface_origin,
+                    session_operation_context=session_operation_context,
+                    _event_id=draft.event_id,
+                    _prepare_only=True,
+                    proposed_state=settled_state,
+                    preparation_work=(
+                        RequiredWorkBinding(
+                            finish_once_work.coordinator,
+                            finish_once_work.publication.key.transition_ordinal,
+                            finish_once_work.publication.key.semantic_ordinal,
+                            RequiredWorkRole.TURN,
+                        )
+                        if finish_once_work is not None
+                        else None
+                    ),
+                )
+            except BaseException as error:
+                _refuse_required_sql(required_work, error)
+            if type(prepared) is not _PreparedPendingInterpretation:
+                _refuse_required_sql(required_work, AuditIntegrityError("pipeline review preparation returned an invalid package"))
+            prepared_events.append(prepared)
 
-        def _sync() -> tuple[PipelineProposalSettlementResult | TrustModeAutoCommitRevokedError, bool]:
+        def _sync() -> tuple[PipelinePublicationSQLResult | TrustModeAutoCommitRevokedError, bool]:
             with (
                 self._session_process_locked_begin(sid) as conn,
                 self._session_write_lock(conn, sid),
-                self._session_composer_mutation_transaction(
-                    conn,
-                    session_id=sid,
-                    session_operation_context=session_operation_context,
-                    expected_kind=operation_kind,
-                ),
+                contextlib.ExitStack() as publication_scope,
             ):
                 # Stamped under the lock, not at request entry: a settlement
                 # that waited on the session lock would otherwise record an
@@ -2998,49 +3535,14 @@ class SessionServiceImpl:
                         raise AuditIntegrityError("pipeline exact retry state content mismatch")
                     if deep_thaw(committed_record.composer_meta) != deep_thaw(final_composer_metadata):
                         raise AuditIntegrityError("pipeline exact retry final metadata mismatch")
-                    expected_terminal = _pipeline_accepted_payload(
-                        authority=authority,
-                        state_id=str(committed_record.id),
-                        state_content_hash=committed_hash,
-                        final_composer_metadata=final_composer_metadata,
-                        dispatch=dispatch,
-                    )
-                    if terminal_rows[0].payload != expected_terminal:
-                        raise AuditIntegrityError("pipeline exact retry terminal binding mismatch")
-                    transition_message = None
-                    if transition_assistant is not None:
-                        message_rows = conn.execute(
-                            select(chat_messages_table)
-                            .where(chat_messages_table.c.session_id == sid)
-                            .where(chat_messages_table.c.role == "assistant")
-                            .where(chat_messages_table.c.composition_state_id == str(committed_record.id))
-                            .where(chat_messages_table.c.writer_principal == "compose_loop")
-                        ).fetchall()
-                        matching_messages = [
-                            self._row_to_chat_message_record(message_row)
-                            for message_row in message_rows
-                            if message_row.content == transition_assistant.content
-                            and message_row.raw_content == transition_assistant.raw_content
-                        ]
-                        if len(matching_messages) > 1:
-                            raise AuditIntegrityError("committed transition assistant exact retry is ambiguous")
-                        if matching_messages:
-                            transition_message = matching_messages[0]
-                        else:
-                            transition_message = self._insert_transition_assistant(
-                                conn,
-                                session_id=sid,
-                                state_id=str(committed_record.id),
-                                content=transition_assistant.content,
-                                raw_content=transition_assistant.raw_content,
-                                created_at=now,
-                                session_operation_context=session_operation_context,
-                            )
                     return (
-                        PipelineProposalSettlementResult(
-                            proposal=replace(authority.row, pipeline_metadata=_pipeline_public_metadata(authority)),
-                            state=committed_record,
-                            transition_message=transition_message,
+                        self._read_pipeline_settlement_replay(
+                            conn,
+                            authority=authority,
+                            accepted_payload=terminal_rows[0].payload,
+                            candidate=committed_record,
+                            prepared_interpretations=prepared_interpretations,
+                            transition_assistant=transition_assistant,
                         ),
                         False,
                     )
@@ -3056,15 +3558,50 @@ class SessionServiceImpl:
                     # after this transaction commits.
                     current_trust_mode = conn.execute(select(sessions_table.c.trust_mode).where(sessions_table.c.id == sid)).scalar_one()
                     if current_trust_mode != required_trust_mode:
-                        _record_auto_commit_revocation_on_connection(
-                            conn,
-                            session_id=sid,
-                            proposal_id=pid,
-                            required_trust_mode=required_trust_mode,
-                            current_trust_mode=current_trust_mode,
-                            actor=actor,
-                            created_at=now,
-                        )
+                        if finish_once_work is not None:
+                            if running is None or current_trust_mode != "explicit_approve" or required_trust_mode != "auto_commit":
+                                raise AuditIntegrityError("required revocation lacks exact durable trust eligibility")
+                            binding = prove_revocation_composer_binding_on_connection(
+                                conn,
+                                running,
+                                user_message_id=authority.row.user_message_id,
+                                actor=authority.creation_actor if authority.creation_actor is not None else "",
+                            )
+                            require_composer_settlement_actor_on_connection(conn, running, actor=actor)
+                            if authority.creation_schema != "pipeline_proposal_created.v3" or authority.composer_operation != binding:
+                                raise AuditIntegrityError("required revocation creation binding mismatch")
+                            return _ComposerRevocationRequired(running, authority, dispatch, actor, state_content_hash), False
+                        if running is not None:
+                            self._record_composer_revocation_on_connection(
+                                conn,
+                                running=running,
+                                authority=authority,
+                                dispatch=dispatch,
+                                actor=actor,
+                                current_trust_mode=current_trust_mode,
+                                expected_content_hash=state_content_hash,
+                            )
+                        else:
+                            # Retained synchronous authority still obtains the complete
+                            # normal guard; only the exact durable revocation proof may
+                            # cross Stop/deadline, and it exposes no business mutation.
+                            publication_scope.enter_context(
+                                self._session_composer_mutation_transaction(
+                                    conn,
+                                    session_id=sid,
+                                    session_operation_context=session_operation_context,
+                                    expected_kind=operation_kind,
+                                )
+                            )
+                            _record_auto_commit_revocation_on_connection(
+                                conn,
+                                session_id=sid,
+                                proposal_id=pid,
+                                required_trust_mode=required_trust_mode,
+                                current_trust_mode=current_trust_mode,
+                                actor=actor,
+                                created_at=now,
+                            )
                         return (
                             TrustModeAutoCommitRevokedError(
                                 sid,
@@ -3074,6 +3611,33 @@ class SessionServiceImpl:
                             False,
                         )
 
+                # ALL normal business DML below retains the existing exact live
+                # operation authority, including durable Stop and DB deadline.
+                # The committed branch above has no DML. The preceding sealed
+                # branch only emits exact operation-bound revocation evidence.
+                publication_scope.enter_context(
+                    self._session_composer_mutation_transaction(
+                        conn,
+                        session_id=sid,
+                        session_operation_context=session_operation_context,
+                        expected_kind=operation_kind,
+                    )
+                )
+                settlement_binding = derive_proposal_composer_binding_on_connection(
+                    conn,
+                    session_operation_context,
+                    user_message_id=authority.row.user_message_id,
+                    actor=authority.creation_actor if authority.creation_actor is not None else actor,
+                    running=running,
+                )
+                if settlement_binding is not None:
+                    if (
+                        running is None
+                        or authority.creation_schema != "pipeline_proposal_created.v3"
+                        or authority.composer_operation != settlement_binding
+                    ):
+                        raise AuditIntegrityError("durable auto-settlement requires this operation's v3 creation")
+                    require_composer_settlement_actor_on_connection(conn, running, actor=actor)
                 current_row = conn.execute(
                     select(composition_states_table)
                     .where(composition_states_table.c.session_id == sid)
@@ -3102,15 +3666,90 @@ class SessionServiceImpl:
                     provenance="tool_call",
                     created_at=now,
                     session_operation_context=session_operation_context,
+                    state_id=candidate_state_id,
                 )
+                candidate_row = conn.execute(
+                    select(composition_states_table).where(
+                        composition_states_table.c.session_id == sid,
+                        composition_states_table.c.id == state_id,
+                    )
+                ).one()
+                accepted_state = self._row_to_state_record(candidate_row)
+                final_state = accepted_state
+                cohort: list[ReviewCohortMember] = []
+                interpretation_events: list[InterpretationEventRecord] = []
+                mutation_state = _RepositoryMutationState(
+                    conn, session_id=sid, database_now=database_now(conn), operation_context=session_operation_context
+                )
+                try:
+                    mutations = _RepositoryInterpretationMutations(mutation_state)
+                    for ordinal, (draft, prepared) in enumerate(zip(prepared_interpretations, prepared_events, strict=True)):
+                        inserted = mutations.create_pipeline_candidate_pending(prepared.command, prepared.validator)
+                        if inserted.event.id != draft.event_id or inserted.event.composition_state_id != UUID(state_id):
+                            raise AuditIntegrityError("pipeline review result is not candidate-bound")
+                        interpretation_events.append(inserted.event)
+                        if inserted.produced_state is not None:
+                            final_state = inserted.produced_state
+                        cohort.append(
+                            review_cohort_member(
+                                draft,
+                                candidate_id=state_id,
+                                ordinal=ordinal,
+                                event=inserted.event,
+                                produced_state=inserted.produced_state,
+                                produced_hash=composition_content_hash(state_from_record(inserted.produced_state))
+                                if inserted.produced_state is not None
+                                else None,
+                            )
+                        )
+                finally:
+                    mutation_state._close()
+                transition_message = None
+                assistant_binding = None
+                if transition_assistant is not None:
+                    transition_message = self._insert_transition_assistant(
+                        conn,
+                        session_id=sid,
+                        state_id=str(final_state.id),
+                        content=transition_assistant.content,
+                        raw_content=transition_assistant.raw_content,
+                        created_at=now,
+                        session_operation_context=session_operation_context,
+                    )
+                    assistant_binding = TransitionAssistantBinding(
+                        message_id=str(transition_message.id),
+                        final_state_id=str(final_state.id),
+                        content_hash=hashlib.sha256(transition_message.content.encode("utf-8")).hexdigest(),
+                        raw_content_hash=hashlib.sha256(transition_message.raw_content.encode("utf-8")).hexdigest()
+                        if transition_message.raw_content is not None
+                        else None,
+                    )
                 event_id = str(uuid.uuid4())
-                terminal_payload = _pipeline_accepted_payload(
+                legacy_payload = _pipeline_accepted_payload(
                     authority=authority,
                     state_id=state_id,
                     state_content_hash=state_content_hash,
                     final_composer_metadata=final_composer_metadata,
                     dispatch=dispatch,
                 )
+                terminal_payload = PipelineAcceptedEvidence(
+                    schema="pipeline_proposal_accepted.v2",
+                    tool_call_id=authority.row.tool_call_id,
+                    tool_name="set_pipeline",
+                    status="committed",
+                    outcome="accepted",
+                    draft_hash=authority.proposal.draft_hash,
+                    committed_state_id=state_id,
+                    committed_state_content_hash=state_content_hash,
+                    final_composer_metadata_hash=legacy_payload["final_composer_metadata_hash"],
+                    dispatch=PipelineDispatchEvidence.model_validate(dispatch.to_dict()),
+                    creation_composer_operation=authority.composer_operation,
+                    settlement_composer_operation=settlement_binding,
+                    review_cohort=tuple(cohort),
+                    final_state_id=str(final_state.id),
+                    final_state_content_hash=composition_content_hash(state_from_record(final_state)),
+                    transition_assistant=assistant_binding,
+                ).model_dump(mode="json", by_alias=True)
                 conn.execute(
                     insert(proposal_events_table).values(
                         id=event_id,
@@ -3146,37 +3785,35 @@ class SessionServiceImpl:
                     .where(composition_proposals_table.c.session_id == sid)
                     .where(composition_proposals_table.c.id == pid)
                 ).one()
-                state_row = conn.execute(
-                    select(composition_states_table)
-                    .where(composition_states_table.c.session_id == sid)
-                    .where(composition_states_table.c.id == state_id)
-                ).one()
-                transition_message = None
-                if transition_assistant is not None:
-                    transition_message = self._insert_transition_assistant(
-                        conn,
-                        session_id=sid,
-                        state_id=state_id,
-                        content=transition_assistant.content,
-                        raw_content=transition_assistant.raw_content,
-                        created_at=now,
-                        session_operation_context=session_operation_context,
-                    )
                 return (
                     PipelineProposalSettlementResult(
                         proposal=replace(
                             _proposal_record_from_row(settled_row),
                             pipeline_metadata=_pipeline_public_metadata(authority),
                         ),
-                        state=self._row_to_state_record(state_row),
+                        state=final_state,
+                        accepted_state=accepted_state,
+                        interpretation_events=tuple(interpretation_events),
                         transition_message=transition_message,
                     ),
                     True,
                 )
 
+        if finish_once_work is not None:
+
+            def _publication() -> PipelinePublicationSQLResult:
+                actual, transitioned = _sync()
+                if isinstance(actual, TrustModeAutoCommitRevokedError):
+                    raise AuditIntegrityError("required publication returned legacy revocation")
+                if transitioned:
+                    _PIPELINE_SETTLEMENT_COUNTER.add(1, {"surface": "freeform", "result": "accepted"})
+                return actual
+
+            return await self._run_pipeline_publication_finish_once(finish_once_work, _publication)
+
         result, transitioned = cast(
             tuple[PipelineProposalSettlementResult | TrustModeAutoCommitRevokedError, bool],
-            await self._run_sync(_sync),
+            await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync),
         )
         if type(result) is TrustModeAutoCommitRevokedError:
             raise result
@@ -3189,20 +3826,411 @@ class SessionServiceImpl:
             )
         return settled_result
 
+    async def _run_pipeline_publication_finish_once(
+        self,
+        work: PipelineFinishOnceWork,
+        publication: Callable[[], PipelinePublicationSQLResult],
+    ) -> ComposerPipelineFinishOnce:
+        outcome = await run_required_sql_finish_once(work.publication, publication)
+        metadata = work.coordinator.issue_publication_projection_unused(
+            publication_ticket=work.publication,
+            projection_ticket=work.publication_projection,
+            actual_outcome=outcome,
+        )
+        if metadata is None or isinstance(outcome, RequiredSQLRaised):
+            for target in (work.revocation, work.revocation_projection):
+                target.complete_unused(
+                    work.coordinator.issue_revocation_work_unused(
+                        target_ticket=target,
+                        publication_ticket=work.publication,
+                        publication_outcome=outcome,
+                    )
+                )
+            if isinstance(outcome, RequiredSQLRaised):
+                if metadata is None:
+                    raise AuditIntegrityError("failed publication lacks exact projection disposition")
+                return ComposerPipelineRaised(outcome.error, outcome.deferred_cancellations, metadata.disposition, metadata)
+            if not isinstance(outcome.value, PipelineProposalSettlementResult):
+                raise AuditIntegrityError("business publication lacks an owned settlement result")
+            return ComposerPipelineBusinessReturned(outcome.value, outcome.deferred_cancellations)
+        eligibility = outcome.value
+        if type(eligibility) is not _ComposerRevocationRequired:
+            raise AuditIntegrityError("required publication eligibility is not owned")
+        revocation = await run_required_sql_finish_once(
+            work.revocation,
+            self._record_required_composer_revocation_sync,
+            eligibility,
+        )
+        cancellations = list(outcome.deferred_cancellations)
+        for cancellation in revocation.deferred_cancellations:
+            if not any(cancellation is retained for retained in cancellations):
+                cancellations.append(cancellation)
+        if isinstance(revocation, RequiredSQLRaised):
+            work.revocation_projection.complete_unused(
+                work.coordinator.issue_revocation_work_unused(
+                    target_ticket=work.revocation_projection,
+                    publication_ticket=work.publication,
+                    publication_outcome=outcome,
+                    revocation_ticket=work.revocation,
+                    revocation_outcome=revocation,
+                )
+            )
+            return ComposerPipelineRaised(revocation.error, tuple(cancellations), metadata.disposition, metadata)
+        work.revocation_projection.begin_projection()
+        try:
+            event = decode_composer_revocation_result(revocation.value)
+        except BaseException as error:
+            work.revocation_projection.complete_owned(error)
+            return ComposerPipelineRaised(error, tuple(cancellations), metadata.disposition, metadata)
+        work.revocation_projection.complete_owned()
+        if metadata.disposition is not PublicationProjectionDisposition.ELIGIBILITY_SELECTED:
+            raise AuditIntegrityError("revocation projection disposition lost actual eligibility")
+        return ComposerPipelineRevocationCompleted(
+            event, tuple(cancellations), PublicationProjectionDisposition.ELIGIBILITY_SELECTED, metadata
+        )
+
+    def _record_required_composer_revocation_sync(
+        self,
+        eligibility: _ComposerRevocationRequired,
+    ) -> ComposerRevocationSQLResult:
+        """Re-prove sealed evidence under a distinct locked transaction."""
+        if type(eligibility) is not _ComposerRevocationRequired:
+            raise AuditIntegrityError("required revocation needs owned publication eligibility")
+        sid = str(eligibility.authority.row.session_id)
+        pid = str(eligibility.authority.row.id)
+        with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+            row = conn.execute(
+                select(composition_proposals_table).where(
+                    composition_proposals_table.c.session_id == sid, composition_proposals_table.c.id == pid
+                )
+            ).one()
+            creations = conn.execute(
+                select(proposal_events_table).where(
+                    proposal_events_table.c.session_id == sid,
+                    proposal_events_table.c.proposal_id == pid,
+                    proposal_events_table.c.event_type == "proposal.created",
+                )
+            ).all()
+            if len(creations) != 1:
+                raise AuditIntegrityError("required revocation creation authority changed")
+            current = _restore_authoritative_pipeline_proposal(
+                row=_proposal_record_from_row(row), creation_event=_proposal_event_record_from_row(creations[0])
+            )
+            _verify_pipeline_lifecycle_authority(conn, service=self, authority=current)
+            if current != eligibility.authority:
+                raise AuditIntegrityError("required revocation immutable proposal authority changed")
+            record = self._record_composer_revocation_on_connection(
+                conn,
+                running=eligibility.running,
+                authority=current,
+                dispatch=eligibility.dispatch,
+                actor=eligibility.actor,
+                current_trust_mode=eligibility.current_trust_mode,
+                expected_content_hash=eligibility.expected_content_hash,
+            )
+            if current.composer_operation is None or current.row.user_message_id is None:
+                raise AuditIntegrityError("required revocation lacks immutable operation/user binding")
+            expected = ComposerRevocationEvidence(
+                schema="auto_commit.revoked.v2",
+                required_trust_mode=eligibility.required_trust_mode,
+                current_trust_mode=eligibility.current_trust_mode,
+                composer_operation=current.composer_operation,
+                proposal_id=pid,
+                user_message_id=str(current.row.user_message_id),
+                tool_call_id=current.row.tool_call_id,
+                dispatch=PipelineDispatchEvidence.model_validate(eligibility.dispatch.to_dict()),
+            )
+            return ComposerRevocationSQLResult(record, ComposerRevocationExpected(sid, pid, eligibility.actor, expected))
+
+    def _record_composer_revocation_on_connection(
+        self,
+        conn: Connection,
+        *,
+        running: ComposerOperationRunning,
+        authority: AuthoritativePipelineProposal,
+        dispatch: PipelineDispatchAuditBinding,
+        actor: str,
+        current_trust_mode: str,
+        expected_content_hash: str,
+    ) -> ProposalEventRecord:
+        """Sealed operation-bound evidence; never grants business mutation authority."""
+        binding = prove_revocation_composer_binding_on_connection(
+            conn,
+            running,
+            user_message_id=authority.row.user_message_id,
+            actor=authority.creation_actor if authority.creation_actor is not None else "",
+        )
+        require_composer_settlement_actor_on_connection(conn, running, actor=actor)
+        if (
+            authority.creation_schema != "pipeline_proposal_created.v3"
+            or authority.composer_operation != binding
+            or authority.row.session_id != running.claim.session_id
+            or authority.row.status != "pending"
+            or authority.row.user_message_id is None
+            or current_trust_mode != "explicit_approve"
+        ):
+            raise AuditIntegrityError("sealed revocation proposal/operation/trust mismatch")
+        sid, pid = str(authority.row.session_id), str(authority.row.id)
+        terminals = conn.execute(
+            select(proposal_events_table.c.id)
+            .where(
+                proposal_events_table.c.session_id == sid,
+                proposal_events_table.c.proposal_id == pid,
+                proposal_events_table.c.event_type.in_(("proposal.accepted", "proposal.rejected")),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        current = conn.execute(select(sessions_table.c.trust_mode).where(sessions_table.c.id == sid)).scalar_one()
+        if terminals is not None or current != current_trust_mode:
+            raise AuditIntegrityError("sealed revocation pending/trust authority changed")
+        if (
+            dispatch.tool_call_id != authority.row.tool_call_id
+            or dispatch.arguments_hash != semantic_redacted_pipeline_arguments_hash(authority.row.arguments_redacted_json)
+            or _persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch) != (expected_content_hash,)
+        ):
+            raise AuditIntegrityError("sealed revocation lacks exact successful dispatch authority")
+        payload = ComposerRevocationEvidence(
+            schema="auto_commit.revoked.v2",
+            required_trust_mode="auto_commit",
+            current_trust_mode="explicit_approve",
+            composer_operation=binding,
+            proposal_id=pid,
+            user_message_id=str(authority.row.user_message_id),
+            tool_call_id=authority.row.tool_call_id,
+            dispatch=PipelineDispatchEvidence.model_validate(dispatch.to_dict()),
+        ).model_dump(mode="json", by_alias=True)
+        existing = conn.execute(
+            select(proposal_events_table).where(
+                proposal_events_table.c.session_id == sid,
+                proposal_events_table.c.proposal_id == pid,
+                proposal_events_table.c.event_type == "auto_commit.revoked",
+            )
+        ).all()
+        if len(existing) > 1:
+            raise AuditIntegrityError("sealed revocation authority is duplicated")
+        if existing:
+            record = _proposal_event_record_from_row(existing[0])
+            if record.actor != actor or deep_thaw(record.payload) != payload:
+                raise AuditIntegrityError("sealed revocation immutable replay mismatch")
+            return record
+        event_id = str(uuid.uuid4())
+        conn.execute(
+            insert(proposal_events_table).values(
+                id=event_id,
+                session_id=sid,
+                proposal_id=pid,
+                event_type="auto_commit.revoked",
+                actor=actor,
+                payload=payload,
+                created_at=self._now(),
+            )
+        )
+        return _proposal_event_record_from_row(
+            conn.execute(select(proposal_events_table).where(proposal_events_table.c.id == event_id)).one()
+        )
+
+    def _read_pipeline_settlement_replay(
+        self,
+        conn: Connection,
+        *,
+        authority: AuthoritativePipelineProposal,
+        accepted_payload: object,
+        candidate: CompositionStateRecord,
+        prepared_interpretations: tuple[PreparedInterpretationEventDraft, ...],
+        transition_assistant: TransitionAssistantDraft | None,
+        verify_requested_assistant: bool = True,
+    ) -> PipelineProposalSettlementResult:
+        try:
+            accepted = PipelineAcceptedEvidence.model_validate_json(canonical_json(accepted_payload))
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise AuditIntegrityError("pipeline replay requires complete closed accepted-v2 evidence") from exc
+        if accepted.creation_composer_operation != authority.composer_operation or accepted.committed_state_id != str(candidate.id):
+            raise AuditIntegrityError("pipeline replay candidate/creation binding mismatch")
+        for binding in (accepted.creation_composer_operation, accepted.settlement_composer_operation):
+            if binding is not None:
+                verify_historical_proposal_composer_binding_on_connection(
+                    conn,
+                    binding=binding,
+                    session_id=authority.row.session_id,
+                    user_message_id=authority.row.user_message_id,
+                    actor=authority.creation_actor,
+                )
+        if len(prepared_interpretations) != len(accepted.review_cohort):
+            raise AuditIntegrityError("pipeline replay semantic cohort length mismatch")
+        sid = str(authority.row.session_id)
+        previous = candidate
+        events: list[InterpretationEventRecord] = []
+        for ordinal, (draft, member) in enumerate(zip(prepared_interpretations, accepted.review_cohort, strict=True)):
+            if review_semantic_material(draft, candidate_id=str(candidate.id), ordinal=ordinal) != member.semantic_material:
+                raise AuditIntegrityError("pipeline replay ordered semantic cohort mismatch")
+            event_row = conn.execute(
+                select(interpretation_events_table).where(
+                    interpretation_events_table.c.session_id == sid,
+                    interpretation_events_table.c.id == member.event_id,
+                )
+            ).one_or_none()
+            if event_row is None:
+                raise AuditIntegrityError("pipeline replay bound review event missing")
+            event = _interpretation_event_record_from_row(event_row)
+            verify_review_event_material(member, event)
+            events.append(event)
+            if member.produced_state_id is not None:
+                produced_row = conn.execute(
+                    select(composition_states_table).where(
+                        composition_states_table.c.session_id == sid,
+                        composition_states_table.c.id == member.produced_state_id,
+                    )
+                ).one_or_none()
+                if produced_row is None or produced_row.provenance != "interpretation_resolve":
+                    raise AuditIntegrityError("pipeline replay bound derived state missing or misattributed")
+                produced = self._row_to_state_record(produced_row)
+                if composition_content_hash(state_from_record(produced)) != member.produced_state_content_hash:
+                    raise AuditIntegrityError("pipeline replay derived content mismatch")
+                verify_opt_out_transformation(member, previous=previous, produced=produced)
+                previous = produced
+        if (
+            str(previous.id) != accepted.final_state_id
+            or composition_content_hash(state_from_record(previous)) != accepted.final_state_content_hash
+        ):
+            raise AuditIntegrityError("pipeline replay explicit final head mismatch")
+        assistant = accepted.transition_assistant
+        transition_message = None
+        if assistant is None:
+            if verify_requested_assistant and transition_assistant is not None:
+                raise AuditIntegrityError("pipeline replay cannot add an omitted assistant")
+        else:
+            message_row = conn.execute(
+                select(chat_messages_table).where(
+                    chat_messages_table.c.session_id == sid,
+                    chat_messages_table.c.id == assistant.message_id,
+                )
+            ).one_or_none()
+            if message_row is None:
+                raise AuditIntegrityError("pipeline replay bound assistant missing")
+            transition_message = self._row_to_chat_message_record(message_row)
+            if (
+                message_row.role != "assistant"
+                or message_row.writer_principal != "compose_loop"
+                or message_row.composition_state_id != accepted.final_state_id
+                or hashlib.sha256(message_row.content.encode("utf-8")).hexdigest() != assistant.content_hash
+                or (hashlib.sha256(message_row.raw_content.encode("utf-8")).hexdigest() if message_row.raw_content is not None else None)
+                != assistant.raw_content_hash
+                or (
+                    verify_requested_assistant
+                    and (
+                        transition_assistant is None
+                        or message_row.content != transition_assistant.content
+                        or message_row.raw_content != transition_assistant.raw_content
+                    )
+                )
+            ):
+                raise AuditIntegrityError("pipeline replay assistant immutable binding mismatch")
+        return PipelineProposalSettlementResult(
+            proposal=replace(authority.row, pipeline_metadata=_pipeline_public_metadata(authority)),
+            state=previous,
+            accepted_state=candidate,
+            interpretation_events=tuple(events),
+            transition_message=transition_message,
+        )
+
+    async def replay_pipeline_composition_proposal(
+        self,
+        *,
+        authority: AuthoritativePipelineProposal,
+        prepared_interpretations: tuple[PreparedInterpretationEventDraft, ...],
+        required_work: RequiredWorkTicket | None = None,
+    ) -> PipelineProposalSettlementResult:
+        """Read only the complete committed cohort and explicit final head."""
+        if type(authority) is not AuthoritativePipelineProposal:
+            _refuse_required_sql(required_work, TypeError("pipeline replay requires exact proposal authority"))
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.POSTCOMMIT_REVIEW_READ_SQL,),
+            session_id=str(authority.row.session_id),
+            proposal_id=str(authority.row.id),
+            tool_call_id=authority.row.tool_call_id,
+        )
+        if type(prepared_interpretations) is not tuple or any(
+            type(item) is not PreparedInterpretationEventDraft for item in prepared_interpretations
+        ):
+            _refuse_required_sql(required_work, TypeError("pipeline replay requires an exact prepared tuple"))
+        sid, pid = str(authority.row.session_id), str(authority.row.id)
+
+        def _sync() -> PipelineProposalSettlementResult:
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    select(composition_proposals_table).where(
+                        composition_proposals_table.c.session_id == sid,
+                        composition_proposals_table.c.id == pid,
+                    )
+                ).one_or_none()
+                creations = conn.execute(
+                    select(proposal_events_table).where(
+                        proposal_events_table.c.session_id == sid,
+                        proposal_events_table.c.proposal_id == pid,
+                        proposal_events_table.c.event_type == "proposal.created",
+                    )
+                ).all()
+                if row is None or len(creations) != 1:
+                    raise AuditIntegrityError("pipeline replay creation authority missing or ambiguous")
+                current = _restore_authoritative_pipeline_proposal(
+                    row=_proposal_record_from_row(row), creation_event=_proposal_event_record_from_row(creations[0])
+                )
+                if current != authority or current.row.status != "committed" or current.row.committed_state_id is None:
+                    raise AuditIntegrityError("pipeline replay proposal authority changed")
+                _verify_pipeline_lifecycle_authority(conn, service=self, authority=current)
+                candidate_row = conn.execute(
+                    select(composition_states_table).where(
+                        composition_states_table.c.session_id == sid,
+                        composition_states_table.c.id == str(current.row.committed_state_id),
+                    )
+                ).one_or_none()
+                terminals = conn.execute(
+                    select(proposal_events_table).where(
+                        proposal_events_table.c.session_id == sid,
+                        proposal_events_table.c.proposal_id == pid,
+                        proposal_events_table.c.event_type == "proposal.accepted",
+                    )
+                ).all()
+                if candidate_row is None or len(terminals) != 1:
+                    raise AuditIntegrityError("pipeline replay committed authority missing or ambiguous")
+                return self._read_pipeline_settlement_replay(
+                    conn,
+                    authority=current,
+                    accepted_payload=terminals[0].payload,
+                    candidate=self._row_to_state_record(candidate_row),
+                    prepared_interpretations=prepared_interpretations,
+                    transition_assistant=None,
+                    verify_requested_assistant=False,
+                )
+
+        return await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+
     async def get_pipeline_dispatch_recovery(
         self,
         *,
         authority: AuthoritativePipelineProposal,
+        required_work: RequiredWorkTicket | None = None,
     ) -> PipelineDispatchRecovery | None:
         """Return one content-bound durable dispatch for pending recovery."""
         if type(authority) is not AuthoritativePipelineProposal:
-            raise TypeError("authority must be an exact AuthoritativePipelineProposal")
+            _refuse_required_sql(required_work, TypeError("authority must be an exact AuthoritativePipelineProposal"))
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PREPARATION_READ_SQL,),
+            session_id=str(authority.row.session_id),
+            proposal_id=str(authority.row.id),
+            tool_call_id=authority.row.tool_call_id,
+        )
 
         def _sync() -> PipelineDispatchRecovery | None:
             with self._engine.begin() as conn:
                 return self._pipeline_dispatch_recovery_on_connection(conn, authority=authority)
 
-        return cast(PipelineDispatchRecovery | None, await self._run_sync(_sync))
+        return cast(
+            PipelineDispatchRecovery | None,
+            await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync),
+        )
 
     async def reject_pipeline_composition_proposal(
         self,
@@ -3215,6 +4243,133 @@ class SessionServiceImpl:
         actor: str,
         session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord:
+        result = await self._reject_pipeline_composition_proposal(
+            session_id=session_id,
+            proposal_id=proposal_id,
+            draft_hash=draft_hash,
+            reason=reason,
+            dispatch=dispatch,
+            actor=actor,
+            session_operation_context=session_operation_context,
+        )
+        if type(result) is not CompositionProposalRecord:
+            raise AuditIntegrityError("legacy rejection returned required custody outcome")
+        return result
+
+    async def reject_pipeline_composition_proposal_finish_once(
+        self,
+        *,
+        expected: PipelineRejectionExpected,
+        coordinator: RequiredWorkCoordinator,
+        rejection_work: RequiredWorkTicket,
+        rejection_projection_work: RequiredWorkTicket,
+        transition_ordinal: int,
+        semantic_ordinal: int,
+    ) -> PipelineRejectionFinishOnce:
+        if type(coordinator) is not RequiredWorkCoordinator or type(expected) is not PipelineRejectionExpected:
+            raise AuditIntegrityError("rejection requires nominal independent custody")
+        # Pair ownership is proved before recording refusal; foreign work is never completed.
+        coordinator.validate_proposal_rejection_work(
+            rejection_ticket=rejection_work,
+            projection_ticket=rejection_projection_work,
+            transition_ordinal=transition_ordinal,
+            semantic_ordinal=semantic_ordinal,
+        )
+        outcome: CompositionProposalRecord | RequiredSQLFinishOnce[PipelineRejectionSQLResult]
+        try:
+            with _required_sql_preflight(rejection_work):
+                if type(expected.authority) is not AuthoritativePipelineProposal:
+                    raise AuditIntegrityError("rejection requires independently restored authority")
+                row = expected.authority.row
+                if type(row) is not CompositionProposalRecord or type(expected.context) is not SessionOperationContext:
+                    raise AuditIntegrityError("rejection requires exact proposal and operation context")
+                if type(expected.actor_user_id) is not str or not expected.actor_user_id:
+                    raise AuditIntegrityError("rejection requires independent authenticated principal")
+                allowed_actors = (
+                    f"user:{expected.actor_user_id}",
+                    f"system:pipeline_commit:user:{expected.actor_user_id}",
+                    "system:auto_reject_request_cancelled",
+                )
+                if expected.actor not in allowed_actors:
+                    raise AuditIntegrityError("rejection actor is outside its authenticated caller scope")
+                scope = rejection_work.key.authority
+                if (
+                    scope.context != expected.context
+                    or rejection_work.key.session_id != str(row.session_id)
+                    or scope.proposal_id != str(row.id)
+                    or scope.tool_call_id != row.tool_call_id
+                ):
+                    raise AuditIntegrityError("rejection receipt differs from independent proposal/fence scope")
+                if expected.running is None and (scope.durable_operation_id is not None or scope.claim_attempt is not None):
+                    raise AuditIntegrityError("durable rejection omitted actual running claim")
+                if expected.running is not None:
+                    if type(expected.running) is not ComposerOperationRunning:
+                        raise AuditIntegrityError("rejection supplied foreign running claim")
+                    if (
+                        expected.running.session_operation_context != expected.context
+                        or scope.durable_operation_id != expected.running.claim.operation_id
+                        or scope.claim_attempt != expected.running.claim.attempt
+                        or expected.running.claim.session_id != row.session_id
+                    ):
+                        raise AuditIntegrityError("rejection receipt differs from actual running claim")
+                self._pipeline_settlement_operation_kind(expected.context)
+                reason = _validated_pipeline_rejection_reason(expected.reason)
+                if reason == "candidate_executor_mismatch" and expected.dispatch is None:
+                    raise AuditIntegrityError("mismatch rejection omitted dispatch")
+                if expected.dispatch is not None and type(expected.dispatch) is not PipelineDispatchAuditBinding:
+                    raise AuditIntegrityError("rejection supplied foreign dispatch")
+        except BaseException as error:
+            # No known arm if actual SQL custody remains unresolved.
+            if not rejection_work.complete:
+                raise
+            outcome = RequiredSQLRaised(error, ())
+            rejection_work.observe_finish_once_handoff(outcome)
+        else:
+            outcome = await self._reject_pipeline_composition_proposal(
+                session_id=row.session_id,
+                proposal_id=row.id,
+                draft_hash=expected.authority.proposal.draft_hash,
+                reason=reason,
+                dispatch=expected.dispatch,
+                actor=expected.actor,
+                session_operation_context=expected.context,
+                expected=expected,
+                rejection_work=rejection_work,
+            )
+        if type(outcome) is RequiredSQLRaised:
+            unused = coordinator.issue_rejection_projection_unused(
+                rejection_ticket=rejection_work,
+                projection_ticket=rejection_projection_work,
+                actual_outcome=outcome,
+            )
+            if unused is None:
+                raise AuditIntegrityError("rejection failure lacks issued unused projection evidence")
+            return PipelineRejectionRaised(outcome, unused)
+        if type(outcome) is not RequiredSQLReturned:
+            raise AuditIntegrityError("required rejection returned legacy material")
+        returned = outcome
+        coordinator.verify_rejection_returned(rejection_ticket=rejection_work, actual_outcome=returned)
+        post_sql_failures: tuple[BaseException, ...] = ()
+        if returned.value.transitioned:
+            try:
+                _PIPELINE_SETTLEMENT_COUNTER.add(1, {"surface": "freeform", "result": expected.reason})
+            except BaseException as error:
+                post_sql_failures = (error,)
+        return PipelineRejectionReturned(returned, post_sql_failures)
+
+    async def _reject_pipeline_composition_proposal(
+        self,
+        *,
+        session_id: UUID,
+        proposal_id: UUID,
+        draft_hash: str,
+        reason: PipelineProposalRejectionReason,
+        dispatch: PipelineDispatchAuditBinding | None,
+        actor: str,
+        session_operation_context: SessionOperationContext,
+        expected: PipelineRejectionExpected | None = None,
+        rejection_work: RequiredWorkTicket | None = None,
+    ) -> CompositionProposalRecord | RequiredSQLFinishOnce[PipelineRejectionSQLResult]:
         """Atomically terminalise a pipeline proposal with a closed reason."""
         reason = _validated_pipeline_rejection_reason(reason)
         if reason == "candidate_executor_mismatch" and dispatch is None:
@@ -3225,7 +4380,7 @@ class SessionServiceImpl:
         pid = str(proposal_id)
         operation_kind = self._pipeline_settlement_operation_kind(session_operation_context)
 
-        def _sync() -> tuple[CompositionProposalRecord, bool]:
+        def _sync() -> PipelineRejectionWriteResult:
             with (
                 self._session_process_locked_begin(sid) as conn,
                 self._session_write_lock(conn, sid),
@@ -3260,6 +4415,24 @@ class SessionServiceImpl:
                     creation_event=_proposal_event_record_from_row(creation_rows[0]),
                 )
                 _verify_pipeline_lifecycle_authority(conn, service=self, authority=authority)
+                if expected is not None:
+                    enriched = replace(authority.row, pipeline_metadata=_pipeline_public_metadata(authority))
+                    if replace(authority, row=enriched) != expected.authority:
+                        raise AuditIntegrityError("rejection locked immutable authority changed")
+                    principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == sid)).scalar_one()
+                    if principal != expected.actor_user_id:
+                        raise AuditIntegrityError("rejection actor is not this session principal")
+                    binding = derive_proposal_composer_binding_on_connection(
+                        conn,
+                        session_operation_context,
+                        user_message_id=authority.row.user_message_id,
+                        actor=authority.creation_actor if authority.creation_actor is not None else actor,
+                        running=expected.running,
+                    )
+                    if binding is not None:
+                        if expected.running is None or authority.composer_operation != binding:
+                            raise AuditIntegrityError("rejection requires actual current durable creation binding")
+                        require_composer_settlement_actor_on_connection(conn, expected.running, actor=f"user:{expected.actor_user_id}")
                 if authority.proposal.draft_hash != draft_hash:
                     raise StaleComposeStateError("pipeline proposal draft hash echo is stale or mismatched")
                 if dispatch is not None:
@@ -3282,9 +4455,11 @@ class SessionServiceImpl:
                         or terminal_rows[0].event_type != "proposal.rejected"
                         or authority.row.audit_event_id != UUID(terminal_rows[0].id)
                         or terminal_rows[0].payload != expected_payload
+                        or (expected is not None and terminal_rows[0].actor != actor)
                     ):
                         raise AuditIntegrityError("rejected pipeline proposal terminal binding mismatch")
-                    return replace(authority.row, pipeline_metadata=_pipeline_public_metadata(authority)), False
+                    record = replace(authority.row, pipeline_metadata=_pipeline_public_metadata(authority))
+                    return PipelineRejectionWriteResult(record, _proposal_event_record_from_row(terminal_rows[0]), False)
                 if authority.row.status != "pending":
                     raise ValueError(f"Proposal {pid} must be pending to reject; got {authority.row.status!r}")
                 if terminal_rows:
@@ -3318,22 +4493,70 @@ class SessionServiceImpl:
                     .where(composition_proposals_table.c.session_id == sid)
                     .where(composition_proposals_table.c.id == pid)
                 ).one()
-                return (
-                    replace(
-                        _proposal_record_from_row(updated_row),
-                        pipeline_metadata=_pipeline_public_metadata(authority),
-                    ),
-                    True,
-                )
+                event_row = conn.execute(select(proposal_events_table).where(proposal_events_table.c.id == event_id)).one()
+                record = replace(_proposal_record_from_row(updated_row), pipeline_metadata=_pipeline_public_metadata(authority))
+                return PipelineRejectionWriteResult(record, _proposal_event_record_from_row(event_row), True)
 
-        result, transitioned = cast(tuple[CompositionProposalRecord, bool], await self._run_sync(_sync))
-        if transitioned:
-            assert result.pipeline_metadata is not None
-            _PIPELINE_SETTLEMENT_COUNTER.add(
-                1,
-                {"surface": "freeform", "result": reason},
+        if rejection_work is not None:
+            if expected is None:
+                raise AuditIntegrityError("required rejection omitted independent immutable expectation")
+            retained_expected = expected
+
+            def _required_sync() -> PipelineRejectionSQLResult:
+                written = _sync()
+                return PipelineRejectionSQLResult(written.record, written.event, retained_expected, written.transitioned)
+
+            return await run_required_sql_finish_once(rejection_work, _required_sync)
+        result: PipelineRejectionWriteResult = await self._run_sync(_sync)
+        if result.transitioned:
+            _PIPELINE_SETTLEMENT_COUNTER.add(1, {"surface": "freeform", "result": reason})
+        return result.record
+
+    def _list_composition_proposals_on_connection(
+        self,
+        conn: Connection,
+        *,
+        session_id: UUID,
+        status: ProposalLifecycleStatus | None = None,
+    ) -> tuple[CompositionProposalRecord, ...]:
+        sid = str(session_id)
+        stmt = select(composition_proposals_table).where(composition_proposals_table.c.session_id == sid)
+        if status is not None:
+            stmt = stmt.where(composition_proposals_table.c.status == status)
+        stmt = stmt.order_by(composition_proposals_table.c.created_at)
+        rows = conn.execute(stmt).fetchall()
+        records = [_proposal_record_from_row(row) for row in rows]
+        if not records:
+            return tuple(records)
+        creation_rows = conn.execute(
+            select(proposal_events_table)
+            .where(proposal_events_table.c.session_id == sid)
+            .where(proposal_events_table.c.event_type == "proposal.created")
+            .where(proposal_events_table.c.proposal_id.in_([str(record.id) for record in records]))
+        ).fetchall()
+        by_proposal: dict[str, list[Any]] = {str(record.id): [] for record in records}
+        for event_row in creation_rows:
+            if event_row.proposal_id not in by_proposal:
+                raise AuditIntegrityError("proposal creation event escaped the constrained proposal query")
+            by_proposal[event_row.proposal_id].append(event_row)
+        enriched: list[CompositionProposalRecord] = []
+        for record in records:
+            events = by_proposal[str(record.id)]
+            if len(events) != 1:
+                raise AuditIntegrityError("composition proposal must have exactly one creation event")
+            authority = _classify_authoritative_composition_proposal(
+                row=record,
+                creation_event=_proposal_event_record_from_row(events[0]),
             )
-        return result
+            if authority.pipeline is not None:
+                _verify_pipeline_lifecycle_authority(
+                    conn,
+                    service=self,
+                    authority=authority.pipeline,
+                )
+            metadata = _pipeline_public_metadata(authority.pipeline) if authority.pipeline is not None else None
+            enriched.append(replace(record, pipeline_metadata=metadata))
+        return tuple(enriched)
 
     async def list_composition_proposals(
         self,
@@ -3341,48 +4564,11 @@ class SessionServiceImpl:
         *,
         status: ProposalLifecycleStatus | None = None,
     ) -> list[CompositionProposalRecord]:
-        """List composer proposals for a session in creation order."""
-        sid = str(session_id)
+        """List strict authoritative proposals in creation order."""
 
         def _sync() -> list[CompositionProposalRecord]:
-            stmt = select(composition_proposals_table).where(composition_proposals_table.c.session_id == sid)
-            if status is not None:
-                stmt = stmt.where(composition_proposals_table.c.status == status)
-            stmt = stmt.order_by(composition_proposals_table.c.created_at)
             with self._engine.connect() as conn:
-                rows = conn.execute(stmt).fetchall()
-                records = [_proposal_record_from_row(row) for row in rows]
-                if not records:
-                    return records
-                creation_rows = conn.execute(
-                    select(proposal_events_table)
-                    .where(proposal_events_table.c.session_id == sid)
-                    .where(proposal_events_table.c.event_type == "proposal.created")
-                    .where(proposal_events_table.c.proposal_id.in_([str(record.id) for record in records]))
-                ).fetchall()
-                by_proposal: dict[str, list[Any]] = {str(record.id): [] for record in records}
-                for event_row in creation_rows:
-                    if event_row.proposal_id not in by_proposal:
-                        raise AuditIntegrityError("proposal creation event escaped the constrained proposal query")
-                    by_proposal[event_row.proposal_id].append(event_row)
-                enriched: list[CompositionProposalRecord] = []
-                for record in records:
-                    events = by_proposal[str(record.id)]
-                    if len(events) != 1:
-                        raise AuditIntegrityError("composition proposal must have exactly one creation event")
-                    authority = _classify_authoritative_composition_proposal(
-                        row=record,
-                        creation_event=_proposal_event_record_from_row(events[0]),
-                    )
-                    if authority.pipeline is not None:
-                        _verify_pipeline_lifecycle_authority(
-                            conn,
-                            service=self,
-                            authority=authority.pipeline,
-                        )
-                    metadata = _pipeline_public_metadata(authority.pipeline) if authority.pipeline is not None else None
-                    enriched.append(replace(record, pipeline_metadata=metadata))
-                return enriched
+                return list(self._list_composition_proposals_on_connection(conn, session_id=session_id, status=status))
 
         return cast(list[CompositionProposalRecord], await self._run_sync(_sync))
 
@@ -3605,6 +4791,7 @@ class SessionServiceImpl:
         _event_id: UUID | None = None,
         _prepare_only: bool = False,
         proposed_state: CompositionStateData | None = None,
+        preparation_work: RequiredWorkBinding | None = None,
     ) -> InterpretationEventRecord | _PreparedPendingInterpretation:
         """Insert a PENDING interpretation event.
 
@@ -3651,7 +4838,7 @@ class SessionServiceImpl:
         ):
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
         event_id = _event_id if _event_id is not None else uuid.uuid4()
-        principal_user_id, plugin_snapshot = await self._session_principal_context(sid)
+        principal_user_id, plugin_snapshot = await self._session_principal_context(sid, preparation_work=preparation_work)
         expected_anchor: CompositionStateRecord | None = None
         expected_live: CompositionStateRecord | None = None
         if proposed_state is None:
@@ -3664,6 +4851,7 @@ class SessionServiceImpl:
                 snapshot_config,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
+                preparation_work=preparation_work,
             )
             if snapshot_config is not None
             else None
@@ -4557,82 +5745,13 @@ class SessionServiceImpl:
             ),
         )
 
-    @staticmethod
-    def _existing_message_ingress_result(
-        conn: Connection,
-        *,
-        session_id: str,
-        client_request_id: UUID,
-        content: str,
-        requested_state_id: str | None,
-    ) -> MessageIngressAccepted | MessageIngressConflict | None:
-        receipt = conn.execute(
-            select(message_ingress_receipts_table).where(
-                message_ingress_receipts_table.c.session_id == session_id,
-                message_ingress_receipts_table.c.client_request_id == str(client_request_id),
-            )
-        ).one_or_none()
-        if receipt is None:
-            return None
-        accepted_message = conn.execute(
-            select(chat_messages_table).where(
-                chat_messages_table.c.session_id == session_id,
-                chat_messages_table.c.id == receipt.user_message_id,
-            )
-        ).one_or_none()
-        if accepted_message is None or accepted_message.role != "user" or accepted_message.writer_principal != "route_user_message":
-            raise AuditIntegrityError("Tier 1: message ingress receipt does not reference a route-owned user row")
-        result_type = (
-            MessageIngressAccepted
-            if accepted_message.content == content and receipt.requested_state_id == requested_state_id
-            else MessageIngressConflict
-        )
-        return result_type(client_request_id=client_request_id, user_message_id=UUID(receipt.user_message_id))
-
-    async def lookup_message_ingress(
-        self,
-        session_id: UUID,
-        *,
-        client_request_id: UUID,
-        content: str,
-        requested_state_id: UUID | None,
-        session_operation_context: SessionOperationContext,
-    ) -> MessageIngressAccepted | MessageIngressConflict | None:
-        """Read prior acceptance under the compose fence before state preflight.
-
-        A missing receipt remains provisional; the atomic insert checks again.
-        """
-        sid = str(session_id)
-        original_state_id = str(requested_state_id) if requested_state_id is not None else None
-
-        def _sync() -> MessageIngressAccepted | MessageIngressConflict | None:
-            with (
-                self._session_process_locked_begin(sid) as conn,
-                self._session_write_lock(conn, sid),
-                self._session_composer_mutation_transaction(
-                    conn,
-                    session_id=sid,
-                    session_operation_context=session_operation_context,
-                    expected_kind=SessionOperationKind.COMPOSE,
-                ),
-            ):
-                return self._existing_message_ingress_result(
-                    conn,
-                    session_id=sid,
-                    client_request_id=client_request_id,
-                    content=content,
-                    requested_state_id=original_state_id,
-                )
-
-        return cast(MessageIngressAccepted | MessageIngressConflict | None, await self._run_sync(_sync))
-
     async def add_message_with_transcript(
         self,
         session_id: UUID,
         role: ChatMessageRole,
         content: str,
         *,
-        client_request_id: UUID,
+        operation_id: UUID,
         requested_state_id: UUID | None,
         writer_principal: ChatMessageWriterPrincipal,
         tool_calls: Sequence[Mapping[str, Any]] | None = None,
@@ -4641,7 +5760,9 @@ class SessionServiceImpl:
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
-    ) -> MessageIngressFresh | MessageIngressAccepted | MessageIngressConflict:
+        running: ComposerOperationRunning,
+        required_work: RequiredWorkTicket | None = None,
+    ) -> MessageIngressFresh:
         """Accept one freeform user message and read its transcript in one transaction.
 
         Write-then-read split across two pooled connections is how the
@@ -4661,23 +5782,29 @@ class SessionServiceImpl:
         cross-session guard, sequence allocation under the write lock,
         and ``sessions.updated_at`` bump).
 
-        A same-session receipt binds the client key to the original content
-        and nullable requested state before sequence allocation. An exact
-        duplicate is an acceptance receipt, never a composition replay.
+        Durable admission owns replay. This transaction binds the one
+        running action, new user row and same-session ingress receipt.
         """
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.INGRESS_SQL,),
+            session_id=str(session_id),
+            context=session_operation_context,
+            running=running,
+        )
         if role != "user" or writer_principal != "route_user_message":
-            raise ValueError("message ingress requires a route-owned user message")
+            _refuse_required_sql(required_work, ValueError("message ingress requires a route-owned user message"))
         if raw_content is not None or tool_calls is not None or tool_call_id is not None or parent_assistant_id is not None:
-            raise ValueError("message ingress user row cannot carry provider or tool metadata")
+            _refuse_required_sql(required_work, ValueError("message ingress user row cannot carry provider or tool metadata"))
         now = self._now()
         sid = str(session_id)
         csid = str(composition_state_id) if composition_state_id else None
         requested_sid = str(requested_state_id) if requested_state_id else None
-        request_id = str(client_request_id)
+        request_id = str(operation_id)
         pid = str(parent_assistant_id) if parent_assistant_id else None
         msg_id_holder: dict[str, str] = {}
 
-        def _sync() -> Sequence[Any] | MessageIngressAccepted | MessageIngressConflict:
+        def _sync() -> Sequence[Any]:
             with (
                 self._session_process_locked_begin(sid) as conn,
                 self._session_write_lock(conn, sid),
@@ -4688,15 +5815,6 @@ class SessionServiceImpl:
                     expected_kind=SessionOperationKind.COMPOSE,
                 ),
             ):
-                existing = self._existing_message_ingress_result(
-                    conn,
-                    session_id=sid,
-                    client_request_id=client_request_id,
-                    content=content,
-                    requested_state_id=requested_sid,
-                )
-                if existing is not None:
-                    return existing
                 if requested_sid is not None:
                     _assert_state_in_session(
                         conn,
@@ -4730,10 +5848,17 @@ class SessionServiceImpl:
                     created_at=now,
                     session_operation_context=session_operation_context,
                 )
+                if (
+                    running.claim.session_id != session_id
+                    or running.claim.operation_id != request_id
+                    or running.session_operation_context != session_operation_context
+                ):
+                    raise AuditIntegrityError("composer ingress running authority mismatch")
+                bind_composer_operation_user_message_on_connection(conn, running, user_message_id=UUID(msg_id_holder["id"]))
                 self._insert_message_ingress_receipt(
                     conn,
                     session_id=sid,
-                    client_request_id=request_id,
+                    operation_id=request_id,
                     user_message_id=msg_id_holder["id"],
                     requested_state_id=requested_sid,
                     created_at=now,
@@ -4751,9 +5876,9 @@ class SessionServiceImpl:
                 ).fetchall()
                 return message_rows
 
-        sync_result = await self._run_sync(_sync)
-        if isinstance(sync_result, (MessageIngressAccepted, MessageIngressConflict)):
-            return sync_result
+        sync_result = (
+            await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+        )
         transcript = [self._row_to_chat_message_record(row) for row in sync_result]
         if not transcript or str(transcript[-1].id) != msg_id_holder["id"]:
             # By construction (single transaction, session write lock held
@@ -4766,12 +5891,12 @@ class SessionServiceImpl:
                 f"transaction snapshot for session {sid} does not end at "
                 f"inserted message {msg_id_holder['id']}."
             )
-        message = replace(transcript[-1], client_request_id=client_request_id)
+        message = replace(transcript[-1], operation_id=operation_id)
         transcript[-1] = message
-        return MessageIngressFresh(client_request_id=client_request_id, message=message, transcript=tuple(transcript))
+        return MessageIngressFresh(operation_id=operation_id, message=message, transcript=tuple(transcript))
 
-    def _row_to_chat_message_record(self, row: Any, *, client_request_id: str | None = None) -> ChatMessageRecord:
-        if client_request_id is not None and (row.role != "user" or row.writer_principal != "route_user_message"):
+    def _row_to_chat_message_record(self, row: Any, *, operation_id: str | None = None) -> ChatMessageRecord:
+        if operation_id is not None and (row.role != "user" or row.writer_principal != "route_user_message"):
             raise AuditIntegrityError("Tier 1: message ingress receipt is attached to a non-user message")
         return ChatMessageRecord(
             id=UUID(row.id),
@@ -4786,7 +5911,7 @@ class SessionServiceImpl:
             writer_principal=row.writer_principal,
             tool_call_id=row.tool_call_id,
             parent_assistant_id=UUID(row.parent_assistant_id) if row.parent_assistant_id else None,
-            client_request_id=UUID(client_request_id) if client_request_id is not None else None,
+            operation_id=UUID(operation_id) if operation_id is not None else None,
         )
 
     async def get_messages(
@@ -4794,6 +5919,8 @@ class SessionServiceImpl:
         session_id: UUID,
         limit: int | None = 100,
         offset: int = 0,
+        *,
+        required_work: RequiredWorkTicket | None = None,
     ) -> list[ChatMessageRecord]:
         """Get messages for a session, ordered by ``sequence_no`` ascending.
 
@@ -4806,10 +5933,12 @@ class SessionServiceImpl:
         makes the new key total within a session.
         """
 
+        _validate_required_sql_ticket(required_work, sources=(RequiredWorkSource.PREPARATION_READ_SQL,), session_id=str(session_id))
+
         def _sync() -> Sequence[Any]:
             with self._engine.connect() as conn:
                 message_rows = conn.execute(
-                    select(chat_messages_table, message_ingress_receipts_table.c.client_request_id)
+                    select(chat_messages_table, message_ingress_receipts_table.c.operation_id)
                     .select_from(
                         chat_messages_table.outerjoin(
                             message_ingress_receipts_table,
@@ -4824,9 +5953,9 @@ class SessionServiceImpl:
                 ).fetchall()
                 return message_rows
 
-        rows = await self._run_sync(_sync)
+        rows = await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync)
 
-        return [self._row_to_chat_message_record(row, client_request_id=row.client_request_id) for row in rows]
+        return [self._row_to_chat_message_record(row, operation_id=row.operation_id) for row in rows]
 
     def count_tool_responses_for_assistant(
         self,
@@ -4995,6 +6124,7 @@ class SessionServiceImpl:
         *,
         provenance: CompositionStateProvenance,
         session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket | None = None,
     ) -> CompositionStateRecord:
         """Save a new immutable composition state snapshot.
 
@@ -5015,20 +6145,34 @@ class SessionServiceImpl:
         state_id = uuid.uuid4()
         now = self._now()
         sid = str(session_id)
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.RECOVERY_PARTIAL_STATE_SQL),
+            session_id=sid,
+            context=session_operation_context,
+        )
         if type(session_operation_context) is not SessionOperationContext:
-            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+            _refuse_required_sql(required_work, TypeError("session_operation_context must be an exact SessionOperationContext"))
         if (
             session_operation_context.operation_kind is not SessionOperationKind.COMPOSE
             or session_operation_context.fence.session_id != sid
         ):
-            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
-        creation = SessionCompositionStateCreation(
-            id=state_id,
-            data=state,
-            provenance=provenance,
-            created_at=now,
-            derived_from_state_id=None,
-        )
+            _refuse_required_sql(required_work, SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH))
+        with _required_sql_preflight(required_work):
+            creation = SessionCompositionStateCreation(
+                id=state_id,
+                data=state,
+                provenance=provenance,
+                created_at=now,
+                derived_from_state_id=None,
+            )
+        if required_work is not None:
+            return await run_required_sql_in_worker(
+                required_work,
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.composition_states.append_state(creation),
+            )
         return cast(
             "CompositionStateRecord",
             await self._run_sync(
@@ -5210,8 +6354,12 @@ class SessionServiceImpl:
     async def get_current_state(
         self,
         session_id: UUID,
+        *,
+        required_work: RequiredWorkTicket | None = None,
     ) -> CompositionStateRecord | None:
         """Return the highest-version state for a session, or None."""
+
+        _validate_required_sql_ticket(required_work, sources=(RequiredWorkSource.PREPARATION_READ_SQL,), session_id=str(session_id))
 
         def _sync() -> Any:
             with self._engine.begin() as conn:
@@ -5222,7 +6370,7 @@ class SessionServiceImpl:
                     .limit(1)
                 ).fetchone()
 
-        row = await self._run_sync(_sync)
+        row = await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync)
 
         if row is None:
             return None
@@ -5494,21 +6642,64 @@ class SessionServiceImpl:
         return cast("tuple[str, ...]", await self._run_sync(_sync))
 
     async def begin_provider_attempt(
-        self, *, session_operation_context: SessionOperationContext, source: TokenUsageSource, run_id: UUID | None = None
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        source: TokenUsageSource,
+        run_id: UUID | None = None,
+        required_work: RequiredWorkTicket | None = None,
     ) -> ProviderAttempt:
         """Admit a provider dispatch and retain pending evidence before sending it."""
+        if type(session_operation_context) is not SessionOperationContext:
+            _refuse_required_sql(required_work, TypeError("provider admission requires an owned operation context"))
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_ADMISSION_SQL, RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL),
+            session_id=session_operation_context.fence.session_id,
+            context=session_operation_context,
+        )
+        if required_work is not None:
+            if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+                _refuse_required_sql(required_work, ValueError("required provider admission needs COMPOSE authority"))
+            expected_source = "auto_title" if required_work.key.source is RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL else "composer"
+            if source != expected_source or run_id is not None:
+                _refuse_required_sql(required_work, AuditIntegrityError("required provider admission role/source mismatch"))
+
+            def _required_admission() -> ProviderAttempt | _ProviderAdmissionRefused:
+                try:
+                    return self._begin_provider_attempt_sync(
+                        session_operation_context=session_operation_context, source=source, run_id=run_id
+                    )
+                except ChargeableAdmissionRefused as refusal:
+                    try:
+                        self._record_provider_attempt_quota_refusal_sync(session_operation_context, source, refusal)
+                    except BaseException as recorder_error:
+                        raise BaseExceptionGroup("provider admission refusal recording failed", [refusal, recorder_error]) from None
+                    return _ProviderAdmissionRefused(refusal)
+
+            outcome = await run_required_sql_in_worker(required_work, _required_admission)
+            if isinstance(outcome, _ProviderAdmissionRefused):
+                raise outcome.refusal
+            return outcome
+
+        def _sync() -> ProviderAttempt:
+            return self._begin_provider_attempt_sync(session_operation_context=session_operation_context, source=source, run_id=run_id)
+
+        compose_custody = (
+            type(session_operation_context) is SessionOperationContext
+            and session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+        )
         try:
-            return cast(
-                "ProviderAttempt",
-                await self._run_sync(
-                    self._begin_provider_attempt_sync,
-                    session_operation_context=session_operation_context,
-                    source=source,
-                    run_id=run_id,
-                ),
-            )
+            return await self._run_composer_sql(_sync) if compose_custody else await self._run_sync(_sync)
         except ChargeableAdmissionRefused as exc:
-            await self._run_sync(self._record_provider_attempt_quota_refusal_sync, session_operation_context, source, exc)
+
+            def _record_refusal(refusal: ChargeableAdmissionRefused = exc) -> None:
+                self._record_provider_attempt_quota_refusal_sync(session_operation_context, source, refusal)
+
+            if compose_custody:
+                await self._run_composer_sql(_record_refusal)
+            else:
+                await self._run_sync(_record_refusal)
             raise
 
     def begin_run_provider_attempt_sync(self, *, session_operation_context: SessionOperationContext, run_id: UUID) -> ProviderAttempt:
@@ -5565,21 +6756,53 @@ class SessionServiceImpl:
         session = self._row_to_session_record(row)
         self._quota_exceeded_recorder(self._quota_exceeded_outcome(session, exc.decision, operation=ChargeableOperation(source)))
 
-    async def finish_provider_attempt(self, *, session_operation_context: SessionOperationContext, call: ComposerLLMCall) -> None:
+    async def finish_provider_attempt(
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        call: ComposerLLMCall,
+        required_work: RequiredWorkTicket | None = None,
+    ) -> None:
         """Persist actual terminal call evidence and settle its ledger atomically."""
         from elspeth.web.composer.audit import llm_call_audit_envelope
 
-        if call.call_id is None:
-            raise AuditIntegrityError("A provider checkpoint requires its pending attempt identity")
-        await self.add_messages_atomic(
-            UUID(session_operation_context.fence.session_id),
-            (AuditMessageDraft(role="audit", content="Provider call result recorded.", tool_calls=(llm_call_audit_envelope(call),)),),
-            writer_principal="compose_loop",
-            session_operation_context=session_operation_context,
+        if type(session_operation_context) is not SessionOperationContext:
+            _refuse_required_sql(required_work, TypeError("provider settlement requires an owned operation context"))
+
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.TITLE_PROVIDER_SETTLEMENT_SQL),
+            session_id=session_operation_context.fence.session_id,
+            context=session_operation_context,
         )
 
+        with _required_sql_preflight(required_work):
+            if type(call) is not ComposerLLMCall or call.call_id is None:
+                raise AuditIntegrityError("A provider checkpoint requires its pending attempt identity")
+            drafts = (
+                AuditMessageDraft(role="audit", content="Provider call result recorded.", tool_calls=(llm_call_audit_envelope(call),)),
+            )
+        try:
+            await self.add_messages_atomic(
+                UUID(session_operation_context.fence.session_id),
+                drafts,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                audit_only=True,
+                required_work=required_work,
+            )
+        except SQLAlchemyError as exc:
+            raise ComposerRequiredAuditPersistenceError(
+                "composer_llm_call_persist_failed: required provider checkpoint failed", helper="llm_calls"
+            ) from exc
+
     async def cancel_undispatched_provider_attempt(
-        self, *, session_operation_context: SessionOperationContext, attempt_id: str, requested_model: str
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        attempt_id: str,
+        requested_model: str,
+        required_work: RequiredWorkTicket | None = None,
     ) -> None:
         """Close a COMPOSE intent only when its owner proved SDK entry never occurred.
 
@@ -5587,6 +6810,14 @@ class SessionServiceImpl:
         together under the original live fence. This cannot reconcile a past
         pending attempt or a provider call whose outcome is unknown.
         """
+        if type(session_operation_context) is not SessionOperationContext:
+            _refuse_required_sql(required_work, TypeError("undispatched cancellation requires an owned operation context"))
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,),
+            session_id=session_operation_context.fence.session_id,
+            context=session_operation_context,
+        )
         if type(session_operation_context) is not SessionOperationContext:
             raise TypeError("session_operation_context must be an exact SessionOperationContext")
         if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
@@ -5596,7 +6827,12 @@ class SessionServiceImpl:
         def _sync() -> None:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
                 self._require_session_operation_context_on_connection(
-                    conn, session_operation_context, session_id=sid, expected_kind=SessionOperationKind.COMPOSE, now=database_now(conn)
+                    conn,
+                    session_operation_context,
+                    session_id=sid,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    now=database_now(conn),
+                    audit_only=True,
                 )
 
                 def _append_audit_event(event_id: str, content: str, created_at: datetime) -> None:
@@ -5617,6 +6853,7 @@ class SessionServiceImpl:
                         created_at=created_at,
                         session_operation_context=session_operation_context,
                         message_id=event_id,
+                        audit_only=True,
                     )
                     with self._session_mutations(conn, session_id=sid, session_operation_context=session_operation_context) as mutations:
                         mutations.mark_session_updated(updated_at=created_at)
@@ -5629,18 +6866,26 @@ class SessionServiceImpl:
                     append_audit_event=_append_audit_event,
                 )
 
-        await self._run_sync(_sync)
+        if required_work is not None:
+            await run_required_sql_in_worker(required_work, _sync)
+        else:
+            await self._run_composer_sql(_sync)
 
     async def settle_provider_attempt(
         self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
     ) -> None:
         """Settle non-Composer provider evidence under its original session lease."""
-        await self._run_sync(
-            self._settle_provider_attempt_sync,
-            session_operation_context=session_operation_context,
-            attempt_id=attempt_id,
-            entry=entry,
-        )
+
+        def _sync() -> None:
+            self._settle_provider_attempt_sync(session_operation_context=session_operation_context, attempt_id=attempt_id, entry=entry)
+
+        if (
+            type(session_operation_context) is SessionOperationContext
+            and session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+        ):
+            await self._run_composer_sql(_sync)
+        else:
+            await self._run_sync(_sync)
 
     def settle_run_provider_attempt_sync(
         self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
@@ -5665,7 +6910,7 @@ class SessionServiceImpl:
         try:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
                 self._require_session_operation_context_on_connection(
-                    conn, session_operation_context, session_id=sid, expected_kind=expected_kind, now=database_now(conn)
+                    conn, session_operation_context, session_id=sid, expected_kind=expected_kind, now=database_now(conn), audit_only=True
                 )
                 settle_provider_attempt_on_connection(conn, session_id=sid, attempt_id=attempt_id, entry=entry)
                 body_completed = True
@@ -5907,14 +7152,22 @@ class SessionServiceImpl:
 
         return self._row_to_run_record(row)
 
-    async def get_state(self, state_id: UUID) -> CompositionStateRecord:
+    async def get_state(self, state_id: UUID, *, required_work: RequiredWorkTicket | None = None) -> CompositionStateRecord:
         """Fetch a composition state by its primary key. Raises ValueError if not found."""
+
+        if required_work is not None:
+            _validate_required_sql_ticket(
+                required_work, sources=(RequiredWorkSource.PREPARATION_READ_SQL,), session_id=required_work.key.session_id
+            )
 
         def _sync() -> Any:
             with self._engine.begin() as conn:
-                return conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(state_id))).fetchone()
+                query = select(composition_states_table).where(composition_states_table.c.id == str(state_id))
+                if required_work is not None:
+                    query = query.where(composition_states_table.c.session_id == required_work.key.session_id)
+                return conn.execute(query).fetchone()
 
-        row = await self._run_sync(_sync)
+        row = await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync)
 
         if row is None:
             raise ValueError(f"State not found: {state_id}")
@@ -6840,7 +8093,9 @@ class SessionServiceImpl:
             data=cast(Mapping[str, Any], row.data),
         )
 
-    async def _session_principal_context(self, session_id: str) -> tuple[str | None, PluginAvailabilitySnapshot | None]:
+    async def _session_principal_context(
+        self, session_id: str, *, preparation_work: RequiredWorkBinding | None = None
+    ) -> tuple[str | None, PluginAvailabilitySnapshot | None]:
         """Read the session principal and build its snapshot before a write transaction."""
 
         def _sync() -> tuple[str | None, PluginAvailabilitySnapshot | None]:
@@ -6850,20 +8105,64 @@ class SessionServiceImpl:
                 return user_id, None
             return user_id, self._plugin_snapshot_factory(user_id)
 
+        if preparation_work is not None:
+            if preparation_work.coordinator.authority.context.fence.session_id != session_id:
+                raise AuditIntegrityError("preparation read binding has a foreign session")
+            return await self._run_required_preparation_read(preparation_work, _sync, project=_validate_principal_snapshot)
         return cast(
             "tuple[str | None, PluginAvailabilitySnapshot | None]",
             await self._run_sync(_sync),
         )
+
+    async def _run_required_preparation_read[T](
+        self,
+        binding: RequiredWorkBinding,
+        read: Callable[[], T],
+        *,
+        project: Callable[[T], None],
+    ) -> T:
+        """Join the actual preparation read, project its value, then retain cancellation."""
+        sql, projection = binding.reserve_pair(RequiredWorkSource.PREPARATION_READ_SQL, RequiredWorkSource.PREPARATION_READ_PROJECTION)
+        outcome = await run_required_sql_finish_once(sql, read)
+        errors: list[BaseException] = []
+        if isinstance(outcome, RequiredSQLRaised):
+            projection.complete_without_submission()
+            errors.append(outcome.error)
+        else:
+            projection.begin_projection()
+            try:
+                project(outcome.value)
+            except BaseException as error:
+                projection.complete_owned(error)
+                errors.append(error)
+            else:
+                projection.complete_owned()
+        errors.extend(outcome.deferred_cancellations)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("Required preparation original outcomes", errors)
+        if isinstance(outcome, RequiredSQLRaised):
+            raise AuditIntegrityError("required preparation failure lost its original error")
+        return outcome.value
 
     async def _run_sync_with_post_commit_projection[T](
         self,
         func: Callable[[], T],
         *,
         project: Callable[[T], None],
+        composer_custody: bool = False,
+        required_work: RequiredWorkTicket | None = None,
     ) -> T:
         """Drain one worker through cancellation, then project iff it committed."""
 
-        worker = asyncio.create_task(self._run_sync(func))
+        worker = asyncio.create_task(
+            run_required_sql_in_worker(required_work, func)
+            if required_work is not None
+            else self._run_composer_sql(func)
+            if composer_custody
+            else self._run_sync(func)
+        )
         cancellation: asyncio.CancelledError | None = None
 
         def record_cancelled_failure(primary: asyncio.CancelledError, failure: BaseException, *, phase: str) -> None:
@@ -6910,38 +8209,476 @@ class SessionServiceImpl:
             raise cancellation
         return result
 
-    async def record_auto_commit_revocation(
+    async def _run_composer_sql[T](self, func: Callable[[], T]) -> T:
+        """Keep actual executor-future custody through direct task cancellation."""
+        return await run_stream_read_in_worker(func)
+
+    async def _run_composer_terminal_sql(
         self,
+        running: ComposerOperationRunning,
+        func: Callable[[], ComposerOperationRecord],
         *,
-        session_id: UUID,
-        proposal_id: UUID,
-        required_trust_mode: str,
-        current_trust_mode: str,
-        actor: str,
-    ) -> ProposalEventRecord:
-        """Idempotently record a non-terminal auto-commit revocation.
+        can_retry: Callable[[ComposerOperationRecord, datetime], bool] | None = None,
+        required_work: RequiredWorkCoordinator | None = None,
+        terminal_source: RequiredWorkSource = RequiredWorkSource.OPERATION_TERMINAL_SQL,
+    ) -> ComposerOperationRecord:
+        """Retain SQL custody; replay terminal or retry one immutable bundle.
 
-        Settlement writes this event inside its own locked transaction. This
-        compatibility entry point uses the same exact-binding helper so an
-        external retry cannot create a second or conflicting audit outcome.
+        Every independent writer read follows actual worker completion. A
+        failed/unknown read cannot establish rollback. Changed cancel/deadline
+        state leaves exact retry; the worker may choose one separate failure
+        through the sealed authority with the original exception evidence.
         """
-        now = self._now()
-        sid = str(session_id)
-        pid = str(proposal_id)
+        authority = ComposerAsyncOperationAuthority(
+            self._engine, owner_instance_id=self.session_operation_owner_instance_id, claim_lease_seconds=30
+        )
+        if required_work is not None:
+            if type(required_work) is not RequiredWorkCoordinator:
+                raise TypeError("terminal SQL requires an exact RequiredWorkCoordinator")
+            scope = required_work.authority
+            if (
+                scope.context != running.session_operation_context
+                or scope.durable_operation_id != running.claim.operation_id
+                or scope.claim_attempt != running.claim.attempt
+                or scope.proposal_id is not None
+            ):
+                raise AuditIntegrityError("terminal SQL coordinator authority mismatch")
+        first_failure: BaseException | None = None
+        for attempt in range(2):
+            sql_started = threading.Event()
+            sql_completed = threading.Event()
+            sql_outcome: list[ComposerOperationRecord | BaseException] = []
 
-        def _sync() -> ProposalEventRecord:
+            def witnessed_sql(
+                started: threading.Event = sql_started,
+                completed: threading.Event = sql_completed,
+                outcomes: list[ComposerOperationRecord | BaseException] = sql_outcome,
+            ) -> ComposerOperationRecord:
+                started.set()
+                try:
+                    result = func()
+                except BaseException as exc:
+                    outcomes.append(exc)
+                    raise
+                else:
+                    outcomes.append(result)
+                    return result
+                finally:
+                    completed.set()
+
+            ticket = required_work.reserve(terminal_source, sql_attempt_ordinal=attempt) if required_work is not None else None
+            child = asyncio.create_task(
+                run_required_sql_in_worker(ticket, witnessed_sql) if ticket is not None else self._run_composer_sql(witnessed_sql)
+            )
+            cancelled: asyncio.CancelledError | None = None
+            while not child.done():
+                try:
+                    await asyncio.shield(child)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+                except BaseException:
+                    break
+            if child.cancelled():
+                if not sql_started.is_set():
+                    raise ComposerTerminalSQLCompletionUnknown("cancelled SQL custody has no invocation completion witness")
+                while not sql_completed.is_set():
+                    try:
+                        await asyncio.sleep(0.01)
+                    except asyncio.CancelledError as exc:
+                        cancelled = exc
+            try:
+                if child.cancelled():
+                    outcome = sql_outcome[0]
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    return outcome
+                return child.result()
+            except BaseException as original_failure:
+                if first_failure is None:
+                    first_failure = original_failure
+                # New pooled connection, committed writer database state.
+                read_ticket = (
+                    required_work.reserve(RequiredWorkSource.TERMINAL_WRITER_READ_SQL, recurrence_ordinal=attempt)
+                    if required_work is not None
+                    else None
+                )
+                read_child = asyncio.create_task(
+                    run_required_sql_in_worker(
+                        read_ticket,
+                        authority.get_with_database_now,
+                        session_id=running.claim.session_id,
+                        operation_id=running.claim.operation_id,
+                    )
+                    if read_ticket is not None
+                    else run_stream_read_in_worker(
+                        authority.get_with_database_now, session_id=running.claim.session_id, operation_id=running.claim.operation_id
+                    )
+                )
+                while not read_child.done():
+                    try:
+                        await asyncio.shield(read_child)
+                    except asyncio.CancelledError as exc:
+                        cancelled = exc
+                    except BaseException:
+                        break
+                try:
+                    current, now = read_child.result()
+                except BaseException as read_failure:
+                    raise ComposerTerminalSQLCompletionUnknown("terminal writer read cannot prove committed outcome") from read_failure
+                if current is not None and current.status in ("completed", "failed"):
+                    return current
+                if (
+                    attempt == 0
+                    and cancelled is None
+                    and current is not None
+                    and current.status == "running"
+                    and can_retry is not None
+                    and can_retry(current, now)
+                ):
+                    continue
+                if cancelled is not None:
+                    raise cancelled from original_failure
+                if attempt > 0 and (
+                    isinstance(original_failure, _ComposerTerminalRetryStateChanged)
+                    or (current is not None and (current.cancel_requested_at is not None or current.deadline_at <= now))
+                ):
+                    # The original immutable bundle remains the failure
+                    # evidence; ordinary Stop/deadline changes cannot invent
+                    # an integrity fault or erase an original accounting fault.
+                    raise first_failure from original_failure
+                if attempt > 0 and original_failure is not first_failure:
+                    raise BaseExceptionGroup("terminal SQL attempts failed", [first_failure, original_failure]) from None
+                raise
+        raise AuditIntegrityError("terminal retry exceeded its closed bound")
+
+    async def complete_composer_async_operation(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        assistant: ComposerOperationAssistantWrite | None,
+        assistant_record: ChatMessageRecord | None,
+        audit_cohort: tuple[AuditMessageDraft, ...],
+        audit_composition_state_id: UUID | None,
+        build_response: Callable[
+            [ChatMessageRecord, tuple[CompositionProposalRecord, ...], CompositionStateRecord | None], MessageWithStateResponse
+        ],
+        required_work: RequiredWorkCoordinator | None = None,
+    ) -> ComposerOperationRecord:
+        """Publish final assistant/audit/snapshot/result in one exact COMPOSE transaction."""
+        if (assistant is None) == (assistant_record is None):
+            raise ValueError("terminal requires exactly one new or persisted assistant")
+        frozen_created_at: datetime | None = None
+        frozen_audit_ids = tuple(str(uuid.uuid4()) for _draft in audit_cohort)
+        sid = str(running.claim.session_id)
+        context = running.session_operation_context
+        attempted_response: MessageWithStateResponse | None = None
+        attempted_message: ChatMessageRecord | None = None
+        attempted_audit_rows: tuple[ChatMessageRecord, ...] | None = None
+        attempted_proposals: tuple[CompositionProposalRecord, ...] | None = None
+        attempted_state: CompositionStateRecord | None = None
+        attempted_deadline_expired: bool | None = None
+
+        def _can_retry(current: ComposerOperationRecord, now: datetime) -> bool:
+            return (
+                attempted_response is not None
+                and current.cancel_requested_at is None
+                and attempted_deadline_expired is False
+                and current.deadline_at > now
+                and current.session_operation_id == context.fence.operation_id
+                and current.session_operation_epoch == context.fence.operation_epoch
+            )
+
+        def _sync() -> ComposerOperationRecord:
+            nonlocal attempted_response, attempted_deadline_expired, frozen_created_at
+            nonlocal attempted_message, attempted_audit_rows, attempted_proposals, attempted_state
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE
+                ),
+            ):
+                now = database_now(conn)
+                if frozen_created_at is None:
+                    frozen_created_at = now
+                # The bound row itself is selected on this transaction below;
+                # no cross-connection response/state read is used.
+                job_row = _read(conn, running.claim.session_id, running.claim.operation_id)
+                if job_row is None:
+                    raise AuditIntegrityError("terminal operation missing")
+                current_job = _record_from_row(job_row)
+                if attempted_response is not None and not _can_retry(current_job, now):
+                    raise _ComposerTerminalRetryStateChanged("immutable terminal retry driving state changed")
+                attempted_deadline_expired = current_job.deadline_at <= now
+                if assistant is not None:
+                    csid = str(assistant.composition_state_id) if assistant.composition_state_id is not None else None
+                    if csid is not None:
+                        _assert_state_in_session(conn, state_id=csid, expected_session_id=sid, caller="complete_composer_async_operation")
+                    message_id = self._insert_chat_message(
+                        conn,
+                        session_id=sid,
+                        role="assistant",
+                        content=assistant.content,
+                        raw_content=assistant.raw_content,
+                        tool_calls=None,
+                        sequence_no=self._reserve_sequence_range(conn, sid, count=1),
+                        writer_principal="compose_loop",
+                        composition_state_id=csid,
+                        tool_call_id=None,
+                        parent_assistant_id=None,
+                        created_at=frozen_created_at,
+                        session_operation_context=context,
+                        message_id=str(assistant.message_id),
+                    )
+                    stored_row = conn.execute(
+                        select(chat_messages_table).where(chat_messages_table.c.id == message_id, chat_messages_table.c.session_id == sid)
+                    ).one()
+                    message = self._row_to_chat_message_record(stored_row)
+                else:
+                    if assistant_record is None:
+                        raise AuditIntegrityError("terminal assistant absent")
+                    row = conn.execute(
+                        select(chat_messages_table).where(
+                            chat_messages_table.c.id == str(assistant_record.id), chat_messages_table.c.session_id == sid
+                        )
+                    ).one_or_none()
+                    if row is None:
+                        raise AuditIntegrityError("terminal reused assistant missing")
+                    message = self._row_to_chat_message_record(row)
+                    if message != assistant_record or message.role != "assistant":
+                        raise AuditIntegrityError("terminal reused assistant differs from durable record")
+                if attempted_message is not None and message != attempted_message:
+                    raise _ComposerTerminalRetryStateChanged("immutable terminal assistant bundle changed")
+                attempted_message = message
+                try:
+                    active_drafts = self._write_audit_cohort_on_connection(
+                        conn,
+                        session_id=running.claim.session_id,
+                        drafts=audit_cohort,
+                        writer_principal="compose_loop",
+                        composition_state_id=audit_composition_state_id,
+                        session_operation_context=context,
+                        audit_only=False,
+                        message_ids=frozen_audit_ids,
+                        created_at=frozen_created_at,
+                        recorded_at=frozen_created_at,
+                    )
+                except SQLAlchemyError as exc:
+                    raise ComposerRequiredAuditPersistenceError(
+                        f"composer_turn_audit_cohort_persist_failed: required atomic audit insert failed for session_id={sid!r}",
+                        helper="turn_audit_cohort",
+                    ) from exc
+                audit_rows = tuple(
+                    self._row_to_chat_message_record(row)
+                    for row in conn.execute(
+                        select(chat_messages_table)
+                        .where(chat_messages_table.c.session_id == sid, chat_messages_table.c.id.in_(frozen_audit_ids))
+                        .order_by(chat_messages_table.c.sequence_no)
+                    )
+                )
+                if attempted_audit_rows is not None and audit_rows != attempted_audit_rows:
+                    raise _ComposerTerminalRetryStateChanged("immutable terminal audit bundle changed")
+                attempted_audit_rows = audit_rows
+                proposals = self._list_composition_proposals_on_connection(conn, session_id=running.claim.session_id)
+                state_row = conn.execute(
+                    select(composition_states_table)
+                    .where(composition_states_table.c.session_id == sid)
+                    .order_by(composition_states_table.c.version.desc())
+                    .limit(1)
+                ).one_or_none()
+                state = self._row_to_state_record(state_row) if state_row is not None else None
+                if attempted_response is not None and (proposals != attempted_proposals or state != attempted_state):
+                    raise _ComposerTerminalRetryStateChanged("immutable terminal response snapshot changed")
+                attempted_proposals, attempted_state = proposals, state
+                response = attempted_response if attempted_response is not None else build_response(message, proposals, state)
+                response = MessageWithStateResponse.model_validate(response.model_dump(mode="python"), strict=True)
+                attempted_response = response
+                result = settle_composer_operation_on_connection(conn, running, outcome=response, settled_at=frozen_created_at)
+            # Telemetry is after commit and cannot change the stored terminal.
+            for draft in active_drafts:
+                record_settled_composer_audit_message(role=draft.role, writer_principal="compose_loop", tool_calls=draft.tool_calls)
+            return result
+
+        return await self._run_composer_terminal_sql(running, _sync, can_retry=_can_retry, required_work=required_work)
+
+    async def fail_composer_async_operation(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        failure: ComposerOperationError,
+        authoritative_failure: bool = False,
+        required_work: RequiredWorkCoordinator | None = None,
+        failure_projection_work: RequiredWorkTicket | None = None,
+    ) -> ComposerOperationRecord:
+        """One sealed failure bundle with at most one exact immutable retry."""
+        if required_work is None:
+            if failure_projection_work is not None:
+                raise AuditIntegrityError("Failure projection requires its exact coordinator")
+        else:
+            if type(required_work) is not RequiredWorkCoordinator or type(failure_projection_work) is not RequiredWorkTicket:
+                raise AuditIntegrityError("Required failure publication needs its exact projection handoff")
+            scope = required_work.authority
+            if (
+                scope.context != running.session_operation_context
+                or scope.durable_operation_id != running.claim.operation_id
+                or scope.claim_attempt != running.claim.attempt
+                or scope.proposal_id is not None
+            ):
+                raise AuditIntegrityError("Failure projection coordinator authority mismatch")
+            required_work.validate_terminal_failure_work(projection_ticket=failure_projection_work)
+        sid = str(running.claim.session_id)
+        attempted_failure: ComposerOperationError | None = None
+        attempted_cancel: datetime | None = None
+        attempted_deadline_expired: bool | None = None
+        frozen_settled_at: datetime | None = None
+
+        def _can_retry(current: ComposerOperationRecord, now: datetime) -> bool:
+            return (
+                attempted_failure is not None
+                and current.cancel_requested_at == attempted_cancel
+                and (current.deadline_at <= now) == attempted_deadline_expired
+                and current.session_operation_id == running.session_operation_context.fence.operation_id
+                and current.session_operation_epoch == running.session_operation_context.fence.operation_epoch
+            )
+
+        def _sync() -> ComposerOperationRecord:
+            nonlocal attempted_failure, attempted_cancel, attempted_deadline_expired, frozen_settled_at
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                return _record_auto_commit_revocation_on_connection(
+                now = database_now(conn)
+                self._require_session_operation_context_on_connection(
                     conn,
+                    running.session_operation_context,
                     session_id=sid,
-                    proposal_id=pid,
-                    required_trust_mode=required_trust_mode,
-                    current_trust_mode=current_trust_mode,
-                    actor=actor,
-                    created_at=now,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    now=now,
+                    audit_only=True,
+                )
+                row = _read(conn, running.claim.session_id, running.claim.operation_id)
+                if row is None:
+                    raise AuditIntegrityError("failed terminal operation missing")
+                current = _record_from_row(row)
+                if attempted_failure is not None and not _can_retry(current, now):
+                    raise _ComposerTerminalRetryStateChanged("immutable failed terminal driving state changed")
+                selected = _select_failure_on_connection(row, failure, now=now, authoritative_failure=authoritative_failure)
+                if attempted_failure is not None and selected != attempted_failure:
+                    raise _ComposerTerminalRetryStateChanged("immutable failed terminal bundle changed")
+                attempted_failure = selected
+                attempted_cancel = current.cancel_requested_at
+                attempted_deadline_expired = current.deadline_at <= now
+                if frozen_settled_at is None:
+                    frozen_settled_at = now
+                return settle_composer_operation_on_connection(
+                    conn, running, outcome=attempted_failure, authoritative_failure=True, settled_at=frozen_settled_at
                 )
 
-        return cast(ProposalEventRecord, await self._run_sync(_sync))
+        try:
+            return await self._run_composer_terminal_sql(
+                running,
+                _sync,
+                can_retry=_can_retry,
+                required_work=required_work,
+                terminal_source=RequiredWorkSource.TERMINAL_FAILURE_SQL,
+            )
+        except ComposerTerminalSQLCompletionUnknown:
+            raise
+        except (SessionOperationFenceLost, ComposerOperationFenceLost) as exc:
+            if attempted_failure is None:
+                # Exact-fence preflight failed before selecting or attempting
+                # a terminal write; the owner-lapsed recovery authority may
+                # now handle this proved refusal after actual SQL completion.
+                raise
+            raise ComposerTerminalSQLCompletionUnknown("failed terminal authority changed after its write attempt") from exc
+        except BaseException as exc:
+            # A separately selected failed-terminal bundle owns one bounded
+            # exact retry; it cannot spawn further changed-state settlements.
+            raise ComposerTerminalSQLCompletionUnknown("failed terminal attempts finished without a committed terminal") from exc
+
+    def _write_audit_cohort_on_connection(
+        self,
+        conn: Connection,
+        *,
+        session_id: UUID,
+        drafts: Sequence[AuditMessageDraft],
+        writer_principal: ChatMessageWriterPrincipal,
+        composition_state_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+        audit_only: bool,
+        message_ids: tuple[str, ...] | None = None,
+        created_at: datetime | None = None,
+        recorded_at: datetime | None = None,
+    ) -> tuple[AuditMessageDraft, ...]:
+        now = created_at if created_at is not None else self._now()
+        if message_ids is not None and len(message_ids) != len(drafts):
+            raise AuditIntegrityError("audit bundle identities do not match its immutable drafts")
+        sid = str(session_id)
+        csid = str(composition_state_id) if composition_state_id else None
+        effective_state_ids = tuple(d.composition_state_id if d.composition_state_id is not None else csid for d in drafts)
+        if not drafts:
+            return ()
+        self._assert_session_write_lock_held(
+            conn,
+            sid,
+            caller="add_messages_atomic._write",
+        )
+        for state_id in dict.fromkeys(effective_state_ids):
+            if state_id is not None:
+                _assert_state_in_session(
+                    conn,
+                    state_id=state_id,
+                    expected_session_id=sid,
+                    caller="add_messages_atomic",
+                )
+        active_drafts: list[AuditMessageDraft] = []
+        active_ids: list[str | None] = []
+        for draft_index, draft in enumerate(drafts):
+            if draft.tool_calls:
+                envelopes = uncheckpointed_envelopes(conn, session_id=sid, envelopes=draft.tool_calls)
+                if not envelopes and draft.role == "audit":
+                    continue
+                draft = replace(draft, tool_calls=envelopes)
+            active_drafts.append(draft)
+            active_ids.append(message_ids[draft_index] if message_ids is not None else None)
+        if not active_drafts:
+            return ()
+        base_seq = self._reserve_sequence_range(conn, sid, count=len(active_drafts))
+        for offset, draft in enumerate(active_drafts):
+            self._insert_chat_message(
+                conn,
+                session_id=sid,
+                role=draft.role,
+                content=draft.content,
+                raw_content=None,
+                # Same deep_thaw rationale as add_message: the
+                # envelopes may carry MappingProxyType / tuple
+                # shapes from frozen-dataclass round-trips.
+                tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
+                sequence_no=base_seq + offset,
+                writer_principal=writer_principal,
+                composition_state_id=draft.composition_state_id if draft.composition_state_id is not None else csid,
+                tool_call_id=draft.tool_call_id,
+                parent_assistant_id=draft.parent_assistant_id,
+                created_at=now,
+                session_operation_context=session_operation_context,
+                audit_only=audit_only,
+                message_id=active_ids[offset],
+            )
+        entries = llm_call_usage_entries(
+            tuple(envelope for draft in active_drafts if draft.tool_calls is not None for envelope in draft.tool_calls)
+        )
+        if entries:
+            # Task I1 Composer adapter (compose loop, turn cohort, planner
+            # evidence): charged in the transaction that makes the audit rows durable.
+            record_token_usage_on_connection(
+                conn,
+                session_id=sid,
+                source="composer",
+                run_id=None,
+                entries=entries,
+                recorded_at=recorded_at if recorded_at is not None else database_now(conn),
+            )
+        with self._session_mutations(conn, session_id=sid, session_operation_context=session_operation_context) as session_mutations:
+            session_mutations.mark_session_updated(updated_at=now)
+        return tuple(active_drafts)
 
     async def add_messages_atomic(
         self,
@@ -6952,6 +8689,8 @@ class SessionServiceImpl:
         composition_state_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
         session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
+        audit_only: bool = False,
+        required_work: RequiredWorkTicket | None = None,
     ) -> None:
         """Persist one audit cohort in a single transaction (elspeth-90231248dc).
 
@@ -6982,75 +8721,39 @@ class SessionServiceImpl:
         An empty ``drafts`` sequence is a no-op (the compose loop drains
         conditionally; an empty cohort must not bump ``updated_at``).
         """
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(
+                RequiredWorkSource.REQUIRED_UNWIND_AUDIT_SQL,
+                RequiredWorkSource.DISPATCH_AUDIT_SQL,
+                RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,
+                RequiredWorkSource.TITLE_PROVIDER_SETTLEMENT_SQL,
+            ),
+            session_id=str(session_id),
+            context=session_operation_context,
+        )
         if type(session_operation_kind) is not SessionOperationKind:
-            raise TypeError("session_operation_kind must be an exact SessionOperationKind")
+            _refuse_required_sql(required_work, TypeError("session_operation_kind must be an exact SessionOperationKind"))
         if session_operation_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL}:
-            raise ValueError("add_messages_atomic fenced writes require COMPOSE or PROPOSAL authority")
+            _refuse_required_sql(required_work, ValueError("add_messages_atomic fenced writes require COMPOSE or PROPOSAL authority"))
         if type(session_operation_context) is not SessionOperationContext:
-            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+            _refuse_required_sql(required_work, TypeError("session_operation_context must be an exact SessionOperationContext"))
         if not drafts:
+            if required_work is not None:
+                required_work.complete_without_submission()
             return
-        now = self._now()
         sid = str(session_id)
-        csid = str(composition_state_id) if composition_state_id else None
-        effective_state_ids = tuple(draft.composition_state_id if draft.composition_state_id is not None else csid for draft in drafts)
 
         def _write(conn: Connection) -> tuple[AuditMessageDraft, ...]:
-            self._assert_session_write_lock_held(
+            return self._write_audit_cohort_on_connection(
                 conn,
-                sid,
-                caller="add_messages_atomic._write",
+                session_id=session_id,
+                drafts=drafts,
+                writer_principal=writer_principal,
+                composition_state_id=composition_state_id,
+                session_operation_context=session_operation_context,
+                audit_only=audit_only,
             )
-            for state_id in dict.fromkeys(effective_state_ids):
-                if state_id is not None:
-                    _assert_state_in_session(
-                        conn,
-                        state_id=state_id,
-                        expected_session_id=sid,
-                        caller="add_messages_atomic",
-                    )
-            active_drafts: list[AuditMessageDraft] = []
-            for draft in drafts:
-                if draft.tool_calls:
-                    envelopes = uncheckpointed_envelopes(conn, session_id=sid, envelopes=draft.tool_calls)
-                    if not envelopes and draft.role == "audit":
-                        continue
-                    draft = replace(draft, tool_calls=envelopes)
-                active_drafts.append(draft)
-            if not active_drafts:
-                return ()
-            base_seq = self._reserve_sequence_range(conn, sid, count=len(active_drafts))
-            for offset, draft in enumerate(active_drafts):
-                self._insert_chat_message(
-                    conn,
-                    session_id=sid,
-                    role=draft.role,
-                    content=draft.content,
-                    raw_content=None,
-                    # Same deep_thaw rationale as add_message: the
-                    # envelopes may carry MappingProxyType / tuple
-                    # shapes from frozen-dataclass round-trips.
-                    tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
-                    sequence_no=base_seq + offset,
-                    writer_principal=writer_principal,
-                    composition_state_id=draft.composition_state_id if draft.composition_state_id is not None else csid,
-                    tool_call_id=draft.tool_call_id,
-                    parent_assistant_id=draft.parent_assistant_id,
-                    created_at=now,
-                    session_operation_context=session_operation_context,
-                )
-            entries = llm_call_usage_entries(
-                tuple(envelope for draft in active_drafts if draft.tool_calls is not None for envelope in draft.tool_calls)
-            )
-            if entries:
-                # Task I1 Composer adapter (compose loop, turn cohort, planner
-                # evidence): charged in the transaction that makes the audit rows durable.
-                record_token_usage_on_connection(
-                    conn, session_id=sid, source="composer", run_id=None, entries=entries, recorded_at=database_now(conn)
-                )
-            with self._session_mutations(conn, session_id=sid, session_operation_context=session_operation_context) as session_mutations:
-                session_mutations.mark_session_updated(updated_at=now)
-            return tuple(active_drafts)
 
         def _sync() -> tuple[AuditMessageDraft, ...]:
             with (
@@ -7061,6 +8764,7 @@ class SessionServiceImpl:
                     session_id=sid,
                     session_operation_context=session_operation_context,
                     expected_kind=session_operation_kind,
+                    audit_only=audit_only,
                 ),
             ):
                 return _write(conn)
@@ -7073,7 +8777,7 @@ class SessionServiceImpl:
                     tool_calls=draft.tool_calls,
                 )
 
-        await self._run_sync_with_post_commit_projection(_sync, project=_project)
+        await self._run_sync_with_post_commit_projection(_sync, project=_project, composer_custody=True, required_work=required_work)
 
     async def add_run_diagnostics_audit_messages_atomic(
         self,
@@ -7221,6 +8925,7 @@ class SessionServiceImpl:
         context: SessionOperationContext,
         *,
         session_id: str,
+        audit_only: bool = False,
     ) -> None:
         """Prove, on ``conn``, that ``context`` is a live operation over ``session_id`` that may write its rows.
 
@@ -7244,4 +8949,5 @@ class SessionServiceImpl:
             session_id=session_id,
             expected_kind=context.operation_kind,
             now=database_now(conn),
+            audit_only=audit_only,
         )

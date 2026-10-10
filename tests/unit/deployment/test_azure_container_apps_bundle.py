@@ -513,6 +513,18 @@ def test_compiled_workloads_load_required_composer_settings(deployment_name: str
     assert settings.composer_rate_limit_per_minute == 10
 
 
+@pytest.mark.parametrize("deployment_name", ["elspeth-web-app", "doctor-schema-init-job", "doctor-runtime-job"])
+def test_compiled_workloads_accept_job_budget_above_transport_ceiling(deployment_name: str) -> None:
+    parameters = _workload_regression_parameters()
+    parameters["composerTimeoutSeconds"] = 900
+    module = _module_parameters_with_values("workload", parameters, deployment_name)
+    settings = _settings_for_compiled_container(module)
+    assert settings.composer_timeout_seconds == 900
+    assert settings.composer_sync_timeout_seconds == (
+        settings.composer_transport_idle_ceiling_seconds - settings.composer_transport_headroom_seconds
+    )
+
+
 @pytest.mark.parametrize("parameter_file", ["workload.production", "workload.acceptance"])
 def test_example_web_and_doctor_environments_load_without_ambient_config(parameter_file: str) -> None:
     parameters = _parameters(parameter_file)
@@ -748,7 +760,7 @@ def test_transport_ceiling_parameter_has_no_default_and_is_capped_at_the_ingress
     assert "defaultValue" not in definition
     assert definition["type"] == "int"
     assert definition["maxValue"] == INGRESS_REQUEST_TIMEOUT_SECONDS
-    assert definition["minValue"] >= 1
+    assert definition["minValue"] == 31
 
 
 @pytest.mark.parametrize("parameter_file", ["workload.production", "workload.acceptance"])

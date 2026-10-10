@@ -76,7 +76,11 @@ wire. Two rules follow:
   notion of "the client sent this" that governs every unsupported field.
 - The configured `ELSPETH_LLM_GATEWAY_MAX_MAX_TOKENS` bound applies
   identically to either spelling; the cap is not escapable by choosing the
-  other name.
+  other name. Its default is **64,000 completion tokens**, matching the
+  operator's `COMPOSER_PLANNER_MAX_COMPLETION_TOKENS=64000` ceiling. This
+  completion budget includes generated reasoning tokens as well as visible
+  output. A lower configured gateway bound still rejects larger requests;
+  the gateway forwards an admitted value unchanged and does not clamp it.
 
 The conformance kit pins all three behaviours (see
 `conformance/test_capabilities.py`), so a derived image that drops the

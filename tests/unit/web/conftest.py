@@ -56,7 +56,9 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.composer_fakes import install_restricted_plugin_policy, interpretation_surfacing_stub
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composer_operations import install_composer_async_worker
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -104,11 +106,10 @@ def _make_session(
 
 
 def _route_client(tmp_path: Path, settings: WebSettings) -> TestClient:
-    """Build a route test app with one in-memory session service."""
+    """Build a route app with independent connections for durable worker SQL."""
     eng = create_session_engine(
-        "sqlite:///:memory:",
+        f"sqlite:///{tmp_path / 'route-sessions.db'}",
         connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
     )
     initialize_session_schema(eng)
     service = FencedSessionServiceHarness(
@@ -170,8 +171,13 @@ def _route_client(tmp_path: Path, settings: WebSettings) -> TestClient:
     app.state.composer_service = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.execution_service = None
-    app.state.composer_progress_registry = None
+    from elspeth.web.composer.progress import ComposerProgressRegistry
+
+    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.interpretation_surfacing = interpretation_surfacing_stub()
+    install_restricted_plugin_policy(app)
     app.state.scoped_secret_resolver = None
+    install_composer_async_worker(app)
     app.include_router(create_session_router())
     client = TestClient(app)
     client.app.state.phase3_engine = eng

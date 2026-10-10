@@ -9,7 +9,6 @@ subclasses ``ValueError``, so its arm must sit above that bare arm.
 from __future__ import annotations
 
 from unittest.mock import AsyncMock
-from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -17,13 +16,17 @@ from httpx import ASGITransport, AsyncClient
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.web.execution.protocol import ExecutionService
 from elspeth.web.interpretation_state import InterpretationReviewIntegrityError
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.unit.web.execution.test_routes import _create_test_app, _execution_service
+
+execution_fixture = execution_custody.execution_fixture
 
 _RAW_INTEGRITY_MESSAGE = f"llm node 'rate' prompt-template review hash drifted (stored {'b' * 64})"
 
 
 @pytest.mark.asyncio
-async def test_execute_maps_review_drift_to_structured_409() -> None:
+async def test_execute_maps_review_drift_to_structured_409(execution_fixture: ExecutionTestCustody) -> None:
     exc = InterpretationReviewIntegrityError(
         _RAW_INTEGRITY_MESSAGE,
         component_id="rate",
@@ -32,10 +35,10 @@ async def test_execute_maps_review_drift_to_structured_409() -> None:
     )
     svc = _execution_service()
     svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
-    app = _create_test_app(execution_service=svc)
+    app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+        resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
 
     assert resp.status_code == 409
     public_detail = (
@@ -55,7 +58,7 @@ async def test_execute_maps_review_drift_to_structured_409() -> None:
 
 
 @pytest.mark.asyncio
-async def test_source_review_drift_names_the_source_component() -> None:
+async def test_source_review_drift_names_the_source_component(execution_fixture: ExecutionTestCustody) -> None:
     exc = InterpretationReviewIntegrityError(
         "invented source review drift: reviewed content hash does not match current source content hash",
         component_id="source:orders",
@@ -64,10 +67,10 @@ async def test_source_review_drift_names_the_source_component() -> None:
     )
     svc = _execution_service()
     svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
-    app = _create_test_app(execution_service=svc)
+    app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+        resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
 
     assert resp.status_code == 409
     detail = resp.json()["detail"]
@@ -79,14 +82,14 @@ async def test_source_review_drift_names_the_source_component() -> None:
 
 
 @pytest.mark.asyncio
-async def test_plain_value_error_keeps_the_not_found_mapping() -> None:
+async def test_plain_value_error_keeps_the_not_found_mapping(execution_fixture: ExecutionTestCustody) -> None:
     """Control: only the typed integrity error leaves the bare ValueError arm."""
     svc = _execution_service()
     svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=ValueError("No composition state for session"))
-    app = _create_test_app(execution_service=svc)
+    app = _create_test_app(execution_service=svc, execution_fixture=execution_fixture)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+        resp = await client.post(f"/api/sessions/{app.state.execute_session_id}/execute")
 
     assert resp.status_code == 404
     assert resp.json()["detail"] == "No composition state for session"

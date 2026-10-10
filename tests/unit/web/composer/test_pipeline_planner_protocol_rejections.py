@@ -12,9 +12,11 @@ Covers three parser/loop classification seams in ``pipeline_planner``:
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 
@@ -25,12 +27,14 @@ from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttemptPhase,
     ComposerPlannerCode,
 )
+from elspeth.web.composer import pipeline_planner
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError, _parse_response_tool_calls
 from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.sessions.routes._helpers import freeform_planner_progress_reason
 from tests.unit.web.composer.test_pipeline_planner import (
     _Function,
+    _lifecycle,
     _Message,
     _pipeline,
     _plan,
@@ -322,3 +326,140 @@ async def test_unparseable_arguments_below_cap_without_length_finish_stay_fatal(
     assert caught.value.code == "MALFORMED_RESPONSE"
     assert len(completion.requests) == 1
     assert recorder.llm_calls[0].error_message == "MALFORMED_RESPONSE"
+
+
+def _length_stopped_tool_response(tmp_path: Path, *, discovery: bool = False) -> _Response:
+    response = _response(("list_sources", {}) if discovery else ("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))
+    choice = _ChoiceWithFinishReason(message=response.choices[0].message, finish_reason="length")
+    response.choices[0] = cast(Any, choice)
+    return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("discovery", [False, True], ids=["parseable-proposal", "parseable-discovery"])
+async def test_length_stopped_parseable_calls_are_discarded_before_dispatch(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    discovery: bool,
+) -> None:
+    completion = _ScriptedCompletion(
+        _length_stopped_tool_response(tmp_path, discovery=discovery),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert len(completion.requests) == 2
+    assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
+    assert recorder.llm_calls[0].finish_reason == "length"
+    assert recorder.llm_calls[0].status is ComposerLLMCallStatus.MALFORMED_RESPONSE
+    assert recorder.llm_calls[0].error_message == "RESPONSE_TRUNCATED"
+    assert recorder.planner_attempts[0].outcome is ComposerPlannerAttemptOutcome.TRUNCATED
+    assert recorder.planner_attempts[0].led_to is ComposerPlannerAttemptLedTo.REPAIR
+    assert recorder.planner_attempts[-1].outcome is ComposerPlannerAttemptOutcome.ACCEPTED
+    assert all(invocation.tool_name != "list_sources" for invocation in recorder.invocations)
+    assert all(message["role"] != "assistant" for message in completion.requests[1]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_length_stopped_parseable_proposal_never_reaches_the_finalizer_without_repair_budget(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(_length_stopped_tool_response(tmp_path))
+    recorder = BufferingRecorder()
+    finalized: list[object] = []
+
+    def finalize(candidate: object) -> object:
+        finalized.append(candidate)
+        return candidate
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            repair_budget=0,
+            candidate_finalizer=finalize,
+        )
+
+    assert caught.value.code == "REPAIR_EXHAUSTED"
+    assert finalized == []
+    assert len(recorder.llm_calls) == 1
+    assert recorder.invocations == ()
+    assert all(attempt.outcome is not ComposerPlannerAttemptOutcome.ACCEPTED for attempt in recorder.planner_attempts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expired_on_reply", [False, True], ids=["repair-with-fourteen-seconds", "expired-before-repair"])
+async def test_length_stop_repair_keeps_the_original_deadline_and_audits_every_attempt(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    expired_on_reply: bool,
+) -> None:
+    elapsed = 0.0
+    calls = 0
+
+    class DeadlineCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs: Any) -> _Response:
+            nonlocal elapsed, calls
+            calls += 1
+            if calls == 1:
+                elapsed = 300.0 if expired_on_reply else 286.0
+                return await super().__call__(**kwargs)
+            self.requests.append(deepcopy(kwargs))
+            elapsed = 300.0
+            raise TimeoutError("controlled remaining provider budget expired")
+
+    completion = DeadlineCompletion(_length_stopped_tool_response(tmp_path))
+    recorder = BufferingRecorder()
+    events: list[str] = []
+    with (
+        patch.object(pipeline_planner, "_planner_deadline_time", side_effect=lambda: elapsed),
+        pytest.raises(PipelinePlannerError) as caught,
+    ):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={"timeout_seconds": 300.0},
+            repair_budget=2,
+            lifecycle=_lifecycle(events),
+        )
+
+    assert caught.value.code == "TIMEOUT"
+    assert events[-1] == "settled:failed"
+    assert calls == (1 if expired_on_reply else 2)
+    assert len(recorder.llm_calls) == calls
+    assert [call.planner_call_ordinal for call in recorder.llm_calls] == list(range(1, calls + 1))
+    assert recorder.llm_calls[0].error_message == "RESPONSE_TRUNCATED"
+    if not expired_on_reply:
+        assert recorder.llm_calls[1].status is ComposerLLMCallStatus.TIMEOUT
+    assert recorder.invocations == ()
+    assert all(attempt.outcome is not ComposerPlannerAttemptOutcome.ACCEPTED for attempt in recorder.planner_attempts)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_length_stop_spends_the_shared_repair_budget(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    response = _cut_off_response(completion_tokens=800, finish_reason="length")
+    response.choices[0].message.tool_calls = None
+    response.usage = {**response.usage, "completion_tokens_details": {"reasoning_tokens": 800}}
+    completion = _ScriptedCompletion(response, response)
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder, repair_budget=1)
+
+    assert caught.value.code == "REPAIR_EXHAUSTED"
+    assert len(completion.requests) == 2
+    assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
+    assert all(call.completion_tokens == 800 for call in recorder.llm_calls)
+    assert all(call.reasoning_tokens == 800 for call in recorder.llm_calls)
+    assert all(call.error_message == "RESPONSE_TRUNCATED" for call in recorder.llm_calls)
+    assert recorder.invocations == ()

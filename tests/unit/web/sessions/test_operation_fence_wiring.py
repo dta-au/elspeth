@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import textwrap
 import types
 import typing
@@ -49,13 +50,14 @@ from elspeth.web.coordination.approval_authority import ApprovalGateInputs
 from elspeth.web.coordination.contracts import SessionOperationContext
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.envelope import RunExecutionInput
-from elspeth.web.execution.service import ExecutionServiceImpl
+from elspeth.web.execution.service import ExecutionServiceImpl, close_execute_lease_before_transfer
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import protocol as sessions_protocol
+from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
+from elspeth.web.sessions.composer_turn import _run_composer_turn, run_composer_turn
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import RunEventRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes import interpretation as interpretation_routes
-from elspeth.web.sessions.routes import messages as message_routes
 from elspeth.web.sessions.service import SessionServiceImpl
 
 
@@ -81,32 +83,127 @@ def test_run_admission_requires_the_exact_session_context(owner: type[Any], meth
     assert parameter.annotation is SessionOperationContext or parameter.annotation == "SessionOperationContext"
 
 
-def test_send_message_acquires_compose_authority_before_state_or_message_access() -> None:
-    source = textwrap.dedent(inspect.getsource(message_routes.register_message_routes))
-    tree = ast.parse(source)
-    send_message = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "send_message")
-    compose_scope = next(
+def _assert_composer_turn_authority(source: str) -> None:
+    tree = ast.parse(textwrap.dedent(source))
+    function = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_composer_turn")
+    guard = next(
         node
-        for node in ast.walk(send_message)
-        if isinstance(node, ast.AsyncWith) and any(ast.unparse(item.context_expr) == "compose_lock" for item in node.items)
+        for node in ast.walk(function)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "lease.context != running.session_operation_context"
     )
-    lease_item = next(item for item in compose_scope.items if "SessionOperationLease.acquire" in ast.unparse(item.context_expr))
-    assert isinstance(lease_item.optional_vars, ast.Name)
-    assert lease_item.optional_vars.id == "compose_operation_lease"
-
+    assert any(isinstance(node, ast.Raise) for node in ast.walk(guard))
     state_read = next(
-        node for node in ast.walk(compose_scope) if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.get_current_state"
+        node for node in ast.walk(function) if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.get_current_state"
     )
     transcript_write = next(
         node
-        for node in ast.walk(compose_scope)
+        for node in ast.walk(function)
         if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.add_message_with_transcript"
     )
-    assert lease_item.context_expr.lineno < state_read.lineno < transcript_write.lineno
-    assert any(
-        keyword.arg == "session_operation_context" and ast.unparse(keyword.value) == "compose_operation_lease.context"
-        for keyword in transcript_write.keywords
+    assert guard.lineno < state_read.lineno < transcript_write.lineno
+    assert [
+        (keyword.arg, ast.unparse(keyword.value)) for keyword in transcript_write.keywords if keyword.arg == "session_operation_context"
+    ] == [("session_operation_context", "lease.context")]
+    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in transcript_write.keywords if keyword.arg == "running"] == [
+        ("running", "running")
+    ]
+    parent = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and node is not transcript_write
+        and transcript_write in ast.walk(node)
+        and ast.unparse(node.func) == "lease.create_task"
     )
+    assert parent is not None
+
+
+def test_detached_turn_checks_exact_adopted_authority_before_state_or_message_access() -> None:
+    _assert_composer_turn_authority(inspect.getsource(_run_composer_turn))
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("lease.context != running.session_operation_context", "lease.context != other_context"),
+        ("session_operation_context=lease.context", "session_operation_context=other_context"),
+        ("running=running", "running=other_running"),
+        ("ingress = lease.create_task", "ingress = asyncio.create_task"),
+    ],
+)
+def test_detached_turn_authority_control_rejects_changed_fence_or_child_owner(before: str, after: str) -> None:
+    source = inspect.getsource(_run_composer_turn)
+    assert before in source
+    _assert_composer_turn_authority(source)
+    with pytest.raises((AssertionError, StopIteration)):
+        _assert_composer_turn_authority(source.replace(before, after))
+
+
+def _assert_worker_adopted_lease_transfer(source: str, *, outer_source: str | None = None) -> None:
+    tree = ast.parse(textwrap.dedent(source))
+    turn = next(node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.unparse(node.func) == "run_composer_turn")
+    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in turn.keywords if keyword.arg in {"lease", "running"}] == [
+        ("lease", "lease"),
+        ("running", "running"),
+    ]
+    outer = ast.parse(textwrap.dedent(outer_source or inspect.getsource(ComposerAsyncWorker._run_started)))
+    reservations = [
+        node
+        for node in ast.walk(outer)
+        if isinstance(node, ast.Assign) and [ast.unparse(target) for target in node.targets] == ["setup_ticket"]
+    ]
+    assert len(reservations) == 1
+    reservation = reservations[0].value
+    assert isinstance(reservation, ast.IfExp)
+    assert ast.unparse(reservation.test) == "coordinator is not None"
+    assert ast.unparse(reservation.body) == "coordinator.reserve(RequiredWorkSource.OWNED_TURN_SETUP_PRODUCER)"
+    assert ast.unparse(reservation.orelse) == "None"
+    transfer = next(
+        node for node in ast.walk(outer) if isinstance(node, ast.Call) and ast.unparse(node.func) == "self._run_started_under_lease"
+    )
+    assert [ast.unparse(arg) for arg in transfer.args] == ["services", "running", "lease", "settlement", "setup_ticket"]
+    scope = next(node for node in ast.walk(outer) if isinstance(node, ast.AsyncWith) and transfer in ast.walk(node))
+    assert any(ast.unparse(item.context_expr) == "lease" for item in scope.items)
+
+
+def test_worker_runs_detached_turn_inside_adopted_renewable_lease() -> None:
+    _assert_worker_adopted_lease_transfer(inspect.getsource(ComposerAsyncWorker._run_started_under_lease))
+    source = inspect.getsource(ComposerAsyncWorker._job)
+    assert "start_composer_async_operation" in source
+    assert "SessionOperationLease.adopt" in source
+    assert "await self._run_started(services, running, lease)" in source
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("lease=lease", "lease=other_lease"),
+        ("running=running", "running=other_running"),
+        ("await run_composer_turn(", "await other_turn("),
+    ],
+)
+def test_worker_transfer_rejects_changed_turn_or_exact_authority(before: str, after: str) -> None:
+    source = inspect.getsource(ComposerAsyncWorker._run_started_under_lease)
+    assert before in source
+    _assert_worker_adopted_lease_transfer(source)
+    with pytest.raises((AssertionError, StopIteration)):
+        _assert_worker_adopted_lease_transfer(source.replace(before, after))
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("settlement, setup_ticket)", "settlement, None)"),
+        ("coordinator.reserve(RequiredWorkSource.OWNED_TURN_SETUP_PRODUCER)", "None"),
+    ],
+)
+def test_worker_transfer_rejects_replaced_required_setup_ticket(before: str, after: str) -> None:
+    source = inspect.getsource(ComposerAsyncWorker._run_started_under_lease)
+    outer = inspect.getsource(ComposerAsyncWorker._run_started)
+    assert before in outer
+    _assert_worker_adopted_lease_transfer(source, outer_source=outer)
+    with pytest.raises(AssertionError):
+        _assert_worker_adopted_lease_transfer(source, outer_source=outer.replace(before, after))
 
 
 @pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
@@ -315,25 +412,122 @@ def test_rate_cap_no_surfaces_write_reuses_compose_context() -> None:
     assert "session_operation_context=session_operation_context" in dispatch_source
 
 
-def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
-    route_source = textwrap.dedent(inspect.getsource(message_routes.register_message_routes))
-    route_tree = ast.parse(route_source)
-    auto_title_call = next(
-        node for node in ast.walk(route_tree) if isinstance(node, ast.Call) and ast.unparse(node.func) == "maybe_auto_title_session"
-    )
-    assert any(
-        keyword.arg == "session_operation_context" and ast.unparse(keyword.value) == "compose_operation_lease.context"
-        for keyword in auto_title_call.keywords
-    )
-    parent = next(
-        node
-        for node in ast.walk(route_tree)
-        if isinstance(node, ast.Call) and auto_title_call in ast.walk(node) and node is not auto_title_call
-    )
-    assert ast.unparse(parent.func) == "compose_operation_lease.create_task"
+def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None:
+    import hashlib
 
+    public_tree = ast.parse(textwrap.dedent(public_source))
+    public = next(node for node in public_tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_composer_turn")
+    transfers = [node for node in ast.walk(public) if isinstance(node, ast.Call) and ast.unparse(node.func) == "_run_composer_turn"]
+    assert len(transfers) == 1
+    transfer = transfers[0]
+    assert [(item.arg, ast.unparse(item.value)) for item in transfer.keywords if item.arg == "lease"] == [("lease", "lease")]
+    assert isinstance(public.body[-1], ast.Return)
+    assert isinstance(public.body[-1].value, ast.Await) and public.body[-1].value.value is transfer
+
+    helper_tree = ast.parse(textwrap.dedent(helper_source))
+    helper = next(node for node in helper_tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_composer_turn")
+    assert isinstance(helper.body[-1], ast.Try)
+    main_try = helper.body[-1]
+    assert isinstance(main_try.body[3], ast.If)
+    title_branch = main_try.body[3]
+    assert ast.unparse(title_branch.test) == (
+        "isinstance(request, SendMessageRequest) and len(records) == 1 and is_default_session_title(session.title)"
+    )
+    assert len(title_branch.body) == 4
+    title_child = title_branch.body[2]
+    assert isinstance(title_child, ast.AsyncFunctionDef) and title_child.name == "run_owned_title"
+    assert len(title_child.body) == 2 and isinstance(title_child.body[0], ast.Try)
+    child_try = title_child.body[0]
+    assert len(child_try.body) == 1 and isinstance(child_try.body[0], ast.Expr)
+    direct_title = child_try.body[0].value
+    assert isinstance(direct_title, ast.Await) and isinstance(direct_title.value, ast.Call)
+    title_call = direct_title.value
+    assert ast.unparse(title_call.func) == "maybe_auto_title_session"
+    assert [(item.arg, ast.unparse(item.value)) for item in title_call.keywords if item.arg == "session_operation_context"] == [
+        ("session_operation_context", "lease.context")
+    ]
+    assert isinstance(title_branch.body[3], ast.Try)
+    owned_try = title_branch.body[3]
+    assert len(owned_try.body) == 1 and isinstance(owned_try.body[0], ast.Assign)
+    assert [ast.unparse(target) for target in owned_try.body[0].targets] == ["auto_title_task"]
+    assert ast.unparse(owned_try.body[0].value) == "lease.create_task(run_owned_title())"
+
+    # Direct edges alone admit earlier returns and nested unreachable guards.
+    # Bind only the reviewed public wrapper and the executed prefix through
+    # the first-message title branch, retaining all AST fields and strings.
+    assert hashlib.sha256(_stable_ast_bytes(public)).hexdigest() == "fe4e8e57be8fd03171e86ac2516422ce4f5d2dc7e75e282ada139fb06980ce0c"
+    assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=helper.body[:-1], type_ignores=[]))).hexdigest() == (
+        "0a880df01e2c8d783aabdbdd02bfadda504f83f5f8b05ef105a497e35c8586d8"
+    )
+    assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=main_try.body[:4], type_ignores=[]))).hexdigest() == (
+        "3bae0eb10d038ce8334121cc6116a3582809bbdd1dbbc65f4264ce6f9562ec51"
+    )
+
+
+def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
+    _assert_auto_title_ownership(inspect.getsource(run_composer_turn), inspect.getsource(_run_composer_turn))
     title_source = textwrap.dedent(inspect.getsource(_auto_title.maybe_auto_title_session))
     assert "session_operation_context=session_operation_context" in title_source
+
+
+@pytest.mark.parametrize(
+    "owner,before,after",
+    [
+        ("public", "lease=lease", "lease=other_lease"),
+        ("helper", "session_operation_context=lease.context", "session_operation_context=other_context"),
+        ("helper", "auto_title_task = lease.create_task(run_owned_title())", "auto_title_task = asyncio.create_task(run_owned_title())"),
+    ],
+)
+def test_auto_title_ownership_rejects_foreign_lease_or_unowned_child(owner: str, before: str, after: str) -> None:
+    sources = {"public": inspect.getsource(run_composer_turn), "helper": inspect.getsource(_run_composer_turn)}
+    assert before in sources[owner]
+    _assert_auto_title_ownership(sources["public"], sources["helper"])
+    sources[owner] = sources[owner].replace(before, after)
+    with pytest.raises(AssertionError):
+        _assert_auto_title_ownership(sources["public"], sources["helper"])
+
+
+@pytest.mark.parametrize("mutation", ["detached_inner", "unawaited_inner", "unreachable_owned", "early_return", "arbitrary_guard"])
+def test_auto_title_ownership_rejects_unreached_or_unjoined_work(mutation: str) -> None:
+    public_source = inspect.getsource(run_composer_turn)
+    helper_source = inspect.getsource(_run_composer_turn)
+    _assert_auto_title_ownership(public_source, helper_source)
+    tree = ast.parse(textwrap.dedent(helper_source))
+    helper = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_composer_turn")
+    assert isinstance(helper.body[-1], ast.Try)
+    main_try = helper.body[-1]
+    assert isinstance(main_try.body[3], ast.If)
+    branch = main_try.body[3]
+    assert isinstance(branch.body[2], ast.AsyncFunctionDef)
+    child = branch.body[2]
+    assert isinstance(child.body[0], ast.Try)
+    title_expr = child.body[0].body[0]
+    assert isinstance(title_expr, ast.Expr) and isinstance(title_expr.value, ast.Await)
+    if mutation in {"detached_inner", "unawaited_inner"}:
+        title_call = title_expr.value.value
+        title_expr.value = (
+            ast.Call(
+                func=ast.Attribute(value=ast.Name(id="asyncio", ctx=ast.Load()), attr="create_task", ctx=ast.Load()),
+                args=[title_call],
+                keywords=[],
+            )
+            if mutation == "detached_inner"
+            else title_call
+        )
+    elif mutation in {"unreachable_owned", "arbitrary_guard"}:
+        assert isinstance(branch.body[3], ast.Try)
+        owned_try = branch.body[3]
+        original = owned_try.body[0]
+        owned_try.body[0] = ast.If(
+            test=ast.Constant(False) if mutation == "unreachable_owned" else ast.Name(id="unreviewed_gate", ctx=ast.Load()),
+            body=[original],
+            orelse=[],
+        )
+    else:
+        main_try.body.insert(3, ast.Return(value=ast.Constant(None)))
+    ast.fix_missing_locations(tree)
+    with pytest.raises(AssertionError):
+        _assert_auto_title_ownership(public_source, ast.unparse(tree))
 
 
 def _resolved_signature(member: Any) -> tuple[tuple[tuple[str, inspect._ParameterKind, Any], ...], Any]:
@@ -804,6 +998,21 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     ),
                     sessions_protocol.InterpretationEventRecord,
                 ),
+                "create_pipeline_candidate_pending": (
+                    (
+                        (
+                            "command",
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            sessions_protocol.SessionPendingInterpretationCommand,
+                        ),
+                        (
+                            "validator",
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            sessions_protocol.SessionPendingInterpretationValidator,
+                        ),
+                    ),
+                    sessions_protocol.PendingInterpretationCreationResult,
+                ),
                 "record_session_opt_out": (
                     (
                         ("event_id", inspect.Parameter.KEYWORD_ONLY, UUID),
@@ -879,44 +1088,294 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                 _assert_no_authority_escape(owner=owner, member_name=name, member=member)
 
 
-def _assert_background_lease_transfer(source: str) -> None:
-    """Bind the submitted worker and its completion callback to the same lease."""
-    tree = ast.parse(textwrap.dedent(source))
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    submissions = [node for node in calls if ast.unparse(node.func) == "self._executor.submit"]
-    callbacks = [node for node in calls if ast.unparse(node.func) == "future.add_done_callback"]
+def _stable_ast_bytes(node: ast.AST) -> bytes:
+    """Serialize every AST field, including empty ones, across Python 3.12/3.13."""
+
+    def encode(value: object) -> object:
+        if isinstance(value, ast.AST):
+            return [type(value).__name__, [[name, encode(child)] for name, child in ast.iter_fields(value)]]
+        if isinstance(value, list):
+            return [encode(child) for child in value]
+        return value
+
+    return json.dumps(encode(node), ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def _assert_background_lease_transfer(execute_source: str, submit_source: str, observer_source: str) -> None:
+    """Trace the exact lease through execute, owned submit, and callback observer."""
+    import hashlib
+
+    execute = ast.parse(textwrap.dedent(execute_source))
+    submit = ast.parse(textwrap.dedent(submit_source))
+    observer = ast.parse(textwrap.dedent(observer_source))
+    execute_method = next(node for node in execute.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "execute")
+    submit_method = next(node for node in submit.body if isinstance(node, ast.FunctionDef) and node.name == "_submit_owned_pipeline")
+    observer_method = next(node for node in observer.body if isinstance(node, ast.FunctionDef) and node.name == "_observe_pipeline_done")
+    transfers = [
+        node for node in ast.walk(execute) if isinstance(node, ast.Call) and ast.unparse(node.func) == "self._submit_owned_pipeline"
+    ]
+    assert len(transfers) == 1
+    transfer = transfers[0]
+    assert [ast.unparse(arg) for arg in transfer.args[:3]] == ["obligation", "session_operation_lease", "loss_watcher"]
+    assert len(transfer.args) == 4
+    invocation = transfer.args[3]
+    assert isinstance(invocation, ast.Call) and ast.unparse(invocation.func) == "partial"
+    assert ast.unparse(invocation.args[0]) == "self._run_pipeline"
+    assert [(item.arg, ast.unparse(item.value)) for item in invocation.keywords if item.arg == "session_operation_lease"] == [
+        ("session_operation_lease", "session_operation_lease")
+    ]
+    submissions = [node for node in ast.walk(submit) if isinstance(node, ast.Call) and ast.unparse(node.func) == "executor.submit"]
+    callbacks = [node for node in ast.walk(submit) if isinstance(node, ast.Call) and ast.unparse(node.func) == "future.add_done_callback"]
     assert len(submissions) == len(callbacks) == 1
-    submission = submissions[0]
-    assert ast.unparse(submission.args[0]) == "self._run_pipeline"
-    assert [(item.arg, ast.unparse(item.value)) for item in submission.keywords if item.arg == "session_operation_lease"] == [
-        ("session_operation_lease", "session_operation_lease")
+    assert [ast.unparse(arg) for arg in submissions[0].args] == ["invocation"]
+    submitted_futures = [node for node in ast.walk(submit) if isinstance(node, ast.Assign) and node.value is submissions[0]]
+    assert len(submitted_futures) == 1
+    assert [ast.unparse(target) for target in submitted_futures[0].targets] == ["future"]
+    future_bindings = [
+        node
+        for node in ast.walk(submit)
+        if isinstance(node, ast.Name) and node.id == "future" and isinstance(node.ctx, (ast.Store, ast.Del))
     ]
-    callback = callbacks[0]
-    assert len(callback.args) == 1
-    bound_callback = callback.args[0]
-    assert isinstance(bound_callback, ast.Call)
-    assert ast.unparse(bound_callback.func) == "partial"
-    assert ast.unparse(bound_callback.args[0]) == "self._on_pipeline_done"
-    assert [(item.arg, ast.unparse(item.value)) for item in bound_callback.keywords if item.arg == "session_operation_lease"] == [
-        ("session_operation_lease", "session_operation_lease")
+    assert future_bindings == [submitted_futures[0].targets[0]]
+    assert len(callbacks[0].args) == 1
+    bound_callback = callbacks[0].args[0]
+    assert isinstance(bound_callback, ast.Call) and ast.unparse(bound_callback.func) == "partial"
+    assert len(bound_callback.args) == 1
+    assert ast.unparse(bound_callback.args[0]) == "self._observe_pipeline_done"
+    assert [(item.arg, ast.unparse(item.value)) for item in bound_callback.keywords] == [
+        ("session_operation_lease", "lease"),
+        ("loss_watcher", "loss_watcher"),
     ]
+    registration_tries = [statement for statement in submit_method.body if isinstance(statement, ast.Try)]
+    assert len(registration_tries) == 2
+    registration_body = registration_tries[1].body
+    assert len(registration_body) == 1
+    assert isinstance(registration_body[0], ast.Expr) and registration_body[0].value is callbacks[0]
+    handoffs = [node for node in ast.walk(observer) if isinstance(node, ast.Call) and ast.unparse(node.func) == "self._on_pipeline_done"]
+    assert len(handoffs) == 1
+    assert [ast.unparse(arg) for arg in handoffs[0].args] == ["future"]
+    assert [(item.arg, ast.unparse(item.value)) for item in handoffs[0].keywords] == [
+        ("session_operation_lease", "session_operation_lease"),
+        ("loss_watcher", "loss_watcher"),
+    ]
+    assert len(observer_method.body) == 1 and isinstance(observer_method.body[0], ast.Try)
+    forwarding_body = observer_method.body[0].body
+    assert len(forwarding_body) == 1
+    assert isinstance(forwarding_body[0], ast.Expr) and forwarding_body[0].value is handoffs[0]
+
+    # Exact reviewed producer bodies close the remaining early-return and
+    # branch-placement gap around the direct edges proved above. A changed
+    # owner path requires a deliberate source review and repin.
+    reviewed_shapes = {
+        "execute": (execute_method, "6f199e7b1043508795aea08104f17e71efc75b562fa29b88b39020adf41461e2"),
+        "_submit_owned_pipeline": (submit_method, "a358f1a5c6af74f99a0d46dc62bd51dc9bf93fb0757b0e658576da6347bdd493"),
+        "_observe_pipeline_done": (observer_method, "754a630635377e47b41c2ef660ee899473b0ee8df7f9acd52a50068ba25b72c9"),
+    }
+    assert {name: hashlib.sha256(_stable_ast_bytes(node)).hexdigest() for name, (node, _digest) in reviewed_shapes.items()} == {
+        name: digest for name, (_node, digest) in reviewed_shapes.items()
+    }
 
 
 @pytest.mark.parametrize(
-    ("before", "after"),
+    ("source_name", "before", "after"),
     [
-        ("self._run_pipeline,", "self._different_worker,"),
-        ("self._on_pipeline_done,", "self._different_completion,"),
-        ("session_operation_lease=session_operation_lease", "session_operation_lease=another_lease"),
-        ("future.add_done_callback", "future.ignore_callback"),
+        ("execute", "self._run_pipeline,", "self._different_worker,"),
+        ("observer", "self._on_pipeline_done(future", "self._different_completion(future"),
+        ("execute", "session_operation_lease=session_operation_lease", "session_operation_lease=another_lease"),
+        ("submit", "future.add_done_callback", "future.ignore_callback"),
+        ("submit", "session_operation_lease=lease", "session_operation_lease=another_lease"),
+        (
+            "submit",
+            "future = executor.submit(invocation)",
+            "future = executor.submit(invocation)\n                    future = foreign_future",
+        ),
+        ("submit", "partial(self._observe_pipeline_done,", "partial(self._observe_pipeline_done, foreign_future,"),
     ],
 )
-def test_background_lease_transfer_rejects_changed_worker_callback_or_authority(before: str, after: str) -> None:
-    source = inspect.getsource(ExecutionServiceImpl.execute)
-    assert before in source
-    _assert_background_lease_transfer(source)
+def test_background_lease_transfer_rejects_changed_worker_callback_or_authority(source_name: str, before: str, after: str) -> None:
+    sources = {
+        "execute": inspect.getsource(ExecutionServiceImpl.execute),
+        "submit": inspect.getsource(ExecutionServiceImpl._submit_owned_pipeline),
+        "observer": inspect.getsource(ExecutionServiceImpl._observe_pipeline_done),
+    }
+    assert before in sources[source_name]
+    _assert_background_lease_transfer(sources["execute"], sources["submit"], sources["observer"])
+    sources[source_name] = sources[source_name].replace(before, after)
     with pytest.raises(AssertionError):
-        _assert_background_lease_transfer(source.replace(before, after))
+        _assert_background_lease_transfer(sources["execute"], sources["submit"], sources["observer"])
+
+
+def test_background_lease_transfer_rejects_foreign_future_after_actual_submit() -> None:
+    sources = {
+        "execute": inspect.getsource(ExecutionServiceImpl.execute),
+        "submit": inspect.getsource(ExecutionServiceImpl._submit_owned_pipeline),
+        "observer": inspect.getsource(ExecutionServiceImpl._observe_pipeline_done),
+    }
+    _assert_background_lease_transfer(sources["execute"], sources["submit"], sources["observer"])
+    submitted = "future = executor.submit(invocation)"
+    line = next(line for line in sources["submit"].splitlines() if submitted in line)
+    indent = line[: len(line) - len(line.lstrip())]
+    sources["submit"] = sources["submit"].replace(
+        submitted,
+        "discarded = executor.submit(invocation)\n" + indent + "future = foreign_future",
+    )
+    with pytest.raises(AssertionError):
+        _assert_background_lease_transfer(sources["execute"], sources["submit"], sources["observer"])
+
+
+@pytest.mark.parametrize(
+    "method,required_statement",
+    [
+        (
+            "submit",
+            "future.add_done_callback(partial(self._observe_pipeline_done, session_operation_lease=lease, loss_watcher=loss_watcher))",
+        ),
+        (
+            "observer",
+            "self._on_pipeline_done(future, session_operation_lease=session_operation_lease, loss_watcher=loss_watcher)",
+        ),
+    ],
+)
+def test_background_lease_transfer_rejects_unreachable_callback_edge(method: str, required_statement: str) -> None:
+    sources = {
+        "execute": inspect.getsource(ExecutionServiceImpl.execute),
+        "submit": inspect.getsource(ExecutionServiceImpl._submit_owned_pipeline),
+        "observer": inspect.getsource(ExecutionServiceImpl._observe_pipeline_done),
+    }
+    _assert_background_lease_transfer(sources["execute"], sources["submit"], sources["observer"])
+    original_lines = [line for line in sources[method].splitlines() if line.strip() == required_statement]
+    assert len(original_lines) == 1
+    line = original_lines[0]
+    indent = line[: len(line) - len(line.lstrip())]
+    sources[method] = sources[method].replace(line, indent + "if False:\n" + indent + "    " + required_statement)
+    ast.parse(textwrap.dedent(sources[method]))
+    with pytest.raises(AssertionError):
+        _assert_background_lease_transfer(sources["execute"], sources["submit"], sources["observer"])
+
+
+def _assert_background_completion_close_custody(
+    callback_source: str,
+    finish_source: str,
+    close_source: str,
+    transfer_source: str,
+) -> None:
+    """Prove the callback's actual scheduled Task reaches and joins lease.close()."""
+    import hashlib
+
+    sources = (callback_source, finish_source, close_source, transfer_source)
+    methods = [ast.parse(textwrap.dedent(source)).body[0] for source in sources]
+    callback, finish, close, transfer = methods
+    assert [method.name for method in methods] == [
+        "_on_pipeline_done",
+        "_finish_execution_authority",
+        "_close_execution_authority",
+        "close_execute_lease_before_transfer",
+    ]
+
+    def calls(method: ast.AST, name: str) -> list[ast.Call]:
+        return [node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == name]
+
+    scheduled = calls(callback, "asyncio.run_coroutine_threadsafe")
+    assert len(scheduled) == 1
+    assert [ast.unparse(arg) for arg in scheduled[0].args] == [
+        "self._finish_execution_authority(obligation, session_operation_lease, loss_watcher, exc)",
+        "self._loop",
+    ]
+    assert len(calls(callback, "obligation.bind_completion_future")) == 1
+    assert [ast.unparse(arg) for arg in calls(callback, "obligation.bind_completion_future")[0].args] == ["scheduled"]
+    assert len(calls(finish, "obligation.bind_completion_task")) == 1
+    assert [ast.unparse(arg) for arg in calls(finish, "obligation.bind_completion_task")[0].args] == ["task"]
+    assert len(calls(finish, "obligation.record_completion_outcome")) == 2
+    awaited_close = [
+        node
+        for node in ast.walk(finish)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func) == "self._close_execution_authority"
+    ]
+    assert len(awaited_close) == 1
+    assert [ast.unparse(arg) for arg in awaited_close[0].value.args] == ["session_operation_lease", "loss_watcher", "exc"]
+    transfer_await = [
+        node
+        for node in ast.walk(close)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func) == "close_execute_lease_before_transfer"
+    ]
+    assert len(transfer_await) == 1
+    assert [ast.unparse(arg) for arg in transfer_await[0].value.args] == ["session_operation_lease"]
+    assert len(calls(transfer, "asyncio.create_task")) == 1
+    assert ast.unparse(calls(transfer, "asyncio.create_task")[0].args[0]) == "lease.close()"
+    assert len(calls(transfer, "asyncio.wait")) == 1
+    assert [ast.unparse(arg) for arg in calls(transfer, "asyncio.wait")[0].args] == ["{task}"]
+    assert len(calls(transfer, "task.result")) == 1
+
+    # Pin the reviewed complete producer bodies. Direct edges alone could
+    # accept an unreachable branch, detached Task, or discarded close result.
+    expected = (
+        "e7a8f83154514fc9914c7ec746ab5252923c3dd6fbb9e6b27e66143491b07fdb",
+        "e749535b4ff010c0b4063ce9a3d4f55f15f10633e42f5a09a7b91ff5760a89ec",
+        "62563bc01a2af20846053d30bb70583462c71eb3ac76ad49a7cf910bd33859f2",
+        "2b58bf6b6eecb7aa94745bc0506939eb778cf4de1cfe95a9ae3fbb28cd13afda",
+    )
+    assert tuple(hashlib.sha256(_stable_ast_bytes(method)).hexdigest() for method in methods) == expected
+
+
+@pytest.mark.parametrize(
+    ("method", "before", "after"),
+    [
+        (
+            "callback",
+            "self._finish_execution_authority(obligation, session_operation_lease, loss_watcher, exc)",
+            "self._finish_execution_authority(obligation, foreign_lease, loss_watcher, exc)",
+        ),
+        ("callback", "obligation.bind_completion_future(scheduled)", "obligation.bind_completion_future(foreign_future)"),
+        (
+            "finish",
+            "await self._close_execution_authority(session_operation_lease, loss_watcher, exc)",
+            "self._close_execution_authority(session_operation_lease, loss_watcher, exc)",
+        ),
+        (
+            "close",
+            "await close_execute_lease_before_transfer(session_operation_lease)",
+            "await close_execute_lease_before_transfer(foreign_lease)",
+        ),
+        ("transfer", "task = asyncio.create_task(lease.close(),", "task = asyncio.create_task(foreign_lease.close(),"),
+        ("transfer", "await asyncio.wait({task})", "await asyncio.wait({foreign_task})"),
+        ("transfer", "task.result()", "foreign_task.result()"),
+    ],
+)
+def test_background_completion_close_custody_rejects_foreign_or_unjoined_owner(method: str, before: str, after: str) -> None:
+    sources = {
+        "callback": inspect.getsource(ExecutionServiceImpl._on_pipeline_done),
+        "finish": inspect.getsource(ExecutionServiceImpl._finish_execution_authority),
+        "close": inspect.getsource(ExecutionServiceImpl._close_execution_authority),
+        "transfer": inspect.getsource(close_execute_lease_before_transfer),
+    }
+    _assert_background_completion_close_custody(*sources.values())
+    assert sources[method].count(before) == 1
+    sources[method] = sources[method].replace(before, after)
+    ast.parse(textwrap.dedent(sources[method]))
+    with pytest.raises(AssertionError):
+        _assert_background_completion_close_custody(*sources.values())
+
+
+def test_background_completion_close_custody_rejects_unreachable_transfer() -> None:
+    sources = [
+        inspect.getsource(ExecutionServiceImpl._on_pipeline_done),
+        inspect.getsource(ExecutionServiceImpl._finish_execution_authority),
+        inspect.getsource(ExecutionServiceImpl._close_execution_authority),
+        inspect.getsource(close_execute_lease_before_transfer),
+    ]
+    _assert_background_completion_close_custody(*sources)
+    before = "await close_execute_lease_before_transfer(session_operation_lease)"
+    assert sources[2].count(before) == 1
+    line = next(line for line in sources[2].splitlines() if before in line)
+    indent = line[: len(line) - len(line.lstrip())]
+    sources[2] = sources[2].replace(line, indent + "if False:\n" + indent + "    " + before)
+    ast.parse(textwrap.dedent(sources[2]))
+    with pytest.raises(AssertionError):
+        _assert_background_completion_close_custody(*sources)
 
 
 def test_execute_transfers_one_renewable_lease_to_background_completion() -> None:
@@ -930,10 +1389,17 @@ def test_execute_transfers_one_renewable_lease_to_background_completion() -> Non
 
     execute_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl.execute))
     assert "session_operation_context = session_operation_lease.context" in execute_source
-    _assert_background_lease_transfer(execute_source)
+    _assert_background_lease_transfer(
+        execute_source,
+        inspect.getsource(ExecutionServiceImpl._submit_owned_pipeline),
+        inspect.getsource(ExecutionServiceImpl._observe_pipeline_done),
+    )
     worker_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl._run_pipeline))
     assert "session_operation_context = session_operation_lease.context" in worker_source
     assert "session_operation_lease.guard_external_effect" in worker_source
-    completion_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl._on_pipeline_done))
-    assert "session_operation_lease" in completion_source
-    assert ".close" in completion_source
+    _assert_background_completion_close_custody(
+        inspect.getsource(ExecutionServiceImpl._on_pipeline_done),
+        inspect.getsource(ExecutionServiceImpl._finish_execution_authority),
+        inspect.getsource(ExecutionServiceImpl._close_execution_authority),
+        inspect.getsource(close_execute_lease_before_transfer),
+    )

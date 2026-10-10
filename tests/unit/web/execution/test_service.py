@@ -58,7 +58,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.run_result import RunResult
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     ResolvedSinkEffectMode,
@@ -127,6 +127,7 @@ from elspeth.web.execution.service import (
     InlineBlobPromptSurfaceAdmissionError,
     _build_web_plugin_policy_evidence,
     _discover_blob_rows_sources,
+    close_execute_lease_before_transfer,
 )
 from elspeth.web.execution.validation import validate_pipeline as _real_validate_pipeline
 from elspeth.web.interpretation_state import (
@@ -153,8 +154,9 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token, make_landscape_db
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import CanonicalExecutionAuthorityObservation, ExecutionTestCustody
 from tests.helpers.session_fences import (
-    RecordingSessionOperationAuthority,
     adopt_execute_lease,
     close_adopted_lease,
     make_blob_read_context,
@@ -162,6 +164,9 @@ from tests.helpers.session_fences import (
 from tests.unit.core.test_audit_export_config import _enabled_config
 
 # ── Fixtures ───────────────────────────────────────────────────────────
+
+execution_fixture = execution_custody.execution_fixture
+
 
 _TEST_PIPELINE_YAML = "source:\n  plugin: csv\n  options: {}\n"
 _RESOLVED_TEST_PIPELINE_YAML = "source:\n  options: {}\n  plugin: csv\n"
@@ -860,46 +865,100 @@ def real_loop() -> Iterator[asyncio.AbstractEventLoop]:
 
 
 _worker_lease: SessionOperationLease | None = None
+_worker_lease_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _execute_lease() -> SessionOperationLease:
-    """The live EXECUTE lease a direct call to a lease-fenced internal passes.
+    """Allocate the direct-internal worker lease only for its actual consumer.
 
-    ``_run_pipeline``, ``_finalize_output_blobs``, ``_on_pipeline_done`` and
-    ``_broadcast_progress_event`` take the exact ``SessionOperationLease`` the
-    worker was handed at submission and reprove it through
-    ``guard_external_effect`` before every external effect. Tests that drive
-    them from the test thread pass this one; it is a real lifecycle lease
-    adopted onto ``real_loop`` over a recording authority, so the guards run.
+    Canonical ``_execute`` acquisition owns a different SQLite lease. Merely
+    requesting ``service`` must not allocate this recording-authority lease.
+    Every returned adopted lease is still closed by the owning fixture.
     """
-    if _worker_lease is None:
+    global _worker_lease
+    if _worker_lease_loop is None:
         raise RuntimeError("live EXECUTE lease fixture is not active")
+    if _worker_lease is None:
+        _worker_lease = adopt_execute_lease(_worker_lease_loop, uuid4())
     return _worker_lease
 
 
 @pytest.fixture(autouse=True)
-def _live_execute_lease(real_loop: asyncio.AbstractEventLoop) -> Iterator[None]:
-    """Adopt one real EXECUTE lease onto ``real_loop`` for the test's duration.
-
-    Closed at teardown on the same loop unless the code under test already
-    closed it (``_on_pipeline_done`` does, when the service's loop is real).
-    """
-    global _worker_lease
-    lease = adopt_execute_lease(real_loop, uuid4())
-    _worker_lease = lease
+def _live_execute_lease(real_loop: asyncio.AbstractEventLoop, execution_fixture: ExecutionTestCustody) -> Iterator[None]:
+    """Retain lazy direct-internal ownership and close every allocated lease."""
+    global _worker_lease, _worker_lease_loop
+    if _worker_lease is not None or _worker_lease_loop is not None:
+        raise RuntimeError("direct-internal lease fixture overlapped another owner")
+    _worker_lease_loop = real_loop
     try:
         yield
     finally:
+        lease = _worker_lease
         _worker_lease = None
-        if not lease.closed:
+        _worker_lease_loop = None
+        if lease is not None and not lease.closed:
             close_adopted_lease(real_loop, lease)
+
+
+async def _join_loop_cleanup_worker(
+    service: ExecutionServiceImpl,
+    execution_fixture: ExecutionTestCustody,
+    lease: SessionOperationLease,
+    *,
+    worker_originals: list[BaseException],
+    primary: BaseException | None = None,
+) -> None:
+    """Join the actual private owner before closing a worker's unused lease.
+
+    The worker normally releases in its loop coroutine before returning.
+    A literal submit error, or failure before that coroutine enters, cannot
+    establish absence of a physical worker. The registered executor's actual
+    joined receipt is the sole fallback handoff; registry join runs alongside
+    it and is allowed to wait for this exact canonical RELEASE.
+    """
+    originals: list[BaseException] = [] if primary is None else [primary]
+    cancellation_start = len(execution_fixture._caller_cancellations)
+
+    async def invocation() -> None:
+        await execution_fixture.shutdown_service(service)
+
+    execution_fixture._issue_join(invocation, "fixture-loop-cleanup-worker-shutdown")
+    owner = execution_fixture._joins[-1]
+    assert owner.invocation is invocation
+    registry = service.execution_lease_release_registry
+    while not registry.executor_join_physically_observed:
+        try:
+            await asyncio.sleep(0.01)
+        except asyncio.CancelledError as original:
+            if not any(original is retained for retained in originals):
+                originals.append(original)
+    for original in worker_originals:
+        if not any(original is retained for retained in originals):
+            originals.append(original)
+    if not lease.closed:
+        try:
+            await close_execute_lease_before_transfer(lease, primary=primary)
+        except BaseException as original:
+            originals.append(original)
+    # A failed/Unknown RELEASE remains registry-owned and cannot become a
+    # successful retirement. The external native controller owns its finite
+    # inconclusive bound; no timeout or exception grants completion here.
+    await execution_fixture._join_issued()
+    assert owner.entered and owner.task is not None and owner.task.done() and owner.outcome_recorded
+    if owner.outcome is not None:
+        originals.append(owner.outcome)
+    for original in execution_fixture._caller_cancellations[cancellation_start:]:
+        if not any(original is retained for retained in originals):
+            originals.append(original)
+    execution_custody.async_workers._raise_lifecycle_originals([], originals)
 
 
 async def _execute(
     service: ExecutionServiceImpl,
     *,
     session_id: UUID,
-    authority: RecordingSessionOperationAuthority | None = None,
+    authority: CanonicalExecutionAuthorityObservation | None = None,
+    execution_fixture: ExecutionTestCustody,
     **kwargs: Any,
 ) -> UUID:
     """Call ``execute()`` the way the route does: under a fresh EXECUTE lease for ``session_id``.
@@ -912,17 +971,23 @@ async def _execute(
     ``authority`` to recover the exact context the lease carries
     (``authority.calls[0]`` is ``("acquire", context)``).
     """
-    lease = await SessionOperationLease.acquire(
-        authority if authority is not None else RecordingSessionOperationAuthority(),
+    observed = authority if authority is not None else execution_fixture.observe_authority(session_id)
+    if type(observed) is not CanonicalExecutionAuthorityObservation:
+        raise TypeError("execute fixture requires its actual canonical authority observation")
+    lease = await execution_fixture.acquire(
+        service.execution_lease_release_registry,
+        observed.authority,
         session_id=session_id,
-        operation_kind=SessionOperationKind.EXECUTE,
         owner_instance_id="execution-service-test",
         lease_seconds=30,
     )
     try:
         return await service.execute(session_id, session_operation_lease=lease, **kwargs)
     except BaseException:
-        await lease.close()
+        obligation = lease.execution_obligation
+        assert obligation is not None
+        if not obligation.completion_required:
+            await close_execute_lease_before_transfer(lease)
         raise
 
 
@@ -933,16 +998,20 @@ def service(
     mock_settings: MagicMock,
     mock_session_service: MagicMock,
     real_loop: asyncio.AbstractEventLoop,
+    execution_fixture: ExecutionTestCustody,
 ) -> Iterator[ExecutionServiceImpl]:
     # AC #17: All Run CRUD goes through SessionService — no direct DB access.
     yaml_generator = _YamlGeneratorStub()
-    svc = ExecutionServiceImpl.for_trained_operator(
-        loop=mock_loop,
-        broadcaster=broadcaster,
-        settings=mock_settings,
-        session_service=mock_session_service,
-        yaml_generator=yaml_generator,
-        telemetry=build_sessions_telemetry(),
+    svc = execution_fixture.bind(
+        ExecutionServiceImpl.for_trained_operator(
+            loop=execution_fixture.loop,
+            broadcaster=broadcaster,
+            settings=mock_settings,
+            session_service=mock_session_service,
+            yaml_generator=yaml_generator,
+            telemetry=build_sessions_telemetry(),
+            execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+        )
     )
     # Patch _call_async for tests that call _run_pipeline directly (sync).
     # The real _call_async uses asyncio.run_coroutine_threadsafe which needs
@@ -1110,6 +1179,7 @@ class TestExecutionFlow:
         mock_session_service: MagicMock,
         authored_compartment: str | None,
         signing_mode: str,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         service._settings.compartment_id = "operator-a"
         authored_export = _enabled_config(compartment_id=authored_compartment)
@@ -1124,7 +1194,7 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.service.load_settings_from_config_dict", return_value=parsed) as load_settings,
             patch.object(service, "_run_pipeline"),
         ):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         loaded_export = load_settings.call_args.args[0]["landscape"]["export"]
         assert loaded_export["compartment_id"] == "operator-a"
@@ -1135,7 +1205,7 @@ class TestExecutionFlow:
     @pytest.mark.parametrize("signing_mode", ["unsigned", "hmac_sha256"])
     @pytest.mark.asyncio
     async def test_export_missing_operator_compartment_refuses_before_run(
-        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, signing_mode: str
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, signing_mode: str, execution_fixture: ExecutionTestCustody
     ) -> None:
         export = LandscapeExportSettings.model_construct(enabled=True, signing_mode=signing_mode, compartment_id=None)
         cast(_YamlGeneratorStub, service._yaml_generator).result = json.dumps(
@@ -1148,13 +1218,13 @@ class TestExecutionFlow:
             patch.object(service, "_run_pipeline"),
             pytest.raises(ValueError, match="compartment_id"),
         ):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         mock_session_service.create_run.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_web_export_refuses_deployment_auth_coverage_before_run(
-        self, service: ExecutionServiceImpl, mock_session_service: MagicMock
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         service._settings.compartment_id = "operator-a"
         cast(_YamlGeneratorStub, service._yaml_generator).result = json.dumps(
@@ -1172,7 +1242,7 @@ class TestExecutionFlow:
             patch.object(service, "_run_pipeline"),
             pytest.raises(ValueError, match="auth_events=deployment_snapshot"),
         ):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         mock_session_service.create_run.assert_not_awaited()
 
@@ -1203,28 +1273,32 @@ class TestExecutionFlow:
             service._require_current_binding_generation(frozen, user_id="alice")
 
     @pytest.mark.asyncio
-    async def test_execute_returns_run_id_immediately(self, service: ExecutionServiceImpl) -> None:
+    async def test_execute_returns_run_id_immediately(self, service: ExecutionServiceImpl, execution_fixture: ExecutionTestCustody) -> None:
         """execute() returns a UUID without blocking on pipeline completion."""
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
-    async def test_execute_rejects_non_string_yaml_generator_output(self, service: ExecutionServiceImpl) -> None:
+    async def test_execute_rejects_non_string_yaml_generator_output(
+        self, service: ExecutionServiceImpl, execution_fixture: ExecutionTestCustody
+    ) -> None:
         """YamlGenerator contract violations must fail fast, not spin in PyYAML."""
         cast(_YamlGeneratorStub, service._yaml_generator).result = object()
 
         with pytest.raises(TypeError, match="must return str"):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
-    async def test_execute_creates_run_via_session_service(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
+    async def test_execute_creates_run_via_session_service(
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
+    ) -> None:
         """Admission persists the immutable execution input under the exact EXECUTE lease."""
         session_id = uuid4()
         state_record = mock_session_service.get_current_state.return_value
-        authority = RecordingSessionOperationAuthority()
+        authority = execution_fixture.observe_authority(session_id)
         with patch.object(service, "_run_pipeline"):
-            await _execute(service, session_id=session_id, authority=authority)
+            await _execute(service, session_id=session_id, authority=authority, execution_fixture=execution_fixture)
         acquired = [context for name, context in authority.calls if name == "acquire"]
         assert len(acquired) == 1
         mock_session_service.create_run.assert_awaited_once()
@@ -1252,6 +1326,7 @@ class TestExecutionFlow:
         mock_session_service: MagicMock,
         mock_settings: _WebSettingsStub,
         tmp_path: Path,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         session_id = uuid4()
         (tmp_path / "blobs").mkdir()
@@ -1269,15 +1344,17 @@ class TestExecutionFlow:
         mock_session_service.get_current_state.return_value = state_record
         snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
         service._plugin_snapshot_factory = lambda _user_id: snapshot
-        completed: Future[None] = Future()
-        completed.set_result(None)
+        physical_submit = service._executor.submit
 
-        with patch.object(service._executor, "submit", return_value=completed) as submit:
-            await _execute(service, session_id=session_id, user_id="alice")
+        with (
+            patch.object(service, "_run_pipeline", return_value=None),
+            patch.object(service._executor, "submit", wraps=physical_submit) as submit,
+        ):
+            await _execute(service, session_id=session_id, user_id="alice", execution_fixture=execution_fixture)
 
-        submitted_args = submit.call_args.args
-        assert submitted_args[4].plugin_snapshot is snapshot
-        assert submitted_args[4].executable_config is not submitted_args[4].audit_safe_config
+        submitted_args = submit.call_args.args[0].args
+        assert submitted_args[3].plugin_snapshot is snapshot
+        assert submitted_args[3].executable_config is not submitted_args[3].audit_safe_config
 
     @pytest.mark.asyncio
     async def test_execute_lowers_profile_into_fanout_guard_and_frozen_executable_config(
@@ -1286,6 +1363,7 @@ class TestExecutionFlow:
         mock_session_service: MagicMock,
         mock_settings: _WebSettingsStub,
         tmp_path: Path,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
         from elspeth.web.composer import yaml_generator
@@ -1383,12 +1461,14 @@ class TestExecutionFlow:
         service._yaml_generator = yaml_generator
         service._plugin_snapshot_factory = lambda _user_id: snapshot
         service._operator_profile_registry = profiles
-        completed: Future[None] = Future()
-        completed.set_result(None)
+        physical_submit = service._executor.submit
 
-        with patch.object(service._executor, "submit", return_value=completed) as submit:
+        with (
+            patch.object(service, "_run_pipeline", return_value=None),
+            patch.object(service._executor, "submit", wraps=physical_submit) as submit,
+        ):
             with pytest.raises(ExecutionFanoutGuardRequired) as raised:
-                await _execute(service, session_id=session_id, user_id="alice")
+                await _execute(service, session_id=session_id, user_id="alice", execution_fixture=execution_fixture)
 
             risk = raised.value.guard.risks[0]
             assert risk.provider == "bedrock"
@@ -1414,9 +1494,10 @@ class TestExecutionFlow:
                 session_id=session_id,
                 user_id="alice",
                 fanout_ack_token=raised.value.guard.ack_token,
+                execution_fixture=execution_fixture,
             )
 
-        frozen = submit.call_args.args[4]
+        frozen = submit.call_args.args[0].args[3]
         executable = json.dumps(frozen.executable_config, default=dict)
         audit_safe = json.dumps(frozen.audit_safe_config, default=dict)
         assert private_model in executable
@@ -1427,7 +1508,7 @@ class TestExecutionFlow:
 
     @pytest.mark.asyncio
     async def test_execute_rejects_invalid_pipeline_before_run_creation(
-        self, service: ExecutionServiceImpl, mock_session_service: MagicMock
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Fix 1 (notes/composer-advisor-surface-map-2026-06-08.md): execute() must
         fail CLOSED on a pipeline that fails validate_pipeline — raising a structured
@@ -1467,7 +1548,7 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=invalid),
             pytest.raises(PipelineValidationError) as exc_info,
         ):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         # No opaque failed-run: the gate refuses BEFORE create_run.
         assert mock_session_service.create_run.await_count == 0
@@ -1477,9 +1558,7 @@ class TestExecutionFlow:
 
     @pytest.mark.asyncio
     async def test_execute_rejects_backend_execution_readiness_before_run_creation(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Execution admission follows readiness even when validation is green."""
         blocker = ValidationReadinessBlocker(
@@ -1506,16 +1585,14 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=not_execution_ready),
             pytest.raises(ExecutionReadinessError) as exc_info,
         ):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         assert exc_info.value.blockers == (blocker,)
         mock_session_service.create_run.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_execute_rejects_backend_execution_readiness_without_blockers(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         not_execution_ready = ValidationResult(
             is_valid=True,
@@ -1533,7 +1610,7 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=not_execution_ready),
             pytest.raises(ExecutionReadinessError) as exc_info,
         ):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         assert exc_info.value.blockers == ()
         mock_session_service.create_run.assert_not_awaited()
@@ -1545,6 +1622,7 @@ class TestExecutionFlow:
         mock_session_service: MagicMock,
         mock_settings: _WebSettingsStub,
         tmp_path: Path,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         session_id = uuid4()
         (tmp_path / "blobs").mkdir()
@@ -1578,7 +1656,7 @@ class TestExecutionFlow:
             patch.object(service._executor, "submit") as submit,
             pytest.raises(PipelineValidationError),
         ):
-            await _execute(service, session_id=session_id, user_id="alice")
+            await _execute(service, session_id=session_id, user_id="alice", execution_fixture=execution_fixture)
 
         mock_session_service.create_run.assert_not_awaited()
         instantiate.assert_not_called()
@@ -1586,9 +1664,7 @@ class TestExecutionFlow:
 
     @pytest.mark.asyncio
     async def test_execute_rejects_aws_s3_endpoint_url_before_run_or_provider_instantiation(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         endpoint_sentinel = "https://provider-canary.attacker.invalid/private"
         state_record = mock_session_service.get_current_state.return_value
@@ -1629,7 +1705,7 @@ class TestExecutionFlow:
             patch.object(service._executor, "submit") as mock_submit,
             pytest.raises(PipelineValidationError) as exc_info,
         ):
-            await _execute(service, session_id=state_record.session_id)
+            await _execute(service, session_id=state_record.session_id, execution_fixture=execution_fixture)
 
         assert mock_session_service.create_run.await_count == 0
         mock_load.assert_not_called()
@@ -1641,7 +1717,7 @@ class TestExecutionFlow:
 
     @pytest.mark.asyncio
     async def test_execute_allows_valid_pipeline_through_the_gate(
-        self, service: ExecutionServiceImpl, mock_session_service: MagicMock
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Fix 1: a valid pipeline passes the new pre-run gate and still creates a run."""
         valid = ValidationResult(
@@ -1659,15 +1735,13 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=valid),
             patch.object(service, "_run_pipeline"),
         ):
-            run_id = await _execute(service, session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
         mock_session_service.create_run.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_execute_merges_selected_state_fact_against_authored_state(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Completion facts bind to the persisted graph, not runtime materialization."""
         from elspeth.web.composer.state import SourceSpec
@@ -1732,7 +1806,7 @@ class TestExecutionFlow:
             ) as merge,
             patch.object(service, "_run_pipeline"),
         ):
-            run_id = await _execute(service, session_id=session_id, state_id=selected_record.id)
+            run_id = await _execute(service, session_id=session_id, state_id=selected_record.id, execution_fixture=execution_fixture)
 
         assert isinstance(run_id, UUID)
         merge.assert_called_once()
@@ -1746,9 +1820,7 @@ class TestExecutionFlow:
 
     @pytest.mark.asyncio
     async def test_execute_rejects_corrupt_completion_gate_before_run_creation(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         selected_record = mock_session_service.get_current_state.return_value
         private_persisted_detail = "private-persisted-advisor-detail"
@@ -1767,7 +1839,7 @@ class TestExecutionFlow:
         }
 
         with pytest.raises(CompletionGateIntegrityError) as exc_info:
-            await _execute(service, session_id=selected_record.session_id)
+            await _execute(service, session_id=selected_record.session_id, execution_fixture=execution_fixture)
 
         assert private_persisted_detail not in str(exc_info.value)
         assert private_persisted_detail not in repr(exc_info.value)
@@ -2434,6 +2506,7 @@ class TestAuthoritativeProofDiagnostics:
         mock_session_service: MagicMock,
         mock_settings: _WebSettingsStub,
         tmp_path: Path,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         session_id = uuid4()
         blob_id = uuid4()
@@ -2475,7 +2548,7 @@ class TestAuthoritativeProofDiagnostics:
             patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
             pytest.raises(PipelineValidationError) as exc_info,
         ):
-            await _execute(service, session_id=session_id, user_id="alice")
+            await _execute(service, session_id=session_id, user_id="alice", execution_fixture=execution_fixture)
 
         assert exc_info.value.errors[0].error_code == "gate_expression_type_mismatch_against_source_schema"
         assert snapshot_calls == 1
@@ -2968,6 +3041,7 @@ class TestExecutionFanoutGuard:
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
         tmp_path: Path,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """A deaggregation transform upstream of LLM must stop at launch."""
         from elspeth.web.execution.fanout_guard import ExecutionFanoutGuardRequired
@@ -3019,12 +3093,13 @@ class TestExecutionFanoutGuard:
             # first (elspeth-f3c1aafd25); acknowledge it to reach the fanout
             # guard under test.
             with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
-                await _execute(service, session_id=session_id)
+                await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
             with pytest.raises(ExecutionFanoutGuardRequired) as raised:
                 await _execute(
                     service,
                     session_id=session_id,
                     secret_ack_token=secret_raised.value.guard.ack_token,
+                    execution_fixture=execution_fixture,
                 )
 
         guard = raised.value.guard
@@ -3043,6 +3118,7 @@ class TestExecutionFanoutGuard:
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
         tmp_path: Path,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Accepted fanout warnings are persisted with the run launch record."""
         from elspeth.web.execution.fanout_guard import ExecutionFanoutGuardRequired
@@ -3092,12 +3168,13 @@ class TestExecutionFanoutGuard:
         ):
             # Secret approval (elspeth-f3c1aafd25) gates first, then fanout.
             with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
-                await _execute(service, session_id=session_id)
+                await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
             with pytest.raises(ExecutionFanoutGuardRequired) as raised:
                 await _execute(
                     service,
                     session_id=session_id,
                     secret_ack_token=secret_raised.value.guard.ack_token,
+                    execution_fixture=execution_fixture,
                 )
 
         run_id = uuid4()
@@ -3106,7 +3183,7 @@ class TestExecutionFanoutGuard:
         # line_explode now correctly fails the independent UNKNOWN semantic
         # contract gate, so keep that sibling gate stubbed on the accepted
         # retry just as it is on the initial guard-producing call above.
-        authority = RecordingSessionOperationAuthority()
+        authority = execution_fixture.observe_authority(session_id)
         with (
             patch.object(service, "_run_pipeline") as run_pipeline,
             patch.object(service, "_loop", asyncio.get_running_loop()),
@@ -3119,11 +3196,12 @@ class TestExecutionFanoutGuard:
                     authority=authority,
                     fanout_ack_token=raised.value.guard.ack_token,
                     secret_ack_token=secret_raised.value.guard.ack_token,
+                    execution_fixture=execution_fixture,
                 )
             finally:
                 # The real executor and its lease-completion callback must
                 # finish before the fixture closes the worker's bridge loop.
-                await service.shutdown()
+                await execution_fixture.shutdown_service(service)
 
         run_pipeline.assert_called_once()
         acquired = [context for name, context in authority.calls if name == "acquire"]
@@ -3149,6 +3227,7 @@ class TestExecutionFanoutGuard:
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
         tmp_path: Path,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """A direct low-cardinality source->LLM path remains a one-click run."""
         data_dir = tmp_path
@@ -3181,7 +3260,7 @@ class TestExecutionFanoutGuard:
             ],
         )
 
-        authority = RecordingSessionOperationAuthority()
+        authority = execution_fixture.observe_authority(session_id)
         with (
             patch.object(service, "_run_pipeline"),
             patch.object(service, "_loop", asyncio.get_running_loop()),
@@ -3191,15 +3270,16 @@ class TestExecutionFanoutGuard:
                 # The wired secret still requires its own out-of-band approval
                 # (elspeth-f3c1aafd25); low cardinality only removes the FANOUT ack.
                 with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
-                    await _execute(service, session_id=session_id)
+                    await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
                 run_id = await _execute(
                     service,
                     session_id=session_id,
                     authority=authority,
                     secret_ack_token=secret_raised.value.guard.ack_token,
+                    execution_fixture=execution_fixture,
                 )
             finally:
-                await service.shutdown()
+                await execution_fixture.shutdown_service(service)
 
         assert isinstance(run_id, UUID)
         acquired = [context for name, context in authority.calls if name == "acquire"]
@@ -3218,6 +3298,7 @@ class TestExecutionFanoutGuard:
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
         tmp_path: Path,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Named source fanout accounting must not inspect only the compatibility source."""
         from elspeth.web.execution.fanout_guard import ExecutionFanoutGuardRequired
@@ -3274,12 +3355,13 @@ class TestExecutionFanoutGuard:
         ):
             # Acknowledge the wired-secret approval first (elspeth-f3c1aafd25).
             with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
-                await _execute(service, session_id=session_id)
+                await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
             with pytest.raises(ExecutionFanoutGuardRequired) as raised:
                 await _execute(
                     service,
                     session_id=session_id,
                     secret_ack_token=secret_raised.value.guard.ack_token,
+                    execution_fixture=execution_fixture,
                 )
 
         risk = raised.value.guard.risks[0]
@@ -5307,19 +5389,18 @@ class TestB7ExceptionHandling:
         # finally must have removed the event
         assert run_id not in service._shutdown_events
 
-    def test_done_callback_logs_last_resort_on_exception(self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop) -> None:
+    def test_done_callback_logs_last_resort_on_exception(
+        self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop, execution_fixture: ExecutionTestCustody
+    ) -> None:
         """Callback logs a last-resort diagnostic when the pipeline future
         carries an exception.  This covers the edge case where _run_pipeline's
         own except block failed (e.g. update_run_status raised).
         """
-        future: Future[None] = Future()
-        future.set_exception(RuntimeError("unhandled"))
         service._loop = real_loop
+        stage = real_loop.run_until_complete(execution_fixture.callback_stage(service, error=RuntimeError("unhandled")))
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future, session_operation_lease=_execute_lease())
-            completion = next(iter(service._lease_completion_futures))
-            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
+            real_loop.run_until_complete(stage.join())
             mock_slog.error.assert_called_once()
             call_kwargs = mock_slog.error.call_args
             assert call_kwargs[0][0] == "pipeline_done_callback_exception"
@@ -5343,6 +5424,7 @@ class TestB7ExceptionHandling:
         service: ExecutionServiceImpl,
         real_loop: asyncio.AbstractEventLoop,
         signal_factory: Callable[[], BaseException],
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """A signal is an interpreter-directed shutdown, not a run failure.
 
@@ -5354,20 +5436,19 @@ class TestB7ExceptionHandling:
         release does NOT hang off the classification — the lease is closed on
         every path before the branch is reached.
         """
-        lease = _execute_lease()
-        future: Future[Any] = Future()
-        future.set_exception(signal_factory())
         service._loop = real_loop
+        stage = real_loop.run_until_complete(execution_fixture.callback_stage(service, error=signal_factory()))
+        lease = stage.lease
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future, session_operation_lease=lease)
-            completion = next(iter(service._lease_completion_futures))
-            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
+            real_loop.run_until_complete(stage.join())
             mock_slog.error.assert_not_called()
 
         assert lease.closed
 
-    def test_done_callback_walks_exception_chain(self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop) -> None:
+    def test_done_callback_walks_exception_chain(
+        self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop, execution_fixture: ExecutionTestCustody
+    ) -> None:
         """Chained exceptions surface as a class-name chain — no payloads.
 
         Regression: ``exc_msg=str(exc)[:200]`` leaked truncated-but-still-
@@ -5380,14 +5461,12 @@ class TestB7ExceptionHandling:
             except ValueError as inner:
                 raise RuntimeError("outer") from inner
         except RuntimeError as outer:
-            future: Future[None] = Future()
-            future.set_exception(outer)
+            original = outer
 
         service._loop = real_loop
+        stage = real_loop.run_until_complete(execution_fixture.callback_stage(service, error=original))
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future, session_operation_lease=_execute_lease())
-            completion = next(iter(service._lease_completion_futures))
-            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
+            real_loop.run_until_complete(stage.join())
             call_kwargs = mock_slog.error.call_args[1]
             assert call_kwargs["exc_type"] == "RuntimeError"
             assert call_kwargs["exc_class_chain"] == ["RuntimeError", "ValueError"]
@@ -5397,16 +5476,15 @@ class TestB7ExceptionHandling:
                     assert "secret" not in value
                     assert "deadbeef" not in value
 
-    def test_done_callback_noop_on_success(self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop) -> None:
+    def test_done_callback_noop_on_success(
+        self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop, execution_fixture: ExecutionTestCustody
+    ) -> None:
         """done_callback does not log on successful completion."""
-        future: Future[None] = Future()
-        future.set_result(None)
         service._loop = real_loop
+        stage = real_loop.run_until_complete(execution_fixture.callback_stage(service))
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future, session_operation_lease=_execute_lease())
-            completion = next(iter(service._lease_completion_futures))
-            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
+            real_loop.run_until_complete(stage.join())
             mock_slog.error.assert_not_called()
 
     @patch("elspeth.web.execution.service.open_landscape_db")
@@ -6303,7 +6381,7 @@ class TestGovernedExecutionAdmission:
 
     @pytest.mark.asyncio
     async def test_missing_approval_refuses_before_run_creation(
-        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, tmp_path: Path
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, tmp_path: Path, execution_fixture: ExecutionTestCustody
     ) -> None:
         service._settings.workflow_governance = "on"
         service._settings.data_dir = tmp_path
@@ -6319,7 +6397,7 @@ class TestGovernedExecutionAdmission:
             patch.object(service, "_approval_inputs_from_frozen", return_value=approval),
             pytest.raises(ExecutionApprovalRequired) as exc_info,
         ):
-            await _execute(service, session_id=uuid4(), user_id="author")
+            await _execute(service, session_id=uuid4(), user_id="author", execution_fixture=execution_fixture)
 
         assert exc_info.value.reason is AdmissionRefusalReason.APPROVAL_REQUIRED
         assert exc_info.value.binding == approval.binding
@@ -6329,7 +6407,7 @@ class TestGovernedExecutionAdmission:
 
     @pytest.mark.asyncio
     async def test_approval_rechecked_after_retaining_source_bytes(
-        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, tmp_path: Path
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, tmp_path: Path, execution_fixture: ExecutionTestCustody
     ) -> None:
         service._settings.workflow_governance = "on"
         service._settings.data_dir = tmp_path
@@ -6348,7 +6426,7 @@ class TestGovernedExecutionAdmission:
             patch.object(service, "_approval_inputs_from_frozen", return_value=approval),
             pytest.raises(ExecutionApprovalRequired) as exc_info,
         ):
-            await _execute(service, session_id=uuid4(), user_id="author")
+            await _execute(service, session_id=uuid4(), user_id="author", execution_fixture=execution_fixture)
 
         assert exc_info.value.reason is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
         assert mock_session_service.check_approval_binding.await_count == 2
@@ -6387,10 +6465,12 @@ class TestGovernedExecutionAdmission:
         settle.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_off_mode_keeps_existing_run_start_calls(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
+    async def test_off_mode_keeps_existing_run_start_calls(
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
+    ) -> None:
         service._settings.workflow_governance = "off"
         with patch.object(service, "_run_pipeline"):
-            await _execute(service, session_id=uuid4(), user_id="author")
+            await _execute(service, session_id=uuid4(), user_id="author", execution_fixture=execution_fixture)
         mock_session_service.check_approval_binding.assert_not_awaited()
         mock_session_service.create_run.assert_awaited_once()
 
@@ -6843,9 +6923,7 @@ class TestCancelMechanism:
 
     @pytest.mark.asyncio
     async def test_shutdown_event_registered_before_blob_linkage(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Race fix part 2: _shutdown_events registration must happen before
         blob linkage, so cancel() finds the event during the blob window."""
@@ -6882,13 +6960,11 @@ class TestCancelMechanism:
         }
 
         with patch.object(service, "_run_pipeline"):
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
     async def test_shutdown_event_cleaned_up_on_blob_linkage_failure(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """If blob linkage raises after event registration, the event must
         be cleaned up to avoid leaking into _shutdown_events."""
@@ -6919,106 +6995,252 @@ class TestCancelMechanism:
         }
 
         with pytest.raises(RuntimeError, match="blob storage unavailable"):
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
 
         assert str(run_id) not in service._shutdown_events
 
 
 class TestP2aCleanupCatchNarrowing:
-    """Regression (P2a): cleanup catches in ExecutionServiceImpl must not
-    launder exception strings into slog.
+    """Preserve redaction and programmer-error visibility before transfer.
 
-    ``except Exception`` over ``update_run_status`` previously logged
-    ``cleanup_error=str(cleanup_err)``. On SQLAlchemyError subclasses that
-    expands to ``[SQL: ...] [parameters: ...]`` plus a ``__cause__`` chain
-    that can carry DB URLs / credentials. Canonical pattern (commits
-    b8ba2214/127417cb): narrow to ``(SQLAlchemyError, OSError)`` and log
-    ``exc_class`` only.
+    A literal submit-no-return is a separate owned Unknown boundary below;
+    it cannot authorize immediate status compensation.
     """
 
     @pytest.mark.asyncio
     async def test_setup_failure_cleanup_slog_uses_exc_class_not_str(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
-        """When a setup failure triggers cleanup and cleanup's own
-        ``update_run_status`` raises a ``SQLAlchemyError``, the slog
-        record must carry ``cleanup_exc_class`` + ``original_exc_class``
-        (class names) — not the legacy ``cleanup_error``/``original_error``
-        string fields."""
+        """Actual blob-link failure reaches class-only pretransfer cleanup."""
         from sqlalchemy.exc import OperationalError
 
-        session_id = uuid4()
-        run_id = uuid4()
+        session_id, run_id = uuid4(), uuid4()
+        blob_ref = str(uuid4())
+        canonical_path = f"/tmp/data/blobs/{session_id}/{blob_ref}_input.csv"
         mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
-
-        # First update_run_status call (in cleanup) raises OperationalError.
-        mock_session_service.update_run_status.side_effect = OperationalError(
+        original = RuntimeError("blob storage unavailable")
+        cleanup_original = OperationalError(
             "UPDATE runs ...",
             {"id": str(run_id), "error": "Setup failed: SuperSecretDSN://u:p@h/d"},
             Exception("lock wait timeout exceeded — __cause__ carries DSN"),
         )
-
-        # Force the setup path to fail so the cleanup catch fires.
-        # _executor.submit raising is the simplest route.
-        def submit_raises(*_args: Any, **_kwargs: Any) -> Future[Any]:
-            raise RuntimeError("pool shutdown")
-
-        service._executor.submit = submit_raises  # type: ignore[method-assign]
-
-        with (
-            patch("elspeth.web.execution.service.slog") as mock_slog,
-            pytest.raises(RuntimeError, match="pool shutdown"),
-        ):
-            await _execute(service, session_id=session_id)
-
-        # slog.error was called for the cleanup failure.
+        mock_session_service.update_run_status.side_effect = cleanup_original
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref, session_id=session_id, storage_path=canonical_path
+        )
+        blob_service.link_blob_to_run.side_effect = original
+        cast(Any, service)._blob_service = blob_service
+        state = mock_session_service.get_current_state.return_value
+        state.source = {
+            "plugin": "csv",
+            "on_success": "continue",
+            "options": {"blob_ref": blob_ref, "path": canonical_path},
+            "on_validation_failure": "quarantine",
+        }
+        observed = execution_fixture.observe_authority(session_id)
+        with patch("elspeth.web.execution.service.slog") as mock_slog, pytest.raises(RuntimeError) as caught:
+            await _execute(service, session_id=session_id, authority=observed, execution_fixture=execution_fixture)
+        assert caught.value is original, "P2A_BLOB_PRIMARY_IDENTITY"
+        blob_service.link_blob_to_run.assert_awaited_once()
+        context = observed.calls[0][1]
+        assert mock_session_service.update_run_status.await_count == 1, "P2A_CLEANUP_REACHED"
+        update = mock_session_service.update_run_status.await_args
+        assert update.args == (run_id,)
+        assert update.kwargs["status"] == "failed"
+        assert update.kwargs["session_operation_context"] is context
+        assert cleanup_original.__traceback__ is not None
         slog_calls = [c for c in mock_slog.error.call_args_list if c[0] and c[0][0] == "run_cleanup_status_update_failed"]
         assert len(slog_calls) == 1, mock_slog.error.call_args_list
         kwargs = slog_calls[0][1]
-
-        # The narrow-catch kwargs are class names, not strings.
         assert kwargs["cleanup_exc_class"] == "OperationalError"
         assert kwargs["original_exc_class"] == "RuntimeError"
-
-        # Legacy string-valued fields are GONE — this is the redaction
-        # regression guard. Any reintroduction re-opens the str(exc) leak.
         assert "cleanup_error" not in kwargs
         assert "original_error" not in kwargs
+        assert str(run_id) not in service._shutdown_events
+        assert _worker_lease is None, "P2A_UNUSED_ADOPTED_LEASE"
 
     @pytest.mark.asyncio
     async def test_setup_cleanup_narrow_catch_lets_runtimeerror_escape(
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
+    ) -> None:
+        """The actually awaited cleanup RuntimeError escapes the narrow catch."""
+        session_id, run_id = uuid4(), uuid4()
+        observed = execution_fixture.observe_authority(session_id)
+        lease = await execution_fixture.acquire(
+            service.execution_lease_release_registry,
+            observed.authority,
+            session_id=session_id,
+            owner_instance_id="p2a-untransferred-handler",
+            lease_seconds=30,
+        )
+        obligation = lease.execution_obligation
+        assert obligation is not None
+        original = RuntimeError("setup predecessor")
+        cleanup_original = RuntimeError("dataclass contract violated inside update_run_status")
+        assert cleanup_original is not original
+        mock_session_service.update_run_status.side_effect = cleanup_original
+        try:
+            assert not obligation.completion_required and obligation.pipeline is None
+            with pytest.raises(RuntimeError) as caught:
+                await service._handle_pipeline_submission_failure(run_id, original, session_operation_lease=lease)
+            assert caught.value is cleanup_original, "P2A_NARROW_CLEANUP_IDENTITY"
+            mock_session_service.update_run_status.assert_awaited_once()
+            update = mock_session_service.update_run_status.await_args
+            assert update.args == (run_id,)
+            assert update.kwargs["session_operation_context"] is lease.context
+            assert update.kwargs["status"] == "failed"
+            assert not obligation.completion_required
+        except BaseException as primary:
+            await close_execute_lease_before_transfer(lease, primary=primary)
+            raise
+        else:
+            await close_execute_lease_before_transfer(lease)
+        assert lease.closed and obligation.release_succeeded
+        assert _worker_lease is None, "P2A_UNUSED_ADOPTED_LEASE"
+
+
+def _p2a_original_leaves(original: BaseException) -> list[BaseException]:
+    if isinstance(original, BaseExceptionGroup):
+        return [leaf for child in original.exceptions for leaf in _p2a_original_leaves(child)]
+    return [original]
+
+
+class TestP2aSubmitNoReturnCustody:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("planned_cleanup", ["sql", "runtime"])
+    async def test_literal_submit_original_survives_actual_private_join(
         self,
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
+        execution_fixture: ExecutionTestCustody,
+        planned_cleanup: str,
     ) -> None:
-        """Narrow catch semantics: a RuntimeError from update_run_status
-        (programmer bug, not a DB/filesystem failure) MUST propagate
-        instead of being swallowed. Pre-narrowing, the broad
-        ``except Exception`` masked such bugs."""
+        """Unknown submit has no immediate compensation or false COMPLETE."""
+        from sqlalchemy.exc import OperationalError
+
         session_id = uuid4()
-        run_id = uuid4()
-        mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
+        registry = service.execution_lease_release_registry
+        observed = execution_fixture.observe_authority(session_id)
+        lease = await execution_fixture.acquire(
+            registry, observed.authority, session_id=session_id, owner_instance_id="p2a-submit-owner", lease_seconds=30
+        )
+        obligation = lease.execution_obligation
+        assert obligation is not None
+        original = RuntimeError("pool shutdown")
+        cleanup_original = (
+            OperationalError("UPDATE runs ...", {}, Exception("private cleanup fault"))
+            if planned_cleanup == "sql"
+            else RuntimeError("dataclass contract violated inside update_run_status")
+        )
+        mock_session_service.update_run_status.side_effect = cleanup_original
+        executor = service._executor
+        assert isinstance(executor, concurrent.futures.ThreadPoolExecutor)
+        entries = []
+        authority_returns = []
+        close_authority = service._close_execution_authority
 
-        # First update_run_status (in cleanup) raises RuntimeError — outside
-        # the narrow (SQLAlchemyError, OSError) catch. It must escape.
-        mock_session_service.update_run_status.side_effect = RuntimeError("dataclass contract violated inside update_run_status")
+        async def observe_authority_return(
+            closing: SessionOperationLease, watcher: asyncio.Task[None] | None, error: BaseException | None
+        ) -> None:
+            await close_authority(closing, watcher, error)
+            assert closing is lease
+            actual_task = asyncio.current_task()
+            assert actual_task is obligation.completion_task, "P2A_COMPLETION_PRODUCER_IDENTITY"
+            assert obligation.release_succeeded, "P2A_RELEASE_BEFORE_COMPLETION"
+            assert not obligation.completion_outcome_recorded and not obligation.completion_observed
+            assert not obligation.retired and registry._pending[id(obligation)] is obligation, "P2A_COMPLETION_PENDING_AT_RELEASE_RETURN"
+            authority_returns.append(actual_task)
 
-        # Force setup to fail so cleanup fires.
-        def submit_raises(*_args: Any, **_kwargs: Any) -> Future[Any]:
-            raise RuntimeError("pool shutdown")
+        def submit_raises(invocation: Callable[[], Any]) -> Future[Any]:
+            assert isinstance(invocation, partial)
+            assert invocation.func.__self__ is service
+            assert invocation.func.__func__ is ExecutionServiceImpl._run_pipeline
+            assert invocation.keywords["session_operation_lease"] is lease
+            assert obligation.completion_required, "P2A_COMPLETION_BEFORE_SUBMIT"
+            assert obligation.context is obligation.acquire_submission.source_value
+            assert obligation.acquire_submission.observed
+            entries.append(invocation)
+            raise original
 
-        service._executor.submit = submit_raises  # type: ignore[method-assign]
+        with (
+            patch.object(executor, "submit", side_effect=submit_raises),
+            patch.object(service, "_close_execution_authority", side_effect=observe_authority_return),
+            patch("elspeth.web.execution.service.slog") as mock_slog,
+        ):
+            with pytest.raises(RuntimeError) as caught:
+                await service.execute(session_id, session_operation_lease=lease)
+            assert caught.value is original, "P2A_SUBMIT_ORIGINAL_IDENTITY"
+            assert len(entries) == 1
+            assert obligation.pipeline_submission_unknown is original, "P2A_UNKNOWN_ORIGINAL_IDENTITY"
+            assert any(original is leaf for root in registry._failures for leaf in _p2a_original_leaves(root)), (
+                "P2A_PREJOIN_RETAINED_ORIGINAL"
+            )
+            assert registry._pending[id(obligation)] is obligation
+            assert not obligation.retired and not lease.closed, "P2A_NO_PREMATURE_RETIREMENT"
+            assert obligation.completion_required and obligation.pipeline is None
+            assert obligation.completion_task is None and obligation.release_submission is None
+            assert not registry.executor_join_physically_observed
+            mock_session_service.update_run_status.assert_not_awaited()
+            assert mock_session_service.update_run_status.await_count == 0, "P2A_NO_PREMATURE_COMPENSATION"
+            assert not any(c.args and c.args[0] == "run_cleanup_status_update_failed" for c in mock_slog.error.call_args_list)
+            assert _worker_lease is None, "P2A_UNUSED_ADOPTED_LEASE"
 
-        # The RuntimeError from update_run_status escapes the narrow catch.
-        # The outer `raise` is bypassed — the cleanup RuntimeError wins
-        # (Python's implicit exception chaining preserves both via
-        # __context__, but the foreground exception is the cleanup one).
-        # We accept either RuntimeError here — the key invariant is that
-        # a RuntimeError propagates rather than being swallowed.
-        with pytest.raises(RuntimeError):
-            await _execute(service, session_id=session_id)
+            with pytest.raises(BaseException) as shutdown:
+                await execution_fixture.shutdown_service(service)
+            shutdown_leaves = _p2a_original_leaves(shutdown.value)
+            assert len(shutdown_leaves) == 1 and shutdown_leaves[0] is original, "P2A_JOIN_RETAINS_ORIGINAL"
+
+        assert registry.executor_join_physically_observed and registry.executor_join_succeeded
+        assert service._executor is executor
+        assert obligation.pipeline is None
+        task = obligation.completion_task
+        assert isinstance(task, asyncio.Task) and task.done(), "P2A_ACTUAL_COMPLETION_JOIN"
+        assert len(authority_returns) == 1 and authority_returns[0] is task, "P2A_ACTUAL_AUTHORITY_RETURN"
+        assert obligation.completion_outcome_recorded and obligation.completion_observed
+        assert obligation.completion_original_error is None
+        assert obligation.unknown_pipeline_cleanup_declared
+        release = obligation.release_submission
+        assert release is not None
+        future, reservation = release.future, release.reservation
+        assert isinstance(future, Future) and future.done(), "P2A_ACTUAL_RELEASE_FUTURE"
+        assert reservation is not None and reservation.future is future
+        assert reservation._registering_generation is obligation.generation
+        assert reservation.released and release.callback_return_observed, "P2A_RELEASE_CALLBACK_COUNTER"
+        witness = reservation.witness.snapshot()
+        assert witness.callable_finished and witness.exited and not witness.impossible
+        assert release.observed and release.original_error is None
+        assert lease.closed and obligation.release_succeeded
+        assert obligation.retired and id(obligation) not in registry._pending
+        assert any(original is leaf for root in registry._failures for leaf in _p2a_original_leaves(root)), "P2A_RETAINED_REGISTRY_ORIGINAL"
+        assert cleanup_original.__traceback__ is None
+        mock_session_service.update_run_status.assert_not_awaited()
+        with pytest.raises(BaseExceptionGroup) as refused:
+            registry.assert_completed()
+        refused_leaves = _p2a_original_leaves(refused.value)
+        assert any(leaf is original for leaf in refused_leaves)
+        assert any(type(leaf) is AuditIntegrityError for leaf in refused_leaves), "P2A_FAILED_COMPLETE_REFUSAL"
+
+        roots_before = tuple(registry._failures)
+        for copied in (
+            RuntimeError("pool shutdown"),
+            cleanup_original,
+            RuntimeError("unrelated cleanup"),
+            asyncio.CancelledError("unrelated"),
+        ):
+            try:
+                execution_fixture.witness_cleanup_original(copied)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError("P2A_COPIED_WITNESS_REFUSED")
+            assert not any(copied is item for item in execution_fixture.witnessed_cleanup_originals), "P2A_COPIED_WITNESS_REFUSED"
+        execution_fixture.witness_cleanup_original(original)
+        assert any(item is original for item in execution_fixture.witnessed_cleanup_originals)
+        assert len(registry._failures) == len(roots_before)
+        assert all(now is before for now, before in zip(registry._failures, roots_before, strict=True))
+        with pytest.raises(BaseExceptionGroup):
+            registry.assert_completed()
 
 
 # ── Completion-Path Guard ─────────────────────────────────────────────
@@ -8006,9 +8228,7 @@ class TestBlobRefPreValidation:
 
     @pytest.mark.asyncio
     async def test_malformed_blob_ref_raises_before_run_creation(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """A non-UUID blob_ref raises typed validation before create_run()
         is called, so no pending run is orphaned."""
@@ -8026,7 +8246,7 @@ class TestBlobRefPreValidation:
         cast(Any, service)._blob_service = blob_service
 
         with pytest.raises(MalformedBlobRefError):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         # The critical invariant: create_run() was never called,
         # so no stale pending run exists.
@@ -8034,9 +8254,7 @@ class TestBlobRefPreValidation:
 
     @pytest.mark.asyncio
     async def test_valid_blob_ref_still_links_correctly(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Valid UUID blob_ref is parsed early and passed to link_blob_to_run."""
         session_id = uuid4()
@@ -8064,9 +8282,9 @@ class TestBlobRefPreValidation:
             "on_validation_failure": "quarantine",
         }
 
-        authority = RecordingSessionOperationAuthority()
+        authority = execution_fixture.observe_authority(session_id)
         with patch.object(service, "_run_pipeline"):
-            await _execute(service, session_id=session_id, authority=authority)
+            await _execute(service, session_id=session_id, authority=authority, execution_fixture=execution_fixture)
 
         blob_service.link_blob_to_run.assert_called_once_with(
             blob_id=UUID(blob_ref),
@@ -8077,9 +8295,7 @@ class TestBlobRefPreValidation:
 
     @pytest.mark.asyncio
     async def test_second_named_source_malformed_blob_ref_raises_before_run_creation(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Malformed blob_ref on any named source is rejected before create_run()."""
         from elspeth.web.execution.errors import MalformedBlobRefError
@@ -8106,16 +8322,14 @@ class TestBlobRefPreValidation:
         cast(Any, service)._blob_service = blob_service
 
         with pytest.raises(MalformedBlobRefError, match=r"sources\.refunds\.blob_ref"):
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
 
         mock_session_service.create_run.assert_not_called()
         blob_service.get_blob.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_named_blob_sources_all_link_to_run(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Every valid named blob source gets an input blob_run_links row."""
         session_id = uuid4()
@@ -8152,7 +8366,7 @@ class TestBlobRefPreValidation:
         }
 
         with patch.object(service, "_run_pipeline"):
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
 
         linked_blob_ids = [call.kwargs["blob_id"] for call in blob_service.link_blob_to_run.await_args_list]
         assert linked_blob_ids == [UUID(orders_blob), UUID(refunds_blob)]
@@ -8172,9 +8386,7 @@ class TestBlobOwnership:
 
     @pytest.mark.asyncio
     async def test_cross_session_blob_ref_rejected(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """The authoritative proof collapses cross-session custody to a generic rejection."""
 
@@ -8200,7 +8412,7 @@ class TestBlobOwnership:
         }
 
         with pytest.raises(PipelineValidationError) as exc_info:
-            await _execute(service, session_id=executing_session_id)
+            await _execute(service, session_id=executing_session_id, execution_fixture=execution_fixture)
         assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
         assert "session-owned path match" in str(exc_info.value)
         assert str(other_session_id) not in str(exc_info.value)
@@ -8210,9 +8422,7 @@ class TestBlobOwnership:
 
     @pytest.mark.asyncio
     async def test_second_named_source_cross_session_blob_ref_rejected(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Cross-session blob_ref on a non-first named source preserves IDOR collapse."""
 
@@ -8249,7 +8459,7 @@ class TestBlobOwnership:
         }
 
         with pytest.raises(PipelineValidationError) as exc_info:
-            await _execute(service, session_id=executing_session_id)
+            await _execute(service, session_id=executing_session_id, execution_fixture=execution_fixture)
         assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
 
         mock_session_service.create_run.assert_not_called()
@@ -8257,9 +8467,7 @@ class TestBlobOwnership:
 
     @pytest.mark.asyncio
     async def test_same_session_blob_ref_accepted(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Blob belonging to the same session passes ownership check."""
         session_id = uuid4()
@@ -8285,7 +8493,7 @@ class TestBlobOwnership:
         }
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=session_id)
+            run_id = await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
 
@@ -8297,9 +8505,7 @@ class TestBlobSourcePathReadGuard:
 
     @pytest.mark.asyncio
     async def test_diverging_stored_path_raises_structured_error(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """A stale allowlisted path is rejected before a run is created."""
 
@@ -8327,7 +8533,7 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(PipelineValidationError) as exc_info:
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
         assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
         assert "session-owned path match" in str(exc_info.value)
 
@@ -8340,9 +8546,7 @@ class TestBlobSourcePathReadGuard:
 
     @pytest.mark.asyncio
     async def test_missing_stored_path_raises_structured_error(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """A blob_ref with no stored path fails authoritative proof."""
 
@@ -8368,14 +8572,12 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(PipelineValidationError) as exc_info:
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
         assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
 
     @pytest.mark.asyncio
     async def test_named_blob_source_path_mismatch_raises_structured_error(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Every named source blob_ref gets the same ownership/path guard."""
 
@@ -8404,16 +8606,14 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(PipelineValidationError) as exc_info:
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
         assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_second_named_blob_source_path_mismatch_raises_structured_error(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """A non-first named source must also match the canonical blob path."""
 
@@ -8450,7 +8650,7 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(PipelineValidationError) as exc_info:
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
         assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
@@ -8462,27 +8662,23 @@ class TestBlobSourcePathReadGuard:
 class TestOneActiveRun:
     @pytest.mark.asyncio
     async def test_second_execute_raises_run_already_active(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """B6: Only one pending/running run per session."""
         session_id = uuid4()
         mock_session_service.get_active_run.return_value = _run_record_stub(status="running")
 
         with pytest.raises(RunAlreadyActiveError):
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
     async def test_execute_after_completed_run_succeeds(
-        self,
-        service: ExecutionServiceImpl,
-        mock_session_service: MagicMock,
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """After a run completes, a new one can start."""
         mock_session_service.get_active_run.return_value = None
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
 
@@ -8634,16 +8830,20 @@ class TestB8AsyncBridging:
         broadcaster: ProgressBroadcaster,
         mock_settings: MagicMock,
         mock_session_service: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """_call_async() schedules coroutine and returns its result."""
         mock_loop = MagicMock(spec=asyncio.AbstractEventLoop)
-        svc = ExecutionServiceImpl.for_trained_operator(
-            loop=mock_loop,
-            broadcaster=broadcaster,
-            settings=mock_settings,
-            session_service=mock_session_service,
-            yaml_generator=_YamlGeneratorStub(),
-            telemetry=build_sessions_telemetry(),
+        svc = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=mock_loop,
+                broadcaster=broadcaster,
+                settings=mock_settings,
+                session_service=mock_session_service,
+                yaml_generator=_YamlGeneratorStub(),
+                telemetry=build_sessions_telemetry(),
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
         mock_future = MagicMock(spec=Future)
         mock_future.result.return_value = "test_result"
@@ -8663,16 +8863,20 @@ class TestB8AsyncBridging:
         broadcaster: ProgressBroadcaster,
         mock_settings: MagicMock,
         mock_session_service: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """If the coroutine raises, _call_async re-raises from future.result()."""
         mock_loop = MagicMock(spec=asyncio.AbstractEventLoop)
-        svc = ExecutionServiceImpl.for_trained_operator(
-            loop=mock_loop,
-            broadcaster=broadcaster,
-            settings=mock_settings,
-            session_service=mock_session_service,
-            yaml_generator=_YamlGeneratorStub(),
-            telemetry=build_sessions_telemetry(),
+        svc = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=mock_loop,
+                broadcaster=broadcaster,
+                settings=mock_settings,
+                session_service=mock_session_service,
+                yaml_generator=_YamlGeneratorStub(),
+                telemetry=build_sessions_telemetry(),
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
         mock_future = MagicMock(spec=Future)
         mock_future.result.side_effect = ValueError("db error")
@@ -8690,16 +8894,20 @@ class TestB8AsyncBridging:
         broadcaster: ProgressBroadcaster,
         mock_settings: MagicMock,
         mock_session_service: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """R6 fix: _call_async raises TimeoutError after 30s, preventing deadlock."""
         mock_loop = MagicMock(spec=asyncio.AbstractEventLoop)
-        svc = ExecutionServiceImpl.for_trained_operator(
-            loop=mock_loop,
-            broadcaster=broadcaster,
-            settings=mock_settings,
-            session_service=mock_session_service,
-            yaml_generator=_YamlGeneratorStub(),
-            telemetry=build_sessions_telemetry(),
+        svc = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=mock_loop,
+                broadcaster=broadcaster,
+                settings=mock_settings,
+                session_service=mock_session_service,
+                yaml_generator=_YamlGeneratorStub(),
+                telemetry=build_sessions_telemetry(),
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
         mock_future = MagicMock(spec=Future)
         mock_future.result.side_effect = concurrent.futures.TimeoutError()
@@ -8718,20 +8926,34 @@ class TestAsyncShutdown:
 
     @pytest.mark.asyncio
     async def test_shutdown_keeps_loop_available_for_worker_cleanup(
-        self,
-        mock_settings: MagicMock,
-        mock_session_service: MagicMock,
+        self, mock_settings: MagicMock, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
     ) -> None:
         """Regression: draining the executor must not strand worker _call_async calls."""
         loop = asyncio.get_running_loop()
-        svc = ExecutionServiceImpl.for_trained_operator(
-            loop=loop,
-            broadcaster=ProgressBroadcaster(loop),
-            settings=mock_settings,
-            session_service=mock_session_service,
-            yaml_generator=_YamlGeneratorStub(),
-            telemetry=build_sessions_telemetry(),
+        svc = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=loop,
+                broadcaster=ProgressBroadcaster(loop),
+                settings=mock_settings,
+                session_service=mock_session_service,
+                yaml_generator=_YamlGeneratorStub(),
+                telemetry=build_sessions_telemetry(),
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
+
+        session_id = uuid4()
+        observed = execution_fixture.observe_authority(session_id)
+        lease = await execution_fixture.acquire(
+            svc.execution_lease_release_registry,
+            observed.authority,
+            session_id=session_id,
+            owner_instance_id="late-loop-cleanup-worker",
+            lease_seconds=30,
+        )
+        assert lease.execution_obligation is not None
+        assert lease.execution_obligation.context is lease.context
+        assert not lease.closed
 
         run_id = str(uuid4())
         shutdown_event = threading.Event()
@@ -8757,25 +8979,40 @@ class TestAsyncShutdown:
 
         worker_done = threading.Event()
         worker_errors: list[str] = []
+        worker_originals: list[BaseException] = []
+
+        async def cleanup_on_loop() -> None:
+            primary: BaseException | None = None
+            try:
+                await mock_session_service.update_run_status(
+                    uuid4(),
+                    status="cancelled",
+                    session_operation_context=lease.context,
+                )
+            except BaseException as original:
+                primary = original
+                raise
+            finally:
+                await close_execute_lease_before_transfer(lease, primary=primary)
 
         def worker() -> None:
             shutdown_event.wait()
             try:
-                svc._call_async(
-                    mock_session_service.update_run_status(
-                        uuid4(),
-                        status="cancelled",
-                        session_operation_context=_execute_lease().context,
-                    )
-                )
+                svc._call_async(cleanup_on_loop())
             except BaseException as exc:
                 worker_errors.append(type(exc).__name__)
+                worker_originals.append(exc)
             finally:
                 worker_done.set()
 
-        svc._executor.submit(worker)
+        submission_original: BaseException | None = None
+        try:
+            svc._executor.submit(worker)
+        except BaseException as original:
+            submission_original = original
+            svc.execution_lease_release_registry.record_failure(original)
 
-        await svc.shutdown()
+        await _join_loop_cleanup_worker(svc, execution_fixture, lease, worker_originals=worker_originals, primary=submission_original)
 
         assert worker_done.is_set()
         assert worker_errors == []
@@ -8831,9 +9068,7 @@ class TestVerifyRunOwnership:
 
     @pytest.fixture
     def idor_service(
-        self,
-        mock_loop: MagicMock,
-        broadcaster: ProgressBroadcaster,
+        self, mock_loop: MagicMock, broadcaster: ProgressBroadcaster, execution_fixture: ExecutionTestCustody
     ) -> tuple[ExecutionServiceImpl, Any]:
         """ExecutionServiceImpl with controllable session service."""
         session_svc = create_autospec(SessionServiceProtocol, instance=True)
@@ -8842,13 +9077,16 @@ class TestVerifyRunOwnership:
         settings.landscape_url = "sqlite:///test.db"
         settings.payload_store_path = Path("/tmp/test")
 
-        svc = ExecutionServiceImpl.for_trained_operator(
-            loop=mock_loop,
-            broadcaster=broadcaster,
-            settings=settings,
-            session_service=session_svc,
-            yaml_generator=_YamlGeneratorStub(),
-            telemetry=build_sessions_telemetry(),
+        svc = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=mock_loop,
+                broadcaster=broadcaster,
+                settings=settings,
+                session_service=session_svc,
+                yaml_generator=_YamlGeneratorStub(),
+                telemetry=build_sessions_telemetry(),
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
         return svc, session_svc
 
@@ -8982,6 +9220,7 @@ class TestSinkPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Sink with path pointing outside data_dir/outputs must be rejected."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9001,7 +9240,7 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
     async def test_sink_path_traversal_rejected(
@@ -9009,6 +9248,7 @@ class TestSinkPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Sink with ../ traversal in path must be rejected."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9028,7 +9268,7 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
     async def test_sink_path_under_outputs_accepted(
@@ -9036,6 +9276,7 @@ class TestSinkPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Sink with path under data_dir/outputs is allowed."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9054,7 +9295,7 @@ class TestSinkPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=session_id)
+            run_id = await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -9063,6 +9304,7 @@ class TestSinkPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """elspeth-bdc17cfdb1: a sink path inside ANOTHER session's blob
         subtree must be rejected at run start — the write primitive this
@@ -9085,7 +9327,7 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
     async def test_sink_path_in_other_session_outputs_rejected(
@@ -9093,6 +9335,7 @@ class TestSinkPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """A shared output root is infrastructure, not cross-session write authority."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9117,7 +9360,7 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await _execute(service, session_id=executing_session)
+            await _execute(service, session_id=executing_session, execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
     async def test_sink_path_in_own_session_blobs_accepted(
@@ -9125,6 +9368,7 @@ class TestSinkPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """A sink path inside the executing session's own blob subtree is
         allowed — the pending-output-blob flow writes exactly there."""
@@ -9144,7 +9388,7 @@ class TestSinkPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=own_session)
+            run_id = await _execute(service, session_id=own_session, execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -9153,6 +9397,7 @@ class TestSinkPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Sink with no path/file options (e.g. database sink) passes check."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9170,7 +9415,7 @@ class TestSinkPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
 
@@ -9227,6 +9472,7 @@ class TestTransformProviderConfigPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Transform with provider_config.persist_directory outside data_dir/outputs must be rejected."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9252,7 +9498,7 @@ class TestTransformProviderConfigPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
     async def test_transform_persist_directory_traversal_rejected(
@@ -9260,6 +9506,7 @@ class TestTransformProviderConfigPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Transform with ../ traversal in provider_config.persist_directory must be rejected."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9285,7 +9532,7 @@ class TestTransformProviderConfigPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
     async def test_transform_persist_directory_under_outputs_accepted(
@@ -9293,6 +9540,7 @@ class TestTransformProviderConfigPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Transform with provider_config.persist_directory under data_dir/outputs is allowed."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9317,7 +9565,7 @@ class TestTransformProviderConfigPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=session_id)
+            run_id = await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -9326,6 +9574,7 @@ class TestTransformProviderConfigPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """A non-Mapping ``provider_config`` is skipped, and the scan keeps going.
 
@@ -9370,7 +9619,7 @@ class TestTransformProviderConfigPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="rag-escaping"):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -9397,6 +9646,7 @@ class TestTransformProviderConfigPathRestriction:
         mock_settings: MagicMock,
         options: dict[str, Any],
         gate: str,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """The execution-layer half of the guarantee that replaces the managed-identity refusal.
 
@@ -9487,7 +9737,7 @@ class TestTransformProviderConfigPathRestriction:
                     patch("elspeth.web.execution.validation.validate_pipeline", side_effect=_real_validate_pipeline),
                     pytest.raises(PipelineValidationError) as raised,
                 ):
-                    await _execute(service, session_id=uuid4(), user_id="alice")
+                    await _execute(service, session_id=uuid4(), user_id="alice", execution_fixture=execution_fixture)
                 # The mocked state never yields loadable settings, so a bare
                 # ``raises`` is satisfied by ANY node. Pin the refusal to the
                 # operator-profile gate and to this node.
@@ -9495,7 +9745,7 @@ class TestTransformProviderConfigPathRestriction:
                 rendered = " ".join(error.message for error in raised.value.errors)
             else:
                 with pytest.raises(RuntimeError, match="Plugin policy validation diverged") as diverged:
-                    await _execute(service, session_id=uuid4(), user_id="alice")
+                    await _execute(service, session_id=uuid4(), user_id="alice", execution_fixture=execution_fixture)
                 rendered = str(diverged.value)
 
         run_pipeline.assert_not_called()
@@ -9509,6 +9759,7 @@ class TestTransformProviderConfigPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Web execution must not run LLM configs that inherit the hour-long sequential retry default."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9544,7 +9795,7 @@ class TestTransformProviderConfigPathRestriction:
             patch.object(service, "_run_pipeline") as run_pipeline,
             pytest.raises(PipelineValidationError, match="sequential multi-query LLM"),
         ):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         run_pipeline.assert_not_called()
 
@@ -9554,6 +9805,7 @@ class TestTransformProviderConfigPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Exact integer strings accepted by LLMConfig must not be blocked by the retry policy."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9587,7 +9839,7 @@ class TestTransformProviderConfigPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -9596,6 +9848,7 @@ class TestTransformProviderConfigPathRestriction:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Transform without provider_config (non-RAG) skips the nested check cleanly."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -9616,7 +9869,7 @@ class TestTransformProviderConfigPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
 
@@ -9717,6 +9970,7 @@ class TestExecuteSemanticContractViolation:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         mock_settings.data_dir = "/tmp/elspeth_data"
         session_id = uuid4()
@@ -9726,7 +9980,7 @@ class TestExecuteSemanticContractViolation:
         # ``except ValueError`` paths still catch it. New callers should
         # catch the specific type and read .entries/.contracts.
         with pytest.raises(ValueError, match="line_explode"):
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
 
         mock_session_service.create_run.assert_not_awaited()
 
@@ -9736,6 +9990,7 @@ class TestExecuteSemanticContractViolation:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Verify the structured payload — the whole point of the new exception.
 
@@ -9750,7 +10005,7 @@ class TestExecuteSemanticContractViolation:
         self._set_web_scrape_line_explode_state(mock_session_service, session_id=session_id)
 
         with pytest.raises(SemanticContractViolationError) as excinfo:
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
 
         exc = excinfo.value
         assert len(exc.entries) >= 1
@@ -9764,6 +10019,7 @@ class TestExecuteSemanticContractViolation:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         mock_settings.data_dir = "/tmp/elspeth_data"
         session_id = uuid4()
@@ -9774,7 +10030,7 @@ class TestExecuteSemanticContractViolation:
         )
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=session_id)
+            run_id = await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
 
         assert isinstance(run_id, UUID)
 
@@ -9927,6 +10183,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """F-17: an unresolved placeholder blocks execution and raises a typed error.
 
@@ -9940,7 +10197,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_unresolved_placeholder_state(mock_session_service)
 
         with pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         # The typed payload carries (node_id, term) — no prompt_template.
         assert excinfo.value.placeholders == (("rate_node", "cool"),)
@@ -9959,6 +10216,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
 
@@ -9966,7 +10224,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_structured_pending_interpretation_state(mock_session_service)
 
         with patch.object(service, "_run_pipeline"), pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         assert excinfo.value.placeholders == (("rate_node", "cool"),)
         mock_session_service.create_run.assert_not_awaited()
@@ -10077,6 +10335,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """elspeth-5a94855935: a resolved invented_source whose content_hash
         drifted after review is rejected with the same contract as any other
@@ -10088,7 +10347,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_drifted_invented_source_state(mock_session_service)
 
         with patch.object(service, "_run_pipeline"), pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         source_sites = [s for s in excinfo.value.sites if s.component_type == "source"]
         assert len(source_sites) == 1
@@ -10102,6 +10361,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
         from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
@@ -10142,7 +10402,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         state.outputs = []
 
         with patch.object(service, "_run_pipeline"), pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         assert [(site.component_id, site.kind.value) for site in excinfo.value.sites] == [("source:orders", "invented_source")]
         mock_session_service.create_run.assert_not_awaited()
@@ -10153,6 +10413,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """F-21: each unresolved interpretation site emits one counter increment.
 
@@ -10167,7 +10428,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_unresolved_placeholder_state(mock_session_service)
 
         with pytest.raises(UnresolvedInterpretationPlaceholderError):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
         counter = service._telemetry.interpretation_placeholder_unresolved_at_runtime_total
         # Test fixture uses fake counters — type-narrow to access ``calls``.
@@ -10203,6 +10464,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """An LLM transform whose prompt_template has no placeholder runs normally.
 
@@ -10286,7 +10548,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
             patch.object(service, "_run_pipeline"),
             patch("elspeth.web.execution.service.evaluate_execution_fanout_guard", return_value=None),
         ):
-            run_id = await _execute(service, session_id=session_id)
+            run_id = await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
 
         assert isinstance(run_id, UUID)
         # Counter was NOT incremented.
@@ -10311,6 +10573,7 @@ class TestRelativePathResolution:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Sink with a relative path under outputs/ passes when resolved against data_dir."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -10328,7 +10591,7 @@ class TestRelativePathResolution:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -10337,6 +10600,7 @@ class TestRelativePathResolution:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Source with a relative path under blobs/ passes when resolved against data_dir."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -10353,7 +10617,7 @@ class TestRelativePathResolution:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await _execute(service, session_id=session_id)
+            run_id = await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -10362,6 +10626,7 @@ class TestRelativePathResolution:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Every named source path must pass the direct /execute allowlist."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -10389,7 +10654,7 @@ class TestRelativePathResolution:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match=r"Source 'refunds'.*resolves outside allowed directories"):
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
 
     @pytest.mark.asyncio
     async def test_relative_traversal_still_blocked(
@@ -10397,6 +10662,7 @@ class TestRelativePathResolution:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """Source with ../ traversal is rejected even when relative."""
         mock_settings.data_dir = "/tmp/elspeth_data"
@@ -10414,7 +10680,7 @@ class TestRelativePathResolution:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed directories"):
-            await _execute(service, session_id=uuid4())
+            await _execute(service, session_id=uuid4(), execution_fixture=execution_fixture)
 
 
 # ── Edge Compatibility in _run_pipeline ───────────────────────────────
@@ -10530,62 +10796,79 @@ class TestFinalizeOutputBlobsCatchWidening:
             loop.close()
 
     def _make_service_with_blob(
-        self, blob_service: BlobServiceProtocol, mock_settings: MagicMock, mock_session_service: MagicMock
+        self,
+        blob_service: BlobServiceProtocol,
+        mock_settings: MagicMock,
+        mock_session_service: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> ExecutionServiceImpl:
-        svc = ExecutionServiceImpl.for_trained_operator(
-            loop=MagicMock(spec=asyncio.AbstractEventLoop),
-            broadcaster=MagicMock(spec=ProgressBroadcaster),
-            settings=mock_settings,
-            session_service=mock_session_service,
-            yaml_generator=_YamlGeneratorStub(),
-            telemetry=build_sessions_telemetry(),
-            blob_service=blob_service,
+        svc = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=MagicMock(spec=asyncio.AbstractEventLoop),
+                broadcaster=MagicMock(spec=ProgressBroadcaster),
+                settings=mock_settings,
+                session_service=mock_session_service,
+                yaml_generator=_YamlGeneratorStub(),
+                telemetry=build_sessions_telemetry(),
+                blob_service=blob_service,
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
         call_async, loop = _make_strict_call_async()
         self._loops_to_close.append(loop)
         cast(Any, svc)._call_async = call_async
         return svc
 
-    def test_suppresses_blob_not_found_error(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
+    def test_suppresses_blob_not_found_error(
+        self, mock_settings: MagicMock, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
+    ) -> None:
         from elspeth.web.blobs.protocol import BlobNotFoundError
 
         blob_service = _blob_service_stub()
         blob_service.finalize_run_output_blobs.side_effect = BlobNotFoundError("missing-blob")
-        svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
+        svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service, execution_fixture=execution_fixture)
         svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
-    def test_propagates_runtime_error_from_blob_lifecycle(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
+    def test_propagates_runtime_error_from_blob_lifecycle(
+        self, mock_settings: MagicMock, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
+    ) -> None:
         """RuntimeError is no longer suppressed — it's too broad and would
         catch Tier 1 anomaly signals.  Blob lifecycle errors should use
         BlobStateError or BlobNotFoundError instead.
         """
         blob_service = _blob_service_stub()
         blob_service.finalize_run_output_blobs.side_effect = RuntimeError("Cannot finalize — status is 'ready', expected 'pending'")
-        svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
+        svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service, execution_fixture=execution_fixture)
         with pytest.raises(RuntimeError, match="Cannot finalize"):
             svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
-    def test_suppresses_blob_quota_exceeded_error(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
+    def test_suppresses_blob_quota_exceeded_error(
+        self, mock_settings: MagicMock, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
+    ) -> None:
         from elspeth.web.blobs.protocol import BlobQuotaExceededError
 
         blob_service = _blob_service_stub()
         blob_service.finalize_run_output_blobs.side_effect = BlobQuotaExceededError("sess-1", current_bytes=100, limit_bytes=50)
-        svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
+        svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service, execution_fixture=execution_fixture)
         svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
-    def test_propagates_type_error(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
+    def test_propagates_type_error(
+        self, mock_settings: MagicMock, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
+    ) -> None:
         """Programmer bugs (TypeError, AttributeError, etc.) must still crash."""
         blob_service = _blob_service_stub()
         blob_service.finalize_run_output_blobs.side_effect = TypeError("unexpected keyword argument")
-        svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
+        svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service, execution_fixture=execution_fixture)
         with pytest.raises(TypeError, match="unexpected keyword argument"):
             svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
-    def test_propagates_attribute_error(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
+    def test_propagates_attribute_error(
+        self, mock_settings: MagicMock, mock_session_service: MagicMock, execution_fixture: ExecutionTestCustody
+    ) -> None:
         """AttributeError is a programmer bug — must crash."""
         blob_service = _blob_service_stub()
         blob_service.finalize_run_output_blobs.side_effect = AttributeError("'NoneType' object has no attribute 'id'")
-        svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
+        svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service, execution_fixture=execution_fixture)
         with pytest.raises(AttributeError):
             svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
@@ -10629,6 +10912,7 @@ class TestTerminalOrderingInvariant:
         mock_orch_cls: MagicMock,
         mock_settings: MagicMock,
         mock_session_service: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """When finalize_run_output_blobs raises BlobNotFoundError after
         a successful orchestrator.run(), exactly one terminal event must
@@ -10653,14 +10937,17 @@ class TestTerminalOrderingInvariant:
         blob_service = _blob_service_stub()
         blob_service.finalize_run_output_blobs.side_effect = BlobNotFoundError("blob-vanished")
 
-        svc = ExecutionServiceImpl.for_trained_operator(
-            loop=MagicMock(spec=asyncio.AbstractEventLoop),
-            broadcaster=mock_broadcaster,
-            settings=mock_settings,
-            session_service=mock_session_service,
-            yaml_generator=_YamlGeneratorStub(),
-            telemetry=build_sessions_telemetry(),
-            blob_service=blob_service,
+        svc = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=MagicMock(spec=asyncio.AbstractEventLoop),
+                broadcaster=mock_broadcaster,
+                settings=mock_settings,
+                session_service=mock_session_service,
+                yaml_generator=_YamlGeneratorStub(),
+                telemetry=build_sessions_telemetry(),
+                blob_service=blob_service,
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
         _real_loop = asyncio.new_event_loop()
         try:
@@ -10692,6 +10979,7 @@ class TestTerminalOrderingInvariant:
         mock_orch_cls: MagicMock,
         mock_settings: MagicMock,
         mock_session_service: MagicMock,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         """When a run completes but the DB status is already 'cancelled'
         (external orphan cleanup raced), exactly one terminal event must
@@ -10721,13 +11009,16 @@ class TestTerminalOrderingInvariant:
         mock_session_service.update_run_status.side_effect = _selective_update
         mock_session_service.get_run.return_value = _run_record_stub(status="cancelled")
 
-        svc = ExecutionServiceImpl.for_trained_operator(
-            loop=MagicMock(spec=asyncio.AbstractEventLoop),
-            broadcaster=mock_broadcaster,
-            settings=mock_settings,
-            session_service=mock_session_service,
-            yaml_generator=_YamlGeneratorStub(),
-            telemetry=build_sessions_telemetry(),
+        svc = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=MagicMock(spec=asyncio.AbstractEventLoop),
+                broadcaster=mock_broadcaster,
+                settings=mock_settings,
+                session_service=mock_session_service,
+                yaml_generator=_YamlGeneratorStub(),
+                telemetry=build_sessions_telemetry(),
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
         _real_loop = asyncio.new_event_loop()
         try:
@@ -11805,21 +12096,32 @@ class TestLossWatcherPollResilience:
         self,
         service: ExecutionServiceImpl,
         real_loop: asyncio.AbstractEventLoop,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
-        async def failed_watcher() -> None:
-            raise OperationalError("SELECT runs", {}, Exception("database is locked"))
+        original = OperationalError("SELECT runs", {}, Exception("database is locked"))
+        actual_signal = service._signal_shutdown_on_operation_loss
 
-        watcher = real_loop.create_task(failed_watcher(), name="execution-operation-loss-test-run")
-        real_loop.run_until_complete(asyncio.gather(watcher, return_exceptions=True))
-        lease = _execute_lease()
-        future: Future[None] = Future()
-        future.set_result(None)
+        async def failed_watcher(current_lease, shutdown_event, *, run_id, close_requested):
+            # Real owned watcher producer delegates the ordinary cooperative
+            # close, then raises the original endpoint fault. This logging unit
+            # test does not claim physical SQL retry/fault coverage.
+            await actual_signal(current_lease, shutdown_event, run_id=run_id, close_requested=close_requested)
+            raise original
+
         service._loop = real_loop
 
-        with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future, session_operation_lease=lease, loss_watcher=watcher)
-            completion = next(iter(service._lease_completion_futures))
-            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
+        with (
+            patch.object(service, "_signal_shutdown_on_operation_loss", side_effect=failed_watcher),
+            patch("elspeth.web.execution.service.slog") as mock_slog,
+        ):
+            stage = real_loop.run_until_complete(
+                execution_fixture.callback_stage(service, watcher_name="execution-operation-loss-test-run")
+            )
+            lease = stage.lease
+            with pytest.raises(OperationalError) as caught:
+                real_loop.run_until_complete(stage.join())
+            assert caught.value is original
+            execution_fixture.witness_cleanup_original(original)
 
         mock_slog.error.assert_called_once()
         event_name, *_ = mock_slog.error.call_args.args
@@ -11834,22 +12136,20 @@ class TestLossWatcherPollResilience:
         self,
         service: ExecutionServiceImpl,
         real_loop: asyncio.AbstractEventLoop,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
-        async def idle_watcher() -> None:
-            await asyncio.Event().wait()
-
-        watcher = real_loop.create_task(idle_watcher(), name="execution-operation-loss-idle-run")
-        lease = _execute_lease()
-        future: Future[None] = Future()
-        future.set_result(None)
         service._loop = real_loop
+        stage = real_loop.run_until_complete(execution_fixture.callback_stage(service, watcher_name="execution-operation-loss-idle-run"))
+        watcher = stage.watcher
+        lease = stage.lease
+        watcher_owner = service._loss_watcher_owner(watcher, lease)
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future, session_operation_lease=lease, loss_watcher=watcher)
-            completion = next(iter(service._lease_completion_futures))
-            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
+            real_loop.run_until_complete(stage.join())
 
-        assert watcher.cancelled()
+        assert watcher.done() and not watcher.cancelled()
+        assert watcher_owner.close_requested.is_set()
+        assert watcher_owner.outcome == (watcher, None)
         mock_slog.error.assert_not_called()
         assert lease.closed
 

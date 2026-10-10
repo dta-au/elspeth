@@ -62,8 +62,8 @@ sudo chmod 0700 ./data ./data/blobs ./data/outputs
 ```
 
 Generate fresh signing keys in the shell, then pass all required web settings
-into the container. The Composer timeout is five minutes, with a six-minute
-declared transport ceiling; any proxy in front must support that ceiling:
+into the container. The durable Composer job budget is five minutes, independent of the transport idle ceiling.
+The declared ceiling is six minutes; any proxy in front must support that ceiling:
 
 ```bash
 export ELSPETH_WEB_SECRET_KEY="$(openssl rand -hex 32)"
@@ -349,11 +349,13 @@ The HTTP-scope map and upstream `Upgrade`/`Connection` headers preserve
 WebSocket negotiation through `/ws/runs/...`; ordinary authenticated requests
 continue through the same proxy. A healthy `/api/ready` does not prove upgrade
 works. Both nginx proxy timeouts are 360 seconds, matching the bundle's declared
-transport ceiling. Composer has 300 seconds (five minutes) with 30 seconds of required
-headroom. Any additional CDN or load balancer must allow at least 360 seconds;
-otherwise lower the declared ceiling to the smallest actual hop and lower the
-Composer timeout to preserve headroom. The 15/10 turn settings are upper bounds,
-not a promise that all 25 provider turns fit inside 300 seconds.
+transport ceiling. The durable composer job retains its 300-second budget,
+independent of observer sockets. Any additional CDN or load balancer must be
+reflected in the smallest declared transport ceiling, which must remain above
+30 seconds for synchronous request headroom. The 15/10 turn settings are upper
+bounds, not a promise that all 25 provider turns fit inside 300 seconds.
+
+Composer shows safe live progress and then the completed durable answer, independent of the transport idle ceiling.
 
 The nginx access log uses `$uri` without query strings and records status and
 timings. Stock nginx error logs can include the full request with a one-use
@@ -607,7 +609,7 @@ docker run --rm \
 - [AWS ECS Full Acceptance Runbook](../runbooks/aws-ecs-deployment.md) - Disposable two-scenario provisioning and acceptance
 - [Azure Container Apps Cold Install](../runbooks/azure-container-apps-cold-install.md) - Bicep environment with external PostgreSQL and NFS Azure Files
 - [Azure Container Apps Existing-Service Redeploy](../runbooks/azure-container-apps-existing-service-redeploy.md) - Digest-pinned revision rollout
-- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.2 test and fix-on-fail procedure
+- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.3 test and fix-on-fail procedure
 - [Your First Pipeline](your-first-pipeline.md) - Getting started guide
 - [Configuration Reference](../reference/configuration.md) - Complete config options
 - [Runbooks](../runbooks/) - Operational procedures

@@ -7,6 +7,7 @@ import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore
 import { resetStore } from "@/test/store-helpers";
 
 const profile = { user_id: "alice", username: "alice", display_name: null, email: null, groups: [], dev_admin: false };
+const authConfig = { provider: "local", registration_mode: "closed", sso_start_url: null };
 function response(status: number) {
   return new Response(JSON.stringify(status === 200 ? profile : { detail: "Unauthorized" }), { status });
 }
@@ -24,7 +25,10 @@ describe("credential ownership of delayed responses", () => {
   beforeEach(() => {
     resetStore(useAuthStore);
     localStorage.clear();
-    vi.stubGlobal("fetch", vi.fn());
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (input === "/api/auth/config") return new Response(JSON.stringify(authConfig));
+      throw new Error(`Unexpected request: ${String(input)}`);
+    }));
   });
 
   it("logs out the credential actually rejected by the server", async () => {
@@ -104,6 +108,16 @@ describe("credential ownership of delayed responses", () => {
     });
     await useAuthStore.getState().logout();
     expect(useInterpretationEventsStore.getState()).toEqual(useInterpretationEventsStore.getInitialState());
+  });
+
+  it("requires successful auth configuration before authenticating a replacement token", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response(200)).mockResolvedValueOnce(response(503));
+    await useAuthStore.getState().loginWithToken("new-token");
+    expect(fetch).toHaveBeenNthCalledWith(2, "/api/auth/config", expect.objectContaining({ cache: "no-store" }));
+    expect(useAuthStore.getState().token).toBeNull();
+    expect(useAuthStore.getState().user).toBeNull();
+    expect(localStorage.getItem("auth_token")).toBeNull();
+    expect(useAuthStore.getState().loginError).toBe("Authentication failed. Please try signing in again.");
   });
 
   it.each(["password", "storage"])("ignores superseded %s login failure", async (kind) => {

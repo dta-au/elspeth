@@ -283,12 +283,16 @@ _evals_http_post_json() {
     body_file=$(_evals_curl_temp_file_from_string "$body")
     data_arg=(--data "@$body_file")
   fi
-  http=$(curl -sS --max-time "$ELSPETH_EVAL_CURL_MAX_TIME" \
+  local post_timeout=$ELSPETH_EVAL_CURL_MAX_TIME
+  if [[ "$url" == */messages ]]; then post_timeout=30; fi
+  if ! http=$(curl -sS --max-time "$post_timeout" \
            -X POST "$url" \
            -H "@$auth_header_file" \
            -H 'Content-Type: application/json' \
            "${data_arg[@]}" \
-           -o "$out" -w '%{http_code}' || echo "000")
+           -o "$out" -w '%{http_code}'); then
+    http=000
+  fi
   rm -f "$auth_header_file" "$body_file"
   if [[ -n "$code_out" ]]; then
     printf '%s' "$http" > "$code_out"
@@ -339,30 +343,104 @@ evals_upload_blob() {
 }
 
 # evals_post_message <sid> <turn> <msg_file>
-# msg_file is plain text; wrapped into {"content":...} envelope.
+# msg_file is plain text; wrapped into the strict content/operation_id/state_id envelope.
 # Writes msg.t<N>.{req,resp,curl_meta}.json
 evals_post_message() {
   local sid=$1 turn=$2 msg_file=$3
   : "${EVALS_OUT_DIR:?EVALS_OUT_DIR not set}"
   local out=$EVALS_OUT_DIR
-  jq -n --rawfile c "$msg_file" '{content:$c}' > "$out/msg.t${turn}.req.json"
+  local operation_id state_id retained=0
+  if [[ -s "$out/msg.t${turn}.req.json" ]]; then
+    retained=1
+    [[ -s "$out/msg.t${turn}.session.txt" ]] || evals_die 73 "Retained composer action has no session binding"
+    [[ "$(cat "$out/msg.t${turn}.session.txt")" == "$sid" ]] || evals_die 73 "Retained composer action belongs to another session"
+    jq -e --rawfile content "$msg_file" '.content == $content' "$out/msg.t${turn}.req.json" >/dev/null \
+      || evals_die 73 "Retained composer action differs from this prompt"
+    operation_id=$(jq -r '.operation_id' "$out/msg.t${turn}.req.json")
+  else
+    _evals_http_get "$ELSPETH_EVAL_BASE_URL/api/sessions/$sid/state" "$out/msg.t${turn}.base.json"
+    operation_id=$(python3 -c 'from uuid import uuid4; print(uuid4())')
+    state_id=$(jq -r 'if . == null then "null" else .id end' "$out/msg.t${turn}.base.json")
+    jq -n --rawfile c "$msg_file" --arg op "$operation_id" --arg state "$state_id" \
+      '{content:$c, operation_id:$op, state_id:(if $state == "null" then null else $state end)}' > "$out/msg.t${turn}.req.json"
+    printf '%s' "$sid" > "$out/msg.t${turn}.session.txt"
+  fi
 
   evals_login_if_needed
   local auth_header_file http_time start end wall
   auth_header_file=$(_evals_auth_header_file)
   start=$(date +%s.%N)
-  http_time=$(curl -sS --max-time "$ELSPETH_EVAL_CURL_MAX_TIME" \
+  if (( retained )); then
+    http_time="000 0.00"
+  elif ! http_time=$(curl -sS --max-time 30 \
                 -X POST "$ELSPETH_EVAL_BASE_URL/api/sessions/$sid/messages" \
                 -H "@$auth_header_file" \
                 -H 'Content-Type: application/json' \
                 --data "@$out/msg.t${turn}.req.json" \
                 -o "$out/msg.t${turn}.resp.json" \
-                -w '%{http_code} %{time_total}\n' || echo "000 0.00")
+                -w '%{http_code} %{time_total}\n'); then
+    http_time="000 0.00"
+  fi
   rm -f "$auth_header_file"
   end=$(date +%s.%N)
   wall=$(awk "BEGIN{printf \"%.2f\", $end - $start}")
   printf '%s\n%.2f\n' "$http_time" "$wall" > "$out/msg.t${turn}.curl_meta"
   local http=${http_time%% *}
+  if [[ "$http" == "202" || "$http" == "000" ]]; then
+    if [[ -f "$out/msg.t${turn}.resp.json" ]]; then
+      cp "$out/msg.t${turn}.resp.json" "$out/msg.t${turn}.accepted.json"
+    fi
+    local poll_status poll_deadline poll_http replay_http remaining candidate terminal=0
+    poll_deadline=$(( $(date +%s) + 950 ))
+    while (( $(date +%s) < poll_deadline )); do
+      if ! evals_try_get "$ELSPETH_EVAL_BASE_URL/api/sessions/$sid/operations/$operation_id" \
+        "$out/msg.t${turn}.operation.json" "$out/msg.t${turn}.operation.http"; then
+        poll_http=$(cat "$out/msg.t${turn}.operation.http")
+        if [[ "$poll_http" == "404" ]] && jq -e '.detail == "Operation not found"' "$out/msg.t${turn}.operation.json" >/dev/null; then
+          replay_http=$(_evals_http_post_json "$ELSPETH_EVAL_BASE_URL/api/sessions/$sid/messages"             "$out/msg.t${turn}.req.json" "$out/msg.t${turn}.replay.json")
+          if [[ "$replay_http" != "202" && "$replay_http" != "000" ]]; then
+            cp "$out/msg.t${turn}.replay.json" "$out/msg.t${turn}.resp.json"
+            http=$replay_http
+            terminal=1
+            break
+          fi
+        elif [[ "$poll_http" == "401" || "$poll_http" == "403" || "$poll_http" == "404" ]]; then
+          cp "$out/msg.t${turn}.operation.json" "$out/msg.t${turn}.resp.json"
+          http=$poll_http
+          terminal=1
+          break
+        fi
+        sleep 1
+        continue
+      fi
+      remaining=$(jq -r '.deadline_remaining_ms' "$out/msg.t${turn}.operation.json")
+      if [[ "$remaining" =~ ^[0-9]+$ ]]; then
+        candidate=$(( $(date +%s) + (remaining + 999) / 1000 + 30 ))
+        if (( candidate < poll_deadline )); then poll_deadline=$candidate; fi
+      fi
+      poll_status=$(jq -r '.status' "$out/msg.t${turn}.operation.json")
+      if [[ "$poll_status" == "completed" ]]; then
+        jq '.result' "$out/msg.t${turn}.operation.json" > "$out/msg.t${turn}.resp.json"
+        http=200
+        terminal=1
+        break
+      elif [[ "$poll_status" == "failed" ]]; then
+        jq '.error.body' "$out/msg.t${turn}.operation.json" > "$out/msg.t${turn}.resp.json"
+        http=$(jq -r '.error.http_status' "$out/msg.t${turn}.operation.json")
+        terminal=1
+        break
+      fi
+      sleep 1
+    done
+    if (( terminal == 0 )); then
+      _evals_http_post_json "$ELSPETH_EVAL_BASE_URL/api/sessions/$sid/operations/$operation_id/cancel"         '{}' "$out/msg.t${turn}.cancel.json" >/dev/null
+      http=000
+      jq -n --arg op "$operation_id" '{error_type:"operation_unresolved",operation_id:$op}' > "$out/msg.t${turn}.resp.json"
+    fi
+    end=$(date +%s.%N)
+    wall=$(python3 -c 'import sys; print(f"{float(sys.argv[2])-float(sys.argv[1]):.2f}")' "$start" "$end")
+    printf '%s %.2f\n%.2f\n' "$http" "$wall" "$wall" > "$out/msg.t${turn}.curl_meta"
+  fi
   evals_log INFO "post_message turn=$turn http=$http wall=${wall}s"
   if [[ "$http" != 2* ]]; then
     evals_log WARN "post_message non-2xx (HTTP $http) — body preserved at msg.t${turn}.resp.json"

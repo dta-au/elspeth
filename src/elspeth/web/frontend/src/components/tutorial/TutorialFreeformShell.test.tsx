@@ -35,7 +35,7 @@ beforeEach(() => {
   resetStore(useSessionStore);
   resetStore(useInterpretationEventsStore);
   useSessionStore.setState({
-    composeTimeoutReady: true,
+    compositionStateLoaded: true,
     selectSession: vi.fn(async (id: string) => {
       useSessionStore.setState({ activeSessionId: id, compositionStateLoaded: true });
     }),

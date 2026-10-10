@@ -31,6 +31,7 @@ export function HeaderVersionSelector(): JSX.Element | null {
   const compositionState = useSessionStore((s) => s.compositionState);
   const messages = useSessionStore((s) => s.messages);
   const stateVersions = useSessionStore((s) => s.stateVersions);
+  const isComposing = useSessionStore((s) => s.isComposing);
   const isLoadingVersions = useSessionStore((s) => s.isLoadingVersions);
   const loadStateVersions = useSessionStore((s) => s.loadStateVersions);
   const revertToVersion = useSessionStore((s) => s.revertToVersion);
@@ -531,7 +532,7 @@ export function HeaderVersionSelector(): JSX.Element | null {
             <Button
               type="button"
               className="version-selector-revert-btn"
-              disabled={!canRevertSelected}
+              disabled={isComposing || !canRevertSelected}
               aria-label={
                 canRevertSelected
                   ? `Revert to version ${selectedVersion.version}`

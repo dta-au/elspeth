@@ -42,8 +42,12 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
+
+execution_fixture = execution_custody.execution_fixture
 
 
 @pytest.fixture
@@ -116,9 +120,7 @@ def _composer(tmp_path: Path, sessions_service: SessionServiceImpl) -> ComposerS
 
 
 def _build_execution_service(
-    tmp_path: Path,
-    sessions_service: SessionServiceImpl,
-    secret_resolver: ScopedSecretResolver,
+    tmp_path: Path, sessions_service: SessionServiceImpl, secret_resolver: ScopedSecretResolver, execution_fixture: ExecutionTestCustody
 ) -> ExecutionServiceImpl:
     """Real ExecutionServiceImpl over the REAL SessionServiceImpl so execute()'s
     get_current_state(session_id) (~execution/service.py:484) loads the persisted
@@ -157,14 +159,17 @@ def _build_execution_service(
             SecretWiringRuleSettings(secret="RUN_BACKSTOP_PROVIDER_KEY", component_type="transform", plugin="llm", option_key="api_key"),
         ),
     )
-    svc = ExecutionServiceImpl.for_trained_operator(
-        loop=loop,
-        broadcaster=broadcaster,
-        settings=settings,
-        session_service=sessions_service,
-        yaml_generator=real_yaml_generator,
-        secret_service=secret_resolver,
-        telemetry=build_sessions_telemetry(),
+    svc = execution_fixture.bind(
+        ExecutionServiceImpl.for_trained_operator(
+            loop=loop,
+            broadcaster=broadcaster,
+            settings=settings,
+            session_service=sessions_service,
+            yaml_generator=real_yaml_generator,
+            secret_service=secret_resolver,
+            telemetry=build_sessions_telemetry(),
+            execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+        )
     )
     return svc
 
@@ -339,12 +344,10 @@ async def _persist_state_with_unresolved_node(
 
 @pytest.mark.asyncio
 async def test_unresolved_card_blocks_run_resolving_permits(
-    tmp_path: Path,
-    sessions_service: SessionServiceImpl,
-    secret_resolver: ScopedSecretResolver,
+    tmp_path: Path, sessions_service: SessionServiceImpl, secret_resolver: ScopedSecretResolver, execution_fixture: ExecutionTestCustody
 ) -> None:
     composer = _composer(tmp_path, sessions_service)
-    execution_service = _build_execution_service(tmp_path, sessions_service, secret_resolver)
+    execution_service = _build_execution_service(tmp_path, sessions_service, secret_resolver, execution_fixture=execution_fixture)
     session_id, _state_id, pt_event_id, mc_event_id, _state = await _persist_state_with_unresolved_node(
         sessions_service, composer, tmp_path
     )
@@ -357,6 +360,12 @@ async def test_unresolved_card_blocks_run_resolving_permits(
             operation_kind=SessionOperationKind.EXECUTE,
             owner_instance_id=sessions_service.session_operation_owner_instance_id,
             lease_seconds=sessions_service.session_operation_lease_seconds,
+            execution_obligation=execution_service.execution_lease_release_registry.admit(
+                sessions_service.session_operation_authority,
+                session_id=session_id,
+                owner_instance_id=sessions_service.session_operation_owner_instance_id,
+                lease_seconds=sessions_service.session_operation_lease_seconds,
+            ),
         )
         async with blocked_lease:
             with pytest.raises(UnresolvedInterpretationPlaceholderError):
@@ -393,6 +402,12 @@ async def test_unresolved_card_blocks_run_resolving_permits(
             operation_kind=SessionOperationKind.EXECUTE,
             owner_instance_id=sessions_service.session_operation_owner_instance_id,
             lease_seconds=sessions_service.session_operation_lease_seconds,
+            execution_obligation=execution_service.execution_lease_release_registry.admit(
+                sessions_service.session_operation_authority,
+                session_id=session_id,
+                owner_instance_id=sessions_service.session_operation_owner_instance_id,
+                lease_seconds=sessions_service.session_operation_lease_seconds,
+            ),
         )
         async with approval_lease:
             with pytest.raises(ExecutionSecretApprovalRequired) as approval:
@@ -409,6 +424,12 @@ async def test_unresolved_card_blocks_run_resolving_permits(
             operation_kind=SessionOperationKind.EXECUTE,
             owner_instance_id=sessions_service.session_operation_owner_instance_id,
             lease_seconds=sessions_service.session_operation_lease_seconds,
+            execution_obligation=execution_service.execution_lease_release_registry.admit(
+                sessions_service.session_operation_authority,
+                session_id=session_id,
+                owner_instance_id=sessions_service.session_operation_owner_instance_id,
+                lease_seconds=sessions_service.session_operation_lease_seconds,
+            ),
         )
         transferred = False
         try:
@@ -425,10 +446,10 @@ async def test_unresolved_card_blocks_run_resolving_permits(
             if not transferred:
                 await execute_lease.close()
         assert run_id is not None
+        execution_input = await sessions_service.get_run_execution_input(run_id)
     finally:
-        await execution_service.shutdown()
+        await execution_fixture.shutdown_service(execution_service)
 
-    execution_input = await sessions_service.get_run_execution_input(run_id)
     assert execution_input is not None
     resolved = secret_resolver.resolve("alice", "RUN_BACKSTOP_PROVIDER_KEY")
     assert resolved is not None

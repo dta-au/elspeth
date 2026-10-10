@@ -351,6 +351,22 @@ class WebSettings(BaseModel):
         default=_DEFAULT_COMPOSER_TRANSPORT_HEADROOM_SECONDS,
         gt=0,
     )
+    # Durable jobs share the bounded 16-thread synchronous worker pool.
+    composer_async_max_queued_operations: int = Field(default=64, ge=1, le=10_000)
+    composer_async_worker_concurrency: int = Field(default=4, ge=1, le=16)
+    composer_async_claim_lease_seconds: int = Field(default=30, ge=5, le=600)
+    composer_async_scan_interval_seconds: float = Field(default=1.0, gt=0, le=60)
+    composer_async_poll_after_ms: int = Field(default=1000, ge=100, le=60_000)
+    composer_async_drain_seconds: float = Field(default=10.0, gt=0, le=120)
+
+    @property
+    def composer_sync_timeout_seconds(self) -> float:
+        """Budget for composer work performed inside a held HTTP request."""
+        return min(
+            self.composer_timeout_seconds,
+            self.composer_transport_idle_ceiling_seconds - self.composer_transport_headroom_seconds,
+        )
+
     composer_runtime_preflight_timeout_seconds: float = Field(default=5.0, gt=0)
     composer_rate_limit_per_minute: int = Field(..., ge=1)
     audit_readiness_rate_limit_per_minute: int = Field(
@@ -1207,26 +1223,14 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_composer_timeout_transport_headroom(self) -> WebSettings:
-        """Keep composer wall-clock failures ahead of browser/proxy aborts.
+        """Keep a positive transport-safe budget for synchronous consumers.
 
-        This validates against the DECLARED ceiling, which nothing here can
-        measure. It is therefore only as good as that declaration: a ceiling
-        naming one hop while another sits in front passes this check and still
-        loses the race it exists to win (elspeth-ad5628ecda — see the
-        derivation rule on ``_DEFAULT_COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS``).
-        When diagnosing a gateway error on a long compose, suspect the declared
-        ceiling before the guard.
+        Durable composer jobs use their admission deadline. Subscription
+        lifetime and socket send deadlines are independently bounded.
         """
         max_backend_timeout_seconds = self.composer_transport_idle_ceiling_seconds - self.composer_transport_headroom_seconds
         if max_backend_timeout_seconds <= 0:
             raise ValueError("composer_transport_headroom_seconds must be less than composer_transport_idle_ceiling_seconds")
-        if self.composer_timeout_seconds > max_backend_timeout_seconds:
-            raise ValueError(
-                "composer_timeout_seconds must leave transport idle ceiling headroom: "
-                f"got {self.composer_timeout_seconds}s, maximum {max_backend_timeout_seconds}s "
-                f"(transport idle ceiling {self.composer_transport_idle_ceiling_seconds}s - "
-                f"headroom {self.composer_transport_headroom_seconds}s)"
-            )
         return self
 
     @model_validator(mode="after")

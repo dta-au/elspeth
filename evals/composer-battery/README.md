@@ -98,8 +98,7 @@ Notes:
 
 - This is a property of the free-tier edge in front of the **development**
   substrate, not a product defect. The ECS deployment derives its transport
-  ceiling from `var.alb_idle_timeout_seconds` (`locals.tf`, with a plan-time
-  cap and a test pinning the mirror), and an enterprise edge configures the
+  ceiling from `var.alb_idle_timeout_seconds` (`locals.tf`, with a test pinning the mirror), and an enterprise edge configures the
   origin timeout directly.
 - The base URL is already part of the **binding identity**
   (`identity.binding.substrate`, alongside `firing.json`'s `base`), so
@@ -118,9 +117,9 @@ Notes:
   (`runs/2026-08-17-socket-verify/deaggregation/1/meta.json`).
 - Nothing proxies the socket, so no intermediary remains that could impose a
   ceiling: the only deadlines left are the driver's `CLIENT_TIMEOUT_S` (620 s)
-  and the origin's own `composer_timeout_seconds` (600 s), which is the
-  arrangement `_validate_composer_timeout_transport_headroom` exists to keep
-  ordered.
+  and the origin's own durable job `composer_timeout_seconds` (600 s). The
+  job budget is independent of observer sockets; clients recover the same
+  admitted operation through authoritative GET after a transport failure.
 - The health check in **Prerequisites** above can be run the same way:
   `curl -s --unix-socket /run/elspeth/uvicorn.sock
   http://localhost/api/system/status | jq .composer_available`.

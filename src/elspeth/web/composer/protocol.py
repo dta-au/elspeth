@@ -22,8 +22,10 @@ if TYPE_CHECKING:
 
     from elspeth.contracts.session_operation import SessionOperationContext
     from elspeth.web.composer.audit import BufferingRecorder
+    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.composer.strict_transport import StrictToolsSetting
     from elspeth.web.execution.completion_gates import CompletionGateFacts
+    from elspeth.web.required_work import RequiredWorkBinding
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -1549,6 +1551,9 @@ class ComposerSettings(Protocol):
     def composer_timeout_seconds(self) -> float: ...
 
     @property
+    def composer_sync_timeout_seconds(self) -> float: ...
+
+    @property
     def composer_planner_max_provider_calls(self) -> int: ...
 
     @property
@@ -1633,6 +1638,9 @@ class ComposerService(Protocol):
         # Durable advisor gate fact from the prior state row (ruling
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
+        budget_seconds: float | None = None,
+        required_work: RequiredWorkBinding | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 

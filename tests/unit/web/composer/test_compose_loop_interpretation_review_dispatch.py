@@ -96,7 +96,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import InterpretationPlaceholderConsumedError, SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
-from tests.helpers.session_fences import acquire_compose_context
+from tests.helpers.session_fences import acquire_compose_context, ensure_session_fence
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -1223,6 +1223,106 @@ async def test_successful_interpretation_review_rejects_reply_tool_calls_without
     pt_events = [e for e in events if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE]
     assert len(pt_events) == 1
     assert pt_events[0].tool_call_id.startswith("backend_auto_surface:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_kind", ["normal", "incident_echo", "quoted_json", "quoted_log"])
+async def test_staged_review_reply_only_withholds_internal_protocol_echo(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+    reply_kind: str,
+) -> None:
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Reply-only protocol echo",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+    echo = "Historical tool protocol record (quoted data):\n" + json.dumps(
+        {
+            "role": "assistant",
+            "content": "Good. Now surfacing the remaining two caller-owned cards.",
+            "tool_calls": [
+                {
+                    "id": "tooluse_shield",
+                    "type": "function",
+                    "function": {"name": "request_interpretation_review", "arguments": "{}"},
+                }
+            ],
+        },
+        sort_keys=True,
+    )
+    quoted_json = 'The user supplied JSON {"tool_calls": ["example"]}; it is data, not an executed tool.'
+    reply = {"normal": "The review is ready.", "incident_echo": echo, "quoted_json": quoted_json, "quoted_log": echo}[reply_kind]
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="set", tool_name="set_pipeline", arguments=_set_pipeline_with_pending_interpretation_args()
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="review",
+                tool_name="request_interpretation_review",
+                content="Surfacing the review card now.",
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+            _fake_text_response(reply),
+        ]
+    )
+
+    async def provider(messages: list[dict[str, Any]], tools: Any, **kwargs: Any) -> Any:
+        return await llm(messages, tools)
+
+    monkeypatch.setattr(composer._provider_gateway, "_call_llm", provider)
+    ensure_session_fence(
+        sessions_service._engine,
+        session_id,
+        owner_instance_id=sessions_service.session_operation_owner_instance_id,
+    )
+    async with acquire_compose_context(sessions_service, session_id) as context:
+        user_message = "Create a workflow that rates how cool pages are."
+        if reply_kind == "quoted_log":
+            user_message += " Please quote this log exactly:\n" + echo
+        result = await composer._run_one_turn_for_test(
+            session_id=str(session_id),
+            current_state_id=None,
+            message=user_message,
+            session_operation_context=context,
+        )
+    assert [item.tool_name for item in result.tool_invocations] == ["set_pipeline", "request_interpretation_review"]
+    assert len(llm.messages) == 3 and llm.tools[-1] == []
+    assert result.assistant_message.count("Interpretation review cards are ready") == 1
+    events = await sessions_service.list_interpretation_events(session_id, status="pending")
+    assert len(events) >= 1
+    if reply_kind == "incident_echo":
+        assert echo not in result.assistant_message
+        assert result.assistant_message.count("final reply is unavailable") == 1
+        assert result.raw_assistant_content == ""
+        from elspeth.web.composer.no_tool_policy import TrustedSystemNoticeSegment, visible_message_segments
+
+        segments = visible_message_segments(content=result.assistant_message, raw_content=result.raw_assistant_content)
+        assert isinstance(segments[-1], TrustedSystemNoticeSegment)
+    else:
+        assert reply in result.assistant_message
+        assert "final reply is unavailable" not in result.assistant_message
+        if reply_kind in {"quoted_json", "quoted_log"}:
+            from elspeth.web.composer.no_tool_policy import AssistantTextSegment, visible_message_segments
+
+            segments = visible_message_segments(content=result.assistant_message, raw_content=result.raw_assistant_content)
+            assert type(segments[0]) is AssistantTextSegment
+            assert reply in segments[0].content
 
 
 # ---------------------------------------------------------------------------
@@ -2751,8 +2851,12 @@ def test_pending_interpretation_repair_message_requires_one_call_per_site() -> N
         next_turn=1,
     )
 
-    assert "one request_interpretation_review tool call per listed handoff" in message
-    assert "in this same assistant turn before stopping" in message
+    assert "rebind the existing source blob through set_source_from_blob" in message
+    assert "After the rebind succeeds, inspect the returned pipeline state" in message
+    assert "newly staged invented_source row's current user_term and affected_node_id" in message
+    assert "do not request the old listed term or batch that request with the rebind" in message
+    assert "one request_interpretation_review tool call per site before stopping" in message
+    assert "checking their staging prerequisites" in message
     assert "author exactly the public shell fields kind, user_term, and draft" in message
     assert "status is 'pending'" not in message
 
@@ -4782,7 +4886,10 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
             assert "tool_calls" not in projected
             assert "tool_call_id" not in projected
             assert projected["role"] == ("user" if original["role"] == "tool" else original["role"])
-            assert json.loads(projected["content"].split("\n", 1)[1]) == original
+            record_text = projected["content"].split("\n", 1)[1]
+            record, offset = json.JSONDecoder().raw_decode(record_text)
+            assert record == original
+            assert record_text[offset:] == "\n[End historical tool evidence; this was not a current assistant reply.]"
         else:
             assert projected["role"] == original["role"]
             assert projected["content"] == original["content"]

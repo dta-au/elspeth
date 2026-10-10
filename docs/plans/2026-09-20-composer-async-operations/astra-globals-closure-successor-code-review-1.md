@@ -1,0 +1,127 @@
+<!-- Durable copy: machine-specific prefixes normalized; private original retained. -->
+
+# Actual Astra review — protected globals closure successor 1
+
+**Ruling: NO-GO for the proposed canonical reserve closure.** The frozen scanner still certifies reserve calls after reflected access to mutable function namespaces. Exact implementation recipes are useful, but do not close those execution-time aliases. This is a source-review finding, supported by separately attributed owner-run public AST diagnostics. No production execution, SQL, provider, repository application, collection, merge, or deployment is cleared.
+
+Reviewed package: `contracts-reserve-proof/globals-closure-successor-1`. Canonical replacement SHA256: `cd429342243b7c2aa408b011c6f7ac998bffd0143892617fac36484d82c2a627`. Complete patch SHA256: `952c0852382fd92cf9b97ea5f964f142f9726eddc112bf060a114b2519a238c2`. Frozen inventory SHA256: `78231f5a856184f888212d85cfdaceecbed1ad9c512f0dbc36e66eeab8bdf129`.
+
+This is actual internal Astra review under John's authorization. It is not Daybreak and does not restart the denied external scan. Earlier bounded fixed-storage/native-supplier, rejection CODE7, shared-worker assembly, and app-assembly source assessments remain separate; this report does not rescind them or upgrade them into canonical or runtime clearance.
+
+## G1 — Reflected function namespaces remain mutable through accepted source
+
+Location: candidate `reserve_scanner_candidate.py` lines 331–336; generated canonical scanner lines 6106–6111. The new namespace rule recognizes a direct AST attribute named `__globals__`/`__builtins__`, or a call whose literal callee spelling is `getattr`/`__getattribute__` and whose **second positional argument** is a literal protected namespace name.
+
+That leaves two direct gaps:
+
+```python
+lookup = getattr
+namespace = lookup(foreign, "__globals__")
+namespace.update(type=foreign)
+return required_work.reserve(source)
+```
+
+```python
+namespace = foreign.__getattribute__("__globals__")
+namespace.update(type=foreign)
+return required_work.reserve(source)
+```
+
+Both diagnostic functions first perform the actual exact `type(required_work) is RequiredWorkCoordinator` rejection guard. The first form changes the callee spelling; the bound method form has one positional argument. Neither changes a protected supplier's source AST. An opaque function can be a protected function at execution time; failed static name resolution cannot establish that its namespace is safe to export or mutate. The surrounding public scanner's existing Landscape reflection rules do not supply the missing closure for this opaque function receiver.
+
+Contracts' separate `successor-reflection-diagnostic-1/diagnostic.py` runs the actual frozen canonical `_reserve_ReserveProof` and `_mutation_callable_escapes`, with guarded candidate SourceUnits and the actual generated scanner. The full source, JSON and raw log were read. Native completion was 0, chunk `361c84`, as recorded in its `completed-exits.json`. Its ordinary/copied-dictionary positive and each of the two bad forms return:
+
+```json
+{"certificate": true, "public_reserve_refused": false, "global_failures": []}
+```
+
+This result is an observed public-gate false clearance, not an inference from a control name or a helper's private return value. The successful exit means the diagnostic completed, not that the scanner passed a safety test. The diagnostic asserted its ordinary positive and exposed the bad results for review; it did not assert that bad cases must be refused.
+
+The completed isolated follow-up `diagnostic3.py` (native 0, chunk `f5bccb`) reproduces both opaque forms and additionally falsely accepts each of these exact owned-supplier forms, followed by `namespace.update(_source_for_ordinal=foreign)` and the guarded reserve:
+
+```python
+namespace = RequiredWorkKey.__post_init__.__getattribute__("__globals__")
+
+lookup = getattr
+namespace = lookup(RequiredWorkKey.__post_init__, "__globals__")
+
+name = "__globals__"
+namespace = getattr(RequiredWorkKey.__post_init__, name)
+```
+
+These are three separate cases, each analyzed in its own full SourceUnit cohort. Each receives `certificate=true`, `public_reserve_refused=false`, empty global failures and empty public violations. The independent ordinary positive is accepted. The seventh case, which passes a directly imported supplier module to the existing raw reader, is correctly refused with `protected supplier module namespace escape`; it is not a false clearance. I read the complete diagnostic source, full raw log, JSON and completion receipt. Thus the G1 impact reaches the actual key-construction supplier, without relying solely on an opaque-function interpretation.
+
+The minimal repair must recognize the actual callable/binding and bound/unbound argument conventions, preserve unknown-origin refusal, and cover resolved names as well as literal namespace names. Add separate public controls for aliases, bound access, name aliases, `__builtins__`, and an exact owned key-supplier namespace. Preserve the ordinary/copied-dictionary positive. Do not fix this by exempting another module, assuming opaque functions are harmless, or building a general Python interpreter.
+
+## G2 — An existing sealed reader exports a live namespace outside its owner
+
+The frozen Runtime-VAL whole-module recipe includes existing helpers which return live objects. In the held `src/elspeth/contracts/runtime_val_manifest.py`, `_owned_instance_state` (lines 1166–1187) stores `vars(candidate)` directly under `state["dict"]`, stores live values read through MemberDescriptors under `state["slots"]`, and returns that state. The later `_normalize_dependency_value` call path normalizes these values, but a direct external call to `_owned_instance_state` does not go through that later normalizer. `_qualified_global_values` and `_merge_qualified_values` also pass raw candidates and owners, rather than universally returning normalized metadata.
+
+The new `private_namespace_helpers` selection (candidate lines 217–225; generated lines 5977–5986) confines all private telemetry helper functions, but confines only `_function_builtin_bindings` in Runtime-VAL. Therefore sealing the Runtime-VAL implementation is not, by itself, proof that all existing accessible results are safe to export. This is a concrete semantic review obligation, distinct from detection of edits that introduce a new raw exporter.
+
+A directly imported protected supplier module passed as an argument is already rejected by the separate supplier-module escape rule. Such a rejection must not be credited as evidence that the unconfined helper's opaque argument/result is safe.
+
+Contracts' isolated `diagnostic4.py` retains the ordinary/copied-dictionary baseline and adds this source after the exact coordinator guard:
+
+```python
+namespace = manifest._owned_instance_state(
+    foreign, owner_module="elspeth.web.required_work"
+)["dict"]
+namespace.update(_source_for_ordinal=foreign)
+return required_work.reserve(source)
+```
+
+The actual frozen canonical scanner accepts both the baseline and this case: `certificate=true`, `public_reserve_refused=false`, `global_failures=[]`, `public_violations=[]`. The full instrument, raw log and JSON were read; contracts reported measured native 0, chunk `602f1d`. This is a second observed public false clearance. The helper's complete recipe remains unchanged. An opaque input can be an owned module or a protected instance; the helper exposes its actual dictionary/slot values before normalization.
+
+The separate concrete `diagnostic5.py` uses `sys.modules["elspeth.web.required_work"]` as that reader's input and then replaces `_source_for_ordinal` with `foreign`. Its independent ordinary positive and actual supplier-module mutation both receive the same accepted result with no public/global violations. I read the full source, raw log and JSON; contracts measured native 0, chunk `6ddd98`. This removes the need to infer which module the opaque argument could denote.
+
+The source impact is specific: `RequiredWorkCoordinator.reserve` calls `make_required_work_key`, which constructs `RequiredWorkKey`; `RequiredWorkKey.__post_init__` calls the `_source_for_ordinal` global. The live dictionary replacement changes that callable before reserve reaches its protected lock/ticket section, while every sealed recipe AST remains unchanged. The diagnostic executes only source analysis; no actual supplier mutation, foreign callback, DML or production failure was executed here.
+
+Repair the accessible raw-reader boundary, including aliases/escapes of existing raw exporters and opaque arguments. Whole-module recipe sealing should remain, but it cannot substitute for this semantic boundary. Preserve proven normalized reader uses. Review the other existing raw function/descriptor/value exporters in the sealed implementation before admitting their external use; the `_qualified_global_values` source observation above is an additional review obligation, not a separately executed false-clearance claim.
+
+## What the frozen repair establishes
+
+The direct namespace access repair now refuses both original function-global false clearances, including opaque receivers. `_function_builtin_bindings` and telemetry private accessors are owner-confined, with direct/alias references and unresolved matching accessor references checked. The whole Runtime-VAL and telemetry-dispatch modules are exact AST recipe dependencies: edited reader bodies, new helper functions, changed imports, and inserted writes invalidate the recipe. This is stronger than a filename exemption. It remains necessary to review every existing raw export's permitted use.
+
+Duplicate SourceUnit identities are explicitly refused by comparing the complete unit count with the path-indexed source count before recipe admission. I verified that branch in source; I do not claim a separately executed duplicate-unit public control in the provided evidence.
+
+The reviewed storage and native-lock slices are byte-identical to the earlier frozen V9 inputs. The complete selected non-DML recipes include native lock imports/module bindings, ordinal lookup and calculation, regular authority Enum hashing semantics, identity records, and constructors. Writer recipes include exact helper/validator bodies, protected carrier writers, class descriptor/storage layouts, whole telemetry record semantics and reader-module implementations. These recipe matches invalidate edits; they do not by themselves make class descriptors, module dictionaries or function namespaces immutable at execution time. G1 specifically bypasses that distinction.
+
+The selected telemetry validator continues to use the exact owned classes and their canonical MemberDescriptors, with storage layout and dispatch checks before foreign getters are used. No new dynamic-dictionary subtype bypass, generalized Python object emulator, IntEnum hash change, provider bypass or tutorial-special path was introduced by this successor. The inherited regular Enum identity hash, native integer ordinal calculation, private immutable ordinal lookup and native lock supplier remain the earlier bounded source decisions.
+
+## Independent source evidence and review coverage
+
+`astra-globals-closure-source-evidence.py` is a reviewer-owned stdlib bytes/AST instrument. It imports no project, candidate or scanner module and executes no candidate definition. The first completed run was native 0, chunk `f33a9c`; its full output is `astra-globals-closure-source-evidence-01.log`. After adding explicit earlier-storage parity and completed G2 evidence, the second run also completed native 0, chunk `3da0ea`, with full output in `astra-globals-closure-source-evidence-02.log`. Evidence is `astra-globals-closure-successor-code-review-1-evidence.json`.
+
+The final evidence run, after incorporating all completed isolated diagnostic results and native receipts, completed native 0, chunk `cd986a`. `astra-globals-closure-source-evidence-03.log` contains its complete output. The final JSON records the exact supplemental instrument/result hashes, preserves the failed combined attempt, and rechecks the unchanged frozen package and held source guards.
+
+The instrument measured all 114 frozen inventory entries as present and exact. The only unmanifested package files were the four enumerated worker-generated `.pyc` files. It independently reconstructed the full four-file patch from complete preimages/replacements, checked the held scanner preimage and HEAD `d2b73990d137e9725200c897544eebc5b958fdf4`, and confirmed new recipe target paths remain absent from the held repository.
+
+It matched all 22 generated candidate definitions to their complete canonical ASTs after the explicit namespace translation. It verified the exact reserve-proof construction, parent lookup and two guarded continuation branches, then compared the complete remaining canonical module AST against the complete preimage. An added outside node fails that comparison. Complete-patch and source-byte changes also fail their respective controls; neither relies on a partial hunk capture.
+
+The independent source reconstruction checked every preimage in the sequential source overlays, then all 942 hashes in the captured source-unit epoch. It recomputed every one of the 62 writer and 46 non-DML recipe AST values directly from those sources. For both whole-reader recipes, the complete unchanged module matches and an appended raw-export helper fails. Those figures describe this guarded source capture, not a permanent production inventory or final source-map admission.
+
+Read coverage includes the complete 690-line candidate scanner, recipe and source-overlay builders, package generator, all new control drivers and their relevant supporting control definitions, the complete Runtime-VAL module, the complete selected telemetry helper/validator, the changed canonical integration function, and the full successor delta. The canonical scanner is a large inherited file; its unrelated existing sections were carried forward by the complete independent AST comparison, not claimed as a new line-by-line rereview of all 20,414 lines. Likewise, byte-identical earlier storage/native-supplier implementations carry only their earlier bounded review conclusions. No claim of a fresh repository-wide audit is made.
+
+## Owner-run control evidence and its limits
+
+I read the completed-exit record and the full relevant raw results, not just summaries or control counts. These are contracts' executions of source instruments, not reviewer production/runtime executions:
+
+| Instrument | Recorded result | What it demonstrates |
+| --- | --- | --- |
+| Private namespace controls, attempt 02 | Native 0; eleven negatives, ordinary/copied positive | Each negative has its own failure and public reserve refusal, including the two original direct false clearances. |
+| Reader recipe controls | Native 0; six implementation mutations and public export mutation refused | Whole reader implementation changes invalidate the gate; existing exporters require separate review. |
+| Inherited public canonical cohort | Native 0; 58 cases, ten accepted and 48 refused | The inherited cases preserve their explicit certificate/public-gate polarity. It is not reflection completeness. |
+| Storage/global controls | Native 0; twelve negatives and copied-dictionary positive | Explicit slot descriptor, class hash, ordinal global and supplier alias examples are rejected. |
+| Mandatory-helper deletion | Native 0; seven missing-supplier failures | Missing helper source cannot silently remove its proof dependencies. |
+| Source38 guard deletion | Native 0; only the named Web producer becomes unproven | This driver uses the workspace reserve proof over actual source units, not the public canonical entry point. Its full registry has 29 certified Web and three unchanged uncertified effect rows in this source epoch. |
+
+The earlier private namespace attempt which rejected legitimate normalized Runtime-VAL usage is retained with native 1 and is not counted as passing. The two original unsafe false-clearance results remain preserved in the package's earlier diagnostic. The later combined `diagnostic2` also hit its ordinary-positive assertion; it is a failed diagnostic and cannot validate or disprove the individual cases within that cohort. A global failure from one added source can refuse unrelated cases, which is why the follow-up diagnostics isolate sources.
+
+The completed isolated `diagnostic3` identifies that global failure precisely as the explicit protected-module argument. Its full public violation list shows that this one failure also disables reserve certificates elsewhere in the cohort. That failed combined attempt has not been silently relabeled as passing. Diagnostics 1, 3, 4 and 5 completed native 0; diagnostic 2 completed native 1. All supplemental diagnostic processes are complete; there is no outstanding diagnostic used to qualify this verdict.
+
+## Remaining gates and action
+
+Fix the namespace/reflection closure and the existing raw-reader export boundary in a separate successor, preserving this frozen package and the false-clearance evidence. Review the precise allowed normalized reader uses and the raw function/descriptor/map exporters; do not impose a blanket private-helper rule that silently breaks legitimate normalization, and do not add a blanket path exemption. Require actual public positive and negative controls on independently isolated cases, with both private proof and public violation outcomes checked.
+
+The package remains the nine-field Coordinator epoch. It must not overwrite rejection V7's eleven-field Coordinator or the later coherent worker/lifecycle/app assemblies. Any final composition needs fresh exact recipes, guarded whole-source comparisons and public controls against that actual final source. Source51/52 admission, source maps/ranks, app controls, current-tree lint/type/contract gates, Runtime-VAL, PostgreSQL/lock proofs, trusted operator signature verification and John's final manual/local review all remain HOLD. All original 102 obligations, four collections and two UNKNOWNs are retained. Root remains the sole repository/runtime editor.

@@ -16,6 +16,8 @@ import {
   TRANSITION_LEDGER_SCHEMA,
   attributeFreshRows,
   classifyTransitionRequest,
+  composerOperationLocator,
+  composerOperationTerminal,
   ledgerTotals,
   ledgerViolations,
   sessionIdFromTransitionUrl,
@@ -96,6 +98,8 @@ export class TransitionLedgerRecorder {
   // gesture list and the known-row set are touched by one transition at a time.
   private chain: Promise<void> = Promise.resolve();
   private inFlight = 0;
+  private ordinal = 0;
+  private readonly pendingOperations = new Map<string, Pick<TransitionLedgerEntry, "ordinal" | "endpoint" | "gesture" | "gestures" | "gesture_count" | "phase_before" | "request" | "requested_at_ms" | "since_previous_ms">>();
 
   sessionId: string | null = null;
 
@@ -106,7 +110,7 @@ export class TransitionLedgerRecorder {
 
   async install(): Promise<void> {
     await this.page.route(
-      (url) => classifyTransitionRequest(url.href, "POST") !== null,
+      (url) => classifyTransitionRequest(url.href, "POST") !== null || composerOperationLocator(url.href) !== null,
       (route) => {
         const run = this.chain.then(() => this.handle(route));
         this.chain = run.catch(() => undefined);
@@ -144,6 +148,9 @@ export class TransitionLedgerRecorder {
 
   private async handle(route: Route): Promise<void> {
     const request = route.request();
+    if (request.method() === "GET" && composerOperationLocator(request.url()) !== null) {
+      await this.recordOperationTerminal(route); return;
+    }
     const endpoint = classifyTransitionRequest(request.url(), request.method());
     if (endpoint === null) {
       await route.continue();
@@ -161,7 +168,7 @@ export class TransitionLedgerRecorder {
     const request = route.request();
     const sid = sessionIdFromTransitionUrl(request.url());
     if (sid !== null && this.sessionId === null) this.sessionId = sid;
-    const ordinal = this.entries.length + 1;
+    const ordinal = ++this.ordinal;
     const gestures = this.pendingGestures;
     this.pendingGestures = [];
     const requestedAt = Date.now() - this.t0;
@@ -207,6 +214,13 @@ export class TransitionLedgerRecorder {
     } catch {
       responseBody = null;
     }
+    if (endpoint === "freeform/compose" && response.status() === 202) {
+      if (!isRecord(responseBody) || typeof responseBody.operation_id !== "string" || sid === null) throw new Error("Malformed composer admission acknowledgement");
+      const key = `${sid}:${responseBody.operation_id}`;
+      if (!this.pendingOperations.has(key)) this.pendingOperations.set(key, base);
+      await route.fulfill({ response });
+      return;
+    }
     const view = summarizeResponse(endpoint, response.status(), responseBody);
 
     // The durable read happens BEFORE the browser sees this response.
@@ -223,6 +237,27 @@ export class TransitionLedgerRecorder {
     this.lastRespondedAt = respondedAt;
     // The page may already be closed when a late response lands (walk deadline
     // tripped mid-request); the entry above is still the record of it.
+    await route.fulfill({ response }).catch(() => undefined);
+  }
+
+  private async recordOperationTerminal(route: Route): Promise<void> {
+    const locator = composerOperationLocator(route.request().url());
+    if (locator === null) { await route.continue(); return; }
+    const key = `${locator.sessionId}:${locator.operationId}`;
+    const base = this.pendingOperations.get(key);
+    if (base === undefined) { await route.continue(); return; }
+    const response = await route.fetch({ timeout: TRANSITION_FETCH_TIMEOUT_MS });
+    let body: unknown = null;
+    try { body = await response.json(); } catch { /* Invalid GET cannot close a transition. */ }
+    const terminal = response.ok() ? composerOperationTerminal(body, locator.operationId) : null;
+    if (terminal === null) { await route.fulfill({ response }); return; }
+    const respondedAt = Date.now() - this.t0;
+    const status = terminal.status === "completed" ? 200 : isRecord(terminal.error) && typeof terminal.error.http_status === "number" ? terminal.error.http_status : 500;
+    const evidence = await this.readEvidence();
+    const partial = { ...base, response: summarizeResponse("freeform/compose", status, terminal.result), responded_at_ms: respondedAt, wall_clock_ms: respondedAt - base.requested_at_ms, error: null, evidence };
+    this.entries.push({ ...partial, violations: transitionViolations(partial) });
+    this.pendingOperations.delete(key); this.lastRespondedAt = respondedAt;
+    // Release the completed answer only after attributing durable provider rows.
     await route.fulfill({ response }).catch(() => undefined);
   }
 
@@ -252,7 +287,7 @@ export class TransitionLedgerRecorder {
       this.chain,
       new Promise<void>((resolve) => setTimeout(resolve, FINALIZE_GRACE_MS)),
     ]);
-    const inFlight = this.inFlight;
+    const inFlight = this.inFlight + this.pendingOperations.size;
     let finalRows: LlmAuditRow[] = [];
     let finalRead: TransitionLedger["final_read"] = { status: "complete", reason: null };
     if (this.sessionId === null) {

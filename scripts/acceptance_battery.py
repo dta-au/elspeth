@@ -9,10 +9,11 @@ Per-graph choreography (see ADR-037 and the round-2 report for why each gate
 exists):
 
     POST /api/sessions                      -> session id
-    POST /api/sessions/{id}/messages        -> freeform compose (minutes; see
-                                               --timeout, and note a client
-                                               timeout does NOT abort the
-                                               server-side compose)
+    POST /api/sessions/{id}/messages        -> 202 durable admission; provide
+                                               content, operation_id and state_id
+    GET /api/sessions/{id}/operations/{op}  -> poll that operation until terminal;
+                                               use its completed result before
+                                               continuing the graph choreography
     resolve-reviews                         -> gate 1: pending interpretation
                                                reviews must be resolved
     POST /api/sessions/{id}/validate        -> real execution contracts

@@ -4,6 +4,84 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.3 - Unreleased (Archive recovery and Composer HTTPS progress candidate)
+
+- **Session archive and cleanup recover on filesystems without no-replace rename.**
+  The merged EFS repair supports an in-place, identity-bound archive path and
+  recovery after interrupted cleanup. It retains collision checks and durable
+  database custody rather than assuming the filesystem has atomic no-replace
+  rename. This is merged source from PR #276.
+- **The tracked LLM gateway accepts a 64,000-token completion allowance.**
+  Its default request bound now matches an operator-configured 64,000-token
+  planner call for either `max_tokens` spelling. Values above the bound are
+  refused, a lower explicit gateway bound still applies, and an admitted
+  value reaches the reference adapter unchanged. This includes reasoning
+  tokens within the requested completion allowance; it does not raise the
+  Web Composer's 16,384-token default or its independent job, transport,
+  cost and repair limits. Standalone mock-upstream and conformance tests
+  passed locally; no deployed gateway image or genuine-model replay is
+  established by this source candidate.
+- **The proposed Web Composer transport delivers live progress over authenticated
+  HTTPS.** An operation-scoped server-sent event subscription follows the same
+  durable operation and progress authority as the authenticated status GET.
+  The browser receives bounded, redacted status and progress, then retrieves
+  the completed answer through GET; it reconciles interrupted subscriptions
+  against that operation. Live role, identity, ownership and token checks,
+  disconnect cleanup and bounded readers protect the stream. The provider and
+  gateway still return complete answers: generated answer-token streaming and
+  interim answer text are outside this release candidate. These changes are
+  held on the streaming branch and remain subject to final integration and
+  acceptance, so this entry does not claim a landed release.
+- **Durable Composer failure paths retain the original outcome and required-work
+  custody.** The held candidate reconciles cancellation, worker failure,
+  pending review, terminal publication and physical cleanup against their
+  committed authorities. These changes are likewise awaiting final frozen
+  default, serial PostgreSQL, TLS and browser acceptance gates.
+- **The first-run tutorial keeps its Build and Run chrome out of the Composer
+  workspace.** Each step's title, one instruction that says what to do next,
+  and its actions (Continue to Run; Run, Retry or Continue) sit in a header
+  above both panes. The tutorial no longer removes the workspace's height
+  floor, so the conversation stays readable on short and narrow screens
+  (measured at 1280×560: 49 px before, 110 px after). The chat header lines up
+  with the pipeline toolbar again, and nothing in the authoring pane sits flush
+  against the window edge. A disabled Continue to Run is described by the
+  instruction naming what it waits for, and stays visible in the narrow Compose
+  view. Run results wrap inside the pane instead of cutting off the summary
+  column.
+- **The Composer chat no longer offers to turn a message into source data,
+  and drops its authority chip.** The "This looks like source data — Create
+  source" offer resent the whole message, instructions included, whenever it
+  contained a URL; the composer creates sources from the conversation itself.
+  The "Auto-apply on" chip and the header row it sat in are gone: nothing in
+  the interface changes the composer's authority, so the chip always said the
+  same thing, and the transcript already labels each change the composer
+  applies. The conversation now starts at the top of the chat pane.
+- **Container and dependency maintenance advances.** Merged main updates the
+  distroless runtime base for patched OpenSSL, the gateway FastAPI and
+  Hatchling locks, root Playwright tooling, and pinned GitHub Actions. The
+  Chroma advisory identifies the registered `rag_retrieval` provider and
+  continues to prohibit Chroma use pending an upstream fix and verification.
+  The image Dockerfile also requires Node 24.18.0 for the build; that
+  image has not been qualified or published.
+
+**Upgrade and publication notes.** Session epoch 72 adds durable Composer jobs
+and ingress bindings; it advances from epoch 71 in the 0.8.2 candidate. The
+Landscape epoch 49 remains unchanged. Upgrading a 0.8.1/0.8.2 session store requires a
+stopped service, archive/export of needed session evidence, and recreation of
+the session database and its sidecars; there is no in-place migration. A
+Landscape database already at epoch 49 remains usable and must not be reset
+solely for this session-only change. Installations still on 0.8.0 have session
+epoch 53 and Landscape epoch 38 and must recreate both stale databases in the
+same service-stop window, as described in the
+[0.8.1 notes](#081---2026-09-10-replica-recovery-and-deployment-hardening) and
+[cutover runbook](docs/runbooks/staging-session-db-recreation.md). This is an
+unreleased source candidate. No 0.8.3 tag, image digest, registry publication,
+live cloud qualification or production readiness is established here. The
+streaming work retains all 102 original obligations and four supplemental
+collections; two original reports remain unavailable. Final default Python,
+PostgreSQL, real HTTPS and browser acceptance are still required before a
+release claim. Use only a separately verified published image tag or digest.
+
 ## 0.8.2 - Unreleased (Bounded validation and release-check hardening)
 
 - **Azurite test tooling uses an owned, bounded diagnostic formatter.** Replace
@@ -56,25 +134,6 @@ All notable changes to ELSPETH are documented here.
   source, workflow and build run. Missing or conflicting identities refuse
   qualification and release promotion; image scans, signing, signature
   verification and smoke checks remain required.
-- **The first-run tutorial keeps its Build and Run chrome out of the Composer
-  workspace.** Each step's title, one instruction that says what to do next,
-  and its actions (Continue to Run; Run, Retry or Continue) sit in a header
-  above both panes. The tutorial no longer removes the workspace's height
-  floor, so the conversation stays readable on short and narrow screens
-  (measured at 1280×560: 49 px before, 110 px after). The chat header lines up
-  with the pipeline toolbar again, and nothing in the authoring pane sits flush
-  against the window edge. A disabled Continue to Run is described by the
-  instruction naming what it waits for, and stays visible in the narrow Compose
-  view. Run results wrap inside the pane instead of cutting off the summary
-  column.
-- **The Composer chat no longer offers to turn a message into source data,
-  and drops its authority chip.** The "This looks like source data — Create
-  source" offer resent the whole message, instructions included, whenever it
-  contained a URL; the composer creates sources from the conversation itself.
-  The "Auto-apply on" chip and the header row it sat in are gone: nothing in
-  the interface changes the composer's authority, so the chip always said the
-  same thing, and the transcript already labels each change the composer
-  applies. The conversation now starts at the top of the chat pane.
 
 **Upgrade and publication notes.** Session epoch 71 and Landscape epoch 49
 are unchanged from 0.8.1; this release adds no schema-epoch cutover. Installations

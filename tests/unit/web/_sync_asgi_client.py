@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from threading import Thread
 from types import TracebackType
 from typing import Any, Self
@@ -40,39 +41,41 @@ class SyncASGITestClient:
         return None
 
     def request(self, method: str, url: str, **kwargs: Any) -> Response:
-        async def send() -> Response:
+        async def send(client: AsyncClient) -> Response:
+            return await client.request(method, url, **kwargs)
+
+        return self.run_in_one_loop(send)
+
+    def run_in_one_loop[T](self, work: Callable[[AsyncClient], Awaitable[T]]) -> T:
+        """Keep a sequence of requests and their owned tasks in one event loop."""
+
+        async def run() -> T:
             async with AsyncClient(
-                transport=ASGITransport(
-                    app=self._app,
-                    raise_app_exceptions=self._raise_server_exceptions,
-                ),
+                transport=ASGITransport(app=self._app, raise_app_exceptions=self._raise_server_exceptions),
                 base_url="http://test",
                 cookies=self.cookies,
             ) as client:
-                response = await client.request(method, url, **kwargs)
-                self.cookies.update(response.cookies)
-                return response
+                result = await work(client)
+                self.cookies.update(client.cookies)
+                return result
 
         if not _inside_async_context():
-            return anyio.run(send)
-
-        result: Response | None = None
-        error: BaseException | None = None
+            return anyio.run(run)
+        outcomes: list[T] = []
+        errors: list[BaseException] = []
 
         def run_in_thread() -> None:
-            nonlocal result, error
             try:
-                result = anyio.run(send)
-            except BaseException as exc:  # pragma: no cover - re-raised below
-                error = exc
+                outcomes.append(anyio.run(run))
+            except BaseException as exc:
+                errors.append(exc)
 
         thread = Thread(target=run_in_thread, daemon=True)
         thread.start()
         thread.join()
-        if error is not None:
-            raise error
-        assert result is not None
-        return result
+        if errors:
+            raise errors[0]
+        return outcomes[0]
 
     def get(self, url: str, **kwargs: Any) -> Response:
         return self.request("GET", url, **kwargs)

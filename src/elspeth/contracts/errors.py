@@ -2803,3 +2803,12 @@ class TelemetryExporterError(Exception):
         self.exporter_name = exporter_name
         self.message = message
         super().__init__(f"Exporter '{exporter_name}' failed: {message}")
+
+
+# TIER-2: owned composer settlement failed before a durable result; operational
+# failure outranks cancellation, independently of audit-integrity corruption.
+class ComposerOwnedSettlementFailure(RuntimeError):
+    """An owned settlement child failed before its outcome became durable."""
+
+    def __init__(self) -> None:
+        super().__init__("Composer owned settlement did not complete")

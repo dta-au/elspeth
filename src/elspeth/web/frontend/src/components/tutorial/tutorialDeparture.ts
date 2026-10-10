@@ -1,4 +1,4 @@
-import { usePreferencesStore } from "@/stores/preferencesStore";
+import { capturePreferenceOwner, requirePreferenceOwner, usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 
 function assertLoadedFreeformSession(sessionId: string): void {
@@ -18,12 +18,21 @@ function assertLoadedFreeformSession(sessionId: string): void {
 export async function departTutorialSession(
   sessionId: string,
   via: "complete" | "exit",
+  ownsLifecycle: () => boolean,
 ): Promise<void> {
+  const ownsPreferences = capturePreferenceOwner();
+  const requireCurrent = () => {
+    requirePreferenceOwner(ownsPreferences);
+    requirePreferenceOwner(ownsLifecycle);
+  };
+  requireCurrent();
   assertLoadedFreeformSession(sessionId);
-  const completedAt = await usePreferencesStore.getState().markTutorialGraduated({
+  const completion = await usePreferencesStore.getState().markTutorialGraduated({
     via,
     publishLocally: false,
   });
+  requireCurrent();
   assertLoadedFreeformSession(sessionId);
-  usePreferencesStore.getState().publishTutorialGraduation(completedAt);
+  requireCurrent();
+  completion.publish();
 }

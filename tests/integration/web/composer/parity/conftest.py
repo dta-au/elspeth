@@ -43,7 +43,9 @@ from elspeth.web.sessions.routes._helpers import _state_from_record
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.composer_fakes import StaticPluginSnapshotFactory
 from tests.fixtures.identities import wire_test_pipeline_user_authority
+from tests.helpers.composer_operations import install_composer_async_worker
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
@@ -407,10 +409,11 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     app.state.catalog_service = catalog
     app.state.web_plugin_policy = web_plugin_policy
     app.state.operator_profile_registry = operator_profile_registry
-    app.state.plugin_snapshot_factory = lambda user: build_snapshot(user.user_id)
+    app.state.plugin_snapshot_factory = StaticPluginSnapshotFactory(build_snapshot("alice"))
     app.state.composer_recorder = BufferingRecorder()
     app.state.composer_progress_registry = ComposerProgressRegistry()
     app.include_router(create_session_router())
+    install_composer_async_worker(app)
 
     try:
         yield ParityEnv(

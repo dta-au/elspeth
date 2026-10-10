@@ -1735,25 +1735,29 @@ def _custody_process(
     operation_context: SessionOperationContext,
 ) -> None:
     """Spawn-safe worker proving PostgreSQL exclusion crosses processes."""
-    request_type, _ = _inline_custody_contract()
-    engine = create_session_engine(database_url)
-    normalized_fields = dict(request_fields)
-    normalized_fields["session_id"] = UUID(str(request_fields["session_id"]))
-    normalized_fields["creation_modality"] = CreationModality(str(request_fields["creation_modality"]))
-    request = request_type(**normalized_fields)
+    from tests.helpers.child_executor_lifecycle import child_executor_lifecycle
+
     try:
-        if not start_event.wait(timeout=15):  # type: ignore[attr-defined]
-            raise RuntimeError("PostgreSQL custody process start barrier timed out")
-        record = asyncio.run(
-            BlobServiceImpl(engine, Path(data_dir), max_storage_per_session=100).reserve_inline_custody(
-                request, session_operation_context=operation_context
-            )
-        )
+        with child_executor_lifecycle():
+            engine = create_session_engine(database_url)
+            try:
+                request_type, _ = _inline_custody_contract()
+                normalized_fields = dict(request_fields)
+                normalized_fields["session_id"] = UUID(str(request_fields["session_id"]))
+                normalized_fields["creation_modality"] = CreationModality(str(request_fields["creation_modality"]))
+                request = request_type(**normalized_fields)
+                if not start_event.wait(timeout=15):  # type: ignore[attr-defined]
+                    raise RuntimeError("PostgreSQL custody process start barrier timed out")
+                record = asyncio.run(
+                    BlobServiceImpl(engine, Path(data_dir), max_storage_per_session=100).reserve_inline_custody(
+                        request, session_operation_context=operation_context
+                    )
+                )
+            finally:
+                engine.dispose()
         result_queue.put(("ok", str(record.id)))  # type: ignore[attr-defined]
     except BaseException as exc:
         result_queue.put(("error", type(exc).__name__, str(exc)))  # type: ignore[attr-defined]
-    finally:
-        engine.dispose()
 
 
 class TestInlineCustodyStartupReconciliation:

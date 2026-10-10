@@ -1,0 +1,62 @@
+<!-- Durable copy: machine-specific prefixes normalized; private original retained. -->
+
+# Astra EXECUTE core code review 4
+
+Verdict: **GO for the narrowly reviewed core4 production source; HOLD for coherent integration, controls, runtime, and application.** Core4 repairs F3's missing failed-finalizer exit without weakening success or allowing an unresolved admission counter to count as complete. App5's success-only wait is still a known integration blocker and needs its separately frozen layer reviewed. No new blocking production defect was found in this core successor.
+
+This is an actual internal Astra source review. It does not clear the old core2/core3 artifacts: their prior NO-GO reports remain valid for their frozen bytes. No project imports, runtime, collection, SQL, provider calls, network/external transmission, repository edits, patch application, merge, deployment, or new agents occurred. John retains local testing, manual Daybreak and merge decisions.
+
+## Source and evidence
+
+Reviewed immutable `transport-cleanup-observation-implementation-1/execute-core-package-4`, its README, complete manifests/preimages/replacements/patch, authored controls, source inventory and claimed syntax evidence; also the complete `execute-core4-failed-counter-control` parent and child source. The complete core2 production files and test source were read during the preceding review. Core4's registry and lifecycle are byte-identical to the already reviewed core3 successor; their complete source assessment carries forward by fresh exact-byte checks. The complete changed finalizer file, changed async-worker functions and all new control bodies were read here. Every remaining async-worker change from core3 was inspected. This is full affected-source review across the two turns, not a claim to have reread unchanged text needlessly.
+
+`astra-execute-core-code-review-4-evidence.json` records the fresh source measurements. All stored and live preimage guards matched, replacement hashes matched, changed-byte negatives failed their guards, and the entire patch reconstructed exactly. Source parsing used Python 3.12 stdlib AST only. This review did not adopt the package's separate Python313 parsing claim as runtime evidence.
+
+- Complete core4 patch: `3a179bc2d69a2446cb708a13a9718e7b34496eed7cd9f7bfc4c58b22889a9fc6`.
+- Finalizer source: `6df51b4177b72e072862f407fc77eb53162790783b4724b844c9c73a84277ab0`.
+- Async worker: `1dae53c90feed3597c0908fb0300ead8599dac3bb0822527345a0a4a1bb3c3bf`.
+- Registry: `e165fd4043994a9346e924bc124831da459949dd866742955c1df9eb3dae8511`.
+- Lifecycle: `b20314c1ab30c2bf9bb858a7680753d2d65b490d9018484dfd5cbc2495f4d1a3`.
+- Core control module: `e4ad528f971361dbed624fe97acff89fcb825d6b6630b9fa874eb78c732d6208`.
+
+The old complete core control module is an exact byte prefix of the new module. Its earlier control assessment remains intact; source inventories and parsing are never treated as collected/passing cases.
+
+## F3 repair: successful release and failed callback are separate receipts
+
+The finalizer reservation now wraps the actual admission release. The wrapper calls the real `_release_admission` first and only then records `_physical_admission_release_return_observed`. An early `reservation.released` flag, a held counter call, or a counter call that raises before decrement cannot publish that receipt. The capability is already bound to the reservation before submitted work can run.
+
+A callback failure retains its exact original and separately records `_physical_callback_failure_exit_observed`. This latter receipt alone proves no physical completion. `physical_failure_completion_known` requires the actual claimed capability, exact bound reservation/Future identity, Future done, actual counter-return receipt, actual callback-failure receipt, retained failure, actual invocation completion/exit, and that reservation's registering generation joined. The generation join ensures the callback has physically returned, even though its failure receipt is recorded immediately before the callback function exits. A missing or failed counter return stays Unknown after generation join.
+
+`run_application_finalizer_in_worker` now waits for successful completion **or** this physically known failed completion. It then retrieves the actual Future outcome and projects every deferred cancellation plus actual invocation error and retained callback errors. It does not replace the original errors with a success value. Successful completion predicates explicitly reject retained failures. Failure observation is not success, registry completion, release retirement, or watchdog COMPLETE.
+
+Copied capabilities cannot borrow receipts: new receipt issuers check `owner.owns_claimed(self)`, and success/failure getters require that same exact registered capability. Exact method dispatch and original Future/reservation binding are preserved. Receipt seals remain private module objects; no public DTO, reconstructed fields, arbitrary function registry or global strong history was introduced.
+
+The new owner check completes before taking the capability lock. Capability properties read the generation's Event and invocation witness without acquiring the generation submission lock. The actual release/generation callback remains in its established order. I found no new capability-lock/owner-lock or capability-lock/submission-lock cycle in these changes.
+
+## Failed submit/setup, originals, and Unknown
+
+Finalizer submit/setup failures now wait on `physical_submission_failure_completion_known`: actual counter return, actual registering generation join, retained original setup/submission failure, and the applicable no-entry or completed-invocation witness. An absent returned Future is not interpreted as no work before actual generation closure. The finalizer's already-ARMED setup path still does not attempt an invalid abort; only WAITING authorizes abort. After real work joins, its actual SQL/invocation error is retained alongside the setup error. Repeated external cancellations remain individual original objects.
+
+A counter failure is deliberately stricter than a generation-observer failure. The former leaves physical admission unresolved and cannot use `generation.joined` plus the early `released` flag as a substitute for counter return. The latter can exit as failure only after the real counter returned and the exact generation joined. That distinction is the substantive repair to F3.
+
+F1/F2 remain source-resolved. The selected EXECUTE bridge still waits for the actual callback-return receipt before census projection or retirement, validates the exact registered carrier and captured canonical bound invocation before admission and at invocation, and uses only the original acquired context. The registry and lifecycle bytes are unchanged from reviewed core3. Generic postcommit acquisition failures stay pending; independent per-phase census still observes siblings despite a first-owner error; producer/Task results and all cancellation originals remain checked. No unknown SQL or pending resource is waived.
+
+Core3's honest result annotation, deleted-except-target local renames, unreachable old EXECUTE branch removal and nominal owned-outcome narrowing are preserved. Their earlier bounded assessment applies; these are not claims that the whole patch is AST-identical or that injected subclasses have identical behavior. Exact authority/carrier dispatch predicates remain exact.
+
+## Control causality and limits
+
+The new failed-callback control invokes the actual registered finalizer, injects a distinct error at its actual generation completion observer after real counter release, holds the actual generation shutdown, and asserts failure completion stays false while join is held. It delivers three separately observed outer cancellations, then releases the real join and compares the escaped originals in order. The parameterized actual invocation failure adds its exact original to that oracle. It also copies the actual capability and requires copied receipt getters/issuers to refuse it.
+
+The held-counter control places the gate inside the actual counter-release call. It checks the early released flag is true while the new counter-return receipt is false and the real outstanding count is one. The post-arm setup control publishes ARMED then raises, holds actual counter return, and requires setup plus actual SQL originals after real generation join. These controls exercise the intended causal boundaries. They are authored controls, not executed passes.
+
+The companion child uses the real process watchdog and actual shared executor. It makes the real counter operation fail before decrement, observes actual generation join, and requires the real outstanding admission and finalizer owner to remain pending. The parent requires the recovery acknowledgment marker, the joined-generation/failed-counter marker, no COMPLETE marker, and watchdog SIGKILL. Its `communicate(timeout=45)` plus process-group cleanup gives the parent independent ownership of a stuck child. Removing the counter-return gate should violate the child's intended custody assertions/marker sequence, rather than be accepted as successful cleanup. This expected-red behavior remains unmeasured.
+
+Root must run the baseline and causal mutations on the coherent candidate, verify expected assertions rather than count timeouts as useful reds, and own/observe child termination. No collection, test, mutation, Ruff, mypy, PostgreSQL, whole-tree or provider clearance follows from this review.
+
+## Integration remains blocked
+
+App5 still waits for executor **success** after a physically known failure. Core4's new failure receipt alone does not let app5 finish observing later cleanup. The separate app/registry getter and consumer failed-handoff layers were announced but are outside this frozen core review; no prospective approval is granted. They must preserve all sibling joins and retained failure roots while continuing to reject success/COMPLETE. The previously reviewed consumer3 healthy retirement conditions must remain strict; a physically observed failure is not authority to retire a healthy owner as successful.
+
+The fresh in-memory async composition used core4, observer5's guarded `_submit_shared` span edits/import/two helpers, and only storage V5's exact finish-once function. It parsed to hash `4b310a6589ae398512bc3353a0edd08ce10eaefb666d14053de8c3d801a73861`. Shared joined-Future helper and lifecycle Event-wait seam match byte-for-byte and occur once. Core's lifecycle supplies `_retain_cancellation`, which standalone observer lifecycle lacks. Unrelated core function ASTs were preserved. No full-file storage overwrite, stale composition preview, repository application or frozen-combined-candidate approval occurred.
+
+The held HEAD still measured `d2b73990d137e9725200c897544eebc5b958fdf4`. All original 102 obligations, four collection obligations, and two UNKNOWNs remain. Narrow source GO does not remove integration HOLD or authorize merge/deploy/production/paid tests.

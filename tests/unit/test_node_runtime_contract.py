@@ -72,11 +72,22 @@ def test_ci_and_release_image_build_with_node_24() -> None:
     ]
     setup_steps = [step for _job_name, step in setup_jobs]
 
-    # The two frontend jobs build and test the app; the dependency audit
-    # needs npm only to read the lockfiles.
-    assert sorted(job_name for job_name, _step in setup_jobs) == ["e2e-frontend", "frontend-unit", "supply-chain-audit"]
+    # Python jobs run real TLS browser acceptance in their own checkout;
+    # frontend jobs build/test the app and the audit reads the lockfiles.
+    assert sorted(job_name for job_name, _step in setup_jobs) == [
+        "e2e-frontend",
+        "frontend-unit",
+        "integration",
+        "supply-chain-audit",
+        "test",
+    ]
     assert {step["uses"] for step in setup_steps} == {f"actions/setup-node@{SETUP_NODE_REVISION}"}
-    assert {step["with"]["node-version"] for step in setup_steps} == {"24"}
+    for job_name, step in setup_jobs:
+        if job_name in {"test", "integration"}:
+            assert step["with"]["node-version-file"] == "${{ env.CI_CHECKOUT_PATH }}/.node-version"
+            assert "node-version" not in step["with"]
+        else:
+            assert step["with"]["node-version"] == "24"
 
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert f"FROM {IMAGE_NODE_BASE} AS frontend-builder" in dockerfile

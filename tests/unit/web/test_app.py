@@ -9,10 +9,10 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar, cast, get_origin
+from typing import ClassVar, get_origin
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
@@ -20,11 +20,9 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader, MetricExporter, MetricExportResult, MetricsData
-from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult, MetricsData
 from pydantic import SecretBytes, ValidationError
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import CompileError, OperationalError, ProgrammingError
 from starlette.requests import Request
@@ -54,7 +52,8 @@ from elspeth.web.app import (
     create_app,
     lifespan,
 )
-from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.application_finalizers import ApplicationFinalizerCapability, ApplicationFinalizerKind
+from elspeth.web.async_workers import run_application_finalizer_in_worker, run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.providers import get_profile
 from elspeth.web.auth.sso import SsoAuthProvider, SsoRuntime
@@ -69,10 +68,12 @@ from elspeth.web.coordination.membership_lifecycle import (
 )
 from elspeth.web.dependencies import get_settings
 from elspeth.web.deployment_contract import DeploymentConfigurationError
+from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
-from elspeth.web.operator_telemetry import OperatorTelemetryFactories, OperatorTelemetryRuntime
+from elspeth.web.process_watchdog_codec import RecoveryReason
 from elspeth.web.readiness import READINESS_CHECK_NAMES, ReadinessCache, ReadinessCheck, ReadinessProbeRunner, ReadinessReport
-from elspeth.web.sessions.models import identity_roles_table
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import identity_roles_table, runs_table
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX,
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
@@ -85,6 +86,7 @@ from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetr
 from elspeth.web.sso_wiring import SsoWiring
 from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import expire_leader_seat
+from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -101,68 +103,6 @@ class _HermeticMetricExporter(MetricExporter):
 
     def shutdown(self, timeout_millis: float = 30_000, **_kwargs: object) -> None:
         del timeout_millis
-
-
-@pytest.fixture(autouse=True)
-def _hermetic_operator_telemetry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Exercise bootstrap policy without process-global providers or OTLP I/O."""
-
-    isolated_runtime: OperatorTelemetryRuntime | None = None
-    previous_runtime: OperatorTelemetryRuntime | None = None
-    runtime_swapped = False
-
-    def meter_provider(readers: Sequence[object], *, resource: Resource, views: tuple[object, ...]) -> MeterProvider:
-        return MeterProvider(
-            metric_readers=cast(Sequence[Any], readers),
-            resource=resource,
-            views=cast(Sequence[Any], views),
-            shutdown_on_exit=False,
-        )
-
-    factories = OperatorTelemetryFactories(
-        prometheus_reader=InMemoryMetricReader,
-        otlp_exporter=lambda **_kwargs: _HermeticMetricExporter(),
-        periodic_reader=lambda _exporter, **_kwargs: InMemoryMetricReader(),
-        meter_provider=meter_provider,
-        set_meter_provider=lambda _provider: None,
-    )
-
-    def bootstrap(settings: WebSettings) -> OperatorTelemetryRuntime:
-        nonlocal isolated_runtime, previous_runtime, runtime_swapped
-        if isolated_runtime is not None:
-            return isolated_runtime
-
-        # bootstrap owns a process singleton in production. Save any runtime
-        # installed by an earlier module, then keep this test's injected
-        # runtime active so module-level event projection reaches the same
-        # provider retained by the app. Teardown restores the prior runtime.
-        with operator_telemetry_module._runtime_lock:
-            previous_runtime = operator_telemetry_module._runtime
-            operator_telemetry_module._runtime = None
-        try:
-            isolated_runtime = operator_telemetry_module.bootstrap_operator_telemetry(settings, factories=factories)
-            runtime_swapped = True
-        except BaseException:
-            with operator_telemetry_module._runtime_lock:
-                operator_telemetry_module._runtime = previous_runtime
-            raise
-        assert isolated_runtime is not None
-        return isolated_runtime
-
-    monkeypatch.setattr(app_module, "bootstrap_operator_telemetry", bootstrap)
-    try:
-        yield
-    finally:
-        try:
-            if isolated_runtime is not None and isolated_runtime._begin_shutdown():
-                try:
-                    isolated_runtime.provider.shutdown(timeout_millis=5_000)
-                finally:
-                    isolated_runtime._finish_shutdown()
-        finally:
-            if runtime_swapped:
-                with operator_telemetry_module._runtime_lock:
-                    operator_telemetry_module._runtime = previous_runtime
 
 
 @pytest.fixture(autouse=True)
@@ -214,6 +154,17 @@ def _ensure_test_user(conn: Connection, *, identity_id: str) -> None:
             granted_at=datetime.now(UTC),
         )
     )
+
+
+def _read_run_after_shutdown(settings: WebSettings, service: SessionServiceImpl, run_id: UUID) -> RunRecord:
+    """Read persisted truth with an independent connection after pool shutdown."""
+    engine = create_session_engine(settings.get_session_db_url())
+    try:
+        with engine.begin() as connection:
+            row = connection.execute(select(runs_table).where(runs_table.c.id == str(run_id))).one()
+        return service._row_to_run_record(row)
+    finally:
+        engine.dispose()
 
 
 async def _save_session_seed_state(
@@ -363,6 +314,20 @@ class _RecordingExecutionService:
         self.get_live_run_ids_calls = 0
         self.catalog_snapshots: list[tuple[str, str]] = []
         self.shutdown_calls = 0
+        self.executor_join_calls = 0
+        self._shutdown_finalizer: ApplicationFinalizerCapability | None = None
+
+    def set_shutdown_finalizer(self, capability: ApplicationFinalizerCapability) -> None:
+        if not isinstance(capability, ApplicationFinalizerCapability):
+            raise TypeError("Execution fake requires an owned finalizer")
+        if capability.kind is not ApplicationFinalizerKind.EXECUTION_EXECUTOR_JOIN:
+            raise TypeError("Execution fake requires its executor finalizer")
+        if self._shutdown_finalizer is not None:
+            raise RuntimeError("Execution fake finalizer already registered")
+        self._shutdown_finalizer = capability
+
+    def join_executor_shutdown(self) -> None:
+        self.executor_join_calls += 1
 
     def get_live_run_ids(self) -> frozenset[str]:
         self.get_live_run_ids_calls += 1
@@ -375,6 +340,10 @@ class _RecordingExecutionService:
 
     async def shutdown(self) -> None:
         self.shutdown_calls += 1
+        if self._shutdown_finalizer is None:
+            await run_sync_in_worker(self.join_executor_shutdown)
+        else:
+            await run_application_finalizer_in_worker(self._shutdown_finalizer)
 
 
 class _RecordingOperatorTelemetry:
@@ -476,24 +445,23 @@ class TestCreateApp:
         first = create_app(_settings(tmp_path / "first"))
         second = create_app(_settings(tmp_path / "second"))
 
-        assert first.state.operator_telemetry is second.state.operator_telemetry
+        # Independent ordinary test applications deliberately have distinct
+        # nominal replaceable installation domains; production foreign-owner
+        # reuse is refused before allocation by the installation controls.
+        assert first.state.operator_telemetry is not second.state.operator_telemetry
+        assert first.state.operator_telemetry.cleanup_owner.installation is not second.state.operator_telemetry.cleanup_owner.installation
 
     def test_app_metrics_bind_to_hermetic_runtime_provider(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))
         assert operator_telemetry_module._runtime is app.state.operator_telemetry
         app_module._COMPOSER_BOOT_CONFIG_COUNTER.add(1, {"surface": "unit-test"})
-        reader = app.state.operator_telemetry.readers[0]
-        assert isinstance(reader, InMemoryMetricReader)
-
-        data = reader.get_metrics_data()
-        assert data is not None
-        metric_names = {
-            metric.name
-            for resource_metric in data.resource_metrics
-            for scope_metric in resource_metric.scope_metrics
-            for metric in scope_metric.metrics
-        }
-        assert "composer.boot_config" in metric_names
+        registry = app.state.operator_telemetry.cleanup_owner.installation.registry
+        families = list(registry.collect())
+        family = next(family for family in families if family.name == "composer_boot_config")
+        sample = next(
+            sample for sample in family.samples if sample.name == "composer_boot_config_total" and sample.labels["surface"] == "unit-test"
+        )
+        assert sample.value == 1
 
     def test_invalid_aws_operator_policy_fails_before_provider_bootstrap(self, tmp_path) -> None:
         settings = _aws_settings(tmp_path, operator_telemetry="prometheus")
@@ -1225,69 +1193,29 @@ class TestBodySizeLimitMiddleware:
 
     @pytest.mark.asyncio
     async def test_missing_content_length_stream_passes_through_without_body_read(self) -> None:
-        """No Content-Length means the middleware defers to per-route validators."""
-
-        async def noop_app(scope, receive, send) -> None:
-            return None
-
-        middleware = _BodySizeLimitMiddleware(app=noop_app)
-        scope = {
-            "type": "http",
-            "method": "POST",
-            "path": "/api/health",
-            "headers": [(b"content-type", b"application/json")],
-            "query_string": b"",
-            "server": ("testserver", 80),
-            "client": ("testclient", 50000),
-            "scheme": "http",
-            "root_path": "",
-            "http_version": "1.1",
-        }
-
-        async def receive() -> dict[str, object]:
-            raise AssertionError("Content-Length-only guard must not read streamed bodies")
-
-        request = Request(scope, receive)
-
-        async def call_next(_request: Request) -> StarletteResponse:
-            return StarletteResponse(status_code=204)
-
-        response = await middleware.dispatch(request, call_next)
-
+        response = await self._dispatch_with_content_length(None)
         assert response.status_code == 204
 
-    async def _dispatch_with_content_length(self, content_length: int | str) -> StarletteResponse:
-        async def noop_app(scope, receive, send) -> None:
-            return None
+    async def _dispatch_with_content_length(self, content_length: int | str | None) -> StarletteResponse:
+        messages: list[dict] = []
 
-        middleware = _BodySizeLimitMiddleware(app=noop_app)
-        scope = {
-            "type": "http",
-            "method": "POST",
-            "path": "/api/health",
-            "headers": [
-                (b"content-length", str(content_length).encode("ascii")),
-                (b"content-type", b"application/json"),
-            ],
-            "query_string": b"",
-            "server": ("testserver", 80),
-            "client": ("testclient", 50000),
-            "scheme": "http",
-            "root_path": "",
-            "http_version": "1.1",
-        }
+        async def downstream(scope, receive, send) -> None:
+            await StarletteResponse(status_code=204)(scope, receive, send)
 
-        async def receive() -> dict[str, object]:
+        scope = {"type": "http", "method": "POST", "path": "/api/health", "headers": []}
+        if content_length is not None:
+            scope["headers"] = [(b"content-length", str(content_length).encode("ascii"))]
+
+        async def receive():
             raise AssertionError("Content-Length-only guard must not read request bodies")
 
-        request = Request(scope, receive)
+        async def send(message):
+            messages.append(message)
 
-        async def call_next(_request: Request) -> StarletteResponse:
-            return StarletteResponse(status_code=204)
-
-        response = await middleware.dispatch(request, call_next)
-        assert isinstance(response, StarletteResponse)
-        return response
+        await _BodySizeLimitMiddleware(downstream)(scope, receive, send)
+        assert messages[0]["type"] == "http.response.start"
+        assert messages[1]["type"] == "http.response.body"
+        return StarletteResponse(content=messages[1]["body"], status_code=messages[0]["status"])
 
 
 class TestGetSettingsDependency:
@@ -1667,6 +1595,205 @@ class TestLifespanShutdown:
     """Shutdown must await the execution-service drain path."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("supervision_source", "auth_fails", "engine_fails"),
+        [
+            (None, False, False),
+            ("join", False, False),
+            (None, True, False),
+            ("join", True, False),
+            ("join", False, True),
+            ("join", True, True),
+            ("request", True, True),
+        ],
+    )
+    async def test_lifespan_preserves_each_original_when_supervision_and_finalizers_fail(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        supervision_source: str | None,
+        auth_fails: bool,
+        engine_fails: bool,
+    ) -> None:
+        calls: list[str] = []
+        primary = ValueError("primary")
+        supervision = RuntimeError("supervision")
+        auth = OSError("auth")
+        engine = AssertionError("engine")
+
+        class Registry:
+            def __init__(self, *, owner: object, recovery: object, loop: object) -> None:
+                calls.append("registry")
+
+            def seal(self) -> None:
+                calls.append("seal")
+
+        class Recovery:
+            def start_monitor(self) -> None:
+                calls.append("start_monitor")
+
+            def request_shutdown(self) -> None:
+                calls.append("request_shutdown")
+                if supervision_source == "request":
+                    raise supervision
+
+            async def join_escalation(self) -> None:
+                calls.append("join_escalation")
+                if supervision_source == "join":
+                    raise supervision
+
+        class Watchdog:
+            def assert_watching(self) -> None:
+                calls.append("watching")
+
+        class Audit:
+            def start(self) -> None:
+                calls.append("audit_start")
+
+        @contextlib.asynccontextmanager
+        async def service(_app: FastAPI):
+            yield
+
+        def finalize_auth() -> None:
+            calls.append("auth")
+            if auth_fails:
+                raise auth
+
+        def finalize_engine() -> None:
+            calls.append("engine")
+            if engine_fails:
+                raise engine
+
+        app = FastAPI()
+        app.state.application_finalizer_owner = object()
+        app.state.process_recovery = Recovery()
+        app.state.process_watchdog = Watchdog()
+        app.state.auth_audit_recorder = Audit()
+        app.state._auth_audit_finalizer = finalize_auth
+        app.state._session_engine_finalizer = finalize_engine
+        monkeypatch.setattr(app_module, "ExecutionLeaseReleaseRegistry", Registry)
+        monkeypatch.setattr(app_module, "_service_lifespan", service)
+
+        with pytest.raises(BaseException) as captured:
+            async with lifespan(app):
+                raise primary
+
+        def leaves(error: BaseException) -> list[BaseException]:
+            if isinstance(error, BaseExceptionGroup):
+                return [leaf for child in error.exceptions for leaf in leaves(child)]
+            return [error]
+
+        expected = [primary]
+        if supervision_source is not None:
+            expected.append(supervision)
+        if auth_fails:
+            expected.append(auth)
+        if engine_fails:
+            expected.append(engine)
+        actual = leaves(captured.value)
+        assert len(actual) == len(expected)
+        assert all(found is original for found, original in zip(actual, expected, strict=True))
+        if supervision_source is None and not auth_fails and not engine_fails:
+            assert captured.value is primary
+        if supervision_source is not None and (auth_fails or engine_fails):
+            assert isinstance(captured.value, BaseExceptionGroup)
+            assert isinstance(captured.value.exceptions[0], BaseExceptionGroup)
+            assert captured.value.exceptions[0].exceptions[0] is primary
+            assert captured.value.exceptions[0].exceptions[1] is supervision
+        assert calls[-2:] == ["auth", "engine"]
+        assert calls.count("seal") == 2
+        assert calls.count("request_shutdown") == 1
+        assert calls.count("join_escalation") == (0 if supervision_source == "request" else 1)
+
+    @pytest.mark.asyncio
+    async def test_lifespan_retains_both_actual_cancellations_through_failed_finalizers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serving = asyncio.Event()
+        joining = asyncio.Event()
+        observed: list[asyncio.CancelledError] = []
+        finalizers: list[str] = []
+        auth = OSError("auth finalizer")
+        engine = RuntimeError("engine finalizer")
+
+        class Registry:
+            def __init__(self, *, owner: object, recovery: object, loop: object) -> None:
+                pass
+
+            def seal(self) -> None:
+                pass
+
+        class Recovery:
+            def start_monitor(self) -> None:
+                pass
+
+            def request_shutdown(self) -> None:
+                pass
+
+            async def join_escalation(self) -> None:
+                joining.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as original:
+                    observed.append(original)
+                    raise
+
+        class Watchdog:
+            def assert_watching(self) -> None:
+                pass
+
+        class Audit:
+            def start(self) -> None:
+                pass
+
+        @contextlib.asynccontextmanager
+        async def service(_app: FastAPI):
+            yield
+
+        def finalize_auth() -> None:
+            finalizers.append("auth")
+            raise auth
+
+        def finalize_engine() -> None:
+            finalizers.append("engine")
+            raise engine
+
+        app = FastAPI()
+        app.state.application_finalizer_owner = object()
+        app.state.process_recovery = Recovery()
+        app.state.process_watchdog = Watchdog()
+        app.state.auth_audit_recorder = Audit()
+        app.state._auth_audit_finalizer = finalize_auth
+        app.state._session_engine_finalizer = finalize_engine
+        monkeypatch.setattr(app_module, "ExecutionLeaseReleaseRegistry", Registry)
+        monkeypatch.setattr(app_module, "_service_lifespan", service)
+
+        async def run() -> None:
+            async with lifespan(app):
+                serving.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as original:
+                    observed.append(original)
+                    raise
+
+        task = asyncio.create_task(run())
+        await asyncio.wait_for(serving.wait(), timeout=5.0)
+        task.cancel("first")
+        await asyncio.wait_for(joining.wait(), timeout=5.0)
+        task.cancel("second")
+        with pytest.raises(BaseExceptionGroup) as captured:
+            await task
+        assert len(observed) == 2
+        assert observed[0] is not observed[1]
+        assert finalizers == ["auth", "engine"]
+        outer = captured.value
+        assert len(outer.exceptions) == 3
+        inner = outer.exceptions[0]
+        assert isinstance(inner, BaseExceptionGroup)
+        assert inner.exceptions[0] is observed[0]
+        assert inner.exceptions[1] is observed[1]
+        assert outer.exceptions[1] is auth
+        assert outer.exceptions[2] is engine
+
+    @pytest.mark.asyncio
     async def test_lifespan_aborts_when_inline_custody_reconciliation_fails(self, monkeypatch, tmp_path) -> None:
         """The server must not serve while a custody journal is unresolved."""
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
@@ -1815,7 +1942,7 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        updated_web_run = await session_service.get_run(web_run.id)
+        updated_web_run = _read_run_after_shutdown(app.state.settings, session_service, web_run.id)
         assert updated_web_run.status == ("empty" if terminal else "running")
         assert (updated_web_run.finished_at is not None) == terminal
         assert updated_web_run.error is None
@@ -1867,7 +1994,7 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        updated = await service.get_run(web_run.id)
+        updated = _read_run_after_shutdown(app.state.settings, service, web_run.id)
         assert updated.status == "running"
         assert updated.saga_state.value == "recovery_required"
         assert updated.recovery_required_reason.value == "missing_baseline"
@@ -1908,7 +2035,7 @@ class TestLifespanShutdown:
         with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
                 pass
-        updated = await service.get_run(web_run.id)
+        updated = _read_run_after_shutdown(app.state.settings, service, web_run.id)
         assert updated.status == "pending"
         assert updated.saga_state.value == "recovery_required"
         assert updated.recovery_required_reason.value == "missing_baseline"
@@ -2432,15 +2559,22 @@ class TestLifespanShutdown:
     @pytest.mark.asyncio
     async def test_lifespan_awaits_execution_service_shutdown(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
-        fake_execution_service = _RecordingExecutionService()
         fake_operator_telemetry = _RecordingOperatorTelemetry()
         app.state.operator_telemetry = fake_operator_telemetry
+        original_shutdown = ExecutionServiceImpl.shutdown
+        shutdown_calls = 0
 
-        with patch("elspeth.web.app.ExecutionServiceImpl", return_value=fake_execution_service):
+        async def observe_shutdown(service: ExecutionServiceImpl) -> None:
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+            await original_shutdown(service)
+
+        with patch.object(ExecutionServiceImpl, "shutdown", observe_shutdown):
             async with lifespan(app):
                 pass
 
-        assert fake_execution_service.shutdown_calls == 1
+        assert shutdown_calls == 1
+        assert app.state.execution_lease_release_registry.executor_join_succeeded
         assert fake_operator_telemetry.shutdown_calls == 1
 
     @pytest.mark.asyncio
@@ -2450,33 +2584,42 @@ class TestLifespanShutdown:
         tmp_path,
     ) -> None:
         """A dead required sweeper must stop serving and cannot skip teardown."""
-        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
-        fake_execution_service = _RecordingExecutionService()
+        app = create_app(
+            _settings(tmp_path, composer_boot_probe_enabled=False),
+            process_watchdog_factory=OwnedTestProcessWatchdog,
+        )
+        watchdog = app.state.process_watchdog
+        assert isinstance(watchdog, OwnedTestProcessWatchdog)
         fake_operator_telemetry = _RecordingOperatorTelemetry()
         app.state.operator_telemetry = fake_operator_telemetry
+        original_shutdown = ExecutionServiceImpl.shutdown
+        shutdown_calls = 0
+
+        async def observe_shutdown(service: ExecutionServiceImpl) -> None:
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+            await original_shutdown(service)
+
         cleanup_failed = asyncio.Event()
 
         async def fatal_cleanup(*_args: object, **_kwargs: object) -> None:
             cleanup_failed.set()
             raise OSError("orphan cleanup storage unavailable")
 
-        async def shutdown_workers() -> None:
-            return None
-
         monkeypatch.setattr(app_module, "_periodic_orphan_cleanup", fatal_cleanup)
-        monkeypatch.setattr("elspeth.web.async_workers.shutdown_async_workers", shutdown_workers)
-        recovery_requested = asyncio.Event()
-        monkeypatch.setattr("elspeth.web.process_recovery.os.kill", lambda _pid, _signal: recovery_requested.set())
         with (
-            patch("elspeth.web.app.ExecutionServiceImpl", return_value=fake_execution_service),
+            patch.object(ExecutionServiceImpl, "shutdown", observe_shutdown),
             pytest.raises(OSError, match="orphan cleanup storage unavailable"),
         ):
             async with lifespan(app):
                 await asyncio.wait_for(cleanup_failed.wait(), timeout=5.0)
-                await asyncio.wait_for(recovery_requested.wait(), timeout=5.0)
+                async with asyncio.timeout(5.0):
+                    while RecoveryReason.REQUIRED_WORKER_LOST not in watchdog.reasons:
+                        await asyncio.sleep(0.01)
                 assert app.state.instance_draining.is_set()
-                assert fake_execution_service.shutdown_calls == 0
-        assert fake_execution_service.shutdown_calls == 1
+                assert shutdown_calls == 0
+        assert shutdown_calls == 1
+        assert app.state.execution_lease_release_registry.executor_join_succeeded
         assert fake_operator_telemetry.shutdown_calls == 1
 
     @pytest.mark.asyncio
@@ -3617,7 +3760,7 @@ class TestValidationErrorRedaction:
         # Send a message with state_id as a non-UUID string — triggers 422
         resp = client.post(
             f"/api/sessions/{session_id}/messages",
-            json={"content": "leaked-password-value", "state_id": "not-a-uuid", "client_request_id": str(uuid4())},
+            json={"content": "leaked-password-value", "state_id": "not-a-uuid", "operation_id": str(uuid4())},
         )
         assert resp.status_code == 422
         body_text = resp.text
@@ -4133,12 +4276,13 @@ class TestDeploymentStateModeStartup:
         primary = ExternalStateSchemaNotReadyError("primary schema validation failure")
         cleanup_sentinel = "dispose-cleanup-sensitive-detail"
         cleanup_detail = f"{cleanup_sentinel}: {settings.session_db_url}"
+        cleanup_error = RuntimeError(cleanup_detail)
         dispose_calls = 0
 
         def dispose(*_args: object, **_kwargs: object) -> None:
             nonlocal dispose_calls
             dispose_calls += 1
-            raise RuntimeError(cleanup_detail)
+            raise cleanup_error
 
         def reject(*_args: object, **_kwargs: object) -> None:
             raise primary
@@ -4147,21 +4291,16 @@ class TestDeploymentStateModeStartup:
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
         monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", reject)
 
-        with capture_logs() as logs, pytest.raises(ExternalStateSchemaNotReadyError) as exc_info:
+        with capture_logs() as logs, pytest.raises(BaseExceptionGroup) as exc_info:
             create_app(settings)
 
-        assert exc_info.value is primary
-        assert type(exc_info.value) is ExternalStateSchemaNotReadyError
-        assert str(exc_info.value) == "primary schema validation failure"
+        assert len(exc_info.value.exceptions) == 2
+        assert exc_info.value.exceptions[0] is primary
+        assert type(exc_info.value.exceptions[0]) is ExternalStateSchemaNotReadyError
+        assert exc_info.value.exceptions[1] is cleanup_error
         assert dispose_calls == 1
-        assert logs == [
-            {
-                "event": "session_engine_finalization_failed",
-                "log_level": "error",
-                "primary_exc_class": "ExternalStateSchemaNotReadyError",
-                "finalization_exc_class": "RuntimeError",
-            }
-        ]
+        # Retained exception objects are diagnostic evidence; logging must
+        # remain free of their sensitive messages and database URLs.
         assert cleanup_sentinel not in repr(logs)
         assert settings.session_db_url not in repr(logs)
 
@@ -4205,12 +4344,13 @@ class TestDeploymentStateModeStartup:
         primary = KeyboardInterrupt("primary synchronous startup failure")
         cleanup_sentinel = "dispose-cleanup-sensitive-detail"
         cleanup_detail = f"{cleanup_sentinel}: {settings.session_db_url}"
+        cleanup_error = RuntimeError(cleanup_detail)
         dispose_calls = 0
 
         def dispose(*_args: object, **_kwargs: object) -> None:
             nonlocal dispose_calls
             dispose_calls += 1
-            raise RuntimeError(cleanup_detail)
+            raise cleanup_error
 
         def fail_catalog() -> object:
             raise primary
@@ -4220,21 +4360,16 @@ class TestDeploymentStateModeStartup:
         monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(app_module, "create_catalog_service", fail_catalog)
 
-        with capture_logs() as logs, pytest.raises(KeyboardInterrupt) as exc_info:
+        with capture_logs() as logs, pytest.raises(BaseExceptionGroup) as exc_info:
             create_app(settings)
 
-        assert exc_info.value is primary
-        assert type(exc_info.value) is KeyboardInterrupt
-        assert str(exc_info.value) == "primary synchronous startup failure"
+        assert len(exc_info.value.exceptions) == 2
+        assert exc_info.value.exceptions[0] is primary
+        assert type(exc_info.value.exceptions[0]) is KeyboardInterrupt
+        assert exc_info.value.exceptions[1] is cleanup_error
         assert dispose_calls == 1
-        assert logs == [
-            {
-                "event": "session_engine_finalization_failed",
-                "log_level": "error",
-                "primary_exc_class": "KeyboardInterrupt",
-                "finalization_exc_class": "RuntimeError",
-            }
-        ]
+        # Retained exception objects are diagnostic evidence; logging must
+        # remain free of their sensitive messages and database URLs.
         assert cleanup_sentinel not in repr(logs)
         assert settings.session_db_url not in repr(logs)
 
@@ -4275,10 +4410,7 @@ class TestDeploymentStateModeStartup:
             pass
         monkeypatch.setattr(app.state.auth_audit_recorder, "landscape_url", audit_url)
 
-        with (
-            patch("elspeth.web.app.ExecutionServiceImpl", return_value=_RecordingExecutionService()),
-            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
-        ):
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
                 pass
 
@@ -4779,8 +4911,8 @@ class TestWebInstanceMembershipWiring:
 
             __slots__ = ("order",)
 
-            def __init__(self) -> None:
-                super().__init__()
+            def __init__(self, instance_draining: threading.Event) -> None:
+                super().__init__(instance_draining=instance_draining)
                 self.order: list[str] = []
 
             async def start(self) -> None:
@@ -4796,9 +4928,9 @@ class TestWebInstanceMembershipWiring:
                 return MembershipShutdownOutcome.NO_MEMBERSHIP
 
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
-        spy = _SpyMembership()
+        spy = _SpyMembership(app.state.instance_draining)
         app.state.web_instance_membership = spy
-        app.state.instance_draining = spy.draining
+        assert app.state.instance_draining is spy.draining
         with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
                 assert spy.order == ["start"]

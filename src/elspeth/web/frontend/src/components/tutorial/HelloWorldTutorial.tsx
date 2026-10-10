@@ -7,7 +7,7 @@ import {
   sendTutorialAbandonBeacon,
 } from "@/api/client";
 import { Button } from "@/components/ui";
-import { usePreferencesStore } from "@/stores/preferencesStore";
+import { capturePreferenceOwner, requirePreferenceOwner, PreferencesRequestSuperseded, usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { TutorialTurn1Welcome } from "./TutorialTurn1Welcome";
 import { TutorialFreeformShell } from "./TutorialFreeformShell";
@@ -52,6 +52,12 @@ export function HelloWorldTutorial({
   tutorialReady = true,
   tutorialUnavailableReason = null,
 }: HelloWorldTutorialProps): JSX.Element {
+  const activeRef = useRef(false);
+  const ownsMountRef = useRef(capturePreferenceOwner());
+  useEffect(() => {
+    activeRef.current = true;
+    return () => { activeRef.current = false; };
+  }, []);
   const [state, dispatch] = useReducer(
     tutorialReducer,
     null,
@@ -176,7 +182,9 @@ export function HelloWorldTutorial({
     ) {
       return;
     }
+    if (!ownsMountRef.current()) return;
     void prefs.saveTutorialProgress(target).catch((err) => {
+      if (!activeRef.current || !ownsMountRef.current() || err instanceof PreferencesRequestSuperseded) return;
       console.error("[tutorial] progress persist failed:", err);
     });
   }, [state, sessionId]);
@@ -269,12 +277,14 @@ export function HelloWorldTutorial({
   // finish click reuses the durable completion and then publishes. Best-effort:
   // on failure the finish click is still the second chance to persist.
   const onSkip = (): void => {
+    if (!activeRef.current || !ownsMountRef.current()) return;
     startAttemptRef.current += 1;
     dispatch({ type: "skipToGraduation" });
     void usePreferencesStore
       .getState()
       .markTutorialGraduated({ via: "skip", publishLocally: false })
       .catch((err) => {
+        if (!activeRef.current || !ownsMountRef.current() || err instanceof PreferencesRequestSuperseded) return;
         setExitError(formatError(err));
       });
   };
@@ -282,6 +292,7 @@ export function HelloWorldTutorial({
   // Keep the tutorial mounted until the session is loaded and the preference
   // save settles. An in-flight freeform compose must finish before departure.
   const onExitTutorial = useCallback((): void => {
+    if (!activeRef.current || !ownsMountRef.current()) return;
     if (exitingRef.current) return;
     const tutorialSessionId = state.sessionId ?? sessionId;
     setExitError(null);
@@ -310,14 +321,17 @@ export function HelloWorldTutorial({
       ) {
         await useSessionStore.getState().selectSession(tutorialSessionId);
       }
-      await departTutorialSession(tutorialSessionId, "exit");
+      requirePreferenceOwner(ownsMountRef.current);
+      if (!activeRef.current) throw new PreferencesRequestSuperseded();
+      await departTutorialSession(tutorialSessionId, "exit", () => activeRef.current && ownsMountRef.current());
     })()
       .catch((err) => {
+        if (!activeRef.current || !ownsMountRef.current() || err instanceof PreferencesRequestSuperseded) return;
         setExitError(formatError(err));
       })
       .finally(() => {
         exitingRef.current = false;
-        setExiting(false);
+        if (activeRef.current && ownsMountRef.current()) setExiting(false);
       });
   }, [state.step, state.runId, state.sessionId, sessionId]);
   const stepLabels = TUTORIAL_STEP_LABELS;

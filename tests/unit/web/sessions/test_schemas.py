@@ -80,60 +80,63 @@ class TestCreateSessionRequest:
 class TestSendMessageRequest:
     def test_rejects_empty_content(self) -> None:
         with pytest.raises(ValidationError, match="content"):
-            SendMessageRequest(content="", client_request_id=uuid.uuid4())
+            SendMessageRequest(content="", operation_id=str(uuid.uuid4()))
 
     @pytest.mark.parametrize("content", ["   ", "\u200b", "\ufeff"])
     def test_rejects_blank_or_invisible_only_content(self, content: str) -> None:
         with pytest.raises(ValidationError, match="content"):
-            SendMessageRequest(content=content, client_request_id=uuid.uuid4())
+            SendMessageRequest(content=content, operation_id=str(uuid.uuid4()))
 
     def test_accepts_nonempty_content(self) -> None:
         request_id = uuid.uuid4()
-        req = SendMessageRequest(content="hello", client_request_id=request_id)
+        req = SendMessageRequest(content="hello", operation_id=str(request_id))
         assert req.content == "hello"
-        assert req.client_request_id == request_id
+        assert req.operation_id == str(request_id)
 
     def test_requires_client_request_id(self) -> None:
-        with pytest.raises(ValidationError, match="client_request_id"):
+        """Historical registration now checks required durable operation identity."""
+        with pytest.raises(ValidationError, match="operation_id"):
             SendMessageRequest(content="hello")
 
     def test_rejects_invalid_client_request_id(self) -> None:
-        with pytest.raises(ValidationError, match="client_request_id"):
-            SendMessageRequest(content="hello", client_request_id="not-a-uuid")
+        """Historical invalid-ID case now checks the canonical operation field."""
+        with pytest.raises(ValidationError, match="operation_id"):
+            SendMessageRequest(content="hello", operation_id="not-a-uuid")
 
     def test_accepts_string_client_request_id_as_uuid(self) -> None:
+        """Historical UUID-string case now preserves the canonical string identity."""
         request_id = uuid.uuid4()
-        req = SendMessageRequest(content="hello", client_request_id=str(request_id))
-        assert req.client_request_id == request_id
+        req = SendMessageRequest(content="hello", operation_id=str(request_id))
+        assert req.operation_id == str(request_id)
 
     def test_rejects_invalid_state_id(self) -> None:
         with pytest.raises(ValidationError, match="state_id"):
-            SendMessageRequest(content="hello", client_request_id=uuid.uuid4(), state_id="not-a-uuid")
+            SendMessageRequest(content="hello", operation_id=str(uuid.uuid4()), state_id="not-a-uuid")
 
     def test_accepts_valid_uuid_state_id(self) -> None:
         import uuid
 
         sid = uuid.uuid4()
-        req = SendMessageRequest(content="hello", client_request_id=uuid.uuid4(), state_id=sid)
+        req = SendMessageRequest(content="hello", operation_id=str(uuid.uuid4()), state_id=sid)
         assert req.state_id == sid
 
     def test_accepts_string_uuid_state_id(self) -> None:
         req = SendMessageRequest(
             content="hello",
-            client_request_id=uuid.uuid4(),
+            operation_id=str(uuid.uuid4()),
             state_id="550e8400-e29b-41d4-a716-446655440000",
         )
         assert str(req.state_id) == "550e8400-e29b-41d4-a716-446655440000"
 
     def test_accepts_none_state_id(self) -> None:
-        req = SendMessageRequest(content="hello", client_request_id=uuid.uuid4(), state_id=None)
+        req = SendMessageRequest(content="hello", operation_id=str(uuid.uuid4()), state_id=None)
         assert req.state_id is None
 
     def test_accepts_content_at_max_length(self) -> None:
         # Phase 5b.0.5 (F-3): max_length=65536 cap on chat message content.
         # Exact-boundary value must validate to confirm the cap is set at
         # 64 KiB rather than at an off-by-one neighbour.
-        req = SendMessageRequest(content="x" * 65536, client_request_id=uuid.uuid4())
+        req = SendMessageRequest(content="x" * 65536, operation_id=str(uuid.uuid4()))
         assert len(req.content) == 65536
 
     def test_rejects_content_exceeding_max_length(self) -> None:
@@ -141,21 +144,21 @@ class TestSendMessageRequest:
         # against unbounded payload allocation before interpretation events
         # can be triggered.
         with pytest.raises(ValidationError, match="content"):
-            SendMessageRequest(content="x" * 65537, client_request_id=uuid.uuid4())
+            SendMessageRequest(content="x" * 65537, operation_id=str(uuid.uuid4()))
 
 
 class TestRecomposeRequest:
     def test_requires_expected_user_message_id(self) -> None:
         with pytest.raises(ValidationError, match="expected_user_message_id"):
-            RecomposeRequest()
+            RecomposeRequest(operation_id=str(uuid.uuid4()))
 
     def test_accepts_expected_user_message_uuid(self) -> None:
         message_id = uuid.uuid4()
-        assert RecomposeRequest(expected_user_message_id=message_id).expected_user_message_id == message_id
+        assert RecomposeRequest(operation_id=str(uuid.uuid4()), expected_user_message_id=message_id).expected_user_message_id == message_id
 
     def test_rejects_invalid_expected_user_message_id(self) -> None:
         with pytest.raises(ValidationError, match="expected_user_message_id"):
-            RecomposeRequest(expected_user_message_id="not-a-uuid")
+            RecomposeRequest(operation_id=str(uuid.uuid4()), expected_user_message_id="not-a-uuid")
 
 
 class TestForkSessionRequest:
@@ -194,7 +197,7 @@ class TestForkSessionRequest:
 class TestRevertStateRequest:
     def test_rejects_invalid_uuid(self) -> None:
         with pytest.raises(ValidationError):
-            RevertStateRequest(state_id="not-a-uuid")
+            RevertStateRequest(operation_id=str(uuid.uuid4()), state_id="not-a-uuid")
 
 
 class TestSessionRequestExtraFieldsRejected:
@@ -206,7 +209,7 @@ class TestSessionRequestExtraFieldsRejected:
                 SendMessageRequest,
                 {
                     "content": "hello",
-                    "client_request_id": "00000000-0000-4000-8000-000000000001",
+                    "operation_id": "00000000-0000-4000-8000-000000000001",
                     "stateId": "550e8400-e29b-41d4-a716-446655440000",
                 },
             ),
@@ -222,6 +225,7 @@ class TestSessionRequestExtraFieldsRejected:
             (
                 RevertStateRequest,
                 {
+                    "operation_id": "00000000-0000-4000-8000-000000000001",
                     "state_id": "550e8400-e29b-41d4-a716-446655440000",
                     "extra": "x",
                 },
@@ -578,3 +582,19 @@ class TestResponseStrictnessTripwire:
         assert issubclass(cls, schemas._StrictResponse)
         with pytest.raises(ValidationError):
             cls.model_validate({"__never_a_field__": 1})
+
+
+@pytest.mark.parametrize("model", [SendMessageRequest, RecomposeRequest])
+def test_composer_request_rejects_obsolete_client_request_id(model: type[BaseModel]) -> None:
+    payload = {"operation_id": str(uuid.uuid4()), "client_request_id": str(uuid.uuid4())}
+    if model is SendMessageRequest:
+        payload["content"] = "hello"
+    else:
+        payload["expected_user_message_id"] = str(uuid.uuid4())
+    with pytest.raises(ValidationError, match="client_request_id"):
+        model.model_validate(payload)
+
+
+def test_recompose_requires_durable_operation_id() -> None:
+    with pytest.raises(ValidationError, match="operation_id"):
+        RecomposeRequest(expected_user_message_id=uuid.uuid4())

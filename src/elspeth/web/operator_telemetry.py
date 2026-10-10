@@ -10,17 +10,14 @@ from __future__ import annotations
 import dataclasses
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
 import structlog
-from opentelemetry import metrics
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
-from opentelemetry.exporter.prometheus import PrometheusMetricReader
 from opentelemetry.metrics import Observation
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult, MetricsData, PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult, MetricsData
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.util.types import Attributes
 
@@ -31,6 +28,17 @@ from elspeth.core.config import ElspethSettings, ExporterSettings, TelemetrySett
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS
 from elspeth.telemetry.resource_identity import is_aws_resource_label
 from elspeth.web.config import WebSettings
+from elspeth.web.operator_telemetry_custody import (
+    OperatorTelemetryCleanupOwner,
+    OwnedMetricExporter,
+    OwnedProviderFactory,
+    RawMetricExporterCustodian,
+    TelemetryCompletionWitness,
+    TelemetryCustodyUnresolved,
+    verify_telemetry_sdk,
+)
+from elspeth.web.operator_telemetry_dispatch import validate_telemetry_reservation_owner
+from elspeth.web.operator_telemetry_installation import OwnedTestTelemetryInstallation
 
 AWS_OTLP_ENDPOINT = "http://127.0.0.1:4317"
 _EXPORT_TIMEOUT_MILLIS = 5_000
@@ -127,33 +135,32 @@ class _OperatorPipelineMetrics:
             self.llm_completion_tokens.add(event.token_usage.completion_tokens)
 
 
-@dataclass(frozen=True, slots=True)
 class OperatorTelemetryFactories:
-    """Resettable construction seam used by bootstrap unit tests."""
+    """Nominal production construction; providers have explicit no-atexit ABI."""
 
-    prometheus_reader: Callable[[], object]
-    otlp_exporter: Callable[..., MetricExporter]
-    periodic_reader: Callable[..., object]
-    meter_provider: Callable[..., _Provider]
-    set_meter_provider: Callable[[object], None]
+    def __init__(self, *, provider_factory: OwnedProviderFactory | None = None) -> None:
+        selected = OwnedProviderFactory() if provider_factory is None else provider_factory
+        if not isinstance(selected, OwnedProviderFactory):
+            raise TypeError("Telemetry provider factory must be nominal")
+        self.provider_factory = selected
+
+    def acquire_exporter(self, *, endpoint: str, insecure: bool, headers: dict[str, str], timeout: float) -> MetricExporter:
+        return OTLPMetricExporter(endpoint=endpoint, insecure=insecure, headers=headers, timeout=timeout)
+
+
+class OwnedTestOperatorTelemetryFactories(OperatorTelemetryFactories):
+    """Explicit no-network exporter seam for isolated nominal test domains."""
+
+    def __init__(self, *, exporter_factory: Callable[..., MetricExporter], provider_factory: OwnedProviderFactory | None = None) -> None:
+        super().__init__(provider_factory=provider_factory)
+        self.exporter_factory = exporter_factory
+
+    def acquire_exporter(self, *, endpoint: str, insecure: bool, headers: dict[str, str], timeout: float) -> MetricExporter:
+        return self.exporter_factory(endpoint=endpoint, insecure=insecure, headers=headers, timeout=timeout)
 
 
 def _production_factories() -> OperatorTelemetryFactories:
-    def _provider(readers: Sequence[object], *, resource: Resource, views: tuple[object, ...]) -> MeterProvider:
-        return MeterProvider(
-            metric_readers=cast(Sequence[Any], readers),
-            resource=resource,
-            views=cast(Sequence[Any], views),
-            shutdown_on_exit=False,
-        )
-
-    return OperatorTelemetryFactories(
-        prometheus_reader=PrometheusMetricReader,
-        otlp_exporter=OTLPMetricExporter,
-        periodic_reader=PeriodicExportingMetricReader,
-        meter_provider=_provider,
-        set_meter_provider=lambda provider: metrics.set_meter_provider(cast(Any, provider)),
-    )
+    return OperatorTelemetryFactories()
 
 
 @dataclass(slots=True)
@@ -220,15 +227,11 @@ def _sanitize_metric_data(metrics_data: MetricsData) -> MetricsData:
     return MetricsData(resource_metrics=tuple(resource_metrics))
 
 
-class _HealthTrackingMetricExporter(MetricExporter):
+class _HealthTrackingMetricExporter(OwnedMetricExporter):
     """Sanitize AWS-bound dimensions and retain aggregate exporter health."""
 
-    def __init__(self, inner: MetricExporter, health: _ExportHealth) -> None:
-        super().__init__(
-            preferred_temporality=inner._preferred_temporality,
-            preferred_aggregation=inner._preferred_aggregation,
-        )
-        self._inner = inner
+    def __init__(self, custody: RawMetricExporterCustodian, health: _ExportHealth) -> None:
+        super().__init__(custody)
         self._health = health
 
     def _record_transport_failure(self) -> None:
@@ -262,11 +265,15 @@ class _HealthTrackingMetricExporter(MetricExporter):
             self._record_transport_failure()
             return False
 
-    def shutdown(self, timeout_millis: float = 30_000, **kwargs: object) -> None:
+    def shutdown(self, timeout_millis: float = 30_000, *, timeout: float | None = None, **kwargs: object) -> None:
         try:
-            self._inner.shutdown(timeout_millis=timeout_millis, **kwargs)
-        except TELEMETRY_TRANSPORT_ERRORS:
-            self._record_transport_failure()
+            super().shutdown(timeout_millis=timeout_millis, timeout=timeout, **kwargs)
+        except TELEMETRY_TRANSPORT_ERRORS as original:
+            try:
+                self._record_transport_failure()
+            except BaseException as logging_error:
+                raise BaseExceptionGroup("Exporter shutdown and health recording failed", [original, logging_error]) from None
+            raise
 
 
 @dataclass(slots=True)
@@ -278,6 +285,7 @@ class OperatorTelemetryRuntime:
     readers: tuple[Any, ...]
     resource: Resource
     health: _ExportHealth
+    cleanup_owner: OperatorTelemetryCleanupOwner
     pipeline_metrics: _OperatorPipelineMetrics | None = None
     _shutdown_state_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _shutdown_started: bool = False
@@ -294,23 +302,17 @@ class OperatorTelemetryRuntime:
         with self._shutdown_state_lock:
             self._shutdown_complete = True
 
+    def shutdown_sync(self) -> TelemetryCompletionWitness:
+        self.cleanup_owner.assert_process()
+        self._begin_shutdown()
+        witness = self.cleanup_owner.shutdown_sync()
+        self._finish_shutdown()
+        return witness
+
     async def shutdown(self) -> None:
-        if self.mode != "aws-otlp":
-            return
-        if not self._begin_shutdown():
-            return
-        try:
-            try:
-                # Run the SDK's synchronous shutdown inline. A timed-out or
-                # cancelled to_thread() await leaves its worker alive and can
-                # keep the interpreter running after shutdown appears
-                # complete. The concrete exporter and reader both receive
-                # this bounded five-second deadline.
-                self.provider.shutdown(timeout_millis=_EXPORT_TIMEOUT_MILLIS)
-            except TELEMETRY_TRANSPORT_ERRORS:
-                _log.warning("operator_otlp_shutdown_unavailable", destination="task-local")
-        finally:
-            self._finish_shutdown()
+        # The independently armed process watchdog bounds physical joins.
+        # The async ABI deliberately owns synchronous SDK completion here.
+        self.shutdown_sync()
 
 
 _runtime: OperatorTelemetryRuntime | None = None
@@ -414,68 +416,72 @@ def record_operator_pipeline_queue_drops(count: int) -> None:
 def bootstrap_operator_telemetry(
     settings: WebSettings,
     *,
+    cleanup_owner: OperatorTelemetryCleanupOwner,
     factories: OperatorTelemetryFactories | None = None,
 ) -> OperatorTelemetryRuntime:
-    """Install exactly one process MeterProvider and retain its readers."""
+    """Install only the exact lexical application owner's retained provider."""
 
     global _runtime
-    with _runtime_lock:
-        if _runtime is not None:
-            return _runtime
-
-        selected = factories
-        if selected is None:
-            selected = _production_factories()
-        resource_attributes: dict[str, str] = {
-            "service.name": settings.operator_telemetry_service_name,
-            "service.version": __version__,
-        }
-        if settings.operator_telemetry_environment is not None:
-            resource_attributes["deployment.environment"] = settings.operator_telemetry_environment
-        if settings.operator_telemetry == "aws-otlp":
-            resource_attributes["cloud.provider"] = "aws"
-            resource_attributes.update(_required_aws_resource_identity(settings))
-        # Explicit Resource avoids the SDK's process/environment detectors,
-        # which add deployment-varying attributes outside this closed AWS
-        # identity contract.
-        resource = Resource(resource_attributes)
-
-        readers: list[object] = [selected.prometheus_reader()]
-        health = _ExportHealth()
-        if settings.operator_telemetry == "aws-otlp":
-            # The gRPC exporter ignores the timeout passed by the periodic
-            # reader and uses its constructor deadline for each RPC. Align it
-            # with the provider's five-second shutdown deadline.
-            raw_exporter = selected.otlp_exporter(
+    installation = validate_telemetry_reservation_owner(cleanup_owner)
+    cleanup_owner.assert_process()
+    existing = installation.reserve(cleanup_owner)
+    if existing is not None:
+        return existing
+    selected = _production_factories() if factories is None else factories
+    if not isinstance(selected, OperatorTelemetryFactories):
+        raise TypeError("Telemetry construction factories must be nominal")
+    if isinstance(selected, OwnedTestOperatorTelemetryFactories) and not isinstance(installation, OwnedTestTelemetryInstallation):
+        raise TypeError("Test telemetry factories require an isolated test installation")
+    verify_telemetry_sdk()
+    resource_attributes: dict[str, str] = {
+        "service.name": settings.operator_telemetry_service_name,
+        "service.version": __version__,
+    }
+    if settings.operator_telemetry_environment is not None:
+        resource_attributes["deployment.environment"] = settings.operator_telemetry_environment
+    if settings.operator_telemetry == "aws-otlp":
+        resource_attributes["cloud.provider"] = "aws"
+        resource_attributes.update(_required_aws_resource_identity(settings))
+    resource = Resource(resource_attributes)
+    cleanup_owner.acquire_prometheus(installation.registry)
+    health = _ExportHealth()
+    if settings.operator_telemetry == "aws-otlp":
+        try:
+            raw_exporter = selected.acquire_exporter(
                 endpoint=AWS_OTLP_ENDPOINT,
                 insecure=True,
                 headers={},
                 timeout=_EXPORT_TIMEOUT_MILLIS / 1_000,
             )
-            exporter = _HealthTrackingMetricExporter(raw_exporter, health)
-            readers.append(
-                selected.periodic_reader(
-                    exporter,
-                    export_interval_millis=settings.operator_telemetry_export_interval_seconds * 1_000,
-                    export_timeout_millis=_EXPORT_TIMEOUT_MILLIS,
-                )
-            )
-
-        provider = selected.meter_provider(readers, resource=resource, views=())
-        pipeline_metrics = None
-        if settings.operator_telemetry == "aws-otlp":
-            _wire_health_instruments(provider, health)
-            pipeline_metrics = _wire_pipeline_instruments(provider)
-        selected.set_meter_provider(provider)
-        _runtime = OperatorTelemetryRuntime(
-            mode=settings.operator_telemetry,
-            provider=provider,
-            readers=tuple(readers),
-            resource=resource,
-            health=health,
-            pipeline_metrics=pipeline_metrics,
+            custody = cleanup_owner.retain_exporter(raw_exporter)
+        except BaseException as original:
+            cleanup_owner.exporter_acquisition_unknown(original)
+            raise
+        exporter = _HealthTrackingMetricExporter(custody, health)
+        cleanup_owner.acquire_periodic(
+            exporter,
+            interval_millis=settings.operator_telemetry_export_interval_seconds * 1_000,
+            timeout_millis=_EXPORT_TIMEOUT_MILLIS,
         )
-        return _runtime
+    provider = cleanup_owner.acquire_provider(selected.provider_factory, resource=resource, views=())
+    pipeline_metrics = None
+    if settings.operator_telemetry == "aws-otlp":
+        _wire_health_instruments(provider, health)
+        pipeline_metrics = _wire_pipeline_instruments(provider)
+    installation.install(cleanup_owner, provider)
+    runtime = OperatorTelemetryRuntime(
+        mode=settings.operator_telemetry,
+        provider=provider,
+        readers=tuple(cleanup_owner.readers),
+        resource=resource,
+        health=health,
+        cleanup_owner=cleanup_owner,
+        pipeline_metrics=pipeline_metrics,
+    )
+    installation.publish(cleanup_owner, runtime)
+    with _runtime_lock:
+        _runtime = runtime
+    return runtime
 
 
 def record_operator_pipeline_event(event: TelemetryEvent) -> None:
@@ -540,45 +546,23 @@ def apply_operator_pipeline_telemetry(settings: ElspethSettings, web_settings: W
 
 
 def reset_operator_telemetry_for_tests() -> None:
-    """Detach test state and close only providers that are safe to replace.
-
-    OpenTelemetry's process-global provider is write-once. Shutting it down
-    here would leave every later ``metrics.get_meter()`` call bound to a dead
-    provider, so a globally installed provider remains process-owned. Tests
-    that need a replaceable runtime must inject factories whose setter does
-    not install it globally.
-    """
-
+    """Reset only a nominal isolated domain after actual successful cleanup."""
     global _runtime
     with _runtime_lock:
         runtime = _runtime
-        if runtime is None:
-            return
-        # Identity check on purpose: "did WE install this exact provider
-        # globally". Typed through `object` because the SDK annotates the
-        # global getter as MeterProvider while ours is the _Provider protocol.
-        global_provider: object = metrics.get_meter_provider()
-        provider_is_global = global_provider is runtime.provider
-        with runtime._shutdown_state_lock:
-            if runtime._shutdown_complete:
-                _runtime = None
-                return
-            if runtime._shutdown_started:
-                raise RuntimeError("operator telemetry shutdown is already in progress")
-            if provider_is_global:
-                _runtime = None
-                return
-            runtime._shutdown_started = True
-        try:
-            try:
-                runtime.provider.shutdown(timeout_millis=_EXPORT_TIMEOUT_MILLIS)
-            except TimeoutError:
-                _log.warning("operator_telemetry_test_reset_timeout")
-            except TELEMETRY_TRANSPORT_ERRORS:
-                _log.warning("operator_telemetry_test_reset_unavailable")
-        finally:
-            runtime._finish_shutdown()
-            _runtime = None
+    if runtime is None:
+        return
+    owner = runtime.cleanup_owner
+    owner.assert_process()
+    installation = owner.installation
+    if not isinstance(installation, OwnedTestTelemetryInstallation):
+        raise TelemetryCustodyUnresolved("Production telemetry installation cannot be reset")
+    witness = runtime.shutdown_sync()
+    installation.reset(owner, witness, installation.replaceability_token)
+    with _runtime_lock:
+        if _runtime is not runtime:
+            raise TelemetryCustodyUnresolved("Telemetry reset lost exact runtime identity")
+        _runtime = None
 
 
 __all__ = [
@@ -587,6 +571,7 @@ __all__ = [
     "SAFE_CLOUDWATCH_METRIC_ATTRIBUTES",
     "OperatorTelemetryFactories",
     "OperatorTelemetryRuntime",
+    "OwnedTestOperatorTelemetryFactories",
     "apply_operator_pipeline_telemetry",
     "bootstrap_operator_telemetry",
     "build_aws_operator_pipeline_telemetry",

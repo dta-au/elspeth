@@ -12,6 +12,8 @@ import {
   transitionViolations,
   unavailableTransitionEvidence,
   TRANSITION_LEDGER_SCHEMA,
+  composerOperationTerminal,
+  composerOperationLocator,
   type LlmAuditRow,
   type TransitionEvidence,
   type TransitionLedger,
@@ -174,5 +176,22 @@ describe("ledger totals and rendering", () => {
     expect(markdown).toContain("| 1 | freeform/compose | Send tutorial brief |");
     expect(markdown).toContain("| 2 | tutorial/run | Run |");
     expect(markdown).toContain("2 provider calls · 1 planner calls in 1 planner run(s)");
+  });
+});
+
+describe("durable composer transition boundary", () => {
+  const operationId = "11111111-1111-4111-8111-111111111111";
+  it("does not settle on 202/live snapshots; settles on matching durable terminal", () => {
+    expect(composerOperationTerminal({ operation_id: operationId, status: "queued" }, operationId)).toBeNull();
+    expect(composerOperationTerminal({ operation_id: operationId, status: "running" }, operationId)).toBeNull();
+    expect(composerOperationTerminal({ operation_id: operationId, status: "completed", result: {}, error: null }, operationId)?.status).toBe("completed");
+    expect(composerOperationTerminal({ operation_id: operationId, status: "completed", result: {}, error: null }, SID)).toBeNull();
+    expect(() => composerOperationTerminal({ operation_id: operationId, status: "completed", result: null, error: null }, operationId)).toThrow();
+  });
+  it("classifies recompose and exact operation GET while excluding streams/cancel", () => {
+    expect(classifyTransitionRequest(`${BASE}/recompose`, "POST")).toBe("freeform/compose");
+    expect(composerOperationLocator(`${BASE}/operations/${operationId}`)).toEqual({ sessionId: SID, operationId });
+    expect(composerOperationLocator(`${BASE}/operations/${operationId}/stream`)).toBeNull();
+    expect(composerOperationLocator(`${BASE}/operations/${operationId}/cancel`)).toBeNull();
   });
 });

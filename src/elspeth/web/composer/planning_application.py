@@ -77,6 +77,7 @@ from elspeth.web.composer.protocol import (
     PipelineCommitIntent,
 )
 from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS, LLM_API_RETRY_BASE_DELAY_SECONDS
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.required_controls import wire_required_controls
@@ -86,8 +87,16 @@ from elspeth.web.composer.tools import RuntimePreflight
 from elspeth.web.composer.withheld_replies import WithheldReply, withheld_reply_envelope
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
-from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, SessionServiceProtocol
+from elspeth.web.sessions.pipeline_rejection import PipelineRejectionExpected
+from elspeth.web.sessions.pipeline_rejection_custody import (
+    original_outcome_group,
+    project_creation_handoff,
+    read_rejection_authority,
+    reject_pipeline_with_required_custody,
+)
+from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, RedactedPipelineArguments, SessionServiceProtocol
 
 slog = structlog.get_logger()
 _FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS: Final[int] = 8
@@ -310,6 +319,7 @@ class PlanningApplication:
         # than silently drop the model's words.
         withheld_replies: tuple[WithheldReply, ...],
         session_operation_context: SessionOperationContext | None,
+        required_work: RequiredWorkBinding | None = None,
     ) -> None:
         """Make planner LLM/discovery evidence durable before proposal authority.
 
@@ -367,6 +377,12 @@ class PlanningApplication:
         # the compose operation the staging turn runs under.
         if session_operation_context is None:
             raise TypeError("pipeline planner audit requires the turn's session_operation_context")
+        audit_sql = audit_projection = None
+        if required_work is not None:
+            required_work.validate_context(session_operation_context)
+            audit_sql, audit_projection = required_work.reserve_pair(
+                RequiredWorkSource.REQUIRED_UNWIND_AUDIT_SQL, RequiredWorkSource.REQUIRED_UNWIND_AUDIT_PROJECTION
+            )
         try:
             await sessions.add_messages_atomic(
                 session_id,
@@ -374,9 +390,19 @@ class PlanningApplication:
                 composition_state_id=current_state_id,
                 writer_principal="compose_loop",
                 session_operation_context=session_operation_context,
+                required_work=audit_sql,
             )
         except SQLAlchemyError as exc:
+            if audit_projection is not None and audit_sql is not None and audit_sql.complete:
+                audit_projection.complete_without_submission()
             raise AuditIntegrityError("pipeline planner audit persistence failed before proposal creation") from exc
+        except BaseException:
+            if audit_projection is not None and audit_sql is not None and audit_sql.complete:
+                audit_projection.complete_without_submission()
+            raise
+        if audit_projection is not None:
+            audit_projection.begin_projection()
+            audit_projection.complete_owned()
 
     async def _planner_preview_preflight(
         self,
@@ -488,6 +514,7 @@ class PlanningApplication:
         # REQUIRED (no default): see ``_persist_pipeline_planner_audit``.
         planner_withheld_replies: tuple[WithheldReply, ...],
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        required_work: RequiredWorkBinding | None = None,
     ) -> ComposerResult:
         """Persist planner evidence, then create one reviewable proposal row.
 
@@ -517,6 +544,7 @@ class PlanningApplication:
             invocations=planner_invocations,
             withheld_replies=planner_withheld_replies,
             session_operation_context=session_operation_context,
+            required_work=required_work,
         )
         arguments = cast(dict[str, Any], deep_thaw(plan.proposal.pipeline))
         redacted_arguments = redact_tool_call_arguments(
@@ -578,37 +606,134 @@ class PlanningApplication:
         # canonical that no human — and no validator — ever cleared.
         preflight_green = runtime_result is not None and runtime_result.is_valid
 
-        row, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
-            sessions.create_pipeline_composition_proposal(
+        if required_work is None:
+            row, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
+                sessions.create_pipeline_composition_proposal(
+                    session_id=session_id,
+                    plan=plan,
+                    summary=summary.summary,
+                    rationale=summary.rationale,
+                    affects=summary.affects,
+                    arguments_redacted_json=summary.arguments_redacted_json,
+                    actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                    composer_model_identifier=plan.model_identifier,
+                    composer_model_version=plan.model_version,
+                    composer_provider=plan.provider,
+                    user_message_id=user_message_id,
+                    session_operation_context=session_operation_context,
+                )
+            )
+            if deferred is not None:
+                if auto_commit_authorized:
+                    await _await_pipeline_staging_write_with_deferred_cancellation(
+                        sessions.reject_pipeline_composition_proposal(
+                            session_id=session_id,
+                            proposal_id=row.id,
+                            draft_hash=plan.proposal.draft_hash,
+                            reason="request_cancelled",
+                            dispatch=None,
+                            actor="system:auto_reject_request_cancelled",
+                            session_operation_context=session_operation_context,
+                        ),
+                        deferred=deferred,
+                    )
+                raise deferred
+        else:
+            required_work.validate_context(session_operation_context)
+            redacted_pipeline_arguments = RedactedPipelineArguments(summary.arguments_redacted_json)
+            creation_sql, creation_projection = required_work.reserve_pair(
+                RequiredWorkSource.PROPOSAL_CREATION_SQL,
+                RequiredWorkSource.PROPOSAL_CREATION_PROJECTION,
+            )
+            required_work.coordinator.validate_creation_work(
+                creation_ticket=creation_sql,
+                projection_ticket=creation_projection,
+                transition_ordinal=required_work.transition_ordinal,
+                semantic_ordinal=required_work.semantic_ordinal,
+            )
+            if user_id is None:
+                missing_principal = AuditIntegrityError("Required planner staging omitted its authenticated principal")
+                creation_sql.complete_without_submission(missing_principal)
+                creation_projection.complete_without_submission(missing_principal)
+                raise missing_principal
+            handoff = await sessions.create_pipeline_composition_proposal_finish_once(
                 session_id=session_id,
                 plan=plan,
                 summary=summary.summary,
                 rationale=summary.rationale,
                 affects=summary.affects,
-                arguments_redacted_json=summary.arguments_redacted_json,
+                arguments_redacted_json=redacted_pipeline_arguments,
                 actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
                 composer_model_identifier=plan.model_identifier,
                 composer_model_version=plan.model_version,
                 composer_provider=plan.provider,
                 user_message_id=user_message_id,
                 session_operation_context=session_operation_context,
+                required_work=creation_sql,
+                running=required_work.running,
             )
-        )
-        if deferred is not None:
-            if auto_commit_authorized:
-                await _await_pipeline_staging_write_with_deferred_cancellation(
-                    sessions.reject_pipeline_composition_proposal(
+            required_row, creation_failures, creation_cancellations = project_creation_handoff(
+                required_work,
+                creation_sql,
+                creation_projection,
+                handoff,
+            )
+            if required_row is None:
+                raise original_outcome_group(
+                    "Actual creation failure and original cancellation", *creation_failures, *creation_cancellations
+                )
+            row = required_row
+            originals: list[BaseException] = [*creation_failures, *creation_cancellations]
+            if creation_cancellations and auto_commit_authorized:
+                try:
+                    authority, read_cancellations = await read_rejection_authority(
+                        sessions,
+                        binding=required_work,
                         session_id=session_id,
                         proposal_id=row.id,
-                        draft_hash=plan.proposal.draft_hash,
-                        reason="request_cancelled",
-                        dispatch=None,
-                        actor="system:auto_reject_request_cancelled",
-                        session_operation_context=session_operation_context,
-                    ),
-                    deferred=deferred,
-                )
-            raise deferred
+                    )
+                    originals.extend(read_cancellations)
+                    child, producer = required_work.coordinator.begin_proposal_child(
+                        str(row.id),
+                        row.tool_call_id,
+                        transition_ordinal=required_work.transition_ordinal,
+                        semantic_ordinal=required_work.semantic_ordinal,
+                    )
+                    child_binding = RequiredWorkBinding(
+                        child,
+                        required_work.transition_ordinal,
+                        required_work.semantic_ordinal,
+                        required_work.role,
+                        required_work.running,
+                    )
+                    try:
+                        await reject_pipeline_with_required_custody(
+                            sessions,
+                            expected=PipelineRejectionExpected(
+                                authority,
+                                "request_cancelled",
+                                None,
+                                "system:auto_reject_request_cancelled",
+                                user_id,
+                                session_operation_context,
+                                required_work.running,
+                            ),
+                            binding=child_binding,
+                        )
+                    except BaseException as rejection_error:
+                        originals.append(rejection_error)
+                        retained = original_outcome_group("Planner creation/rejection original outcomes", *originals)
+                        try:
+                            child.assert_completed()
+                        except BaseException as incomplete:
+                            raise original_outcome_group("Planner original and unresolved rejection child", retained, incomplete) from None
+                        required_work.coordinator.complete_proposal_child(child, producer, retained)
+                    else:
+                        required_work.coordinator.complete_proposal_child(child, producer)
+                except BaseException as cleanup_error:
+                    originals.append(cleanup_error)
+            if originals:
+                raise original_outcome_group("Planner actual creation and rejection original outcomes", *originals) from None
         # Auto-commit needs BOTH authorities: the operator's trust mode (may
         # this commit without review) and a green Stage 2 (is there anything
         # worth committing). The cancellation branch above stays on the trust
@@ -668,6 +793,9 @@ class PlanningApplication:
         recorder: BufferingRecorder,
         plugin_snapshot: PluginAvailabilitySnapshot,
         policy_catalog: PolicyCatalogView,
+        budget_seconds: float | None = None,
+        required_work: RequiredWorkBinding | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> ComposerResult:
         """Build one canonical full-pipeline proposal for an empty topology."""
 
@@ -734,7 +862,7 @@ class PlanningApplication:
                     provider=self._availability.provider or "unknown",
                     temperature=self._settings.composer_temperature,
                     seed=self._settings.composer_seed,
-                    timeout_seconds=self._timeout_seconds,
+                    timeout_seconds=self._timeout_seconds if budget_seconds is None else budget_seconds,
                     max_composition_turns=self._max_composition_turns,
                     max_discovery_turns=self._max_discovery_turns,
                     max_tool_calls_per_turn=self._max_tool_calls_per_turn,
@@ -764,6 +892,8 @@ class PlanningApplication:
                 custody_config=custody_config,
                 lifecycle=self._planner_request_lifecycle(progress),
                 recorder=recorder,
+                provider_service=self._sessions_service if provider_owner is not None else None,
+                provider_owner=provider_owner,
                 candidate_finalizer=_required_controls_candidate_finalizer(
                     policy_catalog=policy_catalog,
                     plugin_snapshot=plugin_snapshot,
@@ -784,6 +914,7 @@ class PlanningApplication:
                 invocations=recorder.invocations[planner_invocation_start:],
                 withheld_replies=recorder.withheld_replies[planner_withheld_start:],
                 session_operation_context=session_operation_context,
+                required_work=required_work,
             )
             decline_message = declined.decline_text.strip() or (
                 "I could not find a way to build this pipeline with the available components."
@@ -810,6 +941,7 @@ class PlanningApplication:
                     invocations=recorder.invocations[planner_invocation_start:],
                     withheld_replies=recorder.withheld_replies[planner_withheld_start:],
                     session_operation_context=session_operation_context,
+                    required_work=required_work,
                 ),
                 deferred=exc if type(exc) is asyncio.CancelledError else None,
             )
@@ -834,4 +966,5 @@ class PlanningApplication:
             planner_invocations=recorder.invocations[planner_invocation_start:],
             planner_withheld_replies=recorder.withheld_replies[planner_withheld_start:],
             plugin_snapshot=plugin_snapshot,
+            required_work=required_work,
         )

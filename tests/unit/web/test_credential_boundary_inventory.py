@@ -167,7 +167,7 @@ _ROUTE_GUARD_ARGUMENTS = {
         "body.new_message_content",
     ),
     "src/elspeth/web/sessions/schemas.py:SendMessageRequest.content": (
-        "src/elspeth/web/sessions/routes/messages.py",
+        "src/elspeth/web/sessions/routes/composer/operations.py",
         "body.content",
     ),
     "src/elspeth/web/sessions/schemas.py:UpdateSessionRequest.title": (
@@ -319,19 +319,26 @@ _PROVIDER_MODULES = (
     "src/elspeth/web/sessions/_auto_title.py",
 )
 _PROVIDER_CALL_DISPOSITIONS = {
-    "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._call_advisor_with_audit._litellm_acompletion": "complete_response_guard",
+    "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._call_advisor_with_audit_body._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/boot_probe.py:probe_composer_config._litellm_acompletion": "discarded_probe_response",
-    "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model.completion": "complete_response_guard",
+    "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model_body.completion": "complete_response_guard",
+    "src/elspeth/web/composer/pipeline_planner.py:_complete_planner_provider._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_text_llm._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:_litellm_acompletion.acompletion": "request_guard",
     "src/elspeth/web/sessions/_auto_title.py:maybe_auto_title_session._litellm_acompletion": "admitted_title_only",
+    "src/elspeth/web/sessions/_auto_title.py:_maybe_auto_title_session_required._litellm_acompletion": "admitted_title_only",
 }
 _PROVIDER_GUARD_OWNERS = {
-    "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._call_advisor_with_audit._litellm_acompletion": (
-        ("AdvisorCheckpointOwner._call_advisor_with_audit", "_require_no_credential_material_in_completion_fields"),
+    "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._call_advisor_with_audit_body._litellm_acompletion": (
+        ("AdvisorCheckpointOwner._call_advisor_with_audit_body", "_require_no_credential_material_in_completion_fields"),
     ),
-    "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model.completion": (
+    "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model_body.completion": (
+        ("_parse_response_tool_calls", "require_no_credential_material"),
+        ("_parse_response_tool_calls", "require_no_credential_material_in_tool_wire"),
+        ("_plan_pipeline_inner", "build_llm_call_record"),
+    ),
+    "src/elspeth/web/composer/pipeline_planner.py:_complete_planner_provider._litellm_acompletion": (
         ("_parse_response_tool_calls", "require_no_credential_material"),
         ("_parse_response_tool_calls", "require_no_credential_material_in_tool_wire"),
         ("_plan_pipeline_inner", "build_llm_call_record"),
@@ -339,7 +346,7 @@ _PROVIDER_GUARD_OWNERS = {
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm._litellm_acompletion": (
         ("ProviderGateway._call_llm", "require_no_credential_material_in_tool_wire"),
         ("ProviderGateway._call_llm", "_require_no_credential_material_in_completion"),
-        ("ProviderGateway._call_llm_with_audit", "_require_no_credential_material_in_completion"),
+        ("ProviderGateway._call_llm_with_audit_body", "_require_no_credential_material_in_completion"),
         ("_require_no_credential_material_in_completion_fields", "require_no_credential_material_in_llm_metadata"),
     ),
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_text_llm._litellm_acompletion": (
@@ -349,6 +356,9 @@ _PROVIDER_GUARD_OWNERS = {
         ("_litellm_acompletion", "require_no_credential_material"),
     ),
     "src/elspeth/web/sessions/_auto_title.py:maybe_auto_title_session._litellm_acompletion": (
+        ("_admit_title_candidate", "reject_credential_shaped_content"),
+    ),
+    "src/elspeth/web/sessions/_auto_title.py:_maybe_auto_title_session_required._litellm_acompletion": (
         ("_admit_title_candidate", "reject_credential_shaped_content"),
     ),
 }
@@ -600,24 +610,24 @@ _STATE_MATERIALIZATION_DISPOSITIONS = {
     "src/elspeth/web/execution/service.py:ExecutionServiceImpl.compile_approval_binding.state_from_record": "direct_state_guard",
     "src/elspeth/web/execution/service.py:ExecutionServiceImpl.validate.state_from_record": "direct_state_guard_downstream",
     "src/elspeth/web/sessions/converters.py:pipeline_dict_from_record.state_from_record": "serialization_helper",
+    "src/elspeth/web/sessions/composer_turn.py:_run_composer_turn._state_from_record": "provider_guard_downstream",
+    "src/elspeth/web/sessions/service.py:SessionServiceImpl._read_pipeline_settlement_replay.state_from_record": "proposal_internal",
     "src/elspeth/web/sessions/mutation_capabilities.py:_SessionComposerMutations.create_pipeline_composition_proposal.state_from_record": "proposal_internal",
     "src/elspeth/web/sessions/pending_interpretation.py:_SessionPendingInterpretationPlanner.plan.state_from_record": "interpretation_internal",
     "src/elspeth/web/sessions/pending_interpretation.py:_SessionPendingInterpretationValidator.__call__.state_from_record": "interpretation_internal",
     "src/elspeth/web/sessions/pending_interpretation.py:_source_data_contract_demand_from_state_record.state_from_record": "interpretation_internal",
     "src/elspeth/web/sessions/proposal_authority.py:_verify_committed_pipeline_authority.state_from_record": "proposal_internal",
-    "src/elspeth/web/sessions/routes/composer/compose.py:recompose._state_from_record": "provider_guard_downstream",
-    "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py:settle_pipeline_proposal_under_compose_lock._state_from_record": "proposal_internal",
+    "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py:_settle_pipeline_proposal_under_compose_lock._state_from_record": "proposal_internal",
     "src/elspeth/web/sessions/routes/composer/proposals.py:accept_composition_proposal._state_from_record": "proposal_internal",
     "src/elspeth/web/sessions/routes/composer/state.py:_surface_reverted_interpretation_reviews._state_from_record": "interpretation_internal",
     "src/elspeth/web/sessions/routes/composer/state.py:get_current_state._state_from_record": "authenticated_state_response",
     "src/elspeth/web/sessions/routes/composer/state.py:get_state_yaml._state_from_record": "authenticated_state_response",
     "src/elspeth/web/sessions/routes/composer/state.py:seed_state_from_runtime_yaml.composition_state_from_runtime_yaml": "direct_state_guard",
-    "src/elspeth/web/sessions/routes/messages.py:register_message_routes.send_message._state_from_record": "provider_guard_downstream",
     "src/elspeth/web/sessions/routes/workflow/inspect.py:create_workflow_inspect_router.inspect_workflow_state.state_from_record": "authenticated_state_response",
     "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.fork_entry.composition_state_from_runtime_yaml": "direct_state_guard",
     "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.publish_entry.state_from_record": "direct_state_guard",
     "src/elspeth/web/sessions/service.py:SessionServiceImpl.resolve_interpretation_event._sync.state_from_record": "interpretation_internal",
-    "src/elspeth/web/sessions/service.py:SessionServiceImpl.settle_pipeline_composition_proposal._sync.state_from_record": "proposal_internal",
+    "src/elspeth/web/sessions/service.py:SessionServiceImpl._settle_pipeline_composition_proposal._sync.state_from_record": "proposal_internal",
     "src/elspeth/web/shareable_reviews/service.py:ShareableReviewService.mark_ready_for_review.state_from_record": "validation_guard_downstream",
     "src/elspeth/web/shareable_reviews/service.py:_build_snapshot.state_from_record": "validated_publication",
 }

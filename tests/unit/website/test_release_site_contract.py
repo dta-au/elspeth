@@ -53,13 +53,19 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_heading = f"\n## {CURRENT_VERSION} - "
     assert changelog.count(current_heading) == 1
     current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_082 = changelog.split("\n## 0.8.2 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_081 = changelog.split("\n## 0.8.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_080 = changelog.split("\n## 0.8.0 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_071 = changelog.split("\n## 0.7.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
 
     assert f"Session epoch {SESSION_SCHEMA_EPOCH}" in current_release
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_release
-    assert "unchanged from 0.8.1; this release adds no schema-epoch cutover" in " ".join(current_release.split())
+    assert "Session epoch 72 adds durable Composer jobs" in current_release
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in current_release
+    assert "A Landscape database already at epoch 49 remains usable" in " ".join(current_release.split())
+
+    assert "Session epoch 71 and Landscape epoch 49" in release_082
+    assert "unchanged from 0.8.1; this release adds no schema-epoch cutover" in " ".join(release_082.split())
 
     assert "SESSION_SCHEMA_EPOCH` advances from 53\nto 71" in release_081
     assert "SQLITE_SCHEMA_EPOCH` advances from 38 to 49" in release_081
@@ -170,8 +176,15 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert f"From 0.8.0 to {CURRENT_VERSION}" in current_text
     assert f"Sessions epoch {SESSION_SCHEMA_EPOCH}" in current_text
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_text
-    assert "Upgrades from 0.8.1 keep both database epochs unchanged" in current_text
+    assert "Upgrades from 0.8.1 or 0.8.2 advance the session store from epoch 71 to 72" in current_text
+    assert f"Keep a Landscape database already at epoch {SQLITE_SCHEMA_EPOCH}" in current_text
+    assert "recreate the session database and its sidecars" in current_text
     assert "ordinary freeform composition" in current_text
+    release_082 = soup.select('[data-release="0.8.2"]')
+    assert len(release_082) == 1
+    historical_082_text = release_082[0].get_text(" ", strip=True)
+    assert "Sessions epoch 71" in historical_082_text and "Landscape epoch 49" in historical_082_text
+    assert "Upgrades from 0.8.1 keep both database epochs unchanged" in historical_082_text
     predecessor = soup.select('[data-release="0.8.1"]')
     assert len(predecessor) == 1
     predecessor_text = predecessor[0].get_text(" ", strip=True)

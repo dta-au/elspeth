@@ -26,10 +26,12 @@ missing usage remains unknown and subsequent admission fails closed.
 from __future__ import annotations
 
 import asyncio
+import time
 import unicodedata
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import httpx
@@ -38,13 +40,16 @@ from opentelemetry import metrics
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import provider_gateway
-from elspeth.web.composer.llm_response_parsing import safe_response_model, token_usage_from_response
+from elspeth.web.composer.llm_response_parsing import build_llm_call_record, safe_response_model, token_usage_from_response
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
+from elspeth.web.composer.provider_quota import ProviderCallCustody, provider_call_scope, required_provider_audit_scope
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
+from elspeth.web.required_work import RequiredWorkRole, RequiredWorkSource
 from elspeth.web.validation import _redact_sensitive_content, _warn_pii_shaped_content, reject_credential_shaped_content
 
 if TYPE_CHECKING:
@@ -372,6 +377,7 @@ async def maybe_auto_title_session(
     session_operation_context: SessionOperationContext,
     api_base: str | None = None,
     api_key: str | None = None,
+    provider_custody: ProviderCallCustody | None = None,
 ) -> None:
     """Generate and persist an auto-title for ``session_id``.
 
@@ -390,12 +396,13 @@ async def maybe_auto_title_session(
         return
     if session_operation_context.fence.session_id != str(session_id):
         raise AuditIntegrityError("Auto-title session authority targets a different session")
-    kwargs: dict[str, object] = {
+    audit_messages: list[dict[str, str]] = [
+        {"role": "system", "content": _AUTO_TITLE_SYSTEM_PROMPT},
+        {"role": "user", "content": _build_auto_title_user_content(user_message)},
+    ]
+    kwargs: dict[str, Any] = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": _AUTO_TITLE_SYSTEM_PROMPT},
-            {"role": "user", "content": _build_auto_title_user_content(user_message)},
-        ],
+        "messages": audit_messages,
         "max_tokens": _AUTO_TITLE_MAX_TOKENS,
     }
     if temperature is not None:
@@ -403,6 +410,19 @@ async def maybe_auto_title_session(
     if seed is not None:
         kwargs["seed"] = seed
     _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
+    if provider_custody is not None:
+        await _maybe_auto_title_session_required(
+            service=service,
+            session_id=session_id,
+            model=model,
+            temperature=temperature,
+            seed=seed,
+            session_operation_context=session_operation_context,
+            kwargs=kwargs,
+            audit_messages=audit_messages,
+            provider_custody=provider_custody,
+        )
+        return
     admission = asyncio.create_task(
         service.begin_provider_attempt(session_operation_context=session_operation_context, source="auto_title")
     )
@@ -493,3 +513,104 @@ async def maybe_auto_title_session(
         candidate,
         session_operation_context=session_operation_context,
     )
+
+
+async def _maybe_auto_title_session_required(
+    *,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    model: str,
+    temperature: float | None,
+    seed: int | None,
+    session_operation_context: SessionOperationContext,
+    kwargs: Mapping[str, Any],
+    audit_messages: Sequence[Mapping[str, str]],
+    provider_custody: ProviderCallCustody,
+) -> None:
+    if (
+        type(provider_custody) is not ProviderCallCustody
+        or provider_custody.service is not service
+        or provider_custody.required_work.role is not RequiredWorkRole.TITLE
+    ):
+        raise AuditIntegrityError("Auto-title requires its exact explicit TITLE custody")
+    provider_custody.required_work.validate_context(session_operation_context)
+    if kwargs["messages"] is not audit_messages:
+        raise AuditIntegrityError("Auto-title request and audit messages must share their owned identity")
+    started_at = datetime.now(UTC)
+    started_ns = time.monotonic_ns()
+    response: Any = None
+    status: ComposerLLMCallStatus | None = None
+    error_class: str | None = None
+    error_message: str | None = None
+    admitted: _AdmittedAutoTitleCompletion | None = None
+    try:
+        async with provider_call_scope(provider_custody):
+            try:
+                response = await provider_gateway._litellm_acompletion(provider_custody=provider_custody, **kwargs)
+                admitted = _admit_auto_title_completion(response)
+                status = ComposerLLMCallStatus.SUCCESS
+            except asyncio.CancelledError as exc:
+                status = ComposerLLMCallStatus.CANCELLED
+                error_class = error_message = type(exc).__name__
+                _record_auto_title_failure(exc)
+                raise
+            except TimeoutError as exc:
+                status = ComposerLLMCallStatus.TIMEOUT
+                error_class = error_message = type(exc).__name__
+                raise
+            except _MalformedAutoTitleResponseError as exc:
+                status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                error_class = type(exc).__name__
+                error_message = "malformed_response"
+                raise
+            except Exception as exc:
+                failure = classify_provider_failure(exc)
+                status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
+                error_class = error_message = type(exc).__name__
+                raise
+            finally:
+                with required_provider_audit_scope(provider_custody):
+                    if status is not None and provider_custody.needs_terminal_audit():
+                        call = build_llm_call_record(
+                            model_requested=model,
+                            messages=audit_messages,
+                            tools=None,
+                            status=status,
+                            started_at=started_at,
+                            started_ns=started_ns,
+                            temperature=temperature,
+                            seed=seed,
+                            response=response,
+                            error_class=error_class,
+                            error_message=error_message,
+                            provider_custody=provider_custody,
+                        )
+                        provider_custody.retain_audit(call)
+    except ChargeableAdmissionRefused as exc:
+        if exc.decision.refusal_reason is None:
+            raise AuditIntegrityError("Refused auto-title admission has no refusal reason") from exc
+        _AUTO_TITLE_ADMISSION_REFUSED_COUNTER.add(1, {"reason": exc.decision.refusal_reason.value})
+        return
+    except (OpenAIError, httpx.TransportError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
+        _record_auto_title_failure(exc)
+        return
+    if admitted is None or admitted.content is None:
+        return
+    candidate = _admit_title_candidate(admitted.content)
+    if isinstance(candidate, _RejectedTitle):
+        _record_auto_title_rejection(candidate.rejection_class, admitted.finish_reason)
+        return
+    sql, projection = provider_custody.required_work.reserve_pair(
+        RequiredWorkSource.TITLE_ACCOUNTING_SQL, RequiredWorkSource.TITLE_ACCOUNTING_PROJECTION
+    )
+    try:
+        _, cancellations = await provider_custody.join_title_update(
+            service.update_session_title(session_id, candidate, session_operation_context=session_operation_context, required_work=sql)
+        )
+    except BaseException:
+        if sql.complete:
+            projection.complete_without_submission()
+        raise
+    projection.begin_projection()
+    projection.complete_owned()
+    provider_custody.raise_deferred_cancellations(cancellations)

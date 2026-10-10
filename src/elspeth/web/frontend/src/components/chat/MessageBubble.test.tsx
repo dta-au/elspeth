@@ -137,6 +137,24 @@ describe("MessageBubble", () => {
       expect(onRetry).not.toHaveBeenCalled();
     });
 
+    it.each(["compose_outcome_unconfirmed", "recompose_saved_proposal", "recompose_already_completed"])("labels read-only recovery as Refresh for %s", (failureCode) => {
+      const onRetry = vi.fn();
+      render(
+        <MessageBubble
+          message={makeMessage({
+            local_status: "failed",
+            local_error: "Refresh the saved outcome before requesting another response.",
+            local_failure_code: failureCode,
+          })}
+          isComposing={false}
+          onRetry={onRetry}
+        />,
+      );
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      expect(onRetry).toHaveBeenCalledExactlyOnceWith("msg-1");
+    });
+
     it("shows default error when local_error is absent", () => {
       const onRetry = vi.fn();
       render(
@@ -149,7 +167,7 @@ describe("MessageBubble", () => {
       expect(screen.getByText("Failed to send message. Please try again.")).toBeInTheDocument();
     });
 
-    it.each(["policy_blocked", "admission_refused", "token_accounting_unavailable", "message_idempotency_conflict", "recompose_user_message_mismatch"])("suppresses the Retry button but keeps the failed text for %s", (failureCode) => {
+    it.each(["policy_blocked", "admission_refused", "token_accounting_unavailable", "composer_operation_conflict", "recompose_user_message_mismatch"])("suppresses the Retry button but keeps the failed text for %s", (failureCode) => {
       // policy_blocked is permanent by construction — a deployment policy
       // refused the pipeline — so the failed row must not invite a retry.
       const onRetry = vi.fn();

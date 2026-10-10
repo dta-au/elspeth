@@ -83,6 +83,10 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
         user_message_id=None,
         session_operation_context=None,
         completion_gates=None,
+        budget_seconds=None,
+        *,
+        required_work=None,
+        provider_owner=None,
     ):
         kwargs = {
             "message": message,
@@ -95,6 +99,9 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
             "user_message_id": user_message_id,
             "session_operation_context": session_operation_context,
             "completion_gates": completion_gates,
+            "budget_seconds": budget_seconds,
+            "required_work": required_work,
+            "provider_owner": provider_owner,
         }
 
         async def call(**kw):

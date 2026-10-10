@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 class _SessionComposerMutationState:
     """Private lifetime and exact operation-kind binding for one DB transaction."""
 
-    __slots__ = ("__active", "__connection", "__expected_kind", "__service", "__session_context", "__session_id")
+    __slots__ = ("__active", "__audit_only", "__connection", "__expected_kind", "__service", "__session_context", "__session_id")
 
     def __init__(
         self,
@@ -67,6 +67,7 @@ class _SessionComposerMutationState:
         session_id: str,
         session_operation_context: SessionOperationContext,
         expected_kind: SessionOperationKind,
+        audit_only: bool = False,
     ) -> None:
         self.__service = service
         self.__connection = connection
@@ -74,6 +75,7 @@ class _SessionComposerMutationState:
         self.__session_context = session_operation_context
         self.__expected_kind = expected_kind
         self.__active = True
+        self.__audit_only = audit_only
 
     def _require_active(self) -> tuple[SessionServiceImpl, Connection, str, SessionOperationContext]:
         if not self.__active:
@@ -89,6 +91,7 @@ class _SessionComposerMutationState:
             session_id=session_id,
             expected_kind=self.__expected_kind,
             now=now,
+            audit_only=False,
         )
         return service, connection, session_id, now
 
@@ -536,6 +539,7 @@ class _SessionComposerMutationTransaction:
         session_id: str,
         session_operation_context: SessionOperationContext,
         expected_kind: SessionOperationKind,
+        audit_only: bool = False,
     ) -> None:
         state = _SessionComposerMutationState(
             service,
@@ -543,6 +547,7 @@ class _SessionComposerMutationTransaction:
             session_id=session_id,
             session_operation_context=session_operation_context,
             expected_kind=expected_kind,
+            audit_only=audit_only,
         )
         self.__state = state
         self.__composer = _SessionComposerMutations(state)

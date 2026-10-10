@@ -440,8 +440,8 @@ async def test_inline_custody_replay_keeps_coalesce_order(tmp_path: Path, monkey
             user_message_id=harness.user_message_id,
         )
 
-    # Success-path rewrite, then the inline-custody rewrite; no finalization change.
-    assert len(caller_lines) == 2, caller_lines
+    # Success-path rewrite, canonical review finalization, then inline custody.
+    assert len(caller_lines) == 3, caller_lines
     replayed = _replayed_pipeline(llm.message_snapshots[1], "call_inline")
     assert "blob_id" in replayed["source"] and "inline_blob" not in replayed["source"]
     assert list(_node(replayed, "merge")["branches"]) == _MODEL_ORDER

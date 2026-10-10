@@ -414,9 +414,21 @@ async def test_atomic_pipeline_settlement_inserts_state_terminal_event_and_row_t
         "committed_state_content_hash",
         "final_composer_metadata_hash",
         "dispatch",
+        "creation_composer_operation",
+        "settlement_composer_operation",
+        "review_cohort",
+        "final_state_id",
+        "final_state_content_hash",
+        "transition_assistant",
     }
-    assert terminal["schema"] == "pipeline_proposal_accepted.v1"
+    assert terminal["schema"] == "pipeline_proposal_accepted.v2"
     assert terminal["dispatch"] == binding.to_dict()
+    assert terminal["creation_composer_operation"] is None
+    assert terminal["settlement_composer_operation"] is None
+    assert terminal["review_cohort"] == ()
+    assert terminal["final_state_id"] == str(settled.state.id)
+    assert terminal["final_state_content_hash"] == terminal["committed_state_content_hash"]
+    assert terminal["transition_assistant"] is None
 
 
 @pytest.mark.asyncio
@@ -512,22 +524,13 @@ async def test_auto_commit_revocation_rejects_unknown_trust_mode_vocabulary(serv
     _insert_session(service, session_id)
     plan = _plan()
     row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
 
     with pytest.raises(ValueError, match="required_trust_mode"):
-        await service.record_auto_commit_revocation(
-            session_id=session_id,
-            proposal_id=row.id,
+        await service.settle_pipeline_composition_proposal(
+            **kwargs,
             required_trust_mode="invalid_mode",
-            current_trust_mode="explicit_approve",
-            actor="user:alice",
-        )
-    with pytest.raises(ValueError, match="current_trust_mode"):
-        await service.record_auto_commit_revocation(
-            session_id=session_id,
-            proposal_id=row.id,
-            required_trust_mode="auto_commit",
-            current_trust_mode="freeform",
-            actor="user:alice",
         )
     assert [item.event_type for item in await service.list_proposal_events(session_id)] == ["proposal.created"]
 
@@ -1878,6 +1881,43 @@ async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from concurrent.futures import Future
+    from functools import partial
+
+    from elspeth.web import async_workers
+    from elspeth.web.required_executor import InvocationReservation, RequiredExecutorGenerationCustodian
+
+    actual_futures: list[Future[object]] = []
+    reservations: list[InvocationReservation | None] = []
+    submission_states: list[tuple[bool, bool]] = []
+    submitted = asyncio.Event()
+    physically_done = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    baseline = async_workers.outstanding_admissions()
+    original_submit = async_workers._submit_shared
+
+    async def observe_submit(callable_, *args, **kwargs):
+        actual = await original_submit(callable_, *args, **kwargs)
+        if isinstance(callable_, partial) and callable_.func in (slow_validate, slow_candidate):
+            assert isinstance(actual, Future)
+            generation = async_workers._GENERATION_CUSTODIAN
+            assert isinstance(generation, RequiredExecutorGenerationCustodian)
+            with generation.submission_lock:
+                matching = [reservation for reservation in generation.reservations.values() if reservation.future is actual]
+                assert len(matching) <= 1
+                reservation = matching[0] if matching else None
+                if reservation is None:
+                    assert actual.done(), "live invocation lost its actual reservation"
+                else:
+                    assert reservation.ticket is None
+                    assert reservation.future is actual
+            submission_states.append((actual.running(), actual.done()))
+            actual_futures.append(actual)
+            reservations.append(reservation)
+            actual.add_done_callback(lambda _completed: loop.call_soon_threadsafe(physically_done.set))
+            submitted.set()
+        return actual
+
     session_id = uuid4()
     _insert_session(service, session_id)
     plan = _runnable_plan(tmp_path, session_id)
@@ -1901,44 +1941,79 @@ async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
     original_validate = policy.validate_composition_state
+    baseline_state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    delayed_validator_states = []
+    delayed_candidate_states = []
 
     def slow_validate(state: CompositionState):
-        time.sleep(0.12)
+        # Delay the initial baseline stage once; candidate validation remains real.
+        if state is baseline_state:
+            delayed_validator_states.append(state)
+            time.sleep(0.12)
         return original_validate(state)
 
     from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as original_candidate
 
-    def slow_candidate(*args, **kwargs):
+    def slow_candidate(arguments, state, context):
+        delayed_candidate_states.append(state)
         time.sleep(0.12)
-        return original_candidate(*args, **kwargs)
+        return original_candidate(arguments, state, context)
 
     monkeypatch.setattr(policy, "validate_composition_state", slow_validate)
     monkeypatch.setattr("elspeth.web.composer.pipeline_commit.build_set_pipeline_candidate", slow_candidate)
-    with pytest.raises(PipelineCommitError, match="timed out") as exc_info:
-        async with acquire_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as proposal_context:
-            await prepare_pipeline_proposal_commit(
-                authority=authority,
-                current_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-                current_state_id=None,
-                policy_catalog=policy,
-                plugin_snapshot=snapshot,
-                config=PipelineCommitConfig(
-                    data_dir=str(tmp_path),
-                    session_engine=service._engine,
-                    session_operation_context=proposal_context,
-                    session_operation_authority=service.session_operation_authority,
-                    secret_service=None,
-                    user_id="alice",
-                    user_message_content=None,
-                    max_blob_storage_per_session_bytes=1_000_000,
-                    runtime_preflight=None,
-                    timeout_seconds=0.2,
-                ),
-                recorder=BufferingRecorder(),
-                actor="user:alice",
-            )
+    with monkeypatch.context() as physical_observer:
+        physical_observer.setattr(async_workers, "_submit_shared", observe_submit)
+        try:
+            with pytest.raises(PipelineCommitError, match="timed out") as exc_info:
+                async with acquire_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as proposal_context:
+                    await prepare_pipeline_proposal_commit(
+                        authority=authority,
+                        current_state=baseline_state,
+                        current_state_id=None,
+                        policy_catalog=policy,
+                        plugin_snapshot=snapshot,
+                        config=PipelineCommitConfig(
+                            data_dir=str(tmp_path),
+                            session_engine=service._engine,
+                            session_operation_context=proposal_context,
+                            session_operation_authority=service.session_operation_authority,
+                            secret_service=None,
+                            user_id="alice",
+                            user_message_content=None,
+                            max_blob_storage_per_session_bytes=1_000_000,
+                            runtime_preflight=None,
+                            timeout_seconds=0.2,
+                        ),
+                        recorder=BufferingRecorder(),
+                        actor="user:alice",
+                    )
 
-    assert exc_info.value.code == "TIMEOUT"
+            assert exc_info.value.code == "TIMEOUT"
+            assert submitted.is_set()
+            assert 1 <= len(actual_futures) <= 2
+            assert len(actual_futures) == len(reservations) == len(submission_states)
+            for actual, reservation in zip(actual_futures, reservations, strict=True):
+                if not actual.done():
+                    assert reservation is not None and reservation.future is actual
+                    assert reservation.held and not reservation.released
+                    assert async_workers.outstanding_admissions() >= baseline + 1
+                else:
+                    assert not actual.cancelled()
+        finally:
+            for actual in actual_futures:
+                await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(actual)), timeout=5)
+            if actual_futures:
+                await asyncio.wait_for(physically_done.wait(), timeout=5)
+        assert 1 <= len(actual_futures) <= 2
+        assert len(actual_futures) == len(reservations)
+        for actual, reservation in zip(actual_futures, reservations, strict=True):
+            assert actual.done() and not actual.cancelled()
+            if reservation is not None:
+                assert reservation.released
+        assert async_workers.outstanding_admissions() == baseline
+        assert delayed_validator_states == [baseline_state]
+        assert delayed_candidate_states == [baseline_state]
+        assert len(actual_futures) == 2
 
 
 @pytest.mark.asyncio

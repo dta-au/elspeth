@@ -1,3 +1,4 @@
+# Durable composer jobs are independent of the transport idle ceiling; synchronous headroom remains required.
 # Validate the resolved production launch before what-if. No secret values.
 def concrete: type == "string" and length > 0 and (test("00000000|<|>|example|placeholder|REPLACE_"; "i") | not);
 def digest: concrete and test("^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$");
@@ -51,7 +52,7 @@ def reserved_environment: [
 (.composerTransportIdleCeilingSeconds | positive_integer and . <= 240) and
 ([.composerMaxCompositionTurns, .composerMaxDiscoveryTurns,
   .composerTimeoutSeconds, .composerRateLimitPerMinute] | all(positive_integer)) and
-(.composerTimeoutSeconds <= (.composerTransportIdleCeilingSeconds - 30)) and
+(.composerTransportIdleCeilingSeconds > 30) and
 (.authProvider | IN("oidc", "entra", "vanguard", "google")) and
 (.registrationMode | IN("closed", "email_verified", "open")) and
 ([.sessionDbUrlRuntimeSecretUrl, .landscapeUrlRuntimeSecretUrl,

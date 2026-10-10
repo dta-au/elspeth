@@ -611,29 +611,24 @@ variable "default_llm_profile" {
 variable "alb_idle_timeout_seconds" {
   type        = number
   default     = 900
-  description = "ALB idle_timeout, and thereby the composer transport ceiling: locals.tf wires ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS to this value so the app's boot guard validates the wall clock against the real proxy limit. Default 900 (was 300, the AWS default) because the shipped corpus needs it: battery round-5 g03's compose settled at ~490-514s and could not reach its first authoring call inside the old 270s ceiling (elspeth-09c91778f5)."
+  description = "ALB idle_timeout, and thereby the composer transport ceiling: locals.tf wires ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS to this value so synchronous request headroom uses the real proxy limit. Durable composer jobs have an independent budget. Default 900 (was 300, the AWS default) because the shipped corpus needs it: battery round-5 g03's compose settled at ~490-514s and could not reach its first authoring call inside the old 270s ceiling (elspeth-09c91778f5)."
 
   validation {
     condition     = var.alb_idle_timeout_seconds >= 60 && var.alb_idle_timeout_seconds <= 4000
-    error_message = "alb_idle_timeout_seconds must be in [60, 4000]: 4000 is the ALB maximum, and below 60 the composer envelope cannot fund even a single authoring turn."
+    error_message = "alb_idle_timeout_seconds must be in [60, 4000]: 4000 is the ALB maximum, and the retained 60-second floor keeps synchronous request headroom positive."
   }
 }
 
 variable "composer_timeout_seconds" {
   type        = number
   default     = 840
-  description = "Composer whole-request wall clock in seconds. Default 840 (elspeth-09c91778f5: the shipped 240 could not fund the shipped corpus - g03's first authoring call lands at t=413s; 840 is the battery round-5 arm-B proven value, funding 56 turns at the app's 15s/turn planning floor). Was 240 (elspeth-f159d2394b), before that a hardcoded 120 that funded ~6 of the authorised 20 turns."
+  description = "Composer durable job wall clock in seconds. Default 840 (elspeth-09c91778f5: the shipped 240 could not fund the shipped corpus - g03's first authoring call lands at t=413s; 840 is the battery round-5 arm-B proven value, funding 56 turns at the app's 15s/turn planning floor). Was 240 (elspeth-f159d2394b), before that a hardcoded 120 that funded ~6 of the authorised 20 turns."
 
-  # A wall clock above (transport idle ceiling - 30s headroom) is a web
-  # STARTUP error, so without this check it is discovered only after the
-  # service is rolled. Checking it here fails `terraform plan` instead. The
-  # ceiling IS the ALB idle timeout (locals.tf wires the env var to
-  # var.alb_idle_timeout_seconds), so the two legs cannot drift: raising the
-  # wall past the proxy's patience is rejected at plan time. The 30 literal
-  # mirrors the WebSettings composer_transport_headroom_seconds default.
+  # Durable composer jobs survive observer disconnection. Only the job's
+  # own positive budget limits execution; socket headroom remains separate.
   validation {
-    condition     = var.composer_timeout_seconds > 0 && var.composer_timeout_seconds <= var.alb_idle_timeout_seconds - 30
-    error_message = "composer_timeout_seconds must be in (0, alb_idle_timeout_seconds - 30]: the web app rejects a wall clock inside the transport headroom, because the ALB would abort with an opaque 504 before the composer reported its honest 422."
+    condition     = var.composer_timeout_seconds > 0
+    error_message = "composer_timeout_seconds must be positive: the durable job budget is independent of the transport idle ceiling."
   }
 }
 

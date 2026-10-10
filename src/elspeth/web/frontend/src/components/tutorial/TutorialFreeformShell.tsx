@@ -79,7 +79,7 @@ export function TutorialFreeformShell({
   onSessionMissing,
 }: TutorialFreeformShellProps): JSX.Element {
   const composer = useComposer();
-  const composeTimeoutReady = useSessionStore((state) => state.composeTimeoutReady);
+  const composeTimeoutReady = useSessionStore((state) => state.compositionStateLoaded);
   const activeSessionId = useSessionStore((state) => state.activeSessionId);
   const compositionStateLoaded = useSessionStore((state) => state.compositionStateLoaded);
   const compositionState = useSessionStore((state) => state.compositionState);

@@ -108,6 +108,7 @@ from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
     ComposerResult,
 )
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import (
     _sync_list_blobs,
@@ -188,11 +189,19 @@ def _pending_interpretation_review_repair_message(
         "vague-term handoff that is unresolvable: "
         f"{sites}. Re-check the user's active request. If the user asks for explanation or says not to make changes, "
         "answer that request without changing the pipeline; the orphaned handoffs still block execution and completion. "
-        "If the user's active request authorizes changes, use the following repair guidance. For each listed handoff, "
-        "call request_interpretation_review with the listed affected_node_id, "
-        "kind, and user_term. If more than one handoff is listed, issue one "
-        "request_interpretation_review tool call per listed handoff in this same "
-        "assistant turn before stopping. For vague_term handoffs, first make sure "
+        "If the user's active request authorizes changes, use the following repair guidance. "
+        "For an invented_source site, first inspect source.options.interpretation_requirements. "
+        "If its matching pending row is missing, rebind the existing source blob through set_source_from_blob "
+        "to restage the exact artifact draft; request_interpretation_review cannot create a missing row. "
+        "After the rebind succeeds, inspect the returned pipeline state and use the newly staged invented_source "
+        "row's current user_term and affected_node_id for the review request. Its term can differ from the "
+        "listed missing-row fallback; do not request the old listed term or batch that request with the rebind. "
+        "If the matching row exists but its pending event is missing, call request_interpretation_review "
+        "with the listed affected_node_id, kind, and user_term. For other listed handoffs, "
+        "call request_interpretation_review with the listed affected_node_id, kind, and user_term after "
+        "checking their staging prerequisites. For every already staged handoff, issue one "
+        "request_interpretation_review tool call per site before stopping. Restaged source sites require a "
+        "new state read first. For vague_term handoffs, first make sure "
         "the target LLM node both (a) contains exactly one matching pending vague_term "
         "interpretation_requirements entry and (b) wires that requirement into the prompt — "
         "either a single prompt_template_parts entry "
@@ -343,10 +352,14 @@ def _orphaned_interpretation_review_validation(
     site_detail = ", ".join(f"{kind.value}:{component_id}:{term}" for component_id, term, kind in missing_sites)
     detail = f"The pipeline carries an unresolvable interpretation handoff with no matching pending review and cannot run: {site_detail}."
     suggestion = (
-        "For each listed site, call request_interpretation_review with the listed "
-        "affected_node_id, kind, and user_term so the interpretation site becomes "
-        "resolvable, or remove the corresponding interpretation token, invented "
-        "source, or downstream field demand from the pipeline."
+        "For an invented_source site, inspect source.options.interpretation_requirements. If the matching "
+        "pending row is missing, rebind the existing source blob through set_source_from_blob to restage "
+        "its exact artifact draft. Then inspect the new pipeline state and request review using the restaged "
+        "row's current user_term, which may differ from this missing-row fallback term. "
+        "If the row is present but its event is missing, "
+        "call request_interpretation_review with the listed affected_node_id, kind, and user_term. "
+        "For other listed sites, check their staging prerequisites before requesting review; remove a "
+        "source or downstream demand only when that graph edit is actually intended."
     )
     affected_nodes = tuple(
         dict.fromkeys(component_id for component_id, _term, kind in missing_sites if _component_type_for_kind(kind) == "transform")
@@ -1286,6 +1299,7 @@ class CompositionCompletion:
         # Durable advisor gate fact from the prior state row (ruling
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> _TerminateOutcome:
         """Phase P2 of the compose loop — handle the no-tool-calls branch.
 
@@ -1504,6 +1518,7 @@ class CompositionCompletion:
                 advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                 deadline=deadline,
                 completion_gates=completion_gates,
+                provider_owner=provider_owner,
             )
         except _AdvisorCheckpointComposeDeadlineExpired:
             # The model had already replied; the timeout envelope carries no
@@ -1933,6 +1948,7 @@ class CompositionCompletion:
         # Durable advisor gate fact from the prior state row (ruling
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
+        provider_owner: ProviderInvocationOwner | None = None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
         """Run the shared terminal no-tool END advisor gate for P2 and P5.
 
@@ -2025,6 +2041,7 @@ class CompositionCompletion:
                 advisor_review_state=review_state,
                 deadline=deadline,
                 session_operation_context=session_operation_context,
+                provider_owner=provider_owner,
             )
             passes_delta += 1
             review_state = _advance_advisor_review_state(

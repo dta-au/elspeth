@@ -171,14 +171,16 @@ def test_committed_reject_survives_cleanup_and_logger_failures(test_client: Test
             raise AuditIntegrityError("logging integrity failed")
         raise RuntimeError("logging backend failed")
 
-    monkeypatch.setattr(SessionOperationLease, "close", close_then_fail)
-    monkeypatch.setattr(proposal_routes.slog, "error", fail_logging)
+    with monkeypatch.context() as faults:
+        faults.setattr(SessionOperationLease, "close", close_then_fail)
+        faults.setattr(proposal_routes.slog, "error", fail_logging)
+        if integrity_failure:
+            with pytest.raises(AuditIntegrityError, match="logging integrity failed"):
+                test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
+        else:
+            response = test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
     if integrity_failure:
-        with pytest.raises(AuditIntegrityError, match="logging integrity failed"):
-            test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
-        monkeypatch.undo()
-    response = test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
-    if integrity_failure:
+        response = test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
         assert response.status_code == 200
         return
     assert response.status_code == 200
@@ -194,11 +196,11 @@ def test_committed_reject_propagates_cleanup_integrity_failure(test_client: Test
         await original_close(lease)
         raise failure
 
-    monkeypatch.setattr(SessionOperationLease, "close", close_then_fail)
-    with pytest.raises(AuditIntegrityError) as caught:
-        test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
+    with monkeypatch.context() as fault:
+        fault.setattr(SessionOperationLease, "close", close_then_fail)
+        with pytest.raises(AuditIntegrityError) as caught:
+            test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
     assert caught.value is failure
-    monkeypatch.undo()
     replay = test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
     assert replay.status_code == 200
 

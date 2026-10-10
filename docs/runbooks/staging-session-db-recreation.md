@@ -2,7 +2,31 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and legacy issue tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.8.1 replica recovery, identity admission, prompt provenance and call mode audit (session epoch 71 and Landscape epoch 49)
+## Current Cutover: 0.8.3 candidate (session epoch 72, Landscape epoch 49)
+
+The 0.8.3 candidate advances the session store from epoch 71 to 72 for
+durable Composer operation jobs and operation-ID ingress bindings. Landscape
+remains at epoch 49. A 0.8.1 or 0.8.2 session store is incompatible: stop
+the service, archive or export needed session evidence, and recreate the
+session store and its matched SQLite sidecars, or have the PostgreSQL
+schema owner recreate its session schema. There is no in-place migration.
+Preserve a Landscape store already at epoch 49; a session-only cutover does
+not justify resetting current Landscape evidence. Preserve the separate
+authentication store. The service and schema doctor refuse mismatched
+epochs rather than relabeling predecessor rows.
+
+A 0.8.0 installation has session epoch 53 and Landscape epoch 38. Archive
+or export needed evidence, then recreate both stale databases in the same
+service-stop window, following the two-DB procedure below. The staging
+reset section applies only to its named staging deployment; other
+installations must use their own database-owner and deployment procedures.
+
+The release acceptance record must cite the
+session-epoch-72/Landscape-epoch-49 record. If a cutover fails, keep the
+service drained and repair the epoch-72 release forward; do not roll
+predecessor code over the recreated session store.
+
+## Prior Cutover: 0.8.1 replica recovery, identity admission, prompt provenance and call mode audit (session epoch 71 and Landscape epoch 49)
 
 0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 71 and Landscape
 `SQLITE_SCHEMA_EPOCH` from 38 to 49. Session epoch 54 adds durable Composer
@@ -206,9 +230,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-71 release forward,
+unsupported: keep the service drained, repair the epoch-72 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-71/Landscape-epoch-49 record when binding candidate and rollback
+session-epoch-72/Landscape-epoch-49 record when binding candidate and rollback
 decisions.
 
 For a later candidate that has used identity administration, the window also
@@ -811,24 +835,26 @@ sudo systemctl status "$SERVICE" --no-pager --lines=20
 
 `initialize_session_schema()` recreates the file on service startup. If either health check fails, inspect `journalctl -u elspeth-web.service --no-pager -n 80` before retrying.
 
-After health checks pass, prove both recreated stores carry the current hard-cut
-sentinels before creating any session. If `LANDSCAPE_PATH` is not already set,
+After health checks pass, prove the recreated session store and compatible
+Landscape store carry the current hard-cut sentinels before creating any
+session. If `LANDSCAPE_PATH` is not already set,
 resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 71 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 72 (== SESSION_SCHEMA_EPOCH)
 sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 49 (== SQLITE_SCHEMA_EPOCH)
 ```
 
-Any predecessor session or Landscape epoch is not repairable in place: keep the
-service drained, recreate both stores with the current release, and rerun the
-probes. Then create a new session through the API or UI and confirm no
+Any predecessor schema epoch is not repairable in place. Keep the service
+drained and recreate each stale store with the current candidate. Keep a
+Landscape store already at epoch 49, then rerun the probes. Create a new
+session through the API or UI and confirm no
 `SessionSchemaError` appears in the service journal.
 
 #### Current epoch + Composer smoke verification
 
-Confirm the recreated session DB and Landscape audit DB carry the new epoch
-sentinels, then drive a fresh freeform tutorial through its Run, Audit, and
+Confirm the recreated session DB and the current Landscape audit DB carry
+the required epoch sentinels, then drive a fresh freeform tutorial through its Run, Audit, and
 Graduation capstone to prove the candidate serves the recreated schemas cleanly:
 
 ```bash

@@ -48,7 +48,7 @@ from elspeth.contracts.composer_interpretation import (
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields, require_int
-from elspeth.contracts.hashing import is_lower_sha256_hex
+from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex
 from elspeth.web.coordination.approval_authority import ApprovalGateInputs
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
@@ -64,6 +64,8 @@ from elspeth.web.coordination.contracts import (
     SessionOperationKind,
     StartPermitState,
 )
+from elspeth.web.sessions.pipeline_publication import PipelineProposalSettlementResult as PipelineProposalSettlementResult
+from elspeth.web.sessions.pipeline_settlement_payloads import ComposerOperationBinding
 
 if TYPE_CHECKING:
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -71,9 +73,40 @@ if TYPE_CHECKING:
     from elspeth.web.composer.pipeline_proposal import PipelineProposal
     from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry, TokenUsageSource
     from elspeth.web.execution.envelope import RunExecutionInput
+    from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkTicket
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
+    from elspeth.web.sessions.composer_operations import (
+        ComposerOperationAssistantWrite,
+        ComposerOperationClaim,
+        ComposerOperationError,
+        ComposerOperationRecord,
+        ComposerOperationRunning,
+    )
+    from elspeth.web.sessions.pipeline_finish_once import ComposerPipelineFinishOnce
+    from elspeth.web.sessions.pipeline_rejection import PipelineRejectionExpected
+    from elspeth.web.sessions.pipeline_rejection_finish_once import PipelineCreationFinishOnce, PipelineRejectionFinishOnce
+    from elspeth.web.sessions.schemas import MessageWithStateResponse
 
 ChatMessageRole = Literal["user", "assistant", "system", "tool", "audit"]
+
+
+@dataclass(slots=True)
+class RedactedPipelineArguments:
+    """Carry the manifest-redacted JSON object into proposal persistence.
+
+    The service independently recomputes the redaction from the owned plan and
+    compares it before writing. Keep the supplied object here without copying
+    so that comparison checks exactly what the caller supplied.
+    """
+
+    value: object
+
+    def __post_init__(self) -> None:
+        if type(self.value) not in (dict, MappingProxyType):
+            raise TypeError("redacted pipeline arguments must be a JSON object or its frozen view")
+        canonical_json(self.value)
+
+
 ComposerTrustMode = Literal["explicit_approve", "auto_commit"]
 ComposerDensityDefault = Literal["high", "medium", "low"]
 ProposalLifecycleStatus = Literal["pending", "committed", "rejected"]
@@ -772,6 +805,9 @@ class AuthoritativePipelineProposal:
     proposal: PipelineProposal
     creation_event_id: UUID
     custody_result: Literal["not_required", "ready"]
+    composer_operation: ComposerOperationBinding | None = None
+    creation_schema: Literal["pipeline_proposal_created.v2", "pipeline_proposal_created.v3"] = "pipeline_proposal_created.v2"
+    creation_actor: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -798,20 +834,22 @@ class TransitionAssistantDraft:
 
 
 @dataclass(frozen=True, slots=True)
-class PipelineProposalSettlementResult:
-    """Atomic accepted proposal, immutable state, and optional response."""
-
-    proposal: CompositionProposalRecord
-    state: CompositionStateRecord
-    transition_message: ChatMessageRecord | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class PipelineDispatchRecovery:
     """One durable successful dispatch available to resume settlement."""
 
     binding: PipelineDispatchAuditBinding
     executor_content_hash: str
+
+
+class PendingInterpretationPolicy(StrEnum):
+    RECONCILE = "reconcile"
+    PIPELINE_CANDIDATE = "pipeline_candidate"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingInterpretationCreationResult:
+    event: InterpretationEventRecord
+    produced_state: CompositionStateRecord | None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -852,7 +890,7 @@ class ChatMessageRecord:
     composition_state_id: UUID | None = None
     tool_call_id: str | None = None
     parent_assistant_id: UUID | None = None
-    client_request_id: UUID | None = None
+    operation_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if self.role not in CHAT_MESSAGE_ROLE_VALUES:
@@ -880,25 +918,9 @@ class ChatMessageRecord:
 class MessageIngressFresh:
     """A newly accepted user row with its same-transaction transcript."""
 
-    client_request_id: UUID
+    operation_id: UUID
     message: ChatMessageRecord
     transcript: tuple[ChatMessageRecord, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class MessageIngressAccepted:
-    """The exact request was accepted earlier; composition is not implied."""
-
-    client_request_id: UUID
-    user_message_id: UUID
-
-
-@dataclass(frozen=True, slots=True)
-class MessageIngressConflict:
-    """A request ID was previously bound to different content or state."""
-
-    client_request_id: UUID
-    user_message_id: UUID
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1960,6 +1982,13 @@ class SessionOperationInterpretationMutations(Protocol):
         validator: SessionPendingInterpretationValidator,
     ) -> InterpretationEventRecord: ...
 
+    # Settlement creates fresh candidate-bound evidence and returns any opt-out-produced state.
+    def create_pipeline_candidate_pending(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+    ) -> PendingInterpretationCreationResult: ...
+
     def record_session_opt_out(
         self,
         *,
@@ -2359,6 +2388,17 @@ class SessionOperationAuthority(Protocol):
     part of the public authority surface.
     """
 
+    def start_composer_async_operation(
+        self,
+        claim: ComposerOperationClaim,
+        *,
+        owner_instance_id: str,
+        lease_seconds: int,
+        auth_provider_type: str,
+    ) -> SessionOperationContext:
+        """Atomically bind one queued claim to a new COMPOSE fence."""
+        ...
+
     def create_session_with_initial_fence(
         self,
         *,
@@ -2457,6 +2497,10 @@ class SessionServiceProtocol(Protocol):
         auth_provider_type: AuthProviderType,
     ) -> SessionRecord: ...
 
+    def get_session_for_stream(self, session_id: UUID) -> SessionRecord:
+        """Synchronous scope read, dispatched with actual worker completion custody."""
+        ...
+
     async def get_session(self, session_id: UUID) -> SessionRecord: ...
 
     async def reserve_operation_receipt(
@@ -2531,6 +2575,7 @@ class SessionServiceProtocol(Protocol):
         title: str,
         *,
         session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket | None = None,
     ) -> SessionRecord: ...
 
     async def list_sessions(
@@ -2595,13 +2640,45 @@ class SessionServiceProtocol(Protocol):
         composer_provider: str,
         user_message_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket | None = None,
     ) -> CompositionProposalRecord: ...
+
+    async def create_pipeline_composition_proposal_finish_once(
+        self,
+        *,
+        session_id: UUID,
+        plan: PipelinePlanResult,
+        summary: str,
+        rationale: str,
+        affects: Sequence[str],
+        arguments_redacted_json: RedactedPipelineArguments,
+        actor: str,
+        composer_model_identifier: str,
+        composer_model_version: str,
+        composer_provider: str,
+        user_message_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket,
+        running: ComposerOperationRunning | None = None,
+    ) -> PipelineCreationFinishOnce: ...
+
+    async def reject_pipeline_composition_proposal_finish_once(
+        self,
+        *,
+        expected: PipelineRejectionExpected,
+        coordinator: RequiredWorkCoordinator,
+        rejection_work: RequiredWorkTicket,
+        rejection_projection_work: RequiredWorkTicket,
+        transition_ordinal: int,
+        semantic_ordinal: int,
+    ) -> PipelineRejectionFinishOnce: ...
 
     async def get_authoritative_pipeline_proposal(
         self,
         *,
         session_id: UUID,
         proposal_id: UUID,
+        required_work: RequiredWorkTicket | None = None,
     ) -> AuthoritativePipelineProposal: ...
 
     async def get_authoritative_composition_proposal(
@@ -2609,6 +2686,7 @@ class SessionServiceProtocol(Protocol):
         *,
         session_id: UUID,
         proposal_id: UUID,
+        required_work: RequiredWorkTicket | None = None,
     ) -> AuthoritativeCompositionProposal: ...
 
     async def settle_pipeline_composition_proposal(
@@ -2626,22 +2704,48 @@ class SessionServiceProtocol(Protocol):
         transition_assistant: TransitionAssistantDraft | None = None,
         required_trust_mode: ComposerTrustMode | None = None,
         session_operation_context: SessionOperationContext,
+        prepared_interpretations: tuple[PreparedInterpretationEventDraft, ...] = (),
+        running: ComposerOperationRunning | None = None,
+        required_work: RequiredWorkTicket | None = None,
     ) -> PipelineProposalSettlementResult: ...
 
-    async def record_auto_commit_revocation(
+    async def settle_pipeline_composition_proposal_finish_once(
         self,
         *,
         session_id: UUID,
         proposal_id: UUID,
-        required_trust_mode: str,
-        current_trust_mode: str,
+        draft_hash: str,
+        state: CompositionStateData,
+        candidate_content_hash: str,
+        executor_content_hash: str,
+        final_composer_metadata: Mapping[str, Any] | None,
+        dispatch: PipelineDispatchAuditBinding,
         actor: str,
-    ) -> ProposalEventRecord: ...
+        session_operation_context: SessionOperationContext,
+        coordinator: RequiredWorkCoordinator,
+        required_work: RequiredWorkTicket,
+        publication_projection_work: RequiredWorkTicket,
+        revocation_required_work: RequiredWorkTicket,
+        revocation_projection_work: RequiredWorkTicket,
+        transition_assistant: TransitionAssistantDraft | None = None,
+        required_trust_mode: ComposerTrustMode | None = None,
+        prepared_interpretations: tuple[PreparedInterpretationEventDraft, ...] = (),
+        running: ComposerOperationRunning | None = None,
+    ) -> ComposerPipelineFinishOnce: ...
+
+    async def replay_pipeline_composition_proposal(
+        self,
+        *,
+        authority: AuthoritativePipelineProposal,
+        prepared_interpretations: tuple[PreparedInterpretationEventDraft, ...],
+        required_work: RequiredWorkTicket | None = None,
+    ) -> PipelineProposalSettlementResult: ...
 
     async def get_pipeline_dispatch_recovery(
         self,
         *,
         authority: AuthoritativePipelineProposal,
+        required_work: RequiredWorkTicket | None = None,
     ) -> PipelineDispatchRecovery | None: ...
 
     async def reject_pipeline_composition_proposal(
@@ -2878,6 +2982,30 @@ class SessionServiceProtocol(Protocol):
         session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> ChatMessageRecord: ...
 
+    async def complete_composer_async_operation(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        assistant: ComposerOperationAssistantWrite | None,
+        assistant_record: ChatMessageRecord | None,
+        audit_cohort: tuple[AuditMessageDraft, ...],
+        audit_composition_state_id: UUID | None,
+        build_response: Callable[
+            [ChatMessageRecord, tuple[CompositionProposalRecord, ...], CompositionStateRecord | None], MessageWithStateResponse
+        ],
+        required_work: RequiredWorkCoordinator | None = None,
+    ) -> ComposerOperationRecord: ...
+
+    async def fail_composer_async_operation(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        failure: ComposerOperationError,
+        authoritative_failure: bool = False,
+        required_work: RequiredWorkCoordinator | None = None,
+        failure_projection_work: RequiredWorkTicket | None = None,
+    ) -> ComposerOperationRecord: ...
+
     async def add_messages_atomic(
         self,
         session_id: UUID,
@@ -2887,6 +3015,8 @@ class SessionServiceProtocol(Protocol):
         composition_state_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
         session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
+        audit_only: bool = False,
+        required_work: RequiredWorkTicket | None = None,
     ) -> None:
         """Persist one audit cohort all-or-nothing (elspeth-90231248dc).
 
@@ -2943,19 +3073,9 @@ class SessionServiceProtocol(Protocol):
         session_id: UUID,
         limit: int | None = 100,
         offset: int = 0,
-    ) -> list[ChatMessageRecord]: ...
-
-    async def lookup_message_ingress(
-        self,
-        session_id: UUID,
         *,
-        client_request_id: UUID,
-        content: str,
-        requested_state_id: UUID | None,
-        session_operation_context: SessionOperationContext,
-    ) -> MessageIngressAccepted | MessageIngressConflict | None:
-        """Read an existing receipt before route state preflight under a compose fence."""
-        ...
+        required_work: RequiredWorkTicket | None = None,
+    ) -> list[ChatMessageRecord]: ...
 
     async def add_message_with_transcript(
         self,
@@ -2963,7 +3083,7 @@ class SessionServiceProtocol(Protocol):
         role: ChatMessageRole,
         content: str,
         *,
-        client_request_id: UUID,
+        operation_id: UUID,
         requested_state_id: UUID | None,
         writer_principal: ChatMessageWriterPrincipal,
         tool_calls: Sequence[Mapping[str, Any]] | None = None,
@@ -2972,7 +3092,9 @@ class SessionServiceProtocol(Protocol):
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
-    ) -> MessageIngressFresh | MessageIngressAccepted | MessageIngressConflict:
+        running: ComposerOperationRunning,
+        required_work: RequiredWorkTicket | None = None,
+    ) -> MessageIngressFresh:
         """Accept a user message once and return a nominal admission result.
 
         The insert and the transcript read MUST happen inside one
@@ -3016,6 +3138,7 @@ class SessionServiceProtocol(Protocol):
         *,
         provenance: CompositionStateProvenance,
         session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket | None = None,
     ) -> CompositionStateRecord:
         """Save a new immutable composition state snapshot.
 
@@ -3070,9 +3193,11 @@ class SessionServiceProtocol(Protocol):
     async def get_current_state(
         self,
         session_id: UUID,
+        *,
+        required_work: RequiredWorkTicket | None = None,
     ) -> CompositionStateRecord | None: ...
 
-    async def get_state(self, state_id: UUID) -> CompositionStateRecord: ...
+    async def get_state(self, state_id: UUID, *, required_work: RequiredWorkTicket | None = None) -> CompositionStateRecord: ...
 
     async def get_state_in_session(
         self,
@@ -3180,18 +3305,34 @@ class SessionServiceProtocol(Protocol):
         """Charge auto-title (COMPOSE) or run (EXECUTE) provider calls to the session owner's token ledger."""
 
     async def begin_provider_attempt(
-        self, *, session_operation_context: SessionOperationContext, source: TokenUsageSource, run_id: UUID | None = None
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        source: TokenUsageSource,
+        run_id: UUID | None = None,
+        required_work: RequiredWorkTicket | None = None,
     ) -> ProviderAttempt:
         """Admit and persist pending provider evidence before dispatch."""
 
     def begin_run_provider_attempt_sync(self, *, session_operation_context: SessionOperationContext, run_id: UUID) -> ProviderAttempt:
         """Return a committed EXECUTE attempt before the pipeline enters its provider."""
 
-    async def finish_provider_attempt(self, *, session_operation_context: SessionOperationContext, call: ComposerLLMCall) -> None:
+    async def finish_provider_attempt(
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        call: ComposerLLMCall,
+        required_work: RequiredWorkTicket | None = None,
+    ) -> None:
         """Checkpoint terminal provider audit and settle its ledger atomically."""
 
     async def cancel_undispatched_provider_attempt(
-        self, *, session_operation_context: SessionOperationContext, attempt_id: str, requested_model: str
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        attempt_id: str,
+        requested_model: str,
+        required_work: RequiredWorkTicket | None = None,
     ) -> None:
         """Close a proven undispatched COMPOSE intent under its original fence."""
 
@@ -3366,6 +3507,7 @@ class SessionServiceProtocol(Protocol):
         writer_principal: ChatMessageWriterPrincipal,
         plugin_crash_pending: bool,
         session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkTicket | None = None,
     ) -> Any:
         """Persist one compose turn (assistant + tool rows + per-tool
         composition states) atomically.

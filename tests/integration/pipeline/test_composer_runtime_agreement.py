@@ -684,6 +684,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import sys
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -747,6 +748,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.accounting import load_run_accounting_from_db
 from elspeth.web.execution.progress import BroadcastResult
 from elspeth.web.execution.schemas import CompletedData
@@ -764,6 +766,11 @@ from tests.fixtures.plugins import (
     ListSource,
     PassTransform,
 )
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
+
+execution_fixture = execution_custody.execution_fixture
+
 
 _AGREEMENT_SESSION_ID = "00000000-0000-4000-8000-000000000001"
 
@@ -3975,25 +3982,86 @@ class _RunSnapshot:
     error: str | None = None
 
 
-def _execute_lease(loop: asyncio.AbstractEventLoop, session_id: Any) -> Any:
-    """Mint the EXECUTE lease the /execute route transfers into _run_pipeline.
+def _execute_lease(
+    loop: asyncio.AbstractEventLoop,
+    session_id: Any,
+    *,
+    service: ExecutionServiceImpl,
+    execution_fixture: ExecutionTestCustody,
+) -> Any:
+    """Acquire the actual canonical lease used by this direct runtime probe.
 
-    The recording authority mints exact contexts without a database; the
-    lease's renewal task lives on ``loop`` for the test's lifetime.
+    This probes _run_pipeline's audit/validation boundary, not an accepted
+    HTTP dispatch. Public SQL acquire/release and lifecycle remain actual.
     """
-    from elspeth.contracts.session_operation import SessionOperationKind
-    from elspeth.web.coordination.lifecycle import SessionOperationLease
-    from tests.helpers.session_fences import RecordingSessionOperationAuthority
-
+    observed = execution_fixture.observe_authority(session_id)
     return loop.run_until_complete(
-        SessionOperationLease.acquire(
-            RecordingSessionOperationAuthority(),
+        execution_fixture.acquire(
+            service.execution_lease_release_registry,
+            observed.authority,
             session_id=session_id,
-            operation_kind=SessionOperationKind.EXECUTE,
             owner_instance_id="test-execute-owner",
             lease_seconds=60,
         )
     )
+
+
+class _DirectRuntimeProbeCustodyUnknown(AssertionError):
+    """Root the exact loop and fixture while physical ownership is unresolved."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, execution_fixture: ExecutionTestCustody) -> None:
+        super().__init__("INCONCLUSIVE: direct runtime probe cleanup has unresolved owners")
+        self.loop = loop
+        self.execution_fixture = execution_fixture
+
+
+def _close_direct_runtime_probe(
+    loop: asyncio.AbstractEventLoop,
+    lease: SessionOperationLease | None,
+    execution_fixture: ExecutionTestCustody,
+    primary: BaseException | None,
+) -> None:
+    failures: list[BaseException] = []
+    if lease is not None:
+        try:
+            loop.run_until_complete(lease.close())
+        except BaseException as original:
+            failures.append(original)
+    try:
+        # Keep the loop open until every retained lifecycle owner is joined,
+        # including acquisition that did not return its actual lease.
+        loop.run_until_complete(execution_fixture.close())
+    except BaseException as original:
+        failures.append(original)
+    joined = execution_fixture._close_declared and (not execution_fixture.owns_lifecycle or execution_fixture._lifecycle_joins_declared)
+    for owner in execution_fixture._joins:
+        try:
+            if owner.task is None or not owner.task.done() or not owner.entered or not owner.outcome_recorded:
+                joined = False
+        except BaseException as original:
+            failures.append(original)
+            joined = False
+    for registry in execution_fixture.registries:
+        try:
+            if registry.has_pending_physical_owners():
+                joined = False
+            if registry.executor_finalizer is not None and not registry.executor_join_physically_observed:
+                joined = False
+        except BaseException as original:
+            failures.append(original)
+            joined = False
+    if joined:
+        try:
+            loop.close()
+        except BaseException as original:
+            failures.append(original)
+    else:
+        failures.append(_DirectRuntimeProbeCustodyUnknown(loop, execution_fixture))
+    if failures:
+        roots = ([primary] if primary is not None else []) + failures
+        if len(roots) == 1:
+            raise roots[0]
+        raise BaseExceptionGroup("Runtime probe body and owned cleanup originals", roots) from None
 
 
 def _fake_settlement_authority() -> Mock:
@@ -4291,7 +4359,9 @@ sinks:
 """
 
     @staticmethod
-    def _execution_service(tmp_path: Path) -> tuple[ExecutionServiceImpl, _FakeSessionService, asyncio.AbstractEventLoop]:
+    def _execution_service(
+        tmp_path: Path, execution_fixture: ExecutionTestCustody
+    ) -> tuple[ExecutionServiceImpl, _FakeSessionService, asyncio.AbstractEventLoop]:
         loop = asyncio.new_event_loop()
         settings = _RuntimeSettingsFake(
             data_dir=str(tmp_path),
@@ -4305,13 +4375,16 @@ sinks:
         # exercise the hash/audit-ordering assertions they actually target.
         session_service = _FakeSessionService(run=_RunSnapshot(session_id=uuid4()))
 
-        service = ExecutionServiceImpl.for_trained_operator(
-            loop=loop,
-            broadcaster=cast(Any, _FakeProgressBroadcaster()),
-            settings=settings,
-            session_service=session_service,
-            yaml_generator=cast(Any, SimpleNamespace()),
-            telemetry=build_sessions_telemetry(),
+        service = execution_fixture.bind(
+            ExecutionServiceImpl.for_trained_operator(
+                loop=loop,
+                broadcaster=cast(Any, _FakeProgressBroadcaster()),
+                settings=settings,
+                session_service=session_service,
+                yaml_generator=cast(Any, SimpleNamespace()),
+                telemetry=build_sessions_telemetry(),
+                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+            )
         )
 
         def _call_async(coro: Any) -> Any:
@@ -4349,9 +4422,10 @@ sinks:
         mock_load: Any,
         mock_orch_cls: Any,
         tmp_path: Path,
+        execution_fixture: ExecutionTestCustody,
     ) -> None:
         del mock_payload_cls, mock_landscape_cls
-        service, _session_service, loop = self._execution_service(tmp_path)
+        service, _session_service, loop = self._execution_service(tmp_path, execution_fixture=execution_fixture)
         content = b"actual prompt bytes"
         blob_id = uuid4()
         run_id = uuid4()
@@ -4364,8 +4438,9 @@ sinks:
         blob_service = _FakeBlobService(blob_record=blob_record, content=content)
         cast(Any, service)._blob_service = blob_service
 
+        lease: SessionOperationLease | None = None
         try:
-            lease = _execute_lease(loop, _session_service.run.session_id)
+            lease = _execute_lease(loop, _session_service.run.session_id, service=service, execution_fixture=execution_fixture)
             with pytest.raises(BlobIntegrityError):
                 service._run_pipeline(
                     str(run_id),
@@ -4374,8 +4449,7 @@ sinks:
                     session_operation_lease=lease,
                 )
         finally:
-            loop.run_until_complete(lease.close())
-            loop.close()
+            _close_direct_runtime_probe(loop, lease, execution_fixture, sys.exc_info()[1])
 
         mock_load.assert_not_called()
         mock_orch_cls.assert_not_called()
@@ -4384,14 +4458,10 @@ sinks:
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
     def test_runtime_records_audit_hash_and_delivers_uploaded_prompt_to_provider_stub(
-        self,
-        mock_payload_cls: Any,
-        mock_landscape_cls: Any,
-        mock_load: Any,
-        tmp_path: Path,
+        self, mock_payload_cls: Any, mock_landscape_cls: Any, mock_load: Any, tmp_path: Path, execution_fixture: ExecutionTestCustody
     ) -> None:
         del mock_payload_cls, mock_landscape_cls
-        service, session_service, loop = self._execution_service(tmp_path)
+        service, session_service, loop = self._execution_service(tmp_path, execution_fixture=execution_fixture)
         content = b"You are an audited prompt."
         sha256 = hashlib.sha256(content).hexdigest()
         blob_id = uuid4()
@@ -4453,8 +4523,9 @@ sinks:
 
         mock_load.side_effect = stop_after_audit
 
+        lease: SessionOperationLease | None = None
         try:
-            lease = _execute_lease(loop, session_service.run.session_id)
+            lease = _execute_lease(loop, session_service.run.session_id, service=service, execution_fixture=execution_fixture)
             with pytest.raises(RuntimeError, match="stop after inline audit"):
                 service._run_pipeline(
                     str(run_id),
@@ -4463,8 +4534,7 @@ sinks:
                     session_operation_lease=lease,
                 )
         finally:
-            loop.run_until_complete(lease.close())
-            loop.close()
+            _close_direct_runtime_probe(loop, lease, execution_fixture, sys.exc_info()[1])
 
         assert len(session_service.recorded_blob_inline_resolutions) == 1
         recorded_call = session_service.recorded_blob_inline_resolutions[0]

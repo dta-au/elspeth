@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import sqlite3
+import sys
 import threading
 import time
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.engine import Engine
 from typer.testing import CliRunner
 
 from elspeth.config_loading import load_settings_from_yaml_string
@@ -62,7 +64,12 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seed_real_follower_ready_item,
     _work_item,
 )
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.helpers.web_cli_profile import create_profile_session
+
+execution_fixture = execution_custody.execution_fixture
+
 
 if TYPE_CHECKING:
     from scripts.state_engine_profile_reporter import RuntimeProfileReporter
@@ -75,12 +82,86 @@ async def _wait_for(predicate: Any, *, timeout: float, message: str) -> None:
         await asyncio.sleep(0.01)
 
 
+class _CliProfileCustodyUnknown(AssertionError):
+    """Keep dependent resources rooted until actual execution owners are joined."""
+
+    def __init__(self, execution_fixture, service, db, lease_stack, session_engine) -> None:
+        super().__init__("INCONCLUSIVE: CLI profile cleanup has unresolved execution ownership")
+        self.execution_fixture = execution_fixture
+        self.service = service
+        self.db = db
+        self.lease_stack = lease_stack
+        self.session_engine = session_engine
+
+
+async def _close_cli_profile_resources(
+    leader_release: threading.Event,
+    execution_fixture: ExecutionTestCustody,
+    service: ExecutionServiceImpl,
+    session_operation_lease: SessionOperationLease,
+    db: LandscapeDB | None,
+    lease_stack: contextlib.AsyncExitStack,
+    session_engine: Engine,
+    primary: BaseException | None,
+) -> None:
+    failures: list[BaseException] = []
+    try:
+        leader_release.set()
+    except BaseException as original:
+        failures.append(original)
+    caller_close = False
+    phase_known = False
+    try:
+        obligation = session_operation_lease.execution_obligation
+        if obligation is None:
+            raise AssertionError("CLI fixture lost actual admitted execution obligation")
+        caller_close = not obligation.completion_required
+        phase_known = True
+    except BaseException as original:
+        failures.append(original)
+    if caller_close:
+        try:
+            await lease_stack.aclose()
+        except BaseException as original:
+            failures.append(original)
+    try:
+        await execution_fixture.shutdown_service(service)
+    except BaseException as original:
+        failures.append(original)
+    registry = service.execution_lease_release_registry
+    joined = False
+    try:
+        joined = phase_known and registry.executor_join_physically_observed and not registry.has_pending_physical_owners()
+    except BaseException as original:
+        failures.append(original)
+    if joined:
+        if db is not None:
+            try:
+                db.close()
+            except BaseException as original:
+                failures.append(original)
+        if not caller_close:
+            try:
+                await lease_stack.aclose()
+            except BaseException as original:
+                failures.append(original)
+        try:
+            session_engine.dispose()
+        except BaseException as original:
+            failures.append(original)
+    else:
+        failures.append(_CliProfileCustodyUnknown(execution_fixture, service, db, lease_stack, session_engine))
+    if failures:
+        roots = ([primary] if primary is not None else []) + failures
+        if len(roots) == 1:
+            raise roots[0]
+        raise BaseExceptionGroup("CLI profile body and owned cleanup originals", roots) from None
+
+
 @pytest.mark.timeout(120)
 @pytest.mark.asyncio
 async def test_web_execution_service_leader_and_actual_cli_follower_share_full_runtime_lifecycle(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    request: pytest.FixtureRequest,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, execution_fixture: ExecutionTestCustody
 ) -> None:
     """A web service leader and real CLI follower compose one fenced run."""
     from elspeth.cli import app
@@ -224,19 +305,22 @@ payload_store:
         policy_hash=snapshot.policy_hash,
     )
     loop = asyncio.get_running_loop()
-    service = ExecutionServiceImpl(
-        loop=loop,
-        broadcaster=ProgressBroadcaster(loop),
-        settings=cast(Any, web_settings),
-        session_service=session_service,
-        yaml_generator=SimpleNamespace(generate_yaml=lambda _state: settings_text),
-        telemetry=build_sessions_telemetry(),
-        blob_service=None,
-        secret_service=None,
-        plugin_snapshot_factory=lambda _user_id: snapshot,
-        operator_profile_registry=MagicMock(spec=OperatorProfileRegistry),
-        web_plugin_policy=web_policy,
-        catalog=catalog,
+    service = execution_fixture.bind(
+        ExecutionServiceImpl(
+            loop=loop,
+            broadcaster=ProgressBroadcaster(loop),
+            settings=cast(Any, web_settings),
+            session_service=session_service,
+            yaml_generator=SimpleNamespace(generate_yaml=lambda _state: settings_text),
+            telemetry=build_sessions_telemetry(),
+            blob_service=None,
+            secret_service=None,
+            plugin_snapshot_factory=lambda _user_id: snapshot,
+            operator_profile_registry=MagicMock(spec=OperatorProfileRegistry),
+            web_plugin_policy=web_policy,
+            catalog=catalog,
+            execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
+        )
     )
     service.set_openrouter_catalog_snapshot(sha256="0" * 64, source="bundled")
 
@@ -349,6 +433,12 @@ payload_store:
         operation_kind=SessionOperationKind.EXECUTE,
         owner_instance_id=session_service.session_operation_owner_instance_id,
         lease_seconds=300,
+        execution_obligation=service.execution_lease_release_registry.admit(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        ),
     )
     lease_stack.push_async_callback(session_operation_lease.close)
     try:
@@ -365,7 +455,9 @@ payload_store:
 
         db = LandscapeDB.from_url(settings.landscape.url)
     except BaseException:
-        await lease_stack.aclose()
+        await _close_cli_profile_resources(
+            leader_release, execution_fixture, service, session_operation_lease, None, lease_stack, session_engine, sys.exc_info()[1]
+        )
         raise
 
     try:
@@ -611,11 +703,9 @@ payload_store:
                 raw.close()
 
     finally:
-        leader_release.set()
-        await service.shutdown()
-        db.close()
-        await lease_stack.aclose()
-        session_engine.dispose()
+        await _close_cli_profile_resources(
+            leader_release, execution_fixture, service, session_operation_lease, db, lease_stack, session_engine, sys.exc_info()[1]
+        )
 
 
 @pytest.mark.timeout(120)

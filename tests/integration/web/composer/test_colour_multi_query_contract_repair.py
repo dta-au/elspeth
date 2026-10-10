@@ -17,13 +17,14 @@ from uuid import UUID
 
 import pytest
 from litellm import ModelResponse
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import yaml_generator
+from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
@@ -37,6 +38,7 @@ from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SO
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
@@ -376,6 +378,85 @@ async def _change_retention(harness: _Harness, state: CompositionState, tmp_path
     assert [event for event in events if event.kind is InterpretationKind.INVENTED_SOURCE] == source_events
     assert isinstance(materialize_state_for_execution(state), CompositionState)
     return state
+
+
+@pytest.mark.asyncio
+async def test_same_bytes_new_blob_keeps_actual_resolved_event_after_public_rebind_and_reload(tmp_path: Path) -> None:
+    harness = await _harness(tmp_path)
+    content = "colour\nred\nblue\n"
+    state = await _approve(harness, await _author(harness, tmp_path, content))
+    old_options = deep_thaw(state.sources["source"].options)
+    prior_events = await harness.sessions.list_interpretation_events(harness.session_id, status="all")
+    source_events = [event for event in prior_events if event.kind is InterpretationKind.INVENTED_SOURCE]
+    assert len(source_events) == 1
+    assert source_events[0].choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
+    assert old_options[SOURCE_AUTHORING_KEY]["review_event_id"] == str(source_events[0].id)
+    with harness.engine.connect() as conn:
+        original_blob = conn.execute(select(blobs_table).where(blobs_table.c.id == old_options["blob_ref"])).one()
+    assert original_blob.creation_modality == "llm_generated"
+    assert original_blob.creating_model_identifier
+    assert original_blob.creating_model_version
+    assert original_blob.creating_provider
+    assert original_blob.creating_composer_skill_hash
+
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    lease = await _lease(harness)
+    async with lease:
+        common = {
+            "plugin_snapshot": snapshot,
+            "data_dir": str(tmp_path),
+            "session_engine": harness.engine,
+            "session_id": str(harness.session_id),
+            "session_operation_context": lease.context,
+            "session_operation_authority": harness.sessions.session_operation_authority,
+            "validate_arguments": True,
+            "require_data_dir_for_paths": True,
+        }
+        create_args = {"filename": "same-bytes-rebound.csv", "mime_type": "text/csv", "content": content}
+        created = execute_tool(
+            "create_blob",
+            create_args,
+            state,
+            policy,
+            **common,
+            user_message_id=str(harness.user_message_id),
+            user_message_content=_USER_MESSAGE,
+            composer_model_identifier=original_blob.creating_model_identifier,
+            composer_model_version=original_blob.creating_model_version,
+            composer_provider=original_blob.creating_provider,
+            composer_skill_hash=original_blob.creating_composer_skill_hash,
+            tool_arguments_hash=composer_authority_hash(create_args),
+        )
+        assert created.success, created.validation
+        assert created.data["blob_id"] != old_options["blob_ref"]
+        assert created.data["content_hash"] == old_options[SOURCE_AUTHORING_KEY]["content_hash"]
+        rebound = execute_tool(
+            "set_source_from_blob",
+            {"blob_id": created.data["blob_id"], "on_success": "colour_rows", "options": {"schema": old_options["schema"]}},
+            state,
+            policy,
+            **common,
+        )
+        assert rebound.success, rebound.validation
+    rebound_options = deep_thaw(rebound.updated_state.sources["source"].options)
+    assert rebound_options["blob_ref"] == created.data["blob_id"]
+    assert rebound_options["path"] != old_options["path"]
+    assert rebound_options[INTERPRETATION_REQUIREMENTS_KEY] == old_options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert rebound_options[SOURCE_AUTHORING_KEY] == old_options[SOURCE_AUTHORING_KEY]
+
+    record = await _persist(harness.sessions, harness.session_id, rebound.updated_state)
+    reloaded = await harness.sessions.get_current_state(harness.session_id)
+    assert reloaded is not None and reloaded.id == record.id
+    restored = state_from_record(reloaded)
+    assert deep_thaw(restored.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY]) == old_options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert deep_thaw(restored.sources["source"].options[SOURCE_AUTHORING_KEY]) == old_options[SOURCE_AUTHORING_KEY]
+    await _run_surfacer(harness.sessions, harness.session_id, reloaded)
+    all_events = await harness.sessions.list_interpretation_events(harness.session_id, status="all")
+    assert [(event.id, event.choice) for event in all_events] == [(event.id, event.choice) for event in prior_events]
+    assert [event for event in all_events if event.kind is InterpretationKind.INVENTED_SOURCE] == source_events
+    assert isinstance(materialize_state_for_execution(restored), CompositionState)
 
 
 @pytest.mark.asyncio

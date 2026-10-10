@@ -1,0 +1,82 @@
+<!-- Durable copy: machine-specific prefixes normalized; private original retained. -->
+
+# Astra review: frozen TLS full32 lineage control 1
+
+**Verdict: source NO-GO for native diagnostic execution.** Four instrument defects remain. This review does not identify the cause of the historical `worker_lost`, change the original acceptance expectation, or clear any production/runtime gate.
+
+Reviewed package: `tls-full32-lineage-control-1`. Evidence: `astra-tls-full32-lineage-code-review-1-evidence.json`. The held worktree HEAD measured during review is `d2b73990d137e9725200c897544eebc5b958fdf4`.
+
+## Scope and measured provenance
+
+I read the complete report, manifest, observer, parser, parent controller, child controller, synthetic controls, and all six copied source dependencies. I traced the original full32 test, its real TLS/app helpers, the watch/settlement paths, shared admission/submission, and source-40 renewal through the copied sources. All manifest entries match their declared hashes. Every copied Python file parses. The byte comparison instrument accepts the original test module and rejects an appended-newline mutation.
+
+The original full test module and both helper modules match the current held worktree exactly. The three production guards currently differ:
+
+| File | Required prefix | Current prefix |
+|---|---|---|
+| Composer worker | `7800ae53` | `e218f621` |
+| Shared async workers | `4ba4114d` | `f8cddc9c` |
+| Lease lifecycle | `b20314c1` | `ea886eb3` |
+
+The source guard must therefore refuse before spawning the native child. This is a source-derived result of the measured hashes; I did not execute the controller. Parent reports that the eventual coherent worker also needs the separately reviewed R8 nominal-entry overlay and other guarded supplier spans. The existing `7800…` guard is not clearance for that future composition. Preserve this package and review a successor with its actual complete dependency hashes; do not weaken the guard to accept either version.
+
+I executed only read-only filesystem/AST/hash work and stdlib compilation/disassembly of source without executing the compiled code. No candidate module was imported; no project test, collection, SQL, TLS process, provider, network operation, source application, or repository mutation ran in this review. The evidence records one corrected report-filename read and one evidence-script SyntaxError that stopped before execution.
+
+## L1 — cleanup can skip the exact child wait and is not fully bounded
+
+`run_lineage_owned.py:18–31` catches only `ProcessLookupError` from TERM/KILL. A `PermissionError` or another signal failure escapes before `child.wait()`. A `poll()` error has the same effect. An unexpected timed-wait error skips escalation and the final wait. The final `child.wait()` is itself unbounded. In `main`, a reaper exception can also replace the original wait/interruption error and skip post-source verification and result/exit publication.
+
+The normal exit race covered by `ProcessLookupError` is useful but does not establish the report's “always reaps” claim. The overall 150-second test timeout does not bound this cleanup path. This is the same custody problem previously rejected in other owned diagnostic controllers.
+
+Required successor: independently attempt cleanup and exact-child observation despite earlier poll/signal errors, retain every original error without treating cleanup failure as the diagnostic RED, use bounded waits with explicit unresolved custody reporting, and preserve the primary error. Do not claim physical completion if the operating system prevents observing it. Author controlled poll, TERM, KILL, and wait failures, including exit-between-poll-and-signal, and assert exact wait attempts plus original identity. The controls must distinguish an actual joined child from merely reaching a timeout or killing a process.
+
+## L2 — real completion events using RETURN_CONST are silently omitted
+
+`tls_lineage.py:66–74` admits only `RETURN_VALUE`. That correctly excludes coroutine suspension at `YIELD_VALUE`, but Python 3.12 and 3.13 compile constant returns to `RETURN_CONST`.
+
+Measured by compiling the copied `_record_renewal_error` function, without evaluating it:
+
+```
+Python 3.12.3:  (26, RETURN_CONST), (212, RETURN_CONST)
+Python 3.13.15: (28, RETURN_CONST), (228, RETURN_CONST)
+```
+
+Consequently the `renewal_lost_latch` branch at the function's actual completion cannot execute under the current predicate. The healthy `return None` in `_acquire_watch_admission` is also `RETURN_CONST` (offset 296 on 3.12), so its successful admission decision is absent. The error-object return uses `RETURN_VALUE`, producing asymmetric evidence. Independent compiler controls showed constant return, value return, and coroutine suspension as distinct bytecode cases.
+
+`assert_required_hooks` validates the line-phase catalogue, not these completion branches. The synthetic controls append records directly, so their green result cannot catch this producer-edge omission. Observer errors remain zero when the event is silently filtered out.
+
+Required successor: recognize actual normal completion opcodes for the selected interpreter while continuing to exclude suspension and exceptional unwinding. Add controls at the real tracing boundary for implicit/explicit None, returned objects, suspension/resumption, and raised outcomes, plus a deliberate completion-filter mutation. Include the actual renewal-latch and healthy admission events in applicable completeness checks. Recording a repeated `_record_renewal_error` call must also distinguish its input from the already retained first latch rather than imply that every input became the latch.
+
+## L3 — bare object IDs do not preserve original-object identity across the capture
+
+`tls_lineage.py:56–63` serializes only `id(value)` and its type. The observer retains observer failures, but it does not retain the business exceptions whose identities are compared. Reservation, Future, result, lease, and ticket references are likewise reduced to integers; the lease/ticket lookup tables keep only integer keys.
+
+Python object IDs are unique only while objects overlap in lifetime. The trace observes transient exceptions, including normal coroutine exception events, and historical records outlive their source frames. A later object may reuse an earlier integer ID. A copied exception of the same type is also indistinguishable from any identity collision. The record therefore cannot establish that two events carry the same original instance simply because their integers match. This is a missing lifetime guarantee in the instrument, not a claim that a collision occurred in the historical failure or that all production custody is absent.
+
+Required successor: bind recorded identities to actual retained objects for the bounded diagnostic lifetime, with exact `is` comparisons and an explicit overflow/inconclusive outcome instead of evicting identities. Use this for identity-bearing lookup tables as well as exception roots/receipts. Keep the table private to the diagnostic; do not manufacture runtime authority or change public producer behavior. Controls should distinguish the same actual object from same-type/equal-field copies and test retention/overflow. Recording `__cause__`/group edges should be explicit if later analysis intends to follow them; the current `_leaves` recurses groups only and is not the production reducer's full semantic traversal.
+
+## L4 — incomplete snapshot and outcome capture can be accepted as a matching public terminal
+
+The `operation_final_assertion` event is emitted **before** the original assertion executes (`tls_lineage.py:214–216`). It records the operation ID from the request path and HTTP status only. It records neither the response's operation ID, its public job status, nor its error code. `inspect_lineage.py:12–55` nevertheless returns `MATCHED_PUBLIC_TERMINAL_CAUSE_UNPROVED` from a selected `worker_lost`, a returned terminal row, and that assertion-entry marker. Its synthetic positive contains no actual public snapshot fields at all.
+
+The child also treats any nonzero pytest outcome after reaching any final-assertion marker as an accepted observation if the broad pool controls hold. It does not observe which assertion actually failed. A later assertion, teardown failure, or pytest interruption after the marker can enter this branch; the comment stating that the retained failure is at a final snapshot is not evidence. The parent correctly keeps process timeout inconclusive, but this child branch does not distinguish the intended original failure from those other nonzero outcomes.
+
+There is a separate completeness weakness on success: `final_snapshot_ids_match` requires only a nonempty subset of the eight posted IDs. The authored positive synthetic fixture supplies exactly one final snapshot for eight posts and is accepted by `require_live_controls`. Thus omission of seven successful snapshot events does not fail the capture check. The original eight-success assertions remain intact, but that does not make the observer's capture complete.
+
+The standalone inspector further trusts stored `controls` booleans rather than checking the raw pool events it is given; its positive fixture contains no pool lane. This is not an untrusted-input security finding. It means the inspector cannot independently detect missing pool capture while claiming a matched observation.
+
+Required successor: observe bounded, non-sensitive fields from the actual snapshot and bind them to the requested operation, selected failure, and returned terminal. Capture the actual original assertion failure at the selected test/code/line boundary, or classify every other nonzero result as unrelated/inconclusive. Require all eight completed snapshot observations on a successful run; allow only the actually reached prefix plus the precisely observed failed assertion on the intended failure path. Validate raw required events when inspecting a saved capture, or clearly limit the inspector's classification to the evidence it actually validates. Add missing/wrong public ID, status, code, successful-snapshot-plus-teardown-failure, interruption, seven-omitted-success-snapshots, and missing-raw-pool controls. Do not promote a generic nonzero exit or missing capture to the desired failure.
+
+## What remains sound within scope
+
+The unchanged original test retains the real 16-running plus 16-queued saturation, refused 33rd callable, cancellation while physical work remains held, actual gate order, fixed timers, eight final `completed` assertions, and zero pool/permit drain. It uses the existing local delayed Composer double, not a paid planner call. The observer supplies no canonical authority, generation, capability, public acquire/release replacement, server-authored graph, tutorial branch, or business-policy rewrite.
+
+The pre/post source guards, exact worktree import checks in the child, original single test selection with `-n 0`, fresh process group, unique artifact directory, explicit observer-error count, event overflow failure, and restoration of trace functions in the protected pytest call are appropriate foundations. Failure JSON contains types/IDs and selected state, not exception messages, request bodies, bearer tokens, or provider arguments. It currently serializes no usable original public failure snapshot, as L4 describes. Unexpected exceptions outside the protected pytest call can bypass lineage publication; a successor should preserve best-effort incomplete diagnostic evidence without converting it to a valid capture.
+
+I read the parent's completed `tls-lineage1-root-static-controls.log` and `.exit`: exit 0 and `SOURCE_ONLY_CONTROLS_PASS: positive, 14 gate negatives, hook/source mutation, 9 lineage negatives`. This is parent-executed synthetic/source evidence, not my execution or native TLS proof. Those controls honestly reject their authored mutations; they do not cover L1–L4, and the positive fixtures themselves illustrate the completeness limits.
+
+## Release posture
+
+Keep this immutable package NO-GO. Review a frozen successor containing repaired instruments and the actual coherent source guards before any root-owned native diagnostic. A traced reproduction, isolated pass, or later failure still cannot prove the original full-suite cause without exact observed lineage and the separately scoped contention/comparator evidence. No `worker_lost` root cause, source-40 retry/timer change, policy-rank waiver, production GO, or Daybreak claim is made here.
+
+Prior canonical fixture package 1 NO-GO, all prior reports, the original 102 obligations, four collection obligations, two UNKNOWNs, and John’s local-testing/manual-Daybreak/merge decision remain unchanged.

@@ -1,29 +1,22 @@
 """Tests for the B1-r3 MeterProvider precondition in elspeth.web.app.
 
-Verifies that ``create_app()`` installs a real ``MeterProvider`` (not the OTel
-default ``NoOpMeterProvider``) and that the FastAPI app exposes a Prometheus
+Verifies that ``create_app()`` retains a real app-owned ``MeterProvider``
+(not the OTel default ``NoOpMeterProvider``) and exposes a Prometheus
 scrape endpoint at ``GET /metrics``.
 
-Process-global side effect notice
-----------------------------------
-``elspeth.web.app.create_app()`` sets the global OTel ``MeterProvider`` during
-application construction (process-global per OTel design, do_once semantics in
-OTel 1.41+).
-Once a real (non-NoOp) provider is set, subsequent ``set_meter_provider``
-calls are silently ignored — the old save/restore test pattern no longer works.
+Production and test installations
+---------------------------------
+The production installation reserves the process-global OTel provider once;
+OTel does not support saving and restoring that slot. Ordinary tests use the
+autouse owned test installation, which retains a real SDK provider and an
+isolated registry per app without setting the global provider. The global
+provider may therefore remain an OTel proxy in these tests. Assert on the
+app-owned runtime and installation when checking app construction.
 
-Tests in this module that need an isolated reader
-(``test_counter_emits_to_in_memory_reader``) use ``provider.get_meter()``
-directly rather than the global ``metrics.get_meter()`` API.  Module-level
-counters in production code (e.g. ``pass_through._VIOLATIONS_COUNTER``) can
-be intercepted by monkeypatching the module global with a counter created from
-a local provider — see ``tests/unit/engine/test_executors.py`` for the
-canonical pattern.
-
-Future test authors: if you write a test here that asserts no-op counter
-behaviour, you will be asserting against the *pre-B1-r3 state* and the test
-will fail. The correct baseline after B1-r3 is that counters emit; write tests
-that assert on emitted data.
+An isolated reader test uses ``provider.get_meter()`` directly. Production
+module-level counters can be intercepted with a counter from a local provider;
+see ``tests/unit/engine/test_executors.py``. Counter tests must assert emitted
+data rather than infer it from provider type alone.
 """
 
 from __future__ import annotations
@@ -31,7 +24,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
-from opentelemetry import metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from pydantic import SecretBytes
@@ -45,7 +37,7 @@ from starlette.routing import Route
 
 
 def test_meter_provider_is_not_noop(tmp_path: Path) -> None:
-    """``create_app()`` installs a real ``MeterProvider``, not the OTel default.
+    """``create_app()`` owns a real ``MeterProvider``, not the OTel default.
 
     This is the B1-r3 load-bearing precondition: without a real provider every
     counter in the codebase silently discards its data.
@@ -61,15 +53,12 @@ def test_meter_provider_is_not_noop(tmp_path: Path) -> None:
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=SecretBytes(b"\x00" * 32),
     )
-    create_app(settings)
+    app = create_app(settings)
 
-    provider = metrics.get_meter_provider()
-    # Must be the real SDK MeterProvider, NOT the OTel no-op.
-    from opentelemetry.sdk.metrics import MeterProvider as SDKMeterProvider
-
-    assert isinstance(provider, SDKMeterProvider), (
-        f"Expected MeterProvider but got {type(provider).__name__!r}. B1-r3 precondition not satisfied — set_meter_provider was not called."
-    )
+    runtime = app.state.operator_telemetry
+    provider = runtime.provider
+    assert isinstance(provider, MeterProvider), f"Expected app-owned MeterProvider but got {type(provider).__name__!r}."
+    assert runtime.cleanup_owner.installation.get_provider() is provider
 
 
 # ---------------------------------------------------------------------------
@@ -83,15 +72,15 @@ def test_counter_emits_to_in_memory_reader() -> None:
 
     Uses an isolated ``InMemoryMetricReader`` bound to its own ``MeterProvider``
     via direct provider access (NOT via the global ``metrics.get_meter()``).
-    This is hermetic with respect to whatever reader ``app.py`` installed
-    globally — after B1-r3 the global is a Prometheus provider that cannot
-    be overridden (OTel 1.41+ do_once semantics).
+    This is hermetic with respect to the app-owned test installation and
+    does not depend on the process-global OTel provider, which production
+    can install only once.
     """
     reader = InMemoryMetricReader()
     provider = MeterProvider(metric_readers=[reader])
     try:
         # Use provider.get_meter() directly — NOT the global metrics.get_meter().
-        # The global API goes through the process-level singleton set by app.py.
+        # The global API is separate from this isolated reader.
         meter = provider.get_meter("elspeth.test.b1r3")
         counter = meter.create_counter("test_counter_b1r3")
         counter.add(1, {"env": "test"})
@@ -136,8 +125,6 @@ def test_metrics_endpoint_returns_prometheus_format(tmp_path: Path) -> None:
     without the application lifespan or an AnyIO portal. The ``/metrics`` route
     is independent of the lifespan context; it works before ``yield`` completes.
     """
-    from opentelemetry import metrics
-
     from elspeth.web.app import create_app
     from elspeth.web.config import WebSettings
 
@@ -163,7 +150,8 @@ def test_metrics_endpoint_returns_prometheus_format(tmp_path: Path) -> None:
     # name, we anchor the test to actual emit behaviour.
     pin_meter_name = "test.meter_provider.endpoint_pin"
     pin_counter_name = "elspeth_test_metrics_endpoint_pin_total"
-    pin_meter = metrics.get_meter(pin_meter_name)
+    runtime = app.state.operator_telemetry
+    pin_meter = runtime.provider.get_meter(pin_meter_name)
     pin_counter = pin_meter.create_counter(
         pin_counter_name.removesuffix("_total"),
         description="Pin counter for /metrics exposition round-trip test.",
@@ -218,7 +206,7 @@ def test_metrics_endpoint_returns_prometheus_format(tmp_path: Path) -> None:
     )
     assert 'phase8_pr_review="s2"' in body, (
         "Pin counter attribute not preserved through the meter → reader → "
-        "exposition path.  Either the global REGISTRY is wired to a "
-        "different reader than the one /metrics reads, or attribute "
+        "exposition path.  Either the app-owned provider and retained "
+        "reader disagree, or attribute "
         f"serialisation has regressed.  Body head: {body[:500]!r}"
     )

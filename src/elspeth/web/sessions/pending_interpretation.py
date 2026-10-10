@@ -63,6 +63,7 @@ from elspeth.web.sessions.protocol import (
     InterpretationNodePluginMutatedError,
     InterpretationPlaceholderConsumedError,
     InterpretationResolveError,
+    PendingInterpretationPolicy,
     SessionCompositionStateCreation,
     SessionPendingInterpretationCommand,
     SessionPendingInterpretationDecision,
@@ -1736,7 +1737,11 @@ class _SessionPendingInterpretationPlanner:
         command: SessionPendingInterpretationCommand,
         snapshot: SessionPendingInterpretationSnapshot,
         validator: SessionPendingInterpretationValidator,
+        *,
+        policy: PendingInterpretationPolicy = PendingInterpretationPolicy.RECONCILE,
     ) -> SessionPendingInterpretationDecision:
+        if type(policy) is not PendingInterpretationPolicy:
+            raise TypeError("pending interpretation policy must be exact")
         if type(validator) is _SessionPendingInterpretationValidator:
             validator.assert_source_state(snapshot)
         event_id = command.event_id
@@ -1997,7 +2002,12 @@ class _SessionPendingInterpretationPlanner:
                         "create_pending_interpretation_event: pending source_data_contract review draft disagrees "
                         "with its immutable surfacing-state demand"
                     )
-            if not snapshot.review_disabled and matching_event_id is None and pending_identity == current_identity:
+            if (
+                policy is PendingInterpretationPolicy.RECONCILE
+                and not snapshot.review_disabled
+                and matching_event_id is None
+                and pending_identity == current_identity
+            ):
                 matching_event_id = site.event.id
             else:
                 rows_to_supersede.append(site.event.id)

@@ -3366,34 +3366,8 @@ def test_dashboard_metrics_preserve_one_row_per_metric() -> None:
     )
 
 
-def test_composer_wall_clock_fits_under_the_app_guard_and_the_alb() -> None:
-    """The composer wall clock must fail before the transport does.
-
-    The envelope is a coupled three-leg chain driven by one variable
-    (elspeth-09c91778f5): `var.alb_idle_timeout_seconds` sets the ALB
-    idle_timeout in `network.tf`, `locals.tf` wires the app's transport
-    ceiling env var to the same variable (so the boot guard validates
-    against the real proxy limit, not the WebSettings default), and
-    `var.composer_timeout_seconds`'s plan-time validation caps the wall
-    clock at the ceiling minus the app's headroom. A wall clock past the
-    proxy's patience would let the load balancer abort the connection
-    before the backend's own timeout fired, replacing the discriminated
-    422 (which persists the partial pipeline) with an opaque 504 (which
-    does not). That is a live-only failure, so it is caught here.
-
-    The chain replaced independent literals that had to agree by
-    discipline: 300/240 (elspeth-f159d2394b) could not fund the shipped
-    corpus — battery round-5 g03's first authoring call lands at t=413s
-    and its compose settles at ~490-514s, so the ceiling itself was the
-    defect, not the wall-clock's margin under it.
-
-    Headroom is still read from the `WebSettings` field default, which is
-    only the value the task actually boots with while this module ships no
-    environment override for it — so the absence of a headroom override is
-    asserted rather than assumed. The ceiling, by contrast, IS shipped as
-    an override now, and this test asserts it is wired to the ALB variable
-    verbatim rather than pinned to a divergent literal.
-    """
+def test_composer_job_defaults_and_real_transport_mirror_are_retained() -> None:
+    """The real transport mirror and independent positive job defaults are retained."""
     tf_sources = "\n".join(path.read_text(encoding="utf-8") for path in _source_files() if path.name.endswith(".tf"))
     assert "ELSPETH_WEB__COMPOSER_TRANSPORT_HEADROOM_" not in tf_sources, (
         "the module now overrides the composer transport headroom, so this test's headroom "
@@ -3432,22 +3406,6 @@ def test_composer_wall_clock_fits_under_the_app_guard_and_the_alb() -> None:
     assert var_match is not None, "var.composer_timeout_seconds no longer declares a default; a stock install would prompt for it"
     timeout_seconds = float(var_match.group("seconds"))
 
-    cap_match = re.search(
-        r'variable\s+"composer_timeout_seconds"\s*\{.*?condition\s*=[^\n]*<=\s*var\.alb_idle_timeout_seconds\s*-\s*(?P<headroom>[\d.]+)',
-        variables_text,
-        re.DOTALL,
-    )
-    assert cap_match is not None, (
-        "var.composer_timeout_seconds lost its plan-time validation cap against "
-        "var.alb_idle_timeout_seconds; an over-limit value would be discovered at service roll "
-        "instead of terraform plan"
-    )
-    assert float(cap_match.group("headroom")) == headroom, (
-        f"the plan-time validation's headroom literal {cap_match.group('headroom')}s no longer "
-        f"mirrors the WebSettings composer_transport_headroom_seconds default ({headroom}s); "
-        f"a plan-clean value could still refuse to boot"
-    )
-
     assert re.search(
         r"idle_timeout\s*=\s*var\.alb_idle_timeout_seconds",
         _text("modules/scenario/network.tf"),
@@ -3456,11 +3414,7 @@ def test_composer_wall_clock_fits_under_the_app_guard_and_the_alb() -> None:
         "the transport ceiling env var would advertise a limit the proxy does not honour"
     )
 
-    assert timeout_seconds + headroom <= alb_idle_seconds, (
-        f"composer timeout {timeout_seconds}s plus {headroom}s headroom exceeds the ALB "
-        f"idle_timeout {alb_idle_seconds}s; the ALB would abort with a 504 before the "
-        f"composer returned its 422 and the partial pipeline would be lost."
-    )
+    assert alb_idle_seconds > headroom
 
     # The floor matters as much as the ceiling now: the corpus needs ~490-514s
     # of compose wall (round-5 arm-B g03), so a default that drifts back under
@@ -3470,6 +3424,89 @@ def test_composer_wall_clock_fits_under_the_app_guard_and_the_alb() -> None:
         f"the shipped corpus (g03 ~490-514s compose) would no longer be fundable at package defaults "
         f"(elspeth-09c91778f5)"
     )
+
+
+@pytest.mark.parametrize(("budget", "accepted"), [(1200, True), (0, False), (-1, False)])
+@pytest.mark.terraform
+def test_durable_composer_job_budget_executes_independently_of_socket_ceiling(tmp_path: Path, budget: int, accepted: bool) -> None:
+    """Execute the complete shipped variable declarations without any provider."""
+    _require_terraform("durable composer job validation must execute")
+    variables = _text("modules/scenario/variables.tf")
+    declarations = []
+    for name in ("alb_idle_timeout_seconds", "composer_timeout_seconds"):
+        match = re.search(r'variable "' + name + r'" \{.*?\n\}\n', variables, re.DOTALL)
+        assert match is not None
+        declarations.append(match.group(0))
+    (tmp_path / "main.tf").write_text("\n".join(declarations), encoding="utf-8")
+    subprocess.run(
+        ["terraform", f"-chdir={tmp_path}", "init", "-backend=false", "-input=false", "-no-color"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    result = subprocess.run(
+        [
+            "terraform",
+            f"-chdir={tmp_path}",
+            "plan",
+            "-input=false",
+            "-no-color",
+            "-var=alb_idle_timeout_seconds=60",
+            f"-var=composer_timeout_seconds={budget}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
+
+
+_GATEWAY_PROBE_ENV = {
+    "ELSPETH_LLM_GATEWAY_INBOUND_BEARER": "b" * 40,
+    "ELSPETH_LLM_GATEWAY_ADAPTER": "example_adapter",
+    "ELSPETH_LLM_GATEWAY_UPSTREAM_ORIGIN": "https://upstream.example.com",
+    "ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL": "https://auth.example.com/token",
+    "ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_ID": "client-id-value",
+    "ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_SECRET": "c" * 40,
+    "ELSPETH_LLM_GATEWAY_OAUTH_AUTH_METHOD": "client_secret_basic",
+    "ELSPETH_LLM_GATEWAY_OAUTH_SCOPES": "read write",
+    "ELSPETH_LLM_GATEWAY_MAX_MESSAGES": "50",
+    "ELSPETH_LLM_GATEWAY_MAX_TOOLS": "10",
+    "ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS": "10000",
+    "ELSPETH_LLM_GATEWAY_MAX_SCHEMA_BYTES": "65536",
+    "ELSPETH_LLM_GATEWAY_MAX_SCHEMA_DEPTH": "10",
+    "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS": '{"gpt-4o": {"target": "backend-a"}}',
+}
+
+
+def test_readme_states_the_gateway_per_call_bound_the_module_ships() -> None:
+    ecs = _text("modules/scenario/ecs.tf")
+    gateway = ecs[ecs.index("gateway_container = {") : ecs.index("candidate_web_container = {")]
+    assert "ELSPETH_LLM_GATEWAY_INBOUND_BEARER" in gateway
+    assert "REQUEST_TIMEOUT_SECONDS" not in gateway
+    locals_text = _text("modules/scenario/locals.tf")
+    assert "value = local.gateway_base_url" in locals_text
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, sys; from elspeth_llm_gateway.core.config import load_config; "
+            "print(json.dumps(load_config(json.loads(sys.argv[1])).request_timeout_seconds))",
+            json.dumps(_GATEWAY_PROBE_ENV),
+        ],
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "gateway" / "src")},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    per_call_seconds = json.loads(probe.stdout)
+    assert isinstance(per_call_seconds, float) and per_call_seconds > 0
+    readme = " ".join(_text("README.md").split())
+    section = readme[readme.index("### Composer wall-clock budget") : readme.index("### Composer reasoning effort")]
+    assert "ELSPETH_LLM_GATEWAY_REQUEST_TIMEOUT_SECONDS" in section
+    assert f"default of {per_call_seconds:g} seconds" in section
 
 
 def test_composer_candidate_reasoning_effort_is_pinned_to_the_measured_value() -> None:

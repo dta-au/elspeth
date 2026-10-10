@@ -1,0 +1,532 @@
+{
+  "scope": "Design adjudication only; no source GO; stdlib source/AST only; no candidate or production execution",
+  "phase_a_sha256": "0ef02df80540752ada25ae4996997f054cd3140821f0ff90fd8e6bb12125f0af",
+  "phase_b_attribution_matches": {
+    "reserve_scanner_candidate.py": "06cddb46f91b64faeba8a9cebd7d56509662799991b7469ed7cb72c45f6c5dab",
+    "canonical-scanner-package/scanner.replacement.py": "ec353c2d06092b7079901c1c1babc5b8952037bbcd35b85f65b1a418ec86d466",
+    "canonical-scanner-package/complete.patch": "b659b2607d02510269fadee460067b928eccc208ee46731f7ef244fffb976d3a",
+    "phase_b_public_controls.py": "4193367cc87ac6774dda42ec7aa4b0900ddd2d6e8eb4f268b80560540a4b7f30",
+    "unresolved_namespace_diagnostic.py": "c9d281700fdb4019fc910a7244e0919a2ab109dcc54babf81a5e236a7e177f43"
+  },
+  "changed_byte_control": true,
+  "phase_a_to_b_changed_reserve_methods": [
+    "dispatch_failures"
+  ],
+  "diagnostic_outcomes": {
+    "src/elspeth/web/_reflection_ordinary.py": {
+      "certificate": true,
+      "public_reserve_refused": false,
+      "global_failures": [],
+      "public_violations": []
+    },
+    "src/elspeth/web/_reflection_unresolved_namespace_name.py": {
+      "certificate": true,
+      "public_reserve_refused": false,
+      "global_failures": [],
+      "public_violations": []
+    }
+  },
+  "diagnostic_native_receipt": {
+    "exit": 0,
+    "chunk": "26b6b2",
+    "log": "unresolved-namespace-diagnostic.log",
+    "instrument": "unresolved_namespace_diagnostic.py",
+    "result": "unresolved_namespace_diagnostic.json",
+    "meaning": "diagnostic observed false-clearance; not a repaired-control pass"
+  },
+  "diagnostic_files_sha256": {
+    "unresolved_namespace_diagnostic.py": "c9d281700fdb4019fc910a7244e0919a2ab109dcc54babf81a5e236a7e177f43",
+    "unresolved_namespace_diagnostic.json": "46ce4714da72575ec6882bba6663cb169056cacd6829345bf076a4cb4568e546",
+    "unresolved-namespace-diagnostic.log": "dc4de7bad6a8b2f896e474e2db196c1eeda321099f5212b4df242629f39f336c",
+    "phase-b-completed-exits.json": "bef41706bde5603292e08f294ca4908de5713cc39b9aa346a6f750be68c14948",
+    "DYNAMIC-SELECTOR-BLOCKER.md": "7a9d38d73fa1234e9a1b2c18b0713857b1e80a358756a210132855126528481e"
+  },
+  "supplied_inventory_rows_checked": 35,
+  "inventory_not_claimed_complete": true,
+  "selector_position_positive_negative_controls": true,
+  "annotated_inventory": [
+    {
+      "path": "src/elspeth/contracts/composer_llm_audit.py",
+      "line": 339,
+      "symbol": "ComposerLLMCall.to_dict",
+      "call": "getattr(self, field.name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "field.name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/contracts/events.py",
+      "line": 543,
+      "symbol": "_event_field_to_serializable",
+      "call": "getattr(obj, f.name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "f.name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/contracts/events.py",
+      "line": 782,
+      "symbol": "ExternalCallCompleted.to_dict",
+      "call": "getattr(self, f.name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "f.name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/contracts/freeze.py",
+      "line": 120,
+      "symbol": "freeze_fields",
+      "call": "getattr(instance, name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/contracts/runtime_val_manifest.py",
+      "line": 168,
+      "symbol": "_function_builtin_bindings",
+      "call": "object.__getattribute__(func, '__builtins__')",
+      "name_values": [
+        null,
+        "__builtins__"
+      ],
+      "actual_selector_source": "'__builtins__'",
+      "actual_selector_literal": "__builtins__",
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/contracts/value_source.py",
+      "line": 171,
+      "symbol": "find_value_source_config",
+      "call": "plugin.__getattribute__(attr_name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "attr_name",
+      "actual_selector_literal": null,
+      "form": "bound source form requiring receiver binding proof"
+    },
+    {
+      "path": "src/elspeth/core/landscape/serialization.py",
+      "line": 66,
+      "symbol": "dataclass_to_dict",
+      "call": "getattr(obj, field_name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "field_name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/core/llm_pricing.py",
+      "line": 84,
+      "symbol": "provider_cost_from_captured_usage",
+      "call": "object.__getattribute__(response, '__pydantic_private__')",
+      "name_values": [
+        null,
+        "__pydantic_private__"
+      ],
+      "actual_selector_source": "'__pydantic_private__'",
+      "actual_selector_literal": "__pydantic_private__",
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/core/security/__init__.py",
+      "line": 96,
+      "symbol": "__getattr__",
+      "call": "getattr(import_module(module_name), attr_name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "attr_name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/engine/__init__.py",
+      "line": 78,
+      "symbol": "__getattr__",
+      "call": "getattr(import_module('elspeth.engine.orchestrator'), name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/engine/orchestrator/__init__.py",
+      "line": 64,
+      "symbol": "__getattr__",
+      "call": "getattr(import_module('elspeth.engine.orchestrator.types'), name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/engine/orchestrator/__init__.py",
+      "line": 66,
+      "symbol": "__getattr__",
+      "call": "getattr(import_module('elspeth.engine.orchestrator.plugin_types'), name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/engine/orchestrator/__init__.py",
+      "line": 68,
+      "symbol": "__getattr__",
+      "call": "getattr(import_module('elspeth.engine.orchestrator.core'), name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/engine/orchestrator/counter_classification.py",
+      "line": 146,
+      "symbol": "apply_counter_increments",
+      "call": "getattr(counters, field_name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "field_name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/engine/orchestrator/outcomes.py",
+      "line": 216,
+      "symbol": "reconcile_sink_write_diversions",
+      "call": "getattr(counters, field_name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "field_name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/engine/orchestrator/outcomes.py",
+      "line": 235,
+      "symbol": "reconcile_sink_write_diversions",
+      "call": "getattr(counters, field_name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "field_name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/engine/orchestrator/preflight.py",
+      "line": 988,
+      "symbol": "_read_field",
+      "call": "config.__getattribute__(field_name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "field_name",
+      "actual_selector_literal": null,
+      "form": "bound source form requiring receiver binding proof"
+    },
+    {
+      "path": "src/elspeth/plugins/infrastructure/base.py",
+      "line": 1627,
+      "symbol": "BaseTransform._config_named_input_columns",
+      "call": "getattr(validated, name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/plugins/infrastructure/templates.py",
+      "line": 417,
+      "symbol": "_LocalSandboxedEnvironment.getattr",
+      "call": "super().getattr(obj, attribute)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "attribute",
+      "actual_selector_literal": null,
+      "form": "method named getattr; distinct supplier proof required"
+    },
+    {
+      "path": "src/elspeth/plugins/transforms/aws/textract_document_analysis.py",
+      "line": 280,
+      "symbol": "AWSTextractDocumentAnalysisConfig._consistency",
+      "call": "getattr(self.extract, facet_name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "facet_name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/plugins/transforms/aws/textract_document_analysis.py",
+      "line": 316,
+      "symbol": "AWSTextractDocumentAnalysisConfig.configured_output_fields",
+      "call": "getattr(self.extract, facet_name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "facet_name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/plugins/transforms/azure/document_intelligence.py",
+      "line": 255,
+      "symbol": "AzureDocumentIntelligenceConfig.configured_output_fields",
+      "call": "getattr(self.extract, attr)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "attr",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/telemetry/exporters/console.py",
+      "line": 214,
+      "symbol": "ConsoleExporter._extract_pretty_details",
+      "call": "getattr(event, field_name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "field_name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/web/composer/llm_response_parsing.py",
+      "line": 401,
+      "symbol": "_provider_artifact_owned_fields",
+      "call": "object.__getattribute__(value, '__dict__')",
+      "name_values": [
+        null,
+        "__dict__"
+      ],
+      "actual_selector_source": "'__dict__'",
+      "actual_selector_literal": "__dict__",
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/web/composer/pipeline_planner.py",
+      "line": 1543,
+      "symbol": "_provider_fields",
+      "call": "object.__getattribute__(value, '__pydantic_extra__')",
+      "name_values": [
+        null,
+        "__pydantic_extra__"
+      ],
+      "actual_selector_source": "'__pydantic_extra__'",
+      "actual_selector_literal": "__pydantic_extra__",
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/web/composer/protocol.py",
+      "line": 1366,
+      "symbol": "ToolArgumentError.argument",
+      "call": "BaseException.__getattribute__(self, '_safe_argument')",
+      "name_values": [
+        null,
+        "_safe_argument"
+      ],
+      "actual_selector_source": "'_safe_argument'",
+      "actual_selector_literal": "_safe_argument",
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/web/composer/protocol.py",
+      "line": 1378,
+      "symbol": "ToolArgumentError.expected",
+      "call": "BaseException.__getattribute__(self, '_safe_expected')",
+      "name_values": [
+        null,
+        "_safe_expected"
+      ],
+      "actual_selector_source": "'_safe_expected'",
+      "actual_selector_literal": "_safe_expected",
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/web/composer/protocol.py",
+      "line": 1397,
+      "symbol": "ToolArgumentError.actual_type",
+      "call": "BaseException.__getattribute__(self, '_safe_actual_type')",
+      "name_values": [
+        null,
+        "_safe_actual_type"
+      ],
+      "actual_selector_source": "'_safe_actual_type'",
+      "actual_selector_literal": "_safe_actual_type",
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/web/composer/protocol.py",
+      "line": 1415,
+      "symbol": "ToolArgumentError.code",
+      "call": "BaseException.__getattribute__(self, '_safe_code')",
+      "name_values": [
+        null,
+        "_safe_code"
+      ],
+      "actual_selector_source": "'_safe_code'",
+      "actual_selector_literal": "_safe_code",
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/web/composer/protocol.py",
+      "line": 1431,
+      "symbol": "ToolArgumentError.category",
+      "call": "BaseException.__getattribute__(self, '_safe_category')",
+      "name_values": [
+        null,
+        "_safe_category"
+      ],
+      "actual_selector_source": "'_safe_category'",
+      "actual_selector_literal": "_safe_category",
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/web/composer/protocol.py",
+      "line": 1452,
+      "symbol": "ToolArgumentError.schema_violations",
+      "call": "BaseException.__getattribute__(self, '_safe_schema_violations')",
+      "name_values": [
+        null,
+        "_safe_schema_violations"
+      ],
+      "actual_selector_source": "'_safe_schema_violations'",
+      "actual_selector_literal": "_safe_schema_violations",
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/web/operator_telemetry_custody.py",
+      "line": 57,
+      "symbol": "_sdk_field",
+      "call": "object.__getattribute__(instance, name)",
+      "name_values": [
+        null,
+        null
+      ],
+      "actual_selector_source": "name",
+      "actual_selector_literal": null,
+      "form": "known unbound source form"
+    },
+    {
+      "path": "src/elspeth/web/preferences/service.py",
+      "line": 381,
+      "symbol": "PreferencesService.update_composer_preferences._sync._resolve_progress",
+      "call": "getattr(payload, name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/web/preferences/service.py",
+      "line": 386,
+      "symbol": "PreferencesService.update_composer_preferences._sync._resolve_progress",
+      "call": "getattr(prior_prefs, name)",
+      "name_values": [
+        null
+      ],
+      "actual_selector_source": "name",
+      "actual_selector_literal": null,
+      "form": "builtin-shaped getattr"
+    },
+    {
+      "path": "src/elspeth/web/operator_telemetry_dispatch.py",
+      "line": 51,
+      "symbol": "_owned_method",
+      "call": "object.__getattribute__(value, name)",
+      "name_values": [
+        null,
+        null
+      ],
+      "actual_selector_source": "name",
+      "actual_selector_literal": null,
+      "form": "known unbound source form"
+    }
+  ],
+  "actual_source_hashes": {
+    "src/elspeth/contracts/composer_llm_audit.py": "a5047b189cfaf7d9ee2480b9fa95f208d1936d4df76f43ebfefde6a325f09847",
+    "src/elspeth/contracts/events.py": "10e0bc945471eb48ff823981315b76512c60c81d97d517412651934b9d8cc5e8",
+    "src/elspeth/contracts/freeze.py": "d6266397bc59d6165215b0cde515410063901fb782c226309522e0570730e420",
+    "src/elspeth/contracts/runtime_val_manifest.py": "497388d77de4b6bebeff5705f518fc7ef9bc72abee58c93b2c76f2e953e9c0b4",
+    "src/elspeth/contracts/value_source.py": "a18cfa8429080d1709def38f1384304871fc5de68f07e0ed68df9b098f3ebab2",
+    "src/elspeth/core/landscape/serialization.py": "4a7508c44f7eff022e283be454b232e8c878637685162f2d52c1797302780da2",
+    "src/elspeth/core/llm_pricing.py": "6a4970506d4ff730573276f2c7a8564bf8c7d2fabfb85e35677858dca9f08c87",
+    "src/elspeth/core/security/__init__.py": "3cfcfd49a99b66f131f854e6320dc55d0640599cf944c0e834fef838575efc7c",
+    "src/elspeth/engine/__init__.py": "5c836800525af780f28154a64905f67e0b1f3a947eda9929bc976a5362711c45",
+    "src/elspeth/engine/orchestrator/__init__.py": "b4124e8fce594983ea567a401caab1f324869b77030455af8785b6bb19aa6391",
+    "src/elspeth/engine/orchestrator/counter_classification.py": "32a3a06fe0b8f70e86d192e289341e13c3549fbc4240c180be56e8430c928c2e",
+    "src/elspeth/engine/orchestrator/outcomes.py": "4039adddebd466c38f6250641a3d321c6ab8b97c254c94737b65de733b25d171",
+    "src/elspeth/engine/orchestrator/preflight.py": "a08928a9ea65b961c34d8b54b7e15e1e7fca150db601b6317e3acb2e28ee0a86",
+    "src/elspeth/plugins/infrastructure/base.py": "97284fa8ac7b00b6b7541e5a74156c84ee8fd024bfdf725d260f58171ee5aabe",
+    "src/elspeth/plugins/infrastructure/templates.py": "2201216f8193c4a12c926a02dc9c9f75073da2a573a91e3dc3f9582be9220c6d",
+    "src/elspeth/plugins/transforms/aws/textract_document_analysis.py": "888ac209c0d7dea1bc38c5e8fdde683b27ccd5c228702ab3c4155d9d960da372",
+    "src/elspeth/plugins/transforms/azure/document_intelligence.py": "9e944d1fae147842158a14b9400fca1eda4013841a482b11546d0c09d2872d7d",
+    "src/elspeth/telemetry/exporters/console.py": "f16e717b144a246b1cb1168acae4db0c88959dcf416501c98879b02e84c2cd61",
+    "src/elspeth/web/composer/llm_response_parsing.py": "56210fe5ef192acc4a3c5bc44266ce03956a7e8f792f3eab5684a78e5c6b1a02",
+    "src/elspeth/web/composer/pipeline_planner.py": "c09a0a6dc877cb7039c40e3f4d66d518ca5b63dfc145e3e2302f49905494fb4a",
+    "src/elspeth/web/composer/protocol.py": "063e2c16eab2757f8c7e6fcb62cd6901d839fe90245572972db6f67a67669ab5",
+    "src/elspeth/web/operator_telemetry_custody.py": "804c2c9122b2657e5157a4ffa8a292f0dc2bf8ab0affaf22bccc38efb0f17fd1",
+    "src/elspeth/web/preferences/service.py": "94bdb10fe73fd496c17b63a3e93fbdf5e41097293b3eebc4d6db8c78e2d0f05e",
+    "src/elspeth/web/operator_telemetry_dispatch.py": "3d77f1b4c36e8505be3efd9b6dd85172fab3c2eaf3933ce236c9a9e9d4638035"
+  },
+  "sdk_internal_literal_selectors": [
+    "_atexit_handler",
+    "_collect",
+    "_collector_to_names",
+    "_daemon_thread",
+    "_export_interval_millis",
+    "_export_lock",
+    "_export_timeout_millis",
+    "_exporter",
+    "_lock",
+    "_measurement_consumer",
+    "_sdk_config",
+    "_shutdown",
+    "_shutdown_event",
+    "_shutdown_once",
+    "metric_readers"
+  ],
+  "sdk_helper_not_claimed_confined_by_inventory": true,
+  "preferences_local_literal_producer": [
+    "tutorial_stage",
+    "tutorial_session_id",
+    "tutorial_run_id",
+    "tutorial_source_data_hash"
+  ],
+  "local_jinja_supplier_sha256": "330d9a8ad958d88f256bb15885c5f6606f41b5461c2e70f41a1ddddbd7035ab6"
+}

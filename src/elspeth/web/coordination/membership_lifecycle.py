@@ -18,12 +18,14 @@ import asyncio
 import threading
 from abc import ABC, abstractmethod
 from enum import StrEnum
+from functools import partial
 from typing import final
 
 import structlog
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
-from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.application_finalizers import ApplicationFinalizerKind, ApplicationFinalizerOwner
+from elspeth.web.async_workers import run_application_finalizer_in_worker, run_sync_in_worker
 from elspeth.web.coordination.membership_authority import (
     RepositoryWebInstanceMembershipAuthority,
     WebInstanceIdentity,
@@ -62,8 +64,8 @@ class WebInstanceMembership(ABC):
 
     __slots__ = ("_draining",)
 
-    def __init__(self) -> None:
-        self._draining = threading.Event()
+    def __init__(self, *, instance_draining: threading.Event) -> None:
+        self._draining = instance_draining
 
     @property
     def draining(self) -> threading.Event:
@@ -101,7 +103,17 @@ class SingleProcessWebInstanceMembership(WebInstanceMembership):
 class RegisteredWebInstanceMembership(WebInstanceMembership):
     """Registers one process, renews its lease, and records drain and stop."""
 
-    __slots__ = ("_authority", "_heartbeat_task", "_identity", "_interval_seconds", "_lease_seconds", "_log", "_process_recovery")
+    __slots__ = (
+        "_authority",
+        "_drain_capability",
+        "_heartbeat_task",
+        "_identity",
+        "_interval_seconds",
+        "_lease_seconds",
+        "_log",
+        "_process_recovery",
+        "_stop_capability",
+    )
 
     def __init__(
         self,
@@ -110,13 +122,15 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         *,
         lease_seconds: int,
         interval_seconds: int | None = None,
-        process_recovery: ProcessRecovery | None = None,
+        process_recovery: ProcessRecovery,
+        instance_draining: threading.Event,
+        finalizer_owner: ApplicationFinalizerOwner,
     ) -> None:
         if type(authority) is not RepositoryWebInstanceMembershipAuthority:
             raise TypeError("authority must be a RepositoryWebInstanceMembershipAuthority")
         if type(identity) is not WebInstanceIdentity:
             raise TypeError("identity must be a WebInstanceIdentity")
-        super().__init__()
+        super().__init__(instance_draining=instance_draining)
         self._authority = authority
         self._identity = identity
         self._lease_seconds = lease_seconds
@@ -126,7 +140,14 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         self._interval_seconds = resolved_interval
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._log = structlog.get_logger("web.membership")
-        self._process_recovery = ProcessRecovery() if process_recovery is None else process_recovery
+        self._process_recovery = process_recovery
+        self._drain_capability = finalizer_owner.register(
+            ApplicationFinalizerKind.MEMBERSHIP_DRAIN,
+            partial(self._authority.begin_drain, self._identity.instance_id, lease_seconds=self._lease_seconds),
+        )
+        self._stop_capability = finalizer_owner.register(
+            ApplicationFinalizerKind.MEMBERSHIP_STOP, partial(self._authority.stop, self._identity.instance_id)
+        )
 
     @property
     def identity(self) -> WebInstanceIdentity:
@@ -180,7 +201,7 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         """Fail readiness locally first; the row write's outcome is returned, never hidden."""
         self._draining.set()
         try:
-            await run_sync_in_worker(self._authority.begin_drain, self._identity.instance_id, lease_seconds=self._lease_seconds)
+            await run_application_finalizer_in_worker(self._drain_capability)
         except (SQLAlchemyError, WebInstanceMembershipLost) as exc:
             # Shutdown proceeds whether or not the database can be reached or
             # the row still exists: a drain write that fails leaves the row
@@ -208,7 +229,7 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
             if not task.cancelled():
                 heartbeat_failure = task.exception()
         try:
-            await run_sync_in_worker(self._authority.stop, self._identity.instance_id)
+            await run_application_finalizer_in_worker(self._stop_capability)
         except (SQLAlchemyError, WebInstanceMembershipLost) as exc:
             # A stop write that fails leaves the row active or draining with a
             # live lease; peers take over once it expires instead of at once.

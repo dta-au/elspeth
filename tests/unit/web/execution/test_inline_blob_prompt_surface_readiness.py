@@ -12,6 +12,7 @@ failed after creation. These tests feed ONE state fixture to both paths.
 from __future__ import annotations
 
 import hashlib
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +30,7 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution._validation_materialization import llm_prompt_surface_field
 from elspeth.web.execution.preflight import resolve_runtime_yaml_paths
 from elspeth.web.execution.service import InlineBlobPromptSurfaceAdmissionError
@@ -38,6 +40,10 @@ from elspeth.web.interpretation_state import (
     model_choice_artifact_hash,
     prompt_review_anchor_hash_from_options,
 )
+from tests.helpers import execution_custody
+from tests.helpers.execution_custody import ExecutionTestCustody
+
+execution_fixture = execution_custody.execution_fixture
 
 _MODEL = "openai/gpt-4o"
 _CONTENT = b"prompt text"
@@ -253,13 +259,17 @@ def test_validate_admits_llm_authored_blob_outside_the_prompt_surface(tmp_path: 
 # ── parity: the same fixture at run admission ───────────────────────────────
 
 
-def _run_admission(tmp_path: Path, field: str, modality: CreationModality) -> tuple[BaseException | None, Any, Any]:
+def _run_admission(
+    tmp_path: Path, field: str, modality: CreationModality, execution_fixture: ExecutionTestCustody
+) -> tuple[BaseException | None, Any, Any]:
     """Drive ``_run_pipeline`` with the runtime YAML the composer generates for the same state.
 
     Returns what the run raised, the fake blob service and the fake session
     service, so a caller can see how far past inline-blob admission it got.
     """
-    service, session_service, loop = agreement.TestComposerRuntimeBlobInlineAgreement._execution_service(tmp_path)
+    service, session_service, loop = agreement.TestComposerRuntimeBlobInlineAgreement._execution_service(
+        tmp_path, execution_fixture=execution_fixture
+    )
     record = replace(_record(modality), session_id=session_service.run.session_id)
     blob_service = agreement._FakeBlobService(blob_record=record, content=_CONTENT)
     cast(Any, service)._blob_service = blob_service
@@ -277,24 +287,25 @@ def _run_admission(tmp_path: Path, field: str, modality: CreationModality) -> tu
         patch("elspeth.web.execution.service.open_landscape_db"),
         patch("elspeth.web.execution.service.FilesystemPayloadStore"),
     ):
-        lease = agreement._execute_lease(loop, session_service.run.session_id)
+        lease: SessionOperationLease | None = None
         try:
-            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=lease)
-        except Exception as exc:
-            raised = exc
+            lease = agreement._execute_lease(loop, session_service.run.session_id, service=service, execution_fixture=execution_fixture)
+            try:
+                service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=lease)
+            except Exception as exc:
+                raised = exc
         finally:
-            loop.run_until_complete(lease.close())
-            loop.close()
+            agreement._close_direct_runtime_probe(loop, lease, execution_fixture, sys.exc_info()[1] or raised)
     return raised, blob_service, session_service
 
 
 @pytest.mark.parametrize("modality", _LLM_AUTHORED_MODALITIES, ids=lambda modality: modality.value)
 @pytest.mark.parametrize("field", _GUARDED_FIELDS)
 def test_validate_and_run_admission_both_refuse_the_same_llm_authored_fixture(
-    tmp_path: Path, field: str, modality: CreationModality
+    tmp_path: Path, field: str, modality: CreationModality, execution_fixture: ExecutionTestCustody
 ) -> None:
     validate_result = _validate(tmp_path / "validate", field, modality)
-    raised, blob_service, session_service = _run_admission(tmp_path / "run", field, modality)
+    raised, blob_service, session_service = _run_admission(tmp_path / "run", field, modality, execution_fixture)
 
     assert validate_result.is_valid is False
     assert _blob_check(validate_result).detail == f"node:classify.options.{field}: llm_authored"
@@ -306,9 +317,11 @@ def test_validate_and_run_admission_both_refuse_the_same_llm_authored_fixture(
 
 
 @pytest.mark.parametrize("field", _GUARDED_FIELDS)
-def test_validate_and_run_admission_both_admit_the_same_user_uploaded_fixture(tmp_path: Path, field: str) -> None:
+def test_validate_and_run_admission_both_admit_the_same_user_uploaded_fixture(
+    tmp_path: Path, field: str, execution_fixture: ExecutionTestCustody
+) -> None:
     validate_result = _validate(tmp_path / "validate", field, CreationModality.VERBATIM)
-    raised, blob_service, session_service = _run_admission(tmp_path / "run", field, CreationModality.VERBATIM)
+    raised, blob_service, session_service = _run_admission(tmp_path / "run", field, CreationModality.VERBATIM, execution_fixture)
 
     assert _blob_check(validate_result).passed is True
     # Admission passed, and substitution completed against the pinned hash: the

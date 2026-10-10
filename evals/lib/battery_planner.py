@@ -185,6 +185,11 @@ def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
         else (f"surface {surface} != expected {expected_surface}" if surface != "undetermined" else "surface undetermined")
     )
     post = next((h for h in (cap.meta.get("http") or []) if h.get("step") == "post_message"), {})
+    durable = next(
+        (h for h in reversed(cap.meta.get("http") or []) if h.get("step") == "composer_operation" and "terminal_status" in h), None
+    )
+    if durable is not None:
+        post = {**post, "status": durable["terminal_status"]}
     terminal = cap.meta.get("server_terminal") or {}
     excluded, evidence = instrument_exclusion(parse_instrument(cap.meta), post.get("status"))
     need = required_information(args)
