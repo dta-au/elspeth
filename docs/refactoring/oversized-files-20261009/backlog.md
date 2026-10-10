@@ -1,11 +1,13 @@
 # Remaining oversized-file backlog on the published streaming base
 
-This backlog uses committed config tip `c4eb6565ef725b39a283663ca2869df8e9eb6298` on published PR281 `9f26833c8f6a7c56abd2c5b35c80484ebe0c82bc`, plus the processor continuation measured after its writer reported frozen source. All four processor test modules are now below 5,000 lines; bounded validation and independent review are complete with no introduced findings. [processor-continuation.md](processor-continuation.md) records implementation and validation evidence; [processor-continuation-review.md](processor-continuation-review.md) records independent approval. Configuration decomposition is complete and independently approved with no introduced findings; [config-slice.md](config-slice.md) and [config-review.md](config-review.md) record its evidence. The historical main-based inventory remains useful baseline evidence, but its sizes are not the current tree. This is not a whole-project completion claim.
+This backlog uses committed processor-continuation tip `d38890ddcc5c6e3d570af645d5e3a25efddfea2a` on published PR281 `9f26833c8f6a7c56abd2c5b35c80484ebe0c82bc`, plus the lint CLI parser extraction measured after frozen-source notification. The explicitly released grammar slice now measures 4,951 lines in the original CLI and 1,206 in `core/cli_parser.py`. Bounded validation and independent approval are complete with no introduced findings; production full premerge verification remains pending streaming priority and capacity release. [cli-parser.md](cli-parser.md) records implementation and validation evidence; [cli-parser-review.md](cli-parser-review.md) records independent approval. Dispatch, findings, signing/rekey behavior and policy remain in the original CLI. Processor and configuration test decomposition are complete with independent approval and no introduced findings; their linked reports below preserve the bounded evidence. The historical main-based inventory remains useful baseline evidence, but its sizes are not the current tree. This is not a whole-project completion claim.
 
 ## Current scope and measured evidence
 
-- Current committed base: `c4eb6565ef725b39a283663ca2869df8e9eb6298`, measured by the controlled Git-blob inventory script with self-test process exit 0.
-- Processor continuation frozen-source manifest: `processor-continuation/frozen-source-files.json`, SHA-256 `4c8e6664d6160f8c3d80bfd29b9674875e26d17adf0baa2b3d52199b867965d1`. All four source hashes and line counts matched. All 26 target rows were remeasured; the other 25 union targets exactly matched committed config-tip blobs. Second byte reads matched first reads; the observation is not an atomic locked snapshot. The existing transform-execution module remains byte-identical to its committed blob.
+- Current committed base: `d38890ddcc5c6e3d570af645d5e3a25efddfea2a`, measured by the controlled Git-blob inventory script with self-test process exit 0.
+- Frozen CLI source record: `cli-parser/candidate-source-parity.json`, SHA-256 `7ca65841a76d789325ae7019dc8583fc22aeb41093c9edda772bf8e11baf3348`. Both source hashes and line counts matched. All 26 target rows and the new parser module were measured; the other 25 union targets exactly matched committed processor-tip blobs. Second byte reads matched first reads; the observation is not an atomic locked snapshot.
+- Streaming owner explicitly released the narrow lint parser extraction and existing focused coverage. Eight grammar/converter functions and seven constants move to the parser owner; dispatch, finding computation, signing/rekey behavior and policy are outside this extraction. This release does not authorize the main application CLI, engine production or corpus harness work.
+- Historical processor continuation frozen-source manifest: `processor-continuation/frozen-source-files.json`, SHA-256 `4c8e6664d6160f8c3d80bfd29b9674875e26d17adf0baa2b3d52199b867965d1`. At that completed slice all four source hashes and line counts matched, all 26 target rows were remeasured, and the other 25 union targets exactly matched committed config-tip blobs. Those processor files are now committed at the current base.
 - Historical config frozen-source manifest: `config-slice/frozen-source-files.json`, SHA-256 `dc4b1825814a393f3382b240ba3992c2ecc025e507d6571e070f2a9bc2ba4b99`. At that completed slice, all three source hashes and line counts matched, all 26 target rows were remeasured, and the other 25 union targets exactly matched committed rebase blobs. Those config files are now committed at the current base.
 - Exact parent base: published PR281 `9f26833c8f6a7c56abd2c5b35c80484ebe0c82bc`; merge-base equality and positive ancestor control verified.
 - Historical main: `9e481bc85a32ee15f808c5e2b16cab7634e57b8e`, used only for the preserved baseline column and original 25-target universe.
@@ -19,18 +21,18 @@ Raw current committed output:
 
 ```text
 snapshot=published-pr281 commit=9f26833c8f6a7c56abd2c5b35c80484ebe0c82bc entries=6393 text=6369 excluded=24 gt5000=38 gt10000=13
-snapshot=post-config commit=c4eb6565ef725b39a283663ca2869df8e9eb6298 entries=6422 text=6397 excluded=25 gt5000=35 gt10000=12
-changed_rows=34 oversized_overlap_rows=4
-current_committed_authored_gt5000=23 current_committed_authored_gt10000=8
-current_committed_original_25_targets_gt5000=22
+snapshot=post-processor commit=d38890ddcc5c6e3d570af645d5e3a25efddfea2a entries=6426 text=6401 excluded=25 gt5000=34 gt10000=12
+changed_rows=38 oversized_overlap_rows=4
+current_committed_authored_gt5000=22 current_committed_authored_gt10000=8
+current_committed_original_25_targets_gt5000=21
 current_extra_execution_source_lines=5315
 ```
 
-The committed **23 authored >5,000** count above describes the exact config tip: 22 original targets plus the execution service. After the frozen processor continuation, the freshly measured 26-target universe leaves **22 authored targets above 5,000: 21 original targets plus the execution service at 5,315**. All three config modules and all four processor test modules are below 5,000. Eight authored >10,000 remain reserved: six literal paths (tool tests, fencing, Sessions writer authority, routes, execution tests, Composer/runtime agreement) and two semantic-only paths (`src/elspeth/web/composer/state.py` and `tests/unit/web/composer/test_state.py`). Processor tests are size-resolved at 4,134 / 3,173 / 2,541 / 1,871 with bounded validation complete.
+The committed **22 authored >5,000** count above describes the exact processor-continuation tip: 21 original targets plus the execution service at 5,315. The newly measured frozen CLI overlay leaves **21 authored targets above 5,000: 20 original targets plus the execution service**. Original lint CLI 4,951 and new parser 1,206 are both below 5,000; this size result alone does not establish behavioral parity. All three config modules and all four processor test modules remain below 5,000. Eight authored >10,000 remain reserved: six literal paths (tool tests, fencing, Sessions writer authority, routes, execution tests, Composer/runtime agreement) and two semantic-only paths (`src/elspeth/web/composer/state.py` and `tests/unit/web/composer/test_state.py`).
 
 ## Every original target plus the published execution service
 
-The 26-row table retains all four now size-resolved original targets. Historical main and published columns remain exact immutable snapshots. Current is the frozen processor overlay for the processor row and byte-identical committed config-tip content for the other 25 rows. Ownership is the canonical 538-path literal list, distinct from broader semantic reservation.
+The 26-row table retains all five now size-resolved original targets. Historical main and published columns remain exact immutable snapshots. Current is the frozen CLI overlay for the lint CLI row and byte-identical committed processor-tip content for the other 25 rows. Ownership is the canonical 538-path literal list, distinct from broader semantic reservation and the explicit narrow lint-parser release.
 
 | Target | Historical main lines | Published PR281 lines | Current lines | Canonical literal | Status / next coherent slice |
 |---|---:|---:|---:|---|---|
@@ -51,17 +53,62 @@ The 26-row table retains all four now size-resolved original targets. Historical
 | `tests/unit/architecture/test_dag_scenario_corpus_contract.py` | 6729 | 6729 | 6729 | Yes | Reserved to streaming semantic owner / coordinated post-integration split. Registry/manifest/schema; semantic projection; recovery evidence; independent case/harness parity. |
 | `tests/unit/web/composer/test_advisor_checkpoint.py` | 6310 | 6310 | 6310 | No | Reserved to streaming semantic owner / coordinated post-integration split. Checkpoint/evidence summaries; termination/repair; disclosure/history replay; telemetry. Preserve per-transition provider calls. |
 | `tests/unit/web/blobs/test_service.py` | 6246 | 6250 | 6250 | Yes | Reserved to streaming semantic owner / coordinated post-integration split. CRUD/quota; custody/reconciliation; fork rollback; run-output finalization; read/verified streaming. |
-| `elspeth-lints/src/elspeth_lints/core/cli.py` | 6110 | 6110 | 6110 | No | Proposed engine/core or CLI/lints follow-up; no independent release inferred. Parser/dispatch; lint reporting; allowlist/reaudit operations; signing-bundle/rekey diagnostics, preserving exact CLI output. |
+| `elspeth-lints/src/elspeth_lints/core/cli.py` | 6110 | 6110 | 4951 | No | Size-resolved narrow parser extraction explicitly released by streaming owner; bounded validation and independent approval complete with no introduced findings. Eight grammar/converter functions and seven constants move to `core/cli_parser.py` (1,206 lines); dispatch, findings, signing/rekey and policy remain original. Production enforcement entry infrastructure requires full premerge verification after streaming's priority work and capacity release. |
 | `src/elspeth/web/coordination/repository.py` | 5807 | 5921 | 5921 | Yes | Reserved to streaming semantic owner / coordinated post-integration split. Session/composition/run facets; blob custody; fork transactions; PostgreSQL authority specialization, preserving one transaction owner. |
 | `tests/unit/core/test_config.py` | 5909 | 5909 | 2156 | No | Completed bounded test decomposition with focused validation and independent approval; no introduced findings. Security/boundary tests remain here; settings and loading groups live in explicit modules. All three modules are below 5,000. |
-| `src/elspeth/engine/processor.py` | 5523 | 5523 | 5523 | No | Proposed engine/core or CLI/lints follow-up; no independent release inferred. Aggregate completion; transform retry/error execution; group-loss settlement through explicit owned collaborators after test decomposition. |
-| `tests/fixtures/dag_scenario_corpus/harness.py` | 5408 | 5408 | 5408 | No | Proposed engine/core or CLI/lints follow-up; no independent release inferred. Build/render; stable/semantic projections; export/sink evidence; recovery runners, preserving frozen oracle bytes. |
+| `src/elspeth/engine/processor.py` | 5523 | 5523 | 5523 | No | A coherent owned collaborator/context is needed for aggregation flush, committed outputs or group-loss settlement; runtime/engine coordination and full-suite capacity required. Persistence/lock-related movement also requires PostgreSQL proofs. Not covered by the narrow grammar release; no blanket reservation inferred. |
+| `tests/fixtures/dag_scenario_corpus/harness.py` | 5408 | 5408 | 5408 | No | Projection/recovery extraction needs reserved manifest/gate-owner coordination, real producer/oracle equality across affected scenarios and broad shared-harness validation capacity. Preserve frozen oracle bytes; grammar release authorizes no manifest/gate edit. Harness itself is not literally reserved. |
 | `src/elspeth/web/execution/service.py` | 4853 | 5315 | 5315 | Yes | Reserved to streaming semantic owner / coordinated post-integration split. Admission/materialization; worker lifecycle; cancellation/recovery; finalization/diagnostics through explicit leases and accounting. |
-| `src/elspeth/cli.py` | 5278 | 5278 | 5278 | No | Proposed engine/core or CLI/lints follow-up; no independent release inferred. Bootstrap; run/validate/explain; resume/join/abandon; export verification; deployment/web command groups. |
+| `src/elspeth/cli.py` | 5278 | 5278 | 5278 | No | Composer/admin/deployment integration needs separate owner coordination. A coherent doctor/health or audit-export extraction must preserve registration order, callbacks/defaults, output and observed patch bindings. Shared bootstrap extraction requires broad runtime verification. Not literally reserved; narrow lint-parser release does not cover it. |
 | `tests/unit/engine/test_executors.py` | 7432 | 7432 | 3317 | No | Completed local decomposition with focused validation and independent review. Transforms/security gate remain here; gate, aggregation and node-state groups moved to their actual modules; shared setup in `tests/fixtures/executors.py`. |
 | `tests/unit/core/test_dag.py` | 6292 | 6292 | 2955 | No | Completed local decomposition with focused validation and independent review. Validation remains here; construction and routing moved to explicit modules with `tests/fixtures/dag.py` as setup authority. |
 
-## Local slices and measured processor continuation
+## Current lint CLI parser measurements
+
+The original CLI owns dispatch and operational handlers; the new parser owns argparse grammar, help/defaults and argument converters. Existing callable/constant bindings use direct explicit imports; moved parser functions intentionally acquire the new owner's globals. No broader private monkeypatch compatibility is claimed. The integrator verified full source/AST equality for all 124 recursive definitions with seven moved constant assignments, exact parser capture, focused tests and unchanged complete keyless/gate diagnostics. These are bounded results; full production premerge verification remains pending.
+
+```text
+elspeth-lints/src/elspeth_lints/core/cli.py: lines=4951 bytes=220930 sha256=9187db72b0003f1abe3efbba98530bcebc15bd932a43d2d6ce5f9654eb59db19 candidate_manifest_match=True
+elspeth-lints/src/elspeth_lints/core/cli_parser.py: lines=1206 bytes=47282 sha256=11a61f1acd03f457de5d66ef597baae40248de07d66629b82bd903f9ced593a6 candidate_manifest_match=True
+candidate_source_record_sha256=7ca65841a76d789325ae7019dc8583fc22aeb41093c9edda772bf8e11baf3348
+original_25_target_residual_gt5000=20
+published_extra_gt5000=1 current_extra_lines=5315
+observed_26_target_residual_gt5000=21
+observed_residual_gt10000=8 literal_owned=6 semantic_only_owned=2
+other_25_current_union_targets_byte_equal_to_d38890dd=True
+observed_target_second_byte_reads_match=True; observations_not_atomic=True
+```
+
+This inventory lane ran no production imports, tests or repository gates. Full premerge verification remains an integrator capacity requirement after streaming's priority work. The grammar move itself touches no SQL, schema, persistence or locks and creates no separate PostgreSQL-contention requirement. Changes to dispatch, registry loading, finding computation or persistence would exceed this narrow release and require reassessment.
+
+Completed bounded CLI parser validation, reported from the integrator's final results:
+
+```text
+baseline.exit: 0; 1033 passed, 1 existing skip in 20.74s
+after.exit: 0; 1033 passed, 1 same existing skip in 20.46s
+collection: 1034 test IDs exactly equal
+parser capture: 17 commands, 82 parser-only cases; complete raw bytes equal
+124 recursive definitions: complete source and location-free AST equality=True
+scoped mypy: 2 source files; exit=0
+ruff check, ruff format check, git diff check: exit=0
+baseline-all-rules.exit: 1; 3163 complete finding records
+after-all-rules.exit: 1; 3163 complete finding records; stdout and stderr byte-equal=True
+baseline-boundary.exit: 0; []
+after-boundary.exit: 0; []; complete raw bytes equal=True
+gates.exit: 1; 2 inherited failures, 18 passed in 110.72s
+complete 11 masquerade finding tuples equal clean published baseline=True
+complete three-mock diagnostic equal clean published baseline=True
+canonical Python inputs: 3986
+input-dictionary SHA-256: b9e9f104ead599b5b67a848fcbf06dfb5617418aa0b27c87254800bf59fc11fb
+before.json == after.json: true, including HEAD
+final-comparison.exit: 0
+independent review: approved for bounded extraction; no introduced findings
+production full premerge verification: pending streaming priority and capacity release
+```
+
+The same existing skip and the two inherited integration-gate failures remain explicit. The keyless all-rules command remains red with exactly unchanged complete diagnostics; the explicit boundary selection remains empty. Independent review verified complete gate diagnostics and frozen hashes before approving the bounded extraction. Neither result establishes operator signature clearance. No real signing/rekey action, policy suppression or protected baseline repair was performed for this extraction.
+
+## Historical completed local slices
 
 Existing processor, executor and DAG reports record their original collection, assertion-preservation, focused checks and review. Their main-based counts are historical; current committed sizes were remeasured after rebase. Their resulting modules remain substantive tests rather than import-forwarding shells. [streaming-rebase.md](streaming-rebase.md) and [streaming-rebase-review.md](streaming-rebase-review.md) record the completed `focused.exit: 0` with `627 passed`, plus `gates.exit: 1` with `2 failed, 24 passed`. Both failing gates reproduced with identical complete diagnostics on the untouched published base. The separate completed config evidence follows; this count lane ran none of those checks.
 
@@ -79,7 +126,7 @@ tests/unit/core/test_config_loading.py: lines=1613 bytes=52660 sha256=35c0314fad
 config_frozen_source_manifest_sha256=dc4b1825814a393f3382b240ba3992c2ecc025e507d6571e070f2a9bc2ba4b99
 ```
 
-Current processor frozen-source measurements and residual accounting:
+Historical completed processor frozen-source measurements and residual accounting (now committed at the current base):
 
 ```text
 tests/unit/engine/test_processor.py: lines=4134 bytes=187203 sha256=f455e4596abdb9060c16230ec1ccf0ab1ce490637736fdd72ff21144dc0c085b frozen_manifest_match=True
@@ -138,8 +185,10 @@ Both affected integration gates remain red on the exact inherited published-base
 
 ## Next coherent work and blockers
 
-Processor test continuation is complete within its bounded scope. Subsequent engine production, harness and CLI/lints work can follow checked dependency ownership; the 22 remaining authored targets constitute the general backlog, while the eight remaining >10,000 targets are immediately reserved to the streaming owner. Authority support moves in Sessions collector → clock proof → Landscape order under one coordinated owner; proof inputs, live records, pins and refusal behavior must remain intact. Composer and execution/Sessions production moves wait for streaming integration or a bounded explicit release on a remeasured tree. Preserve the provider authoring path, immutable composition semantics and transaction/cancellation authorities.
+Processor test continuation is complete within its bounded scope. Lint CLI parser extraction is size-resolved with bounded validation and independent approval complete and no introduced findings; final production premerge verification remains pending. The 21 remaining authored targets constitute the general backlog, while the eight remaining >10,000 targets are immediately reserved to the streaming owner. Authority support moves in Sessions collector → clock proof → Landscape order under one coordinated owner; proof inputs, live records, pins and refusal behavior must remain intact. Composer and execution/Sessions production moves wait for streaming integration or a bounded explicit release on a remeasured tree. Preserve the provider authoring path, immutable composition semantics and transaction/cancellation authorities.
+
+The remaining application CLI, production processor and harness have distinct dependencies rather than a blanket literal reservation. Application CLI work needs owner coordination for Composer/admin/deployment seams, characterization of Typer registration order, callbacks/defaults and output, and preservation of existing patch bindings; shared bootstrap extraction also requires broad runtime verification. A production processor split needs a coherent owned collaborator/context, runtime/engine integration coordination and full-suite capacity; persistence/lock-related movement also requires PostgreSQL tests. Harness projection/recovery work needs reserved manifest/gate-owner coordination, real producer/oracle equality across affected scenarios and broad shared-harness validation capacity. Frozen oracle changes are semantic drift, not routine re-pinning. None of these conditions is cleared by the narrow parser release.
 
 The goal remains every authored module at most 5,000 and none above 10,000. Curated policy/proof records, lockfiles, baseline fixtures, generated reports and data keep producer/consumer-specific maintenance; they are not mechanical code-splitting targets. Broad suite capacity and PostgreSQL proofs remain the integrator’s responsibility for changes that reach those domains.
 
-Remaining blockers and work: inherited unspecced-mock and masquerade baseline integration-gate failures; streaming reserved surfaces and integration of later base omissions if their owner requires them; the 22 oversized authored targets listed above. Processor continuation bounded validation and independent approval are complete with no introduced findings. Config local validation and independent review are complete. The rebase, config and processor continuation reviews approve their bounded scopes but do not clear those two inherited gates or certify a full suite/PostgreSQL run. This document does not claim whole-project decomposition, remote publication, CI acceptance or operator signature clearance.
+Remaining blockers and work: inherited unspecced-mock and masquerade baseline integration-gate failures; streaming reserved surfaces and integration of later base omissions if their owner requires them; the 21 oversized authored targets listed above; coordinated production premerge verification. CLI parser bounded validation and independent approval are complete with no introduced findings. Processor continuation and config bounded validation and independent approval are complete with no introduced findings. The rebase, config, processor continuation and CLI parser reviews approve their bounded scopes but do not clear those two inherited gates or certify a full suite/PostgreSQL run. This document does not claim whole-project decomposition, remote publication, CI acceptance or operator signature clearance.
