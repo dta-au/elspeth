@@ -12540,12 +12540,12 @@ class _reserve_ReserveProof:
                             failures.append("private namespace accessor call/escape outside closed owner " + unit.path)
                 namespace_access = isinstance(n, ast.Attribute) and n.attr in {"__globals__", "__builtins__"}
                 if isinstance(n, ast.Call):
-                    forms = reflection_forms(n.func, n)
                     argument_values = set().union(*(finite_selector_values(argument, n) for argument in n.args)) if n.args else {None}
                     relevant = possible_reflection(n.func, n) or bool(
                         argument_values - {None} & ({"__globals__", "__builtins__"} | namespace_helper_names)
                     )
                     if relevant:
+                        forms = reflection_forms(n.func, n)
                         fields = set()
                         if n.keywords or any(isinstance(argument, ast.Starred) for argument in n.args):
                             fields.add(None)
