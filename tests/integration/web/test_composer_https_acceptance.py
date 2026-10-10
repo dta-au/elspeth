@@ -349,7 +349,6 @@ window.runComposerAcceptance = async ({ token, sessionId, operationId, releaseDe
     )
     bundled = subprocess.run(
         [
-            "node",
             str(frontend / "node_modules/esbuild/bin/esbuild"),
             str(bundle_entry),
             "--bundle",
@@ -905,7 +904,6 @@ window.custodyAcceptance = {
     )
     bundled = subprocess.run(
         [
-            "node",
             str(frontend / "node_modules/esbuild/bin/esbuild"),
             str(bundle_entry),
             "--bundle",

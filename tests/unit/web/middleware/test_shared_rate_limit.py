@@ -9,11 +9,11 @@ from elspeth.web.coordination.rate_limit_authority import RepositoryRateLimitAut
 from elspeth.web.middleware.rate_limit import SharedRateLimiter
 
 
-def test_shared_authority_rejects_sqlite() -> None:
+def test_shared_authority_supports_sqlite_composer_transactions() -> None:
     engine = create_engine("sqlite://")
     try:
-        with pytest.raises(ValueError, match="PostgreSQL"):
-            RepositoryRateLimitAuthority(engine, signing_key=b"s" * 32)
+        authority = RepositoryRateLimitAuthority(engine, signing_key=b"s" * 32)
+        assert SharedRateLimiter(1, authority=authority, scope="composer").composer_admission.authority is authority
     finally:
         engine.dispose()
 

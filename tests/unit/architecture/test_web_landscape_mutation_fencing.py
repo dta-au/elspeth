@@ -5806,7 +5806,7 @@ _reserve_FULL_SOURCE_PATHS = (
 )
 
 _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operations.py"
-_reserve_CANCEL_ROUTE_SHA256 = "c22e0829551dc6c7120ca773d7e5924ec3f8db3fa770c1b736395cac9d6233e4"
+_reserve_CANCEL_ROUTE_SHA256 = "86d206255665ac50b5e2c65bb77bfebc3971e335127483d40c0e1a8d8dd883c2"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
     "src/elspeth/web/sessions/composer_turn.py": "4bf85258c9d207573387567b1e67ff8f5a269eedb28cd7b82a630c2ea9f6be5e",
@@ -27535,3 +27535,27 @@ def test_actual_ticket_runtime_clock_override_withdraws_read_proof():
     violations = _raw_write_surface_violations((changed, *units[1:]))
     assert sum("RepositorySessionWebsocketTicketAuthority.issue" in item and "raw SQL" in item for item in violations) == 1
     assert sum("RepositorySessionWebsocketTicketAuthority.consume" in item and "raw SQL" in item for item in violations) == 1
+
+
+def test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metadata() -> None:
+    """Foreign parser metadata cannot withdraw an unchanged namespace receipt."""
+    helper = _reserve_proposal_child_transfers
+    units = tuple(_read_source(_repo_root() / path, anchor=_repo_root()) for path in (helper.SETTLEMENT, helper.REQUIRED))
+    failures, baseline = helper.proposal_child_local_contracts(units)
+    assert not failures, failures
+    shared_context = next(node.ctx for node in ast.walk(units[1].tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load))
+    original_parent = shared_context._landscape_parent
+    try:
+        unrelated = _parse_source("src/elspeth/unrelated_namespace_read.py", "foreign" + ".value" * 500 + "\n")
+        compile(unrelated.tree, "<unexecuted unrelated namespace source>", "exec", dont_inherit=True)
+        failures, receipt = helper.proposal_child_local_contracts(units)
+        assert not failures, failures
+        assert receipt["reserve_calls"] == baseline["reserve_calls"]
+        required = units[1]
+        header = "class RequiredWorkCoordinator:"
+        assert required.source.count(header) == 1
+        changed = _parse_source(required.path, required.source.replace(header, "class RequiredWorkCoordinator(ForeignBase):"))
+        failures, _ = helper.proposal_child_local_contracts((units[0], changed))
+        assert "proposal child transfer: finite supplier class namespace changed RequiredWorkCoordinator" in failures, failures
+    finally:
+        shared_context._landscape_parent = original_parent

@@ -24,10 +24,12 @@ trees. Do not use `pip` directly or refresh a lockfile as an incidental setup
 step.
 
 The real TLS/browser integration acceptance tests also require a provisioned
-Caddy executable on `PATH`, the existing OpenSSL certificate tool, and the
+Caddy 2.11.6 executable on `PATH`, the existing OpenSSL certificate tool, and the
 checkout-local frontend/browser prerequisites. CI provisions these test tools;
 local contributors must provision them before running that selection. Missing
-tools fail acceptance. Caddy is not an ELSPETH runtime dependency.
+tools fail acceptance. CI pins the official Caddy release archive and its
+SHA256; Debian Bookworm's Caddy 2.6.2 cannot run the buffering and idle-cutoff
+controls. Caddy is not an ELSPETH runtime dependency.
 
 For the repository-specific Caddy/systemd development install, follow
 [Caddy development install refresh](docs/runbooks/caddy-development-refresh.md).

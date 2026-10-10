@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import math
 import secrets
-from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any, Literal, NotRequired, TypedDict, final
 from uuid import UUID
@@ -22,6 +21,7 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.database_clock import database_now
+from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission
 from elspeth.web.sessions.composer_operations import (
     COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH,
     COMPOSER_OPERATION_RESULT_SCHEMA_ERROR,
@@ -237,6 +237,7 @@ class ComposerAsyncOperationAuthority:
     def admit(
         self,
         *,
+        quota: ComposerQuotaAdmission,
         session_id: UUID,
         operation_id: str,
         kind: ComposerOperationKind,
@@ -270,6 +271,11 @@ class ComposerAsyncOperationAuthority:
             or composer_operation_request_hash(session_id=session_id, kind=kind, request=request) != request_hash
         ):
             raise ValueError("composer request does not match its immutable admission binding")
+        if type(quota) is not ComposerQuotaAdmission:
+            raise TypeError("Composer admission requires exact SQL quota configuration")
+        # Cleanup completes before the session lock. Admission then takes the
+        # session lock before its bucket lock, and commits both effects once.
+        quota.prepare(self._engine)
         with locked_session_transaction(self._engine, str(session_id)) as conn:
             _require_owner(conn, session_id=session_id, actor_user_id=actor_user_id, auth_provider_type=auth_provider_type)
             old = _read(conn, session_id, operation_id)
@@ -333,6 +339,9 @@ class ComposerAsyncOperationAuthority:
             inserted = _read(conn, session_id, operation_id)
             if inserted is None:
                 raise AuditIntegrityError("admitted composer operation vanished")
+            # Outside insertion's conflict handler: quota denial or SQL failure
+            # rolls back the outer transaction, including this uncommitted job.
+            quota.check_on_connection(conn, actor_user_id)
             return _record_from_row(inserted), True
 
     def get(self, *, session_id: UUID, operation_id: str) -> ComposerOperationRecord | None:
@@ -704,7 +713,7 @@ class ComposerAsyncOperationAuthority:
 async def admit_composer_operation(
     authority: ComposerAsyncOperationAuthority,
     *,
-    rate_limit: Callable[[], Awaitable[None]],
+    quota: ComposerQuotaAdmission,
     session_id: UUID,
     operation_id: str,
     kind: ComposerOperationKind,
@@ -717,11 +726,9 @@ async def admit_composer_operation(
     max_nonterminal: int,
     auth_provider_type: str,
 ) -> tuple[ComposerOperationRecord, bool]:
-    previous = await run_sync_in_worker(authority.get, session_id=session_id, operation_id=operation_id)
-    if previous is None:
-        await rate_limit()
     return await run_sync_in_worker(
         authority.admit,
+        quota=quota,
         session_id=session_id,
         operation_id=operation_id,
         kind=kind,

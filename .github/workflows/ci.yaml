@@ -433,7 +433,24 @@ jobs:
         # job; the docker-CLI tests run in the host-runner-unit job below.
         run: |
           apt-get update -q
-          apt-get install -y -q libsqlcipher-dev jq unzip nodejs ripgrep sqlite3 caddy
+          apt-get install -y -q libsqlcipher-dev jq unzip nodejs ripgrep sqlite3
+
+      - name: Install pinned Caddy for TLS acceptance
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        # Bookworm's Caddy 2.6.2 does not support the response_buffers control
+        # and does not propagate the idle-cutoff failure used by this harness.
+        # SHA256 is pinned to the official caddyserver/caddy release asset.
+        run: |
+          CADDY_VERSION=2.11.6
+          CADDY_SHA256=22c84f8d2d4e4e0e2d422f8049fdd0fc1ed8d5665d0fe166f506c7fd863b4555
+          caddy_tmp="$(mktemp -d)"
+          trap 'rm -rf "$caddy_tmp"' EXIT
+          curl -fsSLo "$caddy_tmp/caddy.tar.gz" \
+            "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s/caddy.tar.gz\n' "$CADDY_SHA256" "$caddy_tmp" | sha256sum -c -
+          tar -xzf "$caddy_tmp/caddy.tar.gz" -C "$caddy_tmp" caddy
+          install -m 0755 "$caddy_tmp/caddy" /usr/local/bin/caddy
+          /usr/local/bin/caddy version
 
       - name: Set up Node.js for Python TLS browser acceptance
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -665,7 +682,22 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           apt-get update -q
-          apt-get install -y -q libsqlcipher-dev caddy
+          apt-get install -y -q libsqlcipher-dev
+
+      - name: Install pinned Caddy for TLS acceptance
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        # Keep the integration lane on the same transport as the Python shards.
+        run: |
+          CADDY_VERSION=2.11.6
+          CADDY_SHA256=22c84f8d2d4e4e0e2d422f8049fdd0fc1ed8d5665d0fe166f506c7fd863b4555
+          caddy_tmp="$(mktemp -d)"
+          trap 'rm -rf "$caddy_tmp"' EXIT
+          curl -fsSLo "$caddy_tmp/caddy.tar.gz" \
+            "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s/caddy.tar.gz\n' "$CADDY_SHA256" "$caddy_tmp" | sha256sum -c -
+          tar -xzf "$caddy_tmp/caddy.tar.gz" -C "$caddy_tmp" caddy
+          install -m 0755 "$caddy_tmp/caddy" /usr/local/bin/caddy
+          /usr/local/bin/caddy version
 
       - name: Set up Node.js for Python TLS browser acceptance
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020

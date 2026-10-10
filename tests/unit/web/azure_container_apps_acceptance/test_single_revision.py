@@ -131,7 +131,18 @@ class Routing:
                             assert event.wait(2)
                         with self.lock:
                             if session in self.observer.owners and self.observer.operations[session] != body["operation_id"]:
-                                return httpx.Response(409, json={"error_type": "composer_operation_active"}, headers=headers)
+                                return httpx.Response(
+                                    409,
+                                    json={
+                                        "detail": {
+                                            "error_type": "composer_operation_active",
+                                            "operation_id": self.observer.operations[session],
+                                            "kind": "compose_message",
+                                            "detail": "This session already has a composer request in progress.",
+                                        }
+                                    },
+                                    headers=headers,
+                                )
                             if session not in self.observer.owners:
                                 self.observer.owners[session] = instance
                                 self.observer.operations[session] = body["operation_id"]

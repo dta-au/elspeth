@@ -46,7 +46,6 @@ def test_actual_react_chat_rejects_prior_actor_publication(tmp_path: Path, scena
     bundled = tmp_path / "react.js"
     build = subprocess.run(
         [
-            "node",
             str(frontend / "node_modules/esbuild/bin/esbuild"),
             str(support / "react-entry.tsx"),
             "--bundle",

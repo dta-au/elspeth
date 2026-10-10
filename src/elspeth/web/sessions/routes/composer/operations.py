@@ -13,16 +13,19 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.credential_material import scrub_credential_material
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.async_workers import run_stream_read_in_worker, run_sync_in_worker
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_stream_read_in_worker, run_sync_in_worker
 from elspeth.web.auth.models import AuthenticationError
 from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer_stream import BoundedComposerStreamResponse, ComposerStreamCapacityError, ComposerStreamPermits
 from elspeth.web.composer_stream_auth import ComposerStreamAuthServices
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority, admit_composer_operation
+from elspeth.web.coordination.rate_limit_authority import ComposerQuotaExceeded
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
+from elspeth.web.middleware.rate_limit import SharedRateLimiter
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationActiveError,
@@ -135,13 +138,13 @@ async def admit(
             raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
         compartment_ingress_record(body.content, own_compartment_id=settings.compartment_id)
 
-    async def rate_limit() -> None:
-        await rate_limiter.check(user.user_id)
+    if not isinstance(rate_limiter, SharedRateLimiter):
+        raise AuditIntegrityError("Composer admission requires the application's shared SQL composer budget")
 
     try:
         row, _fresh = await admit_composer_operation(
             _authority(request),
-            rate_limit=rate_limit,
+            quota=rate_limiter.composer_admission,
             session_id=session_id,
             operation_id=body.operation_id,
             kind=kind,
@@ -154,6 +157,18 @@ async def admit(
             max_nonterminal=settings.composer_async_max_queued_operations,
             auth_provider_type=settings.auth_provider,
         )
+    except ComposerQuotaExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error_type": "rate_limited",
+                "detail": f"Rate limit exceeded. Try again in {exc.retry_after} seconds.",
+                "retry_after": exc.retry_after,
+            },
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from None
+    except (SQLAlchemyError, AsyncWorkerAdmissionTimeoutError):
+        raise HTTPException(status_code=503, detail="Rate limit service unavailable") from None
     except ComposerOperationPreconditionRefused as exc:
         raise HTTPException(status_code=exc.error.http_status, detail=exc.error.body["detail"]) from exc
     except ComposerOperationCapacityError as exc:

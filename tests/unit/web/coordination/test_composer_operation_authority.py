@@ -18,6 +18,7 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.database_clock import database_now
+from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission, RepositoryRateLimitAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationActiveError,
@@ -72,10 +73,15 @@ async def _wait_for_thread_event(event: Event) -> None:
         await asyncio.sleep(0.01)
 
 
-def admit(authority, sid, request=None, *, actor="alice", provider="local", maximum=64, deadline_seconds=180.0):
+def admit(authority, sid, request=None, *, actor="alice", provider="local", maximum=64, deadline_seconds=180.0, quota=None):
     request = request or SendMessageRequest(operation_id=str(uuid4()), content="Build")
     kind = "compose_message" if isinstance(request, SendMessageRequest) else "compose_recompose"
     return authority.admit(
+        quota=quota
+        if quota is not None
+        else ComposerQuotaAdmission(
+            RepositoryRateLimitAuthority(authority._engine, signing_key=b"operation-test-quota-key-32-bytes"), 10000
+        ),
         session_id=sid,
         operation_id=request.operation_id,
         kind=kind,

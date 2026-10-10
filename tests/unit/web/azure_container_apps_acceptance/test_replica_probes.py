@@ -122,7 +122,18 @@ class _RecordedReplicas:
                     self.operation_id = operation_id
                 if operation_id == self.operation_id or self._both_win:
                     return httpx.Response(202, json={"operation_id": operation_id}, headers=headers)
-                return httpx.Response(409, json={"error_type": "composer_operation_active"}, headers=headers)
+                return httpx.Response(
+                    409,
+                    json={
+                        "detail": {
+                            "error_type": "composer_operation_active",
+                            "operation_id": self.operation_id,
+                            "kind": "compose_message",
+                            "detail": "This session already has a composer request in progress.",
+                        }
+                    },
+                    headers=headers,
+                )
             if self._winner is None or self._both_win:
                 self._winner = instance
                 self.epoch += 1

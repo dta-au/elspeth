@@ -1314,9 +1314,9 @@ def _assert_background_completion_close_custody(
     # accept an unreachable branch, detached Task, or discarded close result.
     expected = (
         "e7a8f83154514fc9914c7ec746ab5252923c3dd6fbb9e6b27e66143491b07fdb",
-        "888d2a1ef863f8564a444a08b92e70c8aca687c77057dba2f8ff9434167186a2",
-        "639a0b67ad955cf0dec71e9d5b91d5250df4710e10bb15f151c760185e744431",
-        "d633750fbd54c0efb1e0b71baba1a003d6fbf175eca645495d64d20ead90130e",
+        "e749535b4ff010c0b4063ce9a3d4f55f15f10633e42f5a09a7b91ff5760a89ec",
+        "62563bc01a2af20846053d30bb70583462c71eb3ac76ad49a7cf910bd33859f2",
+        "2b58bf6b6eecb7aa94745bc0506939eb778cf4de1cfe95a9ae3fbb28cd13afda",
     )
     assert tuple(hashlib.sha256(_stable_ast_bytes(method)).hexdigest() for method in methods) == expected
 

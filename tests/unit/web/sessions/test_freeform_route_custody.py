@@ -28,6 +28,7 @@ from tests.helpers.composer_operations import (
     SettledComposerOperation,
     current_head_state_id,
     install_composer_async_worker,
+    install_composer_rate_limiter,
     submit_and_settle,
 )
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
@@ -54,6 +55,7 @@ def _file_app(tmp_path):
     service = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     app.state.session_service = service
     app.state.session_engine = engine
+    install_composer_rate_limiter(app, limit=100)
     composer = _AuditedComposer()
     app.state.composer_service = composer
     install_composer_async_worker(app)

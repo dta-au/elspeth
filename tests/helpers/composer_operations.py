@@ -14,6 +14,8 @@ from fastapi import FastAPI
 from elspeth.web.app import create_app
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.rate_limit_authority import RepositoryRateLimitAuthority
+from elspeth.web.middleware.rate_limit import ComposerRateLimiter, SharedRateLimiter
 from tests.fixtures.composer_fakes import DelayedComposerFake
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 
@@ -108,6 +110,11 @@ def install_composer_async_worker(
     from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 
     service = app.state.session_service
+    # Hand-built route fixtures must model the production SQL composer budget.
+    # Other local scopes and their adapters stay independent.
+    limiter = app.state.rate_limiter
+    if isinstance(limiter, ComposerRateLimiter):
+        install_composer_rate_limiter(app, limit=limiter._limit)
     authority = ComposerAsyncOperationAuthority(
         app.state.session_engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=claim_lease_seconds
     )
@@ -135,6 +142,17 @@ def install_composer_async_worker(
     app.state.composer_async_operation_authority = authority
     app.state.composer_async_worker = worker
     return worker
+
+
+def install_composer_rate_limiter(app: FastAPI, *, limit: int) -> SharedRateLimiter:
+    """Install one SQL composer bucket for all consumers in a test app."""
+    limiter = SharedRateLimiter(
+        limit,
+        authority=RepositoryRateLimitAuthority(app.state.session_engine, signing_key=b"fixture-composer-quota-key-32!!!!"),
+        scope="composer",
+    )
+    app.state.rate_limiter = limiter
+    return limiter
 
 
 async def submit_and_settle(client: httpx.AsyncClient, app: FastAPI, *, path: str, body, max_rounds: int = 50) -> SettledComposerOperation:

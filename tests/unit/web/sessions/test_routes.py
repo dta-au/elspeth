@@ -113,6 +113,7 @@ from tests.helpers.composer_operations import (
     current_head_state_id,
     current_head_state_id_sync,
     install_composer_async_worker,
+    install_composer_rate_limiter,
     message_body,
     recompose_body,
     running_operation_async,
@@ -953,6 +954,7 @@ def test_send_message_keeps_assistant_reply_when_auto_title_transport_fails(tmp_
         log=structlog.get_logger("test"),
     )
     app.state.session_engine = engine
+    install_composer_rate_limiter(app, limit=100)
     install_composer_async_worker(app)
     app.state.composer_service = _make_composer_mock(response_text="Here is your answer.")
     client = TestClient(app)

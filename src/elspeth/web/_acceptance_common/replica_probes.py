@@ -580,7 +580,8 @@ class ProbeRequest:
     suppresses=("R1", "R5"),
     invariant=(
         "returns an owned ReplicaResponse with bounded detail, run_id and error_type, plus a canonical operation_id, "
-        "taken only from a dict body's named members and None otherwise; never raises on the body's shape and never coerces "
+        "taken only from a dict body's named members or its FastAPI detail object and None otherwise; "
+        "never raises on the body's shape and never coerces "
         "external values"
     ),
     non_raising=True,
@@ -592,19 +593,22 @@ def replica_response_from_envelope(*, addressed_to: str, status: int, instance_i
     error_type: str | None = None
     if isinstance(body, dict):
         candidate_detail = body.get("detail")
+        operation_envelope = candidate_detail if isinstance(candidate_detail, dict) else body
+        if isinstance(candidate_detail, dict):
+            candidate_detail = candidate_detail.get("detail")
         if type(candidate_detail) is str and 0 < len(candidate_detail) <= 256:
             detail = candidate_detail
         candidate_run_id = body.get("run_id")
         if type(candidate_run_id) is str and 0 < len(candidate_run_id) <= 128:
             run_id = candidate_run_id
-        candidate_operation = body.get("operation_id")
+        candidate_operation = operation_envelope.get("operation_id")
         if type(candidate_operation) is str:
             try:
                 if str(UUID(candidate_operation)) == candidate_operation:
                     operation_id = candidate_operation
             except ValueError:
                 pass
-        candidate_error = body.get("error_type")
+        candidate_error = operation_envelope.get("error_type")
         if type(candidate_error) is str and 0 < len(candidate_error) <= 128:
             error_type = candidate_error
     return ReplicaResponse(

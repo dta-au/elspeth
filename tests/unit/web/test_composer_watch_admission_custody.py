@@ -496,6 +496,7 @@ async def _factory_installed_reader(tmp_path):
     operation_id = str(uuid4())
     request = SendMessageRequest(operation_id=operation_id, content="Observe without provider", state_id=None)
     record, fresh = authority.admit(
+        quota=app.state.rate_limiter.composer_admission,
         session_id=fixture.session_id,
         operation_id=operation_id,
         kind="compose_message",

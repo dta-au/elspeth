@@ -5,7 +5,7 @@
   },
   "src/elspeth/web/coordination/composer_operation_authority.py": {
     "protected_exports": [],
-    "sha256": "5bad9ea1a642317306cbe4dc79b73e214ad7114bd15b1328603b2b4e82901f87"
+    "sha256": "21ce974db2b688f578141feb109a49abb96721deb9b7b1ba27111bbb4f09b66b"
   },
   "src/elspeth/web/coordination/lifecycle.py": {
     "protected_exports": [],

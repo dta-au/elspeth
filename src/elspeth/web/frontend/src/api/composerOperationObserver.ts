@@ -9,7 +9,7 @@ import type { OperationCustody, SubmittedCustody } from "@/types/composerOperati
 export class ComposerObservationDetached extends Error { constructor() { super("Composer observation detached; the durable action remains pending"); this.name = "ComposerObservationDetached"; } }
 export class ComposerSessionMissing extends Error { constructor() { super("Session not found"); this.name = "ComposerSessionMissing"; } }
 export class ComposerActiveAttachment extends Error { constructor() { super("Another composer action is active. Your unsent content remains a draft."); this.name = "ComposerActiveAttachment"; } }
-interface ObserverOptions { signal?: AbortSignal; current?: () => boolean; progress?: (snapshot: ComposerProgressSnapshot) => void; reconciliationOnly?: boolean }
+interface ObserverOptions { signal?: AbortSignal; current?: () => boolean; progress?: (snapshot: ComposerProgressSnapshot) => void; timeout?: () => void; reconciliationOnly?: boolean }
 interface ObserverOwner { generation: number; descriptor: OperationCustody; controller: AbortController; stop: boolean; stopRequested: boolean; stopTarget: OperationCustody | null }
 const owners = new Map<string, ObserverOwner>();
 function replayAgeEligible(descriptor: OperationCustody): boolean {
@@ -83,7 +83,10 @@ export async function observeComposerOperation(initial: OperationCustody, option
     if (candidate >= observationDeadline) return;
     observationDeadline = candidate;
     if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-    deadlineTimer = setTimeout(() => owner.controller.abort(), Math.max(0, observationDeadline - performance.now()));
+    deadlineTimer = setTimeout(() => {
+      try { if (current()) options.timeout?.(); }
+      finally { owner.controller.abort(); }
+    }, Math.max(0, observationDeadline - performance.now()));
   };
   try {
     if (options.signal?.aborted) {

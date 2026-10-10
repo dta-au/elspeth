@@ -421,6 +421,46 @@ def test_replica_response_projection_takes_only_bounded_detail_and_run_id(
     assert response == ReplicaResponse(addressed_to="rA", status=409, instance_id=RA, detail=expected_detail, run_id=expected_run_id)
 
 
+def test_replica_response_projects_fastapi_active_operation_refusal() -> None:
+    operation_id = "00000000-0000-4000-8000-000000000001"
+    response = replica_response_from_envelope(
+        addressed_to="rB",
+        status=409,
+        instance_id=RB,
+        body={
+            "detail": {
+                "error_type": "composer_operation_active",
+                "operation_id": operation_id,
+                "kind": "compose_message",
+                "detail": "This session already has a composer request in progress.",
+            }
+        },
+    )
+    assert response.refused_as_active
+    assert response.operation_id == operation_id
+    assert response.detail == "This session already has a composer request in progress."
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [None, [], "composer_operation_active", {"error_type": None}, {"error_type": 42}, {"error_type": "x" * 129}],
+)
+def test_malformed_nested_error_is_not_an_active_operation_refusal(detail: object) -> None:
+    response = replica_response_from_envelope(addressed_to="rB", status=409, instance_id=RB, body={"detail": detail})
+    assert not response.refused_as_active
+
+
+@pytest.mark.parametrize("operation_id", [None, 42, "not-a-uuid", "00000000-0000-4000-8000-00000000000A"])
+def test_nested_refusal_never_coerces_an_invalid_operation_id(operation_id: object) -> None:
+    response = replica_response_from_envelope(
+        addressed_to="rB",
+        status=409,
+        instance_id=RB,
+        body={"detail": {"error_type": "composer_operation_active", "operation_id": operation_id}},
+    )
+    assert response.operation_id is None
+
+
 class _FakeController(ReplicaController):
     def __init__(self, first: ReplicaAddress, second: ReplicaAddress) -> None:
         self._replicas = (first, second)
@@ -493,7 +533,18 @@ class _RecordedReplicas:
                     self._observer.operation_id = operation_id
                 if self._observer.operation_id == operation_id:
                     return httpx.Response(202, json={"operation_id": operation_id}, headers={"X-Elspeth-Instance": instance})
-                return httpx.Response(409, json={"error_type": "composer_operation_active"}, headers={"X-Elspeth-Instance": instance})
+                return httpx.Response(
+                    409,
+                    json={
+                        "detail": {
+                            "error_type": "composer_operation_active",
+                            "operation_id": self._observer.operation_id,
+                            "kind": "compose_message",
+                            "detail": "This session already has a composer request in progress.",
+                        }
+                    },
+                    headers={"X-Elspeth-Instance": instance},
+                )
             if "/operations/" in request.url.path:
                 return httpx.Response(
                     200, json=operation_document(self._observer.operation_id, "session-1"), headers={"X-Elspeth-Instance": instance}
@@ -521,6 +572,23 @@ def _driver(observer: _FakeObserver, replicas: _RecordedReplicas) -> ReplicaProb
 
 
 class TestDriver:
+    def test_distinct_operations_recognize_the_fastapi_active_refusal(self) -> None:
+        observer = _FakeObserver()
+        driver = _driver(observer, _RecordedReplicas(observer))
+        trial = driver.fence_conflict_trial(
+            "session-1",
+            ProbeRequest(
+                "POST",
+                "/api/sessions/session-1/messages",
+                {"content": "Build a pipeline", "operation_id": "00000000-0000-4000-8000-000000000001", "state_id": None},
+            ),
+            kind="distinct_operations",
+        )
+        refusal = next(response for response in trial.responses if response.status == 409)
+        assert refusal.refused_as_active
+        assert refusal.operation_id == observer.operation_id
+        assert "trial[0]:invalid_operation_admission_pair" not in decide_fence_conflict([trial]).reasons
+
     def test_run_start_waits_for_background_landscape_publication(self) -> None:
         class DelayedObserver(_FakeObserver):
             def __init__(self) -> None:

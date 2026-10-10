@@ -35,6 +35,20 @@ it("stream status zero expires observation after grace despite valid heartbeats"
   expect(findComposerOperationCustody(scope, sessionId).foreground?.operationId).toBe(operationId);
   expect(api.cancelComposerOperation).not.toHaveBeenCalled(); expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
 });
+it("a throwing timeout callback still detaches and closes the physical stream", async () => {
+  liveStream(0);
+  const callbackFailure = new Error("timeout subscriber failed");
+  const observing = submitAndObserveComposerOperation(descriptor(), { progress: () => undefined, timeout: () => { throw callbackFailure; } }).catch((error: unknown) => error);
+  await vi.advanceTimersByTimeAsync(0);
+  const streamSignal = vi.mocked(api.fetchComposerOperationStream).mock.calls[0][2];
+  await expect(vi.advanceTimersByTimeAsync(25000)).rejects.toBe(callbackFailure);
+  expect(streamSignal.aborted).toBe(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(await observing).toBeInstanceOf(ComposerObservationDetached);
+  expect(findComposerOperationCustody(scope, sessionId).foreground?.operationId).toBe(operationId);
+  expect(api.fetchComposerOperation).not.toHaveBeenCalled();
+  expect(api.cancelComposerOperation).not.toHaveBeenCalled(); expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+});
 it("absolute subscription lifetime falls back to durable GET despite continual heartbeats", async () => {
   liveStream(300000);
   const observing = submitAndObserveComposerOperation(descriptor());

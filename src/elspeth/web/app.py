@@ -2229,7 +2229,14 @@ def _create_app(
         process_recovery=process_recovery,
         instance_draining=app.state.instance_draining,
     )
-    # PostgreSQL owns cross-process UI state and quotas. Construction never
+    # Composer job admission and every composer-budget consumer share SQL quota
+    # on both databases. SQLite's window intentionally survives app restarts.
+    rate_limit_authority = RepositoryRateLimitAuthority(
+        session_engine,
+        signing_key=derive_rate_limit_key(settings.secret_key),
+    )
+    app.state.rate_limiter = SharedRateLimiter(settings.composer_rate_limit_per_minute, authority=rate_limit_authority, scope="composer")
+    # PostgreSQL owns cross-process UI state and other quotas. Construction never
     # falls back to a process-local store when the database refuses a call.
     if session_engine.dialect.name == "postgresql":
         app.state.composer_progress_registry = DatabaseComposerProgressRegistry(
@@ -2237,13 +2244,6 @@ def _create_app(
         )
         app.state.websocket_ticket_store = RepositorySessionWebsocketTicketAuthority(session_engine)
         app.state.run_progress_reader = RepositoryRunProgressReader(session_engine)
-        rate_limit_authority = RepositoryRateLimitAuthority(
-            session_engine,
-            signing_key=derive_rate_limit_key(settings.secret_key),
-        )
-        app.state.rate_limiter = SharedRateLimiter(
-            settings.composer_rate_limit_per_minute, authority=rate_limit_authority, scope="composer"
-        )
         app.state.write_rate_limiter = SharedRateLimiter(
             settings.write_rate_limit_per_minute, authority=rate_limit_authority, scope="write"
         )
@@ -2258,7 +2258,6 @@ def _create_app(
         app.state.composer_progress_registry = ComposerProgressRegistry()
         app.state.websocket_ticket_store = WebSocketTicketStore()
         app.state.run_progress_reader = None
-        app.state.rate_limiter = ComposerRateLimiter(settings.composer_rate_limit_per_minute)
         app.state.write_rate_limiter = ComposerRateLimiter(settings.write_rate_limit_per_minute)
         app.state.audit_readiness_rate_limiter = ComposerRateLimiter(settings.audit_readiness_rate_limit_per_minute)
         app.state.auth_rate_limiter = ComposerRateLimiter(settings.auth_rate_limit_per_minute)

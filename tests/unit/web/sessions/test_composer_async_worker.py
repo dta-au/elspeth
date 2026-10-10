@@ -122,6 +122,7 @@ async def _admit(app, service, authority, *, operation_id: str, deadline_seconds
     session = await service.create_session("alice", "Owned job", app.state.settings.auth_provider)
     request = SendMessageRequest(operation_id=operation_id, content="Answer plainly", state_id=None)
     record, fresh = authority.admit(
+        quota=app.state.rate_limiter.composer_admission,
         session_id=session.id,
         operation_id=operation_id,
         kind="compose_message",

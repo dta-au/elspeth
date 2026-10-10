@@ -21,6 +21,15 @@ def namespace_grammar(class_node):
     this hash is a conservative source refusal, not runtime class construction.
     """
 
+    def fields_only(value):
+        # Parent metadata can link shared AST context nodes to unrelated trees.
+        # Only declared AST fields belong to the finite source namespace.
+        if isinstance(value, ast.AST):
+            return type(value)(**{field: fields_only(item) for field, item in ast.iter_fields(value)})
+        if isinstance(value, list):
+            return [fields_only(item) for item in value]
+        return value
+
     class Headers(ast.NodeTransformer):
         def visit_FunctionDef(self, node):
             node.body = [ast.Pass()]
@@ -34,7 +43,7 @@ def namespace_grammar(class_node):
             node.body = ast.Constant(value=None)
             return node
 
-    return grammar(Headers().visit(copy.deepcopy(class_node)))
+    return grammar(Headers().visit(fields_only(class_node)))
 
 
 def chain(node):

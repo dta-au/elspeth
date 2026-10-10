@@ -399,7 +399,18 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   let result: import("@/types/index").MessageWithStateResponse | null = null;
   let failure: unknown = null;
   try {
-    const options = { signal, current, reconciliationOnly, progress: (snapshot: ComposerProgressSnapshot) => { if (current() && !reconciliationOnly) useSessionStore.setState({ composerProgress: snapshot }); } };
+    const options = {
+      signal, current, reconciliationOnly,
+      progress: (snapshot: ComposerProgressSnapshot) => { if (current() && !reconciliationOnly) useSessionStore.setState({ composerProgress: snapshot }); },
+      timeout: () => {
+        if (!current()) return;
+        useSessionStore.setState({
+          error: [composerCustodyRecoveryNotice(), "Composer updates stopped before the outcome could be confirmed. Reload this session to check the same action, or use Stop to request cancellation. Your request is still pending."].filter((notice) => notice !== null).join(" "),
+          errorDetails: null,
+          composerProgress: null,
+        });
+      },
+    };
     result = submit && descriptor.mode === "submitted"
       ? await submitAndObserveComposerOperation(descriptor, options)
       : await observeComposerOperation(descriptor, options);

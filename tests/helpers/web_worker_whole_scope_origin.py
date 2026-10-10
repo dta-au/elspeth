@@ -16,7 +16,7 @@ APP = "src/elspeth/web/app.py"
 WORKER = "src/elspeth/web/sessions/composer_async_worker.py"
 TURN = "src/elspeth/web/sessions/composer_turn.py"
 GRAMMARS = {
-    "_create_app": "1c58ae68f69555fb595de5a1a9dd999aa72ea18748eecee8410f7923efaf0010",
+    "_create_app": "593cc7c06e8f7d02817e79a10575b3acbebdec6f7d361ed10aaa63cf4da21152",
     "ComposerAsyncWorker._run_started_under_lease": "daf38d630a65beb59e65af3a81a44ee074492814371c532a285113ad897c2b68",
     "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }

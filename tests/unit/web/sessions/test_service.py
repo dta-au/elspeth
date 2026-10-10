@@ -1856,11 +1856,16 @@ class TestPagination:
 
 
 def _admit_durable_ingress(service, session_id, *, operation_id, content, requested_state_id):
+    from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission, RepositoryRateLimitAuthority
+
     authority = ComposerAsyncOperationAuthority(
         service._engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
     )
     request = SendMessageRequest(operation_id=str(operation_id), content=content, state_id=requested_state_id)
     record, fresh = authority.admit(
+        quota=ComposerQuotaAdmission(
+            RepositoryRateLimitAuthority(service._engine, signing_key=b"service-test-quota-key-32-bytes!!"), 10000
+        ),
         session_id=session_id,
         operation_id=request.operation_id,
         kind="compose_message",
