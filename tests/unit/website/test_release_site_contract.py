@@ -208,7 +208,7 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert "from 0.7.1 to 0.8.0" in historical_text
     assert "both database schemas" in historical_text and "coordinated recreation" in historical_text
     assert f"before installing {CURRENT_VERSION}" in html
-    assert "If upgrading from 0.8.0 or earlier" in html
+    assert "For the preceding 0.8.3 candidate, if upgrading from 0.8.0 or earlier" in html
     assert "aws-ecs-deployment.md" in html
 
 
