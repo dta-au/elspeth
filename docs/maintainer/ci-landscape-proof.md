@@ -1,13 +1,24 @@
 # Prepared Nyx CI and Landscape proofs
 
 This is an **inactive repository preparation**, not runner admission or runtime
-qualification. Every job in [CI](../../.github/workflows/ci.yaml), including the
-reusable proof caller, has `if: ${{ false }}`. The [proof
-callee](../../.github/workflows/landscape-long-run.yml) is independently disabled.
-The complete graph is structurally wired and operationally disconnected.
-Other PR workflows deny PR execution; there is no hosted fallback. Automatic
-CI-triggered image publication is disabled while CI is inactive. A skipped
-workflow must not be treated as successful qualification or publication authority.
+qualification. The six prepared sources, including [CI](../../config/cicd/prepared-nyx/ci.yaml)
+and its [proof callee](../../config/cicd/prepared-nyx/landscape-long-run.yml), live
+outside `.github/workflows`. They cannot produce Actions checks from this checkout.
+There is no placeholder or deliberately skipped required job. The eventual
+reusable call retains its `.github/workflows/landscape-long-run.yml` identity so
+the source can be linted in a disposable deployment mirror. Both executable and
+prepared inventories are checked for runner routing and supply-chain closure;
+duplicate identities or discovered PR producers fail the source contract.
+
+The existing main ruleset requires `CI Success`, `CodeQL`,
+`Check cohort-attribution trailers on PR commits`, and `redaction-gate`. This
+package supplies none of them while parked. Missing required checks block a new
+commit under that rule; conditional job skips can report success, so they are
+unsuitable for keeping this package inactive. Existing same-commit results,
+producer spoofing and bypass permissions remain external policy concerns.
+[GitHub documents the distinction](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
+Automatic CI-triggered image publication remains disabled, and release evidence
+continues to require literal successful results. No required-check rule is relaxed.
 
 ## Admission before activation
 
@@ -25,12 +36,13 @@ Keep this package inactive until those external controls have been demonstrated
 with both admitted and unadmitted commits, including contributor-edited jobs and
 stale approval after a new push. No runner grants, repository settings or external
 policy are changed by these source files. Activation is a separate operator
-step after source qualification. Do not simply remove the false conditions and
-rely on the tests here as a security policy.
+step after source qualification. Copying templates into GitHub discovery is
+activation, and requires the external control first. These tests assert source
+contracts; they cannot grant or enforce runner access.
 
 ## Selection and required evidence
 
-The prepared ordinary matrix has four shards per Python interpreter, with two
+The prepared ordinary matrix has eight shards per Python interpreter, with two
 pytest workers per job and at most two concurrent ordinary matrix jobs. The
 three exact `landscape_long_run` cases are:
 
@@ -47,17 +59,31 @@ proof producer runs one unchanged test serially. All protected formal variants
 remain inside their original test. Python 3.12 is uncovered and 3.13 is covered.
 Local unsharded pytest selection remains unchanged.
 
+Ordinary assignment uses deterministic longest-estimated-first scheduling from
+the [checked-in duration profile](../../config/cicd/pytest-duration-profile.json).
+Ties use node ID and then shard index. Producers preserve native collection order
+inside each bucket. Only current collected IDs are assigned; new or renamed IDs
+receive the positive default estimate, and removed IDs in the profile add no tests.
+The profile records the earlier uncovered, six-worker Python 3.13.15 JUnit source
+and its digest. These are scheduling estimates, not native 3.12/covered 3.13
+qualification or measured shard wall times. Refresh exact ID mappings when moving
+test classes or packages.
+
 Coverage requires native success from both ordinary and proof jobs before
 validating the complete disjoint union for **each interpreter**. Only the 3.13
 union is combined. `CI Success` also requires the proof and coverage results.
 Coverage floors remain overall 85%, Landscape 92%, canonical 99%, orchestrator
 90% and contracts 62%; they apply to the combined database, never a shard.
 
-Partitioned schema-3 manifests bind checked-out HEAD, expected `GITHUB_SHA`, native
+Partitioned schema-4 manifests bind checked-out HEAD, expected `GITHUB_SHA`, native
 run ID/attempt, interpreter, producer role, partition and shard. Proof evidence
 requires an actual successful singleton call, not merely pytest exit zero.
 Covered databases must match their finalized hashes and contain executed source
 lines. All producers must agree on the complete marker-selected collection.
+Every producer also binds the assignment algorithm and exact duration-profile
+digest. The consumer re-derives the weighted assignment from the validated union;
+old schema-3 evidence or swapped buckets cannot satisfy it. Eight ordinary and
+three proof producers are required per interpreter.
 
 Artifacts have seven-day retention and names
 `ordinary-shard-{version}-{index}-attempt-{attempt}` and

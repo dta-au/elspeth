@@ -484,11 +484,11 @@ def test_plugin_preserves_marker_selection_and_reports_final_status(tmp_path: Pa
     assert len(selected) == len(set(selected)) == 40
 
 
-def _artifacts(tmp_path: Path) -> Path:
+def _artifacts(tmp_path: Path, count: int = 4) -> Path:
     commit = _init_checkout(tmp_path)
     nodeids = [f"test_sample.py::test_example[{index}]" for index in range(100)]
     artifacts = tmp_path / "artifacts"
-    for index in range(4):
+    for index in range(count):
         source = tmp_path / f"producer-{index}" / "src" / "elspeth"
         source.mkdir(parents=True)
         module = source / "sample.py"
@@ -508,10 +508,10 @@ def _artifacts(tmp_path: Path) -> Path:
                     "github_run_attempt": None,
                     "producer_job": None,
                     "partition": "all",
-                    "shard_count": 4,
+                    "shard_count": count,
                     "shard_index": index,
                     "collection_digest": collection_digest(nodeids),
-                    "selected_nodeids": [nodeid for nodeid in nodeids if shard_index(nodeid, 4) == index],
+                    "selected_nodeids": [nodeid for nodeid in nodeids if shard_index(nodeid, count) == index],
                     "exit_status": 0,
                     "coverage_sha256": hashlib.sha256((folder / "coverage-data").read_bytes()).hexdigest(),
                 }
@@ -1268,11 +1268,11 @@ def test_active_no_call_refusal_is_visible_to_inner_finalizers(tmp_path: Path, c
     assert manifest["proof_call_passed"] is False and manifest["exit_status"] == 1
 
 
-def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str) -> Path:
-    artifacts = _artifacts(tmp_path)
+def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, count: int = 4) -> Path:
+    artifacts = _artifacts(tmp_path, count)
     nodeids = [f"test_sample.py::test_example[{index}]" for index in range(100)] + list(LONG_RUN_CASES.values())
     profile = load_duration_profile(tmp_path)
-    assignment = ordinary_assignment(nodeids[:-3], 4, profile)
+    assignment = ordinary_assignment(nodeids[:-3], count, profile)
     commit = evidence_identity(tmp_path)["tested_commit"]
     assert commit is not None
     for name, value in {
@@ -1283,7 +1283,7 @@ def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version
         "GITHUB_JOB": "coverage",
     }.items():
         monkeypatch.setenv(name, value)
-    for index in range(4):
+    for index in range(count):
         folder = artifacts / f"coverage-shard-3.13-{index}"
         report = folder / "shard-manifest.json"
         manifest = json.loads(report.read_text(encoding="utf-8"))
@@ -1806,15 +1806,18 @@ def test_all_mode_manifest_refuses_boolean_and_float_integer_substitutes(tmp_pat
 
 
 def test_workflow_requires_all_shards_and_combined_unchanged_floors() -> None:
-    jobs = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8"))["jobs"]
+    jobs = _activation_workflow_jobs()
     matrix = jobs["test"]["strategy"]["matrix"]
-    assert matrix["shard"] == [0, 1, 2, 3]
+    assert matrix["shard"] == list(range(8))
     assert jobs["test"]["strategy"]["max-parallel"] == 2
     assert jobs["test"]["env"]["PYTEST_WORKERS"] == "2"
     assert "matrix.shard" in jobs["test"]["env"]["CI_CHECKOUT_PATH"]
     aggregate = jobs["coverage"]
     assert aggregate["needs"] == ["test", "landscape-proof"]
-    assert aggregate["if"] == "${{ false }}"
+    assert (
+        aggregate["if"]
+        == "always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)"
+    )
     commands = "\n".join(step.get("run", "") for step in aggregate["steps"])
     assert "needs.test.result" in commands
     assert "needs.landscape-proof.result" in commands
@@ -1826,7 +1829,7 @@ def test_workflow_requires_all_shards_and_combined_unchanged_floors() -> None:
 
 
 def _activation_workflow_jobs() -> dict[str, Any]:
-    return yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8"))["jobs"]
+    return yaml.safe_load((REPO_ROOT / "config/cicd/prepared-nyx/ci.yaml").read_text(encoding="utf-8"))["jobs"]
 
 
 def _activation_step(job: dict[str, Any], name: str) -> dict[str, Any]:
@@ -1836,18 +1839,17 @@ def _activation_step(job: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def _assert_activation_contract(jobs: dict[str, Any]) -> None:
-    assert all(job["if"] == "${{ false }}" for job in jobs.values()), "prepared CI must remain inactive"
     caller = jobs["landscape-proof"]
     assert set(caller) == {"name", "if", "uses"}
     assert caller["uses"] == "./.github/workflows/landscape-long-run.yml"
-    assert caller["if"] == "${{ false }}"
+    assert caller["if"] == "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
     for name in ("Run tests with coverage", "Run tests without coverage"):
         run = _activation_step(jobs["test"], name)["run"]
         tokens = shlex.split(run.replace("\\\n", " "), comments=True)
         args = tokens[tokens.index("pytest") + 1 :]
         assert args[:3] == ["tests/", "-p", "scripts.ci_test_shards"]
         assert args.count("--ci-partition=ordinary") == 1
-        assert "--ci-shard-count=4" in args and "--ci-shard-index=${{ matrix.shard }}" in run
+        assert "--ci-shard-count=8" in args and "--ci-shard-index=${{ matrix.shard }}" in run
         assert "--ci-shard-report=shard-manifest.json" in args
         assert not any(arg == "-m" or arg.startswith("--markexpr") or arg in {"-o", "--override-ini"} for arg in args)
     upload = _activation_step(jobs["test"], "Upload shard coverage and selection evidence")
@@ -1891,7 +1893,7 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
             "--artifact-dir",
             f"proof-evidence/{version}",
             "--shard-count",
-            "4",
+            "8",
             "--partitioned",
             "--python-version",
             version,
@@ -1899,7 +1901,7 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
         assert "if" not in validation and "continue-on-error" not in validation
     success = jobs["ci-success"]
     assert "landscape-proof" in success["needs"] and "coverage" in success["needs"]
-    assert success["if"] == "${{ false }}"
+    assert success["if"] == "always()"
     assert 'if [[ "${{ needs.landscape-proof.result }}" != "success" ]]; then' in _activation_step(success, "Check all jobs passed")["run"]
     report = _activation_step(aggregate, "Upload combined coverage report")
     assert report["if"] == "always()"
@@ -1971,7 +1973,7 @@ def test_native_proof_result_must_succeed_before_evidence_or_ci_success(job_name
 def test_yaml_partition_validation_consumes_real_tiny_evidence_and_refuses_missing_proof(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, omit_proof: bool
 ) -> None:
-    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
+    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version, 8)
     root = tmp_path / "proof-evidence"
     root.mkdir()
     artifacts.rename(root / version)
@@ -1995,5 +1997,5 @@ def test_yaml_partition_validation_consumes_real_tiny_evidence_and_refuses_missi
     if omit_proof:
         assert "Missing producer evidence" in completed.stderr
     else:
-        assert len(json.loads(completed.stdout)["selected_artifacts"]) == 7
+        assert len(json.loads(completed.stdout)["selected_artifacts"]) == 11
     assert (tmp_path / ".coverage").exists() is (version == "3.13" and not omit_proof)

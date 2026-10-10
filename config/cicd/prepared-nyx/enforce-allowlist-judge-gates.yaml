@@ -88,8 +88,8 @@ defaults:
 jobs:
   check-override-rate:
     name: Override-rate drift gate (C3)
-    # PR execution awaits external maintainer admission of the exact commit.
-    if: github.event_name != 'pull_request'
+    # Prepared source; external admission is required before activation.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # Judge gates should fail fast if checkout/dependency/git plumbing hangs.
     timeout-minutes: 15
@@ -155,7 +155,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs:
       - check-override-rate
-    if: always() && github.event_name != 'pull_request'
+    if: always()
     steps:
       - name: Reject fork pull requests
         env:

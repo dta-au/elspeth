@@ -14,7 +14,7 @@ from elspeth_lints.core.protocols import Finding, RuleContext, RuleMetadata, Rul
 from elspeth_lints.rules.meta_no_new_bespoke_cicd_enforcer.metadata import MANIFEST_PATH, RULE_ID, RULE_METADATA
 
 MANIFEST_RELATIVE_PATH = Path(MANIFEST_PATH)
-WORKFLOWS_RELATIVE_PATH = Path(".github/workflows")
+WORKFLOW_SOURCE_PATHS = (Path(".github/workflows"), Path("config/cicd/prepared-nyx"))
 PENDING_STATUS = "pending"
 ACTIVE_STATUSES = frozenset({"pending", "shadow", "cutover"})
 DELETED_STATUS = "deleted"
@@ -134,13 +134,13 @@ def _ci_referenced_paths(root: Path) -> frozenset[str]:
 
 
 def _workflow_referenced_cicd_script_paths(root: Path) -> frozenset[str]:
-    workflows_dir = root / WORKFLOWS_RELATIVE_PATH
-    if not workflows_dir.exists():
-        return frozenset()
+    # Parked workflows still declare policy obligations. This is source
+    # inventory only; it does not establish discovery or runtime success.
     workflow_text = "\n".join(
         path.read_text(encoding="utf-8")
+        for relative_path in WORKFLOW_SOURCE_PATHS
         for pattern in ("*.yml", "*.yaml")
-        for path in sorted(workflows_dir.glob(pattern))
+        for path in sorted((root / relative_path).glob(pattern))
         if path.is_file()
     )
     return frozenset(WORKFLOW_CICD_SCRIPT_RE.findall(workflow_text))

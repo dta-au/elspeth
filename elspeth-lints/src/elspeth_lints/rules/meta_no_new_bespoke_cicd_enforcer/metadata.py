@@ -18,7 +18,7 @@ RULE_METADATA = RuleMetadata(
     category=Category.MANIFEST,
     cwe=("CWE-1059",),
     scope=RuleScope.WHOLE_REPO,
-    path_filter=r"^(scripts/cicd/.*\.py|\.github/workflows/.*\.ya?ml)$",
+    path_filter=r"^(scripts/cicd/.*\.py|(?:\.github/workflows|config/cicd/prepared-nyx)/.*\.ya?ml)$",
     examples_violation_count=1,
     examples_clean_count=1,
 )

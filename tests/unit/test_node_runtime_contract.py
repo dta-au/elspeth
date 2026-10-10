@@ -63,7 +63,7 @@ def test_frontend_types_track_the_node_24_line() -> None:
 
 
 def test_ci_and_release_image_build_with_node_24() -> None:
-    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8"))
+    workflow = yaml.safe_load((REPO_ROOT / "config/cicd/prepared-nyx/ci.yaml").read_text(encoding="utf-8"))
     setup_jobs = [
         (job_name, step)
         for job_name, job in workflow["jobs"].items()

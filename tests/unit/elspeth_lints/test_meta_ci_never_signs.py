@@ -30,7 +30,7 @@ import yaml
 
 # tests/unit/elspeth_lints/test_meta_ci_never_signs.py -> repo root is parents[3].
 REPO_ROOT = Path(__file__).resolve().parents[3]
-WORKFLOW = REPO_ROOT / ".github/workflows/enforce-allowlist-judge-gates.yaml"
+WORKFLOW = REPO_ROOT / "config/cicd/prepared-nyx/enforce-allowlist-judge-gates.yaml"
 
 # Automatic CI runs the deterministic override-rate check only.
 ALLOWED_GATE_SUBCOMMANDS = frozenset({"check-override-rate"})

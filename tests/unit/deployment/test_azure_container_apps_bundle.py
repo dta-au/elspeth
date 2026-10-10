@@ -33,7 +33,7 @@ from elspeth.web.config import WebSettings, settings_from_env
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = REPO_ROOT / "deploy" / "azure-container-apps"
-CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+CI_WORKFLOW = REPO_ROOT / "config/cicd/prepared-nyx/ci.yaml"
 BUILD_PUSH_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-push.yaml"
 PLATFORM_FACTS = REPO_ROOT / "docs" / "plans" / "2026-09-05-phase6b-azure-container-apps-platform-facts.md"
 

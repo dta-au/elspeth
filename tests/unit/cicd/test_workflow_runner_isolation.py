@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 import yaml
+from tests.unit.cicd.workflow_sources import PREPARED_NAMES, PREPARED_WORKFLOWS, all_workflow_paths, workflow_paths
 
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -22,7 +23,15 @@ HOSTED = ["ubuntu-24.04"]
 
 
 def _workflows() -> dict[str, dict[str, Any]]:
-    return {path.name: yaml.safe_load(path.read_text()) for path in sorted(WORKFLOWS.iterdir()) if path.suffix in {".yaml", ".yml"}}
+    return {path.name: yaml.safe_load(path.read_text()) for path in all_workflow_paths()}
+
+
+def _active_workflows() -> dict[str, dict[str, Any]]:
+    return {path.name: yaml.safe_load(path.read_text()) for path in workflow_paths(WORKFLOWS)}
+
+
+def _prepared_workflows() -> dict[str, dict[str, Any]]:
+    return {path.name: yaml.safe_load(path.read_text()) for path in workflow_paths(PREPARED_WORKFLOWS)}
 
 
 def _events(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -164,18 +173,19 @@ def _assert_routing(workflows: dict[str, dict[str, Any]]) -> None:
                 assert _runner(job, context) == expected, f"{filename}:{name}:{event}: runner isolation failed"
 
 
-def _assert_inactive_pr_admission(workflows: dict[str, dict[str, Any]]) -> None:
-    for filename in ("ci.yaml", "landscape-long-run.yml"):
-        assert all(job["if"] == "${{ false }}" for job in workflows[filename]["jobs"].values()), (
-            f"{filename}: activation before enforcement"
+def _assert_isolated_inventory(active: dict[str, dict[str, Any]], prepared: dict[str, dict[str, Any]]) -> None:
+    assert active, "executable workflow inventory is empty"
+    assert set(prepared) == PREPARED_NAMES, "prepared inventory differs from reviewed package"
+    assert set(active).isdisjoint(prepared), "duplicate workflow source identity"
+    required_contexts = {"CI Success", "CodeQL", "Check cohort-attribution trailers on PR commits", "redaction-gate"}
+    for filename, workflow in active.items():
+        assert not {"pull_request", "pull_request_target", "pull_request_review"} & set(_events(workflow)), (
+            f"{filename}: PR producer discovered before enforcement"
         )
-    for filename, workflow in workflows.items():
-        if "pull_request" not in _events(workflow):
-            continue
-        for fork in (False, True):
-            context = _context("pull_request", ref="refs/pull/1/merge", protected=False, fork=fork)
-            for name in workflow["jobs"]:
-                assert not _admitted(workflow["jobs"], name, context), f"{filename}:{name}: PR execution before enforcement"
+        assert workflow.get("name") not in required_contexts, f"{filename}: required producer discovered before enforcement"
+        for name, job in workflow["jobs"].items():
+            assert "uses" not in job, f"{filename}:{name}: reusable caller discovered before enforcement"
+            assert job.get("name", name) not in required_contexts, f"{filename}:{name}: required producer discovered before enforcement"
 
 
 def _assert_manual_admission(workflows: dict[str, dict[str, Any]]) -> None:
@@ -200,44 +210,61 @@ def test_all_declared_event_paths_resolve_to_their_isolated_runner_pool() -> Non
 
 
 def test_all_manual_paths_reject_nondefault_or_unprotected_refs_before_runner_allocation() -> None:
-    _assert_manual_admission(_workflows())
-
-
-@pytest.mark.parametrize("fork", [False, True])
-def test_pull_request_aggregates_are_not_admitted_before_external_enforcement(fork: bool) -> None:
-    workflows = _workflows()
-    for filename, name in (("ci.yaml", "ci-success"), ("enforce-allowlist-judge-gates.yaml", "judge-gates-success")):
-        jobs = workflows[filename]["jobs"]
-        context = _context("pull_request", ref="refs/pull/1/merge", protected=False, fork=fork)
-        assert not _admitted(jobs, name, context)
-        assert _runner(jobs[name], context) == LOCAL
+    _assert_manual_admission(_active_workflows())
 
 
 def test_prepared_ci_and_every_other_pr_path_are_inactive() -> None:
-    _assert_inactive_pr_admission(_workflows())
+    _assert_isolated_inventory(_active_workflows(), _prepared_workflows())
 
 
-@pytest.mark.parametrize("filename", ["ci.yaml", "landscape-long-run.yml"])
-def test_either_preparation_seam_refuses_accidental_activation(filename: str) -> None:
-    workflows = copy.deepcopy(_workflows())
-    _assert_inactive_pr_admission(workflows)
-    for job in workflows[filename]["jobs"].values():
-        job["if"] = "always()"
-    with pytest.raises(AssertionError, match="activation before enforcement"):
-        _assert_inactive_pr_admission(workflows)
+@pytest.mark.parametrize("filename", sorted(PREPARED_NAMES))
+def test_every_prepared_source_refuses_accidental_discovery(filename: str) -> None:
+    active, prepared = _active_workflows(), _prepared_workflows()
+    _assert_isolated_inventory(active, prepared)
+    active[filename] = prepared.pop(filename)
+    with pytest.raises(AssertionError, match="prepared inventory"):
+        _assert_isolated_inventory(active, prepared)
 
 
-@pytest.mark.parametrize(
-    "filename",
-    ["codeql.yaml", "composer-redaction-gate.yml", "enforce-allowlist-judge-gates.yaml", "enforce-telemetry-backfill-trailer.yaml"],
-)
-def test_pr_admission_controls_detect_removed_guard(filename: str) -> None:
-    workflows = copy.deepcopy(_workflows())
-    _assert_inactive_pr_admission(workflows)
-    for job in workflows[filename]["jobs"].values():
-        job["if"] = "always()"
-    with pytest.raises(AssertionError, match="PR execution before enforcement"):
-        _assert_inactive_pr_admission(workflows)
+@pytest.mark.parametrize("mutation", ["renamed-pr", "caller", "required-success", "duplicate", "empty-active", "empty-prepared"])
+def test_inactive_inventory_refuses_new_producers_duplicates_and_empty_scans(mutation: str) -> None:
+    active, prepared = _active_workflows(), _prepared_workflows()
+    _assert_isolated_inventory(active, prepared)
+    if mutation == "renamed-pr":
+        active["other.yml"] = {"on": {"pull_request": {}}, "jobs": {"test": {"if": "${{ false }}"}}}
+    elif mutation == "caller":
+        active["other.yml"] = {"on": {"workflow_dispatch": {}}, "jobs": {"proof": {"uses": "./.github/workflows/landscape-long-run.yml"}}}
+    elif mutation == "required-success":
+        active["other.yml"] = {"on": {"workflow_dispatch": {}}, "jobs": {"fake": {"name": "CI Success", "if": "${{ false }}"}}}
+    elif mutation == "duplicate":
+        active["ci.yaml"] = prepared["ci.yaml"]
+    elif mutation == "empty-active":
+        active.clear()
+    else:
+        prepared.clear()
+    with pytest.raises(AssertionError, match=r"inventory|discovered|duplicate"):
+        _assert_isolated_inventory(active, prepared)
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "missing", "extra", "empty-active"])
+def test_source_path_union_refuses_hidden_duplicates_or_incomplete_inventories(tmp_path: Path, mutation: str) -> None:
+    active, prepared = tmp_path / "active", tmp_path / "prepared"
+    active.mkdir()
+    prepared.mkdir()
+    (active / "manual.yml").touch()
+    for name in PREPARED_NAMES:
+        (prepared / name).touch()
+    assert set(all_workflow_paths(active, prepared)) == {active / "manual.yml", *(prepared / name for name in PREPARED_NAMES)}
+    if mutation == "duplicate":
+        (active / "ci.yaml").touch()
+    elif mutation == "missing":
+        (prepared / "ci.yaml").unlink()
+    elif mutation == "extra":
+        (prepared / "unreviewed.yml").touch()
+    else:
+        (active / "manual.yml").unlink()
+    with pytest.raises(AssertionError, match=r"inventory|duplicate"):
+        all_workflow_paths(active, prepared)
 
 
 @pytest.mark.parametrize("mutation", ["checkout", "aggregate", "reversed", "new-trigger", "reusable"])

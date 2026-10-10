@@ -1,4 +1,4 @@
-# Prepared three-case producer; both caller and callee are disabled.
+# Prepared three-case producer; caller and callee are outside workflow discovery.
 # External exact-commit admission enforcement is required before activation.
 name: Landscape long-run proofs
 
@@ -15,7 +15,7 @@ env:
 jobs:
   proof:
     name: Landscape ${{ matrix.proof-case }} (${{ matrix.python-version }})
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     timeout-minutes: ${{ matrix.job-timeout-minutes }}
     container:

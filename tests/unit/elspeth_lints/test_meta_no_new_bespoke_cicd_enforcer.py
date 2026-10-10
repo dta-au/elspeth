@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
+import pytest
 from pytest import CaptureFixture
 
 from elspeth_lints.core.protocols import RuleContext
 from elspeth_lints.rules.meta_no_new_bespoke_cicd_enforcer import RULE
 
 
-def test_meta_gate_allows_manifested_legacy_enforcers(tmp_path: Path) -> None:
+@pytest.mark.parametrize("workflow_source", [".github/workflows", "config/cicd/prepared-nyx"])
+def test_meta_gate_allows_manifested_legacy_enforcers(tmp_path: Path, workflow_source: str) -> None:
     """Existing enforce_*.py scripts are allowed only when tracked in the manifest."""
     _write_file(tmp_path / "scripts/cicd/enforce_existing.py", "print('legacy')\n")
     _write_file(
-        tmp_path / ".github/workflows/ci.yaml",
+        tmp_path / workflow_source / "ci.yaml",
         """
 jobs:
   lint:
@@ -40,11 +43,12 @@ rules:
     assert findings == []
 
 
-def test_meta_gate_blocks_unexercised_pending_enforcers(tmp_path: Path) -> None:
+@pytest.mark.parametrize("workflow_source", [".github/workflows", "config/cicd/prepared-nyx"])
+def test_meta_gate_blocks_unexercised_pending_enforcers(tmp_path: Path, workflow_source: str) -> None:
     """Pending legacy scripts must be visibly exercised by CI while awaiting migration."""
     _write_file(tmp_path / "scripts/cicd/enforce_existing.py", "print('legacy')\n")
     _write_file(
-        tmp_path / ".github/workflows/ci.yaml",
+        tmp_path / workflow_source / "ci.yaml",
         """
 jobs:
   lint:
@@ -116,11 +120,12 @@ rules: []
     assert "scripts/cicd/enforce_new_thing.py" in findings[0].message
 
 
-def test_meta_gate_blocks_unmanifested_workflow_invoked_policy_scripts(tmp_path: Path) -> None:
+@pytest.mark.parametrize("workflow_source", [".github/workflows", "config/cicd/prepared-nyx"])
+def test_meta_gate_blocks_unmanifested_workflow_invoked_policy_scripts(tmp_path: Path, workflow_source: str) -> None:
     """Workflow-invoked policy scripts are tracked even without the enforce_ prefix."""
     _write_file(tmp_path / "scripts/cicd/check_new_policy.py", "print('new')\n")
     _write_file(
-        tmp_path / ".github/workflows/ci.yaml",
+        tmp_path / workflow_source / "ci.yaml",
         """
 jobs:
   policy:
@@ -143,11 +148,12 @@ rules: []
     assert "scripts/cicd/check_new_policy.py" in findings[0].message
 
 
-def test_meta_gate_allows_manifested_workflow_invoked_policy_scripts(tmp_path: Path) -> None:
+@pytest.mark.parametrize("workflow_source", [".github/workflows", "config/cicd/prepared-nyx"])
+def test_meta_gate_allows_manifested_workflow_invoked_policy_scripts(tmp_path: Path, workflow_source: str) -> None:
     """Non-enforce policy scripts can be intentionally tracked in the migration manifest."""
     _write_file(tmp_path / "scripts/cicd/check_new_policy.py", "print('new')\n")
     _write_file(
-        tmp_path / ".github/workflows/ci.yaml",
+        tmp_path / workflow_source / "ci.yaml",
         """
 jobs:
   policy:
@@ -222,6 +228,15 @@ def test_cli_renders_meta_gate_github_annotation(tmp_path: Path, capsys: Capture
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out.startswith("::error file=scripts/cicd/enforce_new_thing.py,line=1,col=1,title=meta.no-new-bespoke-cicd-enforcer::")
+
+
+def test_meta_gate_file_filter_includes_prepared_source_and_excludes_unrelated_config() -> None:
+    pattern = RULE.metadata.path_filter
+    assert pattern is not None
+    for path in ("scripts/cicd/check_policy.py", ".github/workflows/ci.yaml", "config/cicd/prepared-nyx/ci.yaml"):
+        assert re.fullmatch(pattern, path)
+    for path in ("config/other.yaml", "config/cicd/pytest-duration-profile.json", "config/cicd/unreviewed/ci.yaml"):
+        assert re.fullmatch(pattern, path) is None
 
 
 def _write_file(path: Path, text: str) -> None:

@@ -16,13 +16,14 @@ import pytest
 import yaml
 
 from elspeth.testing.pytest_xdist_auto import pytest_cmdline_main
+from tests.unit.cicd.workflow_sources import PREPARED_WORKFLOWS, all_workflow_paths
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
-JUDGE_GATES_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "enforce-allowlist-judge-gates.yaml"
-CODEQL_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "codeql.yaml"
+CI_WORKFLOW = PREPARED_WORKFLOWS / "ci.yaml"
+JUDGE_GATES_WORKFLOW = PREPARED_WORKFLOWS / "enforce-allowlist-judge-gates.yaml"
+CODEQL_WORKFLOW = PREPARED_WORKFLOWS / "codeql.yaml"
 CODEQL_CONFIG = REPO_ROOT / ".github" / "codeql" / "codeql-config.yml"
-PROOF_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "landscape-long-run.yml"
+PROOF_WORKFLOW = PREPARED_WORKFLOWS / "landscape-long-run.yml"
 PROOF_WORKFLOW_CALL = "./.github/workflows/landscape-long-run.yml"
 LONG_RUN_CASES = {
     "no-escape": "test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists",
@@ -32,9 +33,9 @@ LONG_RUN_CASES = {
 PR_WORKFLOWS = (
     CI_WORKFLOW,
     CODEQL_WORKFLOW,
-    REPO_ROOT / ".github" / "workflows" / "composer-redaction-gate.yml",
+    PREPARED_WORKFLOWS / "composer-redaction-gate.yml",
     JUDGE_GATES_WORKFLOW,
-    REPO_ROOT / ".github" / "workflows" / "enforce-telemetry-backfill-trailer.yaml",
+    PREPARED_WORKFLOWS / "enforce-telemetry-backfill-trailer.yaml",
 )
 _SHELL_CONTROL_TOKENS = frozenset({"&&", "||", ";", "|"})
 
@@ -262,7 +263,11 @@ def test_integration_job_runs_on_rc_and_release_branch_pushes() -> None:
 
     condition = integration_job["if"]
 
-    assert condition == "${{ false }}", "prepared CI is inactive pending external admission enforcement"
+    assert condition == (
+        "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && "
+        "(github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || "
+        "startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/')))"
+    )
 
 
 def test_integration_lane_fails_closed_on_real_test_failures() -> None:
@@ -374,7 +379,7 @@ def test_push_workflows_include_release_branches(workflow_path: Path) -> None:
 
 def test_every_workflow_job_uses_the_declared_self_hosted_pool() -> None:
     """Hosted runners are forbidden; live topology proofs retain their cloud pool."""
-    workflow_paths = sorted((REPO_ROOT / ".github" / "workflows").iterdir())
+    workflow_paths = all_workflow_paths()
     assert CI_WORKFLOW in workflow_paths
     for workflow_path in workflow_paths:
         if workflow_path.suffix not in {".yml", ".yaml"}:
@@ -388,16 +393,18 @@ def test_every_workflow_job_uses_the_declared_self_hosted_pool() -> None:
 
 
 def test_fork_pull_requests_cannot_reach_checkout_jobs() -> None:
-    """Prepared Nyx workflows refuse PR execution pending external admission."""
+    """Parked PR sources retain fork guards, independent of external admission."""
     for workflow_path in (*PR_WORKFLOWS, PROOF_WORKFLOW):
+        assert workflow_path.parent == PREPARED_WORKFLOWS
+        assert not (REPO_ROOT / ".github/workflows" / workflow_path.name).exists()
         workflow = _workflow(workflow_path)
         for job_name, job in _executable_jobs(workflow):
             if not any(str(step.get("uses", "")).startswith("actions/checkout@") for step in job["steps"]):
                 continue
             condition = str(job.get("if", ""))
-            assert condition in {"${{ false }}", "github.event_name != 'pull_request'"}, (
-                f"{workflow_path.name}:{job_name} lacks inactive PR admission"
-            )
+            assert (
+                "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository" in condition
+            ), f"{workflow_path.name}:{job_name} lacks fork guard in prepared source"
 
 
 @pytest.mark.parametrize("workflow_path,job_name", [(CI_WORKFLOW, "ci-success"), (JUDGE_GATES_WORKFLOW, "judge-gates-success")])
@@ -407,7 +414,7 @@ def test_fork_pull_requests_fail_aggregate_statuses_without_checkout(
 ) -> None:
     """Skipped fork jobs cannot make either aggregate status green."""
     job = _workflow(workflow_path)["jobs"][job_name]
-    assert job["if"] == ("${{ false }}" if workflow_path == CI_WORKFLOW else "always() && github.event_name != 'pull_request'")
+    assert job["if"] == "always()"
     assert not any(str(step.get("uses", "")).startswith("actions/checkout@") for step in job["steps"])
     gate = job["steps"][0]
     assert gate["env"]["IS_FORK_PR"] == (
@@ -422,7 +429,7 @@ def test_fork_pull_requests_fail_aggregate_statuses_without_checkout(
 def test_local_checkouts_are_isolated_between_jobs_and_attempts() -> None:
     """Host jobs cannot inherit root-owned container environments from another run."""
     paths: set[str] = set()
-    for workflow_path in sorted((REPO_ROOT / ".github" / "workflows").iterdir()):
+    for workflow_path in all_workflow_paths():
         if workflow_path.suffix not in {".yml", ".yaml"}:
             continue
         if workflow_path.name == "state-engine-live-provider.yml":
@@ -444,7 +451,7 @@ def test_local_checkouts_are_isolated_between_jobs_and_attempts() -> None:
 
 def test_no_workflow_references_the_operator_hmac_key() -> None:
     """A key injected at job/workflow scope is as reachable as a step secret."""
-    workflow_paths = sorted((REPO_ROOT / ".github" / "workflows").iterdir())
+    workflow_paths = all_workflow_paths()
     assert CI_WORKFLOW in workflow_paths
     for workflow_path in workflow_paths:
         if workflow_path.suffix in {".yml", ".yaml"}:
@@ -477,7 +484,7 @@ def test_all_automatic_workflows_exclude_paid_judge_quality() -> None:
     This configuration guard does not follow wrapper scripts or reusable actions;
     caller inspection remains part of workflow review.
     """
-    paths = sorted((REPO_ROOT / ".github" / "workflows").glob("*.y*ml"))
+    paths = all_workflow_paths()
     assert CI_WORKFLOW in paths
     assert JUDGE_GATES_WORKFLOW in paths
     for path in paths:
@@ -580,7 +587,7 @@ def _assert_long_run_workflow_contract(workflow: dict[str, Any]) -> None:
     job = workflow["jobs"]["proof"]
     assert "uses" not in job and "defaults" not in job
     assert job.get("continue-on-error", False) is False
-    assert job["if"] == "${{ false }}"
+    assert job["if"] == "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
     assert job["name"] == "Landscape ${{ matrix.proof-case }} (${{ matrix.python-version }})"
     assert job["timeout-minutes"] == "${{ matrix.job-timeout-minutes }}"
     assert job["strategy"]["fail-fast"] is False
@@ -686,10 +693,7 @@ def _assert_long_run_workflow_contract(workflow: dict[str, Any]) -> None:
 def test_three_case_workflow_is_called_complete_and_serial() -> None:
     _assert_long_run_workflow_contract(_workflow(PROOF_WORKFLOW))
     calls = [
-        (path.name, name, job["uses"])
-        for path in sorted((REPO_ROOT / ".github/workflows").glob("*.y*ml"))
-        for name, job in _workflow(path)["jobs"].items()
-        if "uses" in job
+        (path.name, name, job["uses"]) for path in all_workflow_paths() for name, job in _workflow(path)["jobs"].items() if "uses" in job
     ]
     assert calls == [("ci.yaml", "landscape-proof", PROOF_WORKFLOW_CALL)]
     _executable_jobs(_ci_workflow())

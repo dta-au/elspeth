@@ -1,8 +1,10 @@
 # CI Pipeline - Lint and Test
 #
-# Runs on every push and PR. Fast feedback loop with:
+# Inert preparation outside GitHub workflow discovery. External exact-commit
+# admission and runtime qualification are required before operator activation.
+# Intended push and PR feedback loop:
 #   - Linting (ruff, mypy) - ~30 seconds
-#   - Testing (four deterministic pytest shards per Python version)
+#   - Testing (eight duration-balanced pytest shards per Python version)
 #   - Bug-hiding pattern detection
 #   - Contract enforcement (Settings→Runtime alignment, type boundaries)
 #
@@ -51,7 +53,7 @@ jobs:
   # ===========================================================================
   static-analysis:
     name: Static analysis
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
@@ -365,11 +367,11 @@ jobs:
             --root .
 
   # ===========================================================================
-  # Stage 3: Test (four independent processes per interpreter)
+  # Stage 3: Test (eight duration-balanced shards per interpreter)
   # ===========================================================================
   test:
     name: Test (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: ${{ matrix.ci-container-image }}
@@ -390,7 +392,7 @@ jobs:
       max-parallel: 2
       matrix:
         python-version: ["3.12", "3.13"]
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
         # Coverage runs on Python 3.13 only because 3.13 is the release
         # interpreter for this branch. The Python 3.12 lane remains
         # dependency-compatibility signal and intentionally skips coverage so
@@ -535,7 +537,7 @@ jobs:
           # jobs bound each worker's accumulated state and preserve every ID.
           uv run python -m pytest tests/ -p scripts.ci_test_shards \
             --ci-partition=ordinary \
-            --ci-shard-count=4 --ci-shard-index=${{ matrix.shard }} \
+            --ci-shard-count=8 --ci-shard-index=${{ matrix.shard }} \
             --ci-shard-report=shard-manifest.json \
             --cov=src/elspeth \
             --cov-report= \
@@ -553,7 +555,7 @@ jobs:
           # flags and JUnit report.
           uv run python -m pytest tests/ -p scripts.ci_test_shards \
             --ci-partition=ordinary \
-            --ci-shard-count=4 --ci-shard-index=${{ matrix.shard }} \
+            --ci-shard-count=8 --ci-shard-index=${{ matrix.shard }} \
             --ci-shard-report=shard-manifest.json \
             -n "$PYTEST_WORKERS" \
             -q -rfE \
@@ -580,7 +582,7 @@ jobs:
 
   landscape-proof:
     name: Landscape long-run proofs
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/landscape-long-run.yml
 
   coverage:
@@ -589,7 +591,7 @@ jobs:
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
     needs: [test, landscape-proof]
-    if: ${{ false }}
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-coverage
     steps:
@@ -655,16 +657,16 @@ jobs:
 
       - name: Validate Python 3.12 ordinary and proof selection
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: uv run python scripts/ci_test_shards.py --artifact-dir proof-evidence/3.12 --shard-count 4 --partitioned --python-version 3.12
+        run: uv run python scripts/ci_test_shards.py --artifact-dir proof-evidence/3.12 --shard-count 8 --partitioned --python-version 3.12
 
       - name: Validate Python 3.13 selection and combine coverage
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: uv run python scripts/ci_test_shards.py --artifact-dir proof-evidence/3.13 --shard-count 4 --partitioned --python-version 3.13
+        run: uv run python scripts/ci_test_shards.py --artifact-dir proof-evidence/3.13 --shard-count 8 --partitioned --python-version 3.13
 
       - name: Enforce overall and audit-critical coverage floors
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
-          # Floors apply to four ordinary shards plus all three case proofs. Checking
+          # Floors apply to eight ordinary shards plus all three case proofs. Checking
           # every floor together makes all coverage deficits visible per run.
           status=0
           uv run coverage report --fail-under=85 || status=1
@@ -694,7 +696,7 @@ jobs:
       # Same open-file limit as the Test job (see the note there).
       options: --ulimit nofile=65536:524288
     needs: [test]
-    if: ${{ false }}
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/')))
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-integration
     steps:
@@ -804,7 +806,7 @@ jobs:
     name: Testcontainer (PostgreSQL contention proofs)
     # Run on the host so testcontainers-python can use the runner's Docker
     # daemon directly; container jobs do not expose that daemon.
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # Run PostgreSQL proofs even if static analysis fails. CI Success requires both.
     # PR #212 selected 651 ids on a hosted runner and reached 53% when the
@@ -884,7 +886,7 @@ jobs:
     # container job those ids skip with a reason; here the ELSPETH_CI_*_REQUIRED
     # variables turn the skips into failures, so the ids are proven on every
     # push rather than silently absent (elspeth-bc97e06221 B1, B3).
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     timeout-minutes: 15
     env:
@@ -937,7 +939,7 @@ jobs:
   # ===========================================================================
   state-engine-validation:
     name: State-engine catalog and selector validation
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
     timeout-minutes: 15
@@ -995,7 +997,7 @@ jobs:
   # ===========================================================================
   azure-container-apps-bicep:
     name: Azure Container Apps Bicep bundle
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
     timeout-minutes: 15
@@ -1058,7 +1060,7 @@ jobs:
 
   supply-chain-audit:
     name: Dependency and License Audit
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
@@ -1218,7 +1220,7 @@ jobs:
   # ===========================================================================
   gateway:
     name: Gateway (locked tests and image)
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
     env:
@@ -1389,7 +1391,7 @@ jobs:
   # browser journey blocks merge instead of being waved through.
   e2e-frontend:
     name: Frontend E2E (Playwright)
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-e2e-frontend
@@ -1498,7 +1500,7 @@ jobs:
   # blocks merge.
   frontend-unit:
     name: Frontend unit (vitest + typecheck)
-    if: ${{ false }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-frontend-unit
@@ -1548,7 +1550,7 @@ jobs:
       - e2e-frontend
       - frontend-unit
       - gateway
-    if: ${{ false }}
+    if: always()
     steps:
       - name: Reject fork pull requests
         env:

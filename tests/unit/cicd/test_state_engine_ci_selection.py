@@ -20,7 +20,7 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+CI_WORKFLOW = REPO_ROOT / "config/cicd/prepared-nyx/ci.yaml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 V2_CATALOG = "docs/architecture/state_engine/proof-catalog/v2/catalog.json"
 V3_CATALOG = "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
@@ -63,8 +63,8 @@ def test_marker_override_instrument_distinguishes_module_launch_from_selection(l
 
 PUSH_WORKFLOWS = (
     CI_WORKFLOW,
-    REPO_ROOT / ".github" / "workflows" / "codeql.yaml",
-    REPO_ROOT / ".github" / "workflows" / "enforce-allowlist-judge-gates.yaml",
+    REPO_ROOT / "config/cicd/prepared-nyx/codeql.yaml",
+    REPO_ROOT / "config/cicd/prepared-nyx/enforce-allowlist-judge-gates.yaml",
 )
 RELEASE_KEEPS_IN_PROGRESS_RUNS = "${{ !startsWith(github.ref, 'refs/heads/release/') }}"
 BASH_ONLY_TOKENS = ("pipefail", "[[")
@@ -141,7 +141,7 @@ def test_suites_report_independently_and_ci_success_requires_static_analysis() -
         assert _job(dependant)["needs"] == ["static-analysis"], dependant
     ci_success = _job("ci-success")
     assert "static-analysis" in ci_success["needs"]
-    assert ci_success["if"] == "${{ false }}"
+    assert ci_success["if"] == "always()"
     assert 'if [[ "${{ needs.static-analysis.result }}" != "success" ]]' in _run_lines(ci_success)
 
 
@@ -225,7 +225,7 @@ def test_no_job_restates_the_marker_selection_except_the_testcontainer_override(
     steps_with_pytest: list[tuple[str, str]] = []
     marker_expressions: dict[str, list[str]] = {}
     jobs = dict(_workflow()["jobs"])
-    proof = yaml.safe_load((REPO_ROOT / ".github/workflows/landscape-long-run.yml").read_text(encoding="utf-8"))
+    proof = yaml.safe_load((REPO_ROOT / "config/cicd/prepared-nyx/landscape-long-run.yml").read_text(encoding="utf-8"))
     assert jobs["landscape-proof"]["uses"] == "./.github/workflows/landscape-long-run.yml"
     jobs.update({f"landscape-proof/{name}": job for name, job in proof["jobs"].items()})
     for job_name, job in jobs.items():

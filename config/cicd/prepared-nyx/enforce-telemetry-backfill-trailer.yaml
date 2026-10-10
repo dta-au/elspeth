@@ -19,8 +19,8 @@ on:
 jobs:
   check:
     name: Check cohort-attribution trailers on PR commits
-    # PR execution awaits external maintainer admission of the exact commit.
-    if: github.event_name != 'pull_request'
+    # Prepared source; external admission is required before activation.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-telemetry-backfill

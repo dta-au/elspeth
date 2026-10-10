@@ -74,7 +74,7 @@ def _validate(payload: object, *, provider: tr.Provider = "aws", **overrides: st
 
 def test_selection_is_ci_testcontainer_job_token_for_token() -> None:
     """The receipt can only record the run CI itself requires (P6-CI option (a)); the pin test there is untouched."""
-    workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yaml").read_text(encoding="utf-8"))
+    workflow = yaml.safe_load((REPO_ROOT / "config/cicd/prepared-nyx/ci.yaml").read_text(encoding="utf-8"))
     commands = "\n".join(step.get("run", "") for step in workflow["jobs"]["testcontainer"]["steps"])
     for token in tr.TESTCONTAINER_SELECTION:
         assert token in commands, token

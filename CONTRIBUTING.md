@@ -83,6 +83,17 @@ Report a runner or prerequisite failure to the maintainer with the failing
 Actions job URL. Manual live-provider acceptance still needs its GitHub
 environment credentials and remote service access.
 
+### Prepared Nyx workflows
+
+The PR CI sources are parked in `config/cicd/prepared-nyx/`, outside GitHub's
+workflow discovery directory, pending external maintainer admission of exact
+commits and runtime qualification. They produce no remote required checks while
+parked. Do not substitute skipped jobs or relax required checks to accommodate
+this preparation. Source-contract tests inspect both executable and parked
+inventories, and linting the templates requires a disposable deployment mirror.
+See [the proof guide](docs/maintainer/ci-landscape-proof.md) for the evidence graph
+and activation prerequisites.
+
 ## Code Standards
 
 - **No defensive programming** against our own code. Access typed fields directly (`obj.field`), not defensively (`getattr(obj, "field", None)`). See [Data Trust and Error Handling](docs/guides/data-trust-and-error-handling.md) for the trust-boundary rationale.
