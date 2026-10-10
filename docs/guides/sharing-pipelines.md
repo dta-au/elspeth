@@ -70,10 +70,13 @@ accept this trade-off.
 ## First-deploy operator action
 
 Since 0.8.1, shareable-review state is part of the broader web session
-database contract. The 0.8.3 candidate expects `SESSION_SCHEMA_EPOCH=72`
-and `SQLITE_SCHEMA_EPOCH=49`; confirm both against the deployed service's
-live schema constants before recreating a stale store. From 0.8.1 or 0.8.2,
-recreate only the session store when Landscape is already at epoch 49. Landscape epoch 30 adds durable
+database contract. The pending 0.8.4 security integration expects
+`SESSION_SCHEMA_EPOCH=73` and `SQLITE_SCHEMA_EPOCH=49`; confirm both against
+the deployed service's live schema constants before recreating a stale store.
+From 0.8.1, 0.8.2 or 0.8.3, stop the service and recreate the session store and, for local auth,
+obsolete `auth.db` stores. Preserve Landscape when it is already at epoch 49.
+Reprovision local accounts with the current build before restarting the service.
+Landscape epoch 30 adds durable
 row_union barrier
 attribution, and epoch 31 closes scheduler work-item status over the public
 six-state vocabulary. Epoch 32 adds atomic, durable aggregation result receipts

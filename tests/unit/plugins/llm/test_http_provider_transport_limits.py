@@ -17,6 +17,7 @@ import respx
 
 from elspeth.contracts import Call, CallStatus, CallType, RunMode
 from elspeth.contracts.audit_protocols import CallRecorder
+from elspeth.contracts.call_data import HTTPCallResponse
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence
 from elspeth.contracts.chat_parts import ChatMessage, ImagePart, audit_messages, image_response_is_audit_safe, wire_messages
@@ -227,6 +228,36 @@ def test_response_limit_error_cannot_retain_image_echo_in_headers(harness: _Harn
         if call.response_ref is not None:
             assert encoded.encode() not in harness.store.retrieve(call.response_ref)
     assert encoded not in str(harness.events)
+
+
+@pytest.mark.parametrize("outcome", ["success", "provider_error", "cap_error"])
+@respx.mock
+def test_admission_programming_error_propagates_without_audit_or_telemetry(outcome: str) -> None:
+    recorder = Mock(spec=CallRecorder)
+    recorder.allocate_operation_call_index.return_value = 0
+    events: list[TelemetryEvent] = []
+    client = AuditedHTTPClient(
+        execution=recorder,
+        state_id=None,
+        operation_id="operation-1",
+        run_id="run-1",
+        telemetry_emit=events.append,
+        max_response_body_bytes=1024,
+        **mock_audit_authority(),
+    )
+    body = b"x" * 1025 if outcome == "cap_error" else b'{"ok":true}'
+    respx.post("https://provider.example/raw").mock(return_value=httpx.Response(503 if outcome == "provider_error" else 200, content=body))
+
+    def broken_admission(response: HTTPCallResponse, body: bytes) -> bool:
+        raise TypeError("admission programming bug")
+
+    try:
+        with pytest.raises(TypeError, match="admission programming bug"):
+            client.post("https://provider.example/raw", response_admission=broken_admission)
+        recorder.record_operation_call.assert_not_called()
+        assert not events
+    finally:
+        client.close()
 
 
 class _Stream(httpx.SyncByteStream):

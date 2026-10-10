@@ -58,7 +58,13 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     release_080 = changelog.split("\n## 0.8.0 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_071 = changelog.split("\n## 0.7.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
 
-    assert f"Session epoch {SESSION_SCHEMA_EPOCH}" in current_release
+    pending_heading = "\n## Pending 0.8.4 security integration\n"
+    assert changelog.count(pending_heading) == 1
+    pending_integration = changelog.split(pending_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    assert f"Session epoch {SESSION_SCHEMA_EPOCH}" in pending_integration
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in pending_integration
+    assert "recreate" in pending_integration and "auth.db" in pending_integration
+    assert "reprovision accounts before restart" in pending_integration
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_release
     assert "Session epoch 72 adds durable Composer jobs" in current_release
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in current_release
@@ -174,7 +180,13 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert len(current) == 1
     current_text = current[0].get_text(" ", strip=True)
     assert f"From 0.8.0 to {CURRENT_VERSION}" in current_text
-    assert f"Sessions epoch {SESSION_SCHEMA_EPOCH}" in current_text
+    assert "Sessions epoch 72" in current_text
+    pending = soup.select('[data-security-integration="0.8.4"]')
+    assert len(pending) == 1
+    pending_text = pending[0].get_text(" ", strip=True)
+    assert f"Sessions epoch {SESSION_SCHEMA_EPOCH}" in pending_text
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in pending_text
+    assert "recreate incompatible auth.db state and reprovision accounts" in pending_text
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_text
     assert "Upgrades from 0.8.1 or 0.8.2 advance the session store from epoch 71 to 72" in current_text
     assert f"Keep a Landscape database already at epoch {SQLITE_SCHEMA_EPOCH}" in current_text

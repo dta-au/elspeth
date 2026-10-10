@@ -48,7 +48,7 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_71(engine) -> None:
+def test_blob_inline_resolutions_schema_epoch_is_73(engine) -> None:
     # 51: the multi-replica session-operation substrate landed on top of
     # mainline's 50 (elspeth-4d6c0dd0f5).
     # 52: pluggable SSO and the identity substrate (elspeth-07cd19ba73) —
@@ -70,9 +70,10 @@ def test_blob_inline_resolutions_schema_epoch_is_71(engine) -> None:
     # Epoch 69 binds freeform message ingress receipts.
     # Epoch 70 renames the persisted tutorial Build stage to build.
     # Epoch 71 adds mode-neutral fork/revert receipts.
-    assert SESSION_SCHEMA_EPOCH == 72
+    # Epoch 73 adds durable authentication session-family revocation.
+    assert SESSION_SCHEMA_EPOCH == 73
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 72
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 73
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

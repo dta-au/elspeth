@@ -17,6 +17,10 @@ fact, the receipt records a sanitized projection of it.
 > a receipt is an outstanding closure condition. See
 > [Deployment Platforms](../reference/deployment-platforms.md) for support scope.
 
+The current candidate includes the pending 0.8.4 security integration and
+requires session epoch 73 and Landscape epoch 49. The 0.8.3 candidate notes
+describe the preceding epoch-72 schema.
+
 The supported configuration retains `Single` revision mode, `sticky` session
 affinity and 2–4 replicas with one web process per replica. External PostgreSQL
 provides single-use tickets and durable run-event replay on authorized peer
@@ -106,7 +110,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The exact published candidate image digest (session epoch 72, Landscape epoch 49), once available, in the registry.
+- The exact published candidate image digest (session epoch 73, Landscape epoch 49), once available, in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -471,7 +475,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   `/mnt/elspeth/data`, `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads`
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
-  with the schema-owner URLs and initializes both schemas at session epoch 72
+  with the schema-owner URLs and initializes both schemas at session epoch 73
   and Landscape epoch 49.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
@@ -484,7 +488,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   where the process runs.
 
 > **LIVE:** for 0.8.3 acceptance, run the Jobs with the candidate digest and
-> require both schema checks to pass after initialization at session epoch 72
+> require both schema checks to pass after initialization at session epoch 73
 > and Landscape epoch 49. Record the execution names. Any no-schema dry run
 > against a `release/0.8.0` image is predecessor-only wiring evidence; it
 > cannot establish the candidate's schema compatibility or acceptance.
@@ -558,7 +562,7 @@ parity test feeds one corpus through both).
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 72, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 73, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",

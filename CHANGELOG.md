@@ -4,6 +4,15 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## Pending 0.8.4 security integration
+
+The pending 0.8.4 integration requires Session epoch 73 for durable
+authentication session-family revocation. Landscape epoch 49 remains unchanged.
+Stop the service, archive or export needed evidence, and recreate older session
+databases and their sidecars. Local-auth installations must also recreate
+incompatible auth.db state and reprovision accounts before restart. A Landscape
+database already at epoch 49 remains usable.
+
 ## 0.8.3 - Unreleased (Archive recovery and Composer HTTPS progress candidate)
 
 - **Session archive and cleanup recover on filesystems without no-replace rename.**

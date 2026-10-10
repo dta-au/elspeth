@@ -18,7 +18,7 @@ def _readme_text() -> str:
 
 
 def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
-    """Current release guidance must name the build's epochs and install version.
+    """Current guidance must name the build's epochs and qualified install candidate.
 
     Historical release sections cannot satisfy this check. The predecessor
     epochs are 0.8.0's released shape, independent of the older Scenario B
@@ -34,7 +34,8 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     assert f"session epoch 53 to {SESSION_SCHEMA_EPOCH} " in text
     assert f"Landscape epoch 38 to {SQLITE_SCHEMA_EPOCH};" in text
     assert "recreate both stale databases in the same service-stop window" in text
-    assert f"install {version}." in text
+    assert "pending 0.8.4 security integration is qualified" in text
+    assert "install the qualified candidate." in text
 
 
 def test_readme_release_links_resolve() -> None:

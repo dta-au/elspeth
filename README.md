@@ -106,16 +106,21 @@ transport is under final integration and acceptance review. It delivers
 operation progress followed by the completed answer; it does not stream
 generated answer tokens. See the [release notes](CHANGELOG.md).
 
-Session epoch 72 adds durable Composer operations and advances from 71 in
-0.8.2; Landscape remains at epoch 49. Upgrades from 0.8.1 or 0.8.2 must
+The pending 0.8.4 security integration requires session epoch 73 for durable
+session-family revocation and derived WebSocket credentials. With the service
+stopped, recreate obsolete local `auth.db` stores and reprovision local accounts
+before restart.
+Session epoch 72 added durable Composer operations and advanced from 71 in
+0.8.2; Landscape remains at epoch 49. Upgrades from 0.8.1, 0.8.2 or 0.8.3 must
 stop the service, archive or export needed session evidence, and recreate
 the session database and its SQLite sidecars or PostgreSQL schema. Keep a
 Landscape database already at epoch 49. Installations still on 0.8.0
-require a cutover from session epoch 53 to 72 and Landscape epoch 38 to 49;
-ELSPETH does not migrate either store in place. Once a 0.8.3 image is
-published, archive or export evidence you need, stop the old service,
+require a cutover from session epoch 53 to 73 and Landscape epoch 38 to 49;
+ELSPETH does not migrate either store in place. Once an image containing the
+pending 0.8.4 security integration is qualified, archive or export evidence you
+need, stop the old service,
 recreate both stale databases in the same service-stop window, and
-install 0.8.3. See the
+install the qualified candidate. See the
 [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.
 

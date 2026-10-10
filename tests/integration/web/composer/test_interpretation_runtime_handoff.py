@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import json as jsonlib
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -198,6 +200,15 @@ class _FakeHTTPXClient:
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.closed = False
+
+    @contextmanager
+    def stream(self, method: str, url: str, **kwargs: Any) -> Iterator[Any]:
+        assert method == "POST"
+        response = self.post(url, **kwargs)
+        try:
+            yield response
+        finally:
+            response.close()
 
     def post(
         self,

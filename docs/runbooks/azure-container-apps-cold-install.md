@@ -17,6 +17,9 @@ the web app and its Jobs.
 > `docs/operator/evidence/azure-container-apps/0.8.3.json` is no longer a tracker
 > closure or documentation-promotion condition.
 
+The current candidate includes the pending 0.8.4 security integration and
+requires session epoch 73 and Landscape epoch 49.
+
 The supported configuration retains `Single` revision mode, `sticky` session
 affinity and 2–4 replicas with one web process per replica. External PostgreSQL
 provides single-use tickets and durable run-event replay on authorized peer
@@ -83,7 +86,7 @@ A successful install has:
   `/api/health` and `/api/ready`;
 - both databases (`elspeth_sessions`, `elspeth_landscape`) on one Flexible
   Server behind a private endpoint, one schema-owner role and one runtime role,
-  session epoch 72 and Landscape epoch 49 initialized;
+  session epoch 73 and Landscape epoch 49 initialized;
 - one NFS 4.1 Azure Files share mounted at `/mnt/elspeth` on the app and every
   Job with `data`, `data/blobs` and `payloads` owned `1654:1654`. SMB Azure
   Files is not supported for this target; **Azure Files carries no database**

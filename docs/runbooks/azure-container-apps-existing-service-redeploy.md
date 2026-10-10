@@ -18,6 +18,9 @@ Every platform literal below is measured in the
 > `docs/operator/evidence/azure-container-apps/0.8.3.json` is no longer a tracker
 > closure or documentation-promotion condition.
 
+The current candidate includes the pending 0.8.4 security integration and
+requires session epoch 73 and Landscape epoch 49.
+
 The supported configuration retains `Single` revision mode, `sticky` session
 affinity and 2–4 replicas with one web process per replica. External PostgreSQL
 provides single-use tickets and durable run-event replay on authorized peer
@@ -297,8 +300,12 @@ An epoch-crossing candidate needs the database owner to drain the old
 revision, export the stopped Sessions store's identity/grant/edge cohort,
 archive and recreate each stale store, and rerun the schema Job from the
 [cold-install runbook](azure-container-apps-cold-install.md). For 0.8.1 or
-0.8.2 to 0.8.3, only the session store changes from epoch 71 to 72; preserve
-a Landscape store already at epoch 49. Then apply the candidate revision and complete the
+0.8.2 to the preceding 0.8.3 candidate, only the session store changed from
+epoch 71 to 72. The pending 0.8.4 integration instead requires epoch 73;
+recreate the stale session store and preserve a Landscape store already at
+epoch 49. For local auth, also recreate incompatible auth.db state and its
+SQLite sidecars and reprovision accounts while the service is drained, before
+activating the candidate revision. Then apply the candidate revision and complete the
 [identity workflow cutover handoff](identity-workflow-cutover.md): bootstrap,
 re-admit, check authenticated behavior, and send the notice before ordinary
 traffic resumes. This image-only path assumes already-current schemas and

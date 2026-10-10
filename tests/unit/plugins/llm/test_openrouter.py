@@ -191,7 +191,6 @@ def _create_mock_response(
     status_code: int = 200,
     headers: dict[str, str] | None = None,
     raw_body: str | bytes | None = None,
-    raise_for_status_error: Exception | None = None,
 ) -> httpx.Response:
     """Create an httpx.Response using ChaosLLM response generation."""
     request = {
@@ -208,12 +207,6 @@ def _create_mock_response(
         raw_body=raw_body,
         usage_override=usage,
     )
-    if raise_for_status_error is not None:
-
-        def raise_for_status() -> None:
-            raise raise_for_status_error
-
-        response.raise_for_status = raise_for_status  # type: ignore[method-assign]
     return response
 
 
@@ -984,7 +977,7 @@ class TestLLMTransformOpenRouterPipelining:
         """raise_for_status is called on response to check errors."""
         mock_response = _create_mock_response(
             chaosllm_server,
-            raise_for_status_error=_http_status_error("400 Bad Request", 400, "Bad Request"),
+            status_code=400,
         )
         with mock_httpx_client(chaosllm_server, response=mock_response):
             transform.accept(make_pipeline_row({"text": "hello"}), ctx)

@@ -17,6 +17,11 @@ admitted through the normal sign-in process. Preserve current Landscape epoch-49
 evidence. Do not run predecessor code against the recreated stores. Destructive
 shared-state recreation requires the operator's approval.
 
+The release acceptance record must cite the
+session-epoch-73/Landscape-epoch-49 record. If a cutover fails, keep the
+service drained and repair the epoch-73 release forward; do not roll
+predecessor code over the recreated stores.
+
 ## Prior Cutover: 0.8.3 candidate (session epoch 72, Landscape epoch 49)
 
 The 0.8.3 candidate advances the session store from epoch 71 to 72 for
@@ -245,10 +250,10 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-72 release forward,
+unsupported: keep the service drained, repair the deployed release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-72/Landscape-epoch-49 record when binding candidate and rollback
-decisions.
+candidate's recorded session and Landscape epochs when binding candidate and
+rollback decisions.
 
 For a later candidate that has used identity administration, the window also
 needs the [identity workflow cutover handoff](identity-workflow-cutover.md):
@@ -524,8 +529,9 @@ Never print secret values from `deploy/elspeth-web.env`. It is acceptable to pri
    ```
 
 4. Delete or move the confirmed session DB artifact set (main file plus `-wal`, `-shm`, and `-journal` sidecars together). Mixing a new main file with stale sidecars, or restoring a main file without its sidecars, is not a valid reset.
-5. Start the web process. `initialize_session_schema()` recreates the DB with current metadata.
-6. Create a new session through the web API or UI. A startup `SessionSchemaError` means a stale session DB is still being used.
+5. For the epoch-73 local-auth cutover, also recreate incompatible `auth.db` state and its SQLite sidecars while the service is stopped, then reprovision local accounts with the current build's `elspeth composer users add` command. Resolve `auth.db` from the configured data directory; preserve any needed predecessor evidence separately. SSO deployments do not have this local-auth step.
+6. Start the web process only after that local-auth step is complete. `initialize_session_schema()` recreates the DB with current metadata.
+7. Create a new session through the web API or UI. A startup `SessionSchemaError` means a stale session DB is still being used.
 
 ## Phase 5b: Two-DB Reset
 
@@ -841,6 +847,17 @@ fi
 for artifact in "${DB_ARTIFACTS[@]}"; do
     sudo rm -f "$artifact"
 done
+
+# Before the epoch-73 restart, local-auth deployments must recreate the
+# incompatible auth.db and its SQLite sidecars, then reprovision local
+# accounts with this build's `elspeth composer users add` command. Resolve
+# auth.db from the configured data directory while the service stays stopped.
+# The session-only reset above does not perform that separate local-auth step.
+read -r -p "After local-auth recreation and reprovisioning (or confirming SSO), type AUTH-READY to restart: " AUTH_CUTOVER_CONFIRM
+if [ "$AUTH_CUTOVER_CONFIRM" != AUTH-READY ]; then
+    echo "REFUSING: authentication cutover was not confirmed; service remains stopped." >&2
+    exit 1
+fi
 sudo systemctl start "$SERVICE"
 
 curl --unix-socket /run/elspeth/uvicorn.sock -fsS http://localhost/api/health
@@ -856,7 +873,7 @@ session. If `LANDSCAPE_PATH` is not already set,
 resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 72 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 73 (== SESSION_SCHEMA_EPOCH)
 sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 49 (== SQLITE_SCHEMA_EPOCH)
 ```
 

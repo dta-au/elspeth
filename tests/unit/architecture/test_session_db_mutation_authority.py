@@ -14019,7 +14019,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "730473cf9d5628ab",
             1,
             "SessionSchemaAuthority",
-            line=273,
+            line=275,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -14029,7 +14029,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "d7ac5811a7ee7916",
             1,
             "SessionSchemaAuthority",
-            line=308,
+            line=310,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -14039,7 +14039,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "983f117ba847fe0d",
             1,
             "SessionSchemaAuthority",
-            line=422,
+            line=424,
         ),
     )
     expected = _REVIEWED_NON_SESSION_CONNECTIONS + expected_session_reachable

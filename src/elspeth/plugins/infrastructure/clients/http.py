@@ -1514,20 +1514,17 @@ class AuditedHTTPClient(AuditedClientBase):
                 headers=merged_headers,
                 timeout=effective_timeout,
             )
-            response_dto, _ = self._build_response_payload(response, full_url)
-            if response_admission is not None and not response_admission(response_dto, response.content):
-                raise HTTPResponseAuditRejectedError(response_dto)
         except Exception as e:
             latency_ms = (time.perf_counter() - start) * 1000
             response_payload: HTTPCallResponse | None = None
             response_data: Mapping[str, Any] | None = None
-            if isinstance(e, (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError, HTTPResponseAuditRejectedError)):
+            if isinstance(e, (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError)):
                 response_payload = e.response_payload
                 response_data = e.response_data
                 if response_admission is not None and not response_admission(response_payload, b""):
-                    refusal = HTTPResponseAuditRejectedError(response_payload)
-                    response_payload = refusal.response_payload
-                    response_data = refusal.response_data
+                    bounded_refusal = HTTPResponseAuditRejectedError(response_payload)
+                    response_payload = bounded_refusal.response_payload
+                    response_data = bounded_refusal.response_data
 
             self._record_and_emit(
                 call_index=call_index,
@@ -1548,15 +1545,23 @@ class AuditedHTTPClient(AuditedClientBase):
 
             raise
 
+        response_dto, _ = self._build_response_payload(response, full_url)
+        refusal: HTTPResponseAuditRejectedError | None = None
+        if response_admission is not None and not response_admission(response_dto, response.content):
+            refusal = HTTPResponseAuditRejectedError(response_dto)
+            response_dto = refusal.response_payload
+
         latency_ms = (time.perf_counter() - start) * 1000
 
         # 2xx = SUCCESS, 4xx/5xx = ERROR
-        is_success = 200 <= response.status_code < 300
+        is_success = refusal is None and 200 <= response.status_code < 300
         call_status = CallStatus.SUCCESS if is_success else CallStatus.ERROR
         response_data = response_dto.to_dict()
 
         error_data: CallPayload | None = None
-        if not is_success:
+        if refusal is not None:
+            error_data = HTTPCallError(type=type(refusal).__name__, message=str(refusal))
+        elif not is_success:
             error_data = HTTPCallError(
                 type="HTTPError",
                 message=f"HTTP {response.status_code}",
@@ -1567,7 +1572,7 @@ class AuditedHTTPClient(AuditedClientBase):
             call_index=call_index,
             full_url=full_url,
             request_data=request_data,
-            response=response,
+            response=response if refusal is None else None,
             response_data=response_data,
             error_data=error_data,
             latency_ms=latency_ms,
@@ -1577,6 +1582,8 @@ class AuditedHTTPClient(AuditedClientBase):
             token_id_override=token_id,
         )
 
+        if refusal is not None:
+            raise refusal
         return response
 
     def post(
