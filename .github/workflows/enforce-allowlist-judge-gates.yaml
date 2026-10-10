@@ -83,13 +83,13 @@ defaults:
   run:
     shell: bash
 
-# Code-executing jobs admit same-repository PRs and trusted pushes. Fork PRs
-# fail the aggregate without checking out or executing their repository code.
+# Same-repository PR jobs use GitHub-hosted VMs; trusted pushes use Nyx.
+# Fork PRs fail the hosted aggregate without checking out repository code.
 jobs:
   check-override-rate:
     name: Override-rate drift gate (C3)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     # Judge gates should fail fast if checkout/dependency/git plumbing hangs.
     timeout-minutes: 15
     container:
@@ -151,7 +151,7 @@ jobs:
   # additional diagnostic and is intentionally outside branch protection.
   judge-gates-success:
     name: Judge gates success
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     needs:
       - check-override-rate
     if: always()
@@ -161,7 +161,7 @@ jobs:
           IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
           if [[ "$IS_FORK_PR" == "true" ]]; then
-            echo "Fork pull requests cannot run on the trusted local runners."
+            echo "Fork pull requests require maintainer admission onto a repository branch."
             exit 1
           fi
 

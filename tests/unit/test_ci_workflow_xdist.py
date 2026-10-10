@@ -347,23 +347,8 @@ def test_push_workflows_include_release_branches(workflow_path: Path) -> None:
     assert '"release/**"' in push.group("branches")
 
 
-def test_every_workflow_job_uses_the_declared_self_hosted_pool() -> None:
-    """Hosted runners are forbidden; live topology proofs retain their cloud pool."""
-    workflow_paths = sorted((REPO_ROOT / ".github" / "workflows").iterdir())
-    assert CI_WORKFLOW in workflow_paths
-    for workflow_path in workflow_paths:
-        if workflow_path.suffix not in {".yml", ".yaml"}:
-            continue
-        workflow = _workflow(workflow_path)
-        for job_name, job in workflow["jobs"].items():
-            expected = ["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]
-            if workflow_path.name == "state-engine-live-provider.yml":
-                expected = ["self-hosted", "Linux", "X64", "ephemeral", "aws-ecs", "postgresql-16-rds", "state-engine-live-provider"]
-            assert job["runs-on"] == expected, f"{workflow_path.name}:{job_name} must route to its declared self-hosted pool"
-
-
 def test_fork_pull_requests_cannot_reach_checkout_jobs() -> None:
-    """Repository PRs run locally; fork code needs admission onto a repository branch."""
+    """Fork refusal remains policy even though admitted PRs use hosted VMs."""
     for workflow_path in PR_WORKFLOWS:
         workflow = _workflow(workflow_path)
         for job_name, job in workflow["jobs"].items():
@@ -374,7 +359,7 @@ def test_fork_pull_requests_cannot_reach_checkout_jobs() -> None:
             if condition == "github.event_name != 'pull_request'":
                 continue
             assert "github.event.pull_request.head.repo.full_name == github.repository" in condition, (
-                f"{workflow_path.name}:{job_name} can execute fork code locally"
+                f"{workflow_path.name}:{job_name} can execute fork code"
             )
 
 

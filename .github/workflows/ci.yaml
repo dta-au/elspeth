@@ -36,9 +36,9 @@ env:
 permissions:
   contents: read
 
-# Every job uses the trusted local pool. Code-executing jobs admit only
-# same-repository PRs and non-PR events. CI Success rejects fork PRs without
-# checking out or executing their repository code.
+# Pull-request jobs use disposable GitHub-hosted VMs, including the summary
+# status. Trusted pushes retain the local pool. Fork rejection remains policy;
+# runner-group restrictions must independently deny contributor workflow refs.
 #
 # Self-hosted container jobs can leave root-owned venv/cache artifacts in the
 # default workspace. Every checkout below uses a per-run, per-job path so stale
@@ -51,7 +51,7 @@ jobs:
   static-analysis:
     name: Static analysis
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
     env:
@@ -369,7 +369,7 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     container:
       image: ${{ matrix.ci-container-image }}
       # Docker 29 on the self-hosted runners starts containers with a soft
@@ -576,7 +576,7 @@ jobs:
 
   coverage:
     name: Combined coverage
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
     needs: [test]
@@ -653,7 +653,7 @@ jobs:
   # ===========================================================================
   integration:
     name: Integration Tests
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
       # Same open-file limit as the Test job (see the note there).
@@ -770,7 +770,7 @@ jobs:
     # Run on the host so testcontainers-python can use the runner's Docker
     # daemon directly; container jobs do not expose that daemon.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     # Run PostgreSQL proofs even if static analysis fails. CI Success requires both.
     # PR #212 selected 651 ids on a hosted runner and reached 53% when the
     # previous 30-minute limit cancelled the job. Allow the full required
@@ -805,6 +805,10 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          if [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q libsqlcipher-dev
+          fi
           dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
@@ -850,7 +854,7 @@ jobs:
     # variables turn the skips into failures, so the ids are proven on every
     # push rather than silently absent (elspeth-bc97e06221 B1, B3).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     timeout-minutes: 15
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-host-runner-unit
@@ -881,6 +885,10 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          if [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q libsqlcipher-dev
+          fi
           dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
@@ -903,7 +911,7 @@ jobs:
   state-engine-validation:
     name: State-engine catalog and selector validation
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     needs: [static-analysis]
     timeout-minutes: 15
     env:
@@ -930,6 +938,10 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          if [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q libsqlcipher-dev
+          fi
           dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
@@ -961,7 +973,7 @@ jobs:
   azure-container-apps-bicep:
     name: Azure Container Apps Bicep bundle
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     needs: [static-analysis]
     timeout-minutes: 15
     env:
@@ -1013,6 +1025,10 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          if [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q libsqlcipher-dev
+          fi
           dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
@@ -1024,7 +1040,7 @@ jobs:
   supply-chain-audit:
     name: Dependency and License Audit
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
     needs: [static-analysis]
@@ -1184,7 +1200,7 @@ jobs:
   gateway:
     name: Gateway (locked tests and image)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     needs: [static-analysis]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-gateway
@@ -1355,7 +1371,7 @@ jobs:
   e2e-frontend:
     name: Frontend E2E (Playwright)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-e2e-frontend
     steps:
@@ -1382,6 +1398,10 @@ jobs:
       - name: Install system dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
+          if [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q libsqlcipher-dev
+          fi
           dpkg-query -W libsqlcipher-dev
 
       - name: Install Python dependencies
@@ -1401,18 +1421,27 @@ jobs:
 
       - name: Install Playwright browser
         working-directory: ${{ env.CI_CHECKOUT_PATH }}/src/elspeth/web/frontend
-        run: npx playwright install chromium
+        run: |
+          if [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
+            npm run test:e2e:install
+          else
+            npx playwright install chromium
+          fi
 
       - name: Assign isolated Playwright ports
         run: |
-          # One job runs per runner service. Disjoint pairs for each service
-          # prevent simultaneous push and PR runs from sharing a port.
-          if [[ ! "$RUNNER_NAME" =~ ^nyx-elspeth-([1-9][0-9]{0,4})$ ]]; then
-            echo "Unsupported local runner name: $RUNNER_NAME" >&2
-            exit 1
+          # Hosted VMs are isolated per job. Local runner services share a host
+          # and retain disjoint port pairs.
+          if [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
+            port_base=20000
+          else
+            if [[ ! "$RUNNER_NAME" =~ ^nyx-elspeth-([1-9][0-9]{0,4})$ ]]; then
+              echo "Unsupported local runner name: $RUNNER_NAME" >&2
+              exit 1
+            fi
+            runner_index="${BASH_REMATCH[1]}"
+            port_base=$((20000 + 2 * runner_index))
           fi
-          runner_index="${BASH_REMATCH[1]}"
-          port_base=$((20000 + 2 * runner_index))
           if (( port_base + 1 > 65535 )); then
             echo "Runner index exceeds the Playwright port range: $runner_index" >&2
             exit 1
@@ -1464,7 +1493,7 @@ jobs:
   frontend-unit:
     name: Frontend unit (vitest + typecheck)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-frontend-unit
     steps:
@@ -1499,7 +1528,7 @@ jobs:
   # ===========================================================================
   ci-success:
     name: CI Success
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
     needs:
       - static-analysis
       - test
@@ -1519,7 +1548,7 @@ jobs:
           IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
           if [[ "$IS_FORK_PR" == "true" ]]; then
-            echo "Fork pull requests cannot run on the trusted local runners."
+            echo "Fork pull requests require maintainer admission onto a repository branch."
             exit 1
           fi
 
