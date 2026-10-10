@@ -15,6 +15,7 @@ import pytest
 
 from elspeth.web.auth.models import AuthenticationError
 from elspeth.web.auth.session_token import LOCAL_AUDIENCE, SessionTokenIssuer
+from tests.fixtures.auth_sessions import TestSessionFamilies
 
 _KEY = b"a" * 32
 _OTHER_KEY = b"b" * 32
@@ -37,6 +38,7 @@ def _issuer(
         token_expiry_hours=expiry_hours,
         max_refresh_chain_hours=chain_hours,
         principal_is_active=lambda _identity_id: active,
+        sessions=TestSessionFamilies(),
     )
 
 
@@ -261,6 +263,7 @@ def test_decode_does_not_consult_the_identity_store() -> None:
         token_expiry_hours=24,
         max_refresh_chain_hours=168,
         principal_is_active=_explode,
+        sessions=TestSessionFamilies(),
     )
     token = issuer.mint(identity_id=_IDENTITY, username="ada")
     assert issuer.decode(token).identity_id == _IDENTITY

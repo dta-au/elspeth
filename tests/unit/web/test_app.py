@@ -1147,14 +1147,7 @@ class TestBrowserDocumentHeaders:
 
 
 class TestBodySizeLimitMiddleware:
-    """Tests that the 10 MB body-size guard rejects oversized requests.
-
-    Phase 5b.0.5 (F-3): the ASGI body-size middleware is defense-in-depth
-    against unbounded payload allocation.  The Pydantic per-field caps
-    (``SendMessageRequest.content``, ``_InlineBlobModel.content``) are
-    the actual guarantees; the middleware short-circuits Content-Length
-    declarations that would otherwise reach the parser at all.
-    """
+    """Header rejection and ordinary request controls for the body ceiling."""
 
     @pytest.mark.asyncio
     async def test_rejects_oversized_content_length(self) -> None:
@@ -1192,7 +1185,7 @@ class TestBodySizeLimitMiddleware:
         assert response.body == b'{"error": "Invalid Content-Length"}'
 
     @pytest.mark.asyncio
-    async def test_missing_content_length_stream_passes_through_without_body_read(self) -> None:
+    async def test_missing_content_length_allows_bounded_body(self) -> None:
         response = await self._dispatch_with_content_length(None)
         assert response.status_code == 204
 
@@ -1207,7 +1200,13 @@ class TestBodySizeLimitMiddleware:
             scope["headers"] = [(b"content-length", str(content_length).encode("ascii"))]
 
         async def receive():
-            raise AssertionError("Content-Length-only guard must not read request bodies")
+            if content_length is not None and (
+                not str(content_length).isascii()
+                or not str(content_length).isdecimal()
+                or int(content_length) > _BodySizeLimitMiddleware._MAX_BODY_BYTES
+            ):
+                raise AssertionError("Rejected Content-Length must not read request bodies")
+            return {"type": "http.request", "body": b"", "more_body": False}
 
         async def send(message):
             messages.append(message)

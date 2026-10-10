@@ -367,7 +367,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 71 removes the Composer mode preference and adds mode-neutral
     # fork/revert receipts.
     # Epoch 72 persists durable composer operations and exact operation ingress binding.
-    assert SESSION_SCHEMA_EPOCH == 72
+    # Epoch 73 persists session-family revocation and derived-token bindings.
+    assert SESSION_SCHEMA_EPOCH == 73
     expected_tables = frozenset(
         {
             "web_instances",
@@ -376,6 +377,7 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
             "run_start_permits",
             "run_execution_inputs",
             "websocket_tickets",
+            "auth_session_families",
             "composer_inflight_requests",
             "composer_progress_snapshots",
             "rate_limit_buckets",
@@ -394,6 +396,7 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
         "run_start_permits": {"ix_run_start_permits_retention_expires_at"},
         "run_execution_inputs": set(),
         "websocket_tickets": {"ix_websocket_tickets_expires_at", "ix_websocket_tickets_run_id"},
+        "auth_session_families": {"ix_auth_session_families_expires_at", "ix_auth_session_families_identity_id"},
         "composer_inflight_requests": {"ix_composer_inflight_requests_expires_at", "ix_composer_inflight_session_expiry"},
         "composer_progress_snapshots": {"ix_composer_progress_snapshots_expires_at"},
         "rate_limit_buckets": {"ix_rate_limit_buckets_expires_at"},
@@ -482,6 +485,8 @@ def test_coordination_hard_cut_check_constraints_are_exact() -> None:
             "ck_websocket_tickets_digest_sha256",
             "ck_websocket_tickets_run_id_nonblank",
             "ck_websocket_tickets_user_id_nonblank",
+            "ck_websocket_tickets_token_binding",
+            "ck_websocket_tickets_family_nonblank",
         },
         "composer_inflight_requests": {
             "ck_composer_inflight_token_nonblank",
@@ -817,6 +822,9 @@ def test_websocket_ticket_run_id_rejects_ascii_whitespace(engine) -> None:
                 run_id="\n",
                 user_id="alice",
                 auth_provider_type="local",
+                session_family_id="family",
+                credential_generation=0,
+                token_expires_at=int(now.timestamp()),
                 issued_at=now,
                 expires_at=now,
             )

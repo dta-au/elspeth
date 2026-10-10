@@ -76,6 +76,7 @@ class _NameBinding:
 
 
 _TABLE_POLICIES: tuple[TablePolicy, ...] = (
+    TablePolicy("auth_session_families", "global", "AuthSessionAuthority"),
     TablePolicy("composer_async_operations", "session", "ComposerAsyncOperationAuthority"),
     TablePolicy("composer_inflight_requests", "session", "SessionComposerProgressAuthority"),
     TablePolicy("composer_progress_snapshots", "session", "SessionComposerProgressAuthority"),
@@ -256,6 +257,11 @@ _PROTECTED_LOGICAL_TABLES = {
 }
 
 _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/auth_session_authority.py",
+        "RepositoryAuthSessionAuthority",
+        "AuthSessionAuthority",
+    ),
     AuthoritySymbol(
         "src/elspeth/web/sessions/service.py",
         "_record_auto_commit_revocation_on_connection",
@@ -1078,6 +1084,21 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
 # returned, yielded, or forwarded raw connections remain violations.
 _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
     AuthoritySymbol(
+        "src/elspeth/web/coordination/auth_session_authority.py",
+        "RepositoryAuthSessionAuthority.create",
+        "AuthSessionAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/auth_session_authority.py",
+        "RepositoryAuthSessionAuthority.is_active",
+        "AuthSessionAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/auth_session_authority.py",
+        "RepositoryAuthSessionAuthority.revoke",
+        "AuthSessionAuthority",
+    ),
+    AuthoritySymbol(
         "src/elspeth/web/coordination/composer_operation_authority.py",
         "ComposerAsyncOperationAuthority.claim_next",
         "ComposerAsyncOperationAuthority",
@@ -1433,6 +1454,72 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
 # This manifest grows only after routing a site through its table-specific
 # typed authority.
 _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+    WriterIdentity(
+        path="src/elspeth/web/coordination/auth_session_authority.py",
+        symbol="RepositoryAuthSessionAuthority.create",
+        table="auth_session_families",
+        operation="delete",
+        fingerprint="290f672db2a298fd",
+        ordinal=1,
+        authority="AuthSessionAuthority",
+        line=38,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/auth_session_authority.py",
+        symbol="RepositoryAuthSessionAuthority.create",
+        table="auth_session_families",
+        operation="insert",
+        fingerprint="290f672db2a298fd",
+        ordinal=1,
+        authority="AuthSessionAuthority",
+        line=40,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/auth_session_authority.py",
+        symbol="RepositoryAuthSessionAuthority.revoke",
+        table="auth_session_families",
+        operation="update",
+        fingerprint="2d0d85b7a644cd6a",
+        ordinal=1,
+        authority="AuthSessionAuthority",
+        line=68,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/auth_session_authority.py",
+        symbol="RepositoryAuthSessionAuthority.create",
+        table="<sessions-write-connection>",
+        operation="write_connection",
+        fingerprint="8e5d23fed40a855b",
+        ordinal=1,
+        authority="AuthSessionAuthority",
+        line=24,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/auth_session_authority.py",
+        symbol="RepositoryAuthSessionAuthority.revoke",
+        table="<sessions-write-connection>",
+        operation="write_connection",
+        fingerprint="d8a34432550500b1",
+        ordinal=1,
+        authority="AuthSessionAuthority",
+        line=65,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/auth_session_authority.py",
+        symbol="RepositoryAuthSessionAuthority.is_active",
+        table="<sessions-write-connection>",
+        operation="write_connection",
+        fingerprint="820f2c90d063920d",
+        ordinal=1,
+        authority="AuthSessionAuthority",
+        line=49,
+        connection_escape=False,
+    ),
     WriterIdentity(
         path="src/elspeth/web/sessions/service.py",
         symbol="_record_auto_commit_revocation_on_connection",
@@ -4056,10 +4143,10 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         symbol="RepositorySessionWebsocketTicketAuthority.consume",
         table="<sessions-write-connection>",
         operation="write_connection",
-        fingerprint="d467370c2d94b6b5",
+        fingerprint="38f7523b69c1c113",
         ordinal=1,
         authority="SessionWebsocketTicketAuthority",
-        line=115,
+        line=119,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4067,10 +4154,10 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         symbol="RepositorySessionWebsocketTicketAuthority.consume",
         table="websocket_tickets",
         operation="update",
-        fingerprint="38ab0c7045601308",
+        fingerprint="2847f8ef40b21e1b",
         ordinal=1,
         authority="SessionWebsocketTicketAuthority",
-        line=147,
+        line=151,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4078,10 +4165,10 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         symbol="RepositorySessionWebsocketTicketAuthority.issue",
         table="<sessions-write-connection>",
         operation="write_connection",
-        fingerprint="76647f7e368c4dd3",
+        fingerprint="41e8c3fb40cc2dd5",
         ordinal=1,
         authority="SessionWebsocketTicketAuthority",
-        line=46,
+        line=47,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4089,10 +4176,10 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         symbol="RepositorySessionWebsocketTicketAuthority.issue",
         table="websocket_tickets",
         operation="delete",
-        fingerprint="e6a703f4fff59624",
+        fingerprint="f6c742fcfe0501f0",
         ordinal=1,
         authority="SessionWebsocketTicketAuthority",
-        line=95,
+        line=96,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4100,10 +4187,10 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         symbol="RepositorySessionWebsocketTicketAuthority.issue",
         table="websocket_tickets",
         operation="insert",
-        fingerprint="e6a703f4fff59624",
+        fingerprint="f6c742fcfe0501f0",
         ordinal=1,
         authority="SessionWebsocketTicketAuthority",
-        line=99,
+        line=100,
         connection_escape=False,
     ),
     WriterIdentity(

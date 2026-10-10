@@ -42,8 +42,10 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # Epoch 70 replaces the persisted tutorial Build stage's old label with build.
 # Epoch 71 is freeform-only, removes the Composer mode preference, and adds
 # ordinary fork/revert receipts. Existing stores are recreated.
-_COORDINATION_HARD_CUT_EPOCH = 72
+# Epoch 73 binds bearer families and derived WebSocket credentials to revocation.
+_COORDINATION_HARD_CUT_EPOCH = 73
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
+    "auth_session_families": "ix_auth_session_families_expires_at",
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
     "session_read_admissions": "ix_session_read_admissions_expires_at",

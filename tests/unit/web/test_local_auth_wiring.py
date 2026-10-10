@@ -32,6 +32,7 @@ from elspeth.web.auth.local import AccessPending, LocalAuthProvider
 from elspeth.web.auth.models import AuthenticationError, IdentityClaims
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.auth_session_authority import RepositoryAuthSessionAuthority
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
@@ -75,7 +76,12 @@ def _provider(settings: WebSettings, authority: RepositoryIdentityAuthority, req
     recorder = AuthAuditRecorder.from_settings(settings, "sqlite-single")
     request.addfinalizer(recorder.close)
     recorder.start()
-    return _build_local_auth_provider(settings, authority, audit_recorder=recorder)
+    return _build_local_auth_provider(
+        settings,
+        authority,
+        audit_recorder=recorder,
+        sessions=RepositoryAuthSessionAuthority(request.getfixturevalue("substrate")[0]),
+    )
 
 
 def _auth_event_rows(settings: WebSettings) -> list[Any]:

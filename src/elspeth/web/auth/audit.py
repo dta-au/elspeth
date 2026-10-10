@@ -1231,7 +1231,7 @@ class AuthAuditRecorder:
         identity_id: str,
         username: str,
     ) -> None:
-        """Write the ``logout`` row. The client discards the token; nothing is revoked server-side (spec rev2)."""
+        """Record logout after the session family's revocation commits."""
         with self._open_landscape(AuthAuditOperation.LOGOUT) as db:
             self._auth_audit(db).record_auth_event(
                 event_type="logout",

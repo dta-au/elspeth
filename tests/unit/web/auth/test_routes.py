@@ -1554,7 +1554,27 @@ class TestAuthEventPrincipalConsistency:
 
 
 class TestLogout:
-    """POST /api/auth/logout: the ``logout`` row is the whole effect (spec rev2)."""
+    """POST /api/auth/logout revokes the whole family before auditing success."""
+
+    @pytest.mark.asyncio
+    async def test_logout_revokes_ancestors_and_successors_but_not_another_login(self, tmp_path) -> None:
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        provider.create_user("alice", "password123", display_name="Alice")
+        app = _create_test_app(provider, landscape_url=f"sqlite:///{tmp_path / 'audit.db'}")
+        _enable_auth_audit(app)
+        async with _client_for(app) as client:
+            first = await client.post("/api/auth/login", json={"username": "alice", "password": "password123"})
+            first_headers = {"Authorization": f"Bearer {first.json()['access_token']}"}
+            successor = await client.post("/api/auth/token", headers=first_headers)
+            successor_headers = {"Authorization": f"Bearer {successor.json()['access_token']}"}
+            independent = await client.post("/api/auth/login", json={"username": "alice", "password": "password123"})
+            independent_headers = {"Authorization": f"Bearer {independent.json()['access_token']}"}
+            assert (await client.get("/api/auth/me", headers=first_headers)).status_code == 200
+            assert (await client.post("/api/auth/logout", headers=successor_headers)).status_code == 204
+            for headers in (first_headers, successor_headers):
+                assert (await client.get("/api/auth/me", headers=headers)).status_code == 401
+                assert (await client.post("/api/auth/token", headers=headers)).status_code == 401
+            assert (await client.get("/api/auth/me", headers=independent_headers)).status_code == 200
 
     @pytest.mark.asyncio
     async def test_logout_records_a_durable_logout_row_and_answers_204(self, tmp_path) -> None:

@@ -14,6 +14,7 @@ vi.mock("@/api/client", () => ({
   fetchCurrentUser: vi.fn(),
   fetchAuthConfig: vi.fn().mockResolvedValue({ provider: "local", registration_mode: "closed", sso_start_url: null }),
   login: vi.fn(),
+  logoutSession: vi.fn().mockResolvedValue(undefined),
   fetchUserComposerPreferences: vi.fn(),
   updateUserComposerPreferences: vi.fn(),
   fetchPluginPolicy: vi.fn(),
@@ -31,6 +32,31 @@ describe("authStore interactive login", () => {
     localStorage.clear();
     sessionStorage.clear();
     vi.clearAllMocks();
+  });
+
+  it("revokes the captured token once before completing explicit logout", async () => {
+    localStorage.setItem("auth_token", "old-token");
+    useAuthStore.setState({ token: "old-token" });
+    const first = useAuthStore.getState().logout();
+    const duplicate = useAuthStore.getState().logout();
+    expect(localStorage.getItem("auth_token")).toBeNull();
+    await Promise.all([first, duplicate]);
+    expect(apiClient.logoutSession).toHaveBeenCalledExactlyOnceWith("old-token");
+  });
+
+  it("cleans a rejected credential without recursively calling logout", async () => {
+    localStorage.setItem("auth_token", "rejected-token");
+    await useAuthStore.getState().logout({ revoke: false });
+    expect(apiClient.logoutSession).not.toHaveBeenCalled();
+    expect(localStorage.getItem("auth_token")).toBeNull();
+  });
+
+  it("shows when server revocation failed while completing local cleanup", async () => {
+    localStorage.setItem("auth_token", "old-token");
+    vi.mocked(apiClient.logoutSession).mockRejectedValueOnce(new Error("offline"));
+    await useAuthStore.getState().logout();
+    expect(useAuthStore.getState().token).toBeNull();
+    expect(useAuthStore.getState().loginError).toContain("revocation could not be confirmed");
   });
 
   it("failed login sets the generic error, returns false, and never flips isLoading", async () => {

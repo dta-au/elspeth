@@ -22,6 +22,8 @@ from fastapi.routing import APIWebSocketRoute
 from starlette.websockets import WebSocketDisconnect
 
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.auth.session_token import SessionBinding
+from elspeth.web.composer_stream_auth import ComposerStreamAuthServices
 from elspeth.web.execution.schemas import (
     ProgressData,
     RunAccounting,
@@ -34,6 +36,7 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
 from elspeth.web.sessions.protocol import RunEventRecord
+from tests.fixtures.auth_sessions import make_session_binding, make_session_claims
 from tests.fixtures.identities import wire_test_pipeline_user_authority
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -100,6 +103,9 @@ class FakeAuthProvider:
     async def authenticate(self, token: str) -> UserIdentity:
         self.authenticate_tokens.append(token)
         return self.user
+
+    def authorize_binding(self, user: UserIdentity, binding: SessionBinding) -> None:
+        assert user == self.user
 
     def assert_not_authenticated(self) -> None:
         assert self.authenticate_tokens == []
@@ -202,7 +208,7 @@ def _issue_ws_ticket(
     user: UserIdentity | None = None,
 ) -> str:
     identity = user or UserIdentity(user_id=_TEST_USER_ID, username="testuser")
-    ticket = app.state.websocket_ticket_store.issue(run_id=run_id, user=identity)
+    ticket = app.state.websocket_ticket_store.issue(run_id=run_id, user=identity, binding=make_session_binding())
     return ticket.ticket
 
 
@@ -226,6 +232,13 @@ def _create_ws_test_app(
     app.state.session_service = FakeSessionService()
     app.state.settings = FakeSettings()
     wire_test_pipeline_user_authority(app, identity_id=_TEST_USER_ID)
+    app.state.composer_stream_auth = ComposerStreamAuthServices(
+        provider=app.state.auth_provider,
+        decode=make_session_claims,
+        identity_authority=app.state.identity_authority,
+        sessions=app.state.session_service,
+        provider_type="local",
+    )
     app.state.websocket_ticket_store = WebSocketTicketStore()
     app.state.run_progress_reader = None
 
@@ -485,16 +498,17 @@ class TestWebSocketAuth:
         now = datetime(2026, 6, 22, 12, 0, tzinfo=UTC)
         store = WebSocketTicketStore(ttl_seconds=30)
         user = UserIdentity(user_id=_TEST_USER_ID, username="testuser")
-        issued = store.issue(run_id="run-1", user=user, now=now)
+        issued = store.issue(run_id="run-1", user=user, binding=make_session_binding(), now=now)
 
         assert store.consume(ticket=issued.ticket, run_id="wrong-run", now=now) is None
         assert store.consume(ticket=issued.ticket, run_id="run-1", now=now) is None
 
-        issued = store.issue(run_id="run-1", user=user, now=now)
+        issued = store.issue(run_id="run-1", user=user, binding=make_session_binding(), now=now)
         assert store.consume(ticket=issued.ticket, run_id="run-1", now=now + timedelta(seconds=31)) is None
 
-        issued = store.issue(run_id="run-1", user=user, now=now)
-        assert store.consume(ticket=issued.ticket, run_id="run-1", now=now) == user
+        issued = store.issue(run_id="run-1", user=user, binding=make_session_binding(), now=now)
+        consumed = store.consume(ticket=issued.ticket, run_id="run-1", now=now)
+        assert consumed is not None and consumed.user == user and consumed.binding == issued.binding
         assert store.consume(ticket=issued.ticket, run_id="run-1", now=now) is None
 
 

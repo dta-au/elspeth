@@ -2,7 +2,22 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and legacy issue tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.8.3 candidate (session epoch 72, Landscape epoch 49)
+## Current Cutover: 0.8.4 candidate (session epoch 73, Landscape epoch 49)
+
+Session epoch 73 adds durable bearer-family revocation and binds run WebSocket
+tickets to their originating session, credential generation, and bearer expiry.
+Local `auth.db` also requires `users.credential_generation`; password resets
+advance it atomically with the password hash. Previous bearer tokens lack these
+bindings and are refused. There is no compatibility reader or migration.
+
+Stop the service and recreate the obsolete session store and local `auth.db`
+using the deployment's database-owner procedure, preserving any needed evidence
+before removal. Reprovision local accounts after recreation; SSO identities are
+admitted through the normal sign-in process. Preserve current Landscape epoch-49
+evidence. Do not run predecessor code against the recreated stores. Destructive
+shared-state recreation requires the operator's approval.
+
+## Prior Cutover: 0.8.3 candidate (session epoch 72, Landscape epoch 49)
 
 The 0.8.3 candidate advances the session store from epoch 71 to 72 for
 durable Composer operation jobs and operation-ID ingress bindings. Landscape

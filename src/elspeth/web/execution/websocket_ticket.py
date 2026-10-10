@@ -9,8 +9,17 @@ from threading import Lock
 from uuid import UUID
 
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.auth.session_token import SessionBinding
 
 _TICKET_BYTES = 32
+
+
+@dataclass(frozen=True, slots=True)
+class WebSocketCredential:
+    """Trusted non-secret binding to the session that obtained this ticket."""
+
+    user: UserIdentity
+    binding: SessionBinding
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +30,7 @@ class WebSocketTicket:
     run_id: str
     user: UserIdentity
     expires_at: datetime
+    binding: SessionBinding
 
 
 class WebSocketTicketStore:
@@ -38,6 +48,7 @@ class WebSocketTicketStore:
         *,
         run_id: str | UUID,
         user: UserIdentity,
+        binding: SessionBinding,
         now: datetime | None = None,
     ) -> WebSocketTicket:
         """Issue a new ticket for one WebSocket connection attempt."""
@@ -53,6 +64,7 @@ class WebSocketTicketStore:
                 run_id=str(run_id),
                 user=user,
                 expires_at=expires_at,
+                binding=binding,
             )
             self._tickets[ticket.ticket] = ticket
         return ticket
@@ -63,7 +75,7 @@ class WebSocketTicketStore:
         ticket: str,
         run_id: str | UUID,
         now: datetime | None = None,
-    ) -> UserIdentity | None:
+    ) -> WebSocketCredential | None:
         """Consume a ticket and return its bound user when valid."""
         if not ticket.strip():
             return None
@@ -77,7 +89,7 @@ class WebSocketTicketStore:
             return None
         if record.run_id != str(run_id):
             return None
-        return record.user
+        return WebSocketCredential(record.user, record.binding)
 
     @staticmethod
     def _new_ticket_value() -> str:

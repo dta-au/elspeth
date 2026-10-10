@@ -251,7 +251,7 @@ class TestDeleteUser:
 
             assert response.status_code == 409, response.text
             assert response.json()["detail"]["refusal"] == "credential_changed"
-            assert (await client.get("/api/auth/me", headers=alice_headers)).status_code == 200
+            assert (await client.get("/api/auth/me", headers=alice_headers)).status_code == 401
             assert (await client.post("/api/auth/login", json={"username": "alice", "password": "replacement-password"})).status_code == 200
 
     async def test_delete_removes_account(self, tmp_path) -> None:

@@ -44,6 +44,7 @@ from elspeth.web.auth.local import LocalAuthProvider, LocalUserDeletion
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.session_token import LOCAL_AUDIENCE, SessionTokenIssuer
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.auth_session_authority import RepositoryAuthSessionAuthority
 from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
     AdminBootstrapMode,
@@ -469,6 +470,7 @@ def test_retirement_retry_preserves_a_replacement_registration_on_postgres(exter
             token_expiry_hours=24,
             max_refresh_chain_hours=168,
             principal_is_active=principal_is_active,
+            sessions=RepositoryAuthSessionAuthority(registration_engine),
         )
         provider = LocalAuthProvider(
             tmp_path / "auth.db",

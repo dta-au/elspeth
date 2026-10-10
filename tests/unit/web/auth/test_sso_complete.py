@@ -104,6 +104,8 @@ class _Journal:
 
 
 def _issuer(key: bytes = b"k" * 32) -> SessionTokenIssuer:
+    from tests.fixtures.auth_sessions import TestSessionFamilies
+
     return SessionTokenIssuer(
         signing_key=key,
         provider="oidc",
@@ -111,6 +113,7 @@ def _issuer(key: bytes = b"k" * 32) -> SessionTokenIssuer:
         token_expiry_hours=1,
         max_refresh_chain_hours=2,
         principal_is_active=lambda _identity_id: True,
+        sessions=TestSessionFamilies(),
     )
 
 

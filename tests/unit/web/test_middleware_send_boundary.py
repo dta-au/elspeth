@@ -21,7 +21,7 @@ async def test_original_downstream_failure_identity(phase, kind):
         raise original
 
     async def receive():
-        raise AssertionError("Unexpected body read")
+        return {"type": "http.request", "body": b"", "more_body": False}
 
     async def send(message):
         delivered.append(message)
@@ -58,12 +58,14 @@ async def test_non_http_forwards_exact_owned_arguments(scope_type):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("values,status", [(["\u0661"], 400), (["9" * 5000], 400), (["1", "11000000"], 204), (["11000000", "1"], 413)])
-async def test_content_length_first_header_and_no_read(values, status):
+async def test_content_length_first_header_rejection_precedes_read(values, status):
     messages = []
     calls = []
 
     async def receive():
-        raise AssertionError("Guard read body")
+        if status != 204:
+            raise AssertionError("Rejected header read body")
+        return {"type": "http.request", "body": b"", "more_body": False}
 
     async def send(message):
         messages.append(message)
@@ -127,7 +129,7 @@ async def test_external_send_failure_preserves_original_identity(kind):
     entered = []
 
     async def receive():
-        raise AssertionError("Unexpected body read")
+        return {"type": "http.request", "body": b"", "more_body": False}
 
     async def send(message):
         entered.append(asyncio.current_task())
@@ -146,24 +148,25 @@ async def test_external_send_failure_preserves_original_identity(kind):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("value", [None, b"0", b"00", b"01", b"10485760"])
-async def test_accepted_body_forwards_exact_arguments(value):
+async def test_accepted_body_replays_bytes_with_exact_scope_and_send(value):
     scope = {"type": "http", "headers": [] if value is None else [(b"content-length", value)]}
     seen = []
 
     async def receive():
-        raise AssertionError("Guard read accepted body")
+        return {"type": "http.request", "body": b"{}", "more_body": False}
 
     async def send(message):
         raise AssertionError("Guard emitted accepted response")
 
     async def downstream(actual_scope, actual_receive, actual_send):
         seen.append((actual_scope, actual_receive, actual_send))
+        assert await actual_receive() == {"type": "http.request", "body": b"{}", "more_body": False}
 
     await _BodySizeLimitMiddleware(downstream)(scope, receive, send)
     assert len(seen) == 1
     actual_scope, actual_receive, actual_send = seen[0]
     assert actual_scope is scope
-    assert actual_receive is receive
+    assert actual_receive is not receive
     assert actual_send is send
 
 

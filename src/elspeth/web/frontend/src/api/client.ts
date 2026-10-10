@@ -299,7 +299,7 @@ export async function parseResponse<T>(
     if (response.status === 401 && options.logoutOnUnauthorized !== false) {
       const { useAuthStore } = await import("@/stores/authStore");
       if (responseOwnsCredential(response, useAuthStore.getState().token)) {
-        await useAuthStore.getState().logout();
+        await useAuthStore.getState().logout({ revoke: false });
       }
     }
 
@@ -582,6 +582,16 @@ export async function refreshToken(): Promise<{ access_token: string }> {
     headers: authHeaders("application/json"),
   });
   return parseResponse<{ access_token: string }>(response);
+}
+
+/** Revoke the captured session, even after local credential custody is cleared. */
+export async function logoutSession(token: string): Promise<void> {
+  const response = await authFetch("/api/auth/logout", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) await parseResponse<void>(response, { logoutOnUnauthorized: false });
 }
 
 /**

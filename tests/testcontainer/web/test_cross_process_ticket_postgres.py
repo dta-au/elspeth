@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import Engine, select, text, update
 from sqlalchemy.engine import make_url
+from tests.fixtures.auth_sessions import make_session_binding
 from tests.unit.web.execution.test_durable_websocket_ticket import seed_ticket_run
 
 from elspeth.web.auth.models import UserIdentity
@@ -51,7 +52,7 @@ def _issue_process(url: str, run_id: str, user: UserIdentity, pipe: Connection) 
     issuer_url = make_url(url).update_query_dict({"application_name": run_id}).render_as_string(hide_password=False)
     engine = create_session_engine(issuer_url)
     try:
-        issued = RepositorySessionWebsocketTicketAuthority(engine).issue(run_id=run_id, user=user)
+        issued = RepositorySessionWebsocketTicketAuthority(engine).issue(run_id=run_id, user=user, binding=make_session_binding())
         pipe.send(issued.ticket)
     finally:
         engine.dispose()
@@ -65,7 +66,7 @@ def _consume_process(url: str, run_id: str, ticket: str, pipe: Connection) -> No
         pipe.send("ready")
         assert pipe.recv() == "consume"
         result = RepositorySessionWebsocketTicketAuthority(engine).consume(ticket=ticket, run_id=run_id)
-        pipe.send(None if result is None else result.user_id)
+        pipe.send(None if result is None else result.user.user_id)
     finally:
         engine.dispose()
         pipe.close()
@@ -133,7 +134,7 @@ def test_peer_consumes_after_issuer_exits_and_only_one_process_wins(ticket_postg
 
 def test_identity_revocation_committed_while_consumer_waits_refuses(ticket_postgres: Engine) -> None:
     _, run_id, user = seed_ticket_run(ticket_postgres)
-    ticket = RepositorySessionWebsocketTicketAuthority(ticket_postgres).issue(run_id=run_id, user=user)
+    ticket = RepositorySessionWebsocketTicketAuthority(ticket_postgres).issue(run_id=run_id, user=user, binding=make_session_binding())
     ctx = multiprocessing.get_context("spawn")
     parent, child = ctx.Pipe()
     process = ctx.Process(
@@ -163,7 +164,7 @@ def test_identity_revocation_committed_while_consumer_waits_refuses(ticket_postg
 def test_user_role_revocation_committed_while_consumer_waits_refuses(ticket_postgres: Engine) -> None:
     """A ticket minted before workload-role revocation cannot open the stream afterwards."""
     _, run_id, user = seed_ticket_run(ticket_postgres)
-    ticket = RepositorySessionWebsocketTicketAuthority(ticket_postgres).issue(run_id=run_id, user=user)
+    ticket = RepositorySessionWebsocketTicketAuthority(ticket_postgres).issue(run_id=run_id, user=user, binding=make_session_binding())
     ctx = multiprocessing.get_context("spawn")
     parent, child = ctx.Pipe()
     process = ctx.Process(
@@ -199,7 +200,7 @@ def test_session_waiter_does_not_hold_identity_lock(ticket_postgres: Engine, ope
     """A session-fenced writer can take its identity FK lock while tickets wait."""
     session_id, run_id, user = seed_ticket_run(ticket_postgres)
     authority = RepositorySessionWebsocketTicketAuthority(ticket_postgres)
-    issued = authority.issue(run_id=run_id, user=user)
+    issued = authority.issue(run_id=run_id, user=user, binding=make_session_binding())
     url = ticket_postgres.url.render_as_string(hide_password=False)
     ctx = multiprocessing.get_context("spawn")
     parent, child = ctx.Pipe()
@@ -234,7 +235,8 @@ def test_session_waiter_does_not_hold_identity_lock(ticket_postgres: Engine, ope
             assert result == user.user_id
             assert authority.consume(ticket=issued.ticket, run_id=run_id) is None
         else:
-            assert authority.consume(ticket=result, run_id=run_id) == UserIdentity(user.user_id, "current-name")
+            consumed = authority.consume(ticket=result, run_id=run_id)
+            assert consumed is not None and consumed.user == UserIdentity(user.user_id, "current-name")
             assert authority.consume(ticket=result, run_id=run_id) is None
     finally:
         if process.is_alive():
@@ -245,7 +247,7 @@ def test_session_waiter_does_not_hold_identity_lock(ticket_postgres: Engine, ope
 
 def test_expiry_uses_database_time_after_ticket_lock(ticket_postgres: Engine) -> None:
     _, run_id, user = seed_ticket_run(ticket_postgres)
-    issued = RepositorySessionWebsocketTicketAuthority(ticket_postgres).issue(run_id=run_id, user=user)
+    issued = RepositorySessionWebsocketTicketAuthority(ticket_postgres).issue(run_id=run_id, user=user, binding=make_session_binding())
     ctx = multiprocessing.get_context("spawn")
     parent, child = ctx.Pipe()
     process = ctx.Process(
@@ -284,8 +286,8 @@ def test_issuance_cleanup_skips_locked_expired_ticket_and_retries_later(ticket_p
     _, old_run_id, old_user = seed_ticket_run(ticket_postgres)
     _, run_id, user = seed_ticket_run(ticket_postgres)
     authority = RepositorySessionWebsocketTicketAuthority(ticket_postgres)
-    locked_ticket = authority.issue(run_id=old_run_id, user=old_user)
-    removable_ticket = authority.issue(run_id=old_run_id, user=old_user)
+    locked_ticket = authority.issue(run_id=old_run_id, user=old_user, binding=make_session_binding())
+    removable_ticket = authority.issue(run_id=old_run_id, user=old_user, binding=make_session_binding())
     locked_digest = sha256(locked_ticket.ticket.encode()).hexdigest()
     removable_digest = sha256(removable_ticket.ticket.encode()).hexdigest()
     with ticket_postgres.begin() as conn:
@@ -309,11 +311,12 @@ def test_issuance_cleanup_skips_locked_expired_ticket_and_retries_later(ticket_p
             remaining = set(conn.execute(select(websocket_tickets_table.c.ticket_digest)).scalars())
             assert locked_digest in remaining
             assert removable_digest not in remaining
-        authority.issue(run_id=run_id, user=user)
+        authority.issue(run_id=run_id, user=user, binding=make_session_binding())
         with ticket_postgres.connect() as conn:
             assert locked_digest not in set(conn.execute(select(websocket_tickets_table.c.ticket_digest)).scalars())
         assert authority.consume(ticket=locked_ticket.ticket, run_id=old_run_id) is None
-        assert authority.consume(ticket=issued, run_id=run_id) == UserIdentity(user.user_id, "current-name")
+        consumed = authority.consume(ticket=issued, run_id=run_id)
+        assert consumed is not None and consumed.user == UserIdentity(user.user_id, "current-name")
         assert authority.consume(ticket=issued, run_id=run_id) is None
     finally:
         if process.is_alive():

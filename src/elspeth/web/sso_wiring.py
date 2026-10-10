@@ -60,6 +60,7 @@ from elspeth.web.auth.sso import (
     fetch_discovery_endpoints,
 )
 from elspeth.web.config import WebSettings, configured_auth_settings
+from elspeth.web.coordination.auth_session_authority import RepositoryAuthSessionAuthority
 from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
     AdminBootstrapMode,
@@ -275,6 +276,7 @@ def build_sso_wiring(
         token_expiry_hours=DEFAULT_TOKEN_EXPIRY_HOURS,
         max_refresh_chain_hours=DEFAULT_MAX_REFRESH_CHAIN_HOURS,
         principal_is_active=_principal_is_active,
+        sessions=RepositoryAuthSessionAuthority(session_engine),
     )
     return SsoWiring(
         profile=profile,
