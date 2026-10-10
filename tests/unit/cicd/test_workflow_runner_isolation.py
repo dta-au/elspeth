@@ -72,6 +72,8 @@ def _expression(expression: str, context: dict[str, Any]) -> Any:
         if isinstance(node, ast.Constant):
             return node.value
         if isinstance(node, ast.Name):
+            if node.id in {"false", "true"}:
+                return node.id == "true"
             assert node.id in context, f"unresolved context: {node.id}"
             return context[node.id]
         if isinstance(node, ast.Attribute):
@@ -142,14 +144,38 @@ def _assert_routing(workflows: dict[str, dict[str, Any]]) -> None:
     assert workflows, "runner inventory is empty"
     for filename, workflow in workflows.items():
         events = _events(workflow)
-        assert set(events) <= {"push", "pull_request", "schedule", "workflow_dispatch", "workflow_run"}, (
+        assert set(events) <= {"push", "pull_request", "schedule", "workflow_dispatch", "workflow_run", "workflow_call"}, (
             f"{filename}: unresolved trigger path"
         )
+        if "workflow_call" in events:
+            assert filename == "landscape-long-run.yml" and set(events) == {"workflow_call"}, "unreviewed reusable workflow"
         for event in events:
             context = _context(event)
             for name, job in workflow["jobs"].items():
-                expected = HOSTED if event == "pull_request" else LIVE if filename == "state-engine-live-provider.yml" else LOCAL
+                if "uses" in job:
+                    assert filename == "ci.yaml" and name == "landscape-proof", "unreviewed reusable workflow"
+                    assert job["uses"] == "./.github/workflows/landscape-long-run.yml", "unreviewed reusable workflow"
+                    assert set(job) == {"name", "if", "uses"}, "unreviewed reusable workflow overrides"
+                    target = workflows["landscape-long-run.yml"]
+                    assert set(target["jobs"]) == {"proof"} and "uses" not in target["jobs"]["proof"]
+                    assert _runner(target["jobs"]["proof"], context) == LOCAL, "reusable workflow runner isolation failed"
+                    continue
+                expected = LIVE if filename == "state-engine-live-provider.yml" else LOCAL
                 assert _runner(job, context) == expected, f"{filename}:{name}:{event}: runner isolation failed"
+
+
+def _assert_inactive_pr_admission(workflows: dict[str, dict[str, Any]]) -> None:
+    for filename in ("ci.yaml", "landscape-long-run.yml"):
+        assert all(job["if"] == "${{ false }}" for job in workflows[filename]["jobs"].values()), (
+            f"{filename}: activation before enforcement"
+        )
+    for filename, workflow in workflows.items():
+        if "pull_request" not in _events(workflow):
+            continue
+        for fork in (False, True):
+            context = _context("pull_request", ref="refs/pull/1/merge", protected=False, fork=fork)
+            for name in workflow["jobs"]:
+                assert not _admitted(workflow["jobs"], name, context), f"{filename}:{name}: PR execution before enforcement"
 
 
 def _assert_manual_admission(workflows: dict[str, dict[str, Any]]) -> None:
@@ -178,13 +204,40 @@ def test_all_manual_paths_reject_nondefault_or_unprotected_refs_before_runner_al
 
 
 @pytest.mark.parametrize("fork", [False, True])
-def test_pull_request_aggregates_are_hosted_even_when_they_reject_forks(fork: bool) -> None:
+def test_pull_request_aggregates_are_not_admitted_before_external_enforcement(fork: bool) -> None:
     workflows = _workflows()
     for filename, name in (("ci.yaml", "ci-success"), ("enforce-allowlist-judge-gates.yaml", "judge-gates-success")):
         jobs = workflows[filename]["jobs"]
         context = _context("pull_request", ref="refs/pull/1/merge", protected=False, fork=fork)
-        assert _admitted(jobs, name, context)
-        assert _runner(jobs[name], context) == HOSTED
+        assert not _admitted(jobs, name, context)
+        assert _runner(jobs[name], context) == LOCAL
+
+
+def test_prepared_ci_and_every_other_pr_path_are_inactive() -> None:
+    _assert_inactive_pr_admission(_workflows())
+
+
+@pytest.mark.parametrize("filename", ["ci.yaml", "landscape-long-run.yml"])
+def test_either_preparation_seam_refuses_accidental_activation(filename: str) -> None:
+    workflows = copy.deepcopy(_workflows())
+    _assert_inactive_pr_admission(workflows)
+    for job in workflows[filename]["jobs"].values():
+        job["if"] = "always()"
+    with pytest.raises(AssertionError, match="activation before enforcement"):
+        _assert_inactive_pr_admission(workflows)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["codeql.yaml", "composer-redaction-gate.yml", "enforce-allowlist-judge-gates.yaml", "enforce-telemetry-backfill-trailer.yaml"],
+)
+def test_pr_admission_controls_detect_removed_guard(filename: str) -> None:
+    workflows = copy.deepcopy(_workflows())
+    _assert_inactive_pr_admission(workflows)
+    for job in workflows[filename]["jobs"].values():
+        job["if"] = "always()"
+    with pytest.raises(AssertionError, match="PR execution before enforcement"):
+        _assert_inactive_pr_admission(workflows)
 
 
 @pytest.mark.parametrize("mutation", ["checkout", "aggregate", "reversed", "new-trigger", "reusable"])
@@ -192,17 +245,19 @@ def test_runner_policy_detects_privileged_pr_routes_and_unresolved_reusable_path
     workflows = copy.deepcopy(_workflows())
     _assert_routing(workflows)
     if mutation == "new-trigger":
-        workflows["pages.yaml"][True]["pull_request"] = {}
+        workflows["pages.yaml"][True]["pull_request_target"] = {}
     elif mutation == "reusable":
         workflows["ci.yaml"]["jobs"]["delegated"] = {"uses": "./.github/workflows/pages.yaml"}
     else:
         name = "ci-success" if mutation == "aggregate" else "test"
         job = workflows["ci.yaml"]["jobs"][name]
         if mutation == "reversed":
-            job["runs-on"] = job["runs-on"].replace("== 'pull_request'", "!= 'pull_request'")
+            job["runs-on"] = (
+                '${{ fromJSON(github.event_name != \'pull_request\' && \'["self-hosted","Linux","X64","nyx-ci","trusted"]\' || \'["ubuntu-24.04"]\') }}'
+            )
         else:
-            job["runs-on"] = LOCAL
-    with pytest.raises(AssertionError, match=r"runner isolation|reusable workflow"):
+            job["runs-on"] = HOSTED
+    with pytest.raises(AssertionError, match=r"runner isolation|reusable workflow|unresolved trigger"):
         _assert_routing(workflows)
 
 
@@ -220,7 +275,7 @@ def test_manual_admission_detects_removed_guard_in_every_workflow(filename: str)
 def test_build_publication_workflow_run_retains_trusted_push_provenance() -> None:
     jobs = _workflows()["build-push.yaml"]["jobs"]
     context = _context("workflow_run")
-    assert _admitted(jobs, "build-push", context)
+    assert not _admitted(jobs, "build-push", context), "automatic publication stays inactive with CI"
     for field, value in (
         ("event", "pull_request"),
         ("conclusion", "failure"),
@@ -233,16 +288,14 @@ def test_build_publication_workflow_run_retains_trusted_push_provenance() -> Non
     assert _admitted(jobs, "build-push", _context("push", ref="refs/tags/v0.8.4"))
 
 
-def test_hosted_prerequisites_are_explicit_without_changing_container_or_host_proofs() -> None:
+def test_nyx_prerequisites_are_explicit_without_a_hosted_fallback() -> None:
     jobs = _workflows()["ci.yaml"]["jobs"]
     for name in ("testcontainer", "host-runner-unit", "state-engine-validation", "azure-container-apps-bicep", "e2e-frontend"):
         step = next(step for step in jobs[name]["steps"] if step.get("name") == "Install system dependencies")
-        assert 'if [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]' in step["run"]
-        assert "sudo apt-get install -y -q libsqlcipher-dev" in step["run"]
+        assert "github-hosted" not in step["run"]
         assert "dpkg-query -W libsqlcipher-dev" in step["run"]
     browser = next(step for step in jobs["e2e-frontend"]["steps"] if step.get("name") == "Install Playwright browser")
-    assert "npm run test:e2e:install" in browser["run"]
-    assert "npx playwright install chromium" in browser["run"]
+    assert browser["run"] == "npx playwright install chromium"
     package = json.loads((ROOT / "src/elspeth/web/frontend/package.json").read_text())
     assert package["scripts"]["test:e2e:install"] == "playwright install --with-deps chromium"
 
@@ -250,7 +303,7 @@ def test_hosted_prerequisites_are_explicit_without_changing_container_or_host_pr
 @pytest.mark.parametrize(
     "environment,name,probe_status,expected_status,port",
     [
-        ("github-hosted", "Hosted Agent", 0, 0, 20000),
+        ("github-hosted", "Hosted Agent", 0, 1, None),
         ("self-hosted", "nyx-elspeth-1", 0, 0, 20002),
         ("self-hosted", "nyx-elspeth-4", 0, 0, 20008),
         ("self-hosted", "unexpected", 0, 1, None),
@@ -258,7 +311,7 @@ def test_hosted_prerequisites_are_explicit_without_changing_container_or_host_pr
         ("github-hosted", "Hosted Agent", 1, 1, None),
     ],
 )
-def test_playwright_port_allocation_runs_on_both_pools_and_refuses_probe_failure(
+def test_playwright_port_allocation_uses_nyx_service_identity_and_refuses_probe_failure(
     tmp_path: Path, environment: str, name: str, probe_status: int, expected_status: int, port: int | None
 ) -> None:
     job = _workflows()["ci.yaml"]["jobs"]["e2e-frontend"]

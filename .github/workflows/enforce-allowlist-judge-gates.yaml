@@ -88,8 +88,9 @@ defaults:
 jobs:
   check-override-rate:
     name: Override-rate drift gate (C3)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
+    # PR execution awaits external maintainer admission of the exact commit.
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # Judge gates should fail fast if checkout/dependency/git plumbing hangs.
     timeout-minutes: 15
     container:
@@ -151,10 +152,10 @@ jobs:
   # additional diagnostic and is intentionally outside branch protection.
   judge-gates-success:
     name: Judge gates success
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]') }}
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs:
       - check-override-rate
-    if: always()
+    if: always() && github.event_name != 'pull_request'
     steps:
       - name: Reject fork pull requests
         env:
