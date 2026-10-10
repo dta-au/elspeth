@@ -35,6 +35,8 @@ from elspeth.contracts.enums import RunStatus
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.mcp.analyzer import LandscapeAnalyzer
 from elspeth.mcp.limits import MCP_QUERY_DEFAULT_LIMIT, MCP_RESULT_LIMIT_MAX
+from elspeth.mcp.query_protocol import QueryBudgetExceeded
+from elspeth.mcp.query_worker import RawQueryWorker
 from elspeth.mcp.types import OPERATION_STATUS_VALUES, OPERATION_TYPE_VALUES
 
 __all__ = [
@@ -413,7 +415,11 @@ _TOOLS: dict[str, _ToolDef] = {
         },
     ),
     "query": _ToolDef(
-        description="Execute a read-only SQL query against the audit database (SELECT only)",
+        description=(
+            "Execute read-only audit SQL (SELECT only) in a disposable Linux worker. "
+            "One query at a time; 1 MiB request, 8 MiB JSON response, 1 GiB worker address space, "
+            "30 seconds including cleanup. Over-budget queries fail without truncated results."
+        ),
         args=_ArgSpec(
             required_str=("sql",),
             optional_int=(("limit", MCP_QUERY_DEFAULT_LIMIT),),
@@ -723,6 +729,7 @@ def create_server(database_url: str, *, passphrase: str | None = None) -> Server
         Configured MCP Server
     """
     analyzer, startup_failure = _create_analyzer_or_startup_failure(database_url, passphrase=passphrase)
+    raw_query = RawQueryWorker(database_url, passphrase)
 
     server = Server("elspeth-landscape", instructions=startup_failure)
 
@@ -785,7 +792,16 @@ def create_server(database_url: str, *, passphrase: str | None = None) -> Server
                 isError=True,
             )
 
-        # Dispatch to analyzer — no blanket catch. Database errors,
+        if name == "query":
+            try:
+                result_json = await raw_query.execute(args["sql"], args["params"], args["limit"])
+            except QueryBudgetExceeded as exc:
+                return CallToolResult(content=[TextContent(type="text", text=str(exc))], isError=True)
+            # Already admitted complete JSON; do not allocate another decoded
+            # result or serialize it again in the MCP parent.
+            return [TextContent(type="text", text=result_json)]
+
+        # Dispatch other tools to analyzer — no blanket catch. Database errors,
         # serialization bugs, and analyzer bugs must propagate so they
         # surface as MCP protocol errors rather than silent "Error: ..."
         # text. Tier 1 audit data corruption must never be swallowed.

@@ -11,12 +11,15 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from mcp.server import Server
+from mcp.types import CallToolRequest, CallToolRequestParams, CallToolResult, TextContent
 
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.mcp import query_worker
 from elspeth.mcp.analyzer import LandscapeAnalyzer
 from elspeth.mcp.query_protocol import QueryBudgetExceeded, QueryWorkerError
 from elspeth.mcp.query_worker import RawQueryWorker
+from elspeth.mcp.server import create_server
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Qualified Linux worker memory enforcement")
 
@@ -118,6 +121,96 @@ def _assert_reaped(pids: list[int]) -> None:
     for pid in pids:
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
+
+
+async def _call(server: Server, name: str, arguments: dict) -> CallToolResult:
+    response = await server.request_handlers[CallToolRequest](
+        CallToolRequest(method="tools/call", params=CallToolRequestParams(name=name, arguments=arguments))
+    )
+    assert isinstance(response.root, CallToolResult)
+    return response.root
+
+
+def _text(result: CallToolResult) -> str:
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], TextContent)
+    return result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_mcp_dispatch_uses_worker_and_preserves_exact_json(
+    audit_target: tuple[str, str | None], monkeypatch: pytest.MonkeyPatch, process_pids: list[int]
+) -> None:
+    url, passphrase = audit_target
+    server = create_server(url, passphrase=passphrase)
+
+    def forbidden_parent_query(*args: object, **kwargs: object) -> object:
+        pytest.fail("MCP must not execute raw SQL in the parent analyzer")
+
+    monkeypatch.setattr(LandscapeAnalyzer, "query", forbidden_parent_query)
+    result = await _call(server, "query", {"sql": "SELECT :x AS value", "params": {"x": '雪\n"'}})
+    assert not result.isError
+    assert _text(result) == json.dumps([{"value": '雪\n"'}], indent=2)
+    _assert_reaped(process_pids)
+
+
+@pytest.mark.asyncio
+async def test_mcp_giant_field_refusal_and_recovery(
+    audit_target: tuple[str, str | None], monkeypatch: pytest.MonkeyPatch, process_pids: list[int]
+) -> None:
+    monkeypatch.setattr(query_worker, "WORKER_MEMORY_BYTES", 256 * 1024 * 1024)
+    server = create_server(audit_target[0], passphrase=audit_target[1])
+    result = await _call(server, "query", {"sql": "SELECT hex(zeroblob(268435456)) AS value"})
+    assert result.isError
+    assert "memory budget" in _text(result)
+    _assert_reaped(process_pids)
+    followup = await _call(server, "query", {"sql": "SELECT 1 AS value"})
+    assert not followup.isError
+    assert _text(followup) == json.dumps([{"value": 1}], indent=2)
+
+
+@pytest.mark.asyncio
+async def test_mcp_status_and_busy_refusal_during_query(audit_target: tuple[str, str | None], process_pids: list[int]) -> None:
+    server = create_server(audit_target[0], passphrase=audit_target[1])
+    task = asyncio.create_task(_call(server, "query", {"sql": HUNG_SQL}))
+    try:
+        for _ in range(100):
+            if process_pids:
+                break
+            await asyncio.sleep(0.01)
+        assert process_pids
+        status = await asyncio.wait_for(_call(server, "get_mcp_status", {}), 1)
+        assert not status.isError
+        busy = await asyncio.wait_for(_call(server, "query", {"sql": "SELECT 1"}), 1)
+        assert busy.isError and "busy" in _text(busy)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        _assert_reaped(process_pids)
+        assert not (await _call(server, "query", {"sql": "SELECT 1"})).isError
+    finally:
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sql", ["DELETE FROM runs", "SELECT * FROM nonexistent", "SELECT 1 AS x, 2 AS x", "SELECT randomblob(4)"])
+async def test_mcp_non_budget_failures_remain_errors(audit_target: tuple[str, str | None], sql: str) -> None:
+    server = create_server(audit_target[0], passphrase=audit_target[1])
+    result = await _call(server, "query", {"sql": sql})
+    assert result.isError
+    assert "isolated worker" in _text(result)
+    assert sql not in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_mcp_input_budget_refuses_before_spawn(audit_target: tuple[str, str | None], process_pids: list[int]) -> None:
+    server = create_server(audit_target[0], passphrase=audit_target[1])
+    result = await _call(server, "query", {"sql": "SELECT :x", "params": {"x": "x" * (2 * 1024 * 1024)}})
+    assert result.isError
+    assert process_pids == []
 
 
 @pytest.mark.asyncio

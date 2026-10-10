@@ -184,9 +184,26 @@ aggregates, bound parameters and CTEs.
 `READ ONLY` is an additional database-write control, not a confidentiality or
 resource sandbox. Database administrators remain trusted to maintain the
 catalogs and audit schema. SQLite and SQLCipher retain their file-backed
-read-only open modes and `query_only` enforcement. The SQL result limit bounds
-rows returned; it does not bound query execution time or bytes in a single
-field.
+read-only open modes and `query_only` enforcement.
+
+The MCP `query` tool runs raw SQL in a fresh disposable Linux process, with a
+1 MiB request budget, 8 MiB complete JSON response budget, 1 GiB process address
+space limit and 30-second wall-clock budget including cancellation and cleanup.
+These limits also contain allocation of a giant single field before it reaches
+the MCP process. The row limit remains independently enforced. Successful
+results preserve their complete JSON representation; over-budget calls return
+MCP errors without truncated rows or fields. One query is admitted per server;
+a concurrent query is refused immediately. Other MCP tools remain available.
+Unsupported operating systems refuse raw MCP SQL rather than running it without
+memory enforcement.
+
+PostgreSQL workers use a 10-second statement timeout, streaming results and
+driver cancellation; the worker is killed and reaped if cancellation cannot
+finish within the cleanup budget. The process limits protect the MCP host, not
+the remote PostgreSQL server's total CPU or memory. Operators still need
+database-side resource controls for that server. The trusted Python
+`LandscapeAnalyzer.query` facade retains its direct execution and list-of-dicts
+return contract; these disposable-worker limits apply at the MCP boundary.
 
 ## Schema Notes
 

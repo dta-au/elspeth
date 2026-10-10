@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import sys
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 
 import pytest
+from mcp.types import CallToolRequest, CallToolRequestParams, CallToolResult, TextContent
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
@@ -15,7 +20,11 @@ from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run
+from elspeth.mcp import query_worker
 from elspeth.mcp.analyzer import LandscapeAnalyzer
+from elspeth.mcp.query_protocol import QueryBudgetExceeded, QueryWorkerError
+from elspeth.mcp.query_worker import RawQueryWorker
+from elspeth.mcp.server import create_server
 from elspeth.mcp.sql_guard import MCPQueryPrivilegeError
 
 pytestmark = pytest.mark.testcontainer
@@ -302,3 +311,122 @@ def test_custom_domain_is_refused(reader_target: ReaderTarget) -> None:
         analyzer.close()
         with reader_target.admin.begin() as conn:
             conn.exec_driver_sql("DROP DOMAIN public.mcp_domain")
+
+
+@pytest.fixture(params=["psycopg", "psycopg2"])
+def worker_url(reader_target: ReaderTarget, request: pytest.FixtureRequest) -> str:
+    if sys.platform != "linux":
+        pytest.skip("Qualified Linux worker memory enforcement")
+    return make_url(reader_target.reader_url).set(drivername=f"postgresql+{request.param}").render_as_string(hide_password=False)
+
+
+@pytest.mark.asyncio
+async def test_mcp_worker_postgres_preserves_json_and_native_error_contract(worker_url: str) -> None:
+    server = create_server(worker_url)
+    sql = """
+        WITH audit AS (SELECT r.run_id FROM runs r JOIN runs n ON r.run_id = n.run_id)
+        SELECT count(*) AS total, :label AS label FROM audit WHERE run_id = :run_id
+    """
+    params = {"label": '雪\n"', "run_id": "sql-capability-control"}
+    analyzer = LandscapeAnalyzer(worker_url)
+    try:
+        expected = json.dumps(analyzer.query(sql, params), indent=2)
+    finally:
+        analyzer.close()
+    response = await server.request_handlers[CallToolRequest](
+        CallToolRequest(method="tools/call", params=CallToolRequestParams(name="query", arguments={"sql": sql, "params": params}))
+    )
+    assert isinstance(response.root, CallToolResult)
+    assert not response.root.isError
+    assert isinstance(response.root.content[0], TextContent)
+    assert response.root.content[0].text == expected
+
+    worker = RawQueryWorker(worker_url)
+    assert json.loads(await worker.execute("SELECT n FROM generate_series(1, 4) n", None, 2)) == [{"n": 1}, {"n": 2}]
+    for invalid_sql, category in [
+        ("SELECT 'NaN'::float8 AS value", "integrity"),
+        ("SELECT decode('ff', 'hex') AS value", "serialization"),
+        ("SELECT * FROM nonexistent", "database"),
+    ]:
+        with pytest.raises(QueryWorkerError, match=category):
+            await worker.execute(invalid_sql, None, 1)
+    assert json.loads(await worker.execute("SELECT '2026-10-11 00:00:00+00'::timestamptz AS value", None, 1)) == [
+        {"value": "2026-10-11T00:00:00+00:00"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_worker_admin_and_oversized_scalar_refusal(
+    reader_target: ReaderTarget, worker_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = make_url(worker_url).drivername
+    admin_url = make_url(reader_target.admin_url).set(drivername=driver).render_as_string(hide_password=False)
+    with pytest.raises(QueryWorkerError, match="privilege"):
+        await RawQueryWorker(admin_url).execute("SELECT pg_catalog.pg_read_file('PG_VERSION')", None, 1)
+    worker = RawQueryWorker(worker_url)
+    with pytest.raises(QueryBudgetExceeded, match="output"):
+        await worker.execute("SELECT repeat('x', 10000000) AS value", None, 1)
+    # PostgreSQL's native driver imports need more address space than SQLite.
+    # Establish startup at this budget before asking for a giant field.
+    monkeypatch.setattr(query_worker, "WORKER_MEMORY_BYTES", 512 * 1024 * 1024)
+    assert json.loads(await worker.execute("SELECT 1 AS value", None, 1)) == [{"value": 1}]
+    # libpq reports allocation failure as a database exception, rather than
+    # Python MemoryError. Preserve that error category; never infer a budget
+    # verdict from arbitrary driver diagnostic text.
+    with pytest.raises(QueryWorkerError, match="database"):
+        await worker.execute("SELECT repeat('x', 268435456) AS value", None, 1)
+    assert json.loads(await worker.execute("SELECT 1 AS value", None, 1)) == [{"value": 1}]
+
+
+def _active_worker_queries(target: ReaderTarget, application: str) -> int:
+    with target.admin.connect() as conn:
+        return conn.execute(
+            text("SELECT count(*) FROM pg_stat_activity WHERE application_name = :application AND state = 'active'"),
+            {"application": application},
+        ).scalar_one()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["caller-cancel", "parent-deadline", "statement-timeout"])
+async def test_postgres_worker_cancellation_finishes_server_query(
+    reader_target: ReaderTarget, worker_url: str, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    application = f"mcp_worker_control_{uuid.uuid4().hex}"
+    url = make_url(worker_url).update_query_dict({"application_name": application}).render_as_string(hide_password=False)
+    assert _active_worker_queries(reader_target, application) == 0  # Negative instrument control.
+    if ending == "parent-deadline":
+        monkeypatch.setattr(query_worker, "QUERY_SECONDS", 5.0)
+        monkeypatch.setattr(query_worker, "CLEANUP_SECONDS", 0.2)
+    worker = RawQueryWorker(url)
+    started = time.monotonic()
+    task = asyncio.create_task(worker.execute("SELECT pg_sleep(60) AS sleeping", None, 1))
+    try:
+        for _ in range(100):
+            if _active_worker_queries(reader_target, application) == 1:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("Control query never became active on PostgreSQL")
+        if ending == "caller-cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif ending == "parent-deadline":
+            with pytest.raises(QueryBudgetExceeded, match="wall-clock"):
+                await task
+            assert time.monotonic() - started < 7
+        else:
+            with pytest.raises(QueryWorkerError, match="database"):
+                await task
+            assert time.monotonic() - started < 15
+        for _ in range(40):
+            if _active_worker_queries(reader_target, application) == 0:
+                break
+            await asyncio.sleep(0.05)
+        assert _active_worker_queries(reader_target, application) == 0
+        assert json.loads(await worker.execute("SELECT 1 AS value", None, 1)) == [{"value": 1}]
+    finally:
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
