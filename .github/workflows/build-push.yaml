@@ -46,9 +46,10 @@ on:
           - acr
           - both
 
-# Cancel in-progress runs
+# Cancel superseded runs only within the same entry point. Held CI-completion
+# runs must not cancel an explicitly dispatched publication on the same ref.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:

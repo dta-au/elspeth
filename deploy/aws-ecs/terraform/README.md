@@ -146,9 +146,12 @@ the complete command sequence in the project
 ### Producing the candidate image
 
 Published ELSPETH images come from the repository's `Build and Push` workflow
-(`.github/workflows/build-push.yaml`). It publishes `sha-<commit>` tags for
-every trusted merge to `main`, and it publishes a release or release-candidate
-image only when the operator pushes a git tag matching `v*` — for example
+(`.github/workflows/build-push.yaml`). Automatic publication after main CI is
+held. To produce a `sha-<commit>` image, explicitly dispatch `Build and Push`
+on the protected `main` branch after that commit's required CI checks pass,
+selecting the intended registry. Confirm the workflow's scan, signing and smoke
+checks succeed before using its digest. The workflow publishes a release or
+release-candidate image when the operator pushes a git tag matching `v*` — for example
 `v0.8.0`, or the pre-release shape `v0.8.0-RC-280726` for a release-candidate
 handoff. The workflow builds, smoke-tests, and then promotes the verified
 digest to `ghcr.io/<owner>/elspeth:<git-tag>`, where `<git-tag>` is the literal
