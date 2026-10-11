@@ -24,14 +24,25 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypedDict
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SerializerFunctionWrapHandler,
+    ValidationInfo,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.emitted_option import EmittedToOutput
+from elspeth.contracts.errors import TransformErrorReason
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
@@ -127,10 +138,12 @@ def _bounded_canonical_size(value: object, *, limit: int) -> int:
     raise TypeError(f"reference output value of type {type(value).__name__} is not canonical JSON")
 
 
-class ReferenceJoinConfig(TransformDataConfig):
+class _SingleReferenceJoinConfig(TransformDataConfig):
     """Configuration for reference_join."""
 
-    reference_content: str = Field(
+    reference_content: Annotated[
+        str, EmittedToOutput("inline reference text can reach row data after environment expansion", reject_at_validation=False)
+    ] = Field(
         ...,
         description=(
             "The reference table as raw text. Written by the settings loader from "
@@ -138,15 +151,9 @@ class ReferenceJoinConfig(TransformDataConfig):
             "Authoring it directly inline is legal but usually means a file was intended."
         ),
     )
-    # DELIBERATELY NOT ``EmittedToOutput``, even though reference VALUES do reach
-    # row data. ``_expand_config_templates`` runs AFTER ``_expand_env_vars``
-    # (core/config.py:3296-3300), so a ``${VAR}`` inside the table file is never
-    # expanded and cannot carry a host secret; on the web path
-    # ``load_settings_from_config_dict`` defaults ``expand_env_vars=False`` for the
-    # same reason. Marking it would reject a table whose data legitimately
-    # contains ``${...}`` with a message about an expansion that cannot happen.
-    # ``default_values`` below is the option that IS authored in YAML, IS
-    # expanded, and DOES land in row data.
+    # Table text is guarded only BEFORE environment expansion. Materialized
+    # files arrive afterwards and retain literal ${...} values; direct plugin
+    # validation also treats content as already materialized configuration.
     reference_source: str | None = Field(
         default=None,
         description=(
@@ -169,7 +176,7 @@ class ReferenceJoinConfig(TransformDataConfig):
             "Deliberately not named '*_field': it names a column of the reference table, not of the row."
         ),
     )
-    output: dict[str, str] = Field(
+    output: Annotated[dict[str, str], EmittedToOutput("output names and expression literals reach row data")] = Field(
         ...,
         description=(
             "Map of output field name to an expression over the matched entry, bound as 'ref' "
@@ -189,6 +196,8 @@ class ReferenceJoinConfig(TransformDataConfig):
         EmittedToOutput("reference_join writes these values directly into row data whenever a lookup misses"),
     ] = Field(default_factory=dict, description="Per-output-field fallback values used when on_miss is 'default'.")
 
+    _validated_index: ReferenceIndex = PrivateAttr()
+
     @field_validator("key_field", "reference_key_name")
     @classmethod
     def _reject_blank(cls, value: str) -> str:
@@ -198,7 +207,7 @@ class ReferenceJoinConfig(TransformDataConfig):
         return stripped
 
     @model_validator(mode="after")
-    def _validate_join(self) -> ReferenceJoinConfig:
+    def _validate_join(self, info: ValidationInfo) -> _SingleReferenceJoinConfig:
         from elspeth.contracts.identifiers import validate_field_names
 
         if not self.output:
@@ -229,7 +238,14 @@ class ReferenceJoinConfig(TransformDataConfig):
         # first row, and so duplicate keys are refused before anything runs. The
         # declared-type check must live here, not in __init__, so pre-validation
         # and the engine agree on rejection (test_validation_path_agreement).
-        index = build_reference_index(self)
+        entries = info.context["entries"] if info.context is not None else None
+        index = build_reference_index(
+            self,
+            entries=entries,
+            cell_limit=info.context["cell_limit"] if info.context is not None else None,
+            byte_limit=info.context["byte_limit"] if info.context is not None else None,
+        )
+        self._validated_index = index
         _validate_declared_output_types(self, _derive_joined_field_types(self, index))
         return self
 
@@ -262,6 +278,8 @@ class ReferenceIndex:
     """
 
     entries: Mapping[str, Mapping[str, Any]]
+    cell_count: int
+    retained_bytes: int
 
     def __post_init__(self) -> None:
         # The table is resolved once at config load and read on every row;
@@ -272,7 +290,7 @@ class ReferenceIndex:
         freeze_fields(self, "entries")
 
 
-def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, object]]:
+def _parse_reference_entries(cfg: _SingleReferenceJoinConfig | ReferenceTableConfig) -> list[Mapping[str, object]]:
     """Parse ``reference_content`` into a list of entries, one per table row."""
     if cfg.reference_format == "csv":
         # Strip a leading BOM here rather than in the loader: the table arrives as
@@ -339,7 +357,7 @@ def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, obje
     return entries
 
 
-def _compile_output_expressions(cfg: ReferenceJoinConfig) -> dict[str, ExpressionParser]:
+def _compile_output_expressions(cfg: _SingleReferenceJoinConfig) -> dict[str, ExpressionParser]:
     """Compile every ``output`` expression, naming the field that failed."""
     compiled: dict[str, ExpressionParser] = {}
     for field_name, expression in cfg.output.items():
@@ -370,7 +388,13 @@ def _compile_output_expressions(cfg: ReferenceJoinConfig) -> dict[str, Expressio
     return compiled
 
 
-def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
+def build_reference_index(
+    cfg: _SingleReferenceJoinConfig,
+    *,
+    entries: list[Mapping[str, object]] | None = None,
+    cell_limit: int | None = None,
+    byte_limit: int | None = None,
+) -> ReferenceIndex:
     """Resolve the whole table once: parse, key, and evaluate every output path.
 
     Called from config validation so that every failure this can detect —
@@ -378,7 +402,8 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
     that resolves for no entry at all — is reported at load rather than on some
     row deep into a run.
     """
-    entries = _parse_reference_entries(cfg)
+    if entries is None:
+        entries = _parse_reference_entries(cfg)
     if not entries:
         raise ReferenceTableError(
             "reference table has no entries: every row would miss the join. "
@@ -386,7 +411,9 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
             "sparse data — supply the table, or remove the reference_join node."
         )
     cell_count = len(entries) * len(cfg.output)
-    if cell_count > MAX_REFERENCE_INDEX_CELLS:
+    available_cells = MAX_REFERENCE_INDEX_CELLS if cell_limit is None else cell_limit
+    available_bytes = MAX_REFERENCE_INDEX_BYTES if byte_limit is None else byte_limit
+    if cell_count > available_cells:
         raise ReferenceTableError(
             f"reference table with {len(entries)} entries and {len(cfg.output)} output fields would materialize "
             f"{cell_count} values; the limit is {MAX_REFERENCE_INDEX_CELLS}. Reduce the table or output map."
@@ -434,7 +461,7 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
                     ) from exc
                 values[field_name] = _UNRESOLVED
             else:
-                retained_bytes += _bounded_canonical_size(value, limit=MAX_REFERENCE_INDEX_BYTES - retained_bytes)
+                retained_bytes += _bounded_canonical_size(value, limit=available_bytes - retained_bytes)
                 values[field_name] = value
                 resolved_count[field_name] += 1
         resolved[key] = values
@@ -447,7 +474,7 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
             "against the table's actual keys."
         )
 
-    return ReferenceIndex(entries=resolved)
+    return ReferenceIndex(entries=resolved, cell_count=cell_count, retained_bytes=retained_bytes)
 
 
 def _coerce_key(value: object) -> str:
@@ -489,7 +516,7 @@ class _JoinedFieldDerivation:
     known_non_null_runtime_types: frozenset[type]
 
 
-def _derive_joined_field_types(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> dict[str, _JoinedFieldDerivation]:
+def _derive_joined_field_types(cfg: _SingleReferenceJoinConfig, index: ReferenceIndex) -> dict[str, _JoinedFieldDerivation]:
     """Derive each joined field's declarable type from the resolved index.
 
     Under ``on_miss: fail`` the emitted set is CLOSED — a row either takes a
@@ -533,7 +560,7 @@ def _derive_joined_field_types(cfg: ReferenceJoinConfig, index: ReferenceIndex) 
     return derived
 
 
-def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[str, _JoinedFieldDerivation]) -> None:
+def _validate_declared_output_types(cfg: _SingleReferenceJoinConfig, derived: Mapping[str, _JoinedFieldDerivation]) -> None:
     """Refuse an authored joined-field declaration the resolved table proves wrong.
 
     A compatible declaration is honored, never clobbered. Authored ``any`` is
@@ -596,7 +623,7 @@ def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[s
             )
 
 
-def _reference_join_added_output_fields(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> tuple[FieldDefinition, ...]:
+def _reference_join_added_output_fields(cfg: _SingleReferenceJoinConfig, index: ReferenceIndex) -> tuple[FieldDefinition, ...]:
     """One definition per joined field, always required — the join writes every
     output field on every row it emits.
 
@@ -611,25 +638,240 @@ def _reference_join_added_output_fields(cfg: ReferenceJoinConfig, index: Referen
     return tuple(declared_by_name[name] if name in declared_by_name else derived[name].definition for name in sorted(cfg.output))
 
 
-def _build_reference_join_output_schema_config(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> SchemaConfig:
-    schema_config = cfg.schema_config
-    field_by_name: dict[str, FieldDefinition] = {}
-    if schema_config.fields is not None:
-        field_by_name.update((field.name, field) for field in schema_config.fields)
+class ReferenceTableConfig(BaseModel):
+    """One configuration-bound table, shared by any number of lookup specs."""
 
-    added_fields = _reference_join_added_output_fields(cfg, index)
-    field_by_name.update((field.name, field) for field in added_fields)
-
-    base_guaranteed = set(schema_config.guaranteed_fields or ())
-    output_guaranteed = tuple(sorted(base_guaranteed | {field.name for field in added_fields}))
-
-    return SchemaConfig(
-        mode=schema_config.mode if schema_config.fields is not None else "flexible",
-        fields=declare_missing_guaranteed_fields(tuple(field_by_name.values()), output_guaranteed),
-        guaranteed_fields=output_guaranteed,
-        audit_fields=schema_config.audit_fields,
-        required_fields=schema_config.required_fields,
+    model_config = ConfigDict(extra="forbid", strict=True)
+    reference_content: Annotated[
+        str, EmittedToOutput("inline reference text can reach row data after environment expansion", reject_at_validation=False)
+    ] = Field(
+        description=(
+            "Reference table text. On the CLI reference_file is materialized here; in Composer wire an uploaded "
+            "blob at node:<node_id>.options.tables.<table_name>.reference_content. The node never opens files at runtime."
+        )
     )
+    reference_source: str | None = Field(default=None, description="Loader-written source name for diagnostics only; never opened.")
+    reference_format: Literal["csv", "json"] = Field(
+        description="Explicit table format: CSV cells remain strings; JSON retains numeric types."
+    )
+
+
+class ReferenceLookupConfig(BaseModel):
+    """An independent lookup against a named table."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    table: str = Field(min_length=1, description="Name of an entry in tables; multiple lookups may share one table.")
+    key_field: str = Field(description="Key field read from the original input row. Lookups never read another lookup's outputs.")
+    reference_key_name: str = Field(description="Match column within the reference table, not a pipeline row field.")
+    output: Annotated[dict[str, str], EmittedToOutput("output names and expression literals reach row data")] = Field(
+        description="Distinct output fields mapped to expressions over ref, the matched reference entry. No row access."
+    )
+    on_miss: Literal["fail", "null", "default"] = Field(
+        default="fail",
+        description=(
+            "On missing match or sparse output path: fail the whole original row via the node's on_error route, "
+            "write null, or write default_values. No partial enrichment is emitted. Invalid input/configuration is never a miss."
+        ),
+    )
+    default_values: Annotated[dict[str, Any], EmittedToOutput("lookup fallback values are written directly into row data")] = Field(
+        default_factory=dict, description="Per-output fallback values; all output fields must be covered for on_miss: default."
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CompiledLookup:
+    table: str | None
+    config: _SingleReferenceJoinConfig
+    index: ReferenceIndex
+
+    def error(self, reason: TransformErrorReason, lookup_index: int) -> TransformResult:
+        """Attribute an error without adding any row or reference values."""
+        if self.table is not None:
+            reason["lookup_index"] = lookup_index
+            reason["table"] = self.table
+        return TransformResult.error(reason, retryable=False)
+
+
+class _ReferenceFieldWire(TypedDict, total=False):
+    """Serialized field definition; include/exclude may select any subset."""
+
+    name: str
+    field_type: Literal["str", "int", "float", "bool", "any"]
+    required: bool
+    nullable: bool
+
+
+class _ReferenceSchemaWire(TypedDict, total=False):
+    """Pydantic's schema dataclass wire shape in Python and JSON modes."""
+
+    mode: Literal["fixed", "flexible", "observed"]
+    fields: tuple[_ReferenceFieldWire, ...] | list[_ReferenceFieldWire] | None
+    guaranteed_fields: tuple[str, ...] | list[str] | None
+    required_fields: tuple[str, ...] | list[str] | None
+    audit_fields: tuple[str, ...] | list[str] | None
+
+
+class _ReferenceTableWire(TypedDict, total=False):
+    """Serialized named table, including optional diagnostic provenance."""
+
+    reference_content: str
+    reference_source: str | None
+    reference_format: Literal["csv", "json"]
+
+
+class _ReferenceLookupWire(TypedDict, total=False):
+    """Serialized lookup semantics and arbitrary configured fallback values."""
+
+    table: str
+    key_field: str
+    reference_key_name: str
+    output: dict[str, str]
+    on_miss: Literal["fail", "null", "default"]
+    default_values: dict[str, Any]
+
+
+class _ReferenceJoinConfigWire(TypedDict, total=False):
+    """Serialized active join form, honoring aliases and field selections.
+
+    Every key is optional because Pydantic include/exclude/default filtering
+    may remove it. Schema is emitted under exactly one of its two names.
+    The serializer removes the inactive single or multi option set.
+    """
+
+    schema: _ReferenceSchemaWire
+    schema_config: _ReferenceSchemaWire
+    required_input_fields: list[str] | None
+    reference_content: str | None
+    reference_source: str | None
+    reference_format: Literal["csv", "json"] | None
+    key_field: str | None
+    reference_key_name: str | None
+    output: dict[str, str] | None
+    on_miss: Literal["fail", "null", "default"]
+    default_values: dict[str, Any]
+    tables: dict[str, _ReferenceTableWire] | None
+    lookups: list[_ReferenceLookupWire] | None
+
+
+class ReferenceJoinConfig(TransformDataConfig):
+    """One legacy lookup, or named tables and independent lookup specifications."""
+
+    reference_content: Annotated[
+        str | None, EmittedToOutput("inline reference text can reach row data after environment expansion", reject_at_validation=False)
+    ] = Field(default=None, description=_SingleReferenceJoinConfig.model_fields["reference_content"].description)
+    reference_source: str | None = Field(default=None, description=_SingleReferenceJoinConfig.model_fields["reference_source"].description)
+    reference_format: Literal["csv", "json"] | None = Field(
+        default=None, description=_SingleReferenceJoinConfig.model_fields["reference_format"].description
+    )
+    key_field: str | None = Field(default=None, description=_SingleReferenceJoinConfig.model_fields["key_field"].description)
+    reference_key_name: str | None = Field(
+        default=None, description=_SingleReferenceJoinConfig.model_fields["reference_key_name"].description
+    )
+    output: Annotated[dict[str, str] | None, EmittedToOutput("output names and expression literals reach row data")] = Field(
+        default=None, description=_SingleReferenceJoinConfig.model_fields["output"].description
+    )
+    on_miss: Literal["fail", "null", "default"] = Field(
+        default="fail", description=_SingleReferenceJoinConfig.model_fields["on_miss"].description
+    )
+    default_values: Annotated[dict[str, Any], EmittedToOutput("reference_join fallback values are written directly into row data")] = Field(
+        default_factory=dict, description=_SingleReferenceJoinConfig.model_fields["default_values"].description
+    )
+    tables: dict[str, ReferenceTableConfig] | None = Field(default=None, description="Named configuration-bound reference tables.")
+    lookups: list[ReferenceLookupConfig] | None = Field(default=None, description="Independent lookups that read the original input row.")
+    _compiled_lookups: tuple[_CompiledLookup, ...] = PrivateAttr()
+
+    @model_serializer(mode="wrap")
+    def _serialize_active_form(self, handler: SerializerFunctionWrapHandler) -> _ReferenceJoinConfigWire:
+        """Preserve the selected configuration form through normal round trips."""
+        serialized: _ReferenceJoinConfigWire = handler(self)
+        if self.tables is None:
+            serialized.pop("tables", None)
+            serialized.pop("lookups", None)
+        else:
+            serialized.pop("reference_content", None)
+            serialized.pop("reference_source", None)
+            serialized.pop("reference_format", None)
+            serialized.pop("key_field", None)
+            serialized.pop("reference_key_name", None)
+            serialized.pop("output", None)
+            serialized.pop("on_miss", None)
+            serialized.pop("default_values", None)
+        return serialized
+
+    @model_validator(mode="after")
+    def _validate_lookup_forms(self) -> ReferenceJoinConfig:
+        legacy_fields = {
+            "reference_content",
+            "reference_source",
+            "reference_format",
+            "key_field",
+            "reference_key_name",
+            "output",
+            "on_miss",
+            "default_values",
+        }
+        compiled: list[_CompiledLookup] = []
+        if self.tables is None and self.lookups is None:
+            values = {name: value for name, value in self.model_dump().items() if name not in {"tables", "lookups"}}
+            cfg = _SingleReferenceJoinConfig.model_validate(values)
+            compiled.append(_CompiledLookup(None, cfg, cfg._validated_index))
+        else:
+            if self.model_fields_set & legacy_fields:
+                raise ValueError("tables/lookups and single-lookup options are mutually exclusive")
+            if not self.tables or not self.lookups:
+                raise ValueError("tables and at least one lookup are required")
+            used = {spec.table for spec in self.lookups}
+            unknown = used - self.tables.keys()
+            if unknown:
+                raise ValueError(f"lookups name unknown table(s): {sorted(unknown)}")
+            unused = self.tables.keys() - used
+            if unused:
+                raise ValueError(f"unused reference tables: {sorted(unused)}")
+            output_names: set[str] = set()
+            for spec in self.lookups:
+                duplicate = output_names & spec.output.keys()
+                if duplicate:
+                    raise ValueError(f"duplicate output fields across lookups: {sorted(duplicate)}")
+                output_names.update(spec.output)
+            for spec in self.lookups:
+                if spec.key_field.strip() in output_names:
+                    raise ValueError(f"key_field {spec.key_field!r} names an output field; lookups must read the original row")
+            # Configuration-scoped cache: never a filename or a global cache.
+            # The named table binds both content and format; indexes are built
+            # separately for each match-column/output-expression combination.
+            parsed = {name: _parse_reference_entries(table) for name, table in self.tables.items()}
+            cells = 0
+            retained_bytes = 0
+            for spec in self.lookups:
+                values = {
+                    "schema": self.schema_config.to_dict(),
+                    **self.tables[spec.table].model_dump(),
+                    **spec.model_dump(exclude={"table"}),
+                }
+                cfg = _SingleReferenceJoinConfig.model_validate(
+                    values,
+                    context={
+                        "entries": parsed[spec.table],
+                        "cell_limit": MAX_REFERENCE_INDEX_CELLS - cells,
+                        "byte_limit": MAX_REFERENCE_INDEX_BYTES - retained_bytes,
+                    },
+                )
+                index = cfg._validated_index
+                cells += index.cell_count
+                retained_bytes += index.retained_bytes
+                if cells > MAX_REFERENCE_INDEX_CELLS:
+                    raise ReferenceTableError(f"reference lookups materialize {cells} values; the limit is {MAX_REFERENCE_INDEX_CELLS}")
+                if retained_bytes > MAX_REFERENCE_INDEX_BYTES:
+                    raise ReferenceTableError(
+                        f"reference lookup outputs exceed the {MAX_REFERENCE_INDEX_BYTES}-byte materialized index limit"
+                    )
+                compiled.append(_CompiledLookup(spec.table, cfg, index))
+        self._compiled_lookups = tuple(compiled)
+        return self
+
+    @property
+    def declared_input_fields(self) -> frozenset[str]:
+        return super().declared_input_fields | frozenset(lookup.config.key_field for lookup in self._compiled_lookups)
 
 
 class ReferenceJoin(BaseTransform):
@@ -642,7 +884,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5c739014e71f9bbc"
+    source_file_hash: str | None = "sha256:6652161bbf2122c6"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -685,22 +927,23 @@ class ReferenceJoin(BaseTransform):
         super().__init__(options)
         cfg = ReferenceJoinConfig.from_dict(options, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
-
-        self._key_field = cfg.key_field
-        self._reference_key = cfg.reference_key_name
-        # Rendered once: the loader writes reference_source only on the file path,
-        # and a miss is the one diagnostic where knowing WHICH table was searched
-        # is what tells an author whether the key or the file is wrong.
-        self._reference_origin = f" in {cfg.reference_source}" if cfg.reference_source else ""
-        self._on_miss = cfg.on_miss
-        self._default_values = dict(cfg.default_values)
-        self._output_field_names = tuple(sorted(cfg.output))
-        self._index = build_reference_index(cfg)
-
-        self.declared_output_fields = frozenset(cfg.output)
-
+        self._lookups = cfg._compiled_lookups
+        first = self._lookups[0]
+        self._key_field = first.config.key_field
+        self._index = first.index
+        self.declared_output_fields = frozenset(name for lookup in self._lookups for name in lookup.config.output)
         self.input_schema = create_schema_from_config(cfg.schema_config, "ReferenceJoinInput", allow_coercion=False)
-        self._output_schema_config = _build_reference_join_output_schema_config(cfg, self._index)
+        field_by_name = {field.name: field for field in cfg.schema_config.fields or ()}
+        for lookup in self._lookups:
+            field_by_name.update((field.name, field) for field in _reference_join_added_output_fields(lookup.config, lookup.index))
+        guaranteed = tuple(sorted(set(cfg.schema_config.guaranteed_fields or ()) | self.declared_output_fields))
+        self._output_schema_config = SchemaConfig(
+            mode=cfg.schema_config.mode if cfg.schema_config.fields is not None else "flexible",
+            fields=declare_missing_guaranteed_fields(tuple(field_by_name.values()), guaranteed),
+            guaranteed_fields=guaranteed,
+            audit_fields=cfg.schema_config.audit_fields,
+            required_fields=cfg.schema_config.required_fields,
+        )
         self.output_schema = create_schema_from_config(self._output_schema_config, "ReferenceJoinOutput", allow_coercion=False)
 
     @classmethod
@@ -732,6 +975,15 @@ class ReferenceJoin(BaseTransform):
                     "(empty counts, missing does not), and a header with no data rows is refused. These fire "
                     "at config load, so a blob you cannot inspect fails the run.",
                     "on_miss defaults to fail, because an unenriched row reaching a sink looks identical to an enriched one.",
+                    "For multiple lookups use tables: {name: {reference_content, reference_format}} and lookups: "
+                    "[{table, key_field, reference_key_name, output, on_miss, default_values}]. These are mutually exclusive "
+                    "with the top-level single-lookup options. Shared tables are parsed once.",
+                    "Wire each uploaded table with wire_blob_inline_ref at "
+                    "'node:<node_id>.options.tables.<table_name>.reference_content'; on the CLI put reference_file under each table.",
+                    "Each lookup reads the original row independently; chained enrichment requires separate nodes. "
+                    "Output names must be distinct and cannot name any lookup's input key_field.",
+                    "Set a lookup's on_miss to default and supply default_values, or use fail with the node's on_error "
+                    "quarantine sink. A failure routes the whole original row; no partial enrichment goes downstream.",
                 ),
             )
         return None
@@ -742,58 +994,67 @@ class ReferenceJoin(BaseTransform):
 
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
         del ctx
-        if self._key_field not in row:
-            return TransformResult.error(
-                {
-                    "reason": "invalid_input",
-                    "field": self._key_field,
-                    "error": f"row has no {self._key_field!r} field to join on",
-                },
-                retryable=False,
-            )
-
-        raw_key = row[self._key_field]
-        try:
-            key = _coerce_key(raw_key)
-        except ReferenceTableError:
-            return TransformResult.error(
-                {
-                    "reason": "invalid_input",
-                    "field": self._key_field,
-                    "error": f"join key must be a string or number, got {type(raw_key).__name__}",
-                },
-                retryable=False,
-            )
-
-        entry = self._index.entries[key] if key in self._index.entries else None
         values: dict[str, Any] = {}
-        missed: list[str] = []
-        for field_name in self._output_field_names:
-            resolved = _UNRESOLVED if entry is None else entry[field_name]
-            if resolved is _UNRESOLVED:
-                missed.append(field_name)
-                continue
-            values[field_name] = resolved
-
-        if missed:
-            if self._on_miss == "fail":
-                return TransformResult.error(
+        audit: list[dict[str, Any]] = []
+        for lookup_index, lookup in enumerate(self._lookups):
+            cfg = lookup.config
+            attribution = {} if lookup.table is None else {"lookup_index": lookup_index, "table": lookup.table}
+            if cfg.key_field not in row:
+                return lookup.error(
                     {
-                        "reason": "reference_miss",
-                        "field": self._key_field,
-                        "unresolved_fields": missed,
-                        # The join key is row data: it stays in the row carrier,
-                        # never in the reason (the key field is named above).
-                        "error": (
-                            f"no reference entry for the row's {self._key_field!r}{self._reference_origin}"
-                            if entry is None
-                            else f"the reference entry for the row's {self._key_field!r}{self._reference_origin} did not resolve {missed}"
-                        ),
+                        "reason": "invalid_input",
+                        "field": cfg.key_field,
+                        "error": f"row has no {cfg.key_field!r} field to join on",
                     },
-                    retryable=False,
+                    lookup_index,
                 )
-            for field_name in missed:
-                values[field_name] = self._default_values[field_name] if self._on_miss == "default" else None
+            raw_key = row[cfg.key_field]
+            try:
+                key = _coerce_key(raw_key)
+            except ReferenceTableError:
+                return lookup.error(
+                    {
+                        "reason": "invalid_input",
+                        "field": cfg.key_field,
+                        "error": f"join key must be a string or number, got {type(raw_key).__name__}",
+                    },
+                    lookup_index,
+                )
+            entry = lookup.index.entries[key] if key in lookup.index.entries else None
+            missed: list[str] = []
+            for field_name in sorted(cfg.output):
+                resolved = _UNRESOLVED if entry is None else entry[field_name]
+                if resolved is _UNRESOLVED:
+                    missed.append(field_name)
+                else:
+                    values[field_name] = resolved
+            if missed:
+                if cfg.on_miss == "fail":
+                    origin = f" in {cfg.reference_source}" if cfg.reference_source else ""
+                    return lookup.error(
+                        {
+                            "reason": "reference_miss",
+                            "field": cfg.key_field,
+                            "unresolved_fields": missed,
+                            "error": (
+                                f"no reference entry for the row's {cfg.key_field!r}{origin}"
+                                if entry is None
+                                else f"the reference entry for the row's {cfg.key_field!r}{origin} did not resolve {missed}"
+                            ),
+                        },
+                        lookup_index,
+                    )
+                for field_name in missed:
+                    values[field_name] = cfg.default_values[field_name] if cfg.on_miss == "default" else None
+            audit.append(
+                {
+                    **attribution,
+                    "fields": sorted(cfg.output),
+                    "matched": entry is not None,
+                    "unresolved_fields": missed,
+                    "on_miss": cfg.on_miss,
+                }
+            )
 
         output = copy.deepcopy(row.to_dict())
         output.update(values)
@@ -807,10 +1068,11 @@ class ReferenceJoin(BaseTransform):
             success_reason={
                 "action": "enriched",
                 "fields_added": sorted(values),
-                "metadata": {
-                    "matched": entry is not None,
-                    "unresolved_fields": missed,
-                },
+                "metadata": (
+                    {"matched": audit[0]["matched"], "unresolved_fields": audit[0]["unresolved_fields"]}
+                    if self._lookups[0].table is None
+                    else {"lookups": audit}
+                ),
             },
         )
 

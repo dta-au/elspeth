@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, get_args, get_origin
 import yaml
 from pydantic import BaseModel
 
-from elspeth.contracts.emitted_option import emitted_option_fields, env_placeholders_in
+from elspeth.contracts.emitted_option import emitted_option_fields, emitted_option_values, env_placeholders_in
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.config import (
@@ -255,13 +255,17 @@ def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str
     test_ref="tests/unit/core/test_config.py::TestEnvPlaceholderGuardIsDerived::test_rejection_message_names_the_declaring_kind",
     test_fingerprint="5423e68f4c1534e2c8c66c5e3a396e890593343f71449e5e436d65616b4649c4",
 )
-def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mapping[str, object]) -> None:
+def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mapping[str, object], *, expand_env_vars: bool = True) -> None:
     """Reject env placeholders in plugin options whose value is written to output.
 
     Some plugin options are not references or selectors — their literal value is
     rendered into row data or into an artifact's bytes. Reject their raw
     ``${VAR}`` before the loader expands it, so the plugin's own validation
     cannot be bypassed by handing it an already-expanded host value.
+
+    Content marked only for pre-expansion rejection remains literal data when
+    ``expand_env_vars`` is False. Ordinary emitted-value restrictions still
+    apply on that path, as they do during plugin validation.
 
     DERIVED, NOT RESTATED. Both the sections and the forbidden fields come from
     the system's own declarations: the sections from ``ElspethSettings``;
@@ -326,6 +330,36 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
                     f"{reason}.{shared} Env expansion runs before plugin validation on this path, so the "
                     f"placeholder would be replaced by the host value and written out verbatim."
                 )
+
+            # Keep the top-level declaration API intact for output-name
+            # authorities and inspect typed nested models with the same markers.
+            # Do not mark a whole container emitted just because a child is.
+            from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+            manager = get_shared_plugin_manager()
+            for kind, plugins in (
+                ("source", manager.get_sources()),
+                ("transform", manager.get_transforms()),
+                ("sink", manager.get_sinks()),
+            ):
+                for plugin in plugins:
+                    if plugin.name != plugin_name:
+                        continue
+                    model = plugin.get_config_model()
+                    if model is None:
+                        continue
+                    if not issubclass(model, BaseModel):
+                        raise TypeError(f"{plugin_name} configuration model must inherit BaseModel")
+                    for path, value, reason in emitted_option_values(
+                        model, options, nested_only=not expand_env_vars, for_env_expansion=expand_env_vars
+                    ):
+                        if env_placeholders_in(value):
+                            raise ValueError(
+                                f"{section_name}[{entry_key!r}] {plugin_name} option {path!r} "
+                                f"must not contain environment-variable placeholders before env expansion: "
+                                f"as a {kind} plugin, {reason}. Env expansion runs before plugin validation "
+                                f"on this path, so the placeholder would be replaced by the host value and written out verbatim."
+                            )
 
 
 @trust_boundary(
@@ -489,7 +523,7 @@ def load_settings_from_config_dict(
     elif has_power_automate_components(raw_config) and raw_config.get("run_mode", RunMode.LIVE) != RunMode.LIVE:
         raise ValueError("Power Automate nonlive loading requires admitted archive context")
     _reject_file_backed_template_options_for_in_memory_loader(raw_config)
-    _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+    _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config, expand_env_vars=expand_env_vars)
     if expand_env_vars:
         _reject_web_scrape_auth_literal(raw_config)
     # Structural profile-selector checks (unknown alias, ambiguous

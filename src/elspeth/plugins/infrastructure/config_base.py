@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from elspeth.contracts.emitted_option import (
     EmittedToOutput,
-    emitted_option_fields,
+    emitted_option_values,
     env_placeholders_in,
 )
 from elspeth.contracts.header_modes import HeaderMode, parse_header_mode
@@ -289,20 +289,9 @@ class PluginConfig(BaseModel):
         pre-expansion guard in the settings loader closes that window and reads
         the same declarations. Neither is redundant; both derive from here.
         """
-        declared = emitted_option_fields(type(self))
-        if not declared:
-            return self
-
-        # Iterating the model yields (field_name, value) for its own fields —
-        # direct access to an owned type, not a dynamic-attribute probe. A
-        # getattr(self, name) here would read as a masquerade site under
-        # ADR-032 and would need baselining, for no gain: the names come from
-        # this model's own model_fields, so nothing about the lookup is
-        # uncertain.
-        for field_name, value in self:
-            reason = declared[field_name] if field_name in declared else None
-            if reason is not None and env_placeholders_in(value):
-                raise ValueError(f"{field_name} must not contain environment-variable placeholders; {reason}")
+        for path, value, reason in emitted_option_values(type(self), self):
+            if env_placeholders_in(value):
+                raise ValueError(f"{path} must not contain environment-variable placeholders; {reason}")
         return self
 
     @classmethod

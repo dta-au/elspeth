@@ -38,7 +38,7 @@ both enforcement points DERIVE from that declaration:
 
 The marker is metadata only. It performs no validation itself — the enforcing
 validator lives on the plugin config base, and the loader guard reads the same
-metadata through :func:`emitted_option_fields`.
+metadata through :func:`emitted_option_fields` and :func:`emitted_option_values`.
 
 Options whose value names an output field already have a separate,
 truth-tested declaration on the transform class:
@@ -74,13 +74,14 @@ gain; an alias changes no emitted schema at all.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from types import UnionType
+from typing import Union, get_args, get_origin
+
+from pydantic import BaseModel
 
 from elspeth.contracts.trust_boundary import trust_boundary
-
-if TYPE_CHECKING:
-    from pydantic import BaseModel
 
 # The canonical ``${VAR}`` / ``${VAR:-default}`` reference pattern.
 #
@@ -104,16 +105,21 @@ class EmittedToOutput:
             verbatim in the rejection message. Write it so someone who has never
             read this module understands why their ``${VAR}`` was refused —
             "``truncate`` appends this to every truncated value", not "forbidden".
+        reject_at_validation: Also reject literal placeholders during plugin
+            validation. Set False for content materialized after environment
+            expansion: it must stay literal when read from a file or supplied
+            through a loader that does not expand host environment values.
     """
 
     reason: str
+    reject_at_validation: bool = True
 
     def __post_init__(self) -> None:
         if not self.reason.strip():
             raise ValueError("EmittedToOutput.reason must explain where the value surfaces; it is shown to operators")
 
 
-def emitted_option_fields(model: type[BaseModel] | None) -> dict[str, str]:
+def emitted_option_fields(model: type[BaseModel] | None, *, for_env_expansion: bool = False) -> dict[str, str]:
     """Return ``{field_name: reason}`` for every :class:`EmittedToOutput` field.
 
     Reads ``model_fields`` metadata, so an inherited marker is found on the
@@ -123,6 +129,8 @@ def emitted_option_fields(model: type[BaseModel] | None) -> dict[str, str]:
         model: A plugin config model, or ``None``. ``None`` is a normal return
             from ``get_config_model()`` for plugins that take no options (the
             ``null`` source) and means "declares nothing" — not an error.
+        for_env_expansion: Include fields protected only before environment
+            expansion. The default preserves plugin-validation semantics.
 
     Returns:
         Mapping of field name to the declared reason. Empty when the model
@@ -134,10 +142,81 @@ def emitted_option_fields(model: type[BaseModel] | None) -> dict[str, str]:
     declared: dict[str, str] = {}
     for field_name in model.model_fields:
         for entry in model.model_fields[field_name].metadata:
-            if isinstance(entry, EmittedToOutput):
+            if isinstance(entry, EmittedToOutput) and (entry.reject_at_validation or for_env_expansion):
                 declared[field_name] = entry.reason
                 break
     return declared
+
+
+def emitted_option_values(
+    model: type[BaseModel] | None,
+    value: object,
+    *,
+    nested_only: bool = False,
+    for_env_expansion: bool = False,
+) -> Iterator[tuple[str, object, str]]:
+    """Yield declared emitted values and their paths in raw or validated config.
+
+    Traverse only typed model/list/mapping fields, never arbitrary option data.
+    A marker applies to that field's entire value; an unmarked container does
+    not inherit a child's marker. In particular, a lookup's defaults do not
+    make its selectors or reference table content emitted options.
+
+    Malformed raw shapes remain the responsibility of config validation. The
+    traversal does not validate a model or expand any environment references.
+    ``for_env_expansion`` includes pre-expansion-only declarations; the default
+    yields only fields whose literals are also forbidden during validation.
+    """
+    if model is not None:
+        yield from _model_emitted_values(model, value, "", nested_only=nested_only, for_env_expansion=for_env_expansion)
+
+
+def _model_emitted_values(
+    model: type[BaseModel], value: object, prefix: str, *, nested_only: bool, for_env_expansion: bool
+) -> Iterator[tuple[str, object, str]]:
+    if isinstance(value, BaseModel):
+        owned = True
+        values = dict(value)
+    elif isinstance(value, Mapping):
+        owned = False
+        values = dict(value)
+    else:
+        return
+
+    declared = emitted_option_fields(model, for_env_expansion=for_env_expansion)
+    for name, field in model.model_fields.items():
+        # Validated models iterate by field name; raw authors may use aliases.
+        key = name if owned else field.alias or name
+        if key not in values:
+            if not owned and name in values and model.model_config.get("populate_by_name"):
+                key = name
+            else:
+                continue
+        display_name = field.alias or key
+        path = f"{prefix}.{display_name}" if prefix else display_name
+        item = values[key]
+        if name in declared and (prefix or not nested_only):
+            yield path, item, declared[name]
+        yield from _annotation_emitted_values(field.annotation, item, path, for_env_expansion=for_env_expansion)
+
+
+def _annotation_emitted_values(
+    annotation: object, value: object, path: str, *, for_env_expansion: bool
+) -> Iterator[tuple[str, object, str]]:
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        yield from _model_emitted_values(annotation, value, path, nested_only=False, for_env_expansion=for_env_expansion)
+        return
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin in (Union, UnionType):
+        for member in args:
+            yield from _annotation_emitted_values(member, value, path, for_env_expansion=for_env_expansion)
+    elif origin is list and args and isinstance(value, list | tuple):
+        for index, item in enumerate(value):
+            yield from _annotation_emitted_values(args[0], item, f"{path}[{index}]", for_env_expansion=for_env_expansion)
+    elif origin is dict and len(args) == 2 and isinstance(value, Mapping):
+        for key, item in value.items():
+            yield from _annotation_emitted_values(args[1], item, f"{path}[{key!r}]", for_env_expansion=for_env_expansion)
 
 
 @trust_boundary(
