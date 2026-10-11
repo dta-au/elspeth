@@ -1,8 +1,7 @@
 # CI Pipeline - Lint and Test
 #
-# Inert preparation outside GitHub workflow discovery. Trusted-workgroup access,
-# all-external fork approval and qualification precede operator activation.
-# Intended push and PR feedback loop:
+# Nyx execution uses trusted-workgroup access and all-external fork approval.
+# Push and PR feedback loop:
 #   - Linting (ruff, mypy) - ~30 seconds
 #   - Testing (eight duration-balanced pytest shards per Python version)
 #   - Bug-hiding pattern detection
@@ -38,10 +37,9 @@ env:
 permissions:
   contents: read
 
-# INACTIVE PREPARATION: this file and the proof callee are outside discovery.
 # GitHub contributor permissions and fork approval enforce the accepted trust
 # boundary; repository-edited YAML cannot enforce it. Outsider runs stay
-# unapproved. The complete proof/coverage graph awaits authorized activation.
+# unapproved. Native qualification must verify the complete proof/coverage graph.
 #
 # Self-hosted container jobs can leave root-owned venv/cache artifacts in the
 # default workspace. Every checkout below uses a per-run, per-job path so stale

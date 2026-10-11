@@ -1,4 +1,4 @@
-"""Controlled process tests for the inactive Linux proof supervisor."""
+"""Controlled process tests for the Linux proof supervisor used by active CI."""
 
 from __future__ import annotations
 

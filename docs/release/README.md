@@ -1,6 +1,6 @@
 # `docs/release/` — Release Histories and Snapshots
 
-**Last reviewed:** 2026-10-07 (0.8.3)
+**Last reviewed:** 2026-10-11 (0.8.4 candidate index)
 **Audience:** Anyone navigating to release-level documentation
 **Register:** Lightly technical / directory-index
 
@@ -8,7 +8,7 @@ This directory holds the current evaluator guides and the long-lived assurance
 narrative.
 
 The directory is intentionally small. **Current** documents are the maintained
-tier for the release currently being prepared (0.8.3). Superseded point-in-time
+tier for the release currently being prepared (0.8.4). Superseded point-in-time
 release docs and frozen historical snapshots are no longer part of the active
 public docs tree; use git history or maintainer-local archives when historical
 provenance is needed. New readers should start with the current tier below.
@@ -39,7 +39,7 @@ Before diving into the documents below, know which sources they aggregate. **If 
 
 ---
 
-## Current documents (0.8.3, October 2026)
+## Current documents (0.8.4 preparation, October 2026)
 
 | Document | What it answers | Intended reader |
 |----------|-----------------|-----------------|
@@ -50,7 +50,10 @@ Before diving into the documents below, know which sources they aggregate. **If 
 The root project overview is the broad evaluator entry point. Engineering
 readers should use the platform architecture and root changelog for current
 implementation context. Each document states the release or schema epoch it
-covers; where that differs from this index, the document wins.
+covers; where that differs from this index, the document wins. The Composer and
+architecture guides retain their stated 0.8.3 candidate coverage; the current
+changelog and upgrade runbooks describe the additional 0.8.4 changes. This index
+does not establish release qualification or publication.
 
 ## Assurance narrative (long-lived; refreshed per release)
 

@@ -85,7 +85,7 @@ def test_cli_rotate_defaults_to_the_confined_source_root() -> None:
     assert args.root == Path("src/elspeth")
 
 
-@pytest.mark.parametrize("config_path", [Path(".pre-commit-config.yaml"), Path("config/cicd/prepared-nyx/ci.yaml")])
+@pytest.mark.parametrize("config_path", [Path(".pre-commit-config.yaml"), Path(".github/workflows/ci.yaml")])
 def test_full_scan_incremental_policy_gates_fail_on_inert(config_path: Path) -> None:
     """Full-corpus gates opt in; changed-file hooks may legitimately reach only a rule subset."""
     import shlex

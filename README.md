@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.3](https://img.shields.io/badge/status-0.8.3-green.svg)
+![Status: 0.8.4](https://img.shields.io/badge/status-0.8.4-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -98,16 +98,16 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.3
+## What changed in 0.8.4
 
 This unreleased source includes the merged EFS session archive recovery
 repair, container/dependency maintenance and Web Composer HTTPS progress
 transport. The transport delivers operation progress followed by the completed
 answer; it does not stream
-generated answer tokens. Package metadata remains 0.8.3 while the local
-`release/0.8.4` branch includes authentication revocation, PostgreSQL privilege
-separation, bounded MCP SQL execution and provider-response safeguards. Neither
-the branch nor these notes establish a published release. See the
+generated answer tokens. The 0.8.4 source candidate also includes authentication
+revocation, PostgreSQL privilege separation, bounded MCP SQL execution and
+provider-response safeguards. Release qualification and image publication
+remain pending. See the
 [release notes](CHANGELOG.md).
 
 The 0.8.4 candidate requires session epoch 73 for durable session-family
@@ -128,10 +128,12 @@ install the qualified candidate. See the
 [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.
 
-Nyx PR CI preparation remains inactive under `config/cicd/prepared-nyx/`,
-outside GitHub workflow discovery. Activation requires external enforcement of
-maintainer admission for exact PR commits and native CI qualification; workflow
-conditions alone do not restrict access to persistent runners. See the
+Nyx PR CI sources are in `.github/workflows/`, with eight ordinary test shards
+and three long-proof packets per interpreter. GitHub requires approval for all
+external contributors; outsider runs stay unapproved, and the existing workgroup
+and repository writer are explicitly trusted. Workflow conditions alone do not
+restrict access to persistent runners. Native execution and coverage artifacts
+require qualification before release. See the
 [CI proof guide](docs/maintainer/ci-landscape-proof.md).
 
 ## Recovery and deployment

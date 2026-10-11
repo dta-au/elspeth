@@ -1,26 +1,24 @@
-# Prepared Nyx CI and Landscape proofs
+# Nyx CI and Landscape proofs
 
-This is an **inactive repository preparation**, not runner admission or runtime
-qualification. The six prepared sources, including [CI](../../config/cicd/prepared-nyx/ci.yaml)
-and its [proof callee](../../config/cicd/prepared-nyx/landscape-long-run.yml), live
-outside `.github/workflows`. They cannot produce Actions checks from this checkout.
-There is no placeholder or deliberately skipped required job. The eventual
-reusable call retains its `.github/workflows/landscape-long-run.yml` identity so
-the source can be linted in a disposable deployment mirror. Both executable and
-prepared inventories are checked for runner routing and supply-chain closure;
-duplicate identities or discovered PR producers fail the source contract.
+The six Nyx sources, including [CI](../../.github/workflows/ci.yaml) and its
+[proof callee](../../.github/workflows/landscape-long-run.yml), are in GitHub's
+workflow discovery directory. Activation and publication on the release branch
+were authorized on 2026-10-11 UTC. Source activation alone does not establish
+runner admission or runtime qualification. Source contracts require the complete
+executable inventory, runner routing and supply-chain closure; missing or
+duplicate identities fail the contract.
 
 The existing main ruleset requires `CI Success`, `CodeQL`,
 `Check cohort-attribution trailers on PR commits`, and `redaction-gate`. This
-package supplies none of them while parked. Missing required checks block a new
-commit under that rule; conditional job skips can report success, so they are
-unsuitable for keeping this package inactive. Existing same-commit results,
+package must supply genuine successful native checks. Missing required checks
+block a new commit under that rule; conditional job skips can report success,
+so they are unsuitable as qualification evidence. Existing same-commit results,
 producer spoofing and bypass permissions remain external policy concerns.
 [GitHub documents the distinction](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
 Automatic CI-triggered image publication remains disabled, and release evidence
 continues to require literal successful results. No required-check rule is relaxed.
 
-## Admission before activation
+## Admission and native qualification
 
 The [CI admission policy](nyx-ci-admission-proposal.md) records the maintainer's
 trusted-workgroup decision, required GitHub setting and remaining qualification.
@@ -30,9 +28,8 @@ outsider runs unapproved. GitHub's organization-member and collaborator approval
 exceptions are inside that explicitly accepted trust boundary. Contributor-edited
 YAML and runner labels do not provide it.
 
-Keep this package inactive until separately authorized activation after source
-qualification and a fresh readback of the contributor policy. Copying templates
-into GitHub discovery is activation. During native qualification, verify that an
+Read back the contributor policy before publication. During native qualification,
+verify that an
 outsider-edited workflow remains awaiting approval without acquiring a Nyx runner,
 and that trusted same-repository PRs produce the genuine required checks. Do not
 approve the outsider run as part of that refusal check. Preserve native PR merge
@@ -41,7 +38,7 @@ These source files neither change GitHub settings nor qualify the runner host.
 
 ## Selection and required evidence
 
-The prepared ordinary matrix has eight shards per Python interpreter, with two
+The ordinary matrix has eight shards per Python interpreter, with two
 pytest workers per job and at most two concurrent ordinary matrix jobs. The
 three exact `landscape_long_run` cases are:
 

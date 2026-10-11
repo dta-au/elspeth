@@ -13,7 +13,7 @@ from typing import Any
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-CI_WORKFLOW = REPO_ROOT / "config/cicd/prepared-nyx/ci.yaml"
+CI_WORKFLOW = REPO_ROOT / ".github/workflows/ci.yaml"
 BUILD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-push.yaml"
 DEPENDABOT = REPO_ROOT / ".github" / "dependabot.yml"
 GATEWAY = REPO_ROOT / "gateway"

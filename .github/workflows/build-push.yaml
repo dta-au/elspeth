@@ -70,7 +70,7 @@ jobs:
     name: Build and Push
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # Automatic CI-triggered publication is disabled while the prepared CI
-    # graph is inactive: a skipped workflow must not authorize publication.
+    # graph is being qualified: a skipped workflow must not authorize publication.
     # Version tags and protected default-branch dispatch retain their guards.
     # The workflow_run provenance checks stay required for future activation.
     if: |

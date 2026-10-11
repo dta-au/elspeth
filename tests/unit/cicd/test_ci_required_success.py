@@ -1,4 +1,4 @@
-"""Every required producer must succeed before the parked aggregate can succeed."""
+"""Every required producer must succeed before the active aggregate can succeed."""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ from typing import Any
 
 import pytest
 import yaml
-from tests.unit.cicd.workflow_sources import PREPARED_WORKFLOWS
+from tests.unit.cicd.workflow_sources import EXECUTABLE_WORKFLOWS
 
 
 def _aggregate() -> dict[str, Any]:
-    workflow = yaml.safe_load((PREPARED_WORKFLOWS / "ci.yaml").read_text())
+    workflow = yaml.safe_load((EXECUTABLE_WORKFLOWS / "ci.yaml").read_text())
     return workflow["jobs"]["ci-success"]
 
 

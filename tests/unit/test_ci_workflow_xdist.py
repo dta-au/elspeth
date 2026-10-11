@@ -16,14 +16,14 @@ import pytest
 import yaml
 
 from elspeth.testing.pytest_xdist_auto import pytest_cmdline_main
-from tests.unit.cicd.workflow_sources import PREPARED_WORKFLOWS, all_workflow_paths
+from tests.unit.cicd.workflow_sources import EXECUTABLE_WORKFLOWS, all_workflow_paths
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CI_WORKFLOW = PREPARED_WORKFLOWS / "ci.yaml"
-JUDGE_GATES_WORKFLOW = PREPARED_WORKFLOWS / "enforce-allowlist-judge-gates.yaml"
-CODEQL_WORKFLOW = PREPARED_WORKFLOWS / "codeql.yaml"
+CI_WORKFLOW = EXECUTABLE_WORKFLOWS / "ci.yaml"
+JUDGE_GATES_WORKFLOW = EXECUTABLE_WORKFLOWS / "enforce-allowlist-judge-gates.yaml"
+CODEQL_WORKFLOW = EXECUTABLE_WORKFLOWS / "codeql.yaml"
 CODEQL_CONFIG = REPO_ROOT / ".github" / "codeql" / "codeql-config.yml"
-PROOF_WORKFLOW = PREPARED_WORKFLOWS / "landscape-long-run.yml"
+PROOF_WORKFLOW = EXECUTABLE_WORKFLOWS / "landscape-long-run.yml"
 PROOF_WORKFLOW_CALL = "./.github/workflows/landscape-long-run.yml"
 LONG_RUN_CASES = {
     "no-escape": "test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists",
@@ -33,9 +33,9 @@ LONG_RUN_CASES = {
 PR_WORKFLOWS = (
     CI_WORKFLOW,
     CODEQL_WORKFLOW,
-    PREPARED_WORKFLOWS / "composer-redaction-gate.yml",
+    EXECUTABLE_WORKFLOWS / "composer-redaction-gate.yml",
     JUDGE_GATES_WORKFLOW,
-    PREPARED_WORKFLOWS / "enforce-telemetry-backfill-trailer.yaml",
+    EXECUTABLE_WORKFLOWS / "enforce-telemetry-backfill-trailer.yaml",
 )
 _SHELL_CONTROL_TOKENS = frozenset({"&&", "||", ";", "|"})
 
@@ -393,10 +393,10 @@ def test_every_workflow_job_uses_the_declared_self_hosted_pool() -> None:
 
 
 def test_fork_pull_requests_cannot_reach_checkout_jobs() -> None:
-    """Parked PR sources retain fork guards, independent of external admission."""
+    """Active PR sources retain fork guards, independent of external admission."""
     for workflow_path in (*PR_WORKFLOWS, PROOF_WORKFLOW):
-        assert workflow_path.parent == PREPARED_WORKFLOWS
-        assert not (REPO_ROOT / ".github/workflows" / workflow_path.name).exists()
+        assert workflow_path.parent == EXECUTABLE_WORKFLOWS
+        assert workflow_path.is_file()
         workflow = _workflow(workflow_path)
         for job_name, job in _executable_jobs(workflow):
             if not any(str(step.get("uses", "")).startswith("actions/checkout@") for step in job["steps"]):
@@ -404,7 +404,7 @@ def test_fork_pull_requests_cannot_reach_checkout_jobs() -> None:
             condition = str(job.get("if", ""))
             assert (
                 "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository" in condition
-            ), f"{workflow_path.name}:{job_name} lacks fork guard in prepared source"
+            ), f"{workflow_path.name}:{job_name} lacks fork guard in active source"
 
 
 @pytest.mark.parametrize("workflow_path,job_name", [(CI_WORKFLOW, "ci-success"), (JUDGE_GATES_WORKFLOW, "judge-gates-success")])

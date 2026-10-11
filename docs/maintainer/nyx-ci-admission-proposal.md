@@ -7,9 +7,13 @@ public, untrusted code off Nyx; separate approval for every trusted commit is no
 required. A new execution repository, admission controller or paid selected-
 workflow runner-group feature is not part of this policy.
 
-The [prepared workflows](../../config/cicd/prepared-nyx/) remain outside GitHub
-discovery. The contributor setting is confirmed, but source activation and native
-qualification remain separate operator steps.
+The six [CI workflows](../../.github/workflows/) are in GitHub's discovery
+directory. The contributor setting is confirmed, and the maintainer authorized
+activation, publication on `release/0.8.4` and native Nyx qualification on
+2026-10-11 UTC. The maintainer subsequently directed a green protected 0.8.4 PR
+merge and release-container publication through the established release path.
+Source publication, native qualification, merge, image publication and deployment
+remain distinct results. Deployment is outside this work.
 
 ## GitHub execution boundary
 
@@ -46,7 +50,7 @@ identity. Privileged events such as `pull_request_target`, issue comments or
 `workflow_run` must not fetch and execute outsider code or artifacts. Automatic
 CI-triggered image publication remains disabled.
 
-## Required checks and source preparation
+## Required checks and workflow sources
 
 Repository ruleset `12348893` is active on the default branch and requires:
 
@@ -63,16 +67,15 @@ against a malicious writer inside the accepted trust boundary. Missing checks on
 a new commit remain pending. Skipped placeholders and synthetic dispatch results
 are not substitutes for native successful PR checks.
 
-The six prepared sources produce none of those checks while parked. Source
-contracts inspect both active and prepared inventories and reject duplicates or
-accidental discovery. Normal PR execution will retain the actual PR merge SHA,
+Source contracts require all ten executable workflow identities and reject
+missing or duplicate sources. Normal PR execution retains the actual PR merge SHA,
 run ID and attempt; no evidence adapter or `GITHUB_SHA` override is needed.
 See [the proof guide](ci-landscape-proof.md) for the unchanged partition, proof and
 coverage obligations.
 
-## Remaining qualification and activation
+## Publication and remaining qualification
 
-1. Qualify the prepared sources, routing, supply-chain closure, required-success
+1. Qualify the sources, routing, supply-chain closure, required-success
    aggregation and complete ordinary/proof evidence graph. Source checks do not
    establish native runner, timing or artifact behavior.
 2. Read back the contributor setting and trusted access population before
@@ -81,9 +84,10 @@ coverage obligations.
    apps used selected repository scopes whose ELSPETH association was unverified.
    Organization policy and runner-group API reads were unavailable to the current
    credential. These limits are not proof of additional untrusted actors.
-3. Obtain explicit activation/publication direction before moving all six sources
-   into `.github/workflows` and updating the source-inventory contracts. Publish
-   only reviewed source; preserve the current ruleset and four-runner pool.
+3. Publish only the reviewed activation delta and source-inventory contracts on
+   the authorized release branch. Preserve the current ruleset and four-runner
+   pool. Merge only after the protected PR's required checks pass, then qualify
+   the exact main image commit before release-container publication. Do not deploy.
 4. Under an authorized native qualification run, establish that an outsider-
    edited PR workflow stays awaiting approval and acquires no Nyx runner. Leave
    it unapproved. Verify trusted same-repository PR execution, genuine required

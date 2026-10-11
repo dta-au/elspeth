@@ -11,13 +11,13 @@ from typing import Any
 
 import pytest
 import yaml
-from tests.unit.cicd.workflow_sources import PREPARED_WORKFLOWS, all_workflow_paths
+from tests.unit.cicd.workflow_sources import all_workflow_paths
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 BUILD_WORKFLOW = WORKFLOW_DIR / "build-push.yaml"
 MUTATION_WORKFLOW = WORKFLOW_DIR / "mutation-testing.yaml"
-PROOF_WORKFLOW = PREPARED_WORKFLOWS / "landscape-long-run.yml"
+PROOF_WORKFLOW = WORKFLOW_DIR / "landscape-long-run.yml"
 PROOF_WORKFLOW_CALL = "./.github/workflows/landscape-long-run.yml"
 LOCKS = (REPO_ROOT / "uv.lock", REPO_ROOT / "gateway" / "uv.lock")
 

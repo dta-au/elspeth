@@ -13,10 +13,9 @@ from typing import Any
 
 import pytest
 import yaml
-from tests.unit.cicd.workflow_sources import PREPARED_NAMES, PREPARED_WORKFLOWS, all_workflow_paths, workflow_paths
+from tests.unit.cicd.workflow_sources import WORKFLOW_NAMES, all_workflow_paths
 
 ROOT = Path(__file__).resolve().parents[3]
-WORKFLOWS = ROOT / ".github" / "workflows"
 LOCAL = ["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]
 LIVE = ["self-hosted", "Linux", "X64", "ephemeral", "aws-ecs", "postgresql-16-rds", "state-engine-live-provider"]
 HOSTED = ["ubuntu-24.04"]
@@ -24,14 +23,6 @@ HOSTED = ["ubuntu-24.04"]
 
 def _workflows() -> dict[str, dict[str, Any]]:
     return {path.name: yaml.safe_load(path.read_text()) for path in all_workflow_paths()}
-
-
-def _active_workflows() -> dict[str, dict[str, Any]]:
-    return {path.name: yaml.safe_load(path.read_text()) for path in workflow_paths(WORKFLOWS)}
-
-
-def _prepared_workflows() -> dict[str, dict[str, Any]]:
-    return {path.name: yaml.safe_load(path.read_text()) for path in workflow_paths(PREPARED_WORKFLOWS)}
 
 
 def _events(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -173,19 +164,35 @@ def _assert_routing(workflows: dict[str, dict[str, Any]]) -> None:
                 assert _runner(job, context) == expected, f"{filename}:{name}:{event}: runner isolation failed"
 
 
-def _assert_isolated_inventory(active: dict[str, dict[str, Any]], prepared: dict[str, dict[str, Any]]) -> None:
-    assert active, "executable workflow inventory is empty"
-    assert set(prepared) == PREPARED_NAMES, "prepared inventory differs from reviewed package"
-    assert set(active).isdisjoint(prepared), "duplicate workflow source identity"
-    required_contexts = {"CI Success", "CodeQL", "Check cohort-attribution trailers on PR commits", "redaction-gate"}
-    for filename, workflow in active.items():
-        assert not {"pull_request", "pull_request_target", "pull_request_review"} & set(_events(workflow)), (
-            f"{filename}: PR producer discovered before enforcement"
-        )
-        assert workflow.get("name") not in required_contexts, f"{filename}: required producer discovered before enforcement"
+def _assert_active_inventory(workflows: dict[str, dict[str, Any]]) -> None:
+    assert workflows, "executable workflow inventory is empty"
+    assert set(workflows) == WORKFLOW_NAMES, "active inventory differs from reviewed package"
+    expected_pr_sources = {
+        "ci.yaml",
+        "codeql.yaml",
+        "composer-redaction-gate.yml",
+        "enforce-allowlist-judge-gates.yaml",
+        "enforce-telemetry-backfill-trailer.yaml",
+    }
+    assert {filename for filename, workflow in workflows.items() if "pull_request" in _events(workflow)} == expected_pr_sources, (
+        "active PR producer inventory differs from reviewed package"
+    )
+    required_contexts = {
+        "CI Success": [("ci.yaml", "ci-success")],
+        "CodeQL": [("codeql.yaml", None)],
+        "Check cohort-attribution trailers on PR commits": [("enforce-telemetry-backfill-trailer.yaml", "check")],
+        "redaction-gate": [("composer-redaction-gate.yml", "redaction-gate")],
+    }
+    measured: dict[str, list[tuple[str, str | None]]] = {name: [] for name in required_contexts}
+    for filename, workflow in workflows.items():
+        workflow_name = workflow.get("name")
+        if workflow_name in required_contexts:
+            measured[workflow_name].append((filename, None))
         for name, job in workflow["jobs"].items():
-            assert "uses" not in job, f"{filename}:{name}: reusable caller discovered before enforcement"
-            assert job.get("name", name) not in required_contexts, f"{filename}:{name}: required producer discovered before enforcement"
+            display_name = job.get("name", name)
+            if display_name in required_contexts:
+                measured[display_name].append((filename, name))
+    assert measured == required_contexts, "required producer inventory differs from reviewed package"
 
 
 def _assert_manual_admission(workflows: dict[str, dict[str, Any]]) -> None:
@@ -210,61 +217,56 @@ def test_all_declared_event_paths_resolve_to_their_isolated_runner_pool() -> Non
 
 
 def test_all_manual_paths_reject_nondefault_or_unprotected_refs_before_runner_allocation() -> None:
-    _assert_manual_admission(_active_workflows())
+    _assert_manual_admission(_workflows())
 
 
-def test_prepared_ci_and_every_other_pr_path_are_inactive() -> None:
-    _assert_isolated_inventory(_active_workflows(), _prepared_workflows())
+def test_active_inventory_contains_every_reviewed_workflow_and_required_producer() -> None:
+    _assert_active_inventory(_workflows())
 
 
-@pytest.mark.parametrize("filename", sorted(PREPARED_NAMES))
-def test_every_prepared_source_refuses_accidental_discovery(filename: str) -> None:
-    active, prepared = _active_workflows(), _prepared_workflows()
-    _assert_isolated_inventory(active, prepared)
-    active[filename] = prepared.pop(filename)
-    with pytest.raises(AssertionError, match="prepared inventory"):
-        _assert_isolated_inventory(active, prepared)
+@pytest.mark.parametrize("filename", sorted(WORKFLOW_NAMES))
+def test_active_inventory_refuses_each_missing_workflow(filename: str) -> None:
+    workflows = _workflows()
+    _assert_active_inventory(workflows)
+    del workflows[filename]
+    with pytest.raises(AssertionError, match="active inventory"):
+        _assert_active_inventory(workflows)
 
 
-@pytest.mark.parametrize("mutation", ["renamed-pr", "caller", "required-success", "duplicate", "empty-active", "empty-prepared"])
-def test_inactive_inventory_refuses_new_producers_duplicates_and_empty_scans(mutation: str) -> None:
-    active, prepared = _active_workflows(), _prepared_workflows()
-    _assert_isolated_inventory(active, prepared)
-    if mutation == "renamed-pr":
-        active["other.yml"] = {"on": {"pull_request": {}}, "jobs": {"test": {"if": "${{ false }}"}}}
-    elif mutation == "caller":
-        active["other.yml"] = {"on": {"workflow_dispatch": {}}, "jobs": {"proof": {"uses": "./.github/workflows/landscape-long-run.yml"}}}
+@pytest.mark.parametrize("mutation", ["extra", "removed-pr-trigger", "required-success", "empty-active"])
+def test_active_inventory_refuses_unreviewed_producers_and_empty_scans(mutation: str) -> None:
+    workflows = _workflows()
+    _assert_active_inventory(workflows)
+    if mutation == "extra":
+        workflows["other.yml"] = {"on": {"pull_request": {}}, "jobs": {"test": {"if": "${{ false }}"}}}
+    elif mutation == "removed-pr-trigger":
+        del _events(workflows["ci.yaml"])["pull_request"]
     elif mutation == "required-success":
-        active["other.yml"] = {"on": {"workflow_dispatch": {}}, "jobs": {"fake": {"name": "CI Success", "if": "${{ false }}"}}}
-    elif mutation == "duplicate":
-        active["ci.yaml"] = prepared["ci.yaml"]
-    elif mutation == "empty-active":
-        active.clear()
+        workflows["pages.yaml"]["jobs"]["fake"] = {"name": "CI Success", "if": "${{ false }}"}
     else:
-        prepared.clear()
-    with pytest.raises(AssertionError, match=r"inventory|discovered|duplicate"):
-        _assert_isolated_inventory(active, prepared)
+        workflows.clear()
+    with pytest.raises(AssertionError, match="inventory"):
+        _assert_active_inventory(workflows)
 
 
 @pytest.mark.parametrize("mutation", ["duplicate", "missing", "extra", "empty-active"])
-def test_source_path_union_refuses_hidden_duplicates_or_incomplete_inventories(tmp_path: Path, mutation: str) -> None:
-    active, prepared = tmp_path / "active", tmp_path / "prepared"
+def test_active_source_paths_refuse_duplicates_or_incomplete_inventories(tmp_path: Path, mutation: str) -> None:
+    active = tmp_path / "active"
     active.mkdir()
-    prepared.mkdir()
-    (active / "manual.yml").touch()
-    for name in PREPARED_NAMES:
-        (prepared / name).touch()
-    assert set(all_workflow_paths(active, prepared)) == {active / "manual.yml", *(prepared / name for name in PREPARED_NAMES)}
+    for name in WORKFLOW_NAMES:
+        (active / name).touch()
+    assert set(all_workflow_paths(active)) == {active / name for name in WORKFLOW_NAMES}
     if mutation == "duplicate":
-        (active / "ci.yaml").touch()
+        (active / "ci.yml").touch()
     elif mutation == "missing":
-        (prepared / "ci.yaml").unlink()
+        (active / "ci.yaml").unlink()
     elif mutation == "extra":
-        (prepared / "unreviewed.yml").touch()
+        (active / "unreviewed.yml").touch()
     else:
-        (active / "manual.yml").unlink()
+        for path in active.iterdir():
+            path.unlink()
     with pytest.raises(AssertionError, match=r"inventory|duplicate"):
-        all_workflow_paths(active, prepared)
+        all_workflow_paths(active)
 
 
 @pytest.mark.parametrize("mutation", ["checkout", "aggregate", "reversed", "new-trigger", "reusable"])
@@ -302,7 +304,7 @@ def test_manual_admission_detects_removed_guard_in_every_workflow(filename: str)
 def test_build_publication_workflow_run_retains_trusted_push_provenance() -> None:
     jobs = _workflows()["build-push.yaml"]["jobs"]
     context = _context("workflow_run")
-    assert not _admitted(jobs, "build-push", context), "automatic publication stays inactive with CI"
+    assert not _admitted(jobs, "build-push", context), "automatic publication stays disabled during CI qualification"
     for field, value in (
         ("event", "pull_request"),
         ("conclusion", "failure"),

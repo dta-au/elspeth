@@ -4,11 +4,11 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Preparing 0.8.4 (Unreleased)
+## 0.8.4 - Unreleased (Security hardening and Nyx CI candidate)
 
 These changes are integrated into the local `release/0.8.4` source branch.
-Package metadata remains 0.8.3; no 0.8.4 tag, published image, deployment or
-production-readiness claim is established here.
+Package metadata identifies the 0.8.4 candidate; release qualification, image
+publication and deployment remain pending.
 
 - **Authentication revocation follows the login session across refresh and
   derived credentials.** Logout revokes the durable session family for local
@@ -36,15 +36,15 @@ production-readiness claim is established here.
   that echo protected image content are refused before audit or telemetry
   recording. Staging browser tooling also validates credential destinations
   and restricts permissions on persisted bearer state.
-- **Test organization and Nyx CI preparation advance.** Large test modules are
-  split by responsibility. Prepared CI sources plan eight duration-balanced
+- **Test organization and Nyx CI use smaller groups.** Large test modules are
+  split by responsibility. CI sources use eight duration-balanced
   ordinary shards and three separate long-proof packets per Python interpreter,
   with complete collection and retry evidence requirements and existing
-  coverage floors. The six prepared workflows remain outside GitHub discovery
-  in `config/cicd/prepared-nyx/`; they produce no required checks while parked.
-  Activation requires external enforcement of maintainer admission for exact
-  PR commits and native qualification. Workflow YAML alone does not protect
-  persistent runners. Native Actions execution, covered artifact aggregation
+  coverage floors. The six workflows are in `.github/workflows/` and route to
+  Nyx. GitHub requires approval for all external contributors; outsider runs stay
+  unapproved, and the existing workgroup and repository writer are explicitly
+  trusted. Workflow YAML alone does not protect persistent runners.
+  Native Actions execution, covered artifact aggregation
   and coverage floors remain unqualified. Operator signature verification,
   image publication and deployment are separate release steps. See the
   [CI proof guide](docs/maintainer/ci-landscape-proof.md).

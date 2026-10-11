@@ -23,7 +23,7 @@ collaborators from external-contributor approval, including read-only organizati
 members. Reconcile that trusted population and automation authority after access
 changes; do not infer execution denial from read-only repository permission.
 
-The prepared ELSPETH workflows reject fork checkouts, but those conditions are
+The ELSPETH workflows reject fork checkouts, but those conditions are
 defense in depth: contributor-edited YAML can remove them. The GitHub approval
 policy and trusted access population are the admission boundary. Do not approve
 outsider runs on the assumption that a YAML guard makes them harmless. See the

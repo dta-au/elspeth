@@ -1829,7 +1829,7 @@ def test_workflow_requires_all_shards_and_combined_unchanged_floors() -> None:
 
 
 def _activation_workflow_jobs() -> dict[str, Any]:
-    return yaml.safe_load((REPO_ROOT / "config/cicd/prepared-nyx/ci.yaml").read_text(encoding="utf-8"))["jobs"]
+    return yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8"))["jobs"]
 
 
 def _activation_step(job: dict[str, Any], name: str) -> dict[str, Any]:

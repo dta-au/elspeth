@@ -57,10 +57,9 @@ The root suite is scoped to `testpaths = ["tests"]`, so it does **not** cover
 `pyproject.toml` and test suite; if you change it, run its tests from
 `gateway/` as well.
 
-Prepared pull-request workflows and ordinary push, scheduled, publication,
+Pull-request workflows and ordinary push, scheduled, publication,
 website and mutation-testing jobs use the four Nyx runners with labels
-`self-hosted, Linux, X64, nyx-ci, trusted`. The prepared PR workflows remain
-inactive until separately authorized activation. Manual live-provider acceptance
+`self-hosted, Linux, X64, nyx-ci, trusted`. Manual live-provider acceptance
 retains its specialized self-hosted cloud runners because it proves ECS
 execution and managed-identity behavior. Manual workflows admit only the
 protected default branch before allocating a runner.
@@ -74,7 +73,7 @@ collaborators from fork approval, including organization members with read-only
 access. Review that trusted population when membership, access or automation
 changes. Public users can still submit fork PRs.
 
-The prepared workflows also reject fork checkouts and fail their aggregate
+The workflows also reject fork checkouts and fail their aggregate
 statuses, but contributor-edited YAML can remove those conditions or select
 different runners. These conditions, tests and labels are defense in depth;
 GitHub's external-contributor approval policy and the explicitly trusted access
@@ -87,15 +86,14 @@ Report a runner or prerequisite failure to the maintainer with the failing
 Actions job URL. Manual live-provider acceptance still needs its GitHub
 environment credentials and remote service access.
 
-### Prepared Nyx workflows
+### Nyx workflow qualification
 
-The PR CI sources are parked in `config/cicd/prepared-nyx/`, outside GitHub's
-workflow discovery directory, pending separately authorized activation and
-runtime qualification under the trusted-workgroup policy. They produce no remote
-required checks while
-parked. Do not substitute skipped jobs or relax required checks to accommodate
-this preparation. Source-contract tests inspect both executable and parked
-inventories, and linting the templates requires a disposable deployment mirror.
+The six Nyx CI sources are in `.github/workflows/` under the trusted-workgroup
+policy. Source-contract tests require the complete executable inventory and
+reject duplicates or missing workflows. Native qualification must establish
+runner placement, the proof and coverage artifacts, and genuine successful PR
+checks. Do not substitute skipped jobs or relax required checks. Automatic
+CI-triggered image publication remains disabled during qualification.
 See [the proof guide](docs/maintainer/ci-landscape-proof.md) for the evidence graph
 and activation prerequisites.
 

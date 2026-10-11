@@ -1,7 +1,7 @@
 """Structural assertions for the composer redaction-gate workflow.
 
 Closes rev-2 BLOCKER_B / rev-1 B4 / W9 / M10. The workflow itself lives
-at ``config/cicd/prepared-nyx/composer-redaction-gate.yml`` and its logic is
+at ``.github/workflows/composer-redaction-gate.yml`` and its logic is
 extracted into ``scripts/cicd/check_redaction_direction.py`` and
 ``scripts/cicd/assert_redaction_label.py``. These tests assert the
 workflow has the required paths, the direction output step, separate
@@ -22,7 +22,7 @@ from pathlib import Path
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-WORKFLOW_PATH = REPO_ROOT / "config/cicd/prepared-nyx/composer-redaction-gate.yml"
+WORKFLOW_PATH = REPO_ROOT / ".github/workflows/composer-redaction-gate.yml"
 
 # NOTE: ``src/elspeth/web/composer/tools/`` is the package directory, not the
 # legacy ``tools.py`` monolith (which no longer exists). The diff step passes

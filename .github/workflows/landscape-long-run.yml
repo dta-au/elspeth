@@ -1,5 +1,5 @@
-# Prepared three-case producer; caller and callee are outside workflow discovery.
-# Trusted-workgroup access and all-external fork approval precede activation.
+# Three-case producer called by the required CI workflow.
+# Nyx execution uses trusted-workgroup access and all-external fork approval.
 name: Landscape long-run proofs
 
 on:
