@@ -4,14 +4,62 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Pending 0.8.4 security integration
+## Preparing 0.8.4 (Unreleased)
 
-The pending 0.8.4 integration requires Session epoch 73 for durable
-authentication session-family revocation. Landscape epoch 49 remains unchanged.
-Stop the service, archive or export needed evidence, and recreate older session
-databases and their sidecars. Local-auth installations must also recreate
-incompatible auth.db state and reprovision accounts before restart. A Landscape
-database already at epoch 49 remains usable.
+These changes are integrated into the local `release/0.8.4` source branch.
+Package metadata remains 0.8.3; no 0.8.4 tag, published image, deployment or
+production-readiness claim is established here.
+
+- **Authentication revocation follows the login session across refresh and
+  derived credentials.** Logout revokes the durable session family for local
+  and SSO authentication. Local password resets invalidate credentials issued
+  against the previous password generation. Run WebSocket tickets and open
+  connections enforce their originating session's revocation and expiry.
+- **The PostgreSQL Compose bundle separates database privileges.** Cluster
+  administration, session and Landscape schema ownership, and the two runtime
+  roles use distinct credentials. Runtime connections do not own the schema;
+  bootstrap checks reject incompatible privilege grants. Existing deployments
+  must follow the updated [Docker setup](docs/guides/docker.md).
+- **Raw Landscape MCP SQL requires a restricted database connection and bounded
+  execution.** PostgreSQL callers need a dedicated audit-reader login; runtime,
+  schema-owner and administrator connections are refused. On Linux, disposable
+  query workers enforce request, complete-result, memory and time budgets,
+  including cancellation and cleanup. Unsupported operating systems refuse
+  raw MCP SQL. These client-process limits do not bound a remote PostgreSQL
+  server's resources. See the
+  [MCP analysis guide](docs/guides/landscape-mcp-analysis.md) for supported SQL
+  and provisioning requirements.
+- **Web input and provider responses have earlier size and audit checks.**
+  HTTP request limits account for received bytes even without a trustworthy
+  Content-Length. OpenRouter and gateway responses have encoded and decoded
+  body limits. Image-bearing requests use an audit projection, and responses
+  that echo protected image content are refused before audit or telemetry
+  recording. Staging browser tooling also validates credential destinations
+  and restricts permissions on persisted bearer state.
+- **Test organization and Nyx CI preparation advance.** Large test modules are
+  split by responsibility. Prepared CI sources plan eight duration-balanced
+  ordinary shards and three separate long-proof packets per Python interpreter,
+  with complete collection and retry evidence requirements and existing
+  coverage floors. The six prepared workflows remain outside GitHub discovery
+  in `config/cicd/prepared-nyx/`; they produce no required checks while parked.
+  Activation requires external enforcement of maintainer admission for exact
+  PR commits and native qualification. Workflow YAML alone does not protect
+  persistent runners. Native Actions execution, covered artifact aggregation
+  and coverage floors remain unqualified. Operator signature verification,
+  image publication and deployment are separate release steps. See the
+  [CI proof guide](docs/maintainer/ci-landscape-proof.md).
+
+**Upgrade notes.** Session epoch 73 adds durable authentication session-family
+revocation; Landscape epoch 49 remains unchanged. Stop the service, archive or
+export needed evidence, and recreate obsolete session databases and their
+SQLite sidecars or PostgreSQL schema. Local-auth installations must also
+recreate incompatible auth.db state and its sidecars, then
+reprovision accounts before restart.
+A Landscape database already at epoch 49 remains usable. Installations still
+on 0.8.0 must recreate both stale stores in the same service-stop window.
+There is no in-place migration. Follow the current
+[cutover runbook](docs/runbooks/staging-session-db-recreation.md) and use only a
+separately verified published image tag or digest.
 
 ## 0.8.3 - Unreleased (Archive recovery and Composer HTTPS progress candidate)
 
@@ -30,7 +78,7 @@ database already at epoch 49 remains usable.
   cost and repair limits. Standalone mock-upstream and conformance tests
   passed locally; no deployed gateway image or genuine-model replay is
   established by this source candidate.
-- **The proposed Web Composer transport delivers live progress over authenticated
+- **The merged Web Composer transport delivers live progress over authenticated
   HTTPS.** An operation-scoped server-sent event subscription follows the same
   durable operation and progress authority as the authenticated status GET.
   The browser receives bounded, redacted status and progress, then retrieves
@@ -38,14 +86,14 @@ database already at epoch 49 remains usable.
   against that operation. Live role, identity, ownership and token checks,
   disconnect cleanup and bounded readers protect the stream. The provider and
   gateway still return complete answers: generated answer-token streaming and
-  interim answer text are outside this release candidate. These changes are
-  held on the streaming branch and remain subject to final integration and
-  acceptance, so this entry does not claim a landed release.
+  interim answer text are outside this release candidate. The implementation
+  is merged into main and the local release branch; source integration does
+  not establish a published release or live deployment.
 - **Durable Composer failure paths retain the original outcome and required-work
-  custody.** The held candidate reconciles cancellation, worker failure,
+  custody.** The merged implementation reconciles cancellation, worker failure,
   pending review, terminal publication and physical cleanup against their
-  committed authorities. These changes are likewise awaiting final frozen
-  default, serial PostgreSQL, TLS and browser acceptance gates.
+  committed authorities. Release qualification remains separate from source
+  integration.
 - **The first-run tutorial keeps its Build and Run chrome out of the Composer
   workspace.** Each step's title, one instruction that says what to do next,
   and its actions (Continue to Run; Run, Retry or Continue) sit in a header
@@ -86,10 +134,8 @@ same service-stop window, as described in the
 [cutover runbook](docs/runbooks/staging-session-db-recreation.md). This is an
 unreleased source candidate. No 0.8.3 tag, image digest, registry publication,
 live cloud qualification or production readiness is established here. The
-streaming work retains all 102 original obligations and four supplemental
-collections; two original reports remain unavailable. Final default Python,
-PostgreSQL, real HTTPS and browser acceptance are still required before a
-release claim. Use only a separately verified published image tag or digest.
+streaming implementation is now merged; these notes do not certify its release
+gates. Use only a separately verified published image tag or digest.
 
 ## 0.8.2 - Unreleased (Bounded validation and release-check hardening)
 

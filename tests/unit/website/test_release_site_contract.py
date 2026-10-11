@@ -58,13 +58,13 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     release_080 = changelog.split("\n## 0.8.0 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_071 = changelog.split("\n## 0.7.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
 
-    pending_heading = "\n## Pending 0.8.4 security integration\n"
-    assert changelog.count(pending_heading) == 1
-    pending_integration = changelog.split(pending_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
-    assert f"Session epoch {SESSION_SCHEMA_EPOCH}" in pending_integration
-    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in pending_integration
-    assert "recreate" in pending_integration and "auth.db" in pending_integration
-    assert "reprovision accounts before restart" in pending_integration
+    candidate_heading = "\n## Preparing 0.8.4 (Unreleased)\n"
+    assert changelog.count(candidate_heading) == 1
+    candidate_release = changelog.split(candidate_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    assert f"Session epoch {SESSION_SCHEMA_EPOCH}" in candidate_release
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in candidate_release
+    assert "recreate" in candidate_release and "auth.db" in candidate_release
+    assert "reprovision accounts before restart" in candidate_release
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_release
     assert "Session epoch 72 adds durable Composer jobs" in current_release
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in current_release
