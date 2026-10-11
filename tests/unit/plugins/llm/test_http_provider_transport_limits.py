@@ -152,18 +152,25 @@ def test_image_identity_changes_both_transport_and_semantic_request_hashes(harne
 
 
 @pytest.mark.parametrize("status", [200, 503])
-@pytest.mark.parametrize("echo_form", ["content", "metadata", "escaped_slashes", "unicode", "header", "late_duplicate"])
+@pytest.mark.parametrize(
+    "echo_form",
+    ["content", "metadata", "escaped_slashes", "unicode", "header", "late_duplicate", "late_duplicate_utf16", "late_duplicate_utf32"],
+)
+@pytest.mark.parametrize("separator", ["", " \n\t"])
 @respx.mock
-def test_submitted_image_echo_is_rejected_before_any_audit_or_telemetry_egress(harness: _Harness, status: int, echo_form: str) -> None:
+def test_submitted_image_echo_is_rejected_before_any_audit_or_telemetry_egress(
+    harness: _Harness, status: int, echo_form: str, separator: str
+) -> None:
     image = ImagePart.from_bytes(format="png", data=b"\x89PNG\r\n\x1a\n" + b"\xff" * 8, blob_ref=None)
     encoded = base64.b64encode(image.data).decode("ascii")
-    data_url = f"data:image/png;base64,{encoded}"
+    echo = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
+    data_url = f"data:image/png;base64,{echo}"
     payload = _response().json()
     headers = {"content-type": "application/json", "X-ELSPETH-LLM-Gateway-Contract": "1"}
     if echo_form == "content":
         payload["choices"][0]["message"]["content"] = data_url
     elif echo_form == "header":
-        headers["X-Provider-Debug"] = encoded
+        headers["X-Provider-Debug"] = echo
     else:
         payload["diagnostic"] = {"submitted_image": data_url}
     body = json.dumps(payload)
@@ -171,14 +178,17 @@ def test_submitted_image_echo_is_rejected_before_any_audit_or_telemetry_egress(h
         assert "/" in encoded
         body = body.replace("/", "\\/")
     elif echo_form == "unicode":
-        body = body.replace(encoded, "".join(f"\\u{ord(char):04x}" for char in encoded))
-    elif echo_form == "late_duplicate":
+        body = body.replace(json.dumps(echo)[1:-1], "".join(f"\\u{ord(char):04x}" for char in echo))
+    elif echo_form.startswith("late_duplicate"):
         # Sensitive headers suppress exact transport retention. The parsed last
         # duplicate key and first 10KB diagnostic cannot stand in for the wire.
-        headers["set-cookie"] = "session=private"
-        escaped = "".join(f"\\u{ord(char):04x}" for char in encoded)
+        if echo_form == "late_duplicate":
+            headers["set-cookie"] = "session=private"
+        escaped = "".join(f"\\u{ord(char):04x}" for char in echo)
         body = '{"padding":"' + "x" * 11000 + '","echo":"' + escaped + '","echo":"safe"}'
-    respx.post(harness.url).mock(return_value=httpx.Response(status, headers=headers, content=body.encode()))
+    encoding = {"late_duplicate_utf16": "utf-16", "late_duplicate_utf32": "utf-32"}.get(echo_form, "utf-8")
+    headers["content-type"] = f"application/json; charset={encoding}"
+    respx.post(harness.url).mock(return_value=httpx.Response(status, headers=headers, content=body.encode(encoding)))
     with pytest.raises(LLMClientError) as caught:
         _query(harness, [ChatMessage(role="user", content=(image,))])
     assert not caught.value.retryable
@@ -193,6 +203,8 @@ def test_submitted_image_echo_is_rejected_before_any_audit_or_telemetry_egress(h
                 assert encoded.encode() not in retained
                 assert data_url.encode() not in retained
                 assert b"body_b64" not in retained
+                assert b"submitted_image" not in retained
+                assert b"X-Provider-Debug" not in retained
     for event in harness.events:
         if isinstance(event, ExternalCallCompleted):
             for payload in (event.request_payload, event.response_payload):
@@ -200,6 +212,28 @@ def test_submitted_image_echo_is_rejected_before_any_audit_or_telemetry_egress(h
                     retained = json.dumps(payload.to_dict())
                     assert encoded not in retained
                     assert data_url not in retained
+
+
+@pytest.mark.parametrize("separator", ["", " "])
+@respx.mock
+def test_protocol_error_image_echo_is_refused_before_error_audit_and_tracing(harness: _Harness, separator: str) -> None:
+    image = ImagePart.from_bytes(format="png", data=b"\x89PNG\r\n\x1a\nprivate-image", blob_ref=None)
+    encoded = base64.b64encode(image.data).decode()
+    echo = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
+    respx.post(harness.url).mock(side_effect=httpx.RemoteProtocolError("illegal status line: " + echo))
+    with pytest.raises(LLMClientError) as caught:
+        _query(harness, [ChatMessage(role="user", content=(image,))])
+    assert not caught.value.retryable
+    assert echo not in str(caught.value)
+    calls = harness.setup.factory.execution.get_operation_calls(harness.parent.operation_id)
+    assert {call.call_type for call in calls} == {CallType.HTTP, CallType.LLM}
+    for call in calls:
+        assert call.status is CallStatus.ERROR
+        assert call.error_json is not None
+        assert echo not in json.loads(call.error_json)["message"]
+        if call.response_ref is not None:
+            assert encoded.encode() not in harness.store.retrieve(call.response_ref)
+    assert echo not in str(harness.events)
 
 
 def test_provider_sets_explicit_decoded_and_encoded_response_limits(harness: _Harness) -> None:
@@ -211,13 +245,17 @@ def test_provider_sets_explicit_decoded_and_encoded_response_limits(harness: _Ha
         harness.provider._release_http_client(harness.parent.cache_key)
 
 
+@pytest.mark.parametrize("separator", ["", " "])
 @respx.mock
-def test_response_limit_error_cannot_retain_image_echo_in_headers(harness: _Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_response_limit_error_cannot_retain_image_echo_in_headers(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, separator: str
+) -> None:
     monkeypatch.setattr(openrouter, "_MAX_RESPONSE_BODY_BYTES", 1024)
     monkeypatch.setattr(gateway, "_MAX_RESPONSE_BODY_BYTES", 1024)
     image = ImagePart.from_bytes(format="png", data=b"\x89PNG\r\n\x1a\nprivate-image", blob_ref=None)
     encoded = base64.b64encode(image.data).decode()
-    respx.post(harness.url).mock(return_value=httpx.Response(503, headers={"x-debug": encoded}, content=b"x" * 1025))
+    echo = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
+    respx.post(harness.url).mock(return_value=httpx.Response(503, headers={"x-debug": echo}, content=b"x" * 1025))
     with pytest.raises(LLMClientError) as caught:
         _query(harness, [ChatMessage(role="user", content=(image,))])
     assert not caught.value.retryable
@@ -226,7 +264,9 @@ def test_response_limit_error_cannot_retain_image_echo_in_headers(harness: _Harn
     for call in calls:
         assert call.status is CallStatus.ERROR
         if call.response_ref is not None:
-            assert encoded.encode() not in harness.store.retrieve(call.response_ref)
+            retained = harness.store.retrieve(call.response_ref)
+            assert encoded.encode() not in retained
+            assert b"x-debug" not in retained
     assert encoded not in str(harness.events)
 
 
@@ -389,33 +429,45 @@ def test_runtime_preflight_uses_bounded_transport(harness: _Harness, monkeypatch
     assert all(call.status is CallStatus.ERROR for call in calls)
 
 
-@pytest.mark.parametrize("mode", [RunMode.REPLAY, RunMode.VERIFY])
+@pytest.mark.parametrize(
+    ("mode", "echo_source"),
+    [
+        (RunMode.REPLAY, "wire"),
+        (RunMode.VERIFY, "wire"),
+        (RunMode.REPLAY, "archived_body"),
+        (RunMode.REPLAY, "archived_header"),
+        (RunMode.REPLAY, "archived_error"),
+    ],
+)
 @pytest.mark.parametrize("echo", [False, True])
+@pytest.mark.parametrize("separator", ["", "\n\t"])
 @respx.mock
-def test_http_audit_projection_also_binds_replay_verify_and_telemetry(mode: RunMode, echo: bool) -> None:
+def test_http_audit_projection_also_binds_replay_verify_and_telemetry(mode: RunMode, echo: bool, separator: str, echo_source: str) -> None:
     image = ImagePart.from_bytes(format="png", data=b"\x89PNG\r\n\x1a\nprivate-image-marker", blob_ref=None)
     messages = [ChatMessage(role="user", content=(image,))]
     wire = {"messages": wire_messages(messages)}
     audit = {"messages": audit_messages(messages)}
-    response_body = base64.b64encode(image.data).decode() if echo else "ok"
+    encoded = base64.b64encode(image.data).decode()
+    response_body = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4)) if echo else "ok"
+    wire_body = response_body if echo_source == "wire" else "ok"
     session = Mock(spec=CallModeSession)
     session.mode = mode
     session.admit_verify_call.return_value = "source-call"
     session.replay_call.return_value = ReplayCallEvidence(
         source_call_id="source-call",
-        status=CallStatus.SUCCESS,
+        status=CallStatus.ERROR if echo_source == "archived_error" else CallStatus.SUCCESS,
         response_data={
-            "status_code": 200,
-            "headers": {},
-            "body_size": len(response_body),
-            "body": response_body,
+            "status_code": 503 if echo_source == "archived_error" else 200,
+            "headers": {"x-debug": response_body} if echo_source == "archived_header" else {},
+            "body_size": len(wire_body),
+            "body": response_body if echo_source in {"wire", "archived_body"} else "ok",
             "transport": {
-                "body_b64": base64.b64encode(response_body.encode()).decode(),
+                "body_b64": base64.b64encode(wire_body.encode()).decode(),
                 "headers": [],
                 "request_url": "https://example.com/raw",
             },
         },
-        error_data=None,
+        error_data={"type": "HTTPError", "message": response_body, "status_code": 503} if echo_source == "archived_error" else None,
         latency_ms=0.1,
     )
     recorder = Mock(spec=CallRecorder)

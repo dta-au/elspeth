@@ -970,7 +970,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # Release 0.8.2: only eight engine-owned plugin_version audit values moved.
 # Reverting those values reproduces the previous manifest byte-for-byte;
 # frozen semantic oracles, behavior, and the resume history pin are unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "431970183e01858cd0979f2ec29d0cde5090d96532a38c0c1853fc47bd98e22c"
+EXPECTED_CASE_REGISTRY_SHA256 = "2adc9baa61ce4f054c1735803f90b2c403fe3423ee860144e932a5a7cd8082ce"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
