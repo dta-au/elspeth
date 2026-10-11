@@ -115,7 +115,7 @@ jobs:
             --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" \
             --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
       - name: Upload closed evidence envelope
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: state-engine-live-${{ steps.lane.outputs.lane_id }}
           path: ${{ runner.temp }}/state-engine-evidence
@@ -226,7 +226,7 @@ jobs:
             --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" \
             --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
       - name: Upload closed evidence envelope
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: state-engine-live-${{ steps.lane.outputs.lane_id }}
           path: ${{ runner.temp }}/state-engine-evidence
@@ -299,7 +299,7 @@ jobs:
           pytest_status="$?"
           PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py seal --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json --workflow .github/workflows/state-engine-live-provider.yml --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
       - name: Upload closed evidence envelope
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with: {name: "state-engine-live-${{ steps.lane.outputs.lane_id }}", path: "${{ runner.temp }}/state-engine-evidence", if-no-files-found: error, retention-days: 7}
 
   live_chroma:
@@ -366,7 +366,7 @@ jobs:
           pytest_status="$?"
           PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py seal --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json --workflow .github/workflows/state-engine-live-provider.yml --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
       - name: Upload closed evidence envelope
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with: {name: "state-engine-live-${{ steps.lane.outputs.lane_id }}", path: "${{ runner.temp }}/state-engine-evidence", if-no-files-found: error, retention-days: 7}
 
   live_provider:
@@ -458,5 +458,5 @@ jobs:
           pytest_status="$?"
           PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py seal --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json --workflow .github/workflows/state-engine-live-provider.yml --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
       - name: Upload closed evidence envelope
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with: {name: "state-engine-live-${{ steps.lane.outputs.lane_id }}", path: "${{ runner.temp }}/state-engine-evidence", if-no-files-found: error, retention-days: 7}
