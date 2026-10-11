@@ -1,8 +1,9 @@
 # CI Pipeline - Lint and Test
 #
-# Runs on every push and PR. Fast feedback loop with:
+# Nyx execution uses trusted-workgroup access and all-external fork approval.
+# Push and PR feedback loop:
 #   - Linting (ruff, mypy) - ~30 seconds
-#   - Testing (four deterministic pytest shards per Python version)
+#   - Testing (eight duration-balanced pytest shards per Python version)
 #   - Bug-hiding pattern detection
 #   - Contract enforcement (Settings→Runtime alignment, type boundaries)
 #
@@ -36,9 +37,9 @@ env:
 permissions:
   contents: read
 
-# Every job uses the trusted local pool. Code-executing jobs admit only
-# same-repository PRs and non-PR events. CI Success rejects fork PRs without
-# checking out or executing their repository code.
+# GitHub contributor permissions and fork approval enforce the accepted trust
+# boundary; repository-edited YAML cannot enforce it. Outsider runs stay
+# unapproved. Native qualification must verify the complete proof/coverage graph.
 #
 # Self-hosted container jobs can leave root-owned venv/cache artifacts in the
 # default workspace. Every checkout below uses a per-run, per-job path so stale
@@ -364,7 +365,7 @@ jobs:
             --root .
 
   # ===========================================================================
-  # Stage 3: Test (four independent processes per interpreter)
+  # Stage 3: Test (eight duration-balanced shards per interpreter)
   # ===========================================================================
   test:
     name: Test (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
@@ -386,9 +387,10 @@ jobs:
     # Run tests even if static analysis fails, so both results are visible.
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         python-version: ["3.12", "3.13"]
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
         # Coverage runs on Python 3.13 only because 3.13 is the release
         # interpreter for this branch. The Python 3.12 lane remains
         # dependency-compatibility signal and intentionally skips coverage so
@@ -532,7 +534,8 @@ jobs:
           # Partition only after pytest's normal marker selection. Independent
           # jobs bound each worker's accumulated state and preserve every ID.
           uv run python -m pytest tests/ -p scripts.ci_test_shards \
-            --ci-shard-count=4 --ci-shard-index=${{ matrix.shard }} \
+            --ci-partition=ordinary \
+            --ci-shard-count=8 --ci-shard-index=${{ matrix.shard }} \
             --ci-shard-report=shard-manifest.json \
             --cov=src/elspeth \
             --cov-report= \
@@ -549,7 +552,8 @@ jobs:
           # per-lane worker cap as the coverage lane, and the same output
           # flags and JUnit report.
           uv run python -m pytest tests/ -p scripts.ci_test_shards \
-            --ci-shard-count=4 --ci-shard-index=${{ matrix.shard }} \
+            --ci-partition=ordinary \
+            --ci-shard-count=8 --ci-shard-index=${{ matrix.shard }} \
             --ci-shard-report=shard-manifest.json \
             -n "$PYTEST_WORKERS" \
             -q -rfE \
@@ -559,35 +563,44 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: pytest-junit-${{ matrix.python-version }}-${{ matrix.shard }}
+          name: pytest-junit-${{ matrix.python-version }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: ${{ env.CI_CHECKOUT_PATH }}/pytest-junit.xml
           retention-days: 7
 
       - name: Upload shard coverage and selection evidence
-        if: matrix.coverage && always()
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: coverage-shard-${{ matrix.python-version }}-${{ matrix.shard }}
+          name: ordinary-shard-${{ matrix.python-version }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             ${{ env.CI_CHECKOUT_PATH }}/coverage-data
             ${{ env.CI_CHECKOUT_PATH }}/shard-manifest.json
           if-no-files-found: error
           retention-days: 7
 
+  landscape-proof:
+    name: Landscape long-run proofs
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/landscape-long-run.yml
+
   coverage:
     name: Combined coverage
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
-    needs: [test]
+    needs: [test, landscape-proof]
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-coverage
     steps:
-      - name: Require every test shard to pass
+      - name: Require every test shard and exhaustive proof to pass
         run: |
           if [ "${{ needs.test.result }}" != "success" ]; then
             echo "Test shards failed or did not complete"
+            exit 1
+          fi
+          if [ "${{ needs.landscape-proof.result }}" != "success" ]; then
+            echo "Exhaustive Landscape proof failed or did not complete"
             exit 1
           fi
 
@@ -616,20 +629,42 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: uv sync --frozen --all-extras
 
-      - name: Download Python 3.13 coverage shards
+      - name: Download Python 3.12 ordinary evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          pattern: coverage-shard-3.13-*
-          path: ${{ env.CI_CHECKOUT_PATH }}/coverage-shards
+          pattern: ordinary-shard-3.12-*-attempt-*
+          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.12
 
-      - name: Combine complete coverage evidence
+      - name: Download Python 3.12 proof evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: landscape-proof-*-3.12-attempt-*
+          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.12
+
+      - name: Download Python 3.13 ordinary evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: ordinary-shard-3.13-*-attempt-*
+          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.13
+
+      - name: Download Python 3.13 proof evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: landscape-proof-*-3.13-attempt-*
+          path: ${{ env.CI_CHECKOUT_PATH }}/proof-evidence/3.13
+
+      - name: Validate Python 3.12 ordinary and proof selection
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: uv run python scripts/ci_test_shards.py --artifact-dir coverage-shards --shard-count 4
+        run: uv run python scripts/ci_test_shards.py --artifact-dir proof-evidence/3.12 --shard-count 8 --partitioned --python-version 3.12
+
+      - name: Validate Python 3.13 selection and combine coverage
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: uv run python scripts/ci_test_shards.py --artifact-dir proof-evidence/3.13 --shard-count 8 --partitioned --python-version 3.13
 
       - name: Enforce overall and audit-critical coverage floors
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
-          # Floors apply to the union of all four successful shards. Checking
+          # Floors apply to eight ordinary shards plus all three case proofs. Checking
           # every floor together makes all coverage deficits visible per run.
           status=0
           uv run coverage report --fail-under=85 || status=1
@@ -644,7 +679,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: coverage-report
+          name: coverage-report-attempt-${{ github.run_attempt }}
           path: ${{ env.CI_CHECKOUT_PATH }}/coverage.xml
           retention-days: 7
 
@@ -1503,6 +1538,7 @@ jobs:
     needs:
       - static-analysis
       - test
+      - landscape-proof
       - coverage
       - testcontainer
       - host-runner-unit
@@ -1531,6 +1567,10 @@ jobs:
           fi
           if [[ "${{ needs.test.result }}" != "success" ]]; then
             echo "Test job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.landscape-proof.result }}" != "success" ]]; then
+            echo "Exhaustive Landscape proof job failed"
             exit 1
           fi
           if [[ "${{ needs.coverage.result }}" != "success" ]]; then

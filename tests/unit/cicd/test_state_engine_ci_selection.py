@@ -20,7 +20,7 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+CI_WORKFLOW = REPO_ROOT / ".github/workflows/ci.yaml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 V2_CATALOG = "docs/architecture/state_engine/proof-catalog/v2/catalog.json"
 V3_CATALOG = "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
@@ -63,8 +63,8 @@ def test_marker_override_instrument_distinguishes_module_launch_from_selection(l
 
 PUSH_WORKFLOWS = (
     CI_WORKFLOW,
-    REPO_ROOT / ".github" / "workflows" / "codeql.yaml",
-    REPO_ROOT / ".github" / "workflows" / "enforce-allowlist-judge-gates.yaml",
+    REPO_ROOT / ".github/workflows/codeql.yaml",
+    REPO_ROOT / ".github/workflows/enforce-allowlist-judge-gates.yaml",
 )
 RELEASE_KEEPS_IN_PROGRESS_RUNS = "${{ !startsWith(github.ref, 'refs/heads/release/') }}"
 BASH_ONLY_TOKENS = ("pipefail", "[[")
@@ -224,7 +224,11 @@ def test_no_job_restates_the_marker_selection_except_the_testcontainer_override(
     """
     steps_with_pytest: list[tuple[str, str]] = []
     marker_expressions: dict[str, list[str]] = {}
-    for job_name, job in _workflow()["jobs"].items():
+    jobs = dict(_workflow()["jobs"])
+    proof = yaml.safe_load((REPO_ROOT / ".github/workflows/landscape-long-run.yml").read_text(encoding="utf-8"))
+    assert jobs["landscape-proof"]["uses"] == "./.github/workflows/landscape-long-run.yml"
+    jobs.update({f"landscape-proof/{name}": job for name, job in proof["jobs"].items()})
+    for job_name, job in jobs.items():
         for step in job.get("steps", []):
             run = str(step.get("run", ""))
             if "pytest" not in run:
@@ -236,6 +240,7 @@ def test_no_job_restates_the_marker_selection_except_the_testcontainer_override(
             if markers:
                 marker_expressions.setdefault(job_name, []).extend(markers)
     assert len(steps_with_pytest) >= 6, steps_with_pytest  # never pass by finding nothing to check
+    assert sum(job_name == "landscape-proof/proof" for job_name, _ in steps_with_pytest) == 2
     assert set(marker_expressions) == {"testcontainer"}, marker_expressions
     assert marker_expressions["testcontainer"] == ["testcontainer"], marker_expressions
 
