@@ -214,6 +214,7 @@ describe("staging bearer file custody", () => {
   it("rejects an auth directory symlink before login", async () => {
     const victim = join(temporaryDirectory, "outside");
     mkdirSync(victim, { mode: 0o755 });
+    chmodSync(victim, 0o755); // Establish the victim's mode independently of the process umask.
     symlinkSync(victim, dirname(storagePath));
     await expect(stagingGlobalSetup(config)).rejects.toThrow("real directories");
     expect(api.post).not.toHaveBeenCalled();
