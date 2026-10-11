@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import h11
 import httpx
 import pytest
 import respx
@@ -152,6 +153,7 @@ def test_image_identity_changes_both_transport_and_semantic_request_hashes(harne
 
 
 @pytest.mark.parametrize("status", [200, 503])
+@pytest.mark.parametrize("encoding_variant", ["standard", "unpadded", "urlsafe_unpadded"])
 @pytest.mark.parametrize(
     "echo_form",
     ["content", "metadata", "escaped_slashes", "unicode", "header", "late_duplicate", "late_duplicate_utf16", "late_duplicate_utf32"],
@@ -159,10 +161,14 @@ def test_image_identity_changes_both_transport_and_semantic_request_hashes(harne
 @pytest.mark.parametrize("separator", ["", " \n\t"])
 @respx.mock
 def test_submitted_image_echo_is_rejected_before_any_audit_or_telemetry_egress(
-    harness: _Harness, status: int, echo_form: str, separator: str
+    harness: _Harness, status: int, echo_form: str, separator: str, encoding_variant: str
 ) -> None:
     image = ImagePart.from_bytes(format="png", data=b"\x89PNG\r\n\x1a\n" + b"\xff" * 8, blob_ref=None)
     encoded = base64.b64encode(image.data).decode("ascii")
+    if encoding_variant == "unpadded":
+        encoded = encoded.rstrip("=")
+    elif encoding_variant == "urlsafe_unpadded":
+        encoded = base64.urlsafe_b64encode(image.data).decode("ascii").rstrip("=")
     echo = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
     data_url = f"data:image/png;base64,{echo}"
     payload = _response().json()
@@ -175,7 +181,7 @@ def test_submitted_image_echo_is_rejected_before_any_audit_or_telemetry_egress(
         payload["diagnostic"] = {"submitted_image": data_url}
     body = json.dumps(payload)
     if echo_form == "escaped_slashes":
-        assert "/" in encoded
+        assert "/" in data_url
         body = body.replace("/", "\\/")
     elif echo_form == "unicode":
         body = body.replace(json.dumps(echo)[1:-1], "".join(f"\\u{ord(char):04x}" for char in echo))
@@ -214,13 +220,30 @@ def test_submitted_image_echo_is_rejected_before_any_audit_or_telemetry_egress(
                     assert data_url not in retained
 
 
-@pytest.mark.parametrize("separator", ["", " "])
+@pytest.mark.parametrize("separator", ["", " ", "\t", "\f", "\v"])
+@pytest.mark.parametrize("error_source", ["literal", "h11_repr"])
+@pytest.mark.parametrize("encoding_variant", ["standard", "urlsafe_unpadded"])
 @respx.mock
-def test_protocol_error_image_echo_is_refused_before_error_audit_and_tracing(harness: _Harness, separator: str) -> None:
-    image = ImagePart.from_bytes(format="png", data=b"\x89PNG\r\n\x1a\nprivate-image", blob_ref=None)
-    encoded = base64.b64encode(image.data).decode()
+def test_protocol_error_image_echo_is_refused_before_error_audit_and_tracing(
+    harness: _Harness, separator: str, error_source: str, encoding_variant: str
+) -> None:
+    image = ImagePart.from_bytes(format="png", data=b"\x89PNG\r\n\x1a\n" + b"\xff" * 8, blob_ref=None)
+    encoded = (
+        base64.urlsafe_b64encode(image.data).decode().rstrip("=")
+        if encoding_variant == "urlsafe_unpadded"
+        else base64.b64encode(image.data).decode()
+    )
     echo = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
-    respx.post(harness.url).mock(side_effect=httpx.RemoteProtocolError("illegal status line: " + echo))
+    error_message = "illegal status line: " + echo
+    if error_source == "h11_repr":
+        connection = h11.Connection(h11.CLIENT)
+        connection.receive_data(echo.encode() + b"\r\n\r\n")
+        with pytest.raises(h11.RemoteProtocolError, match="illegal status line") as protocol_error:
+            connection.next_event()
+        error_message = str(protocol_error.value)
+        if separator == "\t":
+            assert "\\t" in error_message
+    respx.post(harness.url).mock(side_effect=httpx.RemoteProtocolError(error_message))
     with pytest.raises(LLMClientError) as caught:
         _query(harness, [ChatMessage(role="user", content=(image,))])
     assert not caught.value.retryable
@@ -441,13 +464,18 @@ def test_runtime_preflight_uses_bounded_transport(harness: _Harness, monkeypatch
 )
 @pytest.mark.parametrize("echo", [False, True])
 @pytest.mark.parametrize("separator", ["", "\n\t"])
+@pytest.mark.parametrize("encoding_variant", ["standard", "urlsafe_unpadded"])
 @respx.mock
-def test_http_audit_projection_also_binds_replay_verify_and_telemetry(mode: RunMode, echo: bool, separator: str, echo_source: str) -> None:
+def test_http_audit_projection_also_binds_replay_verify_and_telemetry(
+    mode: RunMode, echo: bool, separator: str, echo_source: str, encoding_variant: str
+) -> None:
     image = ImagePart.from_bytes(format="png", data=b"\x89PNG\r\n\x1a\nprivate-image-marker", blob_ref=None)
     messages = [ChatMessage(role="user", content=(image,))]
     wire = {"messages": wire_messages(messages)}
     audit = {"messages": audit_messages(messages)}
     encoded = base64.b64encode(image.data).decode()
+    if encoding_variant == "urlsafe_unpadded":
+        encoded = base64.urlsafe_b64encode(image.data).decode().rstrip("=")
     response_body = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4)) if echo else "ok"
     wire_body = response_body if echo_source == "wire" else "ok"
     session = Mock(spec=CallModeSession)

@@ -572,9 +572,14 @@ def empty_choices_response(
 
 @pytest.mark.parametrize("echo_form", ["content", "metadata", "empty", "malformed", "dump_error"])
 @pytest.mark.parametrize("separator", ["", " \n\t"])
-def test_sdk_image_echo_refuses_every_response_branch_before_egress(echo_form: str, separator: str) -> None:
+@pytest.mark.parametrize("encoding_variant", ["standard", "unpadded", "urlsafe_unpadded"])
+def test_sdk_image_echo_refuses_every_response_branch_before_egress(echo_form: str, separator: str, encoding_variant: str) -> None:
     image = ImagePart.from_bytes(format="png", data=PNG_BYTES, blob_ref=None)
     encoded = base64.b64encode(image.data).decode()
+    if encoding_variant == "unpadded":
+        encoded = encoded.rstrip("=")
+    elif encoding_variant == "urlsafe_unpadded":
+        encoded = base64.urlsafe_b64encode(image.data).decode().rstrip("=")
     echo = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
     response = provider_response(content=echo if echo_form == "content" else "ordinary output")
     if echo_form in {"metadata", "empty", "malformed"}:
@@ -612,9 +617,12 @@ def test_sdk_image_echo_refuses_every_response_branch_before_egress(echo_form: s
 
 @pytest.mark.parametrize("mode", [RunMode.REPLAY, RunMode.VERIFY])
 @pytest.mark.parametrize("echo_location", ["content", "raw_response", "error"])
-def test_sdk_image_echo_cannot_be_copied_by_replay_or_verify(mode: RunMode, echo_location: str) -> None:
+@pytest.mark.parametrize("encoding_variant", ["standard", "urlsafe_unpadded"])
+def test_sdk_image_echo_cannot_be_copied_by_replay_or_verify(mode: RunMode, echo_location: str, encoding_variant: str) -> None:
     image = ImagePart.from_bytes(format="png", data=PNG_BYTES, blob_ref=None)
     encoded = base64.b64encode(image.data).decode()
+    if encoding_variant == "urlsafe_unpadded":
+        encoded = base64.urlsafe_b64encode(image.data).decode().rstrip("=")
     echo = "\n".join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
     comparisons: list[dict[str, Any]] = []
 

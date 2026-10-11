@@ -41,7 +41,9 @@ IMAGE_FORMATS: frozenset[str] = frozenset(get_args(ImageFormat))
 
 _IMAGE_MIME_BY_FORMAT = {fmt: BINARY_DOCUMENT_MIME_BY_FORMAT[fmt] for fmt in IMAGE_FORMATS}
 _JSON_STRING_LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"')
-_BASE64_WHITESPACE = str.maketrans("", "", " \t\r\n\f\v")
+_BASE64_NORMALIZATION = str.maketrans("-_", "+/", " \t\r\n\f\v")
+_BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+_BASE64_ESCAPED_WHITESPACE = re.compile(r"\\(?:[tnrfv]|x(?:09|0[a-dA-D]|20))")
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,23 +170,58 @@ def audit_messages(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:
     return [{"role": m.role, "content": _audit_content(m.content)} for m in messages]
 
 
-def _contains_image_encoding(text: str, protected: tuple[str, ...]) -> bool:
-    """Compare wrapping-equivalent base64 without changing retained output.
+def _image_encoding_probe(data: bytes) -> tuple[str, str]:
+    """Match every base64 representation of the image's significant bits.
+
+    Padding carries no image bits. A decoder also ignores the low bits of the
+    final symbol when the image does not end at a three-byte boundary. Match
+    those equivalent symbols, including when embedded in a larger value, just
+    as the raw-byte check refuses any occurrence of the full submitted image.
+    Keep the literal prefix and final-symbol set local to this call: compiling
+    image-sized regular expressions would retain images in Python's regex cache.
+    """
+    encoded = base64.b64encode(data).decode("ascii")
+    core = encoded.rstrip("=")
+    padding = len(encoded) - len(core)
+    if not padding:
+        return core, ""
+    first = _BASE64_ALPHABET.index(core[-1])
+    final_symbols = _BASE64_ALPHABET[first : first + (1 << (2 * padding))]
+    return core[:-1], final_symbols
+
+
+def _contains_protected_encoding(text: str, protected: tuple[tuple[str, str], ...]) -> bool:
+    for prefix, final_symbols in protected:
+        if not final_symbols:
+            if prefix in text:
+                return True
+        # Search complete literals, one temporary at a time. Restarting a long
+        # prefix search after every wrong final symbol can revisit overlapping
+        # prefixes quadratically; the pad-bit set bounds this to 4 or 16 searches.
+        elif any(prefix + symbol in text for symbol in final_symbols):
+            return True
+    return False
+
+
+def _contains_image_encoding(text: str, protected: tuple[tuple[str, str], ...]) -> bool:
+    """Compare equivalent base64 without changing retained output.
 
     Decode individual JSON strings too: serialization escapes embedded tabs
     and newlines, and whole-document parsing discards duplicate-key values.
+    HTTP protocol errors also carry Python bytes-repr whitespace escapes;
+    fold those specific spellings without decoding arbitrary nested content.
     Keep JSON syntax intact so separate fields never become one encoding.
     """
-    compact = text.translate(_BASE64_WHITESPACE)
-    if any(value in compact for value in protected):
+    compact = _BASE64_ESCAPED_WHITESPACE.sub("", text).translate(_BASE64_NORMALIZATION)
+    if _contains_protected_encoding(compact, protected):
         return True
     for literal in _JSON_STRING_LITERAL.finditer(text):
         try:
             normalized_string = json.loads(literal.group())
         except json.JSONDecodeError:
             continue
-        compact = normalized_string.translate(_BASE64_WHITESPACE)
-        if any(value in compact for value in protected):
+        compact = _BASE64_ESCAPED_WHITESPACE.sub("", normalized_string).translate(_BASE64_NORMALIZATION)
+        if _contains_protected_encoding(compact, protected):
             return True
     return False
 
@@ -194,15 +231,16 @@ def image_response_is_audit_safe(messages: Sequence[ChatMessage], response: Call
 
     Admission never rewrites completion text. A provider echo cannot be retained
     as a parsed body, a header, or exact replay bytes. JSON string normalization
-    also catches slash/unicode escapes and ASCII base64 wrapping, including malformed/duplicate-key bodies
-    whose diagnostic representation would otherwise retain their raw text.
+    also catches slash/unicode escapes, ASCII wrapping, equivalent alphabets,
+    optional padding and unused pad bits, including malformed/duplicate-key
+    bodies whose diagnostic representation would otherwise retain their raw text.
     """
     images = [
         part for message in messages if not isinstance(message.content, str) for part in message.content if isinstance(part, ImagePart)
     ]
     if not images:
         return True
-    protected = tuple(base64.b64encode(image.data).decode("ascii") for image in images)
+    protected = tuple(_image_encoding_probe(image.data) for image in images)
     audit_text = canonical_json(response.to_dict())
     if _contains_image_encoding(audit_text, protected):
         return False
