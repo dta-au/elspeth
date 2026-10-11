@@ -83,12 +83,12 @@ defaults:
   run:
     shell: bash
 
-# Same-repository PR jobs use GitHub-hosted VMs; trusted pushes use Nyx.
-# Fork PRs fail the hosted aggregate without checking out repository code.
+# Same-repository PR jobs and trusted pushes use Nyx after authorized activation.
+# Outsider fork runs stay unapproved; fork guards are defense in depth.
 jobs:
   check-override-rate:
     name: Override-rate drift gate (C3)
-    # Prepared source; external admission is required before activation.
+    # Prepared source; trusted-workgroup policy and qualification precede activation.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # Judge gates should fail fast if checkout/dependency/git plumbing hangs.

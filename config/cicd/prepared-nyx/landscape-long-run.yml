@@ -1,5 +1,5 @@
 # Prepared three-case producer; caller and callee are outside workflow discovery.
-# External exact-commit admission enforcement is required before activation.
+# Trusted-workgroup access and all-external fork approval precede activation.
 name: Landscape long-run proofs
 
 on:

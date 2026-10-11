@@ -13,9 +13,22 @@ none substitutes for another.
 
 The repository setting **Approval for running fork pull request workflows from
 contributors** must be **Require approval for all external contributors**
-(`approval_policy: all_external_contributors`). Fork jobs remain ineligible for
-the checkout and analysis jobs in the ELSPETH workflows even after approval.
-Review workflow-file changes before moving fork code onto a repository branch.
+(`approval_policy: all_external_contributors`). Leave outsider fork runs
+unapproved. Review their complete code and workflow changes before importing
+accepted work onto a repository branch.
+
+The maintainer explicitly trusts the existing workgroup organization members and
+repository writer. GitHub exempts organization members and repository
+collaborators from external-contributor approval, including read-only organization
+members. Reconcile that trusted population and automation authority after access
+changes; do not infer execution denial from read-only repository permission.
+
+The prepared ELSPETH workflows reject fork checkouts, but those conditions are
+defense in depth: contributor-edited YAML can remove them. The GitHub approval
+policy and trusted access population are the admission boundary. Do not approve
+outsider runs on the assumption that a YAML guard makes them harmless. See the
+[CI admission policy](../maintainer/nyx-ci-admission-proposal.md) for activation
+and required-check qualification.
 
 Measure the live setting with an administrator credential:
 

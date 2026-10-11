@@ -1,121 +1,96 @@
-# Operator proposal: exact-commit Nyx admission
+# Nyx CI admission and activation
 
-**Proposed, unimplemented; activation remains blocked.** The maintainer selected
-admission of exact PR commits with enforcement outside contributor-controlled
-YAML. The [prepared workflows](../../config/cicd/prepared-nyx/) remain outside
-GitHub discovery. Preparing them does not change runner access or required checks.
+The maintainer selected trusted-workgroup execution on the four existing Nyx
+runners. All current organization members are trusted, and the existing outside
+repository writer is the maintainer's other account. The requirement is to keep
+public, untrusted code off Nyx; separate approval for every trusted commit is not
+required. A new execution repository, admission controller or paid selected-
+workflow runner-group feature is not part of this policy.
 
-## Current required checks and inactive behavior
+The [prepared workflows](../../config/cicd/prepared-nyx/) remain outside GitHub
+discovery. The contributor setting is confirmed, but source activation and native
+qualification remain separate operator steps.
 
-A read-only API query of `dta-au/elspeth` ruleset `12348893` on 2026-10-10 UTC
-returned active enforcement on `~DEFAULT_BRANCH`, strict required status checks,
-and these contexts, without `integration_id` source bindings:
+## GitHub execution boundary
+
+In **Settings → Actions → General → Approval for running fork pull request
+workflows from contributors**, require approval for **all external contributors**
+(`approval_policy: all_external_contributors`). A fresh administrator read on
+2026-10-11 UTC confirmed:
 
 ```json
-{"required_status_checks":[{"context":"CI Success"},{"context":"CodeQL"},{"context":"Check cohort-attribution trailers on PR commits"},{"context":"redaction-gate"}],"strict_required_status_checks_policy":true}
+{"approval_policy":"all_external_contributors"}
 ```
 
-Preserve those required contexts. While parked, this package publishes none of
-them. Missing checks on a new commit remain pending under the rule; conditional
-job skips can count as success and are therefore unsuitable as an inactive
-placeholder. Existing results at the same SHA, check-producer spoofing and rule
-bypasses need external review. GitHub supports binding a required check to a
-specific App; external App checks also avoid the event restrictions that prevent
-ordinary `workflow_dispatch` checks from fulfilling PR requirements.
-[GitHub required-check semantics](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
+Leave outsider fork runs unapproved. Review their complete code and workflow
+changes before importing accepted work onto a trusted repository branch. Public
+users can still fork and open PRs; they cannot push upstream without write access.
+Restricting PR submission is unnecessary for this execution policy.
 
-## Proposed enforcement component
+GitHub exempts organization members and repository collaborators from external-
+contributor approval, including read-only organization members. Those identities
+are explicitly inside the maintainer's trusted workgroup boundary. Review future
+membership, writer/admin grants and automation access before extending it. Keep
+named access rosters in controlled administration records, not public docs.
+[GitHub contributor approval and exceptions](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#controlling-changes-from-forks-to-workflows-in-public-repositories).
 
-Create a private, maintainer-controlled execution repository, proposed name
-`dta-au/elspeth-ci-admission`, and an external **Nyx admission controller** with a
-GitHub App. ELSPETH contributors have no write or dispatch rights there. The
-controller holds approvals, reconciles native runs/jobs, provisions capacity and
-publishes the four required checks. Its credentials and management sockets stay
-outside all job-reachable filesystems, networks and host-root Docker authority.
+Fork conditions, runner labels, repository tests, read-only token defaults and
+action SHA pins do not independently prevent arbitrary code execution. A writer
+can edit workflow code and permissions; a fork can remove its YAML conditions.
+The external-contributor approval policy and the trusted access population are
+the boundary. Never approve outsider runs because a YAML guard appears safe.
 
-Replace direct ELSPETH access to persistent Nyx runners with two controller-owned
-disposable VM or equivalent isolated execution slots. Each receives a fresh
-single-job runner registration scoped exclusively to the execution repository.
-Repository-scoped runners serve one repository; an organization runner group can
-instead restrict repository access through settings outside YAML.
-[Runner scope](https://docs.github.com/en/actions/concepts/runners/self-hosted-runners),
-[runner-group access](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access).
+Trusted manual starts through `gh` remain authorized. Keep each reviewed manual
+workflow's protected-default-branch guard. Reusable calls retain native subject
+identity. Privileged events such as `pull_request_target`, issue comments or
+`workflow_run` must not fetch and execute outsider code or artifacts. Automatic
+CI-triggered image publication remains disabled.
 
-Before creating eligible capacity, the controller must:
+## Required checks and source preparation
 
-1. Authenticate a maintainer approval for the full ELSPETH repository/PR/head SHA,
-   observed base, exact executed commit, trusted control revision and suite/profile.
-2. Re-read PR state and bind a one-use ticket to the actual execution run,
-   attempt, job role and interpreter/shard/proof case. Unknown or ambiguous jobs,
-   direct dispatches and reruns receive no capacity.
-3. Acquire one of two global slots, then register a fresh runner with a unique
-   ticket label. Only trusted execution-repository workflow code can request it.
-   Hold the slot until runner revocation and guest teardown are verified.
+Repository ruleset `12348893` is active on the default branch and requires:
 
-The external ledger enforces the two-job host cap across every workflow and retry.
-Matrix limits alone do not. Extra eligible persistent runners would bypass this
-boundary and must be removed from access before activation. A job-start hook,
-maintainer label or repository script after runner allocation does not enforce it.
+- `CI Success`;
+- `CodeQL`;
+- `Check cohort-attribution trailers on PR commits`; and
+- `redaction-gate`.
 
-## Supersession and evidence
+The 2026-10-11 UTC readback retained strict checks, a PR requirement, zero required
+approving reviews and no bypass actors. Required checks have no returned App
+source bindings. Preserve the rule and all four runner registrations. Named
+status checks assume trusted writers; they do not authenticate workflow content
+against a malicious writer inside the accepted trust boundary. Missing checks on
+a new commit remain pending. Skipped placeholders and synthetic dispatch results
+are not substitutes for native successful PR checks.
 
-Approval never transfers to a new SHA. On synchronize, close or revocation, the
-controller advances the PR generation, cancels future tickets and suppresses
-superseded results. Reconcile queued work after outages. Recommended semantics:
-approval authorizes the immutable SHA until revocation is recorded at the
-controller's allocation boundary; already allocated work is terminated when
-revocation is observed. Webhooks and `read head -> register runner` are not atomic
-with a concurrent GitHub push. An absolute ban on old-SHA allocation from the
-instant of push needs an additional atomic platform primitive or enforced branch
-freeze; this proposal does not claim one exists.
+The six prepared sources produce none of those checks while parked. Source
+contracts inspect both active and prepared inventories and reject duplicates or
+accidental discovery. Normal PR execution will retain the actual PR merge SHA,
+run ID and attempt; no evidence adapter or `GITHUB_SHA` override is needed.
+See [the proof guide](ci-landscape-proof.md) for the unchanged partition, proof and
+coverage obligations.
 
-The current same-repository templates cannot simply be copied into the execution
-repository. Its native `GITHUB_SHA` identifies control code, while the subject
-checkout identifies ELSPETH. A reviewed evidence adapter must bind both repository
-identities and commits separately, plus the external admission ticket and native
-run/attempt/job. Overriding `GITHUB_SHA` to make the existing comparison pass is
-unacceptable. Trusted configuration, actions, harness and consumers come from the
-approved control revision; subject code executes only inside the isolated guest.
+## Remaining qualification and activation
 
-The controller admits success only after actual native producer success and the
-complete ordinary/proof union for both interpreters, finalized hashes, singleton
-proof calls and combined 3.13 coverage floors. Failure, skip, cancellation,
-omission or missing newest-attempt evidence cannot publish success. CodeQL needs
-a separate subject-SHA SARIF upload/processing adapter; trailer and redaction jobs
-need explicit subject PR context. These adapters are not implemented. Only the
-management-plane App publishes ELSPETH checks, with Checks write permission, after
-verification; jobs receive no source-repository check credential.
-[Checks API](https://docs.github.com/en/rest/checks/runs#create-a-check-run).
+1. Qualify the prepared sources, routing, supply-chain closure, required-success
+   aggregation and complete ordinary/proof evidence graph. Source checks do not
+   establish native runner, timing or artifact behavior.
+2. Read back the contributor setting and trusted access population before
+   activation. Reconcile pending jobs and any newly associated automation. The
+   read-only inventory confirmed Codex connector access; three other organization
+   apps used selected repository scopes whose ELSPETH association was unverified.
+   Organization policy and runner-group API reads were unavailable to the current
+   credential. These limits are not proof of additional untrusted actors.
+3. Obtain explicit activation/publication direction before moving all six sources
+   into `.github/workflows` and updating the source-inventory contracts. Publish
+   only reviewed source; preserve the current ruleset and four-runner pool.
+4. Under an authorized native qualification run, establish that an outsider-
+   edited PR workflow stays awaiting approval and acquires no Nyx runner. Leave
+   it unapproved. Verify trusted same-repository PR execution, genuine required
+   checks, proof/coverage artifacts and rerun/cancellation behavior separately.
 
-## Minimum operator decision and settings actions
-
-Approve the named execution repository/App, two isolated Nyx slots and the
-immutable-SHA revocation semantics before building the controller. Subsequent
-operator actions, after implementation review, are:
-
-- In ELSPETH **Settings → Actions → Runners**, remove every Nyx attachment eligible
-  for product-repository jobs, including organization/enterprise group access.
-  Local service names are not a complete GitHub registration inventory; the prior
-  runner API 403 remains unresolved and must not be bypassed.
-- Limit execution-repository write, dispatch and administration to the controller
-  and trusted operators. Provision only broker-owned, disposable runner capacity;
-  audit extra repository/group registrations and direct rerun paths.
-- Install the narrowly scoped App with subject read/Checks write and qualified
-  CodeQL upload permissions, and execution dispatch/evidence/runner lifecycle
-  permissions appropriate to the actual registration model. Keep keys in the
-  management plane and validate exact API permissions before enabling it.
-- In ELSPETH **Settings → Rules → Rulesets → main** (`12348893`), bind each existing
-  required context to the controller App's actual integration ID. Preserve strict
-  checks and review applicable bypass actors. Read back the resulting policy.
-
-Before activation, demonstrate that unadmitted commits, contributor-added jobs,
-stale tickets, unauthorized dispatch/rerun, duplicate attempts and controller
-outages cannot acquire capacity or publish accepted success. Prove credential
-isolation, the global slot cap and teardown fencing. Then qualify the real native
-artifact, retry, CodeQL and required-check paths, including same-name spoofed
-checks. Automatic image publication remains disabled until separately restored.
-
-No repository, App, runner, security setting, deployment or spending change is
-performed by this proposal. Until the external component and adapters exist,
-continue operator-invoked local qualification and keep automated PR execution
-parked. The runner-access finding remains unresolved.
+Matrix concurrency limits are per matrix, not a global Nyx resource budget.
+Coordinate long qualification runs with other host users and preserve all four
+runners; no measured resource basis supports retiring two. Host custody and
+Docker authority remain governed by the
+[runner-hardening runbook](../runbooks/self-hosted-runner-hardening.md).

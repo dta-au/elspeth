@@ -25,7 +25,7 @@ on:
 
 jobs:
   redaction-gate:
-    # Prepared source; external admission is required before activation.
+    # Prepared source; trusted-workgroup policy and qualification precede activation.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:

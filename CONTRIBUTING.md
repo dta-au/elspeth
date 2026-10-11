@@ -57,26 +57,30 @@ The root suite is scoped to `testpaths = ["tests"]`, so it does **not** cover
 `pyproject.toml` and test suite; if you change it, run its tests from
 `gateway/` as well.
 
-Pull-request workflows use GitHub-hosted Ubuntu 24.04 VMs, including their
-aggregate status jobs. Pushes, scheduled checks, publication, website and
-mutation-testing jobs retain the local labels
-`self-hosted, Linux, X64, nyx-ci, trusted`. Manual live-provider acceptance
+Prepared pull-request workflows and ordinary push, scheduled, publication,
+website and mutation-testing jobs use the four Nyx runners with labels
+`self-hosted, Linux, X64, nyx-ci, trusted`. The prepared PR workflows remain
+inactive until separately authorized activation. Manual live-provider acceptance
 retains its specialized self-hosted cloud runners because it proves ECS
 execution and managed-identity behavior. Manual workflows admit only the
 protected default branch before allocating a runner.
-Fork pull requests skip jobs that check out code and fail the required
-`CI Success` check and the additional advisory `Judge gates success` status.
-A maintainer must review a fork's code and workflow changes before admitting
-them onto a repository branch. Repository Actions settings must require
-approval for all outside contributors (`all_external_contributors`).
-Contributor-controlled workflow YAML can remove admission conditions or select
-different runners, so repository tests and labels are not an access-control
-boundary. Remaining self-hosted runner groups must independently restrict
-workflow paths and trusted refs; branch and environment policies must protect
-publication and provider credentials. Source routing changes alone do not
-establish those settings or worker integrity. Hosted capacity and job
-prerequisites require authorized CI qualification before claiming the
-mitigation operational.
+
+Repository Actions settings must require approval for all external contributors
+(`all_external_contributors`). Leave outsider fork runs unapproved; review their
+complete code and workflow changes before importing accepted work onto a
+repository branch. The maintainer trusts the existing workgroup organization
+members and repository writer. GitHub exempts organization members and repository
+collaborators from fork approval, including organization members with read-only
+access. Review that trusted population when membership, access or automation
+changes. Public users can still submit fork PRs.
+
+The prepared workflows also reject fork checkouts and fail their aggregate
+statuses, but contributor-edited YAML can remove those conditions or select
+different runners. These conditions, tests and labels are defense in depth;
+GitHub's external-contributor approval policy and the explicitly trusted access
+population provide the execution boundary. Branch and environment policies still
+protect publication and provider credentials. Source checks do not establish host
+integrity or native CI qualification.
 
 Runner slots share one host, so jobs can queue behind other workflows.
 Report a runner or prerequisite failure to the maintainer with the failing
@@ -86,8 +90,9 @@ environment credentials and remote service access.
 ### Prepared Nyx workflows
 
 The PR CI sources are parked in `config/cicd/prepared-nyx/`, outside GitHub's
-workflow discovery directory, pending external maintainer admission of exact
-commits and runtime qualification. They produce no remote required checks while
+workflow discovery directory, pending separately authorized activation and
+runtime qualification under the trusted-workgroup policy. They produce no remote
+required checks while
 parked. Do not substitute skipped jobs or relax required checks to accommodate
 this preparation. Source-contract tests inspect both executable and parked
 inventories, and linting the templates requires a disposable deployment mirror.

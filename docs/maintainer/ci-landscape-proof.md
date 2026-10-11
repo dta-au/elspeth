@@ -22,26 +22,22 @@ continues to require literal successful results. No required-check rule is relax
 
 ## Admission before activation
 
-The [operator proposal](nyx-ci-admission-proposal.md) names the external controller,
-GitHub settings, remaining evidence adapters and minimum operator decision.
+The [CI admission policy](nyx-ci-admission-proposal.md) records the maintainer's
+trusted-workgroup decision, required GitHub setting and remaining qualification.
+The current policy trusts the existing organization members and repository
+writer, requires `all_external_contributors` fork-run approval, and leaves
+outsider runs unapproved. GitHub's organization-member and collaborator approval
+exceptions are inside that explicitly accepted trust boundary. Contributor-edited
+YAML and runner labels do not provide it.
 
-The operator selected maintainer admission of exact PR commits. External
-enforcement must prevent an unadmitted job from acquiring a persistent runner
-**before allocation**, even when a contributor changes workflow YAML, adds a job,
-uses a different workflow, or changes the PR after approval. A same-repository
-PR, trusted label, YAML condition or repository-owned admission script cannot
-establish that boundary. Admission must bind the exact executed commit (including
-the tested merge commit when applicable), repository, workflow/run identity and
-current PR head; a new commit requires new admission. The external control must
-also enforce a shared Nyx execution budget across workflows and runner services.
-
-Keep this package inactive until those external controls have been demonstrated
-with both admitted and unadmitted commits, including contributor-edited jobs and
-stale approval after a new push. No runner grants, repository settings or external
-policy are changed by these source files. Activation is a separate operator
-step after source qualification. Copying templates into GitHub discovery is
-activation, and requires the external control first. These tests assert source
-contracts; they cannot grant or enforce runner access.
+Keep this package inactive until separately authorized activation after source
+qualification and a fresh readback of the contributor policy. Copying templates
+into GitHub discovery is activation. During native qualification, verify that an
+outsider-edited workflow remains awaiting approval without acquiring a Nyx runner,
+and that trusted same-repository PRs produce the genuine required checks. Do not
+approve the outsider run as part of that refusal check. Preserve native PR merge
+SHA and run/attempt evidence; do not substitute a manually dispatched success.
+These source files neither change GitHub settings nor qualify the runner host.
 
 ## Selection and required evidence
 
