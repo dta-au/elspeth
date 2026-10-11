@@ -81,10 +81,11 @@ def _project_event_for_egress(event: TelemetryEvent) -> TelemetryEvent:
 class HealthMetrics(TypedDict):
     """Typed return value for TelemetryManager.health_metrics.
 
-    All fields are operational counters constructed by the manager itself.
+    Operational counters and configuration gauges constructed by the manager itself.
     This is Tier 1 (our data) — not external input.
     """
 
+    configured_exporters: int
     events_attempted: int
     events_delivered: int
     events_failed: int
@@ -146,8 +147,8 @@ class TelemetryManager:
         Args:
             config: Runtime telemetry configuration with granularity,
                 backpressure_mode, and fail_on_total_exporter_failure settings
-            exporters: List of configured exporter instances. May be empty
-                (telemetry will be a no-op).
+            exporters: List of configured exporter instances. May be empty;
+                event observers still receive events, but no export is attempted.
             event_observers: Best-effort projections that receive already-audited
                 events before exporter granularity filtering.
         """
@@ -598,6 +599,11 @@ class TelemetryManager:
         """Return telemetry health metrics for monitoring.
 
         Returns a snapshot of telemetry health:
+        - configured_exporters: Number of configured exporter instances, including
+          same-named destinations. Zero explicitly identifies an enabled manager
+          with no export destination; disabled telemetry returns no manager.
+          This is configuration, not availability or delivery success, and remains
+          unchanged by circuit failures or shutdown.
         - events_emitted: Successfully delivered to at least one exporter
         - events_dropped: Failed to deliver (queue full or all exporters failed)
         - queue_drops: Enqueue/backpressure losses only; excludes exporter failures
@@ -623,6 +629,7 @@ class TelemetryManager:
             queue_drops = self._queue_drops
             observer_failures = self._observer_failures
         return {
+            "configured_exporters": len(self._exporters),
             "events_attempted": self._events_attempted,
             "events_delivered": self._events_delivered,
             "events_failed": self._events_failed,

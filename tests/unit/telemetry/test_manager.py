@@ -1136,12 +1136,55 @@ class TestTotalExporterFailure:
 
 
 class TestHealthMetrics:
+    @pytest.mark.parametrize(("exporter_count", "exported_events"), [(0, 0), (1, 1), (2, 1)])
+    def test_configured_exporters_distinguishes_no_destination_from_idle(self, exporter_count: int, exported_events: int) -> None:
+        # Same-named destinations are distinct instances, not one exporter.
+        exporters = [TelemetryTestExporter(name="destination") for _ in range(exporter_count)]
+        observed: list[TelemetryEvent] = []
+        manager = TelemetryManager(MockTelemetryConfig(), exporters=exporters, event_observers=[observed.append])
+        try:
+            assert {"configured_exporters": exporter_count, "events_attempted": 0}.items() <= manager.health_metrics.items()
+            event = _lifecycle_event()
+            manager.handle_event(event)
+            manager.flush()
+            assert observed == [event]
+            assert {
+                "configured_exporters": exporter_count,
+                "events_attempted": exported_events,
+                "events_delivered": exported_events,
+                "events_failed": 0,
+                "events_dropped": 0,
+            }.items() <= manager.health_metrics.items()
+        finally:
+            manager.close()
+        # Closing delivery does not erase the configuration from a final snapshot.
+        assert {"configured_exporters": exporter_count}.items() <= manager.health_metrics.items()
+
+    def test_configured_exporters_does_not_claim_failed_destination_is_healthy(self) -> None:
+        manager = TelemetryManager(
+            MockTelemetryConfig(fail_on_total_exporter_failure=False, max_consecutive_failures=1),
+            exporters=[FailingExporter()],
+        )
+        try:
+            manager.handle_event(_lifecycle_event())
+            manager.flush()
+            assert manager._disabled is True
+            assert {
+                "configured_exporters": 1,
+                "events_failed": 1,
+                "events_delivered": 0,
+                "consecutive_total_failures": 1,
+            }.items() <= manager.health_metrics.items()
+        finally:
+            manager.close()
+
     def test_returns_correct_structure(self) -> None:
         config = MockTelemetryConfig()
         manager = TelemetryManager(config, exporters=[])
         try:
             metrics = manager.health_metrics
             expected_keys = {
+                "configured_exporters",
                 "events_attempted",
                 "events_delivered",
                 "events_failed",
