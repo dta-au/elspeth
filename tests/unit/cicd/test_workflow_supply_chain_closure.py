@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 import tomllib
 from pathlib import Path
@@ -10,11 +11,14 @@ from typing import Any
 
 import pytest
 import yaml
+from tests.unit.cicd.workflow_sources import all_workflow_paths
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 BUILD_WORKFLOW = WORKFLOW_DIR / "build-push.yaml"
 MUTATION_WORKFLOW = WORKFLOW_DIR / "mutation-testing.yaml"
+PROOF_WORKFLOW = WORKFLOW_DIR / "landscape-long-run.yml"
+PROOF_WORKFLOW_CALL = "./.github/workflows/landscape-long-run.yml"
 LOCKS = (REPO_ROOT / "uv.lock", REPO_ROOT / "gateway" / "uv.lock")
 
 _DIGEST_IMAGE_RE = re.compile(r"^[^\s@]+(?::[^\s@]+)?@sha256:[0-9a-f]{64}$")
@@ -48,8 +52,24 @@ def _workflow(path: Path) -> dict[str, Any]:
 
 
 def _workflows() -> dict[Path, dict[str, Any]]:
-    paths = sorted((*WORKFLOW_DIR.glob("*.yaml"), *WORKFLOW_DIR.glob("*.yml")))
+    paths = all_workflow_paths()
     return {path: _workflow(path) for path in paths}
+
+
+def _executable_jobs(workflow: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Validate approved local calls; all target jobs remain in _workflows()."""
+    result: list[tuple[str, dict[str, Any]]] = []
+    for name, job in workflow["jobs"].items():
+        if "uses" not in job:
+            result.append((name, job))
+            continue
+        assert job["uses"] == PROOF_WORKFLOW_CALL, "unreviewed reusable workflow call"
+        assert set(job) <= {"uses", "name", "needs", "if", "permissions"}, "reusable call has execution or secret overrides"
+        assert job.get("permissions", {"contents": "read"}) == {"contents": "read"}, "reusable call changes token permissions"
+        target = _workflow(PROOF_WORKFLOW)
+        assert set(target.get("on", target.get(True))) == {"workflow_call"}, "proof target must be workflow_call-only"
+        assert set(target["jobs"]) == {"proof"} and "uses" not in target["jobs"]["proof"], "proof target must execute its job"
+    return result
 
 
 def _one_step(job: dict[str, Any], name: str) -> dict[str, Any]:
@@ -177,7 +197,7 @@ def _assert_container_is_digest_pinned(job_name: str, job: dict[str, Any]) -> No
 def test_every_workflow_job_container_is_digest_pinned_including_matrix_mappings() -> None:
     measured = 0
     for path, workflow in _workflows().items():
-        for job_name, job in workflow["jobs"].items():
+        for job_name, job in _executable_jobs(workflow):
             if "container" not in job:
                 continue
             measured += 1
@@ -209,7 +229,7 @@ def test_container_pin_validator_controls_literal_and_matrix_references() -> Non
 def _resolved_setup_uv_versions(workflow: dict[str, Any]) -> list[str]:
     versions: list[str] = []
     workflow_env = workflow.get("env", {})
-    for job in workflow["jobs"].values():
+    for _, job in _executable_jobs(workflow):
         job_env = {**workflow_env, **job.get("env", {})}
         for step in job["steps"]:
             if not str(step.get("uses", "")).startswith(_SETUP_UV_PREFIX):
@@ -258,7 +278,7 @@ def test_workflows_do_not_dynamically_resolve_audit_tools() -> None:
     dynamic_tool = re.compile(r"--with\s+[\"']?(?:pip-audit|pip-licenses)(?:[<>=!~].*)?[\"']?")
 
     for path, workflow in _workflows().items():
-        for job_name, job in workflow["jobs"].items():
+        for job_name, job in _executable_jobs(workflow):
             for step in job["steps"]:
                 run = str(step.get("run", ""))
                 measured += run.count("pip-audit") + run.count("pip-licenses")
@@ -291,3 +311,65 @@ def test_mutation_install_validator_rejects_unfrozen_sync_and_uv_pip_install() -
             "pip-install",
             {"steps": [{"name": "Install dependencies", "run": 'uv venv\nuv pip install -e ".[dev]"'}]},
         )
+
+
+def test_local_proof_call_keeps_supply_chain_target_jobs_visible() -> None:
+    workflows = _workflows()
+    assert PROOF_WORKFLOW in workflows
+    proof = workflows[PROOF_WORKFLOW]
+    assert _executable_jobs({"jobs": {"call": {"uses": PROOF_WORKFLOW_CALL}}}) == []
+    assert _executable_jobs(proof) == [("proof", proof["jobs"]["proof"])]
+    _assert_container_is_digest_pinned("proof", proof["jobs"]["proof"])
+    assert _resolved_setup_uv_versions(proof) == ["0.10.2"]
+
+
+def test_active_long_run_target_remains_in_executable_supply_chain_inventory() -> None:
+    workflows = _workflows()
+    assert PROOF_WORKFLOW in workflows
+    workflow = workflows[PROOF_WORKFLOW]
+    job = workflow["jobs"]["proof"]
+    assert _executable_jobs(workflow) == [("proof", job)]
+    assert len(job["strategy"]["matrix"]["include"]) == 6
+    _assert_container_is_digest_pinned("long-run proof", job)
+    assert _resolved_setup_uv_versions(workflow) == ["0.10.2"]
+    assert [step["uses"] for step in job["steps"] if "uses" in step] == [
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    ]
+    install = _one_step(job, "Install dependencies")
+    assert install["working-directory"] == "${{ env.CI_CHECKOUT_PATH }}"
+    assert install["run"] == "uv sync --frozen --all-extras"
+    assert workflow["permissions"] == {"contents": "read"}
+    assert "secrets" not in workflow and "secrets" not in job
+    assert "${{ secrets." not in json.dumps(workflow)
+
+
+@pytest.mark.parametrize("row_index", range(6))
+def test_active_long_run_supply_chain_rejects_mutable_image_in_every_row(row_index: int) -> None:
+    workflow = _workflow(PROOF_WORKFLOW)
+    job = workflow["jobs"]["proof"]
+    job["strategy"]["matrix"]["include"][row_index]["ci-container-image"] = "python:latest"
+    with pytest.raises(AssertionError, match="mutable"):
+        _assert_container_is_digest_pinned("long-run proof", job)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"uses": "attacker/repo/.github/workflows/landscape-no-escape.yml@main"},
+        {"uses": "./.github/workflows/unreviewed.yml"},
+        {"uses": "./.github/workflows/landscape-no-escape.yml"},
+        {"uses": "./.github/workflows/../workflows/landscape-no-escape.yml"},
+        {"steps": [{"run": "uv pip install malicious"}]},
+        {"container": "python:latest"},
+        {"runs-on": "ubuntu-latest"},
+        {"env": {"UV_VERSION": "latest"}},
+        {"secrets": "inherit"},
+        {"with": {"command": "true"}},
+        {"permissions": {"contents": "write"}},
+    ],
+)
+def test_local_reusable_call_cannot_hide_supply_chain_overrides(override: dict[str, Any]) -> None:
+    with pytest.raises(AssertionError):
+        _executable_jobs({"jobs": {"call": {"uses": PROOF_WORKFLOW_CALL, **override}}})

@@ -491,6 +491,7 @@ markers = [
     "integration: marks tests requiring external services",
     "asyncio: marks tests as async (handled by pytest-asyncio)",
     "performance: marks tests as performance benchmarks",
+    "landscape_long_run: identifies the three exact Landscape long-run cases for explicit CI partitioning",
     "stress: marks tests as stress tests requiring ChaosLLM HTTP server (deselect with '-m \"not stress\"')",
     "composer_llm_eval: characterization/replay tests for the 2026-04-28 composer LLM evaluation scenarios",
     "chaosllm: Configure ChaosLLM server for the test (preset=None, **kwargs)",

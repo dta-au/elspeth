@@ -12540,12 +12540,12 @@ class _reserve_ReserveProof:
                             failures.append("private namespace accessor call/escape outside closed owner " + unit.path)
                 namespace_access = isinstance(n, ast.Attribute) and n.attr in {"__globals__", "__builtins__"}
                 if isinstance(n, ast.Call):
-                    forms = reflection_forms(n.func, n)
                     argument_values = set().union(*(finite_selector_values(argument, n) for argument in n.args)) if n.args else {None}
                     relevant = possible_reflection(n.func, n) or bool(
                         argument_values - {None} & ({"__globals__", "__builtins__"} | namespace_helper_names)
                     )
                     if relevant:
+                        forms = reflection_forms(n.func, n)
                         fields = set()
                         if n.keywords or any(isinstance(argument, ast.Starred) for argument in n.args):
                             fields.add(None)
@@ -25108,12 +25108,14 @@ def test_landscape_subordinate_helper_edge_set_is_frozen() -> None:
     )
 
 
+@pytest.mark.landscape_long_run
 def test_required_work_reserve_admission_on_actual_sources() -> None:
     result = _reserve_run(_production_units())
     assert not result["global_failures"], result["global_failures"]
     assert not result["unproven_web_rows"], result["unproven_web_rows"]
 
 
+@pytest.mark.landscape_long_run
 def test_required_work_reserve_rejects_protected_instance_formal_recovery() -> None:
     """A protected constructor passed through a local formal can still mutate its class."""
     path = "src/elspeth/web/execution/service.py"
@@ -25236,6 +25238,7 @@ def test_required_work_reserve_rejects_protected_instance_formal_recovery() -> N
     )
 
 
+@pytest.mark.landscape_long_run
 def test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists() -> None:
     units = _production_units()
     violations = (

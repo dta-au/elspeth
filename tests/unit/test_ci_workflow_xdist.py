@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -15,18 +16,26 @@ import pytest
 import yaml
 
 from elspeth.testing.pytest_xdist_auto import pytest_cmdline_main
+from tests.unit.cicd.workflow_sources import EXECUTABLE_WORKFLOWS, all_workflow_paths
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
-JUDGE_GATES_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "enforce-allowlist-judge-gates.yaml"
-CODEQL_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "codeql.yaml"
+CI_WORKFLOW = EXECUTABLE_WORKFLOWS / "ci.yaml"
+JUDGE_GATES_WORKFLOW = EXECUTABLE_WORKFLOWS / "enforce-allowlist-judge-gates.yaml"
+CODEQL_WORKFLOW = EXECUTABLE_WORKFLOWS / "codeql.yaml"
 CODEQL_CONFIG = REPO_ROOT / ".github" / "codeql" / "codeql-config.yml"
+PROOF_WORKFLOW = EXECUTABLE_WORKFLOWS / "landscape-long-run.yml"
+PROOF_WORKFLOW_CALL = "./.github/workflows/landscape-long-run.yml"
+LONG_RUN_CASES = {
+    "no-escape": "test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists",
+    "reserve-actual-sources": "test_required_work_reserve_admission_on_actual_sources",
+    "protected-formal-recovery": "test_required_work_reserve_rejects_protected_instance_formal_recovery",
+}
 PR_WORKFLOWS = (
     CI_WORKFLOW,
     CODEQL_WORKFLOW,
-    REPO_ROOT / ".github" / "workflows" / "composer-redaction-gate.yml",
+    EXECUTABLE_WORKFLOWS / "composer-redaction-gate.yml",
     JUDGE_GATES_WORKFLOW,
-    REPO_ROOT / ".github" / "workflows" / "enforce-telemetry-backfill-trailer.yaml",
+    EXECUTABLE_WORKFLOWS / "enforce-telemetry-backfill-trailer.yaml",
 )
 _SHELL_CONTROL_TOKENS = frozenset({"&&", "||", ";", "|"})
 
@@ -39,6 +48,26 @@ def _workflow(path: Path) -> dict[str, Any]:
 
 def _ci_workflow() -> dict[str, Any]:
     return _workflow(CI_WORKFLOW)
+
+
+def _executable_jobs(workflow: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Only the explicitly reviewed local proof call is a non-executable job.
+
+    Every called executable job is still scanned through PROOF_WORKFLOW in the
+    all-workflow inventories and explicitly in the fork-admission inventory.
+    """
+    result: list[tuple[str, dict[str, Any]]] = []
+    for name, job in workflow["jobs"].items():
+        if "uses" not in job:
+            result.append((name, job))
+            continue
+        assert job["uses"] == PROOF_WORKFLOW_CALL, "unreviewed reusable workflow call"
+        assert set(job) <= {"uses", "name", "needs", "if", "permissions"}, "reusable call has execution or secret overrides"
+        assert job.get("permissions", {"contents": "read"}) == {"contents": "read"}, "reusable call changes token permissions"
+        target = _workflow(PROOF_WORKFLOW)
+        assert set(target.get("on", target.get(True))) == {"workflow_call"}, "proof target must be workflow_call-only"
+        assert set(target["jobs"]) == {"proof"} and "uses" not in target["jobs"]["proof"], "proof target must execute its job"
+    return result
 
 
 def _step_run(job: dict[str, Any], step_name: str) -> str:
@@ -234,10 +263,11 @@ def test_integration_job_runs_on_rc_and_release_branch_pushes() -> None:
 
     condition = integration_job["if"]
 
-    assert "github.event_name == 'push'" in condition
-    assert "refs/heads/main" in condition
-    assert "startsWith(github.ref, 'refs/heads/RC')" in condition
-    assert "startsWith(github.ref, 'refs/heads/release/')" in condition
+    assert condition == (
+        "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && "
+        "(github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || "
+        "startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/')))"
+    )
 
 
 def test_integration_lane_fails_closed_on_real_test_failures() -> None:
@@ -349,13 +379,13 @@ def test_push_workflows_include_release_branches(workflow_path: Path) -> None:
 
 def test_every_workflow_job_uses_the_declared_self_hosted_pool() -> None:
     """Hosted runners are forbidden; live topology proofs retain their cloud pool."""
-    workflow_paths = sorted((REPO_ROOT / ".github" / "workflows").iterdir())
+    workflow_paths = all_workflow_paths()
     assert CI_WORKFLOW in workflow_paths
     for workflow_path in workflow_paths:
         if workflow_path.suffix not in {".yml", ".yaml"}:
             continue
         workflow = _workflow(workflow_path)
-        for job_name, job in workflow["jobs"].items():
+        for job_name, job in _executable_jobs(workflow):
             expected = ["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]
             if workflow_path.name == "state-engine-live-provider.yml":
                 expected = ["self-hosted", "Linux", "X64", "ephemeral", "aws-ecs", "postgresql-16-rds", "state-engine-live-provider"]
@@ -363,19 +393,18 @@ def test_every_workflow_job_uses_the_declared_self_hosted_pool() -> None:
 
 
 def test_fork_pull_requests_cannot_reach_checkout_jobs() -> None:
-    """Repository PRs run locally; fork code needs admission onto a repository branch."""
-    for workflow_path in PR_WORKFLOWS:
+    """Active PR sources retain fork guards, independent of external admission."""
+    for workflow_path in (*PR_WORKFLOWS, PROOF_WORKFLOW):
+        assert workflow_path.parent == EXECUTABLE_WORKFLOWS
+        assert workflow_path.is_file()
         workflow = _workflow(workflow_path)
-        for job_name, job in workflow["jobs"].items():
+        for job_name, job in _executable_jobs(workflow):
             if not any(str(step.get("uses", "")).startswith("actions/checkout@") for step in job["steps"]):
                 continue
             condition = str(job.get("if", ""))
-            assert "github.event_name != 'pull_request'" in condition, f"{workflow_path.name}:{job_name} lacks event admission"
-            if condition == "github.event_name != 'pull_request'":
-                continue
-            assert "github.event.pull_request.head.repo.full_name == github.repository" in condition, (
-                f"{workflow_path.name}:{job_name} can execute fork code locally"
-            )
+            assert (
+                "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository" in condition
+            ), f"{workflow_path.name}:{job_name} lacks fork guard in active source"
 
 
 @pytest.mark.parametrize("workflow_path,job_name", [(CI_WORKFLOW, "ci-success"), (JUDGE_GATES_WORKFLOW, "judge-gates-success")])
@@ -400,13 +429,13 @@ def test_fork_pull_requests_fail_aggregate_statuses_without_checkout(
 def test_local_checkouts_are_isolated_between_jobs_and_attempts() -> None:
     """Host jobs cannot inherit root-owned container environments from another run."""
     paths: set[str] = set()
-    for workflow_path in sorted((REPO_ROOT / ".github" / "workflows").iterdir()):
+    for workflow_path in all_workflow_paths():
         if workflow_path.suffix not in {".yml", ".yaml"}:
             continue
         if workflow_path.name == "state-engine-live-provider.yml":
             continue  # This workflow retains disposable cloud runners for topology proofs.
         workflow = _workflow(workflow_path)
-        for job_name, job in workflow["jobs"].items():
+        for job_name, job in _executable_jobs(workflow):
             for step in job["steps"]:
                 if not str(step.get("uses", "")).startswith("actions/checkout@"):
                     continue
@@ -422,7 +451,7 @@ def test_local_checkouts_are_isolated_between_jobs_and_attempts() -> None:
 
 def test_no_workflow_references_the_operator_hmac_key() -> None:
     """A key injected at job/workflow scope is as reachable as a step secret."""
-    workflow_paths = sorted((REPO_ROOT / ".github" / "workflows").iterdir())
+    workflow_paths = all_workflow_paths()
     assert CI_WORKFLOW in workflow_paths
     for workflow_path in workflow_paths:
         if workflow_path.suffix in {".yml", ".yaml"}:
@@ -455,7 +484,7 @@ def test_all_automatic_workflows_exclude_paid_judge_quality() -> None:
     This configuration guard does not follow wrapper scripts or reusable actions;
     caller inspection remains part of workflow review.
     """
-    paths = sorted((REPO_ROOT / ".github" / "workflows").glob("*.y*ml"))
+    paths = all_workflow_paths()
     assert CI_WORKFLOW in paths
     assert JUDGE_GATES_WORKFLOW in paths
     for path in paths:
@@ -519,3 +548,275 @@ def test_test_job_reports_through_junit_not_verbose_log() -> None:
     upload = _step(test_job, "Upload JUnit report")
     assert upload["if"] == "always()"
     assert upload["with"]["path"] == "${{ env.CI_CHECKOUT_PATH }}/pytest-junit.xml"
+
+
+def test_reviewed_local_proof_call_preserves_executable_policy_inventory() -> None:
+    executable = {"runs-on": ["self-hosted"], "steps": [{"run": "false"}]}
+    assert _executable_jobs({"jobs": {"call": {"uses": PROOF_WORKFLOW_CALL}, "native": executable}}) == [("native", executable)]
+    assert _executable_jobs(_workflow(PROOF_WORKFLOW)) == [("proof", _workflow(PROOF_WORKFLOW)["jobs"]["proof"])]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"uses": "untrusted/repo/.github/workflows/proof.yml@main"},
+        {"uses": "./.github/workflows/other.yml"},
+        {"uses": "./.github/workflows/landscape-no-escape.yml"},
+        {"uses": "./.github/workflows/../workflows/landscape-no-escape.yml"},
+        {"steps": [{"run": "false"}]},
+        {"runs-on": "ubuntu-latest"},
+        {"env": {"BYPASS": "1"}},
+        {"secrets": "inherit"},
+        {"with": {"command": "true"}},
+        {"continue-on-error": True},
+        {"permissions": {"contents": "write"}},
+    ],
+)
+def test_reusable_call_cannot_bypass_executable_policy(override: dict[str, Any]) -> None:
+    job = {"uses": PROOF_WORKFLOW_CALL, **override}
+    with pytest.raises(AssertionError):
+        _executable_jobs({"jobs": {"call": job}})
+
+
+def _assert_long_run_workflow_contract(workflow: dict[str, Any]) -> None:
+    assert set(workflow.get("on", workflow.get(True))) == {"workflow_call"}
+    assert "concurrency" not in workflow and "defaults" not in workflow
+    assert workflow["permissions"] == {"contents": "read"}
+    assert workflow["env"] == {"UV_VERSION": "0.10.2"}
+    assert set(workflow["jobs"]) == {"proof"}
+    job = workflow["jobs"]["proof"]
+    assert "uses" not in job and "defaults" not in job
+    assert job.get("continue-on-error", False) is False
+    assert job["if"] == "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
+    assert job["name"] == "Landscape ${{ matrix.proof-case }} (${{ matrix.python-version }})"
+    assert job["timeout-minutes"] == "${{ matrix.job-timeout-minutes }}"
+    assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["max-parallel"] == 2
+    assert set(job["strategy"]["matrix"]) == {"include"}
+    rows = job["strategy"]["matrix"]["include"]
+    assert len(rows) == 6
+    assert {(row["proof-case"], row["python-version"]) for row in rows} == {
+        (case, version) for case in LONG_RUN_CASES for version in ("3.12", "3.13")
+    }
+    images = {
+        "3.12": "python:3.12-bookworm@sha256:dbbe4ceb97851e2e5fa83798b239811f871cb743b259ba3563737349f6bcfaa0",
+        "3.13": "python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea",
+    }
+    for row in rows:
+        assert set(row) == {
+            "proof-case",
+            "proof-nodeid",
+            "python-version",
+            "coverage",
+            "execution-timeout-seconds",
+            "job-timeout-minutes",
+            "ci-container-image",
+        }
+        version = row["python-version"]
+        assert row["proof-nodeid"] == "tests/unit/architecture/test_web_landscape_mutation_fencing.py::" + LONG_RUN_CASES[row["proof-case"]]
+        assert row["coverage"] is (version == "3.13")
+        assert row["execution-timeout-seconds"] == (14400 if version == "3.13" else 7200)
+        assert row["job-timeout-minutes"] == (270 if version == "3.13" else 150)
+        assert row["ci-container-image"] == images[version]
+    assert job["container"] == {"image": "${{ matrix.ci-container-image }}", "options": "--ulimit nofile=65536:524288"}
+    assert job["env"] == {
+        "CI_CHECKOUT_PATH": "ci-${{ github.run_id }}-${{ github.run_attempt }}-landscape-proof-${{ matrix.proof-case }}-${{ matrix.python-version }}",
+        "UV_PYTHON": "${{ matrix.python-version }}",
+        "COVERAGE_FILE": "coverage-data",
+        "PROOF_CASE": "${{ matrix.proof-case }}",
+        "PROOF_NODEID": "${{ matrix.proof-nodeid }}",
+        "PROOF_TIMEOUT_SECONDS": "${{ matrix.execution-timeout-seconds }}",
+    }
+    assert _step(job, "Checkout code")["with"] == {"path": "${{ env.CI_CHECKOUT_PATH }}", "ref": "${{ github.sha }}", "fetch-depth": 0}
+    assert _step(job, "Install dependencies")["run"] == "uv sync --frozen --all-extras"
+    for covered, name in ((True, "Run long-run proof with coverage"), (False, "Run long-run proof without coverage")):
+        step = _step(job, name)
+        assert set(step) == {"name", "if", "working-directory", "run"}
+        assert step["if"] == ("matrix.coverage" if covered else "${{ !matrix.coverage }}")
+        assert step["working-directory"] == "${{ env.CI_CHECKOUT_PATH }}"
+        expected = [
+            "uv",
+            "run",
+            "python",
+            "scripts/ci_proof_progress.py",
+            "--nodeid",
+            "$PROOF_NODEID",
+            "--timeout-seconds",
+            "$PROOF_TIMEOUT_SECONDS",
+            "--heartbeat-seconds",
+            "30",
+            "--grace-seconds",
+            "10",
+            "--report",
+            "proof-progress.json",
+            "--",
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "pytest",
+            "tests/",
+            "-p",
+            "scripts.ci_test_shards",
+            "--ci-partition=proof",
+            "--ci-proof-case=$PROOF_CASE",
+            "--ci-shard-count=1",
+            "--ci-shard-index=0",
+            "--ci-shard-report=shard-manifest.json",
+        ]
+        if covered:
+            expected.extend(["--cov=src/elspeth", "--cov-report=", "--cov-fail-under=0"])
+        expected.extend(["-n", "0", "-q", "-rfE", "--junitxml=pytest-junit.xml"])
+        # Compare the whole executable block, not only pytest args before a shell
+        # operator: prefixes and later newline commands can also mask failures.
+        assert shlex.split(step["run"].replace("\\\n", " ")) == expected
+        assert not any(token in step["run"] for token in ("`", "$(", "||", "&&", ";", "|"))
+    upload = _step(job, "Upload proof selection, coverage and execution evidence")
+    assert upload["if"] == "always()"
+    assert upload.get("continue-on-error", False) is False
+    assert upload["with"] == {
+        "name": "landscape-proof-${{ matrix.proof-case }}-${{ matrix.python-version }}-attempt-${{ github.run_attempt }}",
+        "path": "".join(
+            "${{ env.CI_CHECKOUT_PATH }}/" + name + "\n"
+            for name in (
+                "shard-manifest.json",
+                "coverage-data",
+                "pytest-junit.xml",
+                "proof-progress.json",
+            )
+        ),
+        "if-no-files-found": "error",
+        "retention-days": 7,
+    }
+
+
+def test_three_case_workflow_is_called_complete_and_serial() -> None:
+    _assert_long_run_workflow_contract(_workflow(PROOF_WORKFLOW))
+    calls = [
+        (path.name, name, job["uses"]) for path in all_workflow_paths() for name, job in _workflow(path)["jobs"].items() if "uses" in job
+    ]
+    assert calls == [("ci.yaml", "landscape-proof", PROOF_WORKFLOW_CALL)]
+    _executable_jobs(_ci_workflow())
+    assert not (REPO_ROOT / ".github/workflows/landscape-no-escape.yml").exists()
+
+
+@pytest.mark.parametrize("row_index", range(6))
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("proof-case", "unknown"),
+        ("proof-nodeid", "tests/wrong.py::test_wrong"),
+        ("python-version", "3.14"),
+        ("coverage", "true"),
+        ("execution-timeout-seconds", 1),
+        ("job-timeout-minutes", 1),
+        ("ci-container-image", "python:latest"),
+    ],
+)
+def test_three_case_contract_rejects_every_misbound_row(row_index: int, field: str, value: object) -> None:
+    workflow = copy.deepcopy(_workflow(PROOF_WORKFLOW))
+    workflow["jobs"]["proof"]["strategy"]["matrix"]["include"][row_index][field] = value
+    with pytest.raises(AssertionError):
+        _assert_long_run_workflow_contract(workflow)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "omit",
+        "duplicate",
+        "trigger",
+        "permissions",
+        "concurrency",
+        "fork",
+        "continue",
+        "fail-fast",
+        "capacity",
+        "checkout",
+        "artifact",
+        "node-env",
+        "native-identity",
+        "upload-condition",
+    ],
+)
+def test_three_case_contract_rejects_identity_and_admission_bypasses(mutation: str) -> None:
+    workflow = copy.deepcopy(_workflow(PROOF_WORKFLOW))
+    job = workflow["jobs"]["proof"]
+    rows = job["strategy"]["matrix"]["include"]
+    if mutation == "omit":
+        rows.pop()
+    elif mutation == "duplicate":
+        rows[-1] = rows[0]
+    elif mutation == "trigger":
+        workflow[True]["push"] = {}
+    elif mutation == "permissions":
+        workflow["permissions"] = {"contents": "write"}
+    elif mutation == "concurrency":
+        workflow["concurrency"] = {"group": "${{ github.workflow }}-${{ github.ref }}"}
+    elif mutation == "fork":
+        job["if"] = "always()"
+    elif mutation == "continue":
+        job["continue-on-error"] = True
+    elif mutation == "fail-fast":
+        job["strategy"]["fail-fast"] = True
+    elif mutation == "capacity":
+        job["strategy"]["max-parallel"] = 6
+    elif mutation == "checkout":
+        job["env"]["CI_CHECKOUT_PATH"] = "ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.python-version }}"
+    elif mutation == "artifact":
+        _step(job, "Upload proof selection, coverage and execution evidence")["with"]["name"] = "latest-success"
+    elif mutation == "node-env":
+        job["env"]["PROOF_NODEID"] = "$PROOF_CASE"
+    elif mutation == "native-identity":
+        job["env"]["GITHUB_SHA"] = "old-success"
+    elif mutation == "upload-condition":
+        _step(job, "Upload proof selection, coverage and execution evidence")["if"] = "success()"
+    with pytest.raises(AssertionError):
+        _assert_long_run_workflow_contract(workflow)
+
+
+@pytest.mark.parametrize("step_name", ["Run long-run proof with coverage", "Run long-run proof without coverage"])
+@pytest.mark.parametrize(
+    "mutation", ["or-true", "newline-exit", "newline-true", "prefix-true", "marker", "partition", "case", "parallel", "step-continue"]
+)
+def test_three_case_commands_cannot_mask_supervisor_failure(step_name: str, mutation: str) -> None:
+    workflow = copy.deepcopy(_workflow(PROOF_WORKFLOW))
+    step = _step(workflow["jobs"]["proof"], step_name)
+    if mutation == "or-true":
+        step["run"] += " || true"
+    elif mutation == "newline-exit":
+        step["run"] += "\nexit 0\n"
+    elif mutation == "newline-true":
+        step["run"] += "\ntrue\n"
+    elif mutation == "prefix-true":
+        step["run"] = "true " + step["run"]
+    elif mutation == "marker":
+        step["run"] += " -m landscape_long_run"
+    elif mutation == "partition":
+        step["run"] = step["run"].replace("--ci-partition=proof", "--ci-partition=all")
+    elif mutation == "case":
+        step["run"] = step["run"].replace('--ci-proof-case="$PROOF_CASE"', "--ci-proof-case=no-escape")
+    elif mutation == "parallel":
+        step["run"] = step["run"].replace("-n 0", "-n 2")
+    elif mutation == "step-continue":
+        step["continue-on-error"] = True
+    with pytest.raises(AssertionError):
+        _assert_long_run_workflow_contract(workflow)
+
+
+@pytest.mark.parametrize(
+    "job_name,step_name",
+    [
+        ("coverage", "Require every test shard and exhaustive proof to pass"),
+        ("ci-success", "Check all jobs passed"),
+    ],
+)
+@pytest.mark.parametrize("proof_result", ["success", "failure", "cancelled", "skipped", "timed_out", ""])
+def test_active_native_proof_result_remains_required(job_name: str, step_name: str, proof_result: str) -> None:
+    job = _ci_workflow()["jobs"][job_name]
+    assert "landscape-proof" in job["needs"]
+    run = _step_run(job, step_name)
+    assert "${{ needs.landscape-proof.result }}" in run
+    run = re.sub(r"\$\{\{ needs\.([\w-]+)\.result }}", lambda match: proof_result if match[1] == "landscape-proof" else "success", run)
+    result = subprocess.run(["bash", "-e", "-c", run], capture_output=True, text=True, check=False, timeout=5)
+    assert result.returncode == (0 if proof_result == "success" else 1), result.stdout + result.stderr
