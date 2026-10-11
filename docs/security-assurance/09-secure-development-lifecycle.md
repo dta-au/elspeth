@@ -223,8 +223,9 @@ evidence to capture; the required check name itself remains
 A skipped or cancelled job counts as a failure. The `Integration Tests` job
 (tests that may call a live model) runs only on pushes to protected
 branches, after `Test`. It is not part of `CI Success`, but it fails the CI
-workflow run, and image publication after CI on `main` requires that run to
-have succeeded (§ 6.2) [EV-604] [EV-617] [EV-625].
+workflow run [EV-604] [EV-617]. Automatic image publication after main CI is
+currently held; the admitted tag/manual publication paths and their required
+checks are described in § 6.2 [EV-625].
 
 ### 2.2 Gate table
 
@@ -516,18 +517,19 @@ Limits an assessor should weigh:
 
 ### 6.2 When an image is published
 
-`build-push.yaml` runs on three triggers:
+[`build-push.yaml`](../../.github/workflows/build-push.yaml) receives three
+event types. Automatic publication after main CI is currently held:
 
 | Trigger | Condition |
 |---|---|
-| After CI on `main` | The CI run concluded `success`, was a `push` event, and came from this repository (not a fork) |
+| After CI on `main` | Observed only: the build job is held and its dependent jobs are skipped, including after successful trusted push CI |
 | Version tag `v*` | Any pushed tag; a hyphen marks a pre-release, published as a GitHub prerelease |
 | Manual dispatch | Registry choice: GHCR, ACR or both |
 
 The triggers and their admission conditions are defined by the release
 workflow [EV-625] [EV-626].
 
-In every case the first step,
+For admitted version-tag or manual publication, the required-check gate,
 `scripts/cicd/check_release_required_checks.py`, reads the live `main`
 ruleset, takes its required status checks, and refuses to publish unless the
 image commit has successful evidence for every one. Only missing PR-only
@@ -611,8 +613,9 @@ cosign verify \
   "ghcr.io/dta-au/elspeth-llm-gateway@sha256:<digest>"
 ```
 
-For an image built after CI on `main`, the identity ends in
-`@refs/heads/main`. Then confirm that the image's
+For an image built by an admitted manual dispatch on `main`, the identity
+ends in `@refs/heads/main`; automatic publication after main CI is held.
+Then confirm that the image's
 `org.opencontainers.image.revision` label names the commit being assessed.
 The Azure Container Apps runbooks carry an equivalent step
 ([first deployment](../runbooks/azure-container-apps-deployment.md),
