@@ -9,7 +9,7 @@
 # Base image is pinned by digest (not just the ``3.12-alpine`` tag) so a
 # repository push behind that tag can never silently change what this
 # image is built FROM.
-FROM python:3.12-alpine@sha256:4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111 AS builder
+FROM python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72 AS builder
 
 ARG GATEWAY_REVISION
 RUN test -n "$GATEWAY_REVISION"
@@ -54,7 +54,7 @@ RUN VIRTUAL_ENV=/build-venv PATH="/build-venv/bin:$PATH" uv build \
       --active && \
     uv pip install --python /venv/bin/python --no-deps /dist/elspeth_llm_gateway-*.whl
 
-FROM python:3.12-alpine@sha256:4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111
+FROM python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72
 
 ARG GATEWAY_REVISION
 LABEL org.opencontainers.image.revision="${GATEWAY_REVISION}" \
