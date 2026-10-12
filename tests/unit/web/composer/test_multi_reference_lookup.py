@@ -18,6 +18,7 @@ from elspeth.web.composer.tools import _prevalidate_plugin_options
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate
 from elspeth.web.composer.tools.transforms import _execute_patch_node_options, _execute_upsert_node
 from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
+from tests.unit.plugins.transforms.test_reference_join_multi import chained_options
 from tests.unit.web.composer.test_authoring_reconciliation import _exact_arguments, _node, _state, _trained_context
 from tests.unit.web.execution.test_validate_blob_inline import BLOB_ID, _ready_blob_record, _state_with_reference_join
 
@@ -170,3 +171,49 @@ def test_catalog_exposes_typed_lookup_list_and_table_map() -> None:
     lookup_schema = next(item for item in properties["lookups"]["anyOf"] if item.get("type") == "array")
     lookup_ref = lookup_schema["items"]["$ref"].rsplit("/", 1)[-1]
     assert set(schema["$defs"][lookup_ref]["required"]) >= {"table", "key_field", "reference_key_name", "output"}
+
+
+def test_chained_uploaded_tables_validate_with_distinct_content_bindings(tmp_path: Path) -> None:
+    session_id = uuid4()
+    options = chained_options()
+    options["lookups"][0]["output"] = {"product_code": "ref['code']"}
+    for lookup in options["lookups"][1:]:
+        lookup["key_field"] = "product_code"
+    records: dict[UUID, tuple[BlobRecord, bytes]] = {}
+    for name, table in options["tables"].items():
+        blob_id = uuid4()
+        content = table["reference_content"].encode()
+        digest = hashlib.sha256(content).hexdigest()
+        record = replace(
+            _ready_blob_record(session_id=session_id, size_bytes=len(content)),
+            id=blob_id,
+            filename=f"{name}.csv",
+            mime_type="text/csv",
+            content_hash=digest,
+        )
+        records[blob_id] = (record, content)
+        table["reference_content"] = {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": digest}
+    state = _state_with_reference_join(tmp_path, session_id=session_id, reference_format="csv", content="sku,label\nhat,Hat\n")
+    authoring_state = _state(nodes=(_node(node_id="join", plugin="reference_join", options=options),))
+    arguments = _exact_arguments(authoring_state)
+    assert arguments.success, arguments.validation
+    candidate = build_set_pipeline_candidate(deep_thaw(arguments.data), authoring_state, _trained_context()).result
+    assert candidate.success, candidate.validation
+    state = replace(state, nodes=(replace(state.nodes[0], options=candidate.updated_state.nodes[0].options),))
+    reads: list[UUID] = []
+
+    def get_content(blob_id: UUID) -> tuple[BlobRecord, bytes]:
+        reads.append(blob_id)
+        return records[blob_id]
+
+    result = validate_pipeline_for_trained_operator(
+        state,
+        SimpleNamespace(data_dir=tmp_path),
+        yaml_generator,
+        blob_get_metadata=lambda blob_id: records[blob_id][0],
+        blob_get_content=get_content,
+        session_id=str(session_id),
+    )
+    assert result.is_valid, result.errors
+    assert len(reads) == 3
+    assert set(reads) == records.keys()

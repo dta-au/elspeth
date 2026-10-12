@@ -18,6 +18,7 @@ elspeth run --settings examples/reference_join/settings.yaml --execute
 elspeth run --settings examples/reference_join/settings_nested.yaml --execute
 elspeth run --settings examples/reference_join/settings_missing_product.yaml --execute   # exits 1 BY DESIGN
 elspeth run --settings examples/reference_join/settings_multi.yaml --execute             # exits 1 BY DESIGN
+elspeth run --settings examples/reference_join/settings_chained.yaml --execute           # exits 1 BY DESIGN
 ```
 
 | Config | Table | Rows | Ends |
@@ -26,6 +27,7 @@ elspeth run --settings examples/reference_join/settings_multi.yaml --execute    
 | `settings_nested.yaml` | `products.json` (nested, one sparse entry) | 5 | SUCCESS, exit 0 |
 | `settings_missing_product.yaml` | `products.csv` (flat) | 3 | **PARTIAL, exit 1 by design** |
 | `settings_multi.yaml` | `products.csv`, `regions.csv`, `tax_rates.csv` | 5 | **PARTIAL, exit 1 by design**: 4 enriched, 1 original row quarantined |
+| `settings_chained.yaml` | `product_aliases.csv`, `products.csv`, `fulfilment.csv` | 4 | **PARTIAL, exit 1 by design**: 3 enriched, 1 original row quarantined |
 
 ## Multiple CSV lookups, independent defaults, atomic quarantine
 
@@ -37,9 +39,9 @@ elspeth run --settings examples/reference_join/settings_multi.yaml --execute    
 | `region_code` | `regions.csv` / `code` | `region` | Default `Unmapped region` |
 | `tax_code` | `tax_rates.csv` / `code` | `tax_rate` | Fail the whole row |
 
-Each lookup reads its key from the original arriving row. A lookup cannot use
-another lookup's newly generated output. CSV values and the configured defaults
-here are strings; this variant deliberately does not coerce numeric text.
+In this variant each lookup reads its key from the original arriving row.
+CSV values and the configured defaults here are strings; this variant
+deliberately does not coerce numeric text.
 
 The deterministic fixture has these outcomes:
 
@@ -59,6 +61,37 @@ the error to lookup index 2, table `taxes`, reason `reference_miss`. The success
 rows record per-lookup match/default attribution. The audit database is
 `runs/multi_audit.db`; the four successful rows plus one quarantined row make the
 run PARTIAL and the CLI exit 1.
+
+## Resolve one shared key, then reuse it across tables
+
+`settings_chained.yaml` runs these lookups in configuration order:
+
+| Input key | CSV / search column | Returned expression → output field | Miss policy |
+|---|---|---|---|
+| `product_alias` | `product_aliases.csv` / `alias` | `ref['sku']` → `product_code` | Default string `socks` |
+| `product_code` from lookup 0 | `products.csv` / `sku` | `ref['description']` → `product_description`; `ref['unit_price']` → `unit_price` | Fail |
+| `product_code` from lookup 0 | `fulfilment.csv` / `sku` | `ref['warehouse']` → `warehouse` | Fail |
+
+C-1001 resolves `sunhat` to `hats`, then obtains the product and warehouse.
+C-1002 has an unknown alias: its configured default `socks` is a normal lookup
+key in both later tables. C-1004 resolves `raincoat` to `coats`. C-1003 resolves
+`driving-gloves` to `gloves` and finds its product, but has no fulfilment entry:
+the entire original order goes to `output/chained_quarantine.csv`, with exactly
+`order_id`, `product_alias`, and `quantity`. No intermediate key, description,
+or price is emitted. Landscape records lookup index 2 and table `fulfilment`.
+
+Self and forward references are rejected at configuration load, as are
+duplicate output names. Outputs cannot overwrite arriving fields. Schema and
+required-input admission happen before lookup evaluation; for admitted rows,
+the first failing lookup stops processing. Closed source schemas reject
+unavailable external keys at validation; an observed source checks their
+presence for each row at execution.
+
+`on_miss: null` produces a null output, but null is an invalid key if a later
+lookup consumes it. That consumer fails with `invalid_input`, even with its
+own null/default policy. A configured default string is looked up normally;
+if the string is absent from the next table, that lookup uses its own miss
+policy. A null output that is not used as a key can remain in a successful row.
 
 ## The three things worth understanding
 
@@ -140,5 +173,7 @@ back onto the main line, which is this transform.
 | `products.json` | Nested reference table; `socks` deliberately lacks `tax` |
 | `orders_multi.csv` | Five orders exercising three independent CSV lookups |
 | `regions.csv`, `tax_rates.csv` | Additional configuration tables for the multi-lookup variant |
+| `orders_chained.csv` | Four orders exercising shared-key chaining and original-row quarantine |
+| `product_aliases.csv`, `fulfilment.csv` | Alias-to-product key and product-to-warehouse tables |
 | `output/` | Written by the runs |
 | `runs/` | Landscape audit databases, one per config |

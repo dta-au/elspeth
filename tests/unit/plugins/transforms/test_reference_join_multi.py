@@ -1,5 +1,6 @@
 """Multi-table reference joins preserve atomic enrichment and load-time validation."""
 
+import json
 from copy import deepcopy
 from typing import Any
 
@@ -24,6 +25,140 @@ def options() -> dict[str, Any]:
             {"table": "regions", "key_field": "postcode", "reference_key_name": "postcode", "output": {"region": "ref['region']"}},
         ],
     }
+
+
+def chained_options() -> dict[str, Any]:
+    cfg = options()
+    cfg["tables"]["regions"]["reference_content"] = "code,region\nH,Sydney\n"
+    cfg["tables"]["taxes"] = {"reference_content": "code,rate\nH,0.10\n", "reference_format": "csv"}
+    cfg["lookups"][0]["output"] = {"shared_key": "ref['code']"}
+    cfg["lookups"][1]["key_field"] = "shared_key"
+    cfg["lookups"][1]["reference_key_name"] = "code"
+    cfg["lookups"].append(
+        {"table": "taxes", "key_field": "shared_key", "reference_key_name": "code", "output": {"tax_rate": "ref['rate']"}}
+    )
+    return cfg
+
+
+def test_chained_lookups_share_an_earlier_output_without_requiring_it_in_input() -> None:
+    transform = ReferenceJoin(chained_options())
+    original = {"product": "hat", "order_id": "A-1001"}
+    row = make_pipeline_row(original)
+    result = transform.process(row, make_source_context())
+
+    assert result.row is not None
+    assert result.row.to_dict() == {**original, "shared_key": "H", "region": "Sydney", "tax_rate": "0.10"}
+    assert row.to_dict() == original
+    assert transform.declared_input_fields == frozenset({"product"})
+    assert transform.declared_output_fields == frozenset({"shared_key", "region", "tax_rate"})
+    assert result.success_reason is not None
+    assert [(item["lookup_index"], item["table"]) for item in result.success_reason["metadata"]["lookups"]] == [
+        (0, "products"),
+        (1, "regions"),
+        (2, "taxes"),
+    ]
+
+
+def test_chained_default_string_is_used_as_the_next_lookup_key() -> None:
+    cfg = chained_options()
+    cfg["lookups"][0].update(on_miss="default", default_values={"shared_key": "H"})
+    result = ReferenceJoin(cfg).process(make_pipeline_row({"product": "unlisted"}), make_source_context())
+
+    assert result.row is not None
+    assert result.row.to_dict() == {"product": "unlisted", "shared_key": "H", "region": "Sydney", "tax_rate": "0.10"}
+    assert result.success_reason is not None
+    assert [item["matched"] for item in result.success_reason["metadata"]["lookups"]] == [False, True, True]
+
+
+@pytest.mark.parametrize("downstream_policy", ["fail", "null", "default"])
+def test_chained_null_is_invalid_input_even_when_downstream_has_a_miss_policy(downstream_policy: str) -> None:
+    cfg = chained_options()
+    cfg["lookups"][0]["on_miss"] = "null"
+    cfg["lookups"][1].update(on_miss=downstream_policy, default_values={"region": "Unmapped"})
+    original = {"product": "unlisted", "order_id": "A-1002"}
+    row = make_pipeline_row(original)
+    result = ReferenceJoin(cfg).process(row, make_source_context())
+
+    assert result.row is None
+    assert row.to_dict() == original
+    assert result.reason is not None
+    assert result.reason["reason"] == "invalid_input"
+    assert result.reason["field"] == "shared_key"
+    assert result.reason["lookup_index"] == 1
+    assert result.reason["table"] == "regions"
+    assert "NoneType" in result.reason["error"]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_chained_misses_report_first_lookup_in_configuration_order(reverse: bool) -> None:
+    cfg = chained_options()
+    cfg["lookups"][0].update(on_miss="default", default_values={"shared_key": "unmatched-private-key"})
+    if reverse:
+        cfg["lookups"][1:] = list(reversed(cfg["lookups"][1:]))
+    original = {"product": "unlisted", "order_id": "A-1003"}
+    row = make_pipeline_row(original)
+    result = ReferenceJoin(cfg).process(row, make_source_context())
+
+    assert result.row is None
+    assert row.to_dict() == original
+    assert result.reason is not None
+    assert result.reason["reason"] == "reference_miss"
+    assert result.reason["lookup_index"] == 1
+    assert result.reason["table"] == ("taxes" if reverse else "regions")
+    assert "unmatched-private-key" not in repr(result.reason)
+
+
+def test_chained_declared_inputs_preserve_explicit_external_requirements() -> None:
+    cfg = chained_options()
+    cfg["required_input_fields"] = ["trace_id"]
+    assert ReferenceJoin(cfg).declared_input_fields == frozenset({"product", "trace_id"})
+
+
+def test_chained_keys_can_depend_on_multiple_earlier_stages_and_normalize_whitespace() -> None:
+    cfg = chained_options()
+    cfg["lookups"][1]["key_field"] = " shared_key "
+    cfg["lookups"][2]["key_field"] = "region"
+    cfg["tables"]["taxes"]["reference_content"] = "code,rate\nSydney,0.10\n"
+    transform = ReferenceJoin(cfg)
+    result = transform.process(make_pipeline_row({"product": "hat"}), make_source_context())
+    assert result.row is not None
+    assert result.row["tax_rate"] == "0.10"
+    assert transform.declared_input_fields == frozenset({"product"})
+
+
+@pytest.mark.parametrize("key", ["shared_key", " region "])
+def test_chained_self_and_forward_references_are_rejected(key: str) -> None:
+    cfg = chained_options()
+    cfg["lookups"][0]["key_field"] = key
+    with pytest.raises(PluginConfigError, match=r"lookup 0 key_field.*not yet available"):
+        ReferenceJoin(cfg)
+
+
+@pytest.mark.parametrize("value", [None, ["private-intermediate"], {"private-intermediate": "value"}])
+def test_matched_invalid_intermediate_is_not_a_downstream_miss(value: object) -> None:
+    cfg = chained_options()
+    cfg["tables"]["products"] = {
+        "reference_format": "json",
+        "reference_content": json.dumps([{"sku": "hat", "code": value}]),
+    }
+    cfg["lookups"][1].update(on_miss="default", default_values={"region": "Unmapped"})
+    result = ReferenceJoin(cfg).process(make_pipeline_row({"product": "hat"}), make_source_context())
+    assert result.row is None
+    assert result.reason is not None
+    assert result.reason["reason"] == "invalid_input"
+    assert result.reason["lookup_index"] == 1
+    assert "private-intermediate" not in repr(result.reason)
+
+
+@pytest.mark.parametrize("policy,expected", [("null", None), ("default", "Unmapped")])
+def test_missing_default_string_uses_downstream_lookup_policy(policy: str, expected: str | None) -> None:
+    cfg = chained_options()
+    cfg["lookups"][0].update(on_miss="default", default_values={"shared_key": "missing"})
+    cfg["lookups"][1].update(on_miss=policy, default_values={"region": "Unmapped"})
+    cfg["lookups"][2].update(on_miss="default", default_values={"tax_rate": "0.00"})
+    result = ReferenceJoin(cfg).process(make_pipeline_row({"product": "unknown"}), make_source_context())
+    assert result.row is not None
+    assert result.row.to_dict() == {"product": "unknown", "shared_key": "missing", "region": expected, "tax_rate": "0.00"}
 
 
 def test_distinct_tables_enrich_atomically_with_per_lookup_audit() -> None:
@@ -107,7 +242,7 @@ def test_shared_table_parsed_once_but_distinct_match_semantics(monkeypatch: pyte
     "change,error",
     [
         ("duplicate_output", "duplicate output"),
-        ("chaining", "key_field"),
+        ("forward_reference", "key_field"),
         ("unknown_table", "unknown table"),
         ("empty_lookups", "at least one lookup"),
         ("mixed", "mutually exclusive"),
@@ -121,8 +256,8 @@ def test_invalid_multi_configuration_rejected_at_load(change: str, error: str) -
     cfg = options()
     if change == "duplicate_output":
         cfg["lookups"][1]["output"] = {"description": "ref['region']"}
-    elif change == "chaining":
-        cfg["lookups"][1]["key_field"] = "description"
+    elif change == "forward_reference":
+        cfg["lookups"][0]["key_field"] = "region"
     elif change == "unknown_table":
         cfg["lookups"][1]["table"] = "absent"
     elif change == "empty_lookups":

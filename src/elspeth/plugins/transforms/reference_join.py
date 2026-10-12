@@ -657,11 +657,13 @@ class ReferenceTableConfig(BaseModel):
 
 
 class ReferenceLookupConfig(BaseModel):
-    """An independent lookup against a named table."""
+    """An ordered lookup against a named table."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
     table: str = Field(min_length=1, description="Name of an entry in tables; multiple lookups may share one table.")
-    key_field: str = Field(description="Key field read from the original input row. Lookups never read another lookup's outputs.")
+    key_field: str = Field(
+        description="Key field from the original input row or an earlier lookup's output. No self or forward references."
+    )
     reference_key_name: str = Field(description="Match column within the reference table, not a pipeline row field.")
     output: Annotated[dict[str, str], EmittedToOutput("output names and expression literals reach row data")] = Field(
         description="Distinct output fields mapped to expressions over ref, the matched reference entry. No row access."
@@ -754,7 +756,7 @@ class _ReferenceJoinConfigWire(TypedDict, total=False):
 
 
 class ReferenceJoinConfig(TransformDataConfig):
-    """One legacy lookup, or named tables and independent lookup specifications."""
+    """One legacy lookup, or named tables and ordered lookup specifications."""
 
     reference_content: Annotated[
         str | None, EmittedToOutput("inline reference text can reach row data after environment expansion", reject_at_validation=False)
@@ -777,7 +779,9 @@ class ReferenceJoinConfig(TransformDataConfig):
         default_factory=dict, description=_SingleReferenceJoinConfig.model_fields["default_values"].description
     )
     tables: dict[str, ReferenceTableConfig] | None = Field(default=None, description="Named configuration-bound reference tables.")
-    lookups: list[ReferenceLookupConfig] | None = Field(default=None, description="Independent lookups that read the original input row.")
+    lookups: list[ReferenceLookupConfig] | None = Field(
+        default=None, description="Lookups evaluated in configuration order; later keys may consume earlier outputs."
+    )
     _compiled_lookups: tuple[_CompiledLookup, ...] = PrivateAttr()
 
     @model_serializer(mode="wrap")
@@ -833,9 +837,12 @@ class ReferenceJoinConfig(TransformDataConfig):
                 if duplicate:
                     raise ValueError(f"duplicate output fields across lookups: {sorted(duplicate)}")
                 output_names.update(spec.output)
-            for spec in self.lookups:
-                if spec.key_field.strip() in output_names:
-                    raise ValueError(f"key_field {spec.key_field!r} names an output field; lookups must read the original row")
+            available_outputs: set[str] = set()
+            for lookup_index, spec in enumerate(self.lookups):
+                key_field = spec.key_field.strip()
+                if key_field in output_names and key_field not in available_outputs:
+                    raise ValueError(f"lookup {lookup_index} key_field {spec.key_field!r} references an output not yet available")
+                available_outputs.update(spec.output)
             # Configuration-scoped cache: never a filename or a global cache.
             # The named table binds both content and format; indexes are built
             # separately for each match-column/output-expression combination.
@@ -871,7 +878,13 @@ class ReferenceJoinConfig(TransformDataConfig):
 
     @property
     def declared_input_fields(self) -> frozenset[str]:
-        return super().declared_input_fields | frozenset(lookup.config.key_field for lookup in self._compiled_lookups)
+        required = set(super().declared_input_fields)
+        available_outputs: set[str] = set()
+        for lookup in self._compiled_lookups:
+            if lookup.config.key_field not in available_outputs:
+                required.add(lookup.config.key_field)
+            available_outputs.update(lookup.config.output)
+        return frozenset(required)
 
 
 class ReferenceJoin(BaseTransform):
@@ -884,7 +897,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6652161bbf2122c6"
+    source_file_hash: str | None = "sha256:4ae18cd4950c7221"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -980,8 +993,12 @@ class ReferenceJoin(BaseTransform):
                     "with the top-level single-lookup options. Shared tables are parsed once.",
                     "Wire each uploaded table with wire_blob_inline_ref at "
                     "'node:<node_id>.options.tables.<table_name>.reference_content'; on the CLI put reference_file under each table.",
-                    "Each lookup reads the original row independently; chained enrichment requires separate nodes. "
-                    "Output names must be distinct and cannot name any lookup's input key_field.",
+                    "Lookups run in configuration order. A key_field can read the original row or an earlier lookup's output, "
+                    "so first resolve a shared key and use it in multiple later tables. Self and forward references are rejected. "
+                    "Output names must be distinct and cannot overwrite arriving fields.",
+                    "A generated null is an invalid downstream key, even with on_miss: null or default. A default string is "
+                    "looked up normally; if absent, that later lookup applies its own on_miss policy. Input schema admission "
+                    "precedes the ordered lookups, and the first lookup failure stops processing.",
                     "Set a lookup's on_miss to default and supply default_values, or use fail with the node's on_error "
                     "quarantine sink. A failure routes the whole original row; no partial enrichment goes downstream.",
                 ),
@@ -999,7 +1016,7 @@ class ReferenceJoin(BaseTransform):
         for lookup_index, lookup in enumerate(self._lookups):
             cfg = lookup.config
             attribution = {} if lookup.table is None else {"lookup_index": lookup_index, "table": lookup.table}
-            if cfg.key_field not in row:
+            if cfg.key_field not in values and cfg.key_field not in row:
                 return lookup.error(
                     {
                         "reason": "invalid_input",
@@ -1008,7 +1025,7 @@ class ReferenceJoin(BaseTransform):
                     },
                     lookup_index,
                 )
-            raw_key = row[cfg.key_field]
+            raw_key = values[cfg.key_field] if cfg.key_field in values else row[cfg.key_field]
             try:
                 key = _coerce_key(raw_key)
             except ReferenceTableError:

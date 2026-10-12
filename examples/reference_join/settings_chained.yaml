@@ -1,0 +1,73 @@
+# Resolve a shared product key, then consume it in two later CSV lookups.
+# The final miss quarantines the original order without intermediate fields.
+sources:
+  primary:
+    plugin: csv
+    on_success: enrich_order
+    options:
+      path: examples/reference_join/orders_chained.csv
+      on_validation_failure: quarantine
+      schema:
+        mode: fixed
+        fields: ["order_id: str", "product_alias: str", "quantity: str"]
+
+transforms:
+  - name: enrich_order
+    plugin: reference_join
+    input: enrich_order
+    on_success: output
+    on_error: quarantine
+    options:
+      schema:
+        mode: observed
+      tables:
+        aliases:
+          reference_file: product_aliases.csv
+          reference_format: csv
+        products:
+          reference_file: products.csv
+          reference_format: csv
+        fulfilment:
+          reference_file: fulfilment.csv
+          reference_format: csv
+      lookups:
+        - table: aliases
+          key_field: product_alias
+          reference_key_name: alias
+          output:
+            product_code: "ref['sku']"
+          on_miss: default
+          default_values:
+            product_code: socks
+        - table: products
+          key_field: product_code
+          reference_key_name: sku
+          output:
+            product_description: "ref['description']"
+            unit_price: "ref['unit_price']"
+          on_miss: fail
+        - table: fulfilment
+          key_field: product_code
+          reference_key_name: sku
+          output:
+            warehouse: "ref['warehouse']"
+          on_miss: fail
+
+sinks:
+  output:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/reference_join/output/chained_enriched.csv
+      schema:
+        mode: observed
+  quarantine:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/reference_join/output/chained_quarantine.csv
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/reference_join/runs/chained_audit.db

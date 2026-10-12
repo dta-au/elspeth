@@ -379,6 +379,11 @@
     "transform:enrich_products": [],
     "transform:line_totals": []
   },
+  "examples/reference_join/settings_chained.yaml": {
+    "transform:enrich_order": [
+      "product_alias"
+    ]
+  },
   "examples/reference_join/settings_missing_product.yaml": {
     "transform:enrich_products": []
   },

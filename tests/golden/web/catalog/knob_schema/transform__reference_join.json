@@ -122,7 +122,7 @@
       },
       {
         "default": null,
-        "description": "Independent lookups that read the original input row.",
+        "description": "Lookups evaluated in configuration order; later keys may consume earlier outputs.",
         "kind": "json-array",
         "label": "Lookups",
         "name": "lookups",
