@@ -211,35 +211,18 @@ class TestToolListOrderIsCacheKeyContract:
         )
 
     def test_litellm_tools_preserves_definition_order(self) -> None:
-        """``composer_loop_tool_definitions`` is a list comprehension over ``get_tool_definitions``;
-        order must be preserved (modulo the advisor-toggle filter, which is
-        allowed to drop ``request_advisor_hint`` when disabled but must never
-        reorder the remaining tools).
-
-        The cache-key invariant is "the relative order of tools that DO appear
-        in ``composer_loop_tool_definitions`` matches the relative order in
-        ``get_tool_definitions``." Set inequality (one filtered out) is fine;
-        order swap (cache-invalidating reorder) is not.
-        """
+        """Registry order and the trailing cache anchor survive recovery controls."""
         from elspeth.contracts.composer_llm_audit import ToolContractDialect
         from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
         from elspeth.web.composer.tools import get_tool_definitions
 
-        defn_names = [d["name"] for d in get_tool_definitions()]
-        tool_names = [t["function"]["name"] for t in composer_loop_tool_definitions(ToolContractDialect.NONE)]
-
-        # Subsequence-order invariant: every tool emitted is in the definition
-        # list, and the indices form a strictly increasing sequence (i.e., no
-        # reordering relative to definitions).
-        defn_index = {name: i for i, name in enumerate(defn_names)}
-        emitted_positions = [defn_index[name] for name in tool_names]
-        assert emitted_positions == sorted(emitted_positions), (
-            f"composer_loop_tool_definitions reordered tools relative to get_tool_definitions; "
-            f"emitted positions={emitted_positions}, names={tool_names}"
-        )
-        # Every emitted name must come from definitions (no tool fabricated
-        # by the filter).
-        assert set(tool_names).issubset(set(defn_names))
+        defn_names = [definition["name"] for definition in get_tool_definitions()]
+        tool_names = [tool["function"]["name"] for tool in composer_loop_tool_definitions(ToolContractDialect.NONE)]
+        recovery_names = ["handoff_to_user", "restore_parked_graph"]
+        assert set(recovery_names).isdisjoint(defn_names)
+        assert len(tool_names) == len(set(tool_names))
+        assert tool_names == [*defn_names[:-1], *recovery_names, defn_names[-1]]
+        assert tool_names[-1] == defn_names[-1]
 
     def test_only_web_set_pipeline_is_enveloped_without_changing_cache_marker_placement(self) -> None:
         from elspeth.contracts.composer_llm_audit import ToolContractDialect
@@ -249,8 +232,15 @@ class TestToolListOrderIsCacheKeyContract:
         definitions = get_tool_definitions()
         tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
 
-        assert [tool["function"]["name"] for tool in tools] == [definition["name"] for definition in definitions]
-        for definition, tool in zip(definitions, tools, strict=True):
+        registry_names = [definition["name"] for definition in definitions]
+        recovery_names = ["handoff_to_user", "restore_parked_graph"]
+        assert set(recovery_names).isdisjoint(registry_names)
+        expected_names = [*registry_names[:-1], *recovery_names, registry_names[-1]]
+        tool_names = [tool["function"]["name"] for tool in tools]
+        assert len(tool_names) == len(set(tool_names))
+        assert tool_names == expected_names
+        registry_tools = [tool for tool in tools if tool["function"]["name"] not in recovery_names]
+        for definition, tool in zip(definitions, registry_tools, strict=True):
             parameters = tool["function"]["parameters"]
             if definition["name"] == "set_pipeline":
                 assert parameters == {
@@ -265,7 +255,8 @@ class TestToolListOrderIsCacheKeyContract:
         _, marked_tools = apply_anthropic_cache_markers([], tools)
         assert marked_tools is not None
         marked_names = [tool["function"]["name"] for tool in marked_tools]
-        assert marked_names == [definition["name"] for definition in definitions]
+        assert marked_names == expected_names
+        assert [tool["function"] for tool in marked_tools] == [tool["function"] for tool in tools]
         assert ["cache_control" in tool for tool in marked_tools] == [False] * (len(marked_tools) - 1) + [True]
         assert marked_tools[-1]["cache_control"] == {"type": "ephemeral"}
         set_pipeline_index = marked_names.index("set_pipeline")

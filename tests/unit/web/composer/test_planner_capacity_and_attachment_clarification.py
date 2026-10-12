@@ -273,5 +273,6 @@ async def test_planner_missing_artifact_reply_can_ask_the_model_authored_focused
     assert 'starting with "DECLINE: "' in completion.requests[0]["messages"][-1]["content"]
     rendered = completion.requests[0]["messages"][0]["content"]
     assert "In the freeform Composer" in rendered
-    assert "planner's `DECLINE:` protocol for a clarification or refusal; never emit" in rendered
+    assert "proposal planner, explicit `handoff_to_user` is available without the conditions" in rendered
+    assert "on the planner's `DECLINE:` prose protocol; never emit" in rendered
     assert "`CLARIFY:` from the proposal planner." in rendered

@@ -75,6 +75,27 @@ class TestSQLCipherCreateAndRead:
             LandscapeDB._create_sqlcipher_engine(f"sqlite:///{db_path}?timeout=1&timeout=2", "test-boundary-passphrase")
         assert not db_path.exists()
 
+    def test_query_option_does_not_bypass_existing_store_admission(self, tmp_path: Path) -> None:
+        from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
+
+        db_path = tmp_path / "unsupported-encrypted.db"
+        connection = sqlcipher3.connect(str(db_path))
+        try:
+            connection.execute("PRAGMA key = 'test-existing-store'")
+            connection.execute("CREATE TABLE retained_evidence (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO retained_evidence VALUES ('preserve me')")
+            connection.commit()
+        finally:
+            connection.close()
+        before = db_path.read_bytes()
+
+        with pytest.raises(SchemaCompatibilityError, match="Preserve this store unchanged"):
+            LandscapeDB.from_url(f"sqlite:///{db_path}?check_same_thread=false", passphrase="test-existing-store")
+
+        assert db_path.read_bytes() == before
+        assert not Path(f"{db_path}-wal").exists()
+        assert not Path(f"{db_path}-shm").exists()
+
     def test_sqlcipher_create_and_read(self, tmp_path: Path) -> None:
         from sqlalchemy import select
 

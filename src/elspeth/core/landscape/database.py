@@ -1928,7 +1928,15 @@ class LandscapeDB:
         if parsed.get_backend_name() != "sqlite" or parsed.database in (None, ":memory:"):
             return
         assert parsed.database is not None
-        if parsed.database.startswith("file:") or parsed.query:
+        if parsed.database.startswith("file:"):
+            raise ValueError("Landscape database admission requires a plain SQLite file URL; preserve existing stores")
+        if passphrase is not None:
+            # Reuse the SQLCipher boundary's option validation before any
+            # connection or file creation. Engine construction is lazy; the
+            # existing-store probe below opens this same target read-only.
+            validation_engine = cls._create_sqlcipher_engine(url, passphrase, read_only=True)
+            validation_engine.dispose()
+        elif parsed.query:
             raise ValueError("Landscape database admission requires a plain SQLite file URL; preserve existing stores")
         if Path(parsed.database).is_symlink():
             raise ValueError("Landscape database target must not be a symlink; preserve existing stores")

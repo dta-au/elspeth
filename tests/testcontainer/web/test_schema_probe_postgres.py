@@ -336,7 +336,7 @@ def test_a_drifted_check_constraint_names_itself_on_postgresql(postgres_engine: 
     assert "identity_relationships.ck_identity_relationships_type" in message
     assert "CHECK constraint SQL mismatch" in message
     assert "sponsor" in message, "the FOUND side must survive the reflection round trip"
-    assert "Delete the old session database and restart" in message
+    assert "Preserve this store unchanged and configure an explicitly new session database" in message
     assert "did not produce the current schema" not in message
 
 

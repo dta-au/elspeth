@@ -57,7 +57,11 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
-from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
+from elspeth.web.composer.diagnostic_evidence import (
+    DIAGNOSTIC_EVIDENCE_KIND,
+    ComposerDiagnosticEvidence,
+    diagnostic_evidence_identity,
+)
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult, ComposerService, PipelineCommitIntent
@@ -5915,15 +5919,33 @@ class TestMessageRoutes:
         assert private_evidence
         assert any(evidence.status == "received_response" for evidence in private_evidence)
         assert any(evidence.status == "rejected" for evidence in private_evidence)
+        private_requests = [evidence for evidence in private_evidence if evidence.status == "provider_request"]
+        assert len(private_requests) == 2
+        assert len({evidence.evidence_id for evidence in private_evidence}) == len(private_evidence)
+        for evidence in private_requests:
+            assert evidence.tool_name == "composer_provider_context"
+            assert evidence.evidence_id == diagnostic_evidence_identity("provider-request", evidence.tool_call_id)
+            assert evidence.arguments.disposition == "retained"
+            assert evidence.arguments.content is not None
+            assert prompt_canary in evidence.arguments.content
+        other_private_payload = json.dumps(
+            [evidence.to_envelope() for evidence in private_evidence if evidence.status != "provider_request"]
+        )
+        assert prompt_canary not in other_private_payload
         private_payload = json.dumps([deep_thaw(message.tool_calls) for message in private_audit])
-        assert prompt_canary not in private_payload
         for canary_name in ("option", "path", "validator_message"):
             assert canaries[canary_name] in private_payload
         persisted_audit = [message for message in persisted_messages if message.role == "audit" and message not in private_audit]
         included = client.get(f"/api/sessions/{session_id}/messages?include_llm_audit=true")
         assert included.status_code == 200, included.json()
+        private_message_ids = {str(message.id) for message in private_audit}
+        assert private_message_ids.isdisjoint(message["id"] for message in included.json())
+        raw_included = client.get(f"/api/sessions/{session_id}/messages?include_llm_audit=true&include_raw_content=true")
+        assert raw_included.status_code == 200, raw_included.json()
+        assert private_message_ids.isdisjoint(message["id"] for message in raw_included.json())
         returned_audit = [message for message in included.json() if message["role"] == "audit"]
         audit_surfaces = {
+            "GET with raw content": json.dumps([message for message in raw_included.json() if message["role"] == "audit"]),
             "persisted": json.dumps(
                 [{"content": message.content, "tool_calls": deep_thaw(message.tool_calls)} for message in persisted_audit],
                 sort_keys=True,
@@ -5940,6 +5962,7 @@ class TestMessageRoutes:
         ]
         assert [envelope["call"]["planner_call_ordinal"] for envelope in envelopes[:2]] == [1, 2]
         assert [envelope["attempt"]["planner_call_ordinal"] for envelope in envelopes[2:]] == [1, 2]
+        assert {evidence.tool_call_id for evidence in private_requests} == {envelope["call"]["call_id"] for envelope in envelopes[:2]}
         for surface_name, surface_payload in audit_surfaces.items():
             for canary_name, canary in canaries.items():
                 assert canary not in surface_payload, f"{canary_name} canary leaked through {surface_name} planner audit"
@@ -8026,7 +8049,7 @@ class TestRevertEndpoint:
             session.id,
             CompositionStateData(
                 sources={"source": {"plugin": "csv", "on_success": "main", "options": {}, "on_validation_failure": "discard"}},
-                metadata_={"name": "Policy drift", "description": None},
+                metadata_={"name": "Policy drift", "description": ""},
                 is_valid=True,
             ),
             provenance="session_seed",
@@ -8036,7 +8059,7 @@ class TestRevertEndpoint:
             session.id,
             CompositionStateData(
                 sources={"source": {"plugin": "json", "on_success": "main", "options": {}, "on_validation_failure": "discard"}},
-                metadata_={"name": "Policy drift", "description": None},
+                metadata_={"name": "Policy drift", "description": ""},
                 is_valid=True,
             ),
             provenance="session_seed",
@@ -8717,7 +8740,7 @@ sinks:
                         "on_write_failure": "discard",
                     }
                 ],
-                metadata_={"name": "Historical disabled plugin", "description": None},
+                metadata_={"name": "Historical disabled plugin", "description": ""},
                 is_valid=False,
             ),
             provenance="session_seed",
@@ -8752,8 +8775,6 @@ sinks:
         malformed_component: str,
     ) -> None:
         """A corrupt component must not disappear from a mixed persisted cohort."""
-        from elspeth.contracts.errors import AuditIntegrityError
-
         sources: dict[str, dict[str, Any]] = {
             "valid_source": {
                 "plugin": "csv",
@@ -8767,18 +8788,13 @@ sinks:
                 "id": "valid_node",
                 "node_type": "transform",
                 "plugin": "llm",
+                "input": "valid_source",
+                "on_success": "valid_output",
+                "on_error": "discard",
+                "options": {},
             }
         ]
-        outputs: list[dict[str, Any]] = [{"name": "valid_output", "plugin": "json"}]
-        if malformed_component == "source":
-            sources["corrupt_source"] = {}
-        elif malformed_component == "transform":
-            nodes.append({"id": "corrupt_node", "node_type": "transform"})
-        else:
-            # ``sink_name`` belonged to the retired runtime-event shape. A
-            # persisted composition output has one canonical identity key.
-            outputs.append({"sink_name": "corrupt_output", "plugin": "json"})
-
+        outputs: list[dict[str, Any]] = [{"name": "valid_output", "plugin": "json", "options": {}, "on_write_failure": "discard"}]
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Corrupt plugin projection", "local")
@@ -8794,9 +8810,41 @@ sinks:
             ),
             provenance="session_seed",
         )
+        baseline = client.get(f"/api/sessions/{session.id}/state")
+        assert baseline.status_code == 200, baseline.text
+        if malformed_component == "source":
+            sources["corrupt_source"] = {}
+        elif malformed_component == "transform":
+            nodes.append({"id": "corrupt_node", "node_type": "transform"})
+        else:
+            # ``sink_name`` belonged to the retired runtime-event shape. A
+            # persisted composition output has one canonical identity key.
+            outputs.append({"sink_name": "corrupt_output", "plugin": "json"})
 
-        with pytest.raises(AuditIntegrityError, match=malformed_component):
-            client.get(f"/api/sessions/{session.id}/state")
+        corrupt = await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(
+                sources=sources,
+                nodes=nodes,
+                outputs=outputs,
+                metadata_={"name": "Corrupt plugin projection", "description": ""},
+                is_valid=False,
+            ),
+            provenance="session_seed",
+        )
+        versions_before = await service.get_state_versions(session.id)
+        response = client.get(f"/api/sessions/{session.id}/state")
+        assert response.status_code == 409, response.text
+        assert response.json() == {
+            "detail": {
+                "error_type": "composition_state_unavailable",
+                "detail": "The saved graph is unavailable. You can ask Composer to recover a saved draft.",
+                "state_id": str(corrupt.id),
+                "version": corrupt.version,
+            }
+        }
+        assert await service.get_state_versions(session.id) == versions_before
 
     @pytest.mark.asyncio
     async def test_get_state_succeeds_for_collector_bearing_persisted_state(self, tmp_path: Path) -> None:

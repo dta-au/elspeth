@@ -38,7 +38,11 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToo
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
-from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
+from elspeth.web.composer.diagnostic_evidence import (
+    DIAGNOSTIC_EVIDENCE_KIND,
+    ComposerDiagnosticEvidence,
+    diagnostic_evidence_identity,
+)
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult, PlannerDeclined
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.protocol import ComposerConvergenceError
@@ -286,13 +290,46 @@ async def test_provider_timeout_after_inline_tool_turn_persists_each_record_exac
     assert [row["tool_calls"][0] for row in llm_rows] == [llm_call_audit_envelope(call) for call in exc.llm_calls]
     assert after[: len(before)] == before, "the already committed tool/private cohort must remain unchanged"
     appended = after[len(before) :]
-    assert [_envelope_kind(row) for row in appended] == ["llm_call_audit", DIAGNOSTIC_EVIDENCE_KIND, "llm_call_audit"]
+    assert [_envelope_kind(row) for row in appended] == [
+        DIAGNOSTIC_EVIDENCE_KIND,
+        "llm_call_audit",
+        DIAGNOSTIC_EVIDENCE_KIND,
+        DIAGNOSTIC_EVIDENCE_KIND,
+        "llm_call_audit",
+    ]
+    requests = []
+    for row, call in zip((appended[0], appended[2]), exc.llm_calls, strict=True):
+        call_identity = call.call_id or f"legacy:{call.started_at.isoformat()}:{call.planner_call_ordinal}"
+        assert len(row["tool_calls"]) == 1
+        request = ComposerDiagnosticEvidence.from_envelope(
+            row["tool_calls"][0], expected_session_id=result_session_id, expected_tool_call_id=call_identity
+        )
+        assert request.evidence_id == diagnostic_evidence_identity("provider-request", call_identity)
+        assert request.status == "provider_request" and request.tool_name == "composer_provider_context"
+        assert call.private_request is not None
+        assert request.arguments.disposition == call.private_request.disposition == "retained"
+        assert request.arguments.content == call.private_request.canonical
+        assert request.arguments.content is not None
+        context = json.loads(request.arguments.content)
+        assert stable_hash(context["messages"]) == call.messages_hash
+        assert stable_hash(context["tools"]) == call.tools_spec_hash
+        assert request.authority_arguments is None
+        assert request.result.disposition == "not_returned"
+        assert request.result.content is None
+        assert request.wire_arguments.disposition == "unavailable"
+        assert request.wire_arguments.content is None
+        requests.append(request)
     timeout_call = exc.llm_calls[1]
     timeout_identity = timeout_call.call_id or f"legacy:{timeout_call.started_at.isoformat()}:{timeout_call.planner_call_ordinal}"
     failure = ComposerDiagnosticEvidence.from_envelope(
-        appended[1]["tool_calls"][0], expected_session_id=result_session_id, expected_tool_call_id=timeout_identity
+        appended[3]["tool_calls"][0], expected_session_id=result_session_id, expected_tool_call_id=timeout_identity
     )
+    assert len(appended[3]["tool_calls"]) == 1
+    assert failure.evidence_id == diagnostic_evidence_identity("provider-failure", timeout_identity)
     assert failure.status == "provider_failure" and failure.tool_name == "composer_failure"
+    assert len({request.evidence_id for request in requests} | {failure.evidence_id}) == 3
+    assert all(request.operation_id == failure.operation_id for request in requests)
+    assert all(request.operation_epoch == failure.operation_epoch for request in requests)
     assert failure.result.content is not None and "TimeoutError" in failure.result.content
     sequence_numbers = [row["sequence_no"] for row in appended]
     assert sequence_numbers == list(range(sequence_numbers[0], sequence_numbers[0] + len(appended))), (

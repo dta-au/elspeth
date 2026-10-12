@@ -18,12 +18,7 @@ def _readme_text() -> str:
 
 
 def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
-    """Current release guidance must name the build's epochs and install version.
-
-    Historical release sections cannot satisfy this check. The predecessor
-    epochs are 0.8.0's released shape, independent of the older Scenario B
-    acceptance rollback baseline.
-    """
+    """Current candidate guidance names its epochs and preservation policy."""
     version = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     readme = _readme_text()
     heading = f"\n## What changed in {version}\n"
@@ -31,10 +26,12 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     current_section = readme.split(heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     text = " ".join(current_section.split())
 
-    assert f"session epoch 53 to {SESSION_SCHEMA_EPOCH} " in text
-    assert f"Landscape epoch 38 to {SQLITE_SCHEMA_EPOCH};" in text
-    assert "recreate both stale databases in the same service-stop window" in text
-    assert f"install {version}." in text
+    assert f"session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH}." in text
+    assert "preserve them unchanged and configure explicitly new compatible databases" in text
+    assert "does not migrate either store in place or authorize downgrading these stores" in text
+    assert "compatibility policy has no fixed expiry" in text
+    assert f"Package metadata remains {version};" in text
+    assert "automatic image publication is held" in text
 
 
 def test_readme_release_links_resolve() -> None:

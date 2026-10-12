@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from tests.helpers import web_reserve_compose_proposal_transfers as compose
 from tests.helpers import web_reserve_composer_receiver as receiver
+from tests.helpers import web_reserve_provider_mint_contract as provider
 from tests.helpers import web_reserve_route_helper as route
 from tests.helpers import web_reserve_terminal_sql_transfers as terminal
 from tests.unit.architecture import test_web_landscape_mutation_fencing as fencing
@@ -65,6 +66,24 @@ def test_reviewed_turn_grammar_matches_live_source_and_refuses_reserve_drift(con
         ordinals[0].value = ast.Constant(value=999)
     failures, _ = check(units)
     assert failures == [expected]
+
+
+@pytest.mark.parametrize("fault", ("omit", "include"))
+def test_provider_turn_contract_binds_private_transcript_filter(fault: str) -> None:
+    unit = _source_units((TURN,))[0]
+    actual = fencing._reserve_node_at(unit, "_run_composer_turn")
+    expected = ast.parse(provider.CONTRACTS["elspeth.web.sessions.composer_turn:_run_composer_turn"]).body[0]
+    assert provider._shape(actual) == provider._shape(expected)
+    calls = [node for node in ast.walk(actual) if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.get_messages"]
+    assert len(calls) == 1
+    call = calls[0]
+    keywords = [keyword for keyword in call.keywords if keyword.arg == "include_private_evidence"]
+    assert len(keywords) == 1 and isinstance(keywords[0].value, ast.Constant) and keywords[0].value.value is False
+    if fault == "omit":
+        call.keywords.remove(keywords[0])
+    else:
+        keywords[0].value = ast.Constant(value=True)
+    assert provider._shape(actual) != provider._shape(expected)
 
 
 def test_reviewed_terminal_namespace_matches_live_source_and_refuses_new_descriptor() -> None:

@@ -523,7 +523,7 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
 
 # ---------------------------------------------------------------------------
 # The boot probe against the live gateway. The probe sends the planner's
-# production-shaped requests: the 42-tool compose-loop list with
+# production-shaped requests: the 44-tool compose-loop list with
 # ``max_tokens=16`` (which LiteLLM's ``openai`` path translates to the wire
 # field ``max_completion_tokens``; the gateway's ``extra="forbid"``
 # ``ChatRequest`` once rejected that as an unknown field, so boot failed
@@ -552,7 +552,7 @@ async def test_boot_probe_succeeds_against_gateway(tmp_path: Path, gateway_base_
 
     requests = _planner_probe_requests(tmp_path, gateway_base_url)
     assert [request.surface for request in requests] == ["loop_tools", "planner_tools"]
-    assert requests[0].tool_count == 42
+    assert requests[0].tool_count == 44
 
     for request in requests:
         # True (not the transient-failure False) -- the request was accepted
@@ -591,7 +591,7 @@ async def test_boot_probe_rejects_incompatible_reasoning_model_sampling(tmp_path
     assert isinstance(caught.value.__cause__, UnsupportedParamsError)
     assert f"by {_MODEL_ALIAS}:" in str(caught.value)
     assert "surface=loop_tools" in str(caught.value)
-    assert "tool_count=42" in str(caught.value)
+    assert "tool_count=44" in str(caught.value)
     assert "temperature_present=True" in str(caught.value)
     assert "seed_present=True" in str(caught.value)
     assert "reasoning_effort_present=False" in str(caught.value)
@@ -710,12 +710,12 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
 
 
 def _loop_tools_stamped(flag: bool) -> list[dict[str, Any]]:
-    """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (32 true, 10 false)."""
+    """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (34 true, 10 false)."""
     from elspeth.contracts.composer_llm_audit import ToolContractDialect
     from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
     tools = [tool for tool in composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT) if tool["function"]["strict"] is flag]
-    assert len(tools) == (32 if flag else 10)
+    assert len(tools) == (34 if flag else 10)
     return tools
 
 
@@ -778,7 +778,7 @@ async def test_gateway_accepts_the_preferred_route_tool_list(gateway_base_url: s
     resolution = resolve_strict_transport(model=_MODEL_ALIAS, api_base=f"{gateway_base_url}/v1", setting="preferred", env={})
     assert resolution.transport is StrictTransport.NONE
     tools = composer_loop_tool_definitions(dialect_for(resolution.transport))
-    assert len(tools) == 42
+    assert len(tools) == 44
     assert [tool for tool in tools if "strict" in tool["function"]] == []
 
     response = await litellm.acompletion(

@@ -1621,6 +1621,10 @@ def _raw_sql_is_proven_read(value: str) -> bool:
     if lowered.startswith("explain"):
         remainder = re.sub(r"^explain\s+(?:query\s+plan\s+)?(?:analyze\s+)?", "", lowered, count=1)
         return remainder.startswith("select") and _RAW_DML_RE.search(remainder) is None
+    # This setting also has a parenthesized assignment form. Admit only the
+    # complete bare query; adding its name to the prefix allowlist is unsafe.
+    if lowered == "pragma application_id":
+        return True
     if lowered.startswith("pragma"):
         if "=" in lowered:
             return False
@@ -5808,7 +5812,7 @@ _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operation
 _reserve_CANCEL_ROUTE_SHA256 = "86d206255665ac50b5e2c65bb77bfebc3971e335127483d40c0e1a8d8dd883c2"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "44fb9140460f2ec54fd79124ea33d18446d21e7f3b3749f8a518b2fa56956192",
+    "src/elspeth/web/sessions/composer_turn.py": "387e76e614f5835265f5940c61f0c96342933fc3ecacdd23843ae7b54b15c3ce",
     "src/elspeth/web/sessions/composer_async_worker.py": "ce8543b819fbcf7e6b613a808724df892bf17a120831941cf9ff83cebf3191ee",
 }
 
@@ -14196,6 +14200,36 @@ def _raw_attribute_collector(unit: SourceUnit, units: tuple[SourceUnit, ...]) ->
     return peers[unit.path]
 
 
+# Exact non-run initialization effect: the supplied sources bind the locked
+# callback, EMPTY-only admission, and its shared occupancy implementation.
+# These are source bindings, not permissions granted by a filename alone.
+_NEW_LANDSCAPE_STAMP_SOURCES = {
+    "src/elspeth/web/schema_probe.py": "c0f27e271e6128ea96a4cb345f32ef4c61bbcdd338aba0a9eaaf1db34447851d",
+    "src/elspeth/core/landscape/database.py": "dee9cbab892223687e425cbc3222b9ede3235f95cbdec1316e3f17e991e35135",
+    "src/elspeth/core/schema_shape.py": "5b32f7faf09a03a7c482b48a092eb0f7cf5811eb927302ad72820fde81ceccb0",
+}
+
+
+def _new_landscape_schema_stamp_is_proven(unit: SourceUnit, node: ast.Call, units: tuple[SourceUnit, ...]) -> bool:
+    if (unit.path, _symbol(node)) != ("src/elspeth/web/schema_probe.py", "init_landscape_schema.body"):
+        return False
+    expected = ast.parse('conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")').body[0].value
+    if stable_ast_dump(node) != stable_ast_dump(expected):
+        return False
+    selected = [source for source in units if source.path in _NEW_LANDSCAPE_STAMP_SOURCES]
+    if len(selected) != len(_NEW_LANDSCAPE_STAMP_SOURCES) or {source.path for source in selected} != set(_NEW_LANDSCAPE_STAMP_SOURCES):
+        return False
+    if not any(source is unit for source in selected):
+        return False
+    if not any(candidate is node for candidate in ast.walk(unit.tree)):
+        return False
+    return all(
+        hashlib.sha256(source.source.encode("utf-8")).hexdigest() == _NEW_LANDSCAPE_STAMP_SOURCES[source.path]
+        and stable_ast_dump(source.tree) == stable_ast_dump(ast.parse(source.source))
+        for source in selected
+    )
+
+
 def _raw_write_surface_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]:
     units = tuple(units)
     violations: list[str] = []
@@ -14222,6 +14256,8 @@ def _raw_write_surface_violations(units: Iterable[SourceUnit]) -> tuple[str, ...
             if isinstance(node, ast.Call) and _call_name(node) in {"DatabaseOps", "LandscapeWriteRepositories"}:
                 violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} raw {_call_name(node)} construction")
             if not isinstance(node, ast.Call):
+                continue
+            if _new_landscape_schema_stamp_is_proven(unit, node, units):
                 continue
             for method, _receiver, payloads in _indirect_execution_payloads(node, resolver):
                 raw_values = [value for payload in payloads if (value := _constant_string_value(payload, resolver, use=node)) is not None]
@@ -15801,7 +15837,7 @@ _REVIEWED_REGISTRY_MODULES = {
     # guard, journal installation, and database clock path remain unchanged.
     # #298 admits existing SQLite stores read-only before writer bootstrap and
     # changes refusal guidance. Deadline/journal installation order is retained.
-    "src/elspeth/core/landscape/database.py": "ad72efa6bd148f604a932abad998d17e388aecbfbf2b482dea69cf310544c0cd",
+    "src/elspeth/core/landscape/database.py": "93732e93b20b0a30e76f29d259d9ea24b706de7c9cc61173f9b87bbc38ad1438",
 }
 
 
@@ -21212,6 +21248,101 @@ def test_schema_stamp_guard_preserves_the_integer_conversion_and_exact_connectio
     )
     call = next(node for node in ast.walk(unit.tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute))
     assert _admitted_non_run_raw_write(call, _resolver_for_unit(unit)) is admitted
+
+
+@pytest.mark.parametrize(
+    ("statement", "admitted"),
+    [
+        ("PRAGMA application_id", True),
+        ("pragma application_id;", True),
+        ("PRAGMA application_id = 7", False),
+        ("PRAGMA application_id(7)", False),
+        ("PRAGMA main.application_id(7)", False),
+        ("PRAGMA application_id; PRAGMA user_version = 7", False),
+        ("PRAGMA application_id_extra", False),
+    ],
+)
+def test_application_id_read_admission_requires_the_complete_bare_query(statement: str, admitted: bool) -> None:
+    assert _raw_sql_is_proven_read(statement) is admitted
+
+
+def _new_landscape_stamp_control_units() -> tuple[SourceUnit, ...]:
+    return tuple(_parse_source(path, (_repo_root() / path).read_text()) for path in _NEW_LANDSCAPE_STAMP_SOURCES)
+
+
+def _new_landscape_stamp_control_call(unit: SourceUnit) -> ast.Call:
+    return next(
+        node
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Call) and _symbol(node) == "init_landscape_schema.body" and _call_name(node) == "exec_driver_sql"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "before", "after"),
+    [
+        (
+            "src/elspeth/web/schema_probe.py",
+            'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+            'other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+        ),
+        (
+            "src/elspeth/web/schema_probe.py",
+            'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+            'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")',
+        ),
+        ("src/elspeth/web/schema_probe.py", 'if conn.dialect.name == "sqlite":', "if True:"),
+        ("src/elspeth/web/schema_probe.py", "if state is SchemaState.MISSING:", "if state in (SchemaState.MISSING, SchemaState.PARTIAL):"),
+        ("src/elspeth/web/schema_probe.py", "_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)", "body(engine.connect())"),
+        (
+            "src/elspeth/core/landscape/database.py",
+            "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
+            "return LandscapeSchemaShape.EMPTY",
+        ),
+        ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
+        ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
+    ],
+)
+def test_new_landscape_stamp_requires_exact_locked_empty_target_sources(path: str, before: str, after: str) -> None:
+    units = _new_landscape_stamp_control_units()
+    unit = units[0]
+    call = _new_landscape_stamp_control_call(unit)
+    assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+    changed = []
+    for source in units:
+        if source.path == path:
+            assert before in source.source
+            source = _parse_source(path, source.source.replace(before, after))
+        changed.append(source)
+    changed_units = tuple(changed)
+    changed_unit = changed_units[0]
+    assert not _new_landscape_schema_stamp_is_proven(changed_unit, _new_landscape_stamp_control_call(changed_unit), changed_units)
+
+
+@pytest.mark.parametrize("fault", ["missing", "duplicate", "foreign-scope", "foreign-path", "mutated-tree"])
+def test_new_landscape_stamp_refuses_incomplete_or_foreign_authority(fault: str) -> None:
+    units = _new_landscape_stamp_control_units()
+    unit = units[0]
+    call = _new_landscape_stamp_control_call(unit)
+    assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+    if fault == "missing":
+        units = units[:-1]
+    elif fault == "duplicate":
+        units = (*units, units[-1])
+    elif fault == "mutated-tree":
+        stamp_guard = next(
+            node
+            for node in ast.walk(unit.tree)
+            if isinstance(node, ast.If) and ast.unparse(node.test) == "state is SchemaState.MISSING" and call in ast.walk(node)
+        )
+        stamp_guard.test = ast.Constant(True)
+    else:
+        path = unit.path if fault == "foreign-scope" else "src/elspeth/web/foreign_schema_probe.py"
+        source = unit.source.replace("def init_landscape_schema(", "def foreign_initializer(") if fault == "foreign-scope" else unit.source
+        unit = _parse_source(path, source)
+        call = next(node for node in ast.walk(unit.tree) if isinstance(node, ast.Call) and stable_ast_dump(node) == stable_ast_dump(call))
+        units = (unit, *units[1:])
+    assert not _new_landscape_schema_stamp_is_proven(unit, call, units)
 
 
 def _establishment_test_call(source: str, method: str, *, path: str = "src/elspeth/engine/orchestrator/join_admission.py") -> ast.Call:

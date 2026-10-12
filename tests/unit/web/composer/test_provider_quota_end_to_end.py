@@ -21,7 +21,11 @@ from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, Charg
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
+from elspeth.web.composer.diagnostic_evidence import (
+    DIAGNOSTIC_EVIDENCE_KIND,
+    ComposerDiagnosticEvidence,
+    diagnostic_evidence_identity,
+)
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import admit_provider_attempt, composer_quota_scope, quota_provider_calls
@@ -301,19 +305,32 @@ async def test_retry_settlement_failure_preserves_original_provider_evidence(
         messages = connection.execute(
             select(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id), chat_messages_table.c.role == "audit")
         ).all()
-    assert len(messages) == 2
+    assert len(messages) == 3
     assert all(message.writer_principal == "compose_loop" and len(message.tool_calls) == 1 for message in messages)
-    by_kind = {message.tool_calls[0]["_kind"]: message for message in messages}
-    assert set(by_kind) == {"llm_call_audit", DIAGNOSTIC_EVIDENCE_KIND}
-    message = by_kind["llm_call_audit"]
-    evidence = ComposerDiagnosticEvidence.from_envelope(
-        by_kind[DIAGNOSTIC_EVIDENCE_KIND].tool_calls[0],
-        expected_session_id=str(session.id),
-        expected_operation_id=lease.context.fence.operation_id,
-        expected_tool_call_id=attempt.attempt_id,
-    )
-    assert evidence.status == "provider_failure" and evidence.tool_name == "composer_failure"
-    assert by_kind[DIAGNOSTIC_EVIDENCE_KIND].composition_state_id is None
+    (message,) = [row for row in messages if row.tool_calls[0]["_kind"] == "llm_call_audit"]
+    private_rows = [row for row in messages if row.tool_calls[0]["_kind"] == DIAGNOSTIC_EVIDENCE_KIND]
+    assert len(private_rows) == 2
+    private_evidence = [
+        ComposerDiagnosticEvidence.from_envelope(
+            row.tool_calls[0],
+            expected_session_id=str(session.id),
+            expected_operation_id=lease.context.fence.operation_id,
+            expected_tool_call_id=attempt.attempt_id,
+        )
+        for row in private_rows
+    ]
+    assert {item.status for item in private_evidence} == {"provider_request", "provider_failure"}
+    by_status = {item.status: item for item in private_evidence}
+    evidence = by_status["provider_failure"]
+    request_evidence = by_status["provider_request"]
+    assert evidence.tool_name == "composer_failure"
+    assert evidence.evidence_id == diagnostic_evidence_identity("provider-failure", attempt.attempt_id)
+    assert request_evidence.tool_name == "composer_provider_context"
+    assert request_evidence.evidence_id == diagnostic_evidence_identity("provider-request", attempt.attempt_id)
+    assert all(item.operation_epoch == lease.context.fence.operation_epoch for item in private_evidence)
+    assert all(row.composition_state_id is None for row in private_rows)
+    visible = await service.get_messages(session.id, limit=None, include_private_evidence=False)
+    assert {str(row.id) for row in private_rows}.isdisjoint(str(row.id) for row in visible)
     persisted_call = message.tool_calls[0]["call"]
     assert persisted_call["planner_call_ordinal"] == 1
     assert persisted_call["error_class"] == "APIError"

@@ -88,13 +88,49 @@ def _assert_composer_turn_authority(source: str) -> None:
     function = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_composer_turn")
     guard = next(
         node
-        for node in ast.walk(function)
+        for node in function.body
         if isinstance(node, ast.If) and ast.unparse(node.test) == "lease.context != running.session_operation_context"
     )
     assert any(isinstance(node, ast.Raise) for node in ast.walk(guard))
-    state_read = next(
-        node for node in ast.walk(function) if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.get_current_state"
+    state_reads = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.load_graph_recovery_context"
+    ]
+    assert len(state_reads) == 1
+    state_read = state_reads[0]
+    assert [ast.unparse(arg) for arg in state_read.args] == ["session.id"]
+    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in state_read.keywords] == [
+        ("turn_start_state_id", "request.state_id"),
+        ("session_operation_context", "lease.context"),
+    ]
+    snapshot = next(
+        node
+        for node in function.body
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Await) and node.value.value is state_read
     )
+    start = function.body.index(snapshot)
+    assert [ast.unparse(node) for node in function.body[start : start + 4]] == [
+        "recovery_admission = await service.load_graph_recovery_context(session.id, turn_start_state_id=request.state_id, "
+        "session_operation_context=lease.context)",
+        "recovery_context = recovery_admission.context",
+        "state_record = recovery_admission.record",
+        "compose_base_state_id = UUID(recovery_context.turn_start_state_id) if recovery_context.turn_start_state_id is not None else None",
+    ]
+    head_guard = function.body[start + 4]
+    assert isinstance(head_guard, ast.If) and ast.unparse(head_guard.test) == "compose_base_state_id != request.state_id"
+    assert len(head_guard.body) == 1 and isinstance(head_guard.body[0], ast.Raise) and not head_guard.orelse
+    assert ast.unparse(function.body[start + 5]) == (
+        "state = None if recovery_context.malformed_head else _initial_composition_state() if state_record is None else _state_from_record(state_record)"
+    )
+    reads = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) in {"service.get_session", "service.get_messages", "service.load_graph_recovery_context"}
+    ]
+    assert all(guard.lineno < node.lineno for node in reads)
+    assert not any(isinstance(node, ast.Call) and ast.unparse(node.func) == "service.get_current_state" for node in ast.walk(function))
     transcript_write = next(
         node
         for node in ast.walk(function)
@@ -129,6 +165,10 @@ def test_detached_turn_checks_exact_adopted_authority_before_state_or_message_ac
         ("session_operation_context=lease.context", "session_operation_context=other_context"),
         ("running=running", "running=other_running"),
         ("ingress = lease.create_task", "ingress = asyncio.create_task"),
+        ("turn_start_state_id=request.state_id", "turn_start_state_id=other_state_id"),
+        ("recovery_context = recovery_admission.context", "recovery_context = other_admission.context"),
+        ("state_record = recovery_admission.record", "state_record = other_admission.record"),
+        ("compose_base_state_id != request.state_id", "False"),
     ],
 )
 def test_detached_turn_authority_control_rejects_changed_fence_or_child_owner(before: str, after: str) -> None:
@@ -137,6 +177,35 @@ def test_detached_turn_authority_control_rejects_changed_fence_or_child_owner(be
     _assert_composer_turn_authority(source)
     with pytest.raises((AssertionError, StopIteration)):
         _assert_composer_turn_authority(source.replace(before, after))
+
+
+@pytest.mark.parametrize("fault", ["read-before-guard", "unreachable-guard"])
+def test_detached_turn_rejects_misplaced_recovery_admission(fault: str) -> None:
+    source = inspect.getsource(_run_composer_turn)
+    _assert_composer_turn_authority(source)
+    tree = ast.parse(textwrap.dedent(source))
+    function = tree.body[0]
+    assert isinstance(function, ast.AsyncFunctionDef)
+    guard = next(
+        node
+        for node in function.body
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "lease.context != running.session_operation_context"
+    )
+    if fault == "read-before-guard":
+        snapshot = next(
+            node
+            for node in function.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "recovery_admission" for target in node.targets)
+        )
+        function.body.remove(snapshot)
+        function.body.insert(function.body.index(guard), snapshot)
+    else:
+        index = function.body.index(guard)
+        function.body[index] = ast.If(test=ast.Constant(False), body=[guard], orelse=[])
+    ast.fix_missing_locations(tree)
+    with pytest.raises((AssertionError, StopIteration)):
+        _assert_composer_turn_authority(ast.unparse(tree))
 
 
 def _assert_worker_adopted_lease_transfer(source: str, *, outer_source: str | None = None) -> None:
@@ -430,9 +499,12 @@ def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None
     main_try = helper.body[-1]
     assert isinstance(main_try.body[3], ast.If)
     title_branch = main_try.body[3]
-    assert ast.unparse(title_branch.test) == (
-        "isinstance(request, SendMessageRequest) and len(records) == 1 and is_default_session_title(session.title)"
-    )
+    expected_title_guard = ast.parse(
+        "not recovery_context.malformed_head and isinstance(request, SendMessageRequest) "
+        "and len(records) == 1 and is_default_session_title(session.title)",
+        mode="eval",
+    ).body
+    assert _stable_ast_bytes(title_branch.test) == _stable_ast_bytes(expected_title_guard)
     assert len(title_branch.body) == 4
     title_child = title_branch.body[2]
     assert isinstance(title_child, ast.AsyncFunctionDef) and title_child.name == "run_owned_title"
@@ -457,10 +529,10 @@ def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None
     # the first-message title branch, retaining all AST fields and strings.
     assert hashlib.sha256(_stable_ast_bytes(public)).hexdigest() == "fe4e8e57be8fd03171e86ac2516422ce4f5d2dc7e75e282ada139fb06980ce0c"
     assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=helper.body[:-1], type_ignores=[]))).hexdigest() == (
-        "0a880df01e2c8d783aabdbdd02bfadda504f83f5f8b05ef105a497e35c8586d8"
+        "863662cb0d75d75747b30fb768236f45e14a55187c3c59290fe13e4e3487474c"
     )
     assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=main_try.body[:4], type_ignores=[]))).hexdigest() == (
-        "3bae0eb10d038ce8334121cc6116a3582809bbdd1dbbc65f4264ce6f9562ec51"
+        "2f65c341a560baf72b0f8ba1c12a939c8724a2d7691d83690529e79413b31929"
     )
 
 
@@ -476,6 +548,7 @@ def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
         ("public", "lease=lease", "lease=other_lease"),
         ("helper", "session_operation_context=lease.context", "session_operation_context=other_context"),
         ("helper", "auto_title_task = lease.create_task(run_owned_title())", "auto_title_task = asyncio.create_task(run_owned_title())"),
+        ("helper", "not recovery_context.malformed_head", "True"),
     ],
 )
 def test_auto_title_ownership_rejects_foreign_lease_or_unowned_child(owner: str, before: str, after: str) -> None:

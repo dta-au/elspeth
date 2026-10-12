@@ -11757,9 +11757,7 @@ class _CallerSideProof:
         observed: dict[tuple[str, str], str] = {}
         for collector in self._collectors:
             if collector.path == schema_path:
-                observed[(schema_path, "<module>")] = hashlib.sha256(
-                    ast.dump(collector.tree, include_attributes=False).encode()
-                ).hexdigest()
+                observed[(schema_path, "<module>")] = hashlib.sha256(stable_ast_dump(collector.tree).encode()).hexdigest()
             for node in ast.walk(collector.tree):
                 name = ""
                 if isinstance(node, ast.FunctionDef):
@@ -11770,7 +11768,7 @@ class _CallerSideProof:
                 if key in expected:
                     if key in observed:
                         return False
-                    observed[key] = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+                    observed[key] = hashlib.sha256(stable_ast_dump(node).encode()).hexdigest()
                     guards = [
                         candidate
                         for candidate in ast.walk(node)

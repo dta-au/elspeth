@@ -8840,6 +8840,7 @@ class SessionServiceImpl:
         created_at: datetime,
     ) -> None:
         sid = str(recovery.session_id)
+        self._assert_session_write_lock_held(conn, sid, caller="_write_graph_recovery_receipt")
         bound_state_id = recovery.state_id if recovery.state_id is not None else recovery.expected_state_id
         receipt_id = recovery.receipt_id
         if receipt_id is None:

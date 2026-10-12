@@ -30,7 +30,11 @@ from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.authority_hashing import composer_authority_hash
-from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, is_diagnostic_evidence_envelope
+from elspeth.web.composer.diagnostic_evidence import (
+    ComposerDiagnosticEvidence,
+    diagnostic_evidence_identity,
+    is_diagnostic_evidence_envelope,
+)
 from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
@@ -586,10 +590,28 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
     private_rows = [row for row in persisted_messages if row.tool_calls and is_diagnostic_evidence_envelope(row.tool_calls[0])]
     public_rows = [row for row in persisted_messages if row not in private_rows]
     assert raw_canary not in json.dumps(tuple(tuple(row) for row in public_rows))
-    assert len(private_rows) == 1
-    private = ComposerDiagnosticEvidence.from_envelope(
-        private_rows[0].tool_calls[0], expected_session_id=harness.session_id, expected_tool_call_id="call_inline"
-    )
+    assert len(private_rows) == 3
+    evidence = [ComposerDiagnosticEvidence.from_envelope(row.tool_calls[0], expected_session_id=harness.session_id) for row in private_rows]
+    by_identity = {item.evidence_id: item for item in evidence}
+    assert len(by_identity) == len(evidence)
+    assert len(result.llm_calls) == 2
+    request_ids = {diagnostic_evidence_identity("provider-request", call.call_id) for call in result.llm_calls}
+    authoring_id = diagnostic_evidence_identity("tool-authoring", "call_inline")
+    assert set(by_identity) == request_ids | {authoring_id}
+    for call in result.llm_calls:
+        request = by_identity[diagnostic_evidence_identity("provider-request", call.call_id)]
+        assert request.status == "provider_request"
+        assert request.tool_name == "composer_provider_context"
+        assert request.tool_call_id == call.call_id
+        assert request.arguments.disposition == "retained"
+        assert request.arguments.content is not None
+        assert raw_canary not in request.arguments.content
+    assert all(item.operation_id == compose_lease.context.fence.operation_id for item in evidence)
+    assert all(item.operation_epoch == compose_lease.context.fence.operation_epoch for item in evidence)
+    private = by_identity[authoring_id]
+    assert private.tool_call_id == "call_inline"
+    assert private.tool_name == "set_pipeline"
+    assert private.status == result.tool_invocations[0].status.value
     assert private.arguments.disposition == "retained"
     assert private.arguments.encoding == "json"
     assert private.arguments.content is not None

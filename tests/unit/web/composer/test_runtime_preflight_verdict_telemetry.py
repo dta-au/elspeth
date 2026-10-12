@@ -28,6 +28,7 @@ import pytest
 
 from elspeth.web.composer import composer_preflight as preflight_module
 from elspeth.web.composer import composition_completion as completion_module
+from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.composer_preflight import _preflight_verdict
 from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS
@@ -185,9 +186,6 @@ class TestPreflightInvalidFinalizeTelemetry:
             settings=_make_settings(data_dir=tmp_path),
         )
 
-        class _AssistantMessage:
-            content = "Here is what I attempted."
-
         # session_id=None makes the PT auto-surfacer and the orphan gate no-ops,
         # isolating the finalize tail. ``last_runtime_preflight`` is passed
         # SEPARATELY from ``strict`` rather than reusing it: the empty-state
@@ -195,7 +193,7 @@ class TestPreflightInvalidFinalizeTelemetry:
         # patched validator still has to return something, and collapsing the
         # two would make that shape unreachable.
         result = await service._completion._surface_and_finalize_no_tools(
-            assistant_message=_AssistantMessage(),
+            assistant_message=_AdmittedAssistantMessage(content="Here is what I attempted."),
             state=_non_empty_state() if state is None else state,
             session_id=None,
             current_state_id=None,

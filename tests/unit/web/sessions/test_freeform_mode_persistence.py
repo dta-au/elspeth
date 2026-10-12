@@ -94,7 +94,7 @@ def test_rootless_freeform_proposal_survives_reload(tmp_path, monkeypatch, tool_
                 "edges": [
                     {
                         "id": "e1",
-                        "from_node": "source",
+                        "from_node": "primary",
                         "to_node": "t1",
                         "edge_type": "on_success",
                         "label": None,
@@ -132,6 +132,8 @@ def test_rootless_freeform_proposal_survives_reload(tmp_path, monkeypatch, tool_
     assert persisted.sources["primary"]["plugin"] == "csv"
     assert persisted.sources["primary"]["options"]["path"] == str(input_path)
     assert persisted.sources["primary"]["options"]["schema"]["mode"] == "observed"
+    if tool_name == "set_pipeline":
+        assert [(edge["from_node"], edge["to_node"]) for edge in persisted.edges] == [("primary", "t1")]
     reloaded = client.get(f"/api/sessions/{session_id}/state")
     assert reloaded.status_code == 200, reloaded.json()
     assert reloaded.json()["id"] == str(persisted.id)

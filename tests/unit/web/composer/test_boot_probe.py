@@ -29,6 +29,7 @@ from elspeth.web.composer.pipeline_planner import (
     planner_tool_definitions,
 )
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.recovery_controls import recovery_tool_definitions
 from elspeth.web.config import WebSettings
 
 _CLEAN = '{"verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null}'
@@ -81,8 +82,8 @@ def test_loop_request_sends_the_exact_compose_loop_tool_list(settings_factory: A
 
     assert request.to_litellm_kwargs()["tools"] == composer_loop_tool_definitions(ToolContractDialect.NONE)
     assert request.to_litellm_kwargs()["max_tokens"] == bp.LOOP_PROBE_MAX_TOKENS == 16
-    assert request.tool_count == 42
-    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (0, 0, 42)
+    assert request.tool_count == 44
+    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (0, 0, 44)
 
 
 def test_planner_request_sends_the_planner_tool_list_with_the_planner_token_cap(settings_factory: Any) -> None:
@@ -109,7 +110,7 @@ def test_strict_counts_are_computed_from_the_sent_tools(settings_factory: Any) -
         surface="loop_tools", role="planner", model="gpt-5.5", kwargs={**request.to_litellm_kwargs(), "tools": tools}
     )
 
-    assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (1, 1, 40)
+    assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (1, 1, 42)
 
 
 # --- stamped routes (S1 T8) -------------------------------------------------------
@@ -121,14 +122,14 @@ def test_loop_request_on_a_forwarding_route_sends_the_stamped_loop_list(settings
     request = _request(settings_factory(composer_model=_OPENROUTER_PLANNER), "loop_tools")
 
     assert request.to_litellm_kwargs()["tools"] == composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT)
-    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (32, 10, 0)
+    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (34, 10, 0)
 
 
 def test_planner_request_on_a_forwarding_route_sends_the_stamped_planner_list(settings_factory: Any) -> None:
     request = _request(settings_factory(composer_model=_OPENROUTER_PLANNER), "planner_tools")
 
     assert request.to_litellm_kwargs()["tools"] == planner_tool_definitions(dialect=ToolContractDialect.OPENAI_STRICT)
-    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (19, 1, 0)
+    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (21, 1, 0)
 
 
 def test_strict_counts_are_computed_from_a_stamped_list(settings_factory: Any) -> None:
@@ -141,7 +142,7 @@ def test_strict_counts_are_computed_from_a_stamped_list(settings_factory: Any) -
         surface="loop_tools", role="planner", model=_OPENROUTER_PLANNER, kwargs={**request.to_litellm_kwargs(), "tools": tools}
     )
 
-    assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (31, 11, 0)
+    assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (33, 11, 0)
 
 
 def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory: Any) -> None:
@@ -164,8 +165,11 @@ def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory:
     kwargs = hatch.to_litellm_kwargs()
     assert (hatch.role, hatch.model) == ("planner", "openrouter/z-ai/glm-5.3")
     assert kwargs["model"] == "openrouter/z-ai/glm-5.3"
-    assert kwargs["tools"] == [planner_terminal_tool_definition(dialect=ToolContractDialect.OPENAI_STRICT)]
-    assert kwargs["tools"][0]["function"]["strict"] is False
+    assert kwargs["tools"] == [
+        *recovery_tool_definitions(ToolContractDialect.OPENAI_STRICT),
+        planner_terminal_tool_definition(dialect=ToolContractDialect.OPENAI_STRICT),
+    ]
+    assert kwargs["tools"][-1]["function"]["strict"] is False
     assert kwargs["max_tokens"] == bp.LOOP_PROBE_MAX_TOKENS == 16
     assert kwargs["api_base"] == "https://openrouter.ai/api/v1"
     assert kwargs["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
@@ -173,7 +177,10 @@ def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory:
     expected = build_planner_request_kwargs(
         model="openrouter/z-ai/glm-5.3",
         messages=[{"role": "user", "content": _PROBE_PROMPT}],
-        tools=[planner_terminal_tool_definition(dialect=ToolContractDialect.OPENAI_STRICT)],
+        tools=[
+            *recovery_tool_definitions(ToolContractDialect.OPENAI_STRICT),
+            planner_terminal_tool_definition(dialect=ToolContractDialect.OPENAI_STRICT),
+        ],
         max_completion_tokens=settings.composer_planner_max_completion_tokens,
         temperature=settings.composer_temperature,
         seed=settings.composer_seed,
@@ -183,7 +190,7 @@ def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory:
     )
     expected["max_tokens"] = bp.LOOP_PROBE_MAX_TOKENS
     assert kwargs == expected
-    assert (hatch.strict_true_count, hatch.strict_false_count, hatch.strict_key_omitted) == (0, 1, 0)
+    assert (hatch.strict_true_count, hatch.strict_false_count, hatch.strict_key_omitted) == (2, 1, 0)
 
 
 def test_no_hatch_terminal_when_the_hatch_route_resolves_none(settings_factory: Any) -> None:
@@ -211,13 +218,13 @@ def test_probe_env_defaults_to_the_process_environment_the_service_resolves_agai
 
     assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "advisor"]
     loop, planner = requests[0], requests[1]
-    assert (loop.strict_true_count, loop.strict_false_count, loop.strict_key_omitted) == (0, 0, 42)
-    assert (planner.strict_true_count, planner.strict_false_count, planner.strict_key_omitted) == (0, 0, 20)
+    assert (loop.strict_true_count, loop.strict_false_count, loop.strict_key_omitted) == (0, 0, 44)
+    assert (planner.strict_true_count, planner.strict_false_count, planner.strict_key_omitted) == (0, 0, 22)
 
     contrast = bp.build_composer_probe_requests(settings, env={})
     assert [request.surface for request in contrast] == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
-    assert contrast[0].strict_true_count == 32
-    assert contrast[1].strict_true_count == 19
+    assert contrast[0].strict_true_count == 34
+    assert contrast[1].strict_true_count == 21
 
 
 def test_loop_and_planner_requests_use_their_own_reasoning_efforts(settings_factory: Any) -> None:
@@ -406,7 +413,7 @@ async def test_tool_surfaces_pass_on_any_accepted_response(monkeypatch: pytest.M
 @pytest.mark.parametrize(
     ("surface", "tool_count", "strict_counts"),
     [
-        ("loop_tools", 42, (0, 0, 42)),
+        ("loop_tools", 44, (0, 0, 44)),
         (
             "planner_tools",
             len(planner_tool_definitions(dialect=ToolContractDialect.NONE)),
@@ -414,7 +421,7 @@ async def test_tool_surfaces_pass_on_any_accepted_response(monkeypatch: pytest.M
         ),
         # The fixture's default OpenRouter advisor is FORWARDING, so the hatch
         # terminal goes out with an explicit ``strict: false``.
-        ("hatch_terminal", 1, (0, 1, 0)),
+        ("hatch_terminal", 3, (2, 1, 0)),
         ("advisor", 0, (0, 0, 0)),
     ],
 )

@@ -20,6 +20,7 @@ from tests.unit.web.sessions.session_test_authority import FencedSessionServiceH
 from tests.unit.web.sessions.test_routes import _make_app
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
@@ -175,6 +176,7 @@ class _BlockingSpliceComposer:
         budget_seconds: float | None = None,
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        recovery_context: GraphRecoveryContext | None = None,
     ) -> ComposerResult:
         del (
             message,
@@ -189,6 +191,7 @@ class _BlockingSpliceComposer:
             budget_seconds,
             required_work,
             provider_owner,
+            recovery_context,
         )
         result = execute_tool(
             "splice_transform",

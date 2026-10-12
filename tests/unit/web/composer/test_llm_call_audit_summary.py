@@ -317,10 +317,11 @@ class _CapturingSessionService:
 class _PlannerAuditHost:
     """Minimal host for the real ``PlanningApplication`` drain body.
 
-    ``_persist_pipeline_planner_audit`` reaches ``self`` for exactly one
-    thing — the sessions service. Binding the real method to this host runs
-    the production body rather than a re-implementation of it.
+    Bind the real draft builder as well as the sessions service so the
+    persistence test exercises the production cohort without reimplementing it.
     """
+
+    _pipeline_planner_audit_drafts = PlanningApplication._pipeline_planner_audit_drafts
 
     def __init__(self, sessions: _CapturingSessionService) -> None:
         self._sessions = sessions

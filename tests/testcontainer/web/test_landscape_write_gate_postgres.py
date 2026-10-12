@@ -487,9 +487,10 @@ def test_request_open_does_not_repair_missing_additive_index(
     assert before_request != original
     settings = _settings(tmp_path, runtime_database)
 
-    with open_landscape_db(settings):
-        pass
-    _record_bounded_event(settings, request_id="missing-index-event")
+    with pytest.raises(SchemaCompatibilityError):
+        open_landscape_db(settings)
+    with pytest.raises(SchemaCompatibilityError):
+        _record_bounded_event(settings, request_id="missing-index-event")
 
     assert "ix_tokens_run_id" not in {index["name"] for index in inspect(runtime_database.owner_engine).get_indexes("tokens")}
     assert _catalog_identity(runtime_database.owner_engine) == before_request

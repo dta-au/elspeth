@@ -396,6 +396,8 @@ def _assert_no_sentinel_leak(
         assert all(row["session_id"] == operation["session_id"] and row["writer_principal"] == "compose_loop" for row in failed_calls)
     withheld_count = 0
     private_call_ids: set[str] = set()
+    private_request_call_ids: set[str] = set()
+    calls_by_id = {row["tool_calls"][0]["call"]["call_id"]: row["tool_calls"][0]["call"] for row in failed_calls}
     for row in stored_rows if stored_rows is not None else rows:
         fields = deepcopy(dict(row))
         calls = fields["tool_calls"]
@@ -426,38 +428,65 @@ def _assert_no_sentinel_leak(
                 calls[0], expected_session_id=operation["session_id"], expected_operation_id=operation["session_operation_id"]
             )
             assert evidence.operation_epoch == operation["session_operation_epoch"]
-            assert evidence.tool_name == "composer_failure"
-            assert evidence.status == "provider_failure"
-            assert evidence.evidence_id == diagnostic_evidence_identity("provider-failure", evidence.tool_call_id)
-            assert evidence.tool_call_id in call_ids
-            assert evidence.tool_call_id not in private_call_ids
-            private_call_ids.add(evidence.tool_call_id)
-            assert evidence.authority_arguments is None
-            for payload in (evidence.arguments, evidence.wire_arguments):
-                assert payload.disposition == "unavailable"
-                assert payload.content is None
-                assert payload.reasons == ("not_recorded",)
-            assert evidence.result.disposition == "retained"
-            assert evidence.result.reasons == ()
-            assert evidence.result.content is not None
-            assert json.loads(evidence.result.content) == {
-                "record_type": "failure_facts",
-                "termination": "complete",
-                "nodes": [
-                    {
-                        "relation": "exception",
-                        "class": expected_failure_class,
-                        "arguments": [{"disposition": "retained", "text": failure_text}],
-                        "omitted_arguments": 0,
-                    }
-                ],
-            }
-            # Retain the nonsensitive exception facts only in this exact private
-            # receipt. Hashes and every sibling/metadata field remain scanned.
-            del calls[0]["evidence"]["result"]["content"]
+            if evidence.status == "provider_request":
+                assert evidence.tool_name == "composer_provider_context"
+                assert evidence.evidence_id == diagnostic_evidence_identity("provider-request", evidence.tool_call_id)
+                assert evidence.tool_call_id in call_ids
+                assert evidence.tool_call_id not in private_request_call_ids
+                private_request_call_ids.add(evidence.tool_call_id)
+                assert evidence.authority_arguments is None
+                assert evidence.arguments.disposition == "retained"
+                assert evidence.arguments.reasons == ()
+                assert evidence.arguments.content is not None
+                request = json.loads(evidence.arguments.content)
+                assert set(request) == {"schema_version", "capture_boundary", "messages", "tools"}
+                assert request["schema_version"] == "composer.provider-context.v1"
+                assert request["capture_boundary"] == "prepared_litellm_messages_and_tools"
+                call = calls_by_id[evidence.tool_call_id]
+                assert stable_hash(request["messages"]) == call["messages_hash"]
+                assert stable_hash(request["tools"]) == call["tools_spec_hash"]
+                assert evidence.result.disposition == "not_returned"
+                assert evidence.result.content is None
+                assert evidence.result.reasons == ()
+                assert evidence.wire_arguments.disposition == "unavailable"
+                assert evidence.wire_arguments.content is None
+                assert evidence.wire_arguments.reasons == ("not_recorded",)
+                # Request bytes receive no sentinel exemption. The provider
+                # exception is not appended to messages by the retry loop.
+            else:
+                assert evidence.tool_name == "composer_failure"
+                assert evidence.status == "provider_failure"
+                assert evidence.evidence_id == diagnostic_evidence_identity("provider-failure", evidence.tool_call_id)
+                assert evidence.tool_call_id in call_ids
+                assert evidence.tool_call_id not in private_call_ids
+                private_call_ids.add(evidence.tool_call_id)
+                assert evidence.authority_arguments is None
+                for payload in (evidence.arguments, evidence.wire_arguments):
+                    assert payload.disposition == "unavailable"
+                    assert payload.content is None
+                    assert payload.reasons == ("not_recorded",)
+                assert evidence.result.disposition == "retained"
+                assert evidence.result.reasons == ()
+                assert evidence.result.content is not None
+                assert json.loads(evidence.result.content) == {
+                    "record_type": "failure_facts",
+                    "termination": "complete",
+                    "nodes": [
+                        {
+                            "relation": "exception",
+                            "class": expected_failure_class,
+                            "arguments": [{"disposition": "retained", "text": failure_text}],
+                            "omitted_arguments": 0,
+                        }
+                    ],
+                }
+                # Retain the nonsensitive exception facts only in this exact private
+                # receipt. Hashes and every sibling/metadata field remain scanned.
+                del calls[0]["evidence"]["result"]["content"]
         assert _PROVIDER_LEAK_SENTINEL not in json.dumps(fields, default=str)
     assert withheld_count == expected_withheld_replies
     assert private_call_ids == call_ids
+    assert private_request_call_ids == call_ids
 
 
 def _assert_withheld_prose_is_not_visible_or_replayed(client: SyncASGITestClient, sessions: SessionServiceImpl, session_id: str) -> None:
@@ -665,7 +694,23 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
     completion.assert_awaited_once()
     assert physical_sdk.await_count == expected_calls
     assert len(requests) == expected_calls
-    assert requests[0]["messages"][-1] == {"role": "user", "content": message}
+    assert requests[0]["messages"][-2:] == [
+        {"role": "user", "content": message},
+        {
+            "role": "system",
+            "content": json.dumps(
+                {
+                    "turn_start_state_id": None,
+                    "turn_start_version": 0,
+                    "current_state_id": None,
+                    "current_version": 0,
+                    "malformed_head": False,
+                    "parked_graphs": [],
+                },
+                sort_keys=True,
+            ),
+        },
+    ]
     if expected_calls == 2:
         reconciliation_completion.assert_awaited_once()
         assert requests[1]["model"] == requests[0]["model"]
@@ -681,7 +726,8 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
                 "[composer-system] No tool has run this turn, and the pipeline has no source or nodes. "
                 "Re-check the user's request against that state. If the user requested construction or generated "
                 "source data, carry out that authorized work using the declared tools before claiming it is complete. "
-                "If a required product fact is missing, ask the concrete question. If the user asked only for "
+                "If a required product fact is missing, start your no-tool reply with CLARIFY: and ask the concrete question. "
+                "If the user asked only for "
                 "explanation or revoked construction, answer that request without building. Do not describe data "
                 "as saved, bound, or reviewed until tool results establish it."
             ),
@@ -832,49 +878,65 @@ def test_send_message_freeform_planner_failure_is_translated(
     if expected_provider_failures:
         with engine.connect() as conn:
             stored_rows = [dict(row) for row in conn.execute(select(chat_messages_table)).mappings()]
-        private_index = next(
-            i
-            for i, row in enumerate(stored_rows)
-            if row["tool_calls"] and row["tool_calls"][0].get("_kind") == "composer_diagnostic_evidence"
-        )
-        for mutation in ("summary", "raw_content", "writer", "mixed", "hash", "operation", "epoch", "arguments", "missing", "duplicate"):
-            damaged = deepcopy(stored_rows)
-            row = damaged[private_index]
-            envelope = row["tool_calls"][0]
-            if mutation == "summary":
-                row["content"] += _PROVIDER_LEAK_SENTINEL
-            elif mutation == "raw_content":
-                row["raw_content"] = _PROVIDER_LEAK_SENTINEL
-            elif mutation == "writer":
-                row["writer_principal"] = "route_user_message"
-            elif mutation == "mixed":
-                row["tool_calls"].append({"_kind": "audit"})
-            elif mutation == "hash":
-                envelope["evidence_sha256"] = "0" * 64
-            elif mutation in {"operation", "epoch", "arguments"}:
-                # Recompute the envelope hash so the binding/payload assertion,
-                # rather than only the integrity hash, must reject the record.
-                if mutation == "operation":
-                    envelope["operation_id"] = envelope["evidence"]["operation_id"] = str(uuid4())
-                elif mutation == "epoch":
-                    envelope["operation_epoch"] += 1
-                    envelope["evidence"]["operation_epoch"] = envelope["operation_epoch"]
+        # Each receipt family independently rejects corrupted metadata,
+        # bindings, payloads, omissions and duplication.
+        for receipt_status in ("provider_failure", "provider_request"):
+            private_index = next(
+                i
+                for i, row in enumerate(stored_rows)
+                if row["tool_calls"]
+                and row["tool_calls"][0].get("_kind") == "composer_diagnostic_evidence"
+                and row["tool_calls"][0]["evidence"]["status"] == receipt_status
+            )
+            for mutation in (
+                "summary",
+                "raw_content",
+                "writer",
+                "mixed",
+                "hash",
+                "operation",
+                "epoch",
+                "arguments",
+                "missing",
+                "duplicate",
+            ):
+                damaged = deepcopy(stored_rows)
+                row = damaged[private_index]
+                envelope = row["tool_calls"][0]
+                if mutation == "summary":
+                    row["content"] += _PROVIDER_LEAK_SENTINEL
+                elif mutation == "raw_content":
+                    row["raw_content"] = _PROVIDER_LEAK_SENTINEL
+                elif mutation == "writer":
+                    row["writer_principal"] = "route_user_message"
+                elif mutation == "mixed":
+                    row["tool_calls"].append({"_kind": "audit"})
+                elif mutation == "hash":
+                    envelope["evidence_sha256"] = "0" * 64
+                elif mutation in {"operation", "epoch", "arguments"}:
+                    # Recompute the envelope hash so the binding/payload assertion,
+                    # rather than only the integrity hash, must reject the record.
+                    if mutation == "operation":
+                        envelope["operation_id"] = envelope["evidence"]["operation_id"] = str(uuid4())
+                    elif mutation == "epoch":
+                        envelope["operation_epoch"] += 1
+                        envelope["evidence"]["operation_epoch"] = envelope["operation_epoch"]
+                    else:
+                        envelope["evidence"]["arguments"] = deepcopy(envelope["evidence"]["result"])
+                    envelope["evidence_sha256"] = hashlib.sha256(canonical_json(envelope["evidence"]).encode()).hexdigest()
+                elif mutation == "missing":
+                    damaged.pop(private_index)
                 else:
-                    envelope["evidence"]["arguments"] = deepcopy(envelope["evidence"]["result"])
-                envelope["evidence_sha256"] = hashlib.sha256(canonical_json(envelope["evidence"]).encode()).hexdigest()
-            elif mutation == "missing":
-                damaged.pop(private_index)
-            else:
-                damaged.append(deepcopy(row))
-            with pytest.raises((AssertionError, AuditIntegrityError)):
-                _assert_no_sentinel_leak(
-                    engine,
-                    settled.final.text,
-                    expected_withheld_replies=expected_withheld_replies,
-                    expected_provider_failures=expected_provider_failures,
-                    expected_failure_class=expected_failure_class,
-                    stored_rows=damaged,
-                )
+                    damaged.append(deepcopy(row))
+                with pytest.raises((AssertionError, AuditIntegrityError)):
+                    _assert_no_sentinel_leak(
+                        engine,
+                        settled.final.text,
+                        expected_withheld_replies=expected_withheld_replies,
+                        expected_provider_failures=expected_provider_failures,
+                        expected_failure_class=expected_failure_class,
+                        stored_rows=damaged,
+                    )
 
     # Negative control: a marker leaked to an ordinary row must still fail,
     # even when the same database contains valid withheld-reply records.
@@ -1350,7 +1412,8 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
                     "and the pipeline has no source or nodes. Re-check the user's request against that state. "
                     "If the user requested construction or generated source data, carry out that authorized work "
                     "using the declared tools before claiming it is complete. If a required product fact is missing, "
-                    "ask the concrete question. If the user asked only for explanation or revoked construction, "
+                    "start your no-tool reply with CLARIFY: and ask the concrete question. "
+                    "If the user asked only for explanation or revoked construction, "
                     "answer that request without building. Do not describe data as saved, bound, or reviewed "
                     "until tool results establish it."
                 ),
