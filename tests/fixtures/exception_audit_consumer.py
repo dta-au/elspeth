@@ -59,6 +59,8 @@ def exercise_audit_failed_turn() -> None:
                     redaction_telemetry=NoopRedactionTelemetry(),
                     tool_outcomes=(),
                     decoded_args_by_call_id={},
+                    private_authorings=(),
+                    private_invocations=(),
                     assistant_message=_AdmittedAssistantMessage(content=provider_canary),
                     raw_assistant_content=provider_canary,
                     assistant_tool_calls=calls,
@@ -73,6 +75,8 @@ def exercise_audit_failed_turn() -> None:
                 )
             persist.assert_awaited_once()
             assert persist.call_args.kwargs["raw_content"] == provider_canary
+            assert persist.call_args.kwargs["private_tool_evidence"] == ()
+            assert persist.call_args.kwargs["private_tool_failures"] == ()
             assert caught.value is fault
             response = await handler(request, caught.value)
             assert isinstance(response, JSONResponse)

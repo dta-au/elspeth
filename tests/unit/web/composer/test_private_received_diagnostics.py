@@ -1,6 +1,7 @@
 """Received diagnostics are independent of planner admission and public audit."""
 
 import json
+import warnings
 from uuid import UUID
 
 import pytest
@@ -411,9 +412,16 @@ def test_foreign_class_dictionary_key_callback_is_not_invoked():
                 raise AssertionError("class dictionary key equality executed")
             return False
 
-    with pytest.warns(RuntimeWarning):
-        foreign = type("Foreign", (), {Key(): 1})
+    key = Key()
+    # Python versions differ in whether class creation warns about this key.
+    # The capture contract is that the retained hostile key is never executed.
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always", RuntimeWarning)
+        foreign = type("Foreign", (), {key: 1})
+    assert any(item is key for item in vars(foreign))
     armed = True
+    with pytest.raises(AssertionError, match="class dictionary key equality executed"):
+        assert key == "__dict__"
     facts = capture_received_response(foreign(), namespace="r", ordinal=1, known_tools=frozenset())
     assert json.loads(facts[0].result_canonical)["shape"] == "unavailable_envelope"
 

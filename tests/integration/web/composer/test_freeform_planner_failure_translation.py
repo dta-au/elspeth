@@ -30,10 +30,12 @@ import structlog
 from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import func, select
 
-from elspeth.core.canonical import stable_hash
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
 from elspeth.web.composer.pipeline_planner import _PROSE_NUDGE_BUDGET
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
@@ -45,7 +47,12 @@ from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import chat_messages_table, composition_proposals_table, composition_states_table
+from elspeth.web.sessions.models import (
+    chat_messages_table,
+    composer_async_operations_table,
+    composition_proposals_table,
+    composition_states_table,
+)
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -355,13 +362,42 @@ def _llm_audit_rows(engine: Any) -> list[Any]:
     return [row for row in rows if row.role == "audit" and row.tool_calls and row.tool_calls[0].get("_kind") == "llm_call_audit"]
 
 
-def _assert_no_sentinel_leak(engine: Any, response_text: str, *, expected_withheld_replies: int) -> None:
+def _assert_no_sentinel_leak(
+    engine: Any,
+    response_text: str,
+    *,
+    expected_withheld_replies: int,
+    expected_provider_failures: int = 0,
+    expected_failure_class: str = "APIError",
+    stored_rows: list[dict[str, Any]] | None = None,
+) -> None:
     assert _PROVIDER_LEAK_SENTINEL not in response_text
     with engine.connect() as conn:
         rows = conn.execute(select(chat_messages_table)).mappings().all()
+        operation = conn.execute(select(composer_async_operations_table)).mappings().one() if expected_provider_failures else None
+    # Derive correlation from the physical-call records and persisted fence,
+    # independently of the private envelopes being checked below.
+    failure_status, failure_text = {
+        "APIError": ("api_error", f"litellm.APIError: provider unavailable {_PROVIDER_LEAK_SENTINEL}"),
+        "TimeoutError": ("timeout", _PROVIDER_LEAK_SENTINEL),
+    }[expected_failure_class]
+    failed_calls = [
+        row
+        for row in rows
+        if row["role"] == "audit"
+        and row["tool_calls"]
+        and row["tool_calls"][0].get("_kind") == "llm_call_audit"
+        and row["tool_calls"][0]["call"]["status"] == failure_status
+    ]
+    call_ids = {row["tool_calls"][0]["call"]["call_id"] for row in failed_calls}
+    assert len(failed_calls) == len(call_ids) == expected_provider_failures
+    if operation is not None:
+        assert operation["status"] == "failed"
+        assert all(row["session_id"] == operation["session_id"] and row["writer_principal"] == "compose_loop" for row in failed_calls)
     withheld_count = 0
-    for row in rows:
-        fields = dict(row)
+    private_call_ids: set[str] = set()
+    for row in stored_rows if stored_rows is not None else rows:
+        fields = deepcopy(dict(row))
         calls = fields["tool_calls"]
         if calls and calls[0].get("_kind") == "composer_withheld_reply":
             assert fields["role"] == "audit"
@@ -378,8 +414,50 @@ def _assert_no_sentinel_leak(engine: Any, response_text: str, *, expected_withhe
             # Only this precisely verified content is intentionally retained.
             # Check every other field without SQLAlchemy Row repr truncation.
             del fields["content"]
+        if expected_provider_failures and calls and calls[0].get("_kind") == "composer_diagnostic_evidence":
+            assert len(calls) == 1
+            assert fields["role"] == "audit"
+            assert fields["writer_principal"] == "compose_loop"
+            assert fields["content"] == "Private credential-filtered diagnostic facts"
+            assert all(fields[key] is None for key in ("raw_content", "tool_call_id", "composition_state_id", "parent_assistant_id"))
+            assert operation is not None
+            assert fields["session_id"] == operation["session_id"]
+            evidence = ComposerDiagnosticEvidence.from_envelope(
+                calls[0], expected_session_id=operation["session_id"], expected_operation_id=operation["session_operation_id"]
+            )
+            assert evidence.operation_epoch == operation["session_operation_epoch"]
+            assert evidence.tool_name == "composer_failure"
+            assert evidence.status == "provider_failure"
+            assert evidence.evidence_id == diagnostic_evidence_identity("provider-failure", evidence.tool_call_id)
+            assert evidence.tool_call_id in call_ids
+            assert evidence.tool_call_id not in private_call_ids
+            private_call_ids.add(evidence.tool_call_id)
+            assert evidence.authority_arguments is None
+            for payload in (evidence.arguments, evidence.wire_arguments):
+                assert payload.disposition == "unavailable"
+                assert payload.content is None
+                assert payload.reasons == ("not_recorded",)
+            assert evidence.result.disposition == "retained"
+            assert evidence.result.reasons == ()
+            assert evidence.result.content is not None
+            assert json.loads(evidence.result.content) == {
+                "record_type": "failure_facts",
+                "termination": "complete",
+                "nodes": [
+                    {
+                        "relation": "exception",
+                        "class": expected_failure_class,
+                        "arguments": [{"disposition": "retained", "text": failure_text}],
+                        "omitted_arguments": 0,
+                    }
+                ],
+            }
+            # Retain the nonsensitive exception facts only in this exact private
+            # receipt. Hashes and every sibling/metadata field remain scanned.
+            del calls[0]["evidence"]["result"]["content"]
         assert _PROVIDER_LEAK_SENTINEL not in json.dumps(fields, default=str)
     assert withheld_count == expected_withheld_replies
+    assert private_call_ids == call_ids
 
 
 def _assert_withheld_prose_is_not_visible_or_replayed(client: SyncASGITestClient, sessions: SessionServiceImpl, session_id: str) -> None:
@@ -388,6 +466,11 @@ def _assert_withheld_prose_is_not_visible_or_replayed(client: SyncASGITestClient
     visible = client.get(f"/api/sessions/{session_id}/messages")
     assert visible.status_code == 200, visible.text
     assert _PROVIDER_LEAK_SENTINEL not in visible.text
+    all_views = client.get(
+        f"/api/sessions/{session_id}/messages?include_tool_rows=true&include_raw_content=true&include_llm_audit=true&include_rejection_reasons=true"
+    )
+    assert all_views.status_code == 200, all_views.text
+    assert _PROVIDER_LEAK_SENTINEL not in all_views.text
     stored = asyncio.run(sessions.get_messages(UUID(session_id)))
     assert _PROVIDER_LEAK_SENTINEL not in json.dumps(_composer_chat_history(stored))
 
@@ -732,11 +815,66 @@ def test_send_message_freeform_planner_failure_is_translated(
     # NOT re-persisted as a duplicate) alongside the disposition record.
     assert len(_llm_audit_rows(engine)) == expected_llm_audit_rows
 
-    # (d) refused prose is recoverable only in its dedicated audit envelope.
-    _assert_no_sentinel_leak(engine, settled.final.text, expected_withheld_replies=expected_withheld_replies)
+    # (d) refused prose and nonsensitive failure facts retain dedicated private custody.
+    expected_provider_failures = expected_llm_audit_rows if expected_planner_code in {"PROVIDER_ERROR", "TIMEOUT"} else 0
+    expected_failure_class = "TimeoutError" if expected_planner_code == "TIMEOUT" else "APIError"
+    _assert_no_sentinel_leak(
+        engine,
+        settled.final.text,
+        expected_withheld_replies=expected_withheld_replies,
+        expected_provider_failures=expected_provider_failures,
+        expected_failure_class=expected_failure_class,
+    )
     _assert_withheld_prose_is_not_visible_or_replayed(client, sessions, session_id)
     captured = capsys.readouterr()
     assert _PROVIDER_LEAK_SENTINEL not in captured.out + captured.err + caplog.text
+
+    if expected_provider_failures:
+        with engine.connect() as conn:
+            stored_rows = [dict(row) for row in conn.execute(select(chat_messages_table)).mappings()]
+        private_index = next(
+            i
+            for i, row in enumerate(stored_rows)
+            if row["tool_calls"] and row["tool_calls"][0].get("_kind") == "composer_diagnostic_evidence"
+        )
+        for mutation in ("summary", "raw_content", "writer", "mixed", "hash", "operation", "epoch", "arguments", "missing", "duplicate"):
+            damaged = deepcopy(stored_rows)
+            row = damaged[private_index]
+            envelope = row["tool_calls"][0]
+            if mutation == "summary":
+                row["content"] += _PROVIDER_LEAK_SENTINEL
+            elif mutation == "raw_content":
+                row["raw_content"] = _PROVIDER_LEAK_SENTINEL
+            elif mutation == "writer":
+                row["writer_principal"] = "route_user_message"
+            elif mutation == "mixed":
+                row["tool_calls"].append({"_kind": "audit"})
+            elif mutation == "hash":
+                envelope["evidence_sha256"] = "0" * 64
+            elif mutation in {"operation", "epoch", "arguments"}:
+                # Recompute the envelope hash so the binding/payload assertion,
+                # rather than only the integrity hash, must reject the record.
+                if mutation == "operation":
+                    envelope["operation_id"] = envelope["evidence"]["operation_id"] = str(uuid4())
+                elif mutation == "epoch":
+                    envelope["operation_epoch"] += 1
+                    envelope["evidence"]["operation_epoch"] = envelope["operation_epoch"]
+                else:
+                    envelope["evidence"]["arguments"] = deepcopy(envelope["evidence"]["result"])
+                envelope["evidence_sha256"] = hashlib.sha256(canonical_json(envelope["evidence"]).encode()).hexdigest()
+            elif mutation == "missing":
+                damaged.pop(private_index)
+            else:
+                damaged.append(deepcopy(row))
+            with pytest.raises((AssertionError, AuditIntegrityError)):
+                _assert_no_sentinel_leak(
+                    engine,
+                    settled.final.text,
+                    expected_withheld_replies=expected_withheld_replies,
+                    expected_provider_failures=expected_provider_failures,
+                    expected_failure_class=expected_failure_class,
+                    stored_rows=damaged,
+                )
 
     # Negative control: a marker leaked to an ordinary row must still fail,
     # even when the same database contains valid withheld-reply records.
@@ -749,7 +887,13 @@ def test_send_message_freeform_planner_failure_is_translated(
         )
     )
     with pytest.raises(AssertionError):
-        _assert_no_sentinel_leak(engine, settled.final.text, expected_withheld_replies=expected_withheld_replies)
+        _assert_no_sentinel_leak(
+            engine,
+            settled.final.text,
+            expected_withheld_replies=expected_withheld_replies,
+            expected_provider_failures=expected_provider_failures,
+            expected_failure_class=expected_failure_class,
+        )
 
 
 def test_recompose_freeform_planner_failure_is_translated(
