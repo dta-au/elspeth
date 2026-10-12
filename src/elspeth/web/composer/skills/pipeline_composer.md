@@ -49,7 +49,8 @@ keep these in view the whole turn.
    question, or a successful mutation that omitted the echo.
 
 **Done means** exactly one terminal state: a valid preview; OR all required
-review cards surfaced with no other validation errors; OR a named-gap refusal. A
+review cards surfaced with no other validation errors; OR a named-gap refusal;
+OR a focused clarification when a missing product fact prevents a faithful draft. A
 successful mutation is NOT "done" (see Termination States for the full checklist).
 
 ## Skill Router
@@ -89,6 +90,15 @@ with a named gap when that is safe; stop with a named gap only when no safe draf
 can be created. Apply the same named-gap rule when conflicting requirements
 prevent a faithful draft. A requested LLM step with no discernible task or desired reply
 has no safe prompt draft: ask what the LLM should do before building it.
+
+In the freeform Composer, when a missing product fact prevents a faithful draft,
+start the no-tool reply with exactly `CLARIFY:` followed by the concrete question.
+This marks a request for information, not completed work or execution readiness.
+Do not use it to hide a failed build or bypass pending reviews and validation.
+Ordinary answers and completion summaries do not use this marker. In the
+proposal planner (whose terminal tool is `emit_pipeline_proposal`), use the
+planner's `DECLINE:` protocol for a clarification or refusal; never emit
+`CLARIFY:` from the proposal planner.
 
 For ordinary build/edit turns, the action path is:
 
@@ -1228,6 +1238,11 @@ Do not ask the user to confirm these assumptions in normal assistant prose.
 
 Before you stop, copy this checklist and confirm each item:
 
+If a missing product fact prevents a faithful draft, ask the focused question
+using the surface-specific clarification protocol above instead of claiming
+the build checklist is complete. Existing failures and pending reviews remain
+unresolved; clarification does not establish a valid or runnable pipeline.
+
 ```
 - [ ] Every user-requested source/transform/sink/LLM/cleanup step is present (no silent downgrade).
 - [ ] No non-review validation errors remain.
@@ -1257,6 +1272,9 @@ For build/edit/validate turns, end only in one of these states:
 4. Another tool call is needed; keep working.
 5. The latest user request was informational rather than a build/edit/validate
    request, and you answered from an authoritative tool result.
+6. A missing product fact prevents a faithful draft, and you asked the focused
+   clarification using `CLARIFY:` in freeform Composer or `DECLINE:` in the
+   proposal planner, without claiming the pipeline is complete.
 
 Do not present a pipeline as complete because a mutation succeeded. Mutations
 create draft state; preview or pending review cards decide whether the turn can

@@ -107,6 +107,7 @@ from elspeth.web.composer.progress import (
 # through protocol's TYPE_CHECKING block.)
 from elspeth.web.composer.prompts import _state_referenced_plugins
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_discovery_response import (
     argument_error_response,
     closed_provider_envelope,
@@ -3454,6 +3455,7 @@ async def _plan_pipeline_inner(
                 error_class=type(exc).__name__,
                 error_message=type(exc).__name__,
                 failure=exc,
+                private_request=private_request,
                 max_completion_tokens_requested=budget_policy.max_completion_tokens,
                 planner_policy_hash=budget_policy.audit_hash,
                 planner_call_ordinal=ordinal,
@@ -3547,6 +3549,7 @@ async def _plan_pipeline_inner(
                 api_base=api_base,
                 api_key=api_key,
             )
+            private_request = capture_provider_context(messages=marked_messages, tools=marked_tools)
 
             try:
                 response = await asyncio.wait_for(
@@ -3562,6 +3565,7 @@ async def _plan_pipeline_inner(
                     raise
                 with required_provider_audit_scope(provider_custody):
                     cancelled_call = build_llm_call_record(
+                        private_request=private_request,
                         model_requested=effective_model,
                         pricing_model=effective_pricing_model,
                         messages=marked_messages,
@@ -3589,6 +3593,7 @@ async def _plan_pipeline_inner(
                     raise
                 with required_provider_audit_scope(provider_custody):
                     timed_out_call = build_llm_call_record(
+                        private_request=private_request,
                         model_requested=effective_model,
                         pricing_model=effective_pricing_model,
                         messages=marked_messages,
@@ -3662,6 +3667,7 @@ async def _plan_pipeline_inner(
 
             try:
                 call = build_llm_call_record(
+                    private_request=private_request,
                     model_requested=effective_model,
                     pricing_model=effective_pricing_model,
                     messages=marked_messages,
@@ -3681,6 +3687,7 @@ async def _plan_pipeline_inner(
             except CredentialMaterialRefused as exc:
                 with required_provider_audit_scope(provider_custody):
                     refused_call = build_llm_call_record(
+                        private_request=private_request,
                         model_requested=effective_model,
                         pricing_model=effective_pricing_model,
                         messages=marked_messages,

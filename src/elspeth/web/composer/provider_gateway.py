@@ -29,6 +29,7 @@ from elspeth.web.composer.llm_response_parsing import (
     supports_anthropic_prompt_cache_markers,
 )
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -629,6 +630,8 @@ class ProviderGateway:
             wire_messages, tools_or_none = apply_anthropic_cache_markers(wire_messages, wire_tools, mark_history_tail=True)
             wire_tools = tools_or_none if tools_or_none is not None else wire_tools
 
+        private_request = capture_provider_context(messages=wire_messages, tools=wire_tools or None)
+
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -728,6 +731,7 @@ class ProviderGateway:
                             error_message=error_message,
                             provider_custody=provider_custody,
                             failure=failure_to_capture,
+                            private_request=private_request,
                         )
                         if provider_custody is not None:
                             provider_custody.retain_audit(call)
@@ -746,6 +750,7 @@ class ProviderGateway:
         provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Call the diagnostics text model and record one redacted audit row."""
+        private_request = capture_provider_context(messages=messages, tools=None)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -862,6 +867,7 @@ class ProviderGateway:
                             error_message=error_message,
                             provider_custody=provider_custody,
                             failure=failure_to_capture,
+                            private_request=private_request,
                         )
                         if provider_custody is not None:
                             provider_custody.retain_audit(call)

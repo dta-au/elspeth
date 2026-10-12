@@ -22,12 +22,14 @@ _REQUEST = (
     "with an id and a complaint field, we'll be triaging them by urgency"
 )
 _FALSE_COMPLETION = "The six complaints are bound as the pipeline CSV source. Please confirm the urgency rubric."
+_CLARIFICATION = "Which urgency categories should the pipeline use?"
 
 
 @pytest.mark.asyncio
 async def test_rootless_build_prose_gets_one_neutral_retry_then_tool_execution() -> None:
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
     tool_reply = _make_llm_response(
+        content="CLARIFY: Which categories should the pipeline use?",
         tool_calls=[
             {
                 "id": "source-call",
@@ -39,7 +41,7 @@ async def test_rootless_build_prose_gets_one_neutral_retry_then_tool_execution()
                     "on_validation_failure": "quarantine",
                 },
             }
-        ]
+        ],
     )
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as completion,
@@ -130,3 +132,85 @@ async def test_expired_deadline_does_not_start_rootless_retry() -> None:
         result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
     assert completion.call_count == 1
     assert result.repair_turns_used == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preceding_reply,repair_budget", [(None, 0), (None, 2), (_FALSE_COMPLETION, 2)])
+async def test_marked_clarification_preserves_question_without_build_failure(
+    preceding_reply: str | None, repair_budget: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(completion_module, "_MAX_REPAIR_TURNS", repair_budget)
+    service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
+    replies = [_make_llm_response(content="CLARIFY: " + _CLARIFICATION)]
+    if preceding_reply is not None:
+        replies.insert(0, _make_llm_response(content=preceding_reply))
+    with patch.object(service._provider_gateway, "_call_llm", side_effect=replies) as completion:
+        result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
+    assert completion.call_count == len(replies)
+    assert result.raw_assistant_content == _CLARIFICATION
+    assert result.message.startswith(_CLARIFICATION)
+    assert "No pipeline has been built yet" in result.message
+    assert "did not complete a valid build" not in result.message
+    assert "CLARIFY:" not in result.message
+    assert result.runtime_preflight is None
+    assert result.repair_turns_used == int(preceding_reply is not None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prose", "notice"),
+    [(_FALSE_COMPLETION, "No pipeline has been built yet"), ("I just configured the source. Which categories?", "contradicts")],
+)
+async def test_marked_false_completion_retains_authoritative_disclosure(prose: str, notice: str) -> None:
+    service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
+    with patch.object(service._provider_gateway, "_call_llm", return_value=_make_llm_response(content="CLARIFY: " + prose)) as completion:
+        result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
+    assert completion.call_count == 1
+    assert result.raw_assistant_content == prose
+    assert notice in result.message
+    assert result.message.count("[ELSPETH-SYSTEM]") == 1
+    assert result.runtime_preflight is None
+
+
+@pytest.mark.asyncio
+async def test_marked_clarification_at_expired_deadline_keeps_normal_finalization() -> None:
+    service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
+    terminate = service._completion._try_terminate_no_tools
+
+    async def terminate_after_deadline(**kwargs: Any) -> Any:
+        kwargs["deadline"] = 0.0
+        return await terminate(**kwargs)
+
+    with (
+        patch.object(
+            service._provider_gateway, "_call_llm", return_value=_make_llm_response(content="CLARIFY: " + _CLARIFICATION)
+        ) as completion,
+        patch.object(service._completion, "_try_terminate_no_tools", side_effect=terminate_after_deadline),
+    ):
+        result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
+    assert completion.call_count == 1
+    assert result.runtime_preflight is None
+    assert "No pipeline has been built yet" in result.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["get_pipeline_state", "set_pipeline"])
+async def test_marked_clarification_after_tool_preserves_receipt_policy(tool_name: str) -> None:
+    service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
+    replies = [
+        _make_llm_response(tool_calls=[{"id": "before-question", "name": tool_name, "arguments": {}}]),
+        _make_llm_response(content="CLARIFY: " + _CLARIFICATION),
+        _make_llm_response(content="CLARIFY: " + _CLARIFICATION),
+    ]
+    with patch.object(service._provider_gateway, "_call_llm", side_effect=replies) as completion:
+        result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
+    assert result.tool_invocations[0].tool_name == tool_name
+    if tool_name == "get_pipeline_state":
+        assert completion.call_count == 2
+        assert "No pipeline has been built yet" in result.message
+        assert result.runtime_preflight is None
+    else:
+        assert completion.call_count == 3
+        assert "set_pipeline failed before mutation" in result.message
+        assert result.runtime_preflight is not None and not result.runtime_preflight.is_valid
+        assert "No pipeline has been built yet" not in result.message

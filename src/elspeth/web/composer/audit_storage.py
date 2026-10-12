@@ -20,7 +20,12 @@ from elspeth.web.composer.authority_hashing import (
     project_composer_authority_payload,
     restore_composer_authority_payload,
 )
-from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, build_private_tool_evidence, diagnostic_evidence_identity
+from elspeth.web.composer.diagnostic_evidence import (
+    ComposerDiagnosticEvidence,
+    DiagnosticPayload,
+    build_private_tool_evidence,
+    diagnostic_evidence_identity,
+)
 from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection, inline_custody_manifest_redaction_input
 from elspeth.web.composer.pipeline_proposal import (
     is_owned_composition_state_authority,
@@ -80,6 +85,29 @@ def private_diagnostic_drafts(
         call_id = record.call_id or f"legacy:{record.started_at.isoformat()}:{record.planner_call_ordinal}"
         identity = diagnostic_evidence_identity("provider-failure", call_id)
         status = "provider_failure"
+        if record.private_request is not None:
+            request = record.private_request
+            evidence.append(
+                ComposerDiagnosticEvidence(
+                    session_id=context.fence.session_id,
+                    operation_id=context.fence.operation_id,
+                    operation_epoch=context.fence.operation_epoch,
+                    tool_call_id=call_id,
+                    evidence_id=diagnostic_evidence_identity("provider-request", call_id),
+                    tool_name="composer_provider_context",
+                    status="provider_request",
+                    arguments=DiagnosticPayload(
+                        request.disposition,
+                        "json",
+                        request.canonical,
+                        hashlib.sha256(request.canonical.encode("utf-8")).hexdigest() if request.canonical is not None else None,
+                        request.reasons,
+                    ),
+                    authority_arguments=None,
+                    result=DiagnosticPayload("not_returned", "json", None, None),
+                    wire_arguments=DiagnosticPayload("unavailable", "wire_text", None, None, ("not_recorded",)),
+                )
+            )
         retained_arguments_remaining = 1024 * 1024
         for receipt in record.private_diagnostics:
             item = build_private_tool_evidence(

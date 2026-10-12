@@ -99,6 +99,9 @@ _EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER = _wrapped_diagnostic_template(
     diagnostic_slots="{blocker}",
 )
 
+_CLARIFICATION_NOTICE: Final = "No pipeline has been built yet. Answer the clarification above to continue."
+_CLARIFICATION_FINALIZE_SUFFIX = _bare_trusted_suffix(_CLARIFICATION_NOTICE)
+
 _PREFLIGHT_NOTICE_HEADER: Final = "Runtime preflight failed before this build could be marked complete."
 _PREFLIGHT_NOTICE_FOOTER: Final = "The composer's analysis above is preserved verbatim; the validator's objection is recorded here."
 _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
@@ -378,8 +381,8 @@ _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINDINGS_SUFFIX_WITH_DETAIL = _wrappe
 
 # elspeth-2ed41f0a4a R2: the NO-TOOL finalize tail's own pending-review
 # announcement — the advisor-path notices above are its twins, reached when the
-# END advisor gate ALSO failed to clear. This one says only that review cards
-# are waiting, so it makes no advisory claim.
+# END advisor gate ALSO failed to clear. This one announces pending review
+# and conditions execution on remaining checks without claiming their outcome.
 #
 # It used to be hand-assembled in ``service.py`` and joined to the prose with a
 # bare ``"\n\n"``: no ``_TRUSTED_NOTICE_SEPARATOR``, no ``_TRUSTED_NOTICE_MARKER``,
@@ -394,7 +397,8 @@ _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINDINGS_SUFFIX_WITH_DETAIL = _wrappe
 # from the authoring-masked re-validation (same trust class, and the same
 # treatment, as the preflight wrapper's interpolation).
 _INTERPRETATION_REVIEW_HANDOFF_NOTICE: Final = (
-    "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue."
+    "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue. "
+    "Approval does not establish execution readiness; remaining validation and required advisor checks must pass before execution."
 )
 _INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX = _bare_trusted_suffix(_INTERPRETATION_REVIEW_HANDOFF_NOTICE)
 _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER: Final = (
@@ -657,6 +661,7 @@ _QUOTE_TERMINATORS: Final = {
 _ANY_MUTATION_ACTION_PATTERN: Final = re.compile(rf"\b{_MUTATION_ACTION_PATTERN}\b", re.IGNORECASE)
 
 _AugmentationBranch = Literal[
+    "clarification_augmentation",
     "no_mutation_empty_state_augmentation",
     "preflight_invalid_empty_state_augmentation",
     "preflight_invalid_non_empty_state_augmentation",
@@ -798,6 +803,8 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
         return None
     if suffix == _EMPTY_STATE_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_EMPTY_STATE_NOTICE_BODY),)
+    if suffix == _CLARIFICATION_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_CLARIFICATION_NOTICE),)
     empty_with_blocker = _split_wrapped_diagnostic(
         suffix,
         header=_EMPTY_STATE_NOTICE_HEADER,
@@ -902,6 +909,11 @@ def enforce_augmentation_prefix_invariant(
             "message constructor so the prose appears verbatim at the start "
             "of message."
         )
+
+
+def compose_clarification_message(content: str) -> str:
+    """Disclose the unchanged empty state without asserting a build failure."""
+    return content + _CLARIFICATION_FINALIZE_SUFFIX
 
 
 def compose_empty_state_message(content: str, *, blocker: str | None = None) -> str:
@@ -1156,8 +1168,8 @@ def compose_interpretation_review_handoff_message(
 
     The no-tool finalize tail's counterpart to
     :func:`compose_advisor_pending_handoff_message`, and deliberately quieter:
-    the advisory review is not implicated here, so the notice claims only that
-    review cards exist and that resolving them is the next step.
+    the notice announces review cards and conditions execution on remaining
+    checks without claiming an advisory outcome.
 
     ``outstanding_findings_detail`` carries the leading objection from the
     authoring-masked re-validation (``_pending_handoff_outstanding_findings``)

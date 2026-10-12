@@ -442,6 +442,11 @@ class TestWrappedDiagnosticWireShapeLinkage:
 # family stayed on hand-maintained equality checks until elspeth-25f7b757e7).
 _BARE_SUFFIX_ROUND_TRIP_CASES = [
     pytest.param(
+        no_tool_policy._CLARIFICATION_FINALIZE_SUFFIX,
+        no_tool_policy._CLARIFICATION_NOTICE,
+        id="_CLARIFICATION_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
         no_tool_policy._REVIEW_REPLY_UNAVAILABLE_SUFFIX,
         no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE,
         id="_REVIEW_REPLY_UNAVAILABLE_SUFFIX",
@@ -654,6 +659,9 @@ class TestInterpretationReviewHandoffSegments:
     def test_bare_notice_renders_as_trusted_chrome(self) -> None:
         prose = "I staged the review cards."
         content = compose_interpretation_review_handoff_message(prose)
+
+        assert "Approval does not establish execution readiness" in content
+        assert "remaining validation and required advisor checks must pass before execution" in content
 
         assert visible_message_segments(content=content, raw_content=prose) == (
             AssistantTextSegment(prose),

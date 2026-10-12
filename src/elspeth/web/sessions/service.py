@@ -8711,7 +8711,7 @@ class SessionServiceImpl:
             )
             if evidence.operation_epoch != session_operation_context.fence.operation_epoch:
                 raise AuditIntegrityError("private diagnostic draft has another operation epoch")
-            if not draft.inherit_composition_state and evidence.status not in {"received_response", "provider_failure"}:
+            if not draft.inherit_composition_state and evidence.status not in {"received_response", "provider_failure", "provider_request"}:
                 raise AuditIntegrityError("unbound private state belongs only to physical diagnostics")
             key = (evidence.operation_id, evidence.operation_epoch, evidence.evidence_id)
             if key in incoming:

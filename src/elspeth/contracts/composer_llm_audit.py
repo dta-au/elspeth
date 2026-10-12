@@ -20,6 +20,7 @@ from enum import StrEnum
 from typing import Any, Final, Literal, Protocol
 
 from elspeth.contracts.composer_audit import PrivateFailureFacts, PrivateReceivedDiagnostic
+from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.freeze import deep_thaw, freeze_fields, require_int
 
 ComposerLLMProviderCostSource = Literal[
@@ -233,8 +234,11 @@ class ComposerLLMCall:
     strict_tool_count: int | None = None
     private_failure: PrivateFailureFacts | None = field(default=None, repr=False)
     private_diagnostics: tuple[PrivateReceivedDiagnostic, ...] = field(default=(), repr=False)
+    private_request: PrivateProviderContext | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.private_request is not None and type(self.private_request) is not PrivateProviderContext:
+            raise TypeError("LLM private request context must be owned")
         if self.private_failure is not None and type(self.private_failure) is not PrivateFailureFacts:
             raise TypeError("LLM private failure facts must be owned")
         if type(self.private_diagnostics) is not tuple or any(
@@ -348,7 +352,7 @@ class ComposerLLMCall:
         raw = {
             field.name: deep_thaw(getattr(self, field.name))
             for field in fields(self)
-            if field.name not in {"private_failure", "private_diagnostics"}
+            if field.name not in {"private_failure", "private_diagnostics", "private_request"}
         }
         raw["status"] = self.status.value
         raw["tool_contract_dialect"] = self.tool_contract_dialect.value if self.tool_contract_dialect is not None else None

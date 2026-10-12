@@ -21,6 +21,7 @@ from elspeth.web.composer.no_tool_policy import (
 from elspeth.web.composer.no_tool_policy import (
     carries_build_action as _carries_build_action,
 )
+from elspeth.web.composer.no_tool_policy import compose_clarification_message
 from elspeth.web.composer.no_tool_policy import (
     compose_empty_state_message as _compose_empty_state_message,
 )
@@ -42,6 +43,7 @@ from elspeth.web.composer.no_tool_policy import (
 from elspeth.web.composer.no_tool_policy import (
     state_is_structurally_empty as _state_is_structurally_empty,
 )
+from elspeth.web.composer.no_tool_response import NoToolResponse, is_unstarted_clarification, parse_no_tool_response
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.state_claim_grounding import (
@@ -56,6 +58,7 @@ async def finalize_no_tool_response(
     preflight: ComposerPreflight,
     *,
     content: str,
+    no_tool_response: NoToolResponse | None = None,
     state: CompositionState,
     initial_version: int,
     user_id: str | None,
@@ -160,11 +163,22 @@ async def finalize_no_tool_response(
     partial-state preservation by the coordinator's exception handling
     path — they are not caught here.
     """
+    if no_tool_response is None:
+        no_tool_response = parse_no_tool_response(content)
+    content = no_tool_response.body
+    unstarted_clarification = is_unstarted_clarification(
+        no_tool_response,
+        state=state,
+        initial_version=initial_version,
+        mutation_success_seen=mutation_success_seen,
+        tool_invocations=tool_invocations,
+    )
     if (
         _carries_build_action(user_message)
         and not mutation_success_seen
         and _state_is_structurally_empty(state)
         and not _last_mutation_was_pending_proposal(tool_invocations)
+        and not unstarted_clarification
     ):
         # No-mutation empty-state augmentation. The model produced
         # honest diagnostic prose about what it tried and what blocked
@@ -367,6 +381,22 @@ async def finalize_no_tool_response(
         )
         _enforce_augmentation_prefix_invariant(
             branch="state_claim_grounding_correction",
+            content=content,
+            augmented=augmented_message,
+        )
+        return ComposerResult(
+            message=augmented_message,
+            state=state,
+            runtime_preflight=runtime_result,
+            raw_assistant_content=content,
+            tool_invocations=tool_invocations,
+            llm_calls=llm_calls,
+        )
+
+    if unstarted_clarification:
+        augmented_message = compose_clarification_message(content)
+        _enforce_augmentation_prefix_invariant(
+            branch="clarification_augmentation",
             content=content,
             augmented=augmented_message,
         )

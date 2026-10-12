@@ -682,6 +682,7 @@ async def persist_cancelled_turn_audit(
     rows += sum(record.private_failure is not None for record in tool_invocations)
     rows += sum(call.private_failure is not None for call in llm_calls)
     rows += sum(len(call.private_diagnostics) for call in llm_calls)
+    rows += sum(call.private_request is not None for call in llm_calls)
     if not rows:
         observation.audit_cohort_durable = True
         return

@@ -190,15 +190,24 @@ async def test_no_recorder_owned_provider_failure_private_checkpoint_is_atomic(t
             assert rows == []
             assert _ledger(engine) == []
         elif mode == "success_in_except":
-            assert len(rows) == 1
+            assert len(rows) == 2
             assert "caller-private-canary" not in json.dumps(deep_thaw([row.tool_calls for row in rows]))
             assert len(_ledger(engine)) == 1
         else:
-            assert len(rows) == 2
+            assert len(rows) == 3
             assert "ordinary endpoint temporarily unavailable" in json.dumps(deep_thaw([row.tool_calls for row in rows]))
             public = next(row for row in rows if row.tool_calls[0].get("_kind") == "llm_call_audit")
             assert "ordinary endpoint temporarily unavailable" not in json.dumps(deep_thaw(public.tool_calls))
             assert len(_ledger(engine)) == 1
+        if mode != "rollback":
+            requests = [
+                row.tool_calls[0]["evidence"]
+                for row in rows
+                if row.tool_calls[0].get("_kind") == "composer_diagnostic_evidence"
+                and row.tool_calls[0]["evidence"]["status"] == "provider_request"
+            ]
+            assert len(requests) == 1
+            assert json.loads(requests[0]["arguments"]["content"])["messages"] == [{"role": "user", "content": "ordinary request"}]
     finally:
         authority.release(context)
         engine.dispose()

@@ -38,6 +38,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import provider_gateway
+from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage
 from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner, AdvisorCheckpointVerdict
 from elspeth.web.composer.advisor_context import _node_required_input_fields
@@ -2381,7 +2382,7 @@ async def test_end_gate_compose_deadline_keeps_the_completed_reply_recoverable(m
         )
 
     (row,) = service._sessions_service.add_message.calls
-    assert row.args[1:3] == ("audit", _AssistantMessage.content)
+    assert row.args[1:3] == ("audit", _ASSISTANT_CONTENT)
     (envelope,) = row.kwargs["tool_calls"]
     assert envelope["_kind"] == "composer_withheld_reply"
     assert envelope["origin"] == "compose_deadline_expired"
@@ -2538,10 +2539,7 @@ async def test_checkpoint_deadline_cancels_provider_and_retains_timeout_audit(
 # ---------------------------------------------------------------------------
 
 
-class _AssistantMessage:
-    """Minimal assistant message — the gate only reads ``.content``."""
-
-    content = "Done — the pipeline is ready."
+_ASSISTANT_CONTENT = "Done — the pipeline is ready."
 
 
 @pytest.fixture
@@ -2668,7 +2666,7 @@ async def drive_try_terminate(
         kwargs["deadline"] = deadline
     session_id = str(uuid.uuid4())
     return await service._completion._try_terminate_no_tools(
-        assistant_message=_AssistantMessage(),
+        assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
         message=message,
         llm_messages=[] if llm_messages is None else llm_messages,
         state=state,
@@ -2729,7 +2727,7 @@ async def test_end_gate_block_publishes_the_models_reply(make_service, clean_run
 
     assert outcome.action == "return"
     result = outcome.result
-    prose = _AssistantMessage.content
+    prose = _ASSISTANT_CONTENT
     assert result.raw_assistant_content == prose
     assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in result.message
     assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
@@ -2943,7 +2941,7 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
         session_id=gate_session_id,
         session_operation_context=_compose_context(gate_session_id),
         current_state_id="cs1",
-        assistant_message=_AssistantMessage(),
+        assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
         llm_messages=[],
         recorder=make_recorder(),
         progress=None,
@@ -3285,7 +3283,7 @@ async def test_end_gate_unrendered_verdict_chat_names_the_real_cause(
     # trusted notice (ruling 2026-09-22: the reply is published on a block).
     raw = outcome.result.raw_assistant_content or ""
     segments = visible_message_segments(content=message, raw_content=raw)
-    assert segments[0] == AssistantTextSegment(_AssistantMessage.content)
+    assert segments[0] == AssistantTextSegment(_ASSISTANT_CONTENT)
     assert len(segments) == 2
     assert type(segments[1]) is TrustedSystemNoticeSegment
     # The fail-closed structure is unchanged: completion stays withheld.
@@ -3316,7 +3314,7 @@ async def test_end_gate_flagged_verdict_keeps_did_not_clear_chat(make_service, c
     assert outcome.action == "return"
     expected = _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE if preflight_shape == "absent" else _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE
     assert outcome.result.message.endswith(expected)
-    assert outcome.result.message.startswith(_AssistantMessage.content)
+    assert outcome.result.message.startswith(_ASSISTANT_CONTENT)
     assert "MODEL_FINDING_CANARY" not in outcome.result.message
 
 
@@ -4050,7 +4048,7 @@ async def test_end_gate_masked_graph_failure_blocks_handoff_and_names_outstandin
     )
     # Only fixed backend chrome is trusted. The actual validator detail is
     # preserved as diagnostic text rather than replaced by advisor wording.
-    assert segments[0] == AssistantTextSegment(_AssistantMessage.content)
+    assert segments[0] == AssistantTextSegment(_ASSISTANT_CONTENT)
     assert segments[1] == TrustedSystemNoticeSegment(_PREFLIGHT_NOTICE_HEADER)
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER)
     assert any(isinstance(segment, AssistantTextSegment) and "Edge contract violation" in segment.content for segment in segments)
@@ -4938,7 +4936,7 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
         session_id=session_id,
         session_operation_context=_compose_context(session_id),
         current_state_id="cs1",
-        assistant_message=_AssistantMessage(),
+        assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
         llm_messages=[],
         recorder=make_recorder(),
         progress=None,
@@ -4958,7 +4956,7 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
     )
 
     assert outcome.action == "return"
-    assert outcome.result.raw_assistant_content == _AssistantMessage.content
+    assert outcome.result.raw_assistant_content == _ASSISTANT_CONTENT
     assert service._preflight.pending_handoff_outstanding_findings.await_count == 1
     # Two fenced audit rows, disclosure first, then the ``terminal_block``
     # publication record (audit primacy: the row lands before the publication
@@ -5001,7 +4999,7 @@ async def test_end_gate_terminal_block_blocks_cleanly_without_session(make_servi
         state=clean_runnable_state,
         session_id=None,
         current_state_id=None,
-        assistant_message=_AssistantMessage(),
+        assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
         llm_messages=[],
         recorder=make_recorder(),
         progress=None,
@@ -5079,7 +5077,7 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
             session_id=str(session.id),
             session_operation_context=compose_context,
             current_state_id=None,
-            assistant_message=_AssistantMessage(),
+            assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
             llm_messages=[],
             recorder=make_recorder(),
             progress=None,
@@ -5099,7 +5097,7 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
         )
     assert outcome.action == "return"
     result = outcome.result
-    assert result.raw_assistant_content == _AssistantMessage.content
+    assert result.raw_assistant_content == _ASSISTANT_CONTENT
     # Persist the terminal assistant row exactly as the route does
     # (sessions/routes/composer/compose.py): content=message, raw_content=prose.
     await sessions.add_message(
@@ -5114,7 +5112,7 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
 
     # The blocked turn replays the model's own prose, not the appended notice
     # and not an empty message.
-    assert history[-1] == {"role": "assistant", "content": _AssistantMessage.content}
+    assert history[-1] == {"role": "assistant", "content": _ASSISTANT_CONTENT}
     # The backend's disclosure replays as a user-role message between the
     # instruction and the reply.
     assert [message["content"] for message in history if message["role"] == "user"] == [
@@ -5454,7 +5452,7 @@ async def _drive_gate_with_review_state(service, state, review_state):
         state=state,
         session_id=None,
         current_state_id=None,
-        assistant_message=_AssistantMessage(),
+        assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
         llm_messages=[],
         recorder=make_recorder(),
         progress=None,
@@ -5556,7 +5554,7 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
         state=clean_runnable_state,
         session_id=None,
         current_state_id=None,
-        assistant_message=_AssistantMessage(),
+        assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
         llm_messages=[],
         recorder=make_recorder(),
         progress=None,

@@ -340,7 +340,11 @@ async def test_received_and_accepted_one_shot_candidates_settle_in_actual_planne
     evidence = [ComposerDiagnosticEvidence.from_envelope(row.tool_calls[0], expected_session_id=result_session_id) for row in rows]
     received = [item for item in evidence if item.status == "received_response"]
     assert len(received) == 3
-    evidence = [item for item in evidence if item.status != "received_response"]
+    requests = [item for item in evidence if item.status == "provider_request"]
+    assert len(requests) == len(recorder.llm_calls) == 2
+    for request, call in zip(requests, recorder.llm_calls, strict=True):
+        assert request.arguments.content == call.private_request.canonical
+    evidence = [item for item in evidence if item.status not in {"received_response", "provider_request"}]
     assert [item.status for item in evidence] == ["received_not_dispatched", "accepted"]
     assert all(item.authority_arguments is not None for item in evidence)
     assert all(item.wire_arguments.disposition == "retained" for item in evidence)
@@ -537,6 +541,10 @@ async def test_actual_child_cancellation_joins_private_display_cohort_before_rou
     evidence = [
         ComposerDiagnosticEvidence.from_envelope(row.tool_calls[0], expected_session_id=str(session.id)) for row in _private_rows(rows)
     ]
+    requests = [item for item in evidence if item.status == "provider_request"]
+    assert len(requests) == 1
+    assert requests[0].arguments.disposition == "retained"
+    evidence = [item for item in evidence if item.status != "provider_request"]
     assert [item.tool_call_id for item in evidence] == ["route-inline", "route-preview"]
     assert evidence[0].arguments.content == canonical_json(pipeline)
     assert evidence[0].wire_arguments.content == json.dumps(arguments)
@@ -756,7 +764,10 @@ async def test_rejected_receipt_then_fatal_assertion_drains_private_audit_before
     assert len(failures) == 1
     assert "private primary assertion detail" in failures[0].result.content
     assert "original cause" in failures[0].result.content
-    evidence = [item for item in evidence if item.status != "tool_failure"]
+    requests = [item for item in evidence if item.status == "provider_request"]
+    assert len(requests) == 1
+    assert requests[0].arguments.disposition == "retained"
+    evidence = [item for item in evidence if item.status not in {"tool_failure", "provider_request"}]
     assert [item.tool_call_id for item in evidence] == ["fatal-inline", "fatal-current"]
     assert evidence[0].arguments.content == canonical_json(pipeline)
     assert evidence[0].wire_arguments.content == json.dumps(arguments)
