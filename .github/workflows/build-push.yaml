@@ -5,7 +5,7 @@
 #   - Azure Container Registry (ACR) - optional
 #
 # Triggers:
-#   - After CI passes on main branch
+#   - Main CI completion is observed; automatic publication is held
 #   - On version tags (v*). This includes pre-release/RC tags such as
 #     v0.8.0-RC-280726: the tag may point at a release/* branch commit (CI
 #     runs on release/** pushes), and the required-checks gate below verifies
@@ -22,7 +22,7 @@
 name: Build and Push
 
 on:
-  # Trigger after CI passes on main
+  # Observe main CI completion; the build job holds automatic publication.
   workflow_run:
     workflows: ["CI"]
     types: [completed]
@@ -46,9 +46,10 @@ on:
           - acr
           - both
 
-# Cancel in-progress runs
+# Cancel superseded runs only within the same entry point. Held CI-completion
+# runs must not cancel an explicitly dispatched publication on the same ref.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -69,14 +70,14 @@ jobs:
   build-push:
     name: Build and Push
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
-    # Only run if CI passed for a trusted push in this repository, or always
-    # for tags/dispatch. The workflow_run branch filter alone is not a trust
-    # boundary: fork pull_request runs can report a matching head branch name.
+    # Automatic main publication is held by maintainer direction. Preserve the
+    # trusted-push guards for eventual resumption; tags/dispatch keep their
+    # existing admission and exact-commit qualification checks.
     if: |
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (
-        github.event_name == 'workflow_run' &&
+        false && github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_repository.full_name == github.repository

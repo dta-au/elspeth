@@ -146,15 +146,18 @@ the complete command sequence in the project
 ### Producing the candidate image
 
 Published ELSPETH images come from the repository's `Build and Push` workflow
-(`.github/workflows/build-push.yaml`). It publishes `sha-<commit>` tags for
-every trusted merge to `main`, and it publishes a release or release-candidate
-image only when the operator pushes a git tag matching `v*` — for example
+(`.github/workflows/build-push.yaml`). Automatic publication after main CI is
+held. This ECS handoff requires a release or release-candidate image published
+when the operator pushes a git tag matching `v*` — for example
 `v0.8.0`, or the pre-release shape `v0.8.0-RC-280726` for a release-candidate
 handoff. The workflow builds, smoke-tests, and then promotes the verified
 digest to `ghcr.io/<owner>/elspeth:<git-tag>`, where `<git-tag>` is the literal
 tag name including the leading `v` and any `-RC-...` suffix. No
 release-candidate image exists until that git tag is pushed: publication is an
 explicit operator action, not a side effect of merging a release branch.
+Confirm the workflow's required checks, scans, signing and smoke tests succeed
+before using its digest. Set `GHCR_TAG` to that literal Git tag: the ECR handoff
+below verifies the signing identity at `refs/tags/$GHCR_TAG`.
 The scenario roots deliberately do not accept a GHCR reference: after bootstrap
 creates the private application ECR repository, promote the immutable published
 index into that exact repository using the authenticated handoff in Section 1.
