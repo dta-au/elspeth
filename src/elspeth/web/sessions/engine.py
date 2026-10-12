@@ -21,12 +21,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from types import MethodType
 from typing import Any
+from urllib.parse import quote
 
 from sqlalchemy import ColumnElement, Engine, create_engine, event, func, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.engine.interfaces import DBAPIConnection
+from sqlalchemy.engine.url import make_url
 
 _SESSION_WRITE_INTENT_OPTION = "elspeth_session_write_intent"
 
@@ -52,7 +55,7 @@ def session_unicode_lower(engine: Engine) -> Callable[..., ColumnElement[str]]:
     return func.lower
 
 
-def create_session_engine(url: str, **kwargs: Any) -> Engine:
+def create_session_engine(url: str, *, read_only: bool = False, **kwargs: Any) -> Engine:
     """Build an engine for the sessions DB with PRAGMA discipline wired in.
 
     For SQLite engines, registers a ``connect`` event listener that runs
@@ -88,7 +91,34 @@ def create_session_engine(url: str, **kwargs: Any) -> Engine:
         Forwarded to ``sqlalchemy.create_engine`` (e.g. ``poolclass``,
         ``connect_args``).
     """
-    engine = create_engine(url, **kwargs)
+    parsed = make_url(url)
+    if read_only:
+        if parsed.get_backend_name() != "sqlite" or parsed.database in (None, ":memory:"):
+            raise ValueError("read_only session admission requires a file-backed SQLite database")
+        assert parsed.database is not None
+        if parsed.database.startswith("file:") or parsed.query:
+            raise ValueError("read_only session admission requires a plain SQLite file URL")
+        parsed = parsed.set(
+            database=f"file:{quote(str(Path(parsed.database).absolute()), safe='/')}",
+            query={"mode": "ro", "uri": "true"},
+        )
+    if not read_only and parsed.get_backend_name() == "sqlite" and parsed.database not in (None, ":memory:"):
+        assert parsed.database is not None
+        if parsed.database.startswith("file:") or parsed.query:
+            raise ValueError("Session database admission requires a plain SQLite file URL; preserve existing stores")
+        if Path(parsed.database).is_symlink():
+            raise ValueError("Session database target must not be a symlink; preserve existing stores")
+        if Path(parsed.database).exists():
+            from elspeth.web.schema_probe import SchemaState, probe_session_schema
+            from elspeth.web.sessions.schema import explain_non_current_schema
+
+            admission_engine = create_session_engine(url, read_only=True)
+            try:
+                if probe_session_schema(admission_engine) not in (SchemaState.CURRENT, SchemaState.MISSING):
+                    explain_non_current_schema(admission_engine)
+            finally:
+                admission_engine.dispose()
+    engine = create_engine(parsed, **kwargs)
 
     if engine.dialect.name != "sqlite":
         return engine
@@ -101,7 +131,10 @@ def create_session_engine(url: str, **kwargs: Any) -> Engine:
         cursor = dbapi_conn.cursor()
         try:
             cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA journal_mode=WAL")
+            if read_only:
+                cursor.execute("PRAGMA query_only=ON")
+            else:
+                cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA busy_timeout=5000")
         finally:
@@ -164,7 +197,7 @@ def create_session_engine(url: str, **kwargs: Any) -> Engine:
     # assertion.
     db_path = engine.url.database
     is_memory_db = db_path is None or db_path == ":memory:"
-    if not is_memory_db and journal_mode != "wal":
+    if not read_only and not is_memory_db and journal_mode != "wal":
         raise RuntimeError(
             f"Session engine {engine.url!r} did not enter WAL mode "
             f"(got {journal_mode!r}). Refusing to start — production requires WAL "

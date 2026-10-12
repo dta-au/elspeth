@@ -27,6 +27,7 @@ import structlog
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.auth.local_schema import admit_local_auth_schema, create_local_auth_schema
 from elspeth.web.auth.models import (
     AccessPending,
     AuthenticationError,
@@ -239,17 +240,19 @@ def _append_email_verification_record(outbox_path: Path, record: Mapping[str, ob
             os.close(fd)
 
 
-def _open_owner_only_database(path: Path) -> int:
+def _open_owner_only_database(path: Path, *, read_only: bool = False) -> int:
     """Open or atomically create ``path`` without following a final symlink."""
     try:
         nofollow = os.O_NOFOLLOW
     except AttributeError as exc:
         raise LocalAuthStorageSecurityError("Local auth storage requires no-follow file admission") from exc
-    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK | nofollow
+    flags = (os.O_RDONLY if read_only else os.O_RDWR) | os.O_CLOEXEC | os.O_NONBLOCK | nofollow
     created = False
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:
+        if read_only:
+            raise
         try:
             descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
             created = True
@@ -272,6 +275,39 @@ def _open_owner_only_database(path: Path) -> int:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _connect_owner_only_database(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+    """Open SQLite through a validated, no-follow database descriptor."""
+    descriptor = _open_owner_only_database(path, read_only=read_only)
+    try:
+        identity = os.fstat(descriptor)
+        descriptor_root = Path("/proc/self/fd")
+        if not descriptor_root.is_dir():
+            descriptor_root = Path("/dev/fd")
+        if not descriptor_root.is_dir():
+            raise LocalAuthStorageSecurityError("Local auth storage requires a descriptor-backed filesystem path")
+        connection_path = str(descriptor_root / str(descriptor))
+        conn = sqlite3.connect(f"file:{connection_path}?mode=ro", uri=True) if read_only else sqlite3.connect(connection_path)
+        try:
+            current = os.stat(path, follow_symlinks=False)
+            if not stat.S_ISREG(current.st_mode) or current.st_dev != identity.st_dev or current.st_ino != identity.st_ino:
+                raise LocalAuthStorageSecurityError("Local auth database path changed during secure open")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+    finally:
+        os.close(descriptor)
+
+
+def validate_existing_local_auth_store(path: Path) -> None:
+    """Inspect a credential store without creating it or running constructor effects."""
+    connection = _connect_owner_only_database(path, read_only=True)
+    try:
+        admit_local_auth_schema(connection)
+    finally:
+        connection.close()
 
 
 class LocalAuthProvider:
@@ -347,26 +383,7 @@ class LocalAuthProvider:
             self._reclaim_stale_token_audit_intents(conn, now=now)
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Open SQLite through a validated, no-follow database descriptor."""
-        descriptor = _open_owner_only_database(self._db_path)
-        try:
-            identity = os.fstat(descriptor)
-            descriptor_root = Path("/proc/self/fd")
-            if not descriptor_root.is_dir():
-                descriptor_root = Path("/dev/fd")
-            if not descriptor_root.is_dir():
-                raise LocalAuthStorageSecurityError("Local auth storage requires a descriptor-backed filesystem path")
-            conn = sqlite3.connect(str(descriptor_root / str(descriptor)))
-            try:
-                current = os.stat(self._db_path, follow_symlinks=False)
-                if not stat.S_ISREG(current.st_mode) or current.st_dev != identity.st_dev or current.st_ino != identity.st_ino:
-                    raise LocalAuthStorageSecurityError("Local auth database path changed during secure open")
-            except BaseException:
-                conn.close()
-                raise
-            return conn
-        finally:
-            os.close(descriptor)
+        return _connect_owner_only_database(self._db_path)
 
     @contextmanager
     def _connect(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -391,66 +408,10 @@ class LocalAuthProvider:
             conn.close()
 
     def _ensure_schema(self) -> None:
-        """Create the users table if it does not exist."""
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id TEXT PRIMARY KEY,
-                    password_hash TEXT NOT NULL,
-                    display_name TEXT NOT NULL,
-                    email TEXT,
-                    email_verified INTEGER NOT NULL DEFAULT 1
-                )
-                """
-            )
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-            if "email_verified" not in columns:
-                conn.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS email_verification_tokens (
-                    token_hash TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    expires_at INTEGER NOT NULL,
-                    used_at INTEGER,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS ix_email_verification_tokens_user_id ON email_verification_tokens (user_id)")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS email_verification_outbox (
-                    delivery_id TEXT PRIMARY KEY,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    user_id TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    published_at INTEGER,
-                    FOREIGN KEY (token_hash) REFERENCES email_verification_tokens(token_hash),
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS ix_email_verification_outbox_pending ON email_verification_outbox (published_at, created_at)"
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS token_audit_intents (
-                    intent_id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    issuance_path TEXT NOT NULL,
-                    token_hash TEXT,
-                    claimed_at INTEGER,
-                    created_at INTEGER NOT NULL,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS ix_token_audit_intents_created_at ON token_audit_intents (created_at)")
+        """Create only a fresh credential store; validate existing stores before writes."""
+        with self._connect(immediate=True) as conn:
+            if admit_local_auth_schema(conn):
+                create_local_auth_schema(conn)
 
     def create_user(
         self,

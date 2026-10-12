@@ -520,7 +520,7 @@ def origin_inventory(units):
             if (
                 isinstance(node, ast.Attribute)
                 and isinstance(node.ctx, (ast.Store, ast.Del))
-                and node.attr in {"compose", "composer_service"}
+                and node.attr in {"compose", "compose_recovery", "composer_service"}
             ):
                 root = chain(node.value)
                 canonical = canonical_receiver(root)
@@ -529,14 +529,18 @@ def origin_inventory(units):
                         "path": unit.path,
                         "node_id": id(node),
                         "line": node.lineno,
-                        "kind": "CANONICAL_CLASS_METHOD_WRITE" if canonical and node.attr == "compose" else "RECEIVER_FIELD_WRITE",
+                        "kind": "CANONICAL_CLASS_METHOD_WRITE"
+                        if canonical and node.attr in {"compose", "compose_recovery"}
+                        else "RECEIVER_FIELD_WRITE",
                         "receiver": root,
                         "member": node.attr,
-                        "qualification": "LOCAL_REFUSAL" if canonical and node.attr == "compose" else "UNKNOWN_OWNER_FLOW",
+                        "qualification": "LOCAL_REFUSAL"
+                        if canonical and node.attr in {"compose", "compose_recovery"}
+                        else "UNKNOWN_OWNER_FLOW",
                     }
                 )
             elif isinstance(node, ast.Call) and name(node.func, "setattr") and len(node.args) >= 2:
-                if isinstance(node.args[1], ast.Constant) and node.args[1].value in {"compose", "composer_service"}:
+                if isinstance(node.args[1], ast.Constant) and node.args[1].value in {"compose", "compose_recovery", "composer_service"}:
                     root = chain(node.args[0])
                     canonical = canonical_receiver(root)
                     records.append(
@@ -551,6 +555,48 @@ def origin_inventory(units):
                         }
                     )
     return records, class_origin
+
+
+def composer_dispatch_calls(invoke):
+    """Select only the closed malformed-head/ordinary dispatch on one receiver."""
+    if not isinstance(invoke, ast.Try) or len(invoke.body) < 2:
+        return None
+    annotation, branch = invoke.body[:2]
+    if (
+        not isinstance(annotation, ast.AnnAssign)
+        or ast.unparse(annotation) != "result: ComposerResult | GraphRecoveryResponse"
+        or not isinstance(branch, ast.If)
+        or ast.unparse(branch.test) != "recovery_context.malformed_head"
+        or len(branch.body) != 1
+        or len(branch.orelse) != 2
+        or ast.unparse(branch.orelse[0])
+        != "if state is None:\n    raise AuditIntegrityError('Ordinary Composer admission lacks its graph')"
+    ):
+        return None
+    calls = []
+    for statement, method in ((branch.orelse[1], "compose"), (branch.body[0], "compose_recovery")):
+        if (
+            not isinstance(statement, ast.Assign)
+            or len(statement.targets) != 1
+            or not name(statement.targets[0], "result")
+            or not isinstance(statement.value, ast.Await)
+            or not isinstance(statement.value.value, ast.Call)
+            or chain(statement.value.value.func) != ("composer", method)
+        ):
+            return None
+        call = statement.value.value
+        for keyword, expected in (
+            ("required_work", "provider_binding"),
+            ("provider_owner", "provider_owner"),
+            ("session_operation_context", "lease.context"),
+        ):
+            values = [item.value for item in call.keywords if item.arg == keyword]
+            if len(values) != 1 or ast.unparse(values[0]) != expected:
+                return None
+        if any(item.arg is None for item in call.keywords):
+            return None
+        calls.append(call)
+    return tuple(calls)
 
 
 def composer_receiver_local_contracts(units):
@@ -611,6 +657,7 @@ def composer_receiver_local_contracts(units):
         return failures, receipt
     constructor = find(trees[SERVICE], "ComposerServiceImpl.__init__")
     method = find(trees[SERVICE], "ComposerServiceImpl.compose")
+    recovery_method = find(trees[SERVICE], "ComposerServiceImpl.compose_recovery")
     require(
         isinstance(constructor, ast.FunctionDef)
         and not constructor.decorator_list
@@ -634,6 +681,7 @@ def composer_receiver_local_contracts(units):
         ("dto_factory", DTO, [factory], "ORDINARY_FUNCTION"),
         ("service_initializer", SERVICE, [service, constructor], "ORDINARY_FUNCTION"),
         ("compose_method", SERVICE, [service, method], "NATIVE_COROUTINE"),
+        ("recovery_method", SERVICE, [service, recovery_method], "NATIVE_COROUTINE"),
         ("turn", TURN, [turn], "NATIVE_COROUTINE"),
     ):
         valid, record = invocation_kind(trees[path], owners, expected)
@@ -853,20 +901,21 @@ def composer_receiver_local_contracts(units):
     require(len(calls) == 1, "one executed compose call")
     if len(calls) == 1:
         receipt["compose_call"] = (TURN, id(calls[0]))
-    # The supported actual path is a top-level Try body containing the receiver
-    # assignment, followed by a direct inner Try whose first assignment awaits
-    # this exact Call. No nested definition/lambda/branch occurrence authorizes it.
+    recovery_calls = [n for n in runtime_walk(turn) if isinstance(n, ast.Call) and chain(n.func) == ("composer", "compose_recovery")]
+    require(len(recovery_calls) == 1, "one executed recovery compose call")
+    if len(recovery_calls) == 1:
+        receipt["recovery_call"] = (TURN, id(recovery_calls[0]))
+    # Only the two closed branches selected above can follow the retained capture.
     active_path = False
-    if len(bindings) == 1 and len(calls) == 1:
+    if len(bindings) == 1 and len(calls) == 1 and len(recovery_calls) == 1:
         owners = [n for n in turn.body if isinstance(n, ast.Try) and any(x is bindings[0] for x in n.body)]
         if len(owners) == 1:
             owner = owners[0]
             invoke_blocks = []
             for n in owner.body:
-                if isinstance(n, ast.Try) and n.body and isinstance(n.body[0], ast.Assign):
-                    value = n.body[0].value
-                    if isinstance(value, ast.Await) and value.value is calls[0]:
-                        invoke_blocks.append(n)
+                dispatch = composer_dispatch_calls(n)
+                if dispatch == (calls[0], recovery_calls[0]):
+                    invoke_blocks.append(n)
             if len(invoke_blocks) == 1:
                 invoke = invoke_blocks[0]
                 bi = next(i for i, n in enumerate(owner.body) if n is bindings[0])
@@ -883,15 +932,16 @@ def composer_receiver_local_contracts(units):
                             dict(record, label="settlement_callback", path=TURN, local_kind_valid=deferred_valid)
                         )
                 require(deferred_valid, "actual selected settlement callback must be NATIVE_COROUTINE")
-                active_path = active_path and kinds["turn"] and kinds["compose_method"] and deferred_valid
+                active_path = active_path and kinds["turn"] and kinds["compose_method"] and kinds["recovery_method"] and deferred_valid
                 receipt["receiver_dominance_path"] = {
                     "turn_owner": (TURN, id(turn)),
                     "outer_try": (TURN, id(owner)),
                     "receiver_statement": (TURN, id(bindings[0])),
                     "inner_try": (TURN, id(invoke)),
-                    "await_statement": (TURN, id(invoke.body[0])),
+                    "await_statement": (TURN, id(invoke.body[1].orelse[1])),
                     "call": (TURN, id(calls[0])),
-                    "qualification": "ACTUAL_DIRECT_TRY_BODY_AWAIT_PATH_SAME_RETAINED_BINDING",
+                    "recovery_call": (TURN, id(recovery_calls[0])),
+                    "qualification": "ACTUAL_CLOSED_BRANCH_AWAIT_PATHS_SAME_RETAINED_BINDING",
                 }
                 receipt["receiver_transfer_prefix_nodes"] = [(TURN, id(n)) for n in owner.body[bi + 1 : ci]]
     require(active_path, "actual direct awaited path and same-block receiver dominance")
@@ -900,35 +950,43 @@ def composer_receiver_local_contracts(units):
         turn_scope is not None and "composer" in turn_scope and "services" in turn_scope,
         "compiler-derived turn receiver/argument lexical ownership",
     )
-    method = find(trees[SERVICE], "ComposerServiceImpl.compose")
-    require(
-        isinstance(method, ast.AsyncFunctionDef)
-        and not method.decorator_list
-        and not getattr(method, "type_params", ())
-        and bool(parameters(method))
-        and parameters(method)[0] == "self",
-        "normal async function descriptor",
-    )
-    if method:
-        receipt["compose_method"] = (SERVICE, id(method))
+    for selected_method, receipt_name in ((method, "compose_method"), (recovery_method, "recovery_method")):
+        require(
+            isinstance(selected_method, ast.AsyncFunctionDef)
+            and not selected_method.decorator_list
+            and not selected_method.type_params
+            and bool(parameters(selected_method))
+            and parameters(selected_method)[0] == "self",
+            "normal async function descriptor " + receipt_name,
+        )
+        if selected_method:
+            receipt[receipt_name] = (SERVICE, id(selected_method))
     for fn in body(service):
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for n in runtime_walk(fn):
                 if isinstance(n, ast.Attribute) and isinstance(n.ctx, (ast.Store, ast.Del)):
-                    require(chain(n) != ("self", "compose"), "instance method shadowing in " + fn.name)
+                    require(chain(n) not in {("self", "compose"), ("self", "compose_recovery")}, "instance method shadowing in " + fn.name)
                 if isinstance(n, ast.Call) and name(n.func, "setattr") and len(n.args) >= 2:
                     require(
-                        not (name(n.args[0], "self") and isinstance(n.args[1], ast.Constant) and n.args[1].value == "compose"),
+                        not (
+                            name(n.args[0], "self")
+                            and isinstance(n.args[1], ast.Constant)
+                            and n.args[1].value in {"compose", "compose_recovery"}
+                        ),
                         "instance reflective method shadowing in " + fn.name,
                     )
                 if isinstance(n, ast.Subscript) and isinstance(n.ctx, (ast.Store, ast.Del)):
                     require(
-                        not (chain(n.value) == ("self", "__dict__") and isinstance(n.slice, ast.Constant) and n.slice.value == "compose"),
+                        not (
+                            chain(n.value) == ("self", "__dict__")
+                            and isinstance(n.slice, ast.Constant)
+                            and n.slice.value in {"compose", "compose_recovery"}
+                        ),
                         "instance dictionary method shadowing in " + fn.name,
                     )
                 if isinstance(n, ast.Call) and HARMFUL_REFLECTOR(n):
                     require(
-                        not (name(n.args[0], "self") and n.args[1].value == "compose"),
+                        not (name(n.args[0], "self") and n.args[1].value in {"compose", "compose_recovery"}),
                         "instance low-level descriptor shadowing in " + fn.name,
                     )
     records, origin = origin_inventory(units)
@@ -946,8 +1004,9 @@ def composer_receiver_local_contracts(units):
         ("builtins.staticmethod", "canonical service definition decorator and stable builtin supplier"),
         ("builtins.__build_class__", "canonical class builder/default metaclass and stable class origins"),
         ("builtins.object", "default construction and ordinary instance attribute/method lookup"),
-        (origin, "constructor actual return object/class origin, callback effects and no instance compose shadow"),
+        (origin, "constructor actual return object/class origin, callback effects and no instance compose or compose_recovery shadow"),
         (origin + ".compose", "function descriptor lookup on exact installed ordinary class; outside method/namespace mutation"),
+        (origin + ".compose_recovery", "function descriptor lookup on exact installed ordinary class; outside method/namespace mutation"),
         (
             "SELECTED_SOURCE_CODE_OBJECTS",
             "actual callable objects/code/decorators match compiled source owner/kind; outside __code__/function replacement cannot change invocation semantics",

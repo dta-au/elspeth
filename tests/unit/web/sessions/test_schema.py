@@ -616,7 +616,7 @@ def test_epoch_36_database_is_rejected_by_epoch_44_runtime() -> None:
 
     with pytest.raises(
         SessionSchemaError,
-        match=rf"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Delete the session DB file and restart",
+        match=rf"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Preserve this store unchanged",
     ):
         initialize_session_schema(eng)
 
@@ -1081,7 +1081,7 @@ def test_initialize_session_schema_rejects_epoch_35_database() -> None:
     assert probe_current_schema(eng) is False
     with pytest.raises(
         SessionSchemaError,
-        match=rf"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Delete the session DB file and restart",
+        match=rf"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Preserve this store unchanged",
     ):
         initialize_session_schema(eng)
 
@@ -1173,9 +1173,8 @@ def test_initialize_session_schema_rejects_same_named_check_with_weakened_sql(tm
         conn.execute(text("PRAGMA writable_schema = OFF"))
     eng.dispose()
 
-    reopened = create_session_engine(f"sqlite:///{db_path}")
     with pytest.raises(SessionSchemaError, match="CHECK constraint SQL mismatch"):
-        initialize_session_schema(reopened)
+        create_session_engine(f"sqlite:///{db_path}")
 
 
 # ---------------------------------------------------------------------------

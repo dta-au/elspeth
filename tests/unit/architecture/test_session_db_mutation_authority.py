@@ -4436,7 +4436,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="dc1da0e98009a36e",
         ordinal=1,
         authority="SessionSchemaAuthority",
-        line=295,
+        line=310,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4447,7 +4447,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="ae6f27adb45e82ea",
         ordinal=1,
         authority="SessionSchemaAuthority",
-        line=291,
+        line=306,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4458,7 +4458,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="ae6f27adb45e82ea",
         ordinal=2,
         authority="SessionSchemaAuthority",
-        line=292,
+        line=307,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4469,7 +4469,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="730473cf9d5628ab",
         ordinal=1,
         authority="SessionSchemaAuthority",
-        line=273,
+        line=288,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5371,10 +5371,21 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         symbol="create_session_engine",
         table="<sessions-write-connection>",
         operation="write_connection",
-        fingerprint="4c2f939f8220fd00",
+        fingerprint="95902b022db8ac54",
         ordinal=1,
         authority=None,
-        line=149,
+        line=182,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/schema.py",
+        symbol="assert_empty_session_target",
+        table="<sessions-write-connection>",
+        operation="write_connection",
+        fingerprint="0f0d2bcbf88ed81a",
+        ordinal=1,
+        authority=None,
+        line=182,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5396,7 +5407,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="d7ac5811a7ee7916",
         ordinal=1,
         authority="SessionSchemaAuthority",
-        line=308,
+        line=323,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5407,7 +5418,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="983f117ba847fe0d",
         ordinal=1,
         authority="SessionSchemaAuthority",
-        line=422,
+        line=437,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5803,7 +5814,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "LandscapeDB._sync_schema_identity",
         "<non-session-write-connection>",
         "write_connection",
-        "b92e2e573b8362dd",
+        "bca7301699f0abd0",
         1,
         None,
         line=1388,
@@ -5816,7 +5827,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "LandscapeDB._sync_schema_identity",
         "<non-session-write-connection>",
         "write_connection",
-        "91a7ddcfb7d2279c",
+        "dc8b3ee57e650e2d",
         1,
         None,
         line=1401,
@@ -5837,10 +5848,10 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "LandscapeDB._validate_schema",
         "<non-session-write-connection>",
         "write_connection",
-        "a6bc0744250eff32",
+        "776469621d69e508",
         1,
         None,
-        line=1687,
+        line=1685,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5850,7 +5861,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "44c4543542ceeb85",
         1,
         None,
-        line=2173,
+        line=2220,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5861,7 +5872,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "222b5f4b0d258dbe",
         1,
         None,
-        line=2155,
+        line=2202,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5950,13 +5961,47 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     ),
     WriterIdentity(
         "src/elspeth/web/auth/local.py",
-        "LocalAuthProvider._get_conn",
+        "_connect_owner_only_database",
         "<non-session-write-connection>",
         "write_connection",
-        "df6185754d14a63c",
+        "04f8f6924fdd0d05",
         1,
         None,
-        line=359,
+        line=291,
+        connection_escape=True,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/auth/local.py",
+        "_connect_owner_only_database",
+        "<non-session-write-connection>",
+        "write_connection",
+        "04f8f6924fdd0d05",
+        2,
+        None,
+        line=291,
+        connection_escape=True,
+    ),
+    # Exact read-only Landscape admission; neither URI/SQLCipher path writes.
+    WriterIdentity(
+        "src/elspeth/core/landscape/database.py",
+        "LandscapeDB.admit_existing_sqlite_store",
+        "<sessions-write-connection>",
+        "write_connection",
+        "40f92c2195132323",
+        1,
+        None,
+        line=1929,
+    ),
+    # The reference schema exists only in a private sqlite3 :memory: store.
+    WriterIdentity(
+        "src/elspeth/web/auth/local_schema.py",
+        "admit_local_auth_schema",
+        "<non-session-write-connection>",
+        "write_connection",
+        "f7269e1274dccdd6",
+        1,
+        None,
+        line=53,
         connection_escape=True,
     ),
     # Proven non-Sessions acquisitions (P4-D6 step 1): every origin is a
@@ -11649,6 +11694,84 @@ class _CallerSideProof:
             return argument.id
         return caller._parameter_behind_name(call, argument.id)
 
+    def _fresh_credential_schema_argument(self, caller: _ProductionWriterCollector, call: ast.AST, argument: ast.expr) -> bool:
+        """The exact reviewed fresh-auth bootstrap, never an arbitrary SQLite connection.
+
+        Bind the admission branch, canonical SQL and both complete callers.
+        Any changed body, SQL, extra reference or import refuses this premise.
+        The ordinary caller proof still checks the private-memory caller.
+        """
+        local_path = "src/elspeth/web/auth/local.py"
+        schema_path = "src/elspeth/web/auth/local_schema.py"
+        helper = "create_local_auth_schema"
+        if (
+            caller.path != local_path
+            or _symbol(call) != "LocalAuthProvider._ensure_schema"
+            or not isinstance(argument, ast.Name)
+            or argument.id != "conn"
+            or not isinstance(call, ast.Call)
+            or caller._imported_qualified_name(call.func) != f"elspeth.web.auth.local_schema.{helper}"
+        ):
+            return False
+        expected = {
+            (local_path, "_ensure_schema"): "284f1553301ba2cce25a9a7bb498eb680241e217410794162fa9949412db1f03",
+            (schema_path, "<module>"): "b4e873cc098777b87f82b75b174c4a862d69bcddb05bd3cb1c2f273ffb0abb44",
+        }
+        observed: dict[tuple[str, str], str] = {}
+        for collector in self._collectors:
+            if collector.path == schema_path:
+                observed[(schema_path, "<module>")] = hashlib.sha256(
+                    ast.dump(collector.tree, include_attributes=False).encode()
+                ).hexdigest()
+            for node in ast.walk(collector.tree):
+                name = ""
+                if isinstance(node, ast.FunctionDef):
+                    name = node.name
+                elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    name = node.targets[0].id
+                key = (collector.path, name)
+                if key in expected:
+                    if key in observed:
+                        return False
+                    observed[key] = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+                    guards = [
+                        candidate
+                        for candidate in ast.walk(node)
+                        if isinstance(candidate, ast.Call)
+                        and isinstance(candidate.func, ast.Name)
+                        and candidate.func.id == "admit_local_auth_schema"
+                    ]
+                    if len(guards) != 1 or collector._imported_qualified_name(guards[0].func) != (
+                        "elspeth.web.auth.local_schema.admit_local_auth_schema"
+                    ):
+                        return False
+                if isinstance(node, ast.ImportFrom) and any(
+                    (
+                        alias.name == "*"
+                        and collector._relative_import_module(node) in {"elspeth.web.auth.local_schema", "elspeth.web.auth.local"}
+                    )
+                    or (
+                        alias.name == helper
+                        and (
+                            collector.path != local_path
+                            or alias.asname
+                            or collector._relative_import_module(node) != "elspeth.web.auth.local_schema"
+                        )
+                    )
+                    for alias in node.names
+                ):
+                    return False
+        if observed != expected:
+            return False
+        calls = self._calls_by_name.get(helper, [])
+        if len(calls) != 2 or {(collector.path, _symbol(node)) for collector, node in calls} != {
+            (local_path, "LocalAuthProvider._ensure_schema"),
+            (schema_path, "admit_local_auth_schema"),
+        }:
+            return False
+        call_functions = {id(node.func) for _, node in calls}
+        return all(id(node) in call_functions for _, node in self._references_by_name.get(helper, []))
+
     def _argument_proves_non_session(
         self,
         caller: _ProductionWriterCollector,
@@ -11658,6 +11781,8 @@ class _CallerSideProof:
         depth: int,
         active: frozenset[tuple[int, str]],
     ) -> bool | None:
+        if self._fresh_credential_schema_argument(caller, call, argument):
+            return True
         acquisitions = caller._connection_acquisitions_for_expression(call, argument)
         if (
             acquisitions
@@ -20079,6 +20204,82 @@ def test_writer_manifest_is_bidirectional_and_multiplicity_aware(
     assert subtract_reviewed_identities([], writer_sites[:1]) == ([], writer_sites[:1])
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "none",
+        "sql",
+        "guard",
+        "guard_binding",
+        "catalog",
+        "helper",
+        "sessions_caller",
+        "unknown_caller",
+        "alias_import",
+        "reexport_alias",
+        "reexport_star",
+        "alias_reference",
+    ],
+)
+def test_credential_schema_premise_is_exact_and_rejects_changed_inputs(tmp_path: Path, mutation: str) -> None:
+    root = _repo_root()
+    local_path = Path("src/elspeth/web/auth/local.py")
+    schema_path = Path("src/elspeth/web/auth/local_schema.py")
+    local_source = (root / local_path).read_text()
+    schema_source = (root / schema_path).read_text()
+    extra_source = ""
+    if mutation == "sql":
+        original = "password_hash TEXT NOT NULL"
+        assert schema_source.count(original) == 1
+        schema_source = schema_source.replace(original, "password_hash TEXT")
+    elif mutation == "guard":
+        original = "if admit_local_auth_schema(conn):"
+        assert local_source.count(original) == 1
+        local_source = local_source.replace(original, "if True:")
+    elif mutation == "helper":
+        original = "connection.execute(statement)"
+        assert schema_source.count(original) == 1
+        schema_source = schema_source.replace(original, 'connection.execute("DELETE FROM sessions")')
+    elif mutation == "guard_binding":
+        local_source += "\nadmit_local_auth_schema = lambda conn: True\n"
+    elif mutation == "catalog":
+        original = "for kind, name, table, sql in connection.execute("
+        assert schema_source.count(original) == 1
+        schema_source = schema_source.replace(original, "for kind, name, table, sql in connection.executemany(")
+    elif mutation == "sessions_caller":
+        extra_source = (
+            "from elspeth.web.auth.local_schema import create_local_auth_schema\n"
+            "from elspeth.web.sessions.engine import create_session_engine\n"
+            "def extra():\n"
+            "    engine = create_session_engine('sqlite://')\n"
+            "    with engine.begin() as conn:\n"
+            "        create_local_auth_schema(conn)\n"
+        )
+    elif mutation == "unknown_caller":
+        extra_source = (
+            "from elspeth.web.auth.local_schema import create_local_auth_schema\ndef extra(conn):\n    create_local_auth_schema(conn)\n"
+        )
+    elif mutation == "alias_import":
+        extra_source = "from elspeth.web.auth.local_schema import create_local_auth_schema as alias\ndef extra(conn):\n    alias(conn)\n"
+    elif mutation == "alias_reference":
+        extra_source = "from elspeth.web.auth.local_schema import create_local_auth_schema\nalias = create_local_auth_schema\n"
+    elif mutation == "reexport_alias":
+        extra_source = "from elspeth.web.auth.local import create_local_auth_schema as alias\ndef extra(conn):\n    alias(conn)\n"
+    elif mutation == "reexport_star":
+        extra_source = "from elspeth.web.auth.local import *\ndef extra(conn):\n    create_local_auth_schema(conn)\n"
+    (tmp_path / local_path).parent.mkdir(parents=True)
+    (tmp_path / local_path).write_text(local_source)
+    (tmp_path / schema_path).write_text(schema_source)
+    paths = [tmp_path / local_path, tmp_path / schema_path]
+    if extra_source:
+        extra_path = tmp_path / "src/elspeth/extra.py"
+        extra_path.write_text(extra_source)
+        paths.append(extra_path)
+    sites = scan_production_writers(paths, anchor=tmp_path)
+    schema_writes = [site for site in sites if site.path == schema_path.as_posix() and site.operation != "write_connection"]
+    assert bool(schema_writes) is (mutation != "none")
+
+
 def test_non_session_connection_manifest_is_bidirectional_and_exact() -> None:
     reviewed = WriterIdentity(
         path="src/elspeth/example.py",
@@ -20114,7 +20315,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
         line=542,
         connection_escape=True,
     )
-    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 49
+    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 52
     assert export_read_transaction in _REVIEWED_NON_SESSION_CONNECTIONS
     expected_session_reachable: tuple[WriterIdentity, ...] = (
         # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,
@@ -20210,7 +20411,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "6577c8508024422b",
             1,
             None,
-            line=248,
+            line=249,
             connection_escape=True,
         ),
         # The session-lock wrapper: an honest escape until every caller proves
@@ -20260,7 +20461,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "730473cf9d5628ab",
             1,
             "SessionSchemaAuthority",
-            line=273,
+            line=288,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -20270,7 +20471,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "d7ac5811a7ee7916",
             1,
             "SessionSchemaAuthority",
-            line=308,
+            line=323,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -20280,7 +20481,17 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "983f117ba847fe0d",
             1,
             "SessionSchemaAuthority",
-            line=422,
+            line=437,
+        ),
+        WriterIdentity(
+            "src/elspeth/web/sessions/schema.py",
+            "assert_empty_session_target",
+            "<sessions-write-connection>",
+            "write_connection",
+            "0f0d2bcbf88ed81a",
+            1,
+            None,
+            line=182,
         ),
     )
     expected = _REVIEWED_NON_SESSION_CONNECTIONS + expected_session_reachable
@@ -21118,7 +21329,7 @@ def test_session_schema_authority_is_exact_contained_and_bidirectional() -> None
         [],
         [],
     )
-    assert len(reviewed) == 6 and len(reads) == 4
+    assert len(reviewed) == 6 and len(reads) == 5
     assert not any(site.symbol.startswith("create_session_engine.") for site in live), "the factory hook is absorbed"
     assert authority_policy_violations(live, _TABLE_POLICIES) == ([], [])
     writes, stale_reads = subtract_reviewed_read_identities(live, reads)

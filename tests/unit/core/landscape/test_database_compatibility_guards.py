@@ -826,7 +826,7 @@ class TestSchemaCompatibilityGuards:
         db.close()
 
     def test_older_epoch_is_rejected_without_mutation(self, tmp_path: Path) -> None:
-        """The only supported pre-1.0 upgrade is delete/recreate and reinstall."""
+        """An older store is preserved and requires an explicitly new target."""
         db_path = tmp_path / "recreate-boundary.db"
         db = LandscapeDB(f"sqlite:///{db_path}")
         db.close()
@@ -1103,8 +1103,8 @@ class TestSchemaCompatibilityGuards:
         assert "Landscape database schema is outdated." in msg
         assert "Missing tables:" in msg
         assert "Pre-1.0 schemas are not migrated in place" in msg
-        assert "delete/recreate the database" in msg
-        assert "reinstall this ELSPETH version" in msg
+        assert "Preserve this store unchanged" in msg
+        assert "configure an explicitly new Landscape database" in msg
         assert f"Database: sqlite:///{db_path}" in msg
         instance.close()
 
@@ -1650,8 +1650,8 @@ class TestJournalPathGuards:
         assert "ix_tokens_run_id" not in indexes
         assert epoch == SQLITE_SCHEMA_EPOCH
 
-    def test_from_url_creates_missing_auth_events_table_for_existing_db(self, tmp_path: Path) -> None:
-        """The web-auth audit table is additive for existing Landscape databases."""
+    def test_from_url_preserves_missing_auth_events_table_for_existing_db(self, tmp_path: Path) -> None:
+        """A partial existing store is refused before bootstrap or journal changes."""
         db_path = tmp_path / "missing_auth_events_table.db"
         engine = create_engine(f"sqlite:///{db_path}")
         metadata.create_all(engine)
@@ -1661,8 +1661,10 @@ class TestJournalPathGuards:
             conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")
         engine.dispose()
 
-        db = LandscapeDB.from_url(f"sqlite:///{db_path}")
-        db.close()
+        original = db_path.read_bytes()
+        with pytest.raises(SchemaCompatibilityError, match="Preserve this store unchanged"):
+            LandscapeDB.from_url(f"sqlite:///{db_path}")
+        assert db_path.read_bytes() == original
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = set(inspect(engine).get_table_names())
@@ -1670,11 +1672,11 @@ class TestJournalPathGuards:
             epoch = conn.exec_driver_sql("PRAGMA user_version").scalar_one()
         engine.dispose()
 
-        assert "auth_events" in tables
+        assert "auth_events" not in tables
         assert epoch == SQLITE_SCHEMA_EPOCH
 
     def test_from_url_create_tables_false_rejects_missing_auth_events_without_mutation(self, tmp_path: Path) -> None:
-        """Read-only opens tolerate the additive auth-events table absence."""
+        """Read-only opens reject the missing auth-events table without repair."""
         db_path = tmp_path / "readonly_missing_auth_events_table.db"
         engine = create_engine(f"sqlite:///{db_path}")
         metadata.create_all(engine)
@@ -1696,8 +1698,8 @@ class TestJournalPathGuards:
         assert "auth_events" not in tables
         assert epoch == SQLITE_SCHEMA_EPOCH
 
-    def test_from_url_creates_missing_run_attributions_table_for_existing_db(self, tmp_path: Path) -> None:
-        """The web run-attribution audit table is additive for existing Landscape databases."""
+    def test_from_url_preserves_missing_run_attributions_table_for_existing_db(self, tmp_path: Path) -> None:
+        """A partial existing store is refused before bootstrap or journal changes."""
         db_path = tmp_path / "missing_run_attributions_table.db"
         engine = create_engine(f"sqlite:///{db_path}")
         metadata.create_all(engine)
@@ -1707,8 +1709,10 @@ class TestJournalPathGuards:
             conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")
         engine.dispose()
 
-        db = LandscapeDB.from_url(f"sqlite:///{db_path}")
-        db.close()
+        original = db_path.read_bytes()
+        with pytest.raises(SchemaCompatibilityError, match="Preserve this store unchanged"):
+            LandscapeDB.from_url(f"sqlite:///{db_path}")
+        assert db_path.read_bytes() == original
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = set(inspect(engine).get_table_names())
@@ -1716,11 +1720,11 @@ class TestJournalPathGuards:
             epoch = conn.exec_driver_sql("PRAGMA user_version").scalar_one()
         engine.dispose()
 
-        assert "run_attributions" in tables
+        assert "run_attributions" not in tables
         assert epoch == SQLITE_SCHEMA_EPOCH
 
     def test_from_url_create_tables_false_rejects_missing_run_attributions_without_mutation(self, tmp_path: Path) -> None:
-        """Read-only opens tolerate the additive run-attributions table absence."""
+        """Read-only opens reject the missing run-attributions table without repair."""
         db_path = tmp_path / "readonly_missing_run_attributions_table.db"
         engine = create_engine(f"sqlite:///{db_path}")
         metadata.create_all(engine)

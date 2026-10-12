@@ -29,7 +29,6 @@ from elspeth.core.schema_identity import insert_schema_identity
 from elspeth.web.sessions.models import metadata as session_metadata
 from elspeth.web.sessions.schema import (
     SessionSchemaError,
-    _assert_schema_sentinels,
     _create_session_tables,
     _stamp_schema_sentinels,
     explain_non_current_schema,
@@ -167,7 +166,9 @@ def probe_session_schema(bind: Engine | Connection) -> SchemaState:
         existing.discard("sqlite_sequence")
     if not existing:
         try:
-            _assert_schema_sentinels(bind)
+            from elspeth.web.sessions.schema import assert_empty_session_target
+
+            assert_empty_session_target(bind)
         except SessionSchemaError:
             return SchemaState.STALE
         return SchemaState.MISSING
@@ -363,7 +364,7 @@ def init_landscape_schema(engine: Engine) -> None:
             return
         raise SchemaCompatibilityError(
             "Landscape database schema is stale or foreign; pre-1.0 schemas are not migrated in place. "
-            "Uninstall the deployment, delete/recreate the database, and reinstall."
+            "Preserve this store unchanged and configure an explicitly new Landscape database."
         )
 
     def verify(conn: Connection) -> None:

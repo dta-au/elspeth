@@ -14,9 +14,11 @@ baseline and #297 with the release integrator before integration.
 The recovery schema uses epoch 74 for graph parks and operation-bound
 checkpoints. Ambiguous epoch 73 is retired; the release integrator reserves
 75 or a newer unused epoch for the later auth/recovery union. Neither branch's
-local checks qualify the combined release schema. Startup preservation and
-the existing-store compatibility disposition remain integration prerequisites;
-no store conversion, reset or recreation is authorized. Do not import held
+local checks qualify the combined release schema. John retained the temporary
+no-backwards-compatibility window on 12 October 2026, without an exact expiry.
+Qualification uses new compatible stores. Unsupported stores must be refused
+before incompatible writes, with preservation guidance; no upgrade project,
+store conversion, reset or recreation is authorized. Do not import held
 PR #287 wholesale to reconcile it.
 
 ## Contract
@@ -63,6 +65,12 @@ PR #287 wholesale to reconcile it.
 6. Run affected tests, whole-tree contracts and source gates, lint/type checks,
    keyless finding-set comparison and PostgreSQL qualification. Coordinate host
    capacity before the required frozen broad suite; emergency CI has priority.
+7. Admit all configured local stores read-only before bootstrap. Require exact
+   current schemas or pristine unstamped allocations; preserve unsupported
+   session, Landscape and credential stores, and retain secure file admission.
+   Session engine and local-auth construction validate before journal/schema
+   writes. Landscape admission uses `LandscapeDB.from_url`; the legacy direct
+   `LandscapeDB` constructor is outside this preservation guarantee.
 
 No live provider calls are authorized. Tests use owned scripted fakes. The
 shared virtual environment is read-only; both source roots must resolve to the

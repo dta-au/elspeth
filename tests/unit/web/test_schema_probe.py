@@ -391,7 +391,7 @@ def test_an_existing_database_with_a_drifted_check_names_the_constraint() -> Non
     assert "sponsor" in message, "the message must carry the FOUND side, not only the expected one"
     # The instruction the old sentence carried must not have been traded away
     # for the detail: an operator needs both.
-    assert "Delete the old session database and restart" in message
+    assert "Preserve this store unchanged" in message
     engine.dispose()
 
 

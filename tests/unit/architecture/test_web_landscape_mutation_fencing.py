@@ -5808,7 +5808,7 @@ _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operation
 _reserve_CANCEL_ROUTE_SHA256 = "86d206255665ac50b5e2c65bb77bfebc3971e335127483d40c0e1a8d8dd883c2"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "0f0f46fc83d51ff6dec49b8d996c3b1773371cb13ea521d8624e76f44e7cb38b",
+    "src/elspeth/web/sessions/composer_turn.py": "44fb9140460f2ec54fd79124ea33d18446d21e7f3b3749f8a518b2fa56956192",
     "src/elspeth/web/sessions/composer_async_worker.py": "ce8543b819fbcf7e6b613a808724df892bf17a120831941cf9ff83cebf3191ee",
 }
 
@@ -9611,6 +9611,7 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     ):
         return ["parallel title task can reach or preempt the captured composer receiver"], None
     suffix = outer.body[index + 1 : index + 9]
+    dispatch = _reserve_composer_receiver.composer_dispatch_calls(suffix[7]) if len(suffix) == 8 else None
     if (
         [type(statement).__name__ for statement in suffix]
         != ["ImportFrom", "AsyncFunctionDef", "AnnAssign", "AnnAssign", "Assign", "Assign", "If", "Try"]
@@ -9639,14 +9640,8 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
         or suffix[6].orelse
         or not suffix[6].body
         or not isinstance(suffix[6].body[-1], ast.Raise)
-        or not suffix[7].body
-        or not isinstance(suffix[7].body[0], ast.Assign)
-        or len(suffix[7].body[0].targets) != 1
-        or ast.unparse(suffix[7].body[0].targets[0]) != "result"
-        or not isinstance(suffix[7].body[0].value, ast.Await)
-        or not isinstance(suffix[7].body[0].value.value, ast.Call)
-        or ast.unparse(suffix[7].body[0].value.value.func) != "composer.compose"
-        or (turn_path, id(suffix[7].body[0].value.value)) != compose_call
+        or dispatch is None
+        or (turn_path, id(dispatch[0])) != compose_call
     ):
         return ["captured composer receiver interval has an unreviewed effect"], None
     # An await in the timeout arm cannot reach the following compose: that arm
@@ -9667,7 +9662,7 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
         for node in ast.walk(turn)
     ):
         return ["captured composer local is rebound or deleted"], None
-    return [], (turn_path, id(capture), id(suffix[7].body[0].value.value))
+    return [], (turn_path, id(capture), id(dispatch[0]), id(dispatch[1]))
 
 
 def _reserve_coordinator_self_call_receipts(units):
@@ -11010,7 +11005,7 @@ def _reserve_supported_boundary(units):
     dto_return = dto_factory.body[-1] if dto_factory is not None and dto_factory.body else None
     receiver_nodes = (receiver["app_state_install"], receiver["dto_constructor"])
     if (
-        len(transferred) != 2
+        len(transferred) != 3
         or not transferred <= actual_nodes
         or len(self_calls) != 7
         or not self_calls <= actual_nodes
@@ -11063,8 +11058,10 @@ def _reserve_supported_boundary(units):
         or not isinstance(dto_return.value, ast.Call)
         or (dto_units[0].path, id(dto_return.value)) != receiver["dto_constructor"]
         or receiver["compose_call"] not in transferred
+        or receiver["recovery_call"] not in transferred
         or receiver["turn_receiver_read"] not in actual_nodes
         or receiver["compose_method"] not in actual_nodes
+        or receiver["recovery_method"] not in actual_nodes
         or mint["mint_return"] not in actual_nodes
         or mint["custody_constructor_call"] not in actual_nodes
         or not set(mint["owner_constructor_calls"]) <= actual_nodes
@@ -15802,7 +15799,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # installation and clock issuance are unchanged.
     # 964378989 added ix_node_states_run to _REQUIRED_INDEXES; the deadline
     # guard, journal installation, and database clock path remain unchanged.
-    "src/elspeth/core/landscape/database.py": "2f6b0183b95b876071f1a89238754ae73bd40e43f63b6f3fc4ab4c9706ee3756",
+    # #298 admits existing SQLite stores read-only before writer bootstrap and
+    # changes refusal guidance. Deadline/journal installation order is retained.
+    "src/elspeth/core/landscape/database.py": "ad72efa6bd148f604a932abad998d17e388aecbfbf2b482dea69cf310544c0cd",
 }
 
 
