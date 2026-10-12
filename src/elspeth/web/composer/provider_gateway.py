@@ -29,6 +29,7 @@ from elspeth.web.composer.llm_response_parsing import (
     supports_anthropic_prompt_cache_markers,
 )
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -384,7 +385,11 @@ def composer_loop_tool_definitions(dialect: ToolContractDialect) -> list[dict[st
     affected; advisor is web-composer only by design (the tool is not
     registered in the CLI dispatch tables).
     """
-    return wire_tool_definitions(dialect)
+    from elspeth.web.composer.recovery_controls import recovery_tool_definitions
+
+    tools = wire_tool_definitions(dialect)
+    # Preserve the established trailing cache anchor.
+    return [*tools[:-1], *recovery_tool_definitions(dialect), tools[-1]]
 
 
 def build_composer_loop_request_kwargs(
@@ -629,6 +634,8 @@ class ProviderGateway:
             wire_messages, tools_or_none = apply_anthropic_cache_markers(wire_messages, wire_tools, mark_history_tail=True)
             wire_tools = tools_or_none if tools_or_none is not None else wire_tools
 
+        private_request = capture_provider_context(messages=wire_messages, tools=wire_tools or None)
+
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -648,6 +655,17 @@ class ProviderGateway:
                 surface="composer_provider_response",
             )
             response_metadata = completion.provider_metadata
+            from elspeth.web.composer.recovery_controls import RECOVERY_TOOL_NAMES
+
+            recovery_only = bool(wire_tools) and all(tool["function"]["name"] in RECOVERY_TOOL_NAMES for tool in wire_tools)
+            if recovery_only and (
+                any(call.function.name not in RECOVERY_TOOL_NAMES for call in completion.tool_batch.calls)
+                or (not completion.tool_batch.calls and not (completion.message.content or "").strip())
+            ):
+                raise _MalformedLLMResponseError(
+                    "Reply stage requires text or a terminal recovery control",
+                    provider_metadata=completion.provider_metadata,
+                )
             if not wire_tools and (completion.tool_batch.calls or not (completion.message.content or "").strip()):
                 raise _MalformedLLMResponseError(
                     "Reply-only completion must contain text and no tool calls",
@@ -728,6 +746,7 @@ class ProviderGateway:
                             error_message=error_message,
                             provider_custody=provider_custody,
                             failure=failure_to_capture,
+                            private_request=private_request,
                         )
                         if provider_custody is not None:
                             provider_custody.retain_audit(call)
@@ -746,6 +765,7 @@ class ProviderGateway:
         provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Call the diagnostics text model and record one redacted audit row."""
+        private_request = capture_provider_context(messages=messages, tools=None)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -862,6 +882,7 @@ class ProviderGateway:
                             error_message=error_message,
                             provider_custody=provider_custody,
                             failure=failure_to_capture,
+                            private_request=private_request,
                         )
                         if provider_custody is not None:
                             provider_custody.retain_audit(call)

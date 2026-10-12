@@ -254,14 +254,19 @@ def test_manifest_uses_exact_ordered_advertised_tool_definitions() -> None:
     tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     manifest = _manifest(build_system_prompt(None))
 
-    assert [tool["function"]["name"] for tool in tools] == [*PLANNER_DISCOVERY_TOOL_NAMES, "emit_pipeline_proposal"]
+    assert [tool["function"]["name"] for tool in tools] == [
+        *PLANNER_DISCOVERY_TOOL_NAMES,
+        "handoff_to_user",
+        "restore_parked_graph",
+        "emit_pipeline_proposal",
+    ]
     assert manifest.effective_tool_hash == stable_hash(tools)
     assert manifest.canonical_schema_hash == stable_hash(canonical_set_pipeline_schema())
 
 
 def test_manifest_accepts_an_order_preserving_dynamic_discovery_subset() -> None:
     tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-    retained = {"get_plugin_assistance", "get_plugin_schema", "list_models"}
+    retained = {"get_plugin_assistance", "get_plugin_schema", "list_models", "handoff_to_user", "restore_parked_graph"}
     subset = [tool for tool in tools if tool["function"]["name"] in retained or tool is tools[-1]]
 
     manifest = build_planner_capability_manifest(
@@ -274,6 +279,8 @@ def test_manifest_accepts_an_order_preserving_dynamic_discovery_subset() -> None
         "get_plugin_assistance",
         "get_plugin_schema",
         "list_models",
+        "handoff_to_user",
+        "restore_parked_graph",
         "emit_pipeline_proposal",
     ]
     assert manifest.effective_tool_hash == stable_hash(subset)
@@ -282,7 +289,11 @@ def test_manifest_accepts_an_order_preserving_dynamic_discovery_subset() -> None
 @pytest.mark.parametrize("mutation", ("reordered", "unknown"))
 def test_manifest_rejects_invalid_dynamic_discovery_subset(mutation: str) -> None:
     tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-    subset = [tool for tool in tools if tool["function"]["name"] in {"get_plugin_assistance", "get_plugin_schema"} or tool is tools[-1]]
+    retained = {"get_plugin_assistance", "get_plugin_schema", "handoff_to_user", "restore_parked_graph", "emit_pipeline_proposal"}
+    subset = [tool for tool in tools if tool["function"]["name"] in retained]
+    build_planner_capability_manifest(
+        messages=_messages(build_system_prompt(None)), tools=subset, canonical_schema=canonical_set_pipeline_schema()
+    )
     if mutation == "reordered":
         subset[0], subset[1] = subset[1], subset[0]
     else:

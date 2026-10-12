@@ -1393,7 +1393,7 @@ class LandscapeDB:
         if rows:
             raise SchemaCompatibilityError(
                 f"Landscape database schema identity mismatch ({mismatch}); "
-                "uninstall this pre-1.0 deployment, delete/recreate the Landscape database, and reinstall."
+                "preserve this store unchanged and configure an explicitly new Landscape database."
             )
 
         # Re-read under write intent so concurrent fresh initializers cannot
@@ -1412,7 +1412,7 @@ class LandscapeDB:
         if mismatch is not None:
             raise SchemaCompatibilityError(
                 f"Landscape database schema identity mismatch ({mismatch}); "
-                "uninstall this pre-1.0 deployment, delete/recreate the Landscape database, and reinstall."
+                "preserve this store unchanged and configure an explicitly new Landscape database."
             )
 
     def _get_sqlite_schema_epoch(self) -> int:
@@ -1477,9 +1477,7 @@ class LandscapeDB:
                     "the current one-way schema boundary. ELSPETH does not migrate it in place.\n\n"
                     f"Database epoch: {current_epoch}\n"
                     f"Current epoch: {SQLITE_SCHEMA_EPOCH}\n\n"
-                    "Obtain archive/export approval where retention applies, then have the "
-                    "database operator drop/recreate the Landscape database and initialize "
-                    "a fresh schema. Rolling code back over the recreated database is unsafe.\n\n"
+                    "Preserve this store unchanged and configure an explicitly new Landscape database.\n\n"
                     f"Database: {_safe_database_descriptor(self.connection_string)}"
                 )
 
@@ -1791,14 +1789,14 @@ class LandscapeDB:
                 error_parts.append(
                     "ADR-019 changed token_outcomes from the old single-axis outcome/is_terminal to "
                     "(TerminalOutcome, TerminalPath, completed). See "
-                    f"{ADR019_CUTOVER_GUIDE} and replace the stale audit.db "
-                    "before starting this ELSPETH version."
+                    f"{ADR019_CUTOVER_GUIDE}. Preserve the stale audit.db unchanged and select "
+                    "an explicitly new database before starting this ELSPETH version."
                 )
 
             raise SchemaCompatibilityError(
                 "Landscape database schema is outdated.\n\n" + "\n".join(error_parts) + "\n\n"
-                f"Pre-1.0 schemas are not migrated in place. Uninstall the deployment,\n"
-                f"delete/recreate the database, and reinstall this ELSPETH version.\n\n"
+                "Pre-1.0 schemas are not migrated in place. Preserve this store unchanged\n"
+                "and configure an explicitly new Landscape database.\n\n"
                 f"Database: {_safe_database_descriptor(self.connection_string)}"
             )
 
@@ -1917,6 +1915,45 @@ class LandscapeDB:
         return f"{parsed.drivername}:///file:{uri_path}?mode=ro&uri=true"
 
     @classmethod
+    def admit_existing_sqlite_store(cls, url: str, *, passphrase: str | None = None) -> None:
+        """Admit a current store or pristine allocation without bootstrap writes."""
+        from sqlalchemy import inspect
+
+        engine = (
+            cls._create_sqlcipher_engine(url, passphrase, read_only=True)
+            if passphrase is not None
+            else create_engine(cls._sqlite_read_only_url(url))
+        )
+        try:
+            cls._configure_sqlite(engine, read_only=True)
+            with engine.connect() as connection:
+                objects = connection.exec_driver_sql("SELECT name FROM sqlite_master").all()
+                application_id = connection.exec_driver_sql("PRAGMA application_id").scalar_one()
+                epoch = connection.exec_driver_sql("PRAGMA user_version").scalar_one()
+                if not objects:
+                    if application_id != 0 or epoch != 0:
+                        raise SchemaCompatibilityError(
+                            "Landscape creation requires an unstamped, object-free target. "
+                            "Preserve this store unchanged and configure an explicitly new Landscape database."
+                        )
+                    return
+                inspector = inspect(connection)
+                if inspector.get_view_names():
+                    raise SchemaCompatibilityError(
+                        "Landscape database contains unsupported views. Preserve this store unchanged "
+                        "and configure an explicitly new Landscape database."
+                    )
+            instance = cls._from_parts(url, engine, passphrase=passphrase, require_existing_schema=True, read_only=True)
+            instance._validate_schema()
+        except SchemaCompatibilityError as exc:
+            raise SchemaCompatibilityError(
+                "Landscape database is unsupported. Preserve this store unchanged and configure an explicitly new "
+                f"Landscape database. Detail: {exc}"
+            ) from exc
+        finally:
+            engine.dispose()
+
+    @classmethod
     def from_url(
         cls,
         url: str,
@@ -1966,6 +2003,16 @@ class LandscapeDB:
             raise ValueError("read_only=True requires create_tables=False")
         if read_only and dump_to_jsonl:
             raise ValueError("read_only=True cannot enable dump_to_jsonl")
+
+        parsed_url = make_url(url)
+        if not read_only and parsed_url.get_backend_name() == "sqlite" and parsed_url.database not in (None, ":memory:"):
+            assert parsed_url.database is not None
+            if parsed_url.database.startswith("file:") or parsed_url.query:
+                raise ValueError("Landscape database admission requires a plain SQLite file URL; preserve existing stores")
+            if Path(parsed_url.database).is_symlink():
+                raise ValueError("Landscape database target must not be a symlink; preserve existing stores")
+            if Path(parsed_url.database).exists():
+                cls.admit_existing_sqlite_store(url, passphrase=passphrase)
 
         if passphrase is not None:
             if engine_kwargs:

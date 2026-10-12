@@ -26,6 +26,7 @@ from elspeth.web.composer.pipeline_planner import (
 )
 from elspeth.web.composer.pipeline_proposal import AbsentBase
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+from elspeth.web.composer.skills import load_skill
 from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
@@ -253,6 +254,7 @@ async def test_planner_missing_artifact_reply_can_ask_the_model_authored_focused
             information_aware=True,
             policy_override=(policy_catalog, snapshot),
             intent="Assess case studies against supplied instructions; resolve conflicting report layout and unspecified case scope.",
+            rendered_skill=load_pipeline_capability_core() + "\n\n" + load_skill("pipeline_composer"),
         )
 
     assert caught.value.decline_text == question
@@ -269,3 +271,7 @@ async def test_planner_missing_artifact_reply_can_ask_the_model_authored_focused
     assert payload["information_manifest"]["supplied"]["plugin_selection"] == "policy_snapshot"
     assert payload["information_manifest"]["unresolved"] == []
     assert 'starting with "DECLINE: "' in completion.requests[0]["messages"][-1]["content"]
+    rendered = completion.requests[0]["messages"][0]["content"]
+    assert "In the freeform Composer" in rendered
+    assert "planner's `DECLINE:` protocol for a clarification or refusal; never emit" in rendered
+    assert "`CLARIFY:` from the proposal planner." in rendered

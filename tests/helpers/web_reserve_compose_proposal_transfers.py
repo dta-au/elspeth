@@ -6,6 +6,8 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+from tests.helpers.web_reserve_composer_receiver import composer_dispatch_calls
+
 TURN = "src/elspeth/web/sessions/composer_turn.py"
 SERVICE = "src/elspeth/web/composer/service.py"
 PROPOSALS = "src/elspeth/web/sessions/routes/composer/proposals.py"
@@ -182,7 +184,7 @@ def _source3_local_transfers(units):
         return ["composer service custom lookup unproved"], None
     if any(_lexical_bindings(statement, "compose") for statement in compose_class.body if statement is not compose):
         return ["composer service compose lookup rebound"], None
-    if len(turn.body) < 36 or not all(isinstance(turn.body[i], ast.Assign) for i in (17, 18)):
+    if len(turn.body) < 38 or not all(isinstance(turn.body[i], ast.Assign) for i in (17, 18)):
         return ["composer turn binding position changed"], None
     if not _exact(
         turn.body[8],
@@ -221,32 +223,30 @@ def _source3_local_transfers(units):
             isinstance(n.func, ast.Attribute)
             and isinstance(n.func.value, ast.Name)
             and n.func.value.id == "composer"
-            and n.func.attr == "compose"
+            and n.func.attr in {"compose", "compose_recovery"}
         )
 
     if _nested_body_calls(turn, compose_predicate):
         return ["composer call in unreviewed nested executable body"], None
     compose_calls = _calls(turn, compose_predicate)
-    if len(compose_calls) != 1:
+    if len(compose_calls) != 2 or {call.func.attr for call in compose_calls} != {"compose", "compose_recovery"}:
         return ["composer turn compose call universe changed"], None
-    compose_call = compose_calls[0]
-    if _executed_path(turn, compose_call) != (
-        ("AsyncFunctionDef", "body", 35, "Try"),
-        ("Try", "body", 12, "Try"),
-        ("Try", "body", 0, "Assign"),
-        ("Assign", "value", None, "Await"),
-        ("Await", "value", None, "Call"),
-    ) or _direct_prefix_has_terminal(turn, 35):
+    if not isinstance(turn.body[37], ast.Try) or len(turn.body[37].body) < 13:
         return ["composer call executed path or preceding terminal changed"], None
-    if (
-        _shape(_keyword(compose_call, "required_work")) != _shape(ast.Name(id="provider_binding", ctx=ast.Load()))
-        or _shape(_keyword(compose_call, "provider_owner")) != _shape(ast.Name(id="provider_owner", ctx=ast.Load()))
-        or _shape(_keyword(compose_call, "session_operation_context"))
-        != _shape(ast.Attribute(value=ast.Name(id="lease", ctx=ast.Load()), attr="context", ctx=ast.Load()))
-    ):
-        return ["composer turn exact paired call arguments changed"], None
-    if not isinstance(turn.body[35], ast.Try) or compose_call not in tuple(ast.walk(turn.body[35])):
-        return ["composer call no longer follows provider producer"], None
+    dispatch = composer_dispatch_calls(turn.body[37].body[12])
+    if dispatch is None or set(dispatch) != set(compose_calls) or _direct_prefix_has_terminal(turn, 37):
+        return ["composer turn exact paired call arguments or closed branches changed"], None
+    compose_call, recovery_call = dispatch
+    for call, arm, index in ((compose_call, "orelse", 1), (recovery_call, "body", 0)):
+        if _executed_path(turn, call) != (
+            ("AsyncFunctionDef", "body", 37, "Try"),
+            ("Try", "body", 12, "Try"),
+            ("Try", "body", 1, "If"),
+            ("If", arm, index, "Assign"),
+            ("Assign", "value", None, "Await"),
+            ("Await", "value", None, "Call"),
+        ):
+            return ["composer call executed path or preceding terminal changed"], None
     if len(compose.body) < 5 or not _exact(
         compose.body[1],
         "if (required_work is None) != (provider_owner is None):\n"
@@ -356,7 +356,7 @@ def _source3_local_transfers(units):
     ):
         return ["proposal parent binding and child issuance changed"], None
     return [], {
-        "validated_transfer_nodes": frozenset({(TURN, id(compose_call)), (PROPOSALS, id(proposal_call))}),
+        "validated_transfer_nodes": frozenset({(TURN, id(compose_call)), (TURN, id(recovery_call)), (PROPOSALS, id(proposal_call))}),
         "common_unknown": (
             "composer.app.state receiver and normal method binding",
             "import and callable identity of proposal settlement",
@@ -372,11 +372,12 @@ def _source3_local_transfers(units):
 # hashes bind structural ASTs, not import identity or physical custody; those
 # remain explicit common-boundary obligations in the returned receipt.
 _REVIEWED_METHOD_SHAPES = {
-    TURN: "65b1c800dfe34eef78eacd7b0ff89e306f2d4e292cd3999e8a2792344c69979e",
-    SERVICE: "22eeb587214b5fde4cae2398efb2de9191e491d8ce9add29960a0f1203d97cb8",
+    TURN: "2344f5fa6ac1350694c29e12d01142cb84a6a54fd34e117c1122dcec4c63201b",
+    SERVICE: "c6a769e35aed5d75f8fa38d988fe501a23894fa3f1c759a84de41e1a42aa6049",
     PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
     SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
 }
+_REVIEWED_RECOVERY_METHOD_SHAPE = "2db2d25106a944bdfa39236b7f7344cc99d855dfbfee3da76be3c02b9bda6a4e"
 _REVIEWED_ANNOTATIONS = {TURN: frozenset({"assistant_write", "parent_assistant_id"})}
 _METHOD_PATHS = {
     TURN: "_run_composer_turn",
@@ -507,6 +508,9 @@ def compose_proposal_local_transfers(units):
         selected[unit.path] = unit
     if set(selected) != set(_METHOD_PATHS):
         return ["composer transfer source missing"], None
+    recovery = _node(selected[SERVICE], "ComposerServiceImpl.compose_recovery")
+    if recovery is None or _method_shape(recovery) != _REVIEWED_RECOVERY_METHOD_SHAPE:
+        return ["composer recovery complete executed method grammar changed"], None
     normalized = {}
     for path, unit in selected.items():
         if not any(

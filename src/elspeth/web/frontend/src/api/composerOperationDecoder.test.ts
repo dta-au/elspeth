@@ -72,6 +72,20 @@ describe("completed answer durable GET boundary", () => {
     expect(() => decodeComposerOperationSnapshot({ ...complete, result: { ...complete.result, message: { ...message, created_at: "not a date" } } }, sid, id)).toThrow();
     expect(() => decodeComposerOperationSnapshot({ ...complete, result: { ...complete.result, proposals: [{ id, session_id: sid }] } }, sid, id)).toThrow();
   });
+  it("admits a bound system recovery receipt and rejects forged scope or role", () => {
+    const receipt = { ...message, operation_id: id, id: "33333333-3333-4333-8333-333333333333", role: "system", content: "Restored a saved draft", sequence_no: 2 };
+    const withReceipt = (notice: unknown) => ({ ...complete, result: { ...complete.result, message: { ...message, operation_id: id }, recovery_notice: notice } });
+    expect(decodeComposerOperationSnapshot(withReceipt(receipt), sid, id).result?.recovery_notice).toEqual(receipt);
+    expect(decodeComposerOperationSnapshot(withReceipt(null), sid, id).result?.recovery_notice).toBeNull();
+    for (const override of [{ session_id: id }, { role: "assistant" }, { id: message.id }, { operation_id: null }, { tool_calls: [] }, { injected: true }]) {
+      expect(() => decodeComposerOperationSnapshot(withReceipt({ ...receipt, ...override }), sid, id)).toThrow();
+    }
+    for (const operation_id of [null, sid]) {
+      const mixed = withReceipt({ ...receipt, operation_id });
+      mixed.result.message.operation_id = operation_id as string;
+      expect(() => decodeComposerOperationSnapshot(mixed, sid, id)).toThrow();
+    }
+  });
 });
 
 describe("strict failed terminal recovery", () => {

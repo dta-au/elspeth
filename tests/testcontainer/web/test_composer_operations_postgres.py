@@ -131,6 +131,36 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_unchanged_state_retries_once_after_actual_sql_completion as test_unchanged_state_retries_once_after_actual_sql_completion,
 )
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_explicit_restore_uses_parked_identity_across_turns as test_explicit_restore_uses_parked_identity_across_turns,
+)
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_explicit_unavailable_target_is_terminal_refusal as test_explicit_unavailable_target_is_terminal_refusal,
+)
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_foreign_intermediate_checkpoint_refuses_recovery as test_foreign_intermediate_checkpoint_refuses_recovery,
+)
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_malformed_gate_metadata_is_quarantined as test_malformed_gate_metadata_is_quarantined,
+)
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_park_preserves_current_unpersisted_candidate as test_park_preserves_current_unpersisted_candidate,
+)
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_safe_checkpoint_skips_lossy_unknown_graph_fields as test_safe_checkpoint_skips_lossy_unknown_graph_fields,
+)
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_safe_reset_empty_fallback_and_terminal_are_atomic as test_safe_reset_empty_fallback_and_terminal_are_atomic,
+)
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_target_is_frozen_and_current_head_cas_refuses_newer_work as test_target_is_frozen_and_current_head_cas_refuses_newer_work,
+)
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_terminal_response_failure_rolls_back_graph_and_receipts as test_terminal_response_failure_rolls_back_graph_and_receipts,
+)
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_unsaveable_candidate_never_blocks_reset as test_unsaveable_candidate_never_blocks_reset,
+)
 from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
     test_atomic_candidate_supersedes_older_identical_pending_review as test_atomic_candidate_supersedes_older_identical_pending_review,
 )

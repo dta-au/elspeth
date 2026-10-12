@@ -2193,7 +2193,8 @@ class TestComposerConvergence:
             assert exc_info.value.budget_exhausted == "discovery"
 
     @pytest.mark.asyncio
-    async def test_composition_budget_exceeded_raises(self) -> None:
+    @pytest.mark.parametrize("content", [None, "CLARIFY: Which input?"])
+    async def test_composition_budget_exceeded_raises(self, content: str | None) -> None:
         """Mutation turns exhaust the composition budget."""
         catalog = _mock_catalog()
         settings = _make_settings(composer_max_composition_turns=1)
@@ -2211,6 +2212,7 @@ class TestComposerConvergence:
         )
         # Bonus call also returns tool calls — convergence error
         mut2 = _make_llm_response(
+            content=content,
             tool_calls=[
                 {
                     "id": "c2",
@@ -2227,7 +2229,8 @@ class TestComposerConvergence:
             assert exc_info.value.budget_exhausted == "composition"
 
     @pytest.mark.asyncio
-    async def test_self_correction_on_final_composition_turn_succeeds(self) -> None:
+    @pytest.mark.parametrize("marker", ["", "CLARIFY: "])
+    async def test_self_correction_on_final_composition_turn_succeeds(self, marker: str) -> None:
         """B-4D-3: LLM makes mutation on final turn, then text on bonus call."""
         catalog = _mock_catalog()
         settings = _make_settings(composer_max_composition_turns=1)
@@ -2243,7 +2246,7 @@ class TestComposerConvergence:
                 }
             ],
         )
-        text = _make_llm_response(content="Done after final correction.")
+        text = _make_llm_response(content=marker + "Done after final correction.")
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
@@ -7735,7 +7738,8 @@ class TestEmptyStateFinalizePassthrough:
     # ── End-to-end: pending-proposal suppression of empty-state augmentation ─
 
     @pytest.mark.asyncio
-    async def test_pending_proposal_does_not_trigger_empty_state_augmentation(self) -> None:
+    @pytest.mark.parametrize("marker", ["", "CLARIFY: "])
+    async def test_pending_proposal_does_not_trigger_empty_state_augmentation(self, marker: str) -> None:
         """Reproduces the convergence-failure path from staging session
         d121ba9c-8775-463d-afdf-75fd6b6f2456: under trust_mode=explicit_approve
         a successful set_pipeline produces a pending proposal with
@@ -7756,7 +7760,7 @@ class TestEmptyStateFinalizePassthrough:
 
         with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
             result = await service._completion._finalize_no_tool_response(
-                content=model_prose,
+                content=marker + model_prose,
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
@@ -7880,7 +7884,8 @@ class TestEmptyStateFinalizePassthrough:
         assert "Pipeline empty" not in result.message  # synthesizer skipped
 
     @pytest.mark.asyncio
-    async def test_non_empty_state_invalid_preflight_augments_with_validator_suffix(self) -> None:
+    @pytest.mark.parametrize("marker", ["", "CLARIFY: "])
+    async def test_non_empty_state_invalid_preflight_augments_with_validator_suffix(self, marker: str) -> None:
         """When state is populated AND runtime preflight is invalid, the
         finalizer augments the model's prose with a system-attributed
         suffix naming the validator's objection (issue elspeth-9cfbad6901).
@@ -7934,7 +7939,7 @@ class TestEmptyStateFinalizePassthrough:
 
         with patch.object(service._preflight, "runtime_preflight", return_value=invalid_preflight):
             result = await service._completion._finalize_no_tool_response(
-                content=model_prose,
+                content=marker + model_prose,
                 state=bumped_state,
                 initial_version=state.version,
                 user_id="user-1",

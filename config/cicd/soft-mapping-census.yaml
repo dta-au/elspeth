@@ -830,6 +830,9 @@ files:
     Mapping[str, object]: 1
   src/elspeth/web/composer/reasoning.py:
     dict[str, object]: 1
+  src/elspeth/web/composer/recovery_controls.py:
+    Mapping[str, Any]: 1
+    dict[str, object]: 3
   src/elspeth/web/composer/redaction.py:
     Mapping[str, Any]: 1
     Mapping[str, object]: 3
@@ -1054,10 +1057,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 752
+  Mapping[str, Any]: 753
   Mapping[str, object]: 313
   MutableMapping[str, Any]: 8
   boundary: 59
   dict[str, Any]: 1073
-  dict[str, object]: 390
-  soft: 2536
+  dict[str, object]: 393
+  soft: 2540

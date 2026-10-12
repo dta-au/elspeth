@@ -101,6 +101,7 @@ from elspeth.web.composer.no_tool_policy import (
 from elspeth.web.composer.no_tool_policy import (
     state_is_structurally_empty as _state_is_structurally_empty,
 )
+from elspeth.web.composer.no_tool_response import NoToolResponse, is_unstarted_clarification, parse_no_tool_response
 from elspeth.web.composer.progress import (
     emit_progress,
 )
@@ -1224,6 +1225,7 @@ class CompositionCompletion:
         self,
         *,
         content: str,
+        no_tool_response: NoToolResponse | None = None,
         state: CompositionState,
         initial_version: int,
         user_id: str | None,
@@ -1247,6 +1249,7 @@ class CompositionCompletion:
         return await finalize_no_tool_response(
             self._preflight,
             content=content,
+            no_tool_response=no_tool_response,
             state=state,
             initial_version=initial_version,
             user_id=user_id,
@@ -1314,6 +1317,8 @@ class CompositionCompletion:
           ``persisted_assistant_message_id`` and ``persisted_tool_call_turn``
           so the driver only has to ``return outcome.result``.
         """
+        no_tool_response = parse_no_tool_response(assistant_message.content or "")
+        assistant_message = replace(assistant_message, content=no_tool_response.body)
         if (
             repair_turns_used < _MAX_REPAIR_TURNS
             and _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
@@ -1378,6 +1383,13 @@ class CompositionCompletion:
             and not mutation_success_seen
             and _state_is_structurally_empty(state)
             and carries_build_action(message)
+            and not is_unstarted_clarification(
+                no_tool_response,
+                state=state,
+                initial_version=initial_version,
+                mutation_success_seen=mutation_success_seen,
+                tool_invocations=recorder.invocations,
+            )
             and (deadline is None or deadline > asyncio.get_running_loop().time())
         ):
             # This existing disclosure predicate includes questions and
@@ -1400,7 +1412,8 @@ class CompositionCompletion:
                         f"[composer-system] {activity}, and the pipeline has no source or nodes. "
                         "Re-check the user's request against that state. If the user requested construction or generated "
                         "source data, carry out that authorized work using the declared tools before claiming it is complete. "
-                        "If a required product fact is missing, ask the concrete question. If the user asked only for "
+                        "If a required product fact is missing, start your no-tool reply with CLARIFY: and ask the concrete question. "
+                        "If the user asked only for "
                         "explanation or revoked construction, answer that request without building. Do not describe data "
                         "as saved, bound, or reviewed until tool results establish it."
                         f"{upload_context}"
@@ -1586,6 +1599,7 @@ class CompositionCompletion:
         # ``repair_turns_used`` (only it tracks repair turns) plus the persisted
         # ids onto the returned result.
         result = await self._surface_and_finalize_no_tools(
+            no_tool_response=no_tool_response,
             session_operation_context=session_operation_context,
             assistant_message=assistant_message,
             state=state,
@@ -1752,6 +1766,7 @@ class CompositionCompletion:
         self,
         *,
         assistant_message: _AdmittedAssistantMessage,
+        no_tool_response: NoToolResponse | None = None,
         state: CompositionState,
         session_id: str | None,
         current_state_id: str | None,
@@ -1784,6 +1799,9 @@ class CompositionCompletion:
         and in the comments around ``_missing_pending_interpretation_review_sites``.
         """
 
+        if no_tool_response is None:
+            no_tool_response = parse_no_tool_response(assistant_message.content or "")
+        assistant_message = replace(assistant_message, content=no_tool_response.body)
         runtime_findings = None
         if state.sources and state.outputs and interpretation_sites(state):
             runtime_findings = await self._preflight.pending_handoff_outstanding_findings(
@@ -1824,6 +1842,7 @@ class CompositionCompletion:
         raw_content = assistant_message.content or ""
         result = await self._finalize_no_tool_response(
             content=raw_content,
+            no_tool_response=no_tool_response,
             state=state,
             initial_version=initial_version,
             user_id=user_id,

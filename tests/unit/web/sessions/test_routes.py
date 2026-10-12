@@ -632,9 +632,10 @@ class _BlockingRecordingComposer:
         budget_seconds: float | None = None,
         required_work=None,
         provider_owner=None,
+        recovery_context=None,
     ) -> ComposerResult:
         del state, session_id, current_state_id, user_id, progress, user_message_id
-        del session_operation_context, completion_gates, budget_seconds, required_work, provider_owner
+        del session_operation_context, completion_gates, budget_seconds, required_work, provider_owner, recovery_context
 
         self.calls.append(
             {
@@ -677,9 +678,10 @@ class _ProgressAwareComposer:
         budget_seconds: float | None = None,
         required_work=None,
         provider_owner=None,
+        recovery_context=None,
     ) -> ComposerResult:
         del message, chat_messages, session_id, current_state_id, user_id, user_message_id, completion_gates, budget_seconds
-        del required_work, provider_owner
+        del required_work, provider_owner, recovery_context
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True

@@ -3,7 +3,7 @@
 ELSPETH is pre-release, so the web session database has no migration
 pathway. Fresh databases are created directly from the current
 SQLAlchemy metadata. Existing databases must already match that current
-schema; stale local/runtime files should be deleted and recreated.
+schema; preserve unsupported stores and select an explicitly new store.
 """
 
 from __future__ import annotations
@@ -36,13 +36,13 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # timestamp-leading quota scan indexes, and durable fork failure diagnostics.
 # Epoch 68 admits compose_checkpoint and ordinary_proposal_checkpoint reasons
 # in persisted proposal.rebased events. Earlier readers reject these closed
-# vocabulary additions, so this semantic JSON cut requires store recreation.
+# vocabulary additions, so this semantic JSON cut requires a new store.
 # Epoch 69 adds immutable freeform message ingress receipts and their same-session
 # bindings. Existing session stores cannot satisfy the new admission contract.
 # Epoch 70 replaces the persisted tutorial Build stage's old label with build.
-# Epoch 71 is freeform-only, removes the Composer mode preference, and adds
-# ordinary fork/revert receipts. Existing stores are recreated.
-_COORDINATION_HARD_CUT_EPOCH = 72
+# Epoch 74 adds graph recovery parks and checkpoint operation ownership.
+# Incompatible stores require a separately reviewed compatibility disposition.
+_COORDINATION_HARD_CUT_EPOCH = 74
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
@@ -115,8 +115,8 @@ _REQUIRED_AUDIT_TRIGGERS: frozenset[str] = frozenset(
 class SessionSchemaError(RuntimeError):
     """Raised when a session database does not match the current schema epoch.
 
-    Actionable instruction is always the same: delete the session DB file and
-    restart. Pre-release ELSPETH has no migration pathway for session DBs.
+    Preserve the original store and configure an explicitly new database.
+    Pre-release ELSPETH has no migration pathway for session DBs.
     """
 
 
@@ -151,13 +151,13 @@ def initialize_session_schema(engine: Engine) -> None:
 
     Empty databases are initialized from ``sessions.models.metadata``.
     Non-empty databases are validated in place and are never altered.
-    This keeps the pre-release policy mechanical: delete stale runtime
-    DB files instead of carrying migration code or repair branches.
+    Unsupported stores are preserved; this build has no migration path.
     """
 
     inspector = inspect(engine)
     existing_tables = _user_tables(inspector)
     if not existing_tables:
+        assert_empty_session_target(engine)
         # Fresh DB: build the tables, THEN stamp the schema-version
         # sentinels. Stamping before ``create_all`` would let a partial
         # failure (e.g. SQL syntax error in a model) leave a DB on disk
@@ -169,15 +169,30 @@ def initialize_session_schema(engine: Engine) -> None:
         _validate_current_schema(engine)
         return
 
-    # Existing DB: enforce the schema-version guard BEFORE the deeper
-    # column/FK/constraint validation. A stale DB with the wrong
-    # ``user_version`` is the high-frequency operator failure mode
-    # (forgot to delete the DB across a schema bump); surfacing that
-    # specific cause with the actionable "Delete the session DB file
-    # and restart" message is materially more useful than the column-
-    # mismatch error the validator would otherwise produce downstream.
+    # Check identity before the deeper column/FK/constraint validation.
     _assert_schema_sentinels(engine)
     _validate_current_schema(engine)
+
+
+def assert_empty_session_target(bind: Engine | Connection) -> None:
+    """Admit only an object-free, unstamped target for fresh creation."""
+    if isinstance(bind, Connection):
+        _assert_empty_session_connection(bind)
+    else:
+        with bind.connect() as connection:
+            _assert_empty_session_connection(connection)
+
+
+def _assert_empty_session_connection(connection: Connection) -> None:
+    inspector = inspect(connection)
+    if inspector.get_table_names() or inspector.get_view_names():
+        _schema_error("fresh creation requires an empty target")
+    if connection.dialect.name == "sqlite":
+        application_id = connection.exec_driver_sql("PRAGMA application_id").scalar_one()
+        user_version = connection.exec_driver_sql("PRAGMA user_version").scalar_one()
+        objects = connection.exec_driver_sql("SELECT name FROM sqlite_master").all()
+        if application_id != 0 or user_version != 0 or objects:
+            _schema_error("fresh creation requires an unstamped, object-free SQLite target")
 
 
 def probe_current_schema(bind: Engine | Connection) -> bool:
@@ -192,7 +207,7 @@ def probe_current_schema(bind: Engine | Connection) -> bool:
     # our own Index declarations — it inspects no database state. Run it
     # outside the probe's verdict handler so a first-party declaration bug
     # crashes here instead of being converted into a "stale DB" verdict that
-    # tells the operator to delete a healthy session DB.
+    # incorrectly classifies a healthy session DB as unsupported.
     _validate_partial_index_dialect_symmetry()
     supplied_connection = bind if isinstance(bind, Connection) else None
     supplied_connection_was_idle = supplied_connection is not None and not supplied_connection.in_transaction()
@@ -320,14 +335,14 @@ class SessionSchemaAuthority:
                     f"Session DB has unexpected application_id={app_id:#010x}. "
                     f"Expected {SESSION_DB_APPLICATION_ID:#010x} (ELSP) or 0 (new database). "
                     f"This SQLite file does not belong to ELSPETH. "
-                    f"Delete the session DB file and restart."
+                    f"Preserve this store unchanged and configure an explicitly new session database."
                 )
             if user_ver not in {0, SESSION_SCHEMA_EPOCH}:
                 raise SessionSchemaError(
                     f"Session DB schema version {user_ver} does not match "
                     f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
                     f"does not migrate session databases. "
-                    f"Delete the session DB file and restart."
+                    f"Preserve this store unchanged and configure an explicitly new session database."
                 )
 
         if SCHEMA_IDENTITY_TABLE_NAME not in tables:
@@ -335,7 +350,7 @@ class SessionSchemaAuthority:
                 raise SessionSchemaError(
                     f"Session DB is missing {SCHEMA_IDENTITY_TABLE_NAME} for "
                     f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
-                    "does not migrate session databases. Delete the session DB file and restart."
+                    "does not migrate session databases. Preserve this store unchanged and configure an explicitly new session database."
                 )
             return
 
@@ -353,7 +368,7 @@ class SessionSchemaAuthority:
                 f"Session DB {SCHEMA_IDENTITY_TABLE_NAME} table is missing column(s) "
                 f"{', '.join(sorted(missing_identity_columns))} for "
                 f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
-                "does not migrate session databases. Delete the session DB file and restart."
+                "does not migrate session databases. Preserve this store unchanged and configure an explicitly new session database."
             )
 
         rows = read_schema_identities(connection, schema_identity_table)
@@ -362,7 +377,7 @@ class SessionSchemaAuthority:
             raise SessionSchemaError(
                 f"Session DB schema identity mismatch ({mismatch}) for "
                 f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
-                "does not migrate session databases. Delete the session DB file and restart."
+                "does not migrate session databases. Preserve this store unchanged and configure an explicitly new session database."
             )
 
     def validate_required_triggers(self) -> None:
@@ -444,11 +459,10 @@ def _assert_schema_sentinels(bind: Engine | Connection) -> None:
     """Crash with an actionable message if the session DB schema-version
     sentinels do not match the values this build expects.
 
-    Mechanical enforcement of the operator-delete-DB policy: without
+    Mechanical enforcement of the incompatible-store refusal policy: without
     this guard, a stale DB silently fails in obscure SQLAlchemy errors
     the first time a new code path touches a column/table that does not
-    exist. With it, the operator gets a precise instruction to delete
-    the DB file and restart.
+    exist. With it, the operator gets preservation guidance before use.
 
     SQLite keeps its header-level ``application_id`` / ``user_version`` proof.
     Both SQLite and PostgreSQL additionally require exactly one
@@ -461,7 +475,7 @@ def _assert_schema_sentinels(bind: Engine | Connection) -> None:
       touch it.
     - Wrong SQLite ``user_version`` (non-zero, not the current epoch): the
       file is ours but predates this release's schema. The operator
-      must delete it (pre-release ELSPETH has no migration pathway).
+      must preserve it and select a new store (there is no migration pathway).
     - Missing, malformed, or mismatched identity rows fail closed on either
       dialect.
 
@@ -650,7 +664,7 @@ def _dialect_where(index: Any, dialect_key: str) -> Any:
 def _schema_error(detail: str, *, expected: object | None = None, actual: object | None = None) -> NoReturn:
     message = (
         f"Session database schema does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. "
-        "Delete the old session database and restart; pre-release ELSPETH "
+        "Preserve this store unchanged and configure an explicitly new session database; pre-release ELSPETH "
         f"does not migrate web session databases. Detail: {detail}."
     )
     if expected is not None:

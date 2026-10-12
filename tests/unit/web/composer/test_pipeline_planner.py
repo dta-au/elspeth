@@ -194,10 +194,16 @@ _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES = 823
 # zero initial-request bytes. Keep the prior 72 B headroom and original 10%
 # scaffolding band instead of trimming actionable CSV guidance to fit it.
 _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES = 580
+# #298 mandates always-available recovery controls. Measured canonical growth:
+# 1,319 bytes for the two tool declarations including list separators, plus
+# 219 bytes for the recovery instruction in the nested request JSON. Preserve
+# the prior ceiling/headroom and its negative padding control.
+_GRAPH_RECOVERY_CONTROLS_CANONICAL_BYTES = 1538
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
     + _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES
+    + _GRAPH_RECOVERY_CONTROLS_CANONICAL_BYTES
 )
 
 
@@ -809,7 +815,7 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
     assert set(PLANNER_DISCOVERY_TOOL_NAMES) == expected_discovery
 
     tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-    assert {tool["function"]["name"] for tool in tools[:-1]} == expected_discovery
+    assert {tool["function"]["name"] for tool in tools[:-1]} == expected_discovery | {"handoff_to_user", "restore_parked_graph"}
     terminal = tools[-1]["function"]
     assert terminal["name"] == "emit_pipeline_proposal"
     assert terminal["parameters"] == {
@@ -5444,7 +5450,11 @@ async def test_escape_hatch_overtime_turn_runs_advisor_with_terminal_tool_only(
     assert len(completion.requests) == 3
     hatch_request = completion.requests[2]
     assert hatch_request["model"] == "openrouter/advisor-under-test"
-    assert [tool["function"]["name"] for tool in hatch_request["tools"]] == ["emit_pipeline_proposal"]
+    assert [tool["function"]["name"] for tool in hatch_request["tools"]] == [
+        "handoff_to_user",
+        "restore_parked_graph",
+        "emit_pipeline_proposal",
+    ]
     notices = [
         message for message in hatch_request["messages"] if message["role"] == "user" and "escape hatch" in str(message.get("content"))
     ]
@@ -5799,7 +5809,11 @@ async def test_escape_hatch_fires_on_repair_exhaustion(
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
     assert completion.requests[2]["model"] == "openrouter/advisor-under-test"
-    assert [tool["function"]["name"] for tool in completion.requests[2]["tools"]] == ["emit_pipeline_proposal"]
+    assert [tool["function"]["name"] for tool in completion.requests[2]["tools"]] == [
+        "handoff_to_user",
+        "restore_parked_graph",
+        "emit_pipeline_proposal",
+    ]
 
 
 @pytest.mark.asyncio
@@ -6948,7 +6962,11 @@ async def test_escape_hatch_fires_on_discovery_cycle(
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
     assert completion.requests[3]["model"] == "openrouter/advisor-under-test"
-    assert [tool["function"]["name"] for tool in completion.requests[3]["tools"]] == ["emit_pipeline_proposal"]
+    assert [tool["function"]["name"] for tool in completion.requests[3]["tools"]] == [
+        "handoff_to_user",
+        "restore_parked_graph",
+        "emit_pipeline_proposal",
+    ]
     # The repeated discovery batch is never dispatched.
     assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
     retained_call_ids = [call["id"] for message in completion.requests[3]["messages"] for call in message.get("tool_calls", ())]
@@ -7969,7 +7987,11 @@ async def test_prose_overrun_engages_the_hatch_when_available(
     assert len(completion.requests) == 4
     hatch_request = completion.requests[3]
     assert hatch_request["model"] == "openrouter/advisor-under-test"
-    assert [tool["function"]["name"] for tool in hatch_request["tools"]] == ["emit_pipeline_proposal"]
+    assert [tool["function"]["name"] for tool in hatch_request["tools"]] == [
+        "handoff_to_user",
+        "restore_parked_graph",
+        "emit_pipeline_proposal",
+    ]
     notices = [
         message for message in hatch_request["messages"] if message["role"] == "user" and "escape hatch" in str(message.get("content"))
     ]

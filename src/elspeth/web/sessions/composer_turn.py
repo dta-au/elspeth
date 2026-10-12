@@ -67,6 +67,7 @@ from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord,
 from elspeth.web.composer.audit import ComposerToolCancellation, ComposerToolFailure
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.invariants import InvariantError
+from elspeth.web.composer.no_tool_policy import compose_graph_recovery_refusal_message
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.protocol import (
@@ -77,6 +78,7 @@ from elspeth.web.composer.protocol import (
     ComposerResult,
     ComposerRuntimePreflightError,
     ComposerServiceError,
+    GraphRecoveryResponse,
 )
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
@@ -289,7 +291,7 @@ class ComposerTurnObservation:
       persist stamps LLM sidecars with it, as every other writer of those rows does.
     """
 
-    compose_result: ComposerResult | None = None
+    compose_result: ComposerResult | GraphRecoveryResponse | None = None
     pending_exception_llm_calls: tuple[ComposerLLMCall, ...] = ()
     pending_exception_tool_invocations: tuple[ComposerToolInvocation, ...] = ()
     audit_cohort_durable: bool = False
@@ -444,6 +446,19 @@ def _message_with_state_response(
         state=_state_response(current_state, live_validation=live_validation)
         if state_response is not None and current_state is not None
         else None,
+        proposals=[_composition_proposal_response(proposal) for proposal in proposals if proposal.status == "pending"],
+    )
+
+
+def _graph_recovery_response(
+    assistant: ChatMessageRecord,
+    proposals: tuple[CompositionProposalRecord, ...],
+    current_state: CompositionStateRecord | None,
+) -> MessageWithStateResponse:
+    """Publish editable recovery without executing construction validation."""
+    return MessageWithStateResponse(
+        message=_message_response(assistant),
+        state=_state_response(current_state) if current_state is not None else None,
         proposals=[_composition_proposal_response(proposal) for proposal in proposals if proposal.status == "pending"],
     )
 
@@ -667,10 +682,13 @@ async def persist_cancelled_turn_audit(
     if observation.audit_cohort_durable:
         return
     result = observation.compose_result
+    recovery_drafts = result.recovery_audit_drafts if isinstance(result, ComposerResult) else ()
     tool_invocations: tuple[ComposerToolInvocation, ...]
     llm_calls: tuple[ComposerLLMCall, ...]
     if result is not None:
-        tool_invocations = result.tool_invocations if not result.persisted_tool_call_turn else ()
+        tool_invocations = (
+            result.tool_invocations if isinstance(result, GraphRecoveryResponse) or not result.persisted_tool_call_turn else ()
+        )
         llm_calls = result.llm_calls
     elif observation.pending_exception_llm_calls or observation.pending_exception_tool_invocations:
         tool_invocations = observation.pending_exception_tool_invocations
@@ -678,10 +696,11 @@ async def persist_cancelled_turn_audit(
     else:
         return
     claim = running.claim
-    rows = 2 * len(tool_invocations) + len(llm_calls)
+    rows = 2 * len(tool_invocations) + len(llm_calls) + len(recovery_drafts)
     rows += sum(record.private_failure is not None for record in tool_invocations)
     rows += sum(call.private_failure is not None for call in llm_calls)
     rows += sum(len(call.private_diagnostics) for call in llm_calls)
+    rows += sum(call.private_request is not None for call in llm_calls)
     if not rows:
         observation.audit_cohort_durable = True
         return
@@ -701,6 +720,7 @@ async def persist_cancelled_turn_audit(
                 required_audit=True,
                 required_work=observation.required_work,
                 session_operation_context=running.session_operation_context,
+                additional_drafts=recovery_drafts,
             )
         except (AuditIntegrityError, SQLAlchemyError, SessionOperationFenceLost, AsyncWorkerAdmissionTimeoutError) as exc:
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(rows, {"helper": "cancelled_turn_audit"})
@@ -781,15 +801,28 @@ async def _run_composer_turn(
 
     # E7: the start composite proved head == bound base under this fence, so the
     # loop seeds from the head exactly as the routes do (messages.py:206-218).
-    state_record = await service.get_current_state(session.id)
-    compose_base_state_id = state_record.id if state_record is not None else None
+    recovery_admission = await service.load_graph_recovery_context(
+        session.id,
+        turn_start_state_id=request.state_id,
+        session_operation_context=lease.context,
+    )
+    recovery_context = recovery_admission.context
+    state_record = recovery_admission.record
+    compose_base_state_id = UUID(recovery_context.turn_start_state_id) if recovery_context.turn_start_state_id is not None else None
     if compose_base_state_id != request.state_id:
         raise AuditIntegrityError(
             f"composer operation {turn.operation_id}: the head under its adopted COMPOSE lease is not the "
             "bound base the start composite verified"
         )
-    state = _initial_composition_state() if state_record is None else _state_from_record(state_record)
-    # Tier 1, outside every try: a corrupt envelope must propagate (messages.py:219-223).
+    # An unavailable head is distinct from a genuinely empty session. Only the
+    # scalar recovery context reaches the recovery provider path below.
+    state = (
+        None
+        if recovery_context.malformed_head
+        else _initial_composition_state()
+        if state_record is None
+        else _state_from_record(state_record)
+    )
     prior_completion_gates_facts = parse_completion_gates(state_record.composer_meta) if state_record is not None else None
     plugin_snapshot = services.plugin_snapshot_for_user_id(turn.actor_user_id)
     profile_registry = services.operator_profile_registry
@@ -904,7 +937,12 @@ async def _run_composer_turn(
         )
 
         # messages.py:335-355: first-message auto-title, a child of the lease.
-        if isinstance(request, SendMessageRequest) and len(records) == 1 and is_default_session_title(session.title):
+        if (
+            not recovery_context.malformed_head
+            and isinstance(request, SendMessageRequest)
+            and len(records) == 1
+            and is_default_session_title(session.title)
+        ):
             title_custody = provider_owner.mint(ProviderInvocationFamily.TITLE)
             title_producer = required_work.reserve(
                 RequiredWorkSource.TITLE_CONTINUATION_PRODUCER,
@@ -944,7 +982,68 @@ async def _run_composer_turn(
         composer = services.composer_service
         from openai import OpenAIError
 
-        async def settle_post_provider(result: ComposerResult) -> ComposerOperationRecord:
+        async def settle_post_provider(result: ComposerResult | GraphRecoveryResponse) -> ComposerOperationRecord:
+            recovery_intent = result.intent if isinstance(result, GraphRecoveryResponse) else result.graph_recovery_intent
+            if recovery_intent is not None:
+                recovery = await service.prepare_graph_recovery(
+                    session.id,
+                    context=recovery_context,
+                    intent=recovery_intent,
+                    session_operation_context=lease.context,
+                    candidate_state=result.state if isinstance(result, ComposerResult) and recovery_intent.action == "park" else None,
+                )
+                parent_id = uuid4()
+                # A refused action cannot publish prospective success wording.
+                # The provider's original words remain in its audited call.
+                content = recovery_intent.message if recovery.failure_reason is None else compose_graph_recovery_refusal_message()
+                recovery_assistant_write = ComposerOperationAssistantWrite(
+                    message_id=parent_id,
+                    content=content,
+                    raw_content=None if recovery.failure_reason is None else "",
+                    composition_state_id=compose_base_state_id,
+                )
+                recovery_tools = (
+                    result.tool_invocations if isinstance(result, GraphRecoveryResponse) or not result.persisted_tool_call_turn else ()
+                )
+                audit_cohort, _bindings = _turn_audit_cohort_drafts(
+                    recovery_tools,
+                    result.llm_calls,
+                    tool_composition_state_id=compose_base_state_id,
+                    llm_composition_state_id=compose_base_state_id,
+                    parent_assistant_id=parent_id,
+                    session_operation_context=lease.context,
+                )
+                if isinstance(result, ComposerResult):
+                    audit_cohort = result.recovery_audit_drafts + audit_cohort
+                record = await _join_shielded_task_after_cancellation(
+                    asyncio.create_task(
+                        service.complete_composer_async_operation(
+                            running,
+                            assistant=recovery_assistant_write,
+                            assistant_record=None,
+                            audit_cohort=audit_cohort,
+                            audit_composition_state_id=None,
+                            required_work=observation.required_work,
+                            recovery=recovery,
+                            build_response=_graph_recovery_response,
+                        ),
+                        name="composer-graph-recovery-terminal",
+                    )
+                )
+                observation.audit_cohort_durable = True
+                await _publish_progress(
+                    progress_sink,
+                    event=ComposerProgressEvent(
+                        phase="complete",
+                        headline="The composer response is ready.",
+                        evidence=("The graph recovery outcome and response have been saved.",),
+                        likely_next="Read the recovery outcome and continue the conversation.",
+                        reason="composer_complete",
+                    ),
+                )
+                return record
+            if isinstance(result, GraphRecoveryResponse) or state is None:
+                raise AuditIntegrityError("Recovery-only provider returned without a recovery intent")
             # messages.py:361-570 / compose.py:200-385, ending in the R2 composite.
             _post_compose_updates: ComposerPostComposeUpdates = {
                 "repair_turns_used": result.repair_turns_used,
@@ -1181,21 +1280,35 @@ async def _run_composer_turn(
         try:
             # Awaited inline in the turn task: attach_llm_calls rides on the
             # CancelledError instance and a task boundary would drop it.
-            result = await composer.compose(
-                message_text,
-                chat_messages,
-                state,
-                session_id=str(turn.session_id),
-                current_state_id=str(compose_base_state_id) if compose_base_state_id is not None else None,
-                user_id=turn.actor_user_id,
-                progress=progress_sink,
-                session_operation_context=lease.context,
-                user_message_id=str(turn_user_message_id),
-                completion_gates=prior_completion_gates_facts,
-                budget_seconds=compose_budget_seconds,
-                required_work=provider_binding,
-                provider_owner=provider_owner,
-            )
+            result: ComposerResult | GraphRecoveryResponse
+            if recovery_context.malformed_head:
+                result = await composer.compose_recovery(
+                    message=message_text,
+                    recovery_context=recovery_context,
+                    session_operation_context=lease.context,
+                    budget_seconds=compose_budget_seconds,
+                    required_work=provider_binding,
+                    provider_owner=provider_owner,
+                )
+            else:
+                if state is None:
+                    raise AuditIntegrityError("Ordinary Composer admission lacks its graph")
+                result = await composer.compose(
+                    message_text,
+                    chat_messages,
+                    state,
+                    session_id=str(turn.session_id),
+                    current_state_id=str(compose_base_state_id) if compose_base_state_id is not None else None,
+                    user_id=turn.actor_user_id,
+                    progress=progress_sink,
+                    session_operation_context=lease.context,
+                    user_message_id=str(turn_user_message_id),
+                    completion_gates=prior_completion_gates_facts,
+                    budget_seconds=compose_budget_seconds,
+                    required_work=provider_binding,
+                    provider_owner=provider_owner,
+                    recovery_context=recovery_context,
+                )
             # F-B2/C2: first statement after compose() returns.
             observation.compose_result = result
             if auto_title_task is not None:

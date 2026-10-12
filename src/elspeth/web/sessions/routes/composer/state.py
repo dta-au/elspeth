@@ -61,6 +61,7 @@ from elspeth.web.sessions.routes.operation_receipts import (
     raise_operation_receipt_failure,
     reserve_or_replay_operation_receipt,
 )
+from elspeth.web.sessions.schemas import CompositionHeadResponse
 
 from .._helpers import (
     UTC,
@@ -628,17 +629,49 @@ async def get_current_state(
     session = await _verify_session_ownership(session_id, user, request)
     service = request.app.state.session_service
     catalog, _snapshot = _request_plugin_policy_context(request, user)
-    state = await service.get_current_state(session.id)
+    graph_read = await service.read_current_composition_graph(session.id)
+    if graph_read.hydration_error is not None:
+        head = graph_read.head
+        slog.error(
+            "composer.graph_hydration_unavailable",
+            session_id=str(session.id),
+            exc_class=graph_read.hydration_error,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_type": "composition_state_unavailable",
+                "detail": "The saved graph is unavailable. You can ask Composer to recover a saved draft.",
+                "state_id": str(head.state_id) if head.state_id is not None else None,
+                "version": head.version,
+            },
+        )
+    state = graph_read.record
+    composition = _state_from_record(state) if state is not None else None
     if state is None:
         return None
     response = _state_response(state, policy_catalog=catalog)
     # Suggestions belong to this graph version, so reload recomputes the
     # same Stage-1 advice used after composing.
-    composition = _state_from_record(state)
+    if composition is None:
+        raise AuditIntegrityError("A decoded current graph lacks its composition")
     validation = await run_sync_in_worker(composition.validate)
     response.validation_warnings = _validation_entry_responses(validation.warnings)
     response.validation_suggestions = _validation_entry_responses(validation.suggestions)
     return response
+
+
+@router.get("/{session_id}/state/head", response_model=CompositionHeadResponse)
+async def get_composition_head(
+    session_id: UUID,
+    request: Request,
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
+) -> CompositionHeadResponse:
+    """Read the owned head identity without loading potentially damaged graph data."""
+    session = await _verify_session_ownership(session_id, user, request)
+    service: SessionServiceProtocol = request.app.state.session_service
+    head = await service.get_composition_head(session.id)
+    return CompositionHeadResponse(state_id=str(head.state_id) if head.state_id is not None else None, version=head.version)
 
 
 @router.get(

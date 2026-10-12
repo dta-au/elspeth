@@ -446,20 +446,19 @@ entries:
 - path: tests/helpers/web_reserve_composer_receiver.py
   qualname: composer_receiver_local_contracts
   kind: getattr
-  occurrences: 6
+  occurrences: 5
   probe_shapes:
   - 2ba15a6635ab31b24a18fd9f2bae50e5ca18443a6fb75d9a7bd33256ec4222b1
   - 3afb895646b5c99cc78885be596ee26113c950c26c71bc75ca93d7de5c2e979d
-  - 4fad6f1c9f6f084333a966af978c49cd8fbc81c2b1d7d2461c7ef49b13266fa1
   - 679332bdd2da5a52df751bfd301bc6a5398cfee314e08e5dc61a4abc2d40e547
   - 9ba2120b9748d639f6653118d8bac302816f7903b808af37c2b3878773d4091e
   - ad9c0ba16d3778b1e821aa832a44def9fdd21892f4d7d93797915bb22e8370e1
   classification: approved-introspection
-  justification: Six source-tree probes inspect AST generic metadata on selected app,
-    DTO, turn and method definitions and nullable exception/pattern name and mapping
-    rest binders on nominally selected AST kinds. Noncanonical generics or producer
-    rebinding enter explicit failure paths; these do not classify runtime service
-    objects.
+  justification: Five source-tree probes reject generic AST app, DTO factory and
+    turn definitions and inspect nullable exception/pattern name and mapping rest
+    binders on nominally selected AST kinds. These detect noncanonical definitions
+    or producer rebinding and do not classify runtime service objects. Both
+    selected coroutine descriptors now read their AST type_params directly.
 - path: tests/helpers/web_reserve_composer_receiver.py
   qualname: immediate
   kind: getattr

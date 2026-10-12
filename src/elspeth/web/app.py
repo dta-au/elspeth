@@ -1877,6 +1877,12 @@ def _create_app(
     app.state.platform_identity = platform_identity
 
     external_session_engine: Engine | None = None
+    if settings.auth_provider == "local" and external_state:
+        from elspeth.web.auth.local import validate_existing_local_auth_store
+
+        auth_db_path = settings.data_dir / "auth.db"
+        if auth_db_path.exists() or auth_db_path.is_symlink():
+            validate_existing_local_auth_store(auth_db_path)
     if external_state:
         profile.require_runtime_directories_mounted(settings)
         raw_session_url = settings.session_db_url
@@ -1894,6 +1900,9 @@ def _create_app(
         app.state._session_engine_finalizer = session_engine_finalizer
         profile.validate_only_schema_or_raise(settings, external_session_engine)
     else:
+        from elspeth.web.local_store_admission import admit_local_stores
+
+        admit_local_stores(settings)
         # Ensure data directory and subdirectories exist before any DB access.
         # get_landscape_url() defaults to data_dir/runs/audit.db — SQLite does
         # not create parent directories, so we must ensure runs/ exists too.

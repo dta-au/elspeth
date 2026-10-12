@@ -69,9 +69,11 @@ from elspeth.web.sessions.pipeline_settlement_payloads import ComposerOperationB
 
 if TYPE_CHECKING:
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+    from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
     from elspeth.web.composer.pipeline_proposal import PipelineProposal
+    from elspeth.web.composer.state import CompositionState
     from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry, TokenUsageSource
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkTicket
@@ -82,6 +84,12 @@ if TYPE_CHECKING:
         ComposerOperationError,
         ComposerOperationRecord,
         ComposerOperationRunning,
+    )
+    from elspeth.web.sessions.graph_recovery import (
+        CompositionGraphRead,
+        CompositionStateHead,
+        GraphRecoveryAdmission,
+        GraphRecoverySettlement,
     )
     from elspeth.web.sessions.pipeline_finish_once import ComposerPipelineFinishOnce
     from elspeth.web.sessions.pipeline_rejection import PipelineRejectionExpected
@@ -199,6 +207,7 @@ CompositionStateProvenance = Literal[
     "session_seed",
     "session_fork",
     "interpretation_resolve",
+    "graph_recovery",
 ]
 
 AuditAccessWriterPrincipal = Literal["audit_grade_view", "admin_tool", "workflow_inspect"]
@@ -2995,7 +3004,30 @@ class SessionServiceProtocol(Protocol):
             [ChatMessageRecord, tuple[CompositionProposalRecord, ...], CompositionStateRecord | None], MessageWithStateResponse
         ],
         required_work: RequiredWorkCoordinator | None = None,
+        recovery: GraphRecoverySettlement | None = None,
     ) -> ComposerOperationRecord: ...
+
+    async def load_graph_recovery_context(
+        self,
+        session_id: UUID,
+        *,
+        turn_start_state_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+    ) -> GraphRecoveryAdmission: ...
+
+    async def get_composition_head(self, session_id: UUID) -> CompositionStateHead: ...
+
+    async def read_current_composition_graph(self, session_id: UUID) -> CompositionGraphRead: ...
+
+    async def prepare_graph_recovery(
+        self,
+        session_id: UUID,
+        *,
+        context: GraphRecoveryContext,
+        intent: GraphRecoveryIntent,
+        session_operation_context: SessionOperationContext,
+        candidate_state: CompositionState | None = None,
+    ) -> GraphRecoverySettlement: ...
 
     async def fail_composer_async_operation(
         self,

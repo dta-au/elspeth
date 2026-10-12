@@ -60,6 +60,7 @@ from elspeth.web.composer.authority_hashing import project_composer_authority_pa
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads, require_bounded_text
 from elspeth.web.composer.capability_skill import (
     PLANNER_DISCOVERY_TOOL_NAMES,
+    PLANNER_RECOVERY_TOOL_NAMES,
     PLANNER_TERMINAL_TOOL_NAME,
     PlannerCapabilityManifest,
     build_planner_capability_manifest,
@@ -71,6 +72,7 @@ from elspeth.web.composer.discovery_response import (
     admit_discovery_result,
     serialize_admitted_discovery_result,
 )
+from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
 from elspeth.web.composer.llm_response_parsing import (
     apply_anthropic_cache_markers,
     attach_llm_calls,
@@ -107,6 +109,7 @@ from elspeth.web.composer.progress import (
 # through protocol's TYPE_CHECKING block.)
 from elspeth.web.composer.prompts import _state_referenced_plugins
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_discovery_response import (
     argument_error_response,
     closed_provider_envelope,
@@ -125,6 +128,7 @@ from elspeth.web.composer.provider_quota import (
     required_provider_audit_scope,
 )
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
+from elspeth.web.composer.recovery_controls import parse_recovery_tool_call, recovery_context_message, recovery_tool_definitions
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.response_contracts import AdmittedResponse
 from elspeth.web.composer.state import (
@@ -646,6 +650,14 @@ class PlannerDeclined(PipelinePlannerError):
         self.decline_text = decline_text
 
 
+class PlannerHandoff(PipelinePlannerError):
+    """Provider-selected terminal recovery, settled by the owning compose route."""
+
+    def __init__(self, intent: GraphRecoveryIntent) -> None:
+        super().__init__("planner handed control to the user", code="DECLINED")
+        self.intent = intent
+
+
 class _PipelineCandidateRejected(RuntimeError):
     def __init__(self, result: ToolResult) -> None:
         super().__init__("pipeline candidate was not acceptable")
@@ -1037,7 +1049,9 @@ _PLANNER_SERVER_REJECTION_CODES: Final[frozenset[str]] = frozenset(
         *(category.value for category in ToolArgumentErrorCategory),
     }
 )
-_PLANNER_DECLARED_TOOL_NAMES: Final[frozenset[str]] = frozenset({*PLANNER_DISCOVERY_TOOL_NAMES, PLANNER_TERMINAL_TOOL_NAME})
+_PLANNER_DECLARED_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    {*PLANNER_DISCOVERY_TOOL_NAMES, *PLANNER_RECOVERY_TOOL_NAMES, PLANNER_TERMINAL_TOOL_NAME}
+)
 
 
 def _planner_information_class(key: str) -> ComposerPlannerInformationClass:
@@ -1476,7 +1490,7 @@ def planner_tool_definitions(
     *,
     dialect: ToolContractDialect,
 ) -> list[dict[str, Any]]:
-    """Return an ordered request-owned read-only subset and sole terminal, stamped for ``dialect``.
+    """Return ordered discovery, recovery controls and proposal, stamped for ``dialect``.
 
     The discovery entries are the loop's own wire entries for ``dialect``
     (:func:`~elspeth.web.composer.tools.wire_projection.wire_tool_definitions`),
@@ -1491,7 +1505,7 @@ def planner_tool_definitions(
     if tuple(name for name in PLANNER_DISCOVERY_TOOL_NAMES if name in names) != names:
         raise RuntimeError("planner discovery policy is not an order-preserving registered subset")
     discovery = [wire_entries[name] for name in names]
-    return [*discovery, planner_terminal_tool_definition(dialect=dialect)]
+    return [*discovery, *recovery_tool_definitions(dialect), planner_terminal_tool_definition(dialect=dialect)]
 
 
 def _assert_tools_stamped_for(tools: Sequence[Mapping[str, Any]], dialect: ToolContractDialect) -> None:
@@ -1693,7 +1707,7 @@ def _parse_response_tool_calls(
         strict_sent: bool | None = None
         wire_conformant: bool | None = None
         wire_error: ToolArgumentError | None = None
-        if name != _TERMINAL_TOOL_NAME and name in sent_tool_names:
+        if name != _TERMINAL_TOOL_NAME and name not in PLANNER_RECOVERY_TOOL_NAMES and name in sent_tool_names:
             if dialect == ToolContractDialect.OPENAI_STRICT:
                 strict_sent = _WIRE_TOOL_DEFS[dialect][name].strict_capable
             try:
@@ -1772,7 +1786,9 @@ _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES: Final[int] = 48 * 1024
 # The terminal instruction rides every planner request.
 PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
     "Use read-only discovery as needed, then call emit_pipeline_proposal exactly once "
-    "with one complete canonical set_pipeline argument object."
+    "with one complete canonical set_pipeline argument object. At any stage, you may instead call "
+    "handoff_to_user or restore_parked_graph alone with your message to end authoring and talk to the user. "
+    "Recovery needs no discovery, candidate capture, validation or budget exhaustion."
 )
 
 
@@ -1784,7 +1800,7 @@ def _prose_reply_notice() -> str:
     return (
         "Your previous reply called no tool. You must respond with a declared tool call — "
         "if your design is settled, call emit_pipeline_proposal with the complete proposal now; "
-        "otherwise continue discovery from where you were."
+        "otherwise continue discovery or call handoff_to_user alone to stop and discuss the blocker."
     )
 
 
@@ -1811,7 +1827,8 @@ def _escape_hatch_notice() -> str:
         "You have exactly one turn: either "
         "call emit_pipeline_proposal once with a complete, valid pipeline that satisfies the request, "
         "or reply in plain text honestly explaining why the request cannot be built with the available "
-        "plugins. Do not call any other tool. If you decline, your FIRST sentence must state the cause "
+        "plugins. You may instead call handoff_to_user or restore_parked_graph alone to end authoring "
+        "and talk with the user immediately. If you decline, your FIRST sentence must state the cause "
         "plainly in the user's terms — distinguish a capability that is installed but not turned on in "
         "this deployment (an operator can enable it) from one that does not exist or a request that is "
         "impossible in principle. For example: \"I can't do this here: the LLM transform is not turned "
@@ -3080,6 +3097,7 @@ async def plan_pipeline(
     schemas_loaded: frozenset[tuple[str, str]],
     mark_schema_loaded: Callable[[str, str], None] | None,
     conversation_context: PlannerConversationContext | None = None,
+    recovery_context: GraphRecoveryContext | None = None,
     policy_catalog: PolicyCatalogView,
     plugin_snapshot: PluginAvailabilitySnapshot,
     originating_message: PlannerOriginatingMessage,
@@ -3143,6 +3161,7 @@ async def plan_pipeline(
                 schemas_loaded=schemas_loaded,
                 mark_schema_loaded=mark_schema_loaded,
                 conversation_context=conversation_context,
+                recovery_context=recovery_context,
                 policy_catalog=policy_catalog,
                 plugin_snapshot=plugin_snapshot,
                 originating_message=originating_message,
@@ -3173,6 +3192,9 @@ async def plan_pipeline(
         if isinstance(exc, asyncio.CancelledError):
             outcome = "cancelled"
             trail.log_summary("cancelled")
+        elif isinstance(exc, PlannerHandoff):
+            outcome = "complete"
+            trail.log_summary("declined")
         elif isinstance(exc, PlannerDeclined):
             trail.log_summary("declined")
         elif isinstance(exc, PipelinePlannerError):
@@ -3210,6 +3232,7 @@ async def _plan_pipeline_inner(
     schemas_loaded: frozenset[tuple[str, str]],
     mark_schema_loaded: Callable[[str, str], None] | None,
     conversation_context: PlannerConversationContext | None,
+    recovery_context: GraphRecoveryContext | None,
     policy_catalog: PolicyCatalogView,
     plugin_snapshot: PluginAvailabilitySnapshot,
     originating_message: PlannerOriginatingMessage,
@@ -3307,6 +3330,8 @@ async def _plan_pipeline_inner(
     }
     if conversation_context is not None:
         provider_request["conversation_context"] = conversation_context.to_dict()
+    if recovery_context is not None:
+        provider_request["graph_recovery_context"] = json.loads(recovery_context_message(recovery_context))
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": rendered_skill},
@@ -3454,6 +3479,7 @@ async def _plan_pipeline_inner(
                 error_class=type(exc).__name__,
                 error_message=type(exc).__name__,
                 failure=exc,
+                private_request=private_request,
                 max_completion_tokens_requested=budget_policy.max_completion_tokens,
                 planner_policy_hash=budget_policy.audit_hash,
                 planner_call_ordinal=ordinal,
@@ -3547,6 +3573,7 @@ async def _plan_pipeline_inner(
                 api_base=api_base,
                 api_key=api_key,
             )
+            private_request = capture_provider_context(messages=marked_messages, tools=marked_tools)
 
             try:
                 response = await asyncio.wait_for(
@@ -3562,6 +3589,7 @@ async def _plan_pipeline_inner(
                     raise
                 with required_provider_audit_scope(provider_custody):
                     cancelled_call = build_llm_call_record(
+                        private_request=private_request,
                         model_requested=effective_model,
                         pricing_model=effective_pricing_model,
                         messages=marked_messages,
@@ -3589,6 +3617,7 @@ async def _plan_pipeline_inner(
                     raise
                 with required_provider_audit_scope(provider_custody):
                     timed_out_call = build_llm_call_record(
+                        private_request=private_request,
                         model_requested=effective_model,
                         pricing_model=effective_pricing_model,
                         messages=marked_messages,
@@ -3662,6 +3691,7 @@ async def _plan_pipeline_inner(
 
             try:
                 call = build_llm_call_record(
+                    private_request=private_request,
                     model_requested=effective_model,
                     pricing_model=effective_pricing_model,
                     messages=marked_messages,
@@ -3681,6 +3711,7 @@ async def _plan_pipeline_inner(
             except CredentialMaterialRefused as exc:
                 with required_provider_audit_scope(provider_custody):
                     refused_call = build_llm_call_record(
+                        private_request=private_request,
                         model_requested=effective_model,
                         pricing_model=effective_pricing_model,
                         messages=marked_messages,
@@ -3975,7 +4006,10 @@ async def _plan_pipeline_inner(
                 assert hatch_error is not None
                 message, calls, audited_call = await call_model(
                     model_override=model_config.escape_hatch_model,
-                    tools_override=[planner_terminal_tool_definition(dialect=model_config.escape_hatch_tool_contract_dialect)],
+                    tools_override=[
+                        *recovery_tool_definitions(model_config.escape_hatch_tool_contract_dialect),
+                        planner_terminal_tool_definition(dialect=model_config.escape_hatch_tool_contract_dialect),
+                    ],
                     allow_text_reply=True,
                     reasoning_effort=model_config.candidate_reasoning_effort,
                     attempt_phase_hint=ComposerPlannerAttemptPhase.HATCH,
@@ -4059,6 +4093,20 @@ async def _plan_pipeline_inner(
                 assert hatch_error is not None
                 raise hatch_error from None
             raise
+        recovery_calls = tuple(call for call in calls if call.name in PLANNER_RECOVERY_TOOL_NAMES)
+        if recovery_calls:
+            # Reject mixed control/mutation batches before any discovery,
+            # candidate construction, capture, validation or dispatch.
+            if len(calls) != 1:
+                raise PipelinePlannerError("recovery control must be the only tool call", code="MALFORMED_RESPONSE")
+            recovery_call = recovery_calls[0]
+            try:
+                recovery_intent = parse_recovery_tool_call(recovery_call.name, recovery_call.arguments, recovery_call.call_id)
+            except ValueError as exc:
+                raise PipelinePlannerError("recovery control arguments are malformed", code="MALFORMED_RESPONSE") from exc
+            assert recovery_intent is not None
+            trail.finish_attempt("prose", "declined", planner_code="DECLINED", led_to="terminal")
+            raise PlannerHandoff(recovery_intent)
         terminal_calls = tuple(call for call in calls if call.name == _TERMINAL_TOOL_NAME)
         # Phase of a terminal-tool turn: the first candidate is "candidate",
         # every post-rejection retry is "repair"; the advisor turn is "hatch";
@@ -4879,6 +4927,7 @@ __all__ = [
     "PlannerCustodyConfig",
     "PlannerDeclined",
     "PlannerDiscoveryPolicy",
+    "PlannerHandoff",
     "PlannerInformationManifest",
     "PlannerModelConfig",
     "PlannerOriginatingMessage",

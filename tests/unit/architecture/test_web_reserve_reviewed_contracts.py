@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from tests.helpers import web_reserve_compose_proposal_transfers as compose
+from tests.helpers import web_reserve_composer_receiver as receiver
 from tests.helpers import web_reserve_route_helper as route
 from tests.helpers import web_reserve_terminal_sql_transfers as terminal
 from tests.unit.architecture import test_web_landscape_mutation_fencing as fencing
@@ -75,6 +76,53 @@ def test_reviewed_terminal_namespace_matches_live_source_and_refuses_new_descrip
     ast.fix_missing_locations(units[0].tree)
     failures, _ = terminal.terminal_sql_local_contracts(units)
     assert "terminal SQL transfer: finite current service declaration namespace changed" in failures
+
+
+@pytest.mark.parametrize("branch_name", ("compose", "compose_recovery"))
+@pytest.mark.parametrize("fault", ("receiver", "owner", "work", "context", "await", "escape"))
+def test_both_composer_dispatch_branches_require_the_retained_authority(branch_name: str, fault: str) -> None:
+    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
+    assert compose.compose_proposal_local_transfers(units)[0] == []
+    assert compose._source3_local_transfers(units)[0] == []
+    method = fencing._reserve_node_at(units[0], "_run_composer_turn")
+    invoke = method.body[37].body[12]
+    calls = receiver.composer_dispatch_calls(invoke)
+    assert calls is not None and {call.func.attr for call in calls} == {"compose", "compose_recovery"}
+    call = next(call for call in calls if call.func.attr == branch_name)
+    if fault == "receiver":
+        call.func.value = ast.Name(id="foreign_composer", ctx=ast.Load())
+    elif fault in {"owner", "work", "context"}:
+        keyword_name = {"owner": "provider_owner", "work": "required_work", "context": "session_operation_context"}[fault]
+        keyword = next(item for item in call.keywords if item.arg == keyword_name)
+        keyword.value = ast.Name(id="foreign_authority", ctx=ast.Load())
+    else:
+        branch = invoke.body[1]
+        statements = branch.body if branch_name == "compose_recovery" else branch.orelse
+        statements.insert(
+            len(statements) - 1,
+            ast.parse("await unreviewed_effect()" if fault == "await" else "unreviewed_effect(composer)").body[0],
+        )
+    assert receiver.composer_dispatch_calls(invoke) is None
+    expected = (
+        "composer turn compose call universe changed"
+        if fault == "receiver"
+        else "composer turn exact paired call arguments or closed branches changed"
+    )
+    assert compose._source3_local_transfers(units)[0] == [expected]
+    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + TURN]
+
+
+def test_recovery_callee_cannot_replace_its_nominal_owner_guard() -> None:
+    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
+    assert compose.compose_proposal_local_transfers(units)[0] == []
+    method = fencing._reserve_node_at(units[1], "ComposerServiceImpl.compose_recovery")
+    guard = next(
+        node
+        for node in method.body
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "type(provider_owner) is not ProviderInvocationOwner"
+    )
+    guard.test = ast.Constant(value=False)
+    assert compose.compose_proposal_local_transfers(units)[0] == ["composer recovery complete executed method grammar changed"]
 
 
 def test_missing_shared_prerequisite_refuses_reserve_instead_of_granting_certificate() -> None:

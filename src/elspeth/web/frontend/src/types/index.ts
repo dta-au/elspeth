@@ -348,6 +348,8 @@ export interface MessageWithStateResponse {
   message: ChatMessage;
   state: CompositionState | null;
   proposals: CompositionProposal[];
+  /** Stored system receipt for graph recovery, including when history refresh fails. */
+  recovery_notice?: ChatMessage | null;
 }
 
 // ── Composer Progress ──────────────────────────────────────────────────────
@@ -1167,6 +1169,8 @@ export interface ApiError {
   status: number;
   detail: string;
   error_type?: string;
+  /** Scalar identity of an unreadable graph; never a replacement empty graph. */
+  unavailable_state_head?: { state_id: string; version: number };
   /** The server's current approval state when another approver won the decision race. */
   current_state?: string;
   /** Server-measured identity storage refusal, distinct from a file-size 413. */
