@@ -348,6 +348,19 @@ class InterpretationReviewPending:
         freeze_fields(self, "sites")
 
 
+class UnknownInterpretationRequirementError(ValueError):
+    """A prompt reference does not name a requirement in its own options."""
+
+    def __init__(self, requirement_id: str, *, valid_requirement_ids: tuple[str, ...], component_id: str | None = None) -> None:
+        self.requirement_id = requirement_id
+        self.valid_requirement_ids = valid_requirement_ids
+        self.component_id = component_id
+        super().__init__(
+            f"prompt part references unknown interpretation requirement {requirement_id!r}; "
+            f"valid requirement IDs: {list(valid_requirement_ids)!r}"
+        )
+
+
 class InterpretationReviewIntegrityError(ValueError):
     """Resolved review evidence no longer matches the artifact it attested.
 
@@ -2905,6 +2918,7 @@ def _render_prompt_parts(
     requirements_by_id: Mapping[str, InterpretationRequirement],
     *,
     unresolved_text: str | None,
+    component_id: str | None = None,
 ) -> str:
     rendered: list[str] = []
     for part in parts:
@@ -2916,7 +2930,11 @@ def _render_prompt_parts(
             raise ValueError(f"unknown prompt part kind {kind!r}")
         requirement_id = part["requirement_id"]
         if requirement_id not in requirements_by_id:
-            raise ValueError(f"prompt part references unknown interpretation requirement {requirement_id!r}")
+            raise UnknownInterpretationRequirementError(
+                requirement_id,
+                valid_requirement_ids=tuple(sorted(requirements_by_id)),
+                component_id=component_id,
+            )
         requirement = requirements_by_id[requirement_id]
         if requirement["status"] == "pending":
             if unresolved_text is None:
@@ -3180,11 +3198,22 @@ def _vague_review_is_unchanged(
     # prompt resolves. So (1) the stored prompt must re-render from its own
     # parts + requirements (order-invariant tamper guard), and (2) the
     # requirement hash attests the accepted value alone.
-    rendered_previous = _render_prompt_parts(
-        previous_parts,
-        _requirements_by_id(previous.options),
-        unresolved_text=PENDING_INTERPRETATION_AUTHORING_TEXT,
-    )
+    try:
+        rendered_previous = _render_prompt_parts(
+            previous_parts,
+            _requirements_by_id(previous.options),
+            unresolved_text=PENDING_INTERPRETATION_AUTHORING_TEXT,
+        )
+    except UnknownInterpretationRequirementError as exc:
+        # This render checks the saved authoritative review, not the rejected
+        # candidate. Preserve the existing-review repair path and withhold its
+        # requirement inventory from candidate-specific guidance.
+        raise InterpretationReviewIntegrityError(
+            f"resolved vague-term review {requirement_id!r} prompt references unknown interpretation requirement {exc.requirement_id!r}",
+            component_id=previous.id,
+            component_type="transform",
+            kind=InterpretationKind.VAGUE_TERM,
+        ) from exc
     if rendered_previous != previous_prompt:
         raise InterpretationReviewIntegrityError(
             f"resolved vague-term review {requirement_id!r} prompt drifted from its parts render",
@@ -3283,6 +3312,7 @@ def _reconcile_node_options(
             parts,
             requirements_by_id,
             unresolved_text=PENDING_INTERPRETATION_AUTHORING_TEXT,
+            component_id=proposed.id,
         )
         options["prompt_template"] = rendered
     if carried_prompt_review:

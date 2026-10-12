@@ -55,7 +55,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
-from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
+from elspeth.web.composer.audit import BufferingRecorder, PrivatePlannerCandidate, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads, require_bounded_text
 from elspeth.web.composer.capability_skill import (
@@ -2448,6 +2448,14 @@ def _allowlisted_candidate_feedback(
         guidance = explain_withheld_validation_code(code) if withhold_candidate_facts else explain_validation_code(code)
         if guidance is not None:
             projected["explanation"], projected["suggested_fix"] = guidance
+        if code == "review_reconciliation_failed" and not withhold_candidate_facts and entry.review_reference is not None:
+            # Candidate-local IDs from the typed rejection producer, never
+            # inferred from raw prose or the unchanged saved graph. Options
+            # custody applies even when the finalizer owns only routing.
+            projected["review_reference"] = {
+                "unknown_requirement_id": entry.review_reference.unknown_requirement_id,
+                "valid_requirement_ids": list(entry.review_reference.valid_requirement_ids),
+            }
         if (
             code
             in (
@@ -3455,6 +3463,22 @@ async def _plan_pipeline_inner(
             parsed_calls: tuple[_ParsedToolCall, ...] = (),
         ) -> None:
             planner_call_ordinal = call_to_bind.planner_call_ordinal
+            for parsed_call in parsed_calls:
+                if parsed_call.name == _TERMINAL_TOOL_NAME:
+                    private_arguments = deep_thaw(parsed_call.arguments)
+                    private_authority = dict(private_arguments)
+                    if type(private_arguments.get("pipeline")) is dict:
+                        private_authority["pipeline"] = project_composer_authority_payload(private_arguments["pipeline"])
+                    recorder.record_private_candidate(
+                        PrivatePlannerCandidate(
+                            evidence_id=f"planner:{planner_call_ordinal}:{parsed_call.call_id}",
+                            tool_call_id=parsed_call.call_id,
+                            tool_name=parsed_call.name,
+                            arguments_canonical=canonical_json(private_arguments),
+                            authority_arguments_canonical=canonical_json(private_authority),
+                            raw_arguments=parsed_call.raw_arguments,
+                        )
+                    )
             if planner_call_ordinal is None:
                 raise AuditIntegrityError("planner semantic attempt requires a physical call ordinal")
             selected_tools = tuple(_planner_tool_name(parsed_call.name) for parsed_call in parsed_calls)
@@ -4052,6 +4076,8 @@ async def _plan_pipeline_inner(
                     trail.finish_attempt(attempt_phase, "budget_exhausted", planner_code="COMPOSITION_EXHAUSTED", led_to="terminal")
                     raise PipelinePlannerError("planner composition turn budget exhausted", code="COMPOSITION_EXHAUSTED")
             call = terminal_calls[0]
+            candidate_evidence_id = f"planner:{audited_call.planner_call_ordinal}:{call.call_id}"
+            recorder.settle_private_candidate(candidate_evidence_id, status="candidate_evaluation_started")
             terminal_feedback: Mapping[str, Any] | None = None
             # Only fingerprinted feedback kinds can repeat; schema feedback
             # carries no rejection identity to compare.
@@ -4129,6 +4155,9 @@ async def _plan_pipeline_inner(
                         finalizer_refs = _derive_finalizer_owned_refs(pipeline, finalizer_result)
                         finalizer_owned_refs = finalizer_refs
             if terminal_feedback is not None:
+                recorder.settle_private_candidate(
+                    candidate_evidence_id, status="rejected", result_canonical=canonical_json(terminal_feedback)
+                )
                 last_rejection_codes = _feedback_error_codes(terminal_feedback)
                 if is_hatch_turn:
                     trail.finish_attempt(
@@ -4233,6 +4262,9 @@ async def _plan_pipeline_inner(
                     provider=effective_provider,
                 )
             except ToolArgumentError as exc:
+                recorder.settle_private_candidate(
+                    candidate_evidence_id, status="arg_error", result_canonical=canonical_json(_allowlisted_argument_feedback(exc))
+                )
                 last_rejection_codes = (exc.category.value,)
                 if is_hatch_turn:
                     trail.finish_attempt("hatch", "arg_error", codes=last_rejection_codes, led_to="terminal")
@@ -4282,6 +4314,9 @@ async def _plan_pipeline_inner(
                     finalizer_owned=finalizer_owned_refs,
                     components_withheld=_withheld_component_count(exc.result),
                     plugin_contract_resolver=_violated_plugin_contract,
+                )
+                recorder.settle_private_candidate(
+                    candidate_evidence_id, status="rejected", result_canonical=canonical_json(exc.result.to_dict())
                 )
                 if "ELSPETH_PLANNER_REJECTION_DETAIL_LOG" in os.environ and os.environ["ELSPETH_PLANNER_REJECTION_DETAIL_LOG"] == "1":
                     # Operator-opted diagnostic seam. Validator messages are never
@@ -4404,6 +4439,7 @@ async def _plan_pipeline_inner(
                     raise hatch_error from None
                 raise
             trail.finish_attempt(attempt_phase, "accepted", led_to="done", tool_calls=len(calls))
+            recorder.settle_private_candidate(candidate_evidence_id, status="accepted")
             return accepted_plan
 
         if is_hatch_turn:

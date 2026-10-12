@@ -15,14 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
 from pydantic import JsonValue
 
-from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_audit import PrivateToolAuthoring, ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
@@ -30,6 +30,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.canonical import canonical_json
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobQuotaExceededError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -53,15 +54,18 @@ from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
     BufferingRecorder,
+    DispatchAudit,
     begin_dispatch,
     begin_dispatch_or_arg_error,
+    build_canonicalization_sentinel,
     dispatch_with_audit,
     finish_arg_error,
+    finish_cancelled,
     finish_plugin_crash,
     finish_success,
     rebind_dispatch_arguments,
 )
-from elspeth.web.composer.authority_hashing import composer_authority_hash
+from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
 from elspeth.web.composer.bounded_json import (
     JsonBoundaryError,
     _validate_decoded_json,
@@ -888,6 +892,15 @@ class BatchAccumulator:
     advisor_calls_used: int
 
 
+async def _await_started_tool_stage[T](awaitable: Awaitable[T], *, audit: DispatchAudit, recorder: BufferingRecorder) -> T:
+    """Close a started dispatch when one unaudited async stage cancels."""
+    try:
+        return await awaitable
+    except asyncio.CancelledError as cancellation:
+        recorder.record(finish_cancelled(audit, exc=cancellation))
+        raise
+
+
 async def run_tool_batch(
     *,
     call_model: _CallModelOutcome,
@@ -1032,6 +1045,7 @@ async def run_tool_batch(
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = current_state_id
     decoded_args_by_call_id: dict[str, dict[str, Any]] = {}
+    private_authorings_by_call: dict[str, PrivateToolAuthoring] = {}
     proposals_this_turn = 0
     mutation_success_observed = False
     from elspeth.web.composer.redaction import MANIFEST
@@ -1049,6 +1063,10 @@ async def run_tool_batch(
             break
         tool_name = tool_call.function.name
         pre_version = state.version
+        private_arguments_canonical = private_authority_canonical = None
+        private_raw_arguments = tool_call.function.arguments
+        private_authorings_by_call[tool_call.id] = PrivateToolAuthoring(tool_call.id, tool_name, None, None, private_raw_arguments)
+        recorder.record_private_tool_authoring(private_authorings_by_call[tool_call.id])
         unknown_audit_arguments: dict[str, Any] | None = None
         if tool_name not in MANIFEST:
             if is_discovery_tool(tool_name) or is_mutation_tool(tool_name) or is_session_aware_tool(tool_name):
@@ -1180,6 +1198,17 @@ async def run_tool_batch(
             )
             all_cache_hits = False
             continue
+
+        # Copy receipt semantics before envelope rejection, redaction or
+        # finalizer rebinding can replace them with a display projection.
+        try:
+            private_arguments_canonical = canonical_json(decoded_arguments)
+        except (TypeError, ValueError) as exc:
+            private_arguments_canonical = canonical_json(build_canonicalization_sentinel(exc, decoded_arguments))
+        private_authorings_by_call[tool_call.id] = replace(
+            private_authorings_by_call[tool_call.id], arguments_canonical=private_arguments_canonical
+        )
+        recorder.record_private_tool_authoring(private_authorings_by_call[tool_call.id])
 
         # Exact-type: bounded_json_loads is called with no object_hook /
         # object_pairs_hook, so json.loads builds a plain dict, and its own
@@ -1315,6 +1344,19 @@ async def run_tool_batch(
             call_wire_facts.wire_conformant = decoded.wire_conformant
         else:
             arguments = cast(dict[str, Any], decoded_arguments)
+        try:
+            private_arguments_canonical = canonical_json(arguments)
+            if tool_name == "set_pipeline":
+                private_authority_canonical = composer_authority_canonical_json(arguments)
+        except (TypeError, ValueError) as exc:
+            private_arguments_canonical = canonical_json(build_canonicalization_sentinel(exc, arguments))
+            private_authority_canonical = None
+        private_authorings_by_call[tool_call.id] = replace(
+            private_authorings_by_call[tool_call.id],
+            arguments_canonical=private_arguments_canonical,
+            authority_arguments_canonical=private_authority_canonical,
+        )
+        recorder.record_private_tool_authoring(private_authorings_by_call[tool_call.id])
         if unknown_audit_arguments is not None:
             audit_arguments = unknown_audit_arguments
         elif tool_name == "set_pipeline":
@@ -1386,14 +1428,18 @@ async def run_tool_batch(
                 # Audit-recorded with cache_hit=True so the trail
                 # captures every LLM decision-point, even those
                 # served from cache without re-running the handler.
-                await emit_progress(
-                    progress,
-                    ComposerProgressEvent(
-                        phase="using_tools",
-                        headline="I'm reusing recently checked tool information.",
-                        evidence=("The same discovery request was already answered for this compose step.",),
-                        likely_next="ELSPETH will continue from the cached tool result.",
+                await _await_started_tool_stage(
+                    emit_progress(
+                        progress,
+                        ComposerProgressEvent(
+                            phase="using_tools",
+                            headline="I'm reusing recently checked tool information.",
+                            evidence=("The same discovery request was already answered for this compose step.",),
+                            likely_next="ELSPETH will continue from the cached tool result.",
+                        ),
                     ),
+                    audit=audit,
+                    recorder=recorder,
                 )
                 try:
                     cached_admitted = (
@@ -1929,48 +1975,56 @@ async def run_tool_batch(
                     )
                     if type(ctx.session_operation_context) is not SessionOperationContext:
                         raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
-                    proposal = await turn_sessions_service.create_pipeline_composition_proposal(
-                        session_id=turn_session_uuid,
-                        session_operation_context=ctx.session_operation_context,
-                        plan=PipelinePlanResult(
-                            proposal=pipeline_proposal,
-                            tool_call_id=tool_call.id,
-                            custody_result=pipeline_custody_result,
-                            model_identifier=ctx.provenance.model_identifier,
-                            model_version=provider_model_version,
-                            provider=ctx.provenance.provider or "unknown",
+                    proposal = await _await_started_tool_stage(
+                        turn_sessions_service.create_pipeline_composition_proposal(
+                            session_id=turn_session_uuid,
+                            session_operation_context=ctx.session_operation_context,
+                            plan=PipelinePlanResult(
+                                proposal=pipeline_proposal,
+                                tool_call_id=tool_call.id,
+                                custody_result=pipeline_custody_result,
+                                model_identifier=ctx.provenance.model_identifier,
+                                model_version=provider_model_version,
+                                provider=ctx.provenance.provider or "unknown",
+                            ),
+                            summary=proposal_summary.summary,
+                            rationale=proposal_summary.rationale,
+                            affects=proposal_summary.affects,
+                            arguments_redacted_json=proposal_summary.arguments_redacted_json,
+                            actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                            user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+                            composer_model_identifier=ctx.provenance.model_identifier,
+                            composer_model_version=provider_model_version,
+                            composer_provider=ctx.provenance.provider or "unknown",
                         ),
-                        summary=proposal_summary.summary,
-                        rationale=proposal_summary.rationale,
-                        affects=proposal_summary.affects,
-                        arguments_redacted_json=proposal_summary.arguments_redacted_json,
-                        actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
-                        user_message_id=UUID(user_message_id) if user_message_id is not None else None,
-                        composer_model_identifier=ctx.provenance.model_identifier,
-                        composer_model_version=provider_model_version,
-                        composer_provider=ctx.provenance.provider or "unknown",
+                        audit=audit,
+                        recorder=recorder,
                     )
                 else:
                     if type(ctx.session_operation_context) is not SessionOperationContext:
                         raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
-                    proposal = await turn_sessions_service.create_composition_proposal(
-                        session_id=turn_session_uuid,
-                        session_operation_context=ctx.session_operation_context,
-                        tool_call_id=tool_call.id,
-                        tool_name=proposal_tool_name,
-                        summary=proposal_summary.summary,
-                        rationale=proposal_summary.rationale,
-                        affects=proposal_summary.affects,
-                        arguments_json=proposal_arguments,
-                        arguments_redacted_json=proposal_summary.arguments_redacted_json,
-                        base_state_id=UUID(current_state_id) if current_state_id is not None else None,
-                        actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
-                        user_message_id=UUID(user_message_id) if user_message_id is not None else None,
-                        composer_model_identifier=ctx.provenance.model_identifier,
-                        composer_model_version=provider_model_version,
-                        composer_provider=ctx.provenance.provider or "unknown",
-                        composer_skill_hash=ctx.provenance.skill_hash,
-                        tool_arguments_hash=audit.binding_arguments_hash,
+                    proposal = await _await_started_tool_stage(
+                        turn_sessions_service.create_composition_proposal(
+                            session_id=turn_session_uuid,
+                            session_operation_context=ctx.session_operation_context,
+                            tool_call_id=tool_call.id,
+                            tool_name=proposal_tool_name,
+                            summary=proposal_summary.summary,
+                            rationale=proposal_summary.rationale,
+                            affects=proposal_summary.affects,
+                            arguments_json=proposal_arguments,
+                            arguments_redacted_json=proposal_summary.arguments_redacted_json,
+                            base_state_id=UUID(current_state_id) if current_state_id is not None else None,
+                            actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                            user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+                            composer_model_identifier=ctx.provenance.model_identifier,
+                            composer_model_version=provider_model_version,
+                            composer_provider=ctx.provenance.provider or "unknown",
+                            composer_skill_hash=ctx.provenance.skill_hash,
+                            tool_arguments_hash=audit.binding_arguments_hash,
+                        ),
+                        audit=audit,
+                        recorder=recorder,
                     )
                 proposals_this_turn += 1
                 proposal_result = ToolResult(
@@ -2029,7 +2083,7 @@ async def run_tool_batch(
             # pre-proposal work. All fall through to the canonical
             # dispatch/outcome path below.
 
-        await emit_progress(progress, tool_started_progress_event(tool_name))
+        await _await_started_tool_stage(emit_progress(progress, tool_started_progress_event(tool_name)), audit=audit, recorder=recorder)
 
         # Advisor escape-hatch interception. The request_advisor_hint
         # tool is intercepted here BEFORE execute_tool() because the
@@ -2208,11 +2262,15 @@ async def run_tool_batch(
             advisor_calls_used += 1
 
             try:
-                advisor_outcome = await ctx.advisor_checkpoint._call_advisor_for_tool(
-                    advisor_arg_error,
+                advisor_outcome = await _await_started_tool_stage(
+                    ctx.advisor_checkpoint._call_advisor_for_tool(
+                        advisor_arg_error,
+                        recorder=recorder,
+                        timeout=effective_advisor_timeout,
+                        provider_owner=ctx.provider_owner,
+                    ),
+                    audit=audit,
                     recorder=recorder,
-                    timeout=effective_advisor_timeout,
-                    provider_owner=ctx.provider_owner,
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 # Lifecycle exceptions: do not absorb. Propagate so
@@ -2409,7 +2467,9 @@ async def run_tool_batch(
             # handler. Its failure/deadline carriers must reach the phase
             # owner without being recategorized as a handler crash.
             try:
-                review_preflight = await _pending_review_runtime_findings(state, ctx)
+                review_preflight = await _await_started_tool_stage(
+                    _pending_review_runtime_findings(state, ctx), audit=audit, recorder=recorder
+                )
             except ComposerRuntimePreflightError as preflight_exc:
                 raise ComposerRuntimePreflightError(
                     original_exc=preflight_exc.original_exc,
@@ -2419,21 +2479,25 @@ async def run_tool_batch(
                     failed_turn=preflight_exc.failed_turn,
                 ) from preflight_exc.original_exc
             try:
-                session_aware_outcome = await ctx.session_tools._dispatch_session_aware_tool(
-                    tool_name=tool_name,
-                    tool_call_id=tool_call.id,
-                    arguments=arguments,
-                    state=state,
+                session_aware_outcome = await _await_started_tool_stage(
+                    ctx.session_tools._dispatch_session_aware_tool(
+                        tool_name=tool_name,
+                        tool_call_id=tool_call.id,
+                        arguments=arguments,
+                        state=state,
+                        audit=audit,
+                        recorder=recorder,
+                        session_id=session_id,
+                        session_operation_context=ctx.session_operation_context,
+                        current_state_id=current_state_id,
+                        composer_model_version=provider_model_version,
+                        llm_messages=llm_messages,
+                        anti_anchor=anti_anchor,
+                        policy_catalog=ctx.policy_catalog,
+                        review_preflight=review_preflight,
+                    ),
                     audit=audit,
                     recorder=recorder,
-                    session_id=session_id,
-                    session_operation_context=ctx.session_operation_context,
-                    current_state_id=current_state_id,
-                    composer_model_version=provider_model_version,
-                    llm_messages=llm_messages,
-                    anti_anchor=anti_anchor,
-                    policy_catalog=ctx.policy_catalog,
-                    review_preflight=review_preflight,
                 )
             except (AssertionError, MemoryError, RecursionError, SystemError):
                 # Same narrow-class discipline as the sync execute_tool
@@ -2505,6 +2569,9 @@ async def run_tool_batch(
                     plugin_snapshot=ctx.plugin_snapshot,
                     session_operation_context=ctx.session_operation_context,
                 )
+            except asyncio.CancelledError as cancellation:
+                recorder.record(finish_cancelled(audit, exc=cancellation))
+                raise
             except ComposerRuntimePreflightError as preflight_exc:
                 recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
                 raise ComposerRuntimePreflightError.capture(
@@ -2539,17 +2606,21 @@ async def run_tool_batch(
             # turn claimed to check for.
             if is_pending_interpretation_handoff(preview_preflight):
                 try:
-                    structural_preflight_result = await ctx.preflight.cached_runtime_preflight(
-                        state,
-                        user_id=user_id,
-                        session_id=session_id,
-                        cache=runtime_preflight_cache,
-                        initial_version=initial_version,
-                        session_scope=session_scope,
-                        llm_calls=recorder.llm_calls,
-                        plugin_snapshot=ctx.plugin_snapshot,
-                        session_operation_context=ctx.session_operation_context,
-                        interpretation_tolerant=True,
+                    structural_preflight_result = await _await_started_tool_stage(
+                        ctx.preflight.cached_runtime_preflight(
+                            state,
+                            user_id=user_id,
+                            session_id=session_id,
+                            cache=runtime_preflight_cache,
+                            initial_version=initial_version,
+                            session_scope=session_scope,
+                            llm_calls=recorder.llm_calls,
+                            plugin_snapshot=ctx.plugin_snapshot,
+                            session_operation_context=ctx.session_operation_context,
+                            interpretation_tolerant=True,
+                        ),
+                        audit=audit,
+                        recorder=recorder,
                     )
                 except ComposerRuntimePreflightError as preflight_exc:
                     recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
@@ -3020,6 +3091,10 @@ async def run_tool_batch(
         last_runtime_preflight=last_runtime_preflight,
         tool_outcomes=tuple(tool_outcomes),
         decoded_args_by_call_id=decoded_args_by_call_id,
+        private_authorings=tuple(private_authorings_by_call[outcome.call.id] for outcome in tool_outcomes),
+        private_invocations=tuple(
+            invocation for invocation in recorder.invocations if invocation.tool_call_id in {outcome.call.id for outcome in tool_outcomes}
+        ),
         turn_has_mutation=turn_has_mutation,
         turn_has_discovery=turn_has_discovery,
         all_cache_hits=all_cache_hits,

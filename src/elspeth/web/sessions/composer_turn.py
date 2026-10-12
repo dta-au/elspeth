@@ -61,8 +61,10 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToo
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord, compartment_ingress_record
+from elspeth.web.composer.audit import ComposerToolCancellation, ComposerToolFailure
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -577,11 +579,22 @@ def _turn_audit_cohort_drafts(
     tool_composition_state_id: UUID | None,
     llm_composition_state_id: UUID | None,
     parent_assistant_id: UUID | None,
+    session_operation_context: SessionOperationContext,
 ) -> tuple[tuple[AuditMessageDraft, ...], tuple[PipelineDispatchAuditBinding, ...]]:
     """Preserve the production cohort redaction, locators and binding shapes."""
     drafts: list[AuditMessageDraft] = []
     bindings: list[PipelineDispatchAuditBinding] = []
     for invocation in tool_invocations:
+        from elspeth.web.composer.audit_storage import private_tool_invocation_draft
+
+        drafts.append(
+            private_tool_invocation_draft(
+                invocation,
+                session_id=session_operation_context.fence.session_id,
+                session_operation_context=session_operation_context,
+                composition_state_id=str(tool_composition_state_id) if tool_composition_state_id is not None else None,
+            )
+        )
         content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
         drafts.append(
             AuditMessageDraft(
@@ -648,7 +661,7 @@ async def persist_cancelled_turn_audit(
     else:
         return
     claim = running.claim
-    rows = len(tool_invocations) + len(llm_calls)
+    rows = 2 * len(tool_invocations) + len(llm_calls)
     if not rows:
         observation.audit_cohort_durable = True
         return
@@ -1092,6 +1105,7 @@ async def _run_composer_turn(
                 tool_composition_state_id=post_compose_state_id,
                 llm_composition_state_id=compose_base_state_id,
                 parent_assistant_id=parent_assistant_id,
+                session_operation_context=lease.context,
             )
             # Joined through cancellation: a lease-loss cancel of this child must not
             # leave the composite's worker thread committing while the frame decides
@@ -1218,6 +1232,30 @@ async def _run_composer_turn(
             if post_provider_error is not None:
                 raise post_provider_error from turn_cancel
             raise
+        except ComposerToolFailure as failure:
+            if type(failure) is not ComposerToolFailure:
+                raise
+            observation.pending_exception_tool_invocations = failure.tool_invocations
+            observation.pending_exception_llm_calls = failure.llm_calls
+            await _required_audit(
+                observation,
+                _persist_turn_audit_cohort(
+                    service,
+                    session.id,
+                    failure.tool_invocations,
+                    failure.llm_calls,
+                    tool_composition_state_id=compose_base_state_id,
+                    llm_composition_state_id=compose_base_state_id,
+                    plugin_crash_pending=True,
+                    required_audit=True,
+                    required_work=observation.required_work,
+                    session_operation_context=lease.context,
+                ),
+            )
+            observation.audit_cohort_durable = True
+            # Reuse the existing post-provider failure exit outside this
+            # exception handler, preserving the original cause and identity.
+            post_provider_error = failure.original_exception
         except ComposerConvergenceError as exc:
             observation.pending_exception_llm_calls = _llm_calls_from_exception(exc)
             terminal_status = "timed_out" if exc.budget_exhausted == "timeout" else "failed"
@@ -1567,17 +1605,21 @@ async def _run_composer_turn(
         # through the shielded join, so it is durable before the re-raise and
         # therefore before the worker's terminal. The attached calls ride only on
         # compose()'s own CancelledError, when there is no compose result.
-        llm_calls = _llm_calls_from_exception(exc)
+        tool_invocations = exc.tool_invocations if type(exc) is ComposerToolCancellation else ()
+        llm_calls = exc.llm_calls if type(exc) is ComposerToolCancellation else _llm_calls_from_exception(exc)
         observation.pending_exception_llm_calls = llm_calls
+        observation.pending_exception_tool_invocations = tool_invocations
         try:
-            if llm_calls:
+            if tool_invocations or llm_calls:
                 await _join_shielded_task_after_cancellation(
                     asyncio.create_task(
-                        _persist_llm_calls(
+                        _persist_turn_audit_cohort(
                             service,
                             session.id,
+                            tool_invocations,
                             llm_calls,
-                            compose_base_state_id,
+                            tool_composition_state_id=compose_base_state_id,
+                            llm_composition_state_id=compose_base_state_id,
                             plugin_crash_pending=True,
                             session_operation_context=lease.context,
                             required_audit=True,
@@ -1588,7 +1630,7 @@ async def _run_composer_turn(
                     primary_cancellation=exc,
                 )
                 observation.audit_cohort_durable = True
-            user_stop = _cancel_is_user_stop(exc)
+            user_stop = _cancel_is_user_stop(exc.original_cancellation if type(exc) is ComposerToolCancellation else exc)
             await _join_shielded_task_after_cancellation(
                 asyncio.create_task(
                     _publish_progress(

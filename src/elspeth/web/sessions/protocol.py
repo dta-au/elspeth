@@ -68,6 +68,7 @@ from elspeth.web.sessions.pipeline_publication import PipelineProposalSettlement
 from elspeth.web.sessions.pipeline_settlement_payloads import ComposerOperationBinding
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
     from elspeth.web.composer.pipeline_proposal import PipelineProposal
@@ -3501,6 +3502,7 @@ class SessionServiceProtocol(Protocol):
         raw_content: str | None = None,
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[Any, ...],
+        private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
         rejection_records: tuple[Any, ...] = (),
         parent_composition_state_id: str | None,
         expected_current_state_id: str | None,

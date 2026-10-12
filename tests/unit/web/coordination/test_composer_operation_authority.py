@@ -1304,6 +1304,7 @@ async def test_required_intermediate_cancellation_joins_actual_sql(operation_sto
             assistant_content="Observed",
             redacted_assistant_tool_calls=(),
             redacted_tool_rows=(),
+            private_tool_evidence=(),
             parent_composition_state_id=None,
             expected_current_state_id=None,
             writer_principal="compose_loop",

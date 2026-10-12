@@ -2,7 +2,9 @@
 
 John approved this design on 2026-10-12. The feature starts from main at
 `fdaa670394fd311fc5df61befb1a7b1941c01182`, outside frozen release 0.8.4.
-John selected a standalone PR into `main` as the integration target.
+John's current delivery direction combines this feature with the emergency
+diagnostic repairs on `codex/emergency-diagnostics-20261012`, followed by
+combined qualification and normal protected landing into `main`.
 
 ## Behavior
 
@@ -41,7 +43,8 @@ lookup-count limit.
    generated source-hash/census/catalog evidence, and run focused and relevant
    whole-tree checks. Run the canonical full-repository gate on a frozen tree
    when shared test capacity is available; preserve every failure and exit code.
-6. Publish a standalone PR into `main` and use normal protected merge only
+6. Include the reviewed feature commit in the emergency repair branch and
+   publish the combined PR into `main`. Use normal protected merge only
    after current-head checks qualify.
 
 No deployment, protection changes, paid calls, or unrelated release/security

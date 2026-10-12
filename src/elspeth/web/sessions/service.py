@@ -24,7 +24,7 @@ from uuid import UUID
 import structlog
 from opentelemetry import metrics
 from pydantic import ValidationError
-from sqlalchemy import ColumnElement, Connection, Engine, case, delete, desc, exists, func, insert, or_, select, update
+from sqlalchemy import ColumnElement, Connection, Engine, and_, case, delete, desc, exists, func, insert, or_, select, update
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
@@ -387,6 +387,7 @@ from elspeth.web.validation import _validate_accepted_value_content
 
 if TYPE_CHECKING:
     from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -1837,6 +1838,7 @@ class SessionServiceImpl:
         raw_content: str | None = None,
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[RedactedToolRow, ...],
+        private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
         rejection_records: tuple[RejectionRecord, ...] = (),
         parent_composition_state_id: str | None,
         expected_current_state_id: str | None,
@@ -1908,6 +1910,25 @@ class SessionServiceImpl:
         # turn: an id naming no persisted tool row would orphan the reason.
         # Same pre-transaction posture as the transcript validation above.
         tool_row_ids = {row.tool_call_id for row in redacted_tool_rows}
+        if (tool_row_ids or private_tool_evidence) and writer_principal != "compose_loop":
+            raise AuditIntegrityError("private tool evidence requires compose_loop writer custody")
+        from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+
+        evidence_by_id: dict[str, ComposerDiagnosticEvidence] = {}
+        for evidence in private_tool_evidence:
+            if type(evidence) is not ComposerDiagnosticEvidence:
+                raise AuditIntegrityError("normal tool evidence requires an owned diagnostic record")
+            if evidence.tool_call_id in evidence_by_id:
+                raise AuditIntegrityError("normal tool evidence repeats a tool call")
+            if (
+                evidence.session_id != session_id
+                or evidence.operation_id != session_operation_context.fence.operation_id
+                or evidence.operation_epoch != session_operation_context.fence.operation_epoch
+            ):
+                raise AuditIntegrityError("normal tool evidence has unrelated operation authority")
+            evidence_by_id[evidence.tool_call_id] = evidence
+        if set(evidence_by_id) != tool_row_ids:
+            raise AuditIntegrityError("normal tool evidence does not match the exact persisted tool set")
         for record in rejection_records:
             if record.tool_call_id not in tool_row_ids:
                 raise ValueError(
@@ -1967,7 +1988,7 @@ class SessionServiceImpl:
                             "compose result based on a stale state."
                         )
 
-                    base_seq = self._reserve_sequence_range(conn, session_id, count=1 + len(redacted_tool_rows))
+                    base_seq = self._reserve_sequence_range(conn, session_id, count=1 + 2 * len(redacted_tool_rows))
 
                     assistant_id = self._insert_chat_message(
                         conn,
@@ -2021,11 +2042,26 @@ class SessionServiceImpl:
                             content=tool_row.content,
                             raw_content=None,
                             tool_calls=None,
-                            sequence_no=base_seq + offset,
+                            sequence_no=base_seq + 2 * offset - 1,
                             writer_principal=writer_principal,
                             composition_state_id=state_id,
                             tool_call_id=tool_row.tool_call_id,
                             parent_assistant_id=assistant_id,
+                            created_at=now,
+                            session_operation_context=session_operation_context,
+                        )
+                        self._insert_chat_message(
+                            conn,
+                            session_id=session_id,
+                            role="audit",
+                            content="Private credential-filtered tool evidence",
+                            raw_content=None,
+                            tool_calls=[evidence_by_id[tool_row.tool_call_id].to_envelope()],
+                            sequence_no=base_seq + 2 * offset,
+                            writer_principal=writer_principal,
+                            composition_state_id=current_state_id,
+                            tool_call_id=None,
+                            parent_assistant_id=None,
                             created_at=now,
                             session_operation_context=session_operation_context,
                         )
@@ -2194,6 +2230,7 @@ class SessionServiceImpl:
         raw_content: str | None = None,
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[RedactedToolRow, ...],
+        private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
         rejection_records: tuple[RejectionRecord, ...] = (),
         parent_composition_state_id: str | None,
         expected_current_state_id: str | None,
@@ -2243,6 +2280,7 @@ class SessionServiceImpl:
                 raw_content=raw_content,
                 redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                 redacted_tool_rows=redacted_tool_rows,
+                private_tool_evidence=private_tool_evidence,
                 rejection_records=rejection_records,
                 parent_composition_state_id=parent_composition_state_id,
                 expected_current_state_id=expected_current_state_id,
@@ -7590,6 +7628,7 @@ class SessionServiceImpl:
         Returns a ``StagedForkSession`` with the child, public messages, copied
         state when present, and the immutable plan used by later blob custody.
         """
+        from elspeth.web.composer.diagnostic_evidence import is_diagnostic_evidence_envelope
         from elspeth.web.sessions.protocol import InvalidForkTargetError
 
         # Load source data (read-only, outside the write transaction)
@@ -7614,7 +7653,14 @@ class SessionServiceImpl:
         if fork_msg.role != "user":
             raise InvalidForkTargetError(str(fork_message_id), fork_msg.role)
 
-        messages_to_copy = source_messages[:fork_idx]
+        # Private diagnostics belong to the source session and its operation
+        # bindings. A fork copies conversation/state, not private evidence.
+        # Recognize the kind even on a damaged row rather than copying it.
+        messages_to_copy = [
+            message
+            for message in source_messages[:fork_idx]
+            if message.tool_calls is None or not any(is_diagnostic_evidence_envelope(envelope) for envelope in message.tool_calls)
+        ]
         pre_send_state_id = fork_msg.composition_state_id
 
         # Load source composition state if it exists (read-only)
@@ -8593,6 +8639,89 @@ class SessionServiceImpl:
             # exact retry; it cannot spawn further changed-state settlements.
             raise ComposerTerminalSQLCompletionUnknown("failed terminal attempts finished without a committed terminal") from exc
 
+    def _deduplicate_private_audit_drafts(
+        self,
+        conn: Connection,
+        *,
+        session_id: str,
+        drafts: Sequence[AuditMessageDraft],
+        writer_principal: ChatMessageWriterPrincipal,
+        session_operation_context: SessionOperationContext,
+        composition_state_id: str | None,
+    ) -> tuple[AuditMessageDraft, ...]:
+        """Validate exact private replays under the held session write lock."""
+        from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, is_diagnostic_evidence_envelope
+
+        incoming: dict[tuple[str, int, str], tuple[str, str | None]] = {}
+        candidates: list[tuple[AuditMessageDraft, tuple[str, int, str] | None]] = []
+        for draft in drafts:
+            private = tuple(value for value in draft.tool_calls or () if is_diagnostic_evidence_envelope(value))
+            if not private:
+                candidates.append((draft, None))
+                continue
+            if draft.role != "audit" or writer_principal != "compose_loop" or len(private) != 1 or len(draft.tool_calls or ()) != 1:
+                raise AuditIntegrityError("private diagnostic draft has public or mixed custody")
+            evidence = ComposerDiagnosticEvidence.from_envelope(
+                private[0], expected_session_id=session_id, expected_operation_id=session_operation_context.fence.operation_id
+            )
+            if evidence.operation_epoch != session_operation_context.fence.operation_epoch:
+                raise AuditIntegrityError("private diagnostic draft has another operation epoch")
+            key = (evidence.operation_id, evidence.operation_epoch, evidence.evidence_id)
+            if key in incoming:
+                raise AuditIntegrityError("private diagnostic cohort repeats an evidence identity")
+            incoming[key] = (
+                canonical_json(evidence.to_envelope()),
+                draft.composition_state_id if draft.composition_state_id is not None else composition_state_id,
+            )
+            candidates.append((draft, key))
+        if not incoming:
+            return tuple(drafts)
+        existing: dict[tuple[str, int, str], tuple[str, str | None]] = {}
+        rows = conn.execute(
+            select(
+                chat_messages_table.c.role,
+                chat_messages_table.c.writer_principal,
+                chat_messages_table.c.tool_calls,
+                chat_messages_table.c.composition_state_id,
+            ).where(
+                chat_messages_table.c.session_id == session_id,
+                or_(
+                    chat_messages_table.c.tool_calls[0]["_kind"].as_string() == "composer_diagnostic_evidence",
+                    chat_messages_table.c.tool_calls[0]["evidence"]["schema_version"].as_string() == "composer.private-tool-evidence.v1",
+                ),
+                or_(
+                    and_(
+                        chat_messages_table.c.tool_calls[0]["operation_id"].as_string() == session_operation_context.fence.operation_id,
+                        chat_messages_table.c.tool_calls[0]["operation_epoch"].as_integer()
+                        == session_operation_context.fence.operation_epoch,
+                        chat_messages_table.c.tool_calls[0]["evidence_id"].as_string().in_([key[2] for key in incoming]),
+                    ),
+                    and_(
+                        chat_messages_table.c.tool_calls[0]["evidence"]["operation_id"].as_string()
+                        == session_operation_context.fence.operation_id,
+                        chat_messages_table.c.tool_calls[0]["evidence"]["operation_epoch"].as_integer()
+                        == session_operation_context.fence.operation_epoch,
+                        chat_messages_table.c.tool_calls[0]["evidence"]["evidence_id"].as_string().in_([key[2] for key in incoming]),
+                    ),
+                ),
+            )
+        ).all()
+        for row in rows:
+            for envelope in row.tool_calls or ():
+                if not is_diagnostic_evidence_envelope(envelope):
+                    raise AuditIntegrityError("persisted private diagnostic discriminator is corrupt")
+                if row.role != "audit" or row.writer_principal != "compose_loop" or len(row.tool_calls) != 1:
+                    raise AuditIntegrityError("persisted private diagnostic record has public or mixed custody")
+                evidence = ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=session_id)
+                key = (evidence.operation_id, evidence.operation_epoch, evidence.evidence_id)
+                if key in existing:
+                    raise AuditIntegrityError("persisted private diagnostic identity repeats")
+                existing[key] = (canonical_json(evidence.to_envelope()), row.composition_state_id)
+        for key, value in incoming.items():
+            if key in existing and existing[key] != value:
+                raise AuditIntegrityError("private diagnostic replay changed its retained evidence or state binding")
+        return tuple(draft for draft, key in candidates if key is None or key not in existing)
+
     def _write_audit_cohort_on_connection(
         self,
         conn: Connection,
@@ -8620,6 +8749,18 @@ class SessionServiceImpl:
             sid,
             caller="add_messages_atomic._write",
         )
+        original_drafts = tuple(drafts)
+        drafts = self._deduplicate_private_audit_drafts(
+            conn,
+            session_id=sid,
+            drafts=drafts,
+            writer_principal=writer_principal,
+            session_operation_context=session_operation_context,
+            composition_state_id=csid,
+        )
+        if message_ids is not None:
+            retained_ids = {id(draft) for draft in drafts}
+            message_ids = tuple(message_ids[index] for index, draft in enumerate(original_drafts) if id(draft) in retained_ids)
         for state_id in dict.fromkeys(effective_state_ids):
             if state_id is not None:
                 _assert_state_in_session(

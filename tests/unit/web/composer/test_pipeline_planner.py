@@ -1404,14 +1404,17 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
         "messages": [request["messages"][0], {"role": "user", "content": canonical_json(fixed_payload)}],
         "tools": request["tools"],
     }
-    assert len(canonical_json(fixed_scaffolding).encode("utf-8")) <= _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
+    fixed_bytes = len(canonical_json(fixed_scaffolding).encode("utf-8"))
+    assert fixed_bytes <= _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
     if catalog_inventory == "live":
-        # Positive control for the byte gate: the measured 72 B headroom
-        # cannot silently absorb unrelated static-guidance growth. Mutate a
-        # real declaration, keeping request data and the other tools fixed.
+        # Exercise the fixed byte ceiling against the current catalog rather
+        # than assuming a historical amount of headroom. Mutate a real tool
+        # declaration; ASCII padding adds exactly one canonical byte per x.
         enlarged_scaffolding = deepcopy(fixed_scaffolding)
         source_tool = next(tool for tool in enlarged_scaffolding["tools"] if tool["function"]["name"] == "inspect_source")
-        source_tool["function"]["description"] += "x" * 73
+        source_tool["function"]["description"] += "x" * (_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES - fixed_bytes)
+        assert len(canonical_json(enlarged_scaffolding).encode("utf-8")) == _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
+        source_tool["function"]["description"] += "x"
         assert len(canonical_json(enlarged_scaffolding).encode("utf-8")) > _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
 
 
@@ -8036,6 +8039,10 @@ async def test_cancellation_after_response_closes_the_active_semantic_attempt(
     assert attempt.outcome is ComposerPlannerAttemptOutcome.CANCELLED
     assert attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
     assert caught.value.planner_attempts == (attempt,)  # type: ignore[attr-defined]
+    (candidate,) = recorder.private_candidates
+    assert candidate.status == "candidate_evaluation_started"
+    assert candidate.result_canonical is None
+    assert "pipeline" in json.loads(candidate.arguments_canonical)
 
 
 @pytest.mark.asyncio

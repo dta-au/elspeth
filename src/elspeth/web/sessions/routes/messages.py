@@ -27,6 +27,7 @@ from ._helpers import (
     require_pipeline_user,
 )
 from .composer.operations import admit, parse_message_body
+from .diagnostics import register_diagnostic_routes
 
 
 def _requests_audit_grade_messages_view(
@@ -40,6 +41,8 @@ def _requests_audit_grade_messages_view(
 
 
 def register_message_routes(router: APIRouter) -> None:
+    register_diagnostic_routes(router)
+
     @router.post("/{session_id}/messages", response_model=ComposerOperationAcceptedResponse, status_code=202)
     async def send_message(
         session_id: UUID,

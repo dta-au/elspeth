@@ -63,6 +63,7 @@ from elspeth.web.sessions.routes._helpers import ComposerRequestLifecycle, compo
 from elspeth.web.sessions.routes.composer import pipeline_settlement
 from elspeth.web.sessions.schemas import MessageWithStateResponse, RecomposeRequest, SendMessageRequest
 from elspeth.web.sessions.service import SessionServiceImpl
+from tests.helpers.session_fences import make_compose_context
 from tests.unit.web.sessions.test_routes import (
     _EMPTY_STATE,
     _cancelled_error_with_llm_call,
@@ -340,17 +341,24 @@ def test_turn_audit_cohort_drafts_bind_tool_rows_to_the_named_parent() -> None:
     invocation = _tool_invocation("get_pipeline_state")
     parent = uuid.uuid4()
     tool_state, llm_state = uuid.uuid4(), uuid.uuid4()
+    context = make_compose_context(uuid.uuid4())
     drafts, bindings = composer_turn._turn_audit_cohort_drafts(
         (invocation,),
         (_llm_call(),),
         tool_composition_state_id=tool_state,
         llm_composition_state_id=llm_state,
         parent_assistant_id=parent,
+        session_operation_context=context,
     )
-    assert [draft.role for draft in drafts] == ["tool", "audit"]
-    assert drafts[0].parent_assistant_id == str(parent)
-    assert drafts[0].tool_call_id == "call_get_pipeline_state_1"
-    assert (drafts[0].composition_state_id, drafts[1].composition_state_id) == (str(tool_state), str(llm_state))
+    assert [draft.role for draft in drafts] == ["audit", "tool", "audit"]
+    assert drafts[0].tool_call_id is None
+    assert drafts[1].parent_assistant_id == str(parent)
+    assert drafts[1].tool_call_id == "call_get_pipeline_state_1"
+    assert (drafts[0].composition_state_id, drafts[1].composition_state_id, drafts[2].composition_state_id) == (
+        str(tool_state),
+        str(tool_state),
+        str(llm_state),
+    )
     assert bindings == ()
     orphaned, _ = composer_turn._turn_audit_cohort_drafts(
         (invocation,),
@@ -358,8 +366,12 @@ def test_turn_audit_cohort_drafts_bind_tool_rows_to_the_named_parent() -> None:
         tool_composition_state_id=None,
         llm_composition_state_id=None,
         parent_assistant_id=None,
+        session_operation_context=context,
     )
-    assert [(draft.role, draft.parent_assistant_id, draft.tool_call_id) for draft in orphaned] == [("audit", None, None)]
+    assert [(draft.role, draft.parent_assistant_id, draft.tool_call_id) for draft in orphaned] == [
+        ("audit", None, None),
+        ("audit", None, None),
+    ]
 
 
 def test_settlement_timeout_detail_is_the_settlement_route_string() -> None:
@@ -1255,7 +1267,7 @@ async def test_cancelled_turn_required_audit_failure_outranks_cancellation(tmp_p
     session = await service.create_session("alice", "Required evidence", "local")
     async with _running_job(app, service, session.id, kind="compose_message", content="Go.") as job:
         monkeypatch.setattr(service, "_insert_chat_message", fail_insert)
-        with pytest.raises(AuditIntegrityError, match="composer_llm_call_persist_failed"):
+        with pytest.raises(AuditIntegrityError, match="composer_turn_audit_cohort_persist_failed"):
             await _run(app, job)
         assert audit_insert_hits == 1
         assert job.observation.pending_exception_llm_calls == (call,)

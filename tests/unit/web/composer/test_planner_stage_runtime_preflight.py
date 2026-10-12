@@ -236,6 +236,7 @@ async def _stage(
             preferences=_FakePreferences(trust_mode=trust_mode),
             recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
             planner_llm_calls=(),
+            planner_private_candidates=(),
             planner_attempts=(),
             planner_invocations=(),
             planner_withheld_replies=(),

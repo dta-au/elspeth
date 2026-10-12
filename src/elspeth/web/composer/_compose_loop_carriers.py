@@ -40,7 +40,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring, ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
@@ -314,6 +314,8 @@ class _DispatchOutcome:
 
     # Per-tool decoded arguments, by tool_call.id (used by P4 redaction)
     decoded_args_by_call_id: Mapping[str, Mapping[str, Any]]
+    private_authorings: tuple[PrivateToolAuthoring, ...]
+    private_invocations: tuple[ComposerToolInvocation, ...]
 
     # Turn classification (set during dispatch, read by P5)
     turn_has_mutation: bool

@@ -166,11 +166,11 @@ def test_concurrent_DIFFERENT_sessions_do_not_deadlock(service):
 
     assert not errors, f"errors: {errors}\ntracebacks:\n" + "\n---\n".join(tracebacks)
 
-    # Both sessions reached 10 messages each (1 assistant + 1 tool per turn × 5).  # noqa: RUF003
+    # Each turn commits an assistant, a tool and its private audit sibling.
     with service._engine.begin() as conn:
         for sid in session_ids:
             count = conn.execute(text("SELECT COUNT(*) FROM chat_messages WHERE session_id = :sid"), {"sid": sid}).scalar()
-            assert count == 10, f"session {sid} count: {count}"
+            assert count == 15, f"session {sid} count: {count}"
             seqs = [
                 row.sequence_no
                 for row in conn.execute(
@@ -242,10 +242,10 @@ def test_concurrent_SAME_session_serialises_via_advisory_lock(service):
     assert not errors, f"advisory-lock serialisation failed; errors:\n{errors}\ntracebacks:\n" + "\n---\n".join(tracebacks)
 
     # Both writers must have completed; total rows = 2 × 10 turns ×  # noqa: RUF003
-    # 2 rows/turn (one assistant + one tool) = 40.
+    # 3 rows/turn (assistant, tool, private evidence) = 60.
     with service._engine.begin() as conn:
         count = conn.execute(text("SELECT COUNT(*) FROM chat_messages WHERE session_id = :sid"), {"sid": sid}).scalar()
-        assert count == 40, f"expected 40 rows, got {count}"
+        assert count == 60, f"expected 60 rows, got {count}"
 
         # sequence_no values must be unique across both writers.
         # Duplicates would manifest as IntegrityError above; the
@@ -259,11 +259,11 @@ def test_concurrent_SAME_session_serialises_via_advisory_lock(service):
             )
         ]
         assert len(seqs) == len(set(seqs)), f"duplicate sequence_no values: {[s for s in seqs if seqs.count(s) > 1]}"
-        # Strict monotonicity: 1..40 with no gaps under successful
+        # Strict monotonicity: 1..60 with no gaps under successful
         # serial allocation. (Gaps are allowed in general — see spec
         # §4.1.1 — but happen only on rollback paths, none of which
         # this test exercises.)
-        assert seqs == list(range(min(seqs), min(seqs) + 40))
+        assert seqs == list(range(min(seqs), min(seqs) + 60))
 
 
 def test_advisory_lock_actually_acquired_on_postgres(service):

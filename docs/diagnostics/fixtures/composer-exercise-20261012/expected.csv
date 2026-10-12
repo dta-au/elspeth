@@ -1,0 +1,7 @@
+case_id,expected_service_type,decisive_rule
+A01,PCS,Supplier direction and responsibility for an independent survey report
+A02,LH,Customer daily supervision and leave approval
+A03,PCS,Supplier-directed help desk with delivery and rework responsibility
+A04,PCS,Current design-report agreement supersedes historical supervised pilot
+A05,Unknown,Missing supervision and concrete deliverable evidence
+A06,LH,Customer task assignment and leave approval override monthly output label

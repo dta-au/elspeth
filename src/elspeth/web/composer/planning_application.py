@@ -27,13 +27,14 @@ from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.application_policy import PluginPolicyContextFactory
 from elspeth.web.composer.audit import (
     BufferingRecorder,
+    PrivatePlannerCandidate,
     interleave_planner_audit_records,
     llm_call_audit_envelope,
     llm_call_audit_summary,
     planner_attempt_audit_envelope,
     planner_attempt_audit_summary,
 )
-from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.audit_storage import private_tool_invocation_draft, redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.composer_preflight import ComposerPreflight
@@ -318,6 +319,7 @@ class PlanningApplication:
         # separate write, so a caller that forgets them must fail loudly rather
         # than silently drop the model's words.
         withheld_replies: tuple[WithheldReply, ...],
+        private_candidates: tuple[PrivatePlannerCandidate, ...],
         session_operation_context: SessionOperationContext | None,
         required_work: RequiredWorkBinding | None = None,
     ) -> None:
@@ -357,6 +359,11 @@ class PlanningApplication:
                     )
                 )
         for invocation in invocations:
+            if session_operation_context is None:
+                raise AuditIntegrityError("planner private evidence requires operation authority")
+            drafts.append(
+                private_tool_invocation_draft(invocation, session_id=str(session_id), session_operation_context=session_operation_context)
+            )
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
             drafts.append(
                 AuditMessageDraft(
@@ -377,6 +384,27 @@ class PlanningApplication:
         # the compose operation the staging turn runs under.
         if session_operation_context is None:
             raise TypeError("pipeline planner audit requires the turn's session_operation_context")
+        from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence
+
+        for candidate in private_candidates:
+            evidence = build_private_tool_evidence(
+                session_id=str(session_id),
+                operation_id=session_operation_context.fence.operation_id,
+                operation_epoch=session_operation_context.fence.operation_epoch,
+                tool_call_id=candidate.tool_call_id,
+                evidence_id=candidate.evidence_id,
+                tool_name=candidate.tool_name,
+                status=candidate.status,
+                arguments_canonical=candidate.arguments_canonical,
+                authority_arguments_canonical=candidate.authority_arguments_canonical,
+                result_canonical=candidate.result_canonical,
+                raw_arguments=candidate.raw_arguments,
+            )
+            drafts.append(
+                AuditMessageDraft(
+                    role="audit", content="Private credential-filtered planner candidate", tool_calls=(evidence.to_envelope(),)
+                )
+            )
         audit_sql = audit_projection = None
         if required_work is not None:
             required_work.validate_context(session_operation_context)
@@ -513,6 +541,7 @@ class PlanningApplication:
         planner_invocations: tuple[ComposerToolInvocation, ...],
         # REQUIRED (no default): see ``_persist_pipeline_planner_audit``.
         planner_withheld_replies: tuple[WithheldReply, ...],
+        planner_private_candidates: tuple[PrivatePlannerCandidate, ...],
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         required_work: RequiredWorkBinding | None = None,
     ) -> ComposerResult:
@@ -543,6 +572,7 @@ class PlanningApplication:
             planner_attempts=planner_attempts,
             invocations=planner_invocations,
             withheld_replies=planner_withheld_replies,
+            private_candidates=planner_private_candidates,
             session_operation_context=session_operation_context,
             required_work=required_work,
         )
@@ -843,6 +873,7 @@ class PlanningApplication:
         planner_attempt_start = len(recorder.planner_attempts)
         planner_invocation_start = len(recorder.invocations)
         planner_withheld_start = len(recorder.withheld_replies)
+        planner_private_start = len(recorder.private_candidates)
         try:
             plan = await plan_pipeline(
                 intent=message,
@@ -913,6 +944,7 @@ class PlanningApplication:
                 planner_attempts=recorder.planner_attempts[planner_attempt_start:],
                 invocations=recorder.invocations[planner_invocation_start:],
                 withheld_replies=recorder.withheld_replies[planner_withheld_start:],
+                private_candidates=recorder.private_candidates[planner_private_start:],
                 session_operation_context=session_operation_context,
                 required_work=required_work,
             )
@@ -940,6 +972,7 @@ class PlanningApplication:
                     planner_attempts=attached_attempts,
                     invocations=recorder.invocations[planner_invocation_start:],
                     withheld_replies=recorder.withheld_replies[planner_withheld_start:],
+                    private_candidates=recorder.private_candidates[planner_private_start:],
                     session_operation_context=session_operation_context,
                     required_work=required_work,
                 ),
@@ -965,6 +998,7 @@ class PlanningApplication:
             planner_attempts=recorder.planner_attempts[planner_attempt_start:],
             planner_invocations=recorder.invocations[planner_invocation_start:],
             planner_withheld_replies=recorder.withheld_replies[planner_withheld_start:],
+            planner_private_candidates=recorder.private_candidates[planner_private_start:],
             plugin_snapshot=plugin_snapshot,
             required_work=required_work,
         )

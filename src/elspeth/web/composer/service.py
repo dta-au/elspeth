@@ -38,7 +38,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.blobs import BlobServiceProtocol
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
-from elspeth.contracts.composer_audit import ComposerToolInvocation
+from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring
 from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
 )
@@ -72,7 +72,7 @@ from elspeth.web.composer.advisor_decision import (
 )
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.application_policy import PluginPolicyContextFactory
-from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.audit import BufferingRecorder, ComposerToolCancellation, ComposerToolFailure
 from elspeth.web.composer.availability import ComposerAvailability as ComposerAvailability  # re-export; genuine home is availability.py
 from elspeth.web.composer.availability import compute_availability
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
@@ -112,6 +112,7 @@ from elspeth.web.composer.protocol import (
     ComposerHistoryMessage,
     ComposerPluginCrashError,
     ComposerResult,
+    ComposerRuntimePreflightError,
     ComposerServiceError,
     ComposerSettings,
 )
@@ -185,7 +186,9 @@ async def _await_tool_turn_with_deferred_cancellation[T](
             # outcome. ``shield`` only protects it from cancellation of this
             # awaiting task; it does not launder child cancellation.
             if task.cancelled():
-                raise
+                # shield raises its own cancellation. The settled child owns
+                # the typed evidence carrier and original cancellation cause.
+                return task.result(), deferred
             cancellation_requested.set()
             if deferred is None:
                 deferred = exc
@@ -199,6 +202,12 @@ async def _await_tool_turn_with_deferred_cancellation[T](
                         "tool_turn_child_failed_during_deferred_cancellation",
                         exc_class=type(child_exc).__name__,
                     )
+                    if type(child_exc) is ComposerToolFailure:
+                        raise ComposerToolCancellation(
+                            deferred,
+                            tool_invocations=child_exc.tool_invocations,
+                            llm_calls=child_exc.llm_calls,
+                        ) from child_exc.original_exception
                     raise deferred from child_exc
         except Exception as child_exc:
             # The child failed AFTER a cancellation was caught and deferred.
@@ -215,6 +224,12 @@ async def _await_tool_turn_with_deferred_cancellation[T](
                 "tool_turn_child_failed_during_deferred_cancellation",
                 exc_class=type(child_exc).__name__,
             )
+            if type(child_exc) is ComposerToolFailure:
+                raise ComposerToolCancellation(
+                    deferred,
+                    tool_invocations=child_exc.tool_invocations,
+                    llm_calls=child_exc.llm_calls,
+                ) from child_exc.original_exception
             raise deferred from child_exc
 
 
@@ -1307,6 +1322,8 @@ class ComposerServiceImpl:
         *,
         tool_outcomes: tuple[_ToolOutcome, ...],
         decoded_args_by_call_id: Mapping[str, Mapping[str, Any]],
+        private_authorings: tuple[PrivateToolAuthoring, ...],
+        private_invocations: tuple[ComposerToolInvocation, ...],
         assistant_message: _AdmittedAssistantMessage,
         raw_assistant_content: str | None,
         assistant_tool_calls: tuple[_AdmittedToolCall, ...],
@@ -1351,6 +1368,8 @@ class ComposerServiceImpl:
             redaction_telemetry=self._redaction_telemetry,
             tool_outcomes=tool_outcomes,
             decoded_args_by_call_id=decoded_args_by_call_id,
+            private_authorings=private_authorings,
+            private_invocations=private_invocations,
             assistant_message=persisted_assistant_message,
             raw_assistant_content=persisted_raw_assistant_content,
             assistant_tool_calls=assistant_tool_calls,
@@ -2361,36 +2380,63 @@ class ComposerServiceImpl:
                 _discovery_turns_used: int = discovery_turns_used,
                 _failed_turn: FailedTurnMetadata | None = failed_turn,
             ) -> tuple[_DispatchOutcome, _PersistOutcome, int, bool, bool]:
-                dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
-                    call_model=_call_model,
-                    session_operation_context=session_operation_context,
-                    state=_state,
-                    last_validation=_last_validation,
-                    last_runtime_preflight=_last_runtime_preflight,
-                    llm_messages=llm_messages,
-                    recorder=recorder,
-                    anti_anchor=anti_anchor,
-                    discovery_cache=discovery_cache,
-                    runtime_preflight_cache=runtime_preflight_cache,
-                    session_id=session_id,
-                    user_id=user_id,
-                    user_message_id=user_message_id,
-                    user_message_content=message,
-                    current_state_id=_current_state_id,
-                    actor=actor,
-                    initial_version=initial_version,
-                    deadline=deadline,
-                    progress=progress,
-                    session_scope=session_scope,
-                    advisor_calls_used=_advisor_calls_used,
-                    cancellation_requested=_cancellation_requested,
-                    plugin_snapshot=plugin_snapshot,
-                    policy_catalog=policy_catalog,
-                    composition_turns_used=_composition_turns_used,
-                    discovery_turns_used=_discovery_turns_used,
-                    failed_turn=_failed_turn,
-                    provider_owner=provider_owner,
-                )
+                invocation_start = len(recorder.invocations)
+                try:
+                    dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
+                        call_model=_call_model,
+                        session_operation_context=session_operation_context,
+                        state=_state,
+                        last_validation=_last_validation,
+                        last_runtime_preflight=_last_runtime_preflight,
+                        llm_messages=llm_messages,
+                        recorder=recorder,
+                        anti_anchor=anti_anchor,
+                        discovery_cache=discovery_cache,
+                        runtime_preflight_cache=runtime_preflight_cache,
+                        session_id=session_id,
+                        user_id=user_id,
+                        user_message_id=user_message_id,
+                        user_message_content=message,
+                        current_state_id=_current_state_id,
+                        actor=actor,
+                        initial_version=initial_version,
+                        deadline=deadline,
+                        progress=progress,
+                        session_scope=session_scope,
+                        advisor_calls_used=_advisor_calls_used,
+                        cancellation_requested=_cancellation_requested,
+                        plugin_snapshot=plugin_snapshot,
+                        policy_catalog=policy_catalog,
+                        composition_turns_used=_composition_turns_used,
+                        discovery_turns_used=_discovery_turns_used,
+                        failed_turn=_failed_turn,
+                        provider_owner=provider_owner,
+                    )
+                except ComposerRuntimePreflightError as preflight_failure:
+                    raise ComposerRuntimePreflightError(
+                        original_exc=preflight_failure.original_exc,
+                        partial_state=preflight_failure.partial_state,
+                        tool_invocations=recorder.invocations[invocation_start:],
+                        llm_calls=preflight_failure.llm_calls,
+                        failed_turn=preflight_failure.failed_turn,
+                    ) from preflight_failure.original_exc
+                except (AssertionError, MemoryError, RecursionError, SystemError, AuditIntegrityError) as fatal_failure:
+                    current_invocations = recorder.invocations[invocation_start:]
+                    if not current_invocations:
+                        raise
+                    raise ComposerToolFailure(
+                        fatal_failure,
+                        tool_invocations=current_invocations,
+                        llm_calls=recorder.llm_calls,
+                    ) from fatal_failure
+                except asyncio.CancelledError as cancellation:
+                    # P4 has not started. Earlier loop turns are already durable
+                    # and must never be rebound by this batch's fallback drain.
+                    raise ComposerToolCancellation(
+                        cancellation,
+                        tool_invocations=recorder.invocations[invocation_start:],
+                        llm_calls=recorder.llm_calls,
+                    ) from cancellation
                 if diagnostics is not None:
                     diagnostics.tool_outcomes = dispatch_result.tool_outcomes
                     diagnostics.pre_state_id = dispatch_result.pre_state_id
@@ -2432,6 +2478,8 @@ class ComposerServiceImpl:
                     persist_result = await self._persist_turn_audit(
                         tool_outcomes=dispatch_result.tool_outcomes,
                         decoded_args_by_call_id=dispatch_result.decoded_args_by_call_id,
+                        private_authorings=dispatch_result.private_authorings,
+                        private_invocations=dispatch_result.private_invocations,
                         assistant_message=dispatch_result.assistant_message,
                         raw_assistant_content=dispatch_result.raw_assistant_content,
                         assistant_tool_calls=dispatch_result.assistant_tool_calls,

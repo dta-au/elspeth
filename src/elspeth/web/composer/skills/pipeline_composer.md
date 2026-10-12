@@ -988,7 +988,11 @@ id "rate_cool"):
 ```
 
 You author ONLY `kind`, `user_term`, `draft`, and optional `display_title`. The backend projects a node
-requirement ID as `<normalized user_term>:<node id>`; use that projected value
+requirement ID as `user_term.strip() + ":" + node_id`. Only leading and trailing
+whitespace is removed: internal spaces, case, punctuation and underscores remain
+unchanged. For example, `user_term=" service type "` on node `classify_pcs_lh`
+produces `service type:classify_pcs_lh`, not `service_type:classify_pcs_lh`.
+Use that exact projected value
 in `prompt_template_parts` when an `interpretation_ref` must reference the row,
 as the example does, but never add `id` to the requirement shell. Never author
 `status` or the server-bookkeeping fields (`event_id`, `accepted_value`,

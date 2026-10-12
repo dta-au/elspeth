@@ -364,7 +364,7 @@ class _FakePreferences:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fail_at", [None, 0, 1, 2], ids=["control", "index0", "index1", "index2"])
+@pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
 async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
@@ -392,6 +392,7 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
                 preferences=_FakePreferences(trust_mode="explicit_approve"),
                 recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
                 planner_llm_calls=(),
+                planner_private_candidates=(),
                 planner_attempts=(),
                 planner_invocations=_PLANNER_COHORT,
                 planner_withheld_replies=(),
@@ -405,7 +406,7 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
             rows = _chat_rows(sessions_service, result_session_id)
             assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
             assert _proposal_count(sessions_service, result_session_id) == 1
-            assert injector.calls == len(_PLANNER_COHORT)
+            assert injector.calls == 2 * len(_PLANNER_COHORT)
             return
 
         with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
@@ -442,7 +443,7 @@ async def _plan_and_stage_empty(service: ComposerServiceImpl, session_id: str, r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fail_at", [None, 0, 1, 2], ids=["control", "index0", "index1", "index2"])
+@pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
 async def test_planner_decline_path_cohort_is_all_or_nothing_at_every_write_index(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
@@ -470,7 +471,7 @@ async def test_planner_decline_path_cohort_is_all_or_nothing_at_every_write_inde
         assert result.message == "I cannot build that from the available components."
         rows = _chat_rows(sessions_service, result_session_id)
         assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
-        assert injector.calls == len(_PLANNER_COHORT)
+        assert injector.calls == 2 * len(_PLANNER_COHORT)
         return
 
     with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
@@ -610,6 +611,7 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
                 preferences=_FakePreferences(trust_mode="explicit_approve"),
                 recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
                 planner_llm_calls=(),
+                planner_private_candidates=(),
                 planner_attempts=(),
                 planner_invocations=_PLANNER_COHORT,
                 planner_withheld_replies=(),

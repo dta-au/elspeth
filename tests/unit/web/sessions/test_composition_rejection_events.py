@@ -29,12 +29,13 @@ from elspeth.web.sessions._persist_payload import (
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_persist_compose_turn import _make_session, _test_compose_context
 
 
 @pytest.fixture
 def service(engine, tmp_path) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

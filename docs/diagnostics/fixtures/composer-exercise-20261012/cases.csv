@@ -1,0 +1,7 @@
+case_id,case_study,category
+A01,"Council commissions an independent electrical survey. The supplier sets its own roster and accepts responsibility for the report.",Professional services
+A02,"A temporary analyst works inside the council team. Council sets daily priorities, approves leave and supervises the worker.",Staff augmentation
+A03,"A managed help desk supplies a contracted resolution outcome. Its vendor directs the team, replaces staff and bears rework cost.",ICT support
+A04,"A 2023 pilot supplied supervised workers, but the current agreement instead buys a vendor-directed engineering design report.",Professional services
+A05,"The description only says specialist support and gives no information about supervision or deliverables.",Consulting
+A06,"A vendor promises a monthly output target, but council assigns each worker's tasks and approves their leave.",Managed service

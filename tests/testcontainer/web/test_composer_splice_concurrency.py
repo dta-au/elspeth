@@ -16,6 +16,7 @@ from sqlalchemy import Engine
 from tests.helpers.composer_operations import SettledComposerOperation, message_body, running_operation_async, submit_and_settle
 from tests.helpers.postgres_target import postgres_test_target
 from tests.integration.web.conftest import _ensure_released_session_operation_fence, _make_session
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_routes import _make_app
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -287,7 +288,7 @@ def postgres_engine() -> Iterator[Engine]:
 
 @pytest.fixture
 def postgres_service(postgres_engine: Engine, tmp_path: Path) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return FencedSessionServiceHarness(
         postgres_engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

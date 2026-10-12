@@ -7,6 +7,7 @@ Receipt helpers retain a matching context across claim and settlement.
 from __future__ import annotations
 
 import contextlib
+import json
 import weakref
 from typing import Any, cast
 from uuid import UUID
@@ -16,8 +17,44 @@ from elspeth.web.sessions.protocol import OperationReceiptClaimed, OperationRece
 from elspeth.web.sessions.service import SessionServiceImpl
 
 
+def private_evidence_for_test_turn(kwargs: dict[str, Any]) -> tuple:
+    """Give legacy direct-writer fixtures explicit synthetic private evidence.
+
+    These fixtures only possess their already-redacted transcript. Production
+    callers must capture the actual authored values before that projection.
+    """
+    from elspeth.core.canonical import canonical_json
+    from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence
+
+    context = kwargs["session_operation_context"]
+    names = {call["id"]: call["function"]["name"] for call in kwargs["redacted_assistant_tool_calls"]}
+    return tuple(
+        build_private_tool_evidence(
+            session_id=kwargs["session_id"],
+            operation_id=context.fence.operation_id,
+            operation_epoch=context.fence.operation_epoch,
+            tool_call_id=row.tool_call_id,
+            tool_name=names.get(row.tool_call_id, "test_tool"),
+            status="success",
+            arguments_canonical=canonical_json({}),
+            result_canonical=canonical_json(json.loads(row.content)),
+        )
+        for row in kwargs["redacted_tool_rows"]
+    )
+
+
 class FencedSessionServiceHarness(SessionServiceImpl):
     _contexts_by_engine: weakref.WeakKeyDictionary[Any, dict[UUID, SessionOperationContext]] = weakref.WeakKeyDictionary()
+
+    def persist_compose_turn(self, **kwargs):
+        if "private_tool_evidence" not in kwargs:
+            kwargs["private_tool_evidence"] = private_evidence_for_test_turn(kwargs)
+        return super().persist_compose_turn(**kwargs)
+
+    async def persist_compose_turn_async(self, **kwargs):
+        if "private_tool_evidence" not in kwargs:
+            kwargs["private_tool_evidence"] = private_evidence_for_test_turn(kwargs)
+        return await super().persist_compose_turn_async(**kwargs)
 
     async def _receipt_context(self, session_id: UUID, kind: OperationReceiptKind) -> SessionOperationContext:
         if kind == "session_fork":

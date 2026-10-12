@@ -368,9 +368,8 @@ def test_get_messages_orders_assistant_before_tool_rows_within_one_turn(service)
 
     msgs = asyncio.run(service.get_messages(sid_uuid))
     roles = [m.role for m in msgs]
-    # Exactly four rows from this turn: 1 assistant + 3 tool. No fork
-    # rows, no system messages — _make_session left the chat empty.
-    assert roles == ["assistant", "tool", "tool", "tool"], (
+    # Each tool is immediately followed by its private audit sibling.
+    assert roles == ["assistant", "tool", "audit", "tool", "audit", "tool", "audit"], (
         f"intra-turn ordering broken: expected assistant before all tool rows, "
         f"got {roles!r} — see plan §14.7 (B2 fix). The pre-B2 ORDER BY created_at "
         f"would produce a nondeterministic permutation of these four roles."

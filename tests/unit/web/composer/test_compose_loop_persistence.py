@@ -26,8 +26,10 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer import turn_audit as turn_audit_module
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.audit import ComposerToolFailure
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
+from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, is_diagnostic_evidence_envelope
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError
 from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_tool_call_response
@@ -210,6 +212,138 @@ def _assert_provider_tool_batch_rejection(caught: BaseException | None, expected
     assert str(caught) == f"LLM tool batch failed admission: {expected_message}"
     assert type(caught.__cause__) is AuditIntegrityError
     assert str(caught.__cause__) == expected_message
+
+
+def _private_evidence_for_call(service: ComposerServiceImpl, session_id: str, call_id: str) -> ComposerDiagnosticEvidence:
+    sessions_service = service._sessions_service
+    assert sessions_service is not None
+    with cast(Any, sessions_service)._engine.connect() as conn:
+        envelopes = (
+            conn.execute(
+                select(chat_messages_table.c.tool_calls)
+                .where(chat_messages_table.c.session_id == session_id)
+                .where(chat_messages_table.c.role == "audit")
+            )
+            .scalars()
+            .all()
+        )
+    evidence = [
+        ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=session_id)
+        for row in envelopes
+        if row is not None
+        for envelope in row
+        if is_diagnostic_evidence_envelope(envelope) and envelope["tool_call_id"] == call_id
+    ]
+    assert len(evidence) == 1
+    return evidence[0]
+
+
+@pytest.mark.asyncio
+async def test_private_evidence_keeps_original_inline_blob_content_before_audit_projection(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    fake_llm_one_set_pipeline_tool_call: Any,
+    result_session_id: str,
+) -> None:
+    original = await fake_llm_one_set_pipeline_tool_call(None, None)
+    arguments = json.loads(original.tool_batch.calls[0].function.arguments)
+    pipeline = arguments["pipeline"]
+    content = "value\noriginal authored row\nsecond authored row\n"
+    pipeline["source"]["options"].pop("path")
+    pipeline["source"]["inline_blob"] = {"filename": "authored.csv", "mime_type": "text/csv", "content": content}
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(("private-inline", "set_pipeline", arguments)),
+    )
+    assert caught is None
+    evidence = _private_evidence_for_call(composer_service_with_real_sessions, result_session_id, "private-inline")
+    assert evidence.arguments.content == canonical_json(pipeline)
+    assert evidence.authority_arguments is not None
+    assert evidence.authority_arguments.content == composer_authority_canonical_json(pipeline)
+    assert json.loads(evidence.arguments.content)["source"]["inline_blob"]["content"] == content
+    assert evidence.wire_arguments.content == json.dumps(arguments)
+    assert evidence.result.content is not None
+    # This harness owns the SQL session but supplies no blob tool context.
+    # Even that real candidate rejection must retain the received inline data.
+    result = json.loads(evidence.result.content)
+    assert result["success"] is False
+    assert "inline_blob requires session context" in result["validation"]["errors"][0]["message"]
+    sessions_service = composer_service_with_real_sessions._sessions_service
+    assert sessions_service is not None
+    with cast(Any, sessions_service)._engine.connect() as conn:
+        display_calls = conn.execute(
+            select(chat_messages_table.c.tool_calls)
+            .where(chat_messages_table.c.session_id == result_session_id)
+            .where(chat_messages_table.c.role == "assistant")
+            .where(chat_messages_table.c.tool_calls.is_not(None))
+        ).scalar_one()
+    display_arguments = json.loads(display_calls[0]["function"]["arguments"])
+    assert display_arguments["source"]["inline_blob"] == "[redacted inline content held for custody]"
+
+
+@pytest.mark.asyncio
+async def test_private_evidence_keeps_received_ids_when_real_finalizer_rebinds_candidate(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    fake_llm_one_set_pipeline_tool_call: Any,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = await fake_llm_one_set_pipeline_tool_call(None, None)
+    arguments = json.loads(original.tool_batch.calls[0].function.arguments)
+    pipeline = arguments["pipeline"]
+    finalized_ids: list[str] = []
+    real_wire_controls = tool_batch_module.wire_required_controls
+
+    def rename_required_candidate(*args: Any, **kwargs: Any) -> Any:
+        finalized = deep_thaw(real_wire_controls(*args, **kwargs))
+        finalized["nodes"][0]["id"] = "finalized_t1"
+        finalized["edges"][0]["to_node"] = "finalized_t1"
+        finalized_ids.append(finalized["nodes"][0]["id"])
+        return finalized
+
+    monkeypatch.setattr(tool_batch_module, "wire_required_controls", rename_required_candidate)
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(("private-rebound", "set_pipeline", arguments)),
+    )
+    assert caught is None
+    assert finalized_ids == ["finalized_t1"]
+    sessions_service = composer_service_with_real_sessions._sessions_service
+    assert sessions_service is not None
+    current = await sessions_service.get_current_state(UUID(result_session_id))
+    assert current is not None
+    assert current.nodes is not None
+    assert current.nodes[0]["id"] == "finalized_t1"
+    evidence = _private_evidence_for_call(composer_service_with_real_sessions, result_session_id, "private-rebound")
+    assert evidence.arguments.content == canonical_json(pipeline)
+    assert evidence.authority_arguments is not None
+    assert evidence.authority_arguments.content == composer_authority_canonical_json(pipeline)
+    assert json.loads(evidence.arguments.content)["nodes"][0]["id"] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_private_evidence_keeps_valid_json_rejected_wire_envelope_and_actual_error(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+) -> None:
+    arguments = {"pipeline": "received ordinary authored value", "unexpected": "preserve for diagnosis"}
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(("private-envelope", "set_pipeline", arguments)),
+    )
+    assert caught is None
+    evidence = _private_evidence_for_call(composer_service_with_real_sessions, result_session_id, "private-envelope")
+    assert evidence.status == "arg_error"
+    assert evidence.arguments.content == canonical_json(arguments)
+    assert evidence.result.disposition == "retained"
+    assert evidence.result.content is not None
+    result = json.loads(evidence.result.content)
+    assert type(result["error"]) is str
+    assert "set_pipeline" in result["error"]
+    assert "pipeline" in result["error"]
+    assert "<redacted" not in result["error"]
 
 
 def _assert_no_blob_side_effects(
@@ -634,6 +768,7 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
                 planner_attempts=(),
                 invocations=(invocation,),
                 withheld_replies=(),
+                private_candidates=(),
                 session_operation_context=compose_context,
             )
 
@@ -660,6 +795,7 @@ async def test_planner_audit_cohort_carries_the_prose_the_planner_refused_to_pub
             planner_attempts=(),
             invocations=(),
             withheld_replies=(WithheldReply(origin="planner_prose_unadmitted", content=prose),),
+            private_candidates=(),
             session_operation_context=compose_context,
         )
 
@@ -1682,15 +1818,21 @@ async def test_step1_assertion_error_reraises_before_persist(
     fake_llm_assertion_error_on_second: Any,
     result_session_id: str,
 ) -> None:
-    """AssertionError is re-raised before any compose-turn DB write runs."""
+    """Fatal dispatch carries its undurable receipts before the route drain."""
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(ComposerToolFailure) as caught:
         await _run_one_turn(
             composer_service_with_real_sessions,
             llm=fake_llm_assertion_error_on_second,
             session_id=result_session_id,
         )
 
+    assert type(caught.value) is ComposerToolFailure
+    assert type(caught.value.original_exception) is AssertionError
+    assert caught.value.__cause__ is caught.value.original_exception
+    assert [item.tool_call_id for item in caught.value.tool_invocations] == ["call_ok", "call_assert"]
+    assert [item.status for item in caught.value.tool_invocations] == [ComposerToolStatus.SUCCESS, ComposerToolStatus.PLUGIN_CRASH]
+    assert all(item.private_authoring is not None for item in caught.value.tool_invocations)
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         rows = conn.execute(
@@ -1698,6 +1840,7 @@ async def test_step1_assertion_error_reraises_before_persist(
             {"session_id": result_session_id},
         ).fetchall()
     assert rows == []
+    assert await sessions_service.get_current_state(UUID(result_session_id)) is None
 
 
 @pytest.mark.asyncio

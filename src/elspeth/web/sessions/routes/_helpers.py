@@ -66,7 +66,7 @@ from elspeth.web.composer.audit import (
     llm_call_audit_envelope,
     llm_call_audit_summary,
 )
-from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.audit_storage import private_tool_invocation_draft, redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.control_messages import replay_composer_control_message
 from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
@@ -589,6 +589,10 @@ def _message_response(
     row whose call id has a rejection row carries it as ``rejection``. Every
     other caller omits it and the field stays ``None``.
     """
+    from elspeth.web.composer.diagnostic_evidence import is_diagnostic_evidence_envelope
+
+    if msg.tool_calls is not None and any(is_diagnostic_evidence_envelope(envelope) for envelope in msg.tool_calls):
+        raise AuditIntegrityError("Private Composer evidence cannot be projected into a public message")
     tool_calls = deep_thaw(msg.tool_calls) if msg.tool_calls is not None else None
     if tool_calls is not None and tool_outcomes:
         stamped: list[Any] = []
@@ -1831,8 +1835,14 @@ def _composer_chat_history(messages: Sequence[ChatMessageRecord]) -> list[Compos
     request that produced them creates orphan OpenAI tool messages. Keep them
     in storage, but exclude them from prompt history and normal chat responses.
     """
+    from elspeth.web.composer.diagnostic_evidence import is_diagnostic_evidence_envelope
+
     history: list[ComposerHistoryMessage] = []
     for message in messages:
+        if message.tool_calls is not None and any(is_diagnostic_evidence_envelope(envelope) for envelope in message.tool_calls):
+            if message.role != "audit" or len(message.tool_calls) != 1 or message.writer_principal != "compose_loop":
+                raise AuditIntegrityError("Private Composer evidence requires a dedicated Composer audit row")
+            continue
         control = replay_composer_control_message(
             stored_role=message.role,
             writer_principal=message.writer_principal,
@@ -2022,6 +2032,9 @@ async def _persist_tool_invocations(
         for invocation in tool_invocations:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
             drafts.append(
+                private_tool_invocation_draft(invocation, session_id=str(session_id), session_operation_context=session_operation_context)
+            )
+            drafts.append(
                 AuditMessageDraft(
                     role=role,
                     content=content,
@@ -2078,7 +2091,7 @@ async def _persist_tool_invocations(
             # per-row loop this replaced must keep reading evidence
             # loss at the same magnitude.
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                len(tool_invocations),
+                2 * len(tool_invocations),
                 {"helper": "tool_invocations"},
             )
             slog.error(
@@ -2307,6 +2320,14 @@ async def _persist_turn_audit_cohort(
         for invocation in tool_invocations:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
             drafts.append(
+                private_tool_invocation_draft(
+                    invocation,
+                    session_id=str(session_id),
+                    session_operation_context=session_operation_context,
+                    composition_state_id=tool_csid,
+                )
+            )
+            drafts.append(
                 AuditMessageDraft(
                     role=role,
                     content=content,
@@ -2363,7 +2384,7 @@ async def _persist_turn_audit_cohort(
             # the whole turn — tool rows AND LLM sidecars — failed to
             # become durable together.
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                len(tool_invocations) + len(llm_calls),
+                2 * len(tool_invocations) + len(llm_calls),
                 {"helper": "turn_audit_cohort"},
             )
             slog.error(

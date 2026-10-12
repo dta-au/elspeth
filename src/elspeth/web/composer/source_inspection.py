@@ -545,8 +545,11 @@ def _inspect_csv(
             raise ValueError("CSV source encoding is unknown") from exc
         bom_encoding = None
     decode_replacements = _count_replacement_chars(text)
-    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
+    stream = io.StringIO(text, newline="")
+    reader = csv.reader(stream, delimiter=delimiter)
     rows: list[list[str]] = []
+    uncertain_tail: list[str] | None = None
+    record_start = 0
     runtime_headers: tuple[str, ...] | None = None
     field_name_mapping: Mapping[str, str] | None = None
     try:
@@ -554,6 +557,19 @@ def _inspect_csv(
             if i >= _MAX_ROWS:
                 break
             rows.append(row)
+            record_end = stream.tell()
+            if sample_truncated and record_end == len(text):
+                record_text = text[record_start:record_end]
+                # A physical newline can still belong to an open quoted
+                # field. Continue only the bounded final record through the
+                # same relaxed dialect: a real record boundary leaves the
+                # first parsed record unchanged, including a split CRLF.
+                if (
+                    not record_text.endswith(("\r", "\n"))
+                    or next(csv.reader(io.StringIO(record_text + "\n", newline=""), delimiter=delimiter)) != row
+                ):
+                    uncertain_tail = row
+            record_start = record_end
     except csv.Error as exc:
         return SourceInspectionFacts(
             source_kind="csv",
@@ -615,6 +631,12 @@ def _inspect_csv(
         headers = columns
         data_rows = rows
     warnings: list[str] = []
+    if data_rows and data_rows[-1] is uncertain_tail:
+        data_rows = data_rows[:-1]
+        warnings.append(
+            "csv_sample_record_truncated: the inspected prefix ends at an uncertain data-record boundary; "
+            "the final record is excluded from row counts, type hints, URL hints and shape checks"
+        )
 
     if delimiter != ",":
         # Surface the delimiter so the audit trail (and the composer LLM
