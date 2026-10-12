@@ -49,6 +49,7 @@ _PIPELINE_USER_ROUTES: dict[str, frozenset[str]] = {
             "get_composer_preferences",
             "update_composer_preferences",
             "get_current_state",
+            "get_composition_head",
             "get_state_versions",
             "revert_state",
             "import_state_yaml",
@@ -329,10 +330,18 @@ async def test_pipeline_user_expiry_is_checked_after_role_retrieval(engine, tmp_
     assert role_reads == 2
 
 
-@pytest.mark.parametrize("function_name", ["get_composer_operation", "cancel_composer_operation", "stream_operation"])
-def test_operation_route_live_user_inventory_rejects_dependency_removal(function_name: str) -> None:
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    [
+        ("operations", "get_composer_operation"),
+        ("operations", "cancel_composer_operation"),
+        ("operations", "stream_operation"),
+        ("state", "get_composition_head"),
+    ],
+)
+def test_workload_route_live_user_inventory_rejects_dependency_removal(module_name: str, function_name: str) -> None:
     root = Path(__file__).resolve().parents[4]
-    path = "src/elspeth/web/sessions/routes/composer/operations.py"
+    path = f"src/elspeth/web/sessions/routes/composer/{module_name}.py"
     functions = _decorated_route_functions(ast.parse((root / path).read_text()))
     function = functions[function_name]
     assert "Depends(require_pipeline_user)" in _user_dependency(function)

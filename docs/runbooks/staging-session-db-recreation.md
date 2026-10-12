@@ -1,8 +1,62 @@
-# Session DB Reset Runbook
+# Session Store Compatibility and Historical Reset Runbook
 
-Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and legacy issue tracker data are still out of scope for this runbook.
+For this candidate, startup admission preserves existing stores: do not
+delete, recreate, restamp, or silently repair them. Unsupported stores are
+refused before incompatible writes. This guidance provides no in-place
+migration and sets no expiry for the preservation policy.
 
-## Current Cutover: 0.8.3 candidate (session epoch 72, Landscape epoch 49)
+The current guidance below supersedes every legacy reset procedure later in
+this document. Those procedures are historical reference only and do not
+apply to the current candidate. They do not authorize a deployment or a reset.
+
+## Current Cutover: 0.8.3 candidate for next 0.8.4 (session epoch 74, Landscape epoch 49)
+
+The current candidate uses session epoch 74 for graph recovery and Landscape
+epoch 49. The ambiguous session epoch 73 is retired; the held authentication
+schema and prospective epoch-75 union are excluded. Existing compatible stores
+may reopen after exact schema admission. Unsupported stores remain unchanged;
+a matching epoch number alone does not establish compatible table, column,
+constraint, or index shape. Startup and schema doctor must refuse incompatible
+stores before writer configuration or schema repair.
+
+Keep existing/user stores and their SQLite sidecars in place. Configure an
+explicitly new database target when a fresh store is needed, keeping the
+existing session, Landscape, authentication, blob, and payload data intact.
+Creation is allowed only for an object-free, unstamped target. PostgreSQL
+requires an empty, supported target namespace. This is not an upgrade of the
+preserved store, and it does not make predecessor rows readable by this code.
+
+### Current Procedure
+
+1. Identify the configured session and Landscape targets without printing
+   credentials. Preserve existing stores and their sidecars; do not run any
+   historical reset procedure below.
+2. If either target is unsupported, stop admission and leave it unchanged.
+   Keep the compatible prior application available for existing users, or
+   configure a separately allocated new target for the candidate. Do not
+   restamp, repair missing schema objects, or run migrations on the old store.
+3. After separately authorized initialization of new targets or successful
+   admission of existing compatible stores, verify their schema identities.
+   For existing SQLite files, use read-only probes so an incorrect path cannot
+   create a database:
+
+```bash
+sqlite3 -readonly "$DB_PATH" 'PRAGMA user_version;'         # expect 74 (== SESSION_SCHEMA_EPOCH)
+sqlite3 -readonly "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 49 (== SQLITE_SCHEMA_EPOCH)
+```
+
+These epoch probes supplement exact shape admission; they do not replace it.
+Record the session-epoch-74/Landscape-epoch-49 result for the candidate. On a
+mismatch, preserve both stores and refuse candidate startup against them.
+After separately authorized startup, a fresh test session can complete the
+freeform Build step, run the pipeline, and inspect its recorded audit story.
+Do not reset an existing user's tutorial or data to perform this verification.
+
+All remaining cutovers and procedures below are historical reference. Their
+reset, deletion, and recreation instructions are not applicable to this
+candidate or to existing/user stores under the current preservation policy.
+
+## Prior Cutover: 0.8.3 candidate (session epoch 72, Landscape epoch 49)
 
 The 0.8.3 candidate advances the session store from epoch 71 to 72 for
 durable Composer operation jobs and operation-ID ingress bindings. Landscape
@@ -655,6 +709,10 @@ sudo systemctl restart elspeth-web.service
 After restart, verify by composing a new session and confirming the new guidance is reflected in the assistant's behaviour (for Phase 5b.8: the LLM offers `request_interpretation_review` when the composition includes a non-trivial interpretive choice; for Phase 5a.8: simple chat-typed source data prefers `inline_blob` over CSV upload).
 
 ## Staging Reset For `elspeth.example.gov.au`
+
+**Historical procedure only; not applicable to the current candidate.**
+Follow the Current Procedure above to preserve existing/user stores. The
+commands below describe an earlier, explicitly destructive staging reset.
 
 The staging site is a source-checkout systemd/Caddy deployment from `/srv/elspeth`, not the generic VM/Docker flow. When a pre-release plan changes the session DB schema (e.g. composer-progress-persistence Phase 1A and later schema-changing phases), the schema validator at startup will refuse a stale DB; the only accepted cutover path is archive + delete + recreate. Row-level `DELETE FROM chat_messages` / `DELETE FROM composition_states` is incorrect: it leaves the old table shape behind and startup rejects the stale DB.
 
