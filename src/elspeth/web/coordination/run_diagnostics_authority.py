@@ -23,6 +23,7 @@ from elspeth.web.sessions.protocol import (
     RunDiagnosticsAuditDraft,
     RunDiagnosticsAuthorityLostError,
 )
+from elspeth.web.sessions.transcript_reads import non_private_message_predicate, validate_transcript_private_custody
 
 
 @final
@@ -123,7 +124,12 @@ class RepositoryRunDiagnosticsAuditAuthority:
                 if row.tool_calls and not envelopes:
                     call_ids = {entry.call_id for entry in llm_call_usage_entries(row.tool_calls)}
                     recorded_ids: set[str | None] = set()
-                    for prior in conn.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == sid)):
+                    validate_transcript_private_custody(conn, sid)
+                    for prior in conn.execute(
+                        select(chat_messages_table).where(
+                            chat_messages_table.c.session_id == sid, non_private_message_predicate(conn.dialect.name)
+                        )
+                    ):
                         prior_ids = {entry.call_id for entry in llm_call_usage_entries(prior.tool_calls or ())}
                         if not call_ids.intersection(prior_ids):
                             continue

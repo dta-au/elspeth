@@ -15,6 +15,7 @@ from typing import cast
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web._acceptance_common.schema_facts import _require_supported_deployment_scenario
 
 from .contracts import _SHA256_PATTERN, AcceptanceCheckError, _control_timestamp, _sha256, _utc_timestamp
 from .manifest_schema import (
@@ -36,6 +37,8 @@ def _require_current_approval(
     approval_sha256: str,
     current: datetime,
 ) -> Mapping[str, object]:
+    if kind == "terraform-plan" and scenario_id in {"A", "B"}:
+        _require_supported_deployment_scenario(scenario_id)
     approval_records = cast(list[Mapping[str, object]], approvals)
     matches = [
         approval
@@ -249,6 +252,8 @@ def approval_require_current(
 ) -> None:
     """Reopen a stored approval and require it to be current at point of use."""
 
+    if kind == "terraform-plan" and scenario_id in {"A", "B"}:
+        _require_supported_deployment_scenario(scenario_id)
     if (
         scenario_id not in _INFRASTRUCTURE_APPROVAL_SCOPES
         or kind not in {"terraform-plan", "terraform-destroy-plan"}

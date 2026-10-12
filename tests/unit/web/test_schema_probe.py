@@ -12,6 +12,7 @@ from sqlalchemy.exc import OperationalError
 from structlog.testing import capture_logs
 
 from elspeth.core.landscape.database import SchemaCompatibilityError
+from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web import schema_probe as schema_probe_module
 from elspeth.web.schema_probe import (
     AWS_ECS_POOL_KWARGS,
@@ -282,14 +283,41 @@ def test_session_foreign_partial_and_current_states() -> None:
     current.dispose()
 
 
-def test_landscape_additive_gap_is_partial_and_initializer_repairs_it() -> None:
+@pytest.mark.parametrize("object_name", ["auth_events", "run_attributions", "ix_tokens_run_id"])
+def test_landscape_additive_gap_is_partial_and_initializer_preserves_it(object_name: str) -> None:
     engine = create_engine("sqlite:///:memory:")
     init_landscape_schema(engine)
     with engine.begin() as conn:
-        conn.exec_driver_sql("DROP INDEX ix_tokens_run_id")
+        kind = "INDEX" if object_name.startswith("ix_") else "TABLE"
+        conn.exec_driver_sql(f"DROP {kind} {object_name}")
+    with engine.connect() as conn:
+        before = conn.exec_driver_sql("SELECT type, name, sql FROM sqlite_master ORDER BY name").all()
     assert probe_landscape_schema(engine) is SchemaState.PARTIAL
-    init_landscape_schema(engine)
-    assert probe_landscape_schema(engine) is SchemaState.CURRENT
+    with pytest.raises(SchemaCompatibilityError, match="Preserve this store unchanged"):
+        init_landscape_schema(engine)
+    assert probe_landscape_schema(engine) is SchemaState.PARTIAL
+    with engine.connect() as conn:
+        assert conn.exec_driver_sql("SELECT type, name, sql FROM sqlite_master ORDER BY name").all() == before
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "CREATE VIEW retained_view AS SELECT 1 AS value",
+        "PRAGMA application_id = 12345",
+        f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}",
+    ],
+)
+def test_landscape_tableless_objects_and_stamps_are_preserved(statement: str) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.exec_driver_sql(statement)
+    assert probe_landscape_schema(engine) is SchemaState.STALE
+    with pytest.raises(SchemaCompatibilityError, match="Preserve this store unchanged"):
+        init_landscape_schema(engine)
+    assert inspect(engine).get_table_names() == []
+    engine.dispose()
 
 
 def test_populated_landscape_missing_epoch_23_policy_table_is_stale_and_not_repaired() -> None:

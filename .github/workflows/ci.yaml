@@ -501,7 +501,7 @@ jobs:
         run: |
           BICEP_VERSION=0.46.1
           BICEP_SHA256=3e011d629ea4311b7a7dd8f0040ab2b1a072ea4ff5d02cb75e0e55a9a6703fb9
-          curl -fsSLo /tmp/bicep \
+          curl --retry 4 --retry-delay 2 --retry-max-time 120 --connect-timeout 15 --max-time 60 -fsSLo /tmp/bicep \
             "https://github.com/Azure/bicep/releases/download/v${BICEP_VERSION}/bicep-linux-x64"
           printf '%s  /tmp/bicep\n' "$BICEP_SHA256" | sha256sum -c -
           install -m 0755 /tmp/bicep /usr/local/bin/bicep
@@ -1017,7 +1017,7 @@ jobs:
           BICEP_SHA256=3e011d629ea4311b7a7dd8f0040ab2b1a072ea4ff5d02cb75e0e55a9a6703fb9
           bicep_dir="$RUNNER_TEMP/bicep-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_CHECKOUT_PATH"
           mkdir -p "$bicep_dir"
-          curl -fsSLo "$bicep_dir/bicep" \
+          curl --retry 4 --retry-delay 2 --retry-max-time 120 --connect-timeout 15 --max-time 60 -fsSLo "$bicep_dir/bicep" \
             "https://github.com/Azure/bicep/releases/download/v${BICEP_VERSION}/bicep-linux-x64"
           printf '%s  %s\n' "$BICEP_SHA256" "$bicep_dir/bicep" | sha256sum -c -
           chmod 0755 "$bicep_dir/bicep"

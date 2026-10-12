@@ -131,8 +131,9 @@ def test_freeform_trial_inventory_requires_distinct_sessions_and_valid_message_b
 
 def test_current_schema_facts_use_mode_neutral_release_labels() -> None:
     facts = _expected_schema_facts("B")
-    assert str(facts["structural_changes"]).endswith("_blob_cleanup_row_union_barrier_and_coordination_schema")
-    assert facts["semantics_only_changes"] == "coalesce_timeout_seconds_and_node_options_summary_required"
+    assert str(facts["structural_changes"]).endswith("_preserve_existing_stores")
+    assert facts["semantics_only_changes"] == "not_applicable"
+    assert facts["in_place_upgrade_supported"] is False
 
 
 def test_default_twenty_trial_path_executes_each_prepared_session_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -295,7 +296,7 @@ def test_compatibility_record_validate_binds_the_record_and_the_gate_delegates_t
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     record = {
-        "schema": "elspeth.azure-container-apps-compatibility-receipt.v1",
+        "schema": "elspeth.azure-container-apps-compatibility-receipt.v2",
         "record_id": "change-1",
         "acceptance_run_id": "run-1",
         "scenario_id": "A",
@@ -310,7 +311,7 @@ def test_compatibility_record_validate_binds_the_record_and_the_gate_delegates_t
         "rollback_doctor_job_sha256": "",
         "previous_package_version": "",
         "schema_facts": _expected_schema_facts("A"),
-        "forward_compatible": True,
+        "new_store_compatible": True,
         "backward_compatible": False,
         "rollback_permitted": False,
         "decision": "approved",

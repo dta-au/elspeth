@@ -897,7 +897,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4ae18cd4950c7221"
+    source_file_hash: str | None = "sha256:8259abbb3dde8479"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -994,10 +994,10 @@ class ReferenceJoin(BaseTransform):
                     "Wire each uploaded table with wire_blob_inline_ref at "
                     "'node:<node_id>.options.tables.<table_name>.reference_content'; on the CLI put reference_file under each table.",
                     "Lookups run in configuration order. A key_field can read the original row or an earlier lookup's output, "
-                    "so first resolve a shared key and use it in multiple later tables. Self and forward references are rejected. "
+                    "so resolve a shared key and use it in multiple later tables. Self and forward references are rejected. "
                     "Output names must be distinct and cannot overwrite arriving fields.",
                     "A generated null is an invalid downstream key, even with on_miss: null or default. A default string is "
-                    "looked up normally; if absent, that later lookup applies its own on_miss policy. Input schema admission "
+                    "looked up normally; if absent, the later lookup applies its on_miss policy. Input schema admission "
                     "precedes the ordered lookups, and the first lookup failure stops processing.",
                     "Set a lookup's on_miss to default and supply default_values, or use fail with the node's on_error "
                     "quarantine sink. A failure routes the whole original row; no partial enrichment goes downstream.",

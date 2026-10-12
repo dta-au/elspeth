@@ -19,7 +19,6 @@ from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import (
     LandscapeSchemaShape,
     SchemaCompatibilityError,
-    create_additive_indexes,
     probe_schema_shape,
 )
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
@@ -325,11 +324,8 @@ def init_session_schema(engine: Engine) -> None:
             _create_session_tables(conn, checkfirst=True)
             _stamp_schema_sentinels(conn)
             return
-        # Same treatment as verify(), and for the same reason: the operator
-        # instruction alone does not say WHAT drifted. The validator's own
-        # message already ends with "Delete the old session database and
-        # restart", so routing through the explainer keeps the instruction
-        # and adds the table, the constraint and both sides of the mismatch.
+        # Preserve the target and report the precise drift; initialization
+        # authority does not permit converting an unsupported existing store.
         explain_non_current_schema(conn)
 
     def verify(conn: Connection) -> None:
@@ -351,19 +347,19 @@ def init_landscape_schema(engine: Engine) -> None:
         state = probe_landscape_schema(conn)
         if state is SchemaState.CURRENT:
             return
-        if state in (SchemaState.MISSING, SchemaState.PARTIAL):
+        if state is SchemaState.MISSING:
             landscape_metadata.create_all(bind=conn, checkfirst=True)
-            create_additive_indexes(conn)
-            if state is SchemaState.MISSING:
-                insert_schema_identity(
-                    conn,
-                    landscape_schema_identity_table,
-                    store_kind="landscape",
-                    schema_epoch=SQLITE_SCHEMA_EPOCH,
-                )
+            insert_schema_identity(
+                conn,
+                landscape_schema_identity_table,
+                store_kind="landscape",
+                schema_epoch=SQLITE_SCHEMA_EPOCH,
+            )
+            if conn.dialect.name == "sqlite":
+                conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")
             return
         raise SchemaCompatibilityError(
-            "Landscape database schema is stale or foreign; pre-1.0 schemas are not migrated in place. "
+            "Landscape database schema is partial, stale or foreign; pre-1.0 schemas are not migrated in place. "
             "Preserve this store unchanged and configure an explicitly new Landscape database."
         )
 

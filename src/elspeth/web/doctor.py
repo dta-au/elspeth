@@ -323,9 +323,13 @@ def schema_check(label: str, state: SchemaState) -> ContractCheck:
     if state is SchemaState.MISSING:
         return ContractCheck(label, False, "missing; rerun with --init-schema")
     if state is SchemaState.PARTIAL and label == "landscape_schema":
-        return ContractCheck(label, False, "partial; rerun with --init-schema")
+        return ContractCheck(
+            label, False, "partial; preserve the Landscape database; select an explicitly new compatible store, then rerun doctor"
+        )
     database = "session" if label == "session_schema" else "Landscape"
-    return ContractCheck(label, False, f"stale; drop and recreate the {database} database, then rerun doctor")
+    return ContractCheck(
+        label, False, f"stale; preserve the {database} database; select an explicitly new compatible store, then rerun doctor"
+    )
 
 
 def _human_schema_label(label: str) -> str:
@@ -615,10 +619,9 @@ def _collect_deployment_checks(
         return checks
 
     session_repairable = session_state is SchemaState.MISSING
-    landscape_repairable = landscape_state in (SchemaState.MISSING, SchemaState.PARTIAL)
+    landscape_repairable = landscape_state is SchemaState.MISSING
     states_eligible = session_state in (SchemaState.MISSING, SchemaState.CURRENT) and landscape_state in (
         SchemaState.MISSING,
-        SchemaState.PARTIAL,
         SchemaState.CURRENT,
     )
     complete_preflight_passed = all(check.ok for check in checks) and states_eligible

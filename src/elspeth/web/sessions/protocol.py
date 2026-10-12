@@ -3107,6 +3107,7 @@ class SessionServiceProtocol(Protocol):
         limit: int | None = 100,
         offset: int = 0,
         *,
+        include_private_evidence: bool = True,
         required_work: RequiredWorkTicket | None = None,
     ) -> list[ChatMessageRecord]: ...
 

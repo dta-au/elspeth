@@ -6,11 +6,12 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
-from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
+from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, metadata, schema_identity_table
+from elspeth.core.schema_identity import insert_schema_identity
 from elspeth.web.auth.local import LocalAuthStorageSecurityError, validate_existing_local_auth_store
 from elspeth.web.auth.local_schema import AUTH_SCHEMA_STATEMENTS, LocalAuthSchemaError
 from elspeth.web.local_store_admission import admit_local_stores
@@ -75,14 +76,58 @@ def test_session_writer_admission_refuses_before_wal_or_bootstrap(tmp_path, kind
     assert _snapshot(path) == before
 
 
-@pytest.mark.parametrize("kind", ["foreign", "partial", "stamped-empty", "foreign-empty", "views-only", "future"])
-def test_landscape_writer_refuses_without_header_schema_or_row_changes(tmp_path, kind):
+def _incomplete_landscape(path, kind):
+    engine = create_engine(_url(path))
+    metadata.create_all(engine)
+    with engine.begin() as conn:
+        insert_schema_identity(conn, schema_identity_table, store_kind="landscape", schema_epoch=SQLITE_SCHEMA_EPOCH)
+        conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")
+        conn.execute(
+            text(
+                "INSERT INTO runs (run_id, started_at, config_hash, settings_json, canonical_version, status, "
+                "openrouter_catalog_sha256, openrouter_catalog_source) VALUES "
+                "('retained-run', CURRENT_TIMESTAMP, :config_hash, '{}', 'v1', 'completed', :catalog_hash, 'bundled')"
+            ),
+            {"config_hash": "a" * 64, "catalog_hash": "b" * 64},
+        )
+        if kind == "zero-epoch":
+            conn.exec_driver_sql("PRAGMA user_version = 0")
+        else:
+            object_type = "INDEX" if kind.startswith("ix_") else "TABLE"
+            conn.exec_driver_sql(f"DROP {object_type} {kind}")
+    engine.dispose()
+
+
+@pytest.mark.parametrize("constructor", [LandscapeDB, LandscapeDB.from_url])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "foreign",
+        "partial",
+        "stamped-empty",
+        "foreign-empty",
+        "views-only",
+        "future",
+        "auth_events",
+        "run_attributions",
+        "ix_tokens_run_id",
+        "zero-epoch",
+    ],
+)
+def test_landscape_writer_refuses_without_header_schema_or_row_changes(tmp_path, kind, constructor):
     path = tmp_path / "audit.db"
-    _unsupported(path, kind, current_epoch=SQLITE_SCHEMA_EPOCH)
+    if kind in {"auth_events", "run_attributions", "ix_tokens_run_id", "zero-epoch"}:
+        _incomplete_landscape(path, kind)
+    else:
+        _unsupported(path, kind, current_epoch=SQLITE_SCHEMA_EPOCH)
     before = _snapshot(path)
-    with pytest.raises(SchemaCompatibilityError), LandscapeDB.from_url(_url(path)):
+    before_bytes = path.read_bytes()
+    with pytest.raises(SchemaCompatibilityError), constructor(_url(path)):
         pass
     assert _snapshot(path) == before
+    assert path.read_bytes() == before_bytes
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
 
 
 @pytest.mark.parametrize("broken_store", ["session", "landscape", "auth"])

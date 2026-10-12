@@ -10,6 +10,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+from elspeth.web._acceptance_common.schema_facts import _require_supported_deployment_scenario, _schema_facts_equal
+
 from .approvals import _require_current_approval
 from .contracts import (
     _EMERGENCY_CLEANUP_SECONDS,
@@ -33,7 +35,6 @@ from .manifest_schema import (
 )
 from .receipt_contracts import (
     _CANDIDATE_PACKAGE_VERSION,
-    _ROLLBACK_PACKAGE_VERSION,
     _expected_schema_facts,
 )
 from .scenario_inventory import (
@@ -91,8 +92,60 @@ def control_manifest_validate(
     return manifest
 
 
-@_serialized_control_manifest_write
 def control_manifest_update(
+    path: Path,
+    *,
+    cleanup_required: bool | None = None,
+    ecr_baseline_tag: str | None = None,
+    ecr_candidate_tag: str | None = None,
+    ecr_registry: str | None = None,
+    ecr_repository: str | None = None,
+    ecr_baseline_digest: str | None = None,
+    ecr_candidate_digest: str | None = None,
+    acceptance_state_path: str | None = None,
+    oidc_evidence_dir: str | None = None,
+    evidence_export_receipt: str | None = None,
+    final_evidence_export_receipt: str | None = None,
+    terraform_plan_receipt: str | None = None,
+    terraform_applied: str | None = None,
+    terraform_noop_receipt: str | None = None,
+    cleanup_checkpoint: str | None = None,
+    verdict_failure: str | None = None,
+    emergency_cleanup_deadline_utc: str | None = None,
+    cleanup_escalation: str | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> dict[str, object]:
+    """Reject unsupported activation before acquiring the manifest write lock."""
+
+    for receipt in (terraform_plan_receipt, terraform_applied, terraform_noop_receipt):
+        if receipt is not None and receipt.split(":", 1)[0] == "B":
+            _require_supported_deployment_scenario("B")
+    return _control_manifest_update_locked(
+        path,
+        cleanup_required=cleanup_required,
+        ecr_baseline_tag=ecr_baseline_tag,
+        ecr_candidate_tag=ecr_candidate_tag,
+        ecr_registry=ecr_registry,
+        ecr_repository=ecr_repository,
+        ecr_baseline_digest=ecr_baseline_digest,
+        ecr_candidate_digest=ecr_candidate_digest,
+        acceptance_state_path=acceptance_state_path,
+        oidc_evidence_dir=oidc_evidence_dir,
+        evidence_export_receipt=evidence_export_receipt,
+        final_evidence_export_receipt=final_evidence_export_receipt,
+        terraform_plan_receipt=terraform_plan_receipt,
+        terraform_applied=terraform_applied,
+        terraform_noop_receipt=terraform_noop_receipt,
+        cleanup_checkpoint=cleanup_checkpoint,
+        verdict_failure=verdict_failure,
+        emergency_cleanup_deadline_utc=emergency_cleanup_deadline_utc,
+        cleanup_escalation=cleanup_escalation,
+        now=now,
+    )
+
+
+@_serialized_control_manifest_write
+def _control_manifest_update_locked(
     path: Path,
     *,
     cleanup_required: bool | None = None,
@@ -682,7 +735,7 @@ def scenario_load(
     scenario_id: str,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> str:
-    """Render one bound scenario inventory as a closed shell assignment set."""
+    """Read bound inventory for inspection/cleanup; this grants no deployment authority."""
 
     if scenario_id not in {"A", "B"}:
         raise AcceptanceCheckError("scenario_inventory_binding")
@@ -708,6 +761,7 @@ def validate_compatibility_record(
 
     if scenario_id not in _APPLICATION_SCENARIO_IDS:
         raise AcceptanceCheckError("compatibility_record_binding")
+    _require_supported_deployment_scenario(scenario_id)
     manifest = _read_control_manifest(manifest_path)
     inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
     values = cast(dict[str, object], inventory["values"])
@@ -729,7 +783,7 @@ def validate_compatibility_record(
         "rollback_doctor_task_definition",
         "previous_package_version",
         "schema_facts",
-        "forward_compatible",
+        "new_store_compatible",
         "backward_compatible",
         "rollback_permitted",
         "decision",
@@ -739,17 +793,8 @@ def validate_compatibility_record(
         "countersigned_at",
         "expires_at",
     }
-    if set(record) != fields or record["schema"] != "elspeth.aws-ecs-compatibility-record.v2":
+    if set(record) != fields or record["schema"] != "elspeth.aws-ecs-compatibility-record.v3":
         raise AcceptanceCheckError("compatibility_record_schema")
-    previous = values["PREVIOUS_TASK_DEFINITION"] if scenario_id == "B" else ""
-    rollback_doctor = values["ROLLBACK_DOCTOR_TASK_DEFINITION"] if scenario_id == "B" else ""
-    previous_digest = ecr["baseline_digest"] if scenario_id == "B" else ""
-    baseline_tag = ecr["baseline_tag"] if scenario_id == "B" else ""
-    previous_source_sha = ""
-    if scenario_id == "B":
-        baseline_match = re.search(r"baseline-([0-9a-f]{40})$", cast(str, baseline_tag))
-        if baseline_match is not None:
-            previous_source_sha = baseline_match.group(1)
     expected_schema_facts = _expected_schema_facts(scenario_id)
     if (
         record["acceptance_run_id"] != manifest["acceptance_run_id"]
@@ -759,19 +804,19 @@ def validate_compatibility_record(
         or record["candidate_task_definition"] != values["CANDIDATE_TASK_DEFINITION"]
         or record["candidate_doctor_task_definition"] != values["DOCTOR_TASK_DEFINITION"]
         or record["candidate_package_version"] != _CANDIDATE_PACKAGE_VERSION
-        or record["previous_source_sha"] != previous_source_sha
-        or record["previous_image_digest"] != previous_digest
-        or record["previous_task_definition"] != previous
-        or record["rollback_doctor_task_definition"] != rollback_doctor
-        or record["previous_package_version"] != (_ROLLBACK_PACKAGE_VERSION if scenario_id == "B" else "")
-        or record["schema_facts"] != expected_schema_facts
+        or record["previous_source_sha"] != ""
+        or record["previous_image_digest"] != ""
+        or record["previous_task_definition"] != ""
+        or record["rollback_doctor_task_definition"] != ""
+        or record["previous_package_version"] != ""
+        or not _schema_facts_equal(record["schema_facts"], expected_schema_facts)
         or record["decision"] != "approved"
-        or record["forward_compatible"] is not True
+        or record["new_store_compatible"] is not True
         or record["backward_compatible"] is not False
         or record["rollback_permitted"] is not False
     ):
         raise AcceptanceCheckError("compatibility_record_binding")
-    if any(type(record[field]) is not bool for field in ("forward_compatible", "backward_compatible", "rollback_permitted")):
+    if any(type(record[field]) is not bool for field in ("new_store_compatible", "backward_compatible", "rollback_permitted")):
         raise AcceptanceCheckError("compatibility_record_schema")
     for field in ("record_id", "approver_identity", "countersigner_identity"):
         value = record[field]
@@ -786,18 +831,8 @@ def validate_compatibility_record(
     if current.tzinfo is None or current.utcoffset() is None or not approved_at <= countersigned_at <= current < expires_at:
         raise AcceptanceCheckError("compatibility_record_expired")
     canonical = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    receipt_previous_source_sha: str | None = previous_source_sha
-    if receipt_previous_source_sha == "":
-        receipt_previous_source_sha = None
-    receipt_previous_image_digest: object = None
-    previous_task_definition_sha256: str | None = None
-    rollback_doctor_task_definition_sha256: str | None = None
-    if scenario_id == "B":
-        receipt_previous_image_digest = previous_digest
-        previous_task_definition_sha256 = _sha256(cast(str, previous).encode())
-        rollback_doctor_task_definition_sha256 = _sha256(cast(str, rollback_doctor).encode())
     return {
-        "schema": "elspeth.aws-ecs-compatibility-receipt.v2",
+        "schema": "elspeth.aws-ecs-compatibility-receipt.v3",
         "record_sha256": _sha256(canonical),
         "acceptance_run_id_sha256": _sha256(cast(str, manifest["acceptance_run_id"]).encode()),
         "scenario_id": scenario_id,
@@ -806,13 +841,13 @@ def validate_compatibility_record(
         "candidate_task_definition_sha256": _sha256(cast(str, values["CANDIDATE_TASK_DEFINITION"]).encode()),
         "candidate_doctor_task_definition_sha256": _sha256(cast(str, values["DOCTOR_TASK_DEFINITION"]).encode()),
         "candidate_package_version": _CANDIDATE_PACKAGE_VERSION,
-        "previous_source_sha": receipt_previous_source_sha,
-        "previous_image_digest": receipt_previous_image_digest,
-        "previous_task_definition_sha256": previous_task_definition_sha256,
-        "rollback_doctor_task_definition_sha256": rollback_doctor_task_definition_sha256,
-        "previous_package_version": _ROLLBACK_PACKAGE_VERSION if scenario_id == "B" else None,
+        "previous_source_sha": None,
+        "previous_image_digest": None,
+        "previous_task_definition_sha256": None,
+        "rollback_doctor_task_definition_sha256": None,
+        "previous_package_version": None,
         "schema_facts": expected_schema_facts,
-        "forward_compatible": record["forward_compatible"],
+        "new_store_compatible": record["new_store_compatible"],
         "backward_compatible": record["backward_compatible"],
         "rollback_permitted": record["rollback_permitted"],
         "decision": "approved",

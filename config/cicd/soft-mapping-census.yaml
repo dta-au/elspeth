@@ -664,7 +664,7 @@ files:
     Mapping[str, object]: 5
     dict[str, object]: 2
   src/elspeth/web/_aws_ecs_acceptance/control_service.py:
-    dict[str, object]: 4
+    dict[str, object]: 5
   src/elspeth/web/_aws_ecs_acceptance/ecs_metadata.py:
     dict[str, object]: 2
   src/elspeth/web/_aws_ecs_acceptance/evidence.py:
@@ -1062,5 +1062,5 @@ totals:
   MutableMapping[str, Any]: 8
   boundary: 59
   dict[str, Any]: 1073
-  dict[str, object]: 393
-  soft: 2540
+  dict[str, object]: 394
+  soft: 2541

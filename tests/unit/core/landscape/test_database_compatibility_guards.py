@@ -221,19 +221,20 @@ class TestSyncSchemaEpochDirectionalGuard:
         finally:
             check.dispose()
 
-    def test_sync_upgrades_epoch_zero(self, tmp_path: Path) -> None:
-        """_sync_sqlite_schema_epoch upgrades unstamped databases (epoch 0)."""
+    def test_sync_refuses_existing_epoch_zero(self, tmp_path: Path) -> None:
+        """Existing unstamped databases must never be restamped in place."""
         db_path = tmp_path / "unstamped.db"
         engine = create_engine(f"sqlite:///{db_path}")
         metadata.create_all(engine)
         engine.dispose()
 
         instance = _make_instance(f"sqlite:///{db_path}")
-        instance._sync_sqlite_schema_epoch()
+        with pytest.raises(SchemaCompatibilityError, match="Preserve this store unchanged"):
+            instance._sync_sqlite_schema_epoch()
 
         with instance.engine.connect() as conn:
             epoch = conn.exec_driver_sql("PRAGMA user_version").scalar_one()
-        assert epoch == SQLITE_SCHEMA_EPOCH
+        assert epoch == 0
         instance.close()
 
     def test_sync_noops_on_current_epoch(self, tmp_path: Path) -> None:
@@ -1604,8 +1605,8 @@ class TestRequiredCompositeForeignKeysExhaustive:
 class TestJournalPathGuards:
     """Coverage for from_url journal path derivation failure modes."""
 
-    def test_from_url_creates_missing_tokens_run_id_index_for_existing_current_db(self, tmp_path: Path) -> None:
-        """The run-accounting performance index is additive, not a startup blocker."""
+    def test_from_url_refuses_missing_tokens_run_id_index_for_existing_current_db(self, tmp_path: Path) -> None:
+        """An existing incomplete store is refused before writable setup."""
         db_path = tmp_path / "missing_tokens_run_id_index.db"
         engine = create_engine(f"sqlite:///{db_path}")
         metadata.create_all(engine)
@@ -1615,8 +1616,12 @@ class TestJournalPathGuards:
             conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")
         engine.dispose()
 
-        db = LandscapeDB.from_url(f"sqlite:///{db_path}")
-        db.close()
+        before = db_path.read_bytes()
+        with pytest.raises(SchemaCompatibilityError, match="Preserve this store unchanged"):
+            LandscapeDB.from_url(f"sqlite:///{db_path}")
+        assert db_path.read_bytes() == before
+        assert not Path(f"{db_path}-wal").exists()
+        assert not Path(f"{db_path}-shm").exists()
 
         engine = create_engine(f"sqlite:///{db_path}")
         indexes = {idx["name"] for idx in inspect(engine).get_indexes("tokens")}
@@ -1624,11 +1629,11 @@ class TestJournalPathGuards:
             epoch = conn.exec_driver_sql("PRAGMA user_version").scalar_one()
         engine.dispose()
 
-        assert "ix_tokens_run_id" in indexes
+        assert "ix_tokens_run_id" not in indexes
         assert epoch == SQLITE_SCHEMA_EPOCH
 
-    def test_from_url_create_tables_false_allows_missing_tokens_run_id_index_without_mutation(self, tmp_path: Path) -> None:
-        """Read-only opens tolerate the additive index absence and do not mutate it."""
+    def test_from_url_create_tables_false_refuses_missing_tokens_run_id_index_without_mutation(self, tmp_path: Path) -> None:
+        """Disabling table creation does not admit an incomplete store."""
         db_path = tmp_path / "readonly_missing_tokens_run_id_index.db"
         engine = create_engine(f"sqlite:///{db_path}")
         metadata.create_all(engine)
@@ -1638,8 +1643,8 @@ class TestJournalPathGuards:
             conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")
         engine.dispose()
 
-        db = LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False)
-        db.close()
+        with pytest.raises(SchemaCompatibilityError, match="Preserve this store unchanged"):
+            LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False)
 
         engine = create_engine(f"sqlite:///{db_path}")
         indexes = {idx["name"] for idx in inspect(engine).get_indexes("tokens")}
@@ -1761,15 +1766,15 @@ class TestJournalPathGuards:
         assert epoch == SQLITE_SCHEMA_EPOCH
 
     def test_from_url_create_tables_false_does_not_stamp_schema_epoch(self, tmp_path: Path) -> None:
-        """Read-only opens must not mutate compatible legacy SQLite databases."""
+        """Disabling creation must refuse, rather than stamp, an old target."""
         db_path = tmp_path / "readonly_epoch.db"
         engine = create_engine(f"sqlite:///{db_path}")
         metadata.create_all(engine)
         _stamp_current_landscape_identity(engine)
         engine.dispose()
 
-        db = LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False)
-        db.close()
+        with pytest.raises(SchemaCompatibilityError, match="Preserve this store unchanged"):
+            LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False)
 
         engine = create_engine(f"sqlite:///{db_path}")
         with engine.connect() as conn:

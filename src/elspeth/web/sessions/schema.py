@@ -21,7 +21,7 @@ from elspeth.core.schema_identity import (
     read_schema_identities,
     schema_identity_mismatch,
 )
-from elspeth.core.schema_shape import collect_metadata_shape_issues
+from elspeth.core.schema_shape import _connection_target_is_empty, collect_metadata_shape_issues
 from elspeth.web.sessions.models import (
     SESSION_DB_APPLICATION_ID,
     SESSION_SCHEMA_EPOCH,
@@ -184,15 +184,8 @@ def assert_empty_session_target(bind: Engine | Connection) -> None:
 
 
 def _assert_empty_session_connection(connection: Connection) -> None:
-    inspector = inspect(connection)
-    if inspector.get_table_names() or inspector.get_view_names():
-        _schema_error("fresh creation requires an empty target")
-    if connection.dialect.name == "sqlite":
-        application_id = connection.exec_driver_sql("PRAGMA application_id").scalar_one()
-        user_version = connection.exec_driver_sql("PRAGMA user_version").scalar_one()
-        objects = connection.exec_driver_sql("SELECT name FROM sqlite_master").all()
-        if application_id != 0 or user_version != 0 or objects:
-            _schema_error("fresh creation requires an unstamped, object-free SQLite target")
+    if not _connection_target_is_empty(connection):
+        _schema_error("fresh creation requires an unstamped, object-free target")
 
 
 def probe_current_schema(bind: Engine | Connection) -> bool:

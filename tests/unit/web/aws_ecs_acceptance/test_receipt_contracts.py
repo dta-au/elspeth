@@ -598,7 +598,7 @@ def test_stored_operator_receipt_rejects_wrong_retained_namespace() -> None:
 def _compatibility_receipt(scenario_id: str) -> dict[str, object]:
     previous = scenario_id == "B"
     return {
-        "schema": "elspeth.aws-ecs-compatibility-receipt.v2",
+        "schema": "elspeth.aws-ecs-compatibility-receipt.v3",
         "record_sha256": "a" * 64,
         "acceptance_run_id_sha256": "b" * 64,
         "scenario_id": scenario_id,
@@ -613,7 +613,7 @@ def _compatibility_receipt(scenario_id: str) -> dict[str, object]:
         "rollback_doctor_task_definition_sha256": "4" * 64 if previous else None,
         "previous_package_version": "0.7.1" if previous else None,
         "schema_facts": receipt_contracts._expected_schema_facts(scenario_id),
-        "forward_compatible": True,
+        "new_store_compatible": True,
         "backward_compatible": False,
         "rollback_permitted": False,
         "decision": "approved",
@@ -622,15 +622,14 @@ def _compatibility_receipt(scenario_id: str) -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize("scenario_id", ["A", "B"])
-def test_stored_compatibility_receipt_accepts_exact_scenario_variants(scenario_id: str) -> None:
-    payload = _compatibility_receipt(scenario_id)
+def test_stored_compatibility_receipt_accepts_exact_new_store_variant() -> None:
+    payload = _compatibility_receipt("A")
 
     assert (
         receipt_contracts._validate_stored_receipt(
             payload,
             kind="compatibility-record",
-            scenario_id=scenario_id,
+            scenario_id="A",
             subject_sha256="9" * 64,
             candidate_sha="c" * 40,
             subject_id="a" * 64,
@@ -639,9 +638,21 @@ def test_stored_compatibility_receipt_accepts_exact_scenario_variants(scenario_i
     )
 
 
+def test_stored_compatibility_receipt_refuses_existing_store_transition() -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="compatibility_transition_unsupported"):
+        receipt_contracts._validate_stored_receipt(
+            _compatibility_receipt("B"),
+            kind="compatibility-record",
+            scenario_id="B",
+            subject_sha256="9" * 64,
+            candidate_sha="c" * 40,
+            subject_id="a" * 64,
+        )
+
+
 @pytest.mark.parametrize(
     "mutation",
-    ["subject_hash", "scenario", "candidate", "a_with_previous", "bool_compatibility"],
+    ["subject_hash", "candidate", "a_with_previous", "bool_compatibility"],
 )
 def test_stored_compatibility_receipt_rejects_wrong_hash_binding_or_variant(mutation: str) -> None:
     payload = _compatibility_receipt("A")
@@ -650,8 +661,6 @@ def test_stored_compatibility_receipt_rejects_wrong_hash_binding_or_variant(muta
     candidate_sha = "c" * 40
     if mutation == "subject_hash":
         subject_id = "9" * 64
-    elif mutation == "scenario":
-        scenario_id = "B"
     elif mutation == "candidate":
         candidate_sha = "d" * 40
     elif mutation == "a_with_previous":
@@ -670,16 +679,15 @@ def test_stored_compatibility_receipt_rejects_wrong_hash_binding_or_variant(muta
         )
 
 
-@pytest.mark.parametrize("scenario_id", ["A", "B"])
-def test_stored_compatibility_receipt_rejects_stale_candidate_package_version(scenario_id: str) -> None:
-    payload = _compatibility_receipt(scenario_id)
+def test_stored_compatibility_receipt_rejects_stale_candidate_package_version() -> None:
+    payload = _compatibility_receipt("A")
     payload["candidate_package_version"] = "0.8.0"
 
     with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_binding"):
         receipt_contracts._validate_stored_receipt(
             payload,
             kind="compatibility-record",
-            scenario_id=scenario_id,
+            scenario_id="A",
             subject_sha256="9" * 64,
             candidate_sha="c" * 40,
             subject_id="a" * 64,
@@ -688,7 +696,7 @@ def test_stored_compatibility_receipt_rejects_stale_candidate_package_version(sc
 
 def test_compatibility_schema_facts_track_current_epochs() -> None:
     """Regression: elspeth-7f4c87b341 — the compatibility validators must demand
-    the CURRENT candidate epochs and a migration label naming the current
+    the CURRENT candidate epochs and an unsupported-transition label naming the current
     landscape epoch, so truthful facts are accepted and a future epoch bump
     fails here instead of silently requiring a false attestation."""
     facts = acceptance._expected_schema_facts("B")
@@ -706,15 +714,19 @@ def test_compatibility_schema_facts_track_current_epochs() -> None:
         "run_web_plugin_policy_present": True,
     }
     assert label == (
-        f"session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
-        "_blob_cleanup_row_union_barrier_and_coordination_schema"
+        f"unsupported_session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}_preserve_existing_stores"
     )
-    assert facts["semantics_only_changes"] == "coalesce_timeout_seconds_and_node_options_summary_required"
+    assert facts["semantics_only_changes"] == "not_applicable"
+    assert facts["archive_export_decision"] == "preserve_existing_store"
     facts_a = acceptance._expected_schema_facts("A")
     assert facts_a["previous"] is None
     assert facts_a["structural_changes"] == "initial_create"
     assert facts_a["semantics_only_changes"] == "none"
     assert facts_a["archive_export_decision"] == "not_applicable"
+    for variant in (facts, facts_a):
+        assert variant["store_policy"] == "new_store_only"
+        assert variant["existing_store_action"] == "preserve_and_refuse"
+        assert variant["in_place_upgrade_supported"] is False
 
 
 def _bedrock_receipt_details() -> dict[str, object]:

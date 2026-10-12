@@ -36,6 +36,7 @@ from tests.unit.web.composer.test_service import (
     _empty_state,
     _execution_ready,
     _make_llm_response,
+    _make_raw_llm_response,
     _make_settings,
     _mock_catalog,
 )
@@ -93,9 +94,9 @@ def test_recovery_palettes_preserve_explicit_target_choices(dialect: ToolContrac
 async def test_primary_control_exits_before_dispatch_repair_and_advisor(name: str, arguments: dict[str, str], action: str) -> None:
     service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
     state = _empty_state()
-    response = _make_llm_response(tool_calls=[{"id": "handoff-1", "name": name, "arguments": arguments}])
+    response = _make_raw_llm_response(tool_calls=[{"id": "handoff-1", "name": name, "arguments": arguments}])
     with (
-        patch.object(service._provider_gateway, "_call_llm", side_effect=[response]) as provider,
+        patch("litellm.acompletion", side_effect=[response]) as provider,
         patch.object(service, "_dispatch_tool_batch", side_effect=AssertionError("Recovery reached ordinary dispatch")) as dispatch,
         patch.object(
             service._completion, "_try_terminate_no_tools", side_effect=AssertionError("Recovery reached no-tool repair")
@@ -111,7 +112,7 @@ async def test_primary_control_exits_before_dispatch_repair_and_advisor(name: st
             session_id=session_id,
         )
     assert provider.call_count == 1
-    advertised = {tool["function"]["name"] for tool in provider.call_args.args[1]}
+    advertised = {tool["function"]["name"] for tool in provider.call_args.kwargs["tools"]}
     assert advertised >= _CONTROL_NAMES, "Provider palette omitted recovery controls"
     dispatch.assert_not_called()
     finalize.assert_not_called()
@@ -232,7 +233,7 @@ async def test_mixed_primary_control_batch_executes_neither_call(control_first: 
         calls.reverse()
     state = _empty_state()
     with (
-        patch.object(service._provider_gateway, "_call_llm", side_effect=[_make_llm_response(tool_calls=calls)]) as provider,
+        patch("litellm.acompletion", side_effect=[_make_raw_llm_response(tool_calls=calls)]) as provider,
         patch.object(service, "_dispatch_tool_batch", side_effect=AssertionError("Mixed control batch dispatched")) as dispatch,
         pytest.raises(ValueError, match="sole tool call"),
     ):
@@ -269,11 +270,11 @@ async def test_final_preview_reply_still_accepts_recovery_without_advisor_reentr
         )
     )
     scripted_replies = [
-        _make_llm_response(tool_calls=[{"id": "preview", "name": "preview_pipeline", "arguments": {}}]),
-        _make_llm_response(tool_calls=[{"id": "reply-recovery", "name": name, "arguments": arguments}]),
+        _make_raw_llm_response(tool_calls=[{"id": "preview", "name": "preview_pipeline", "arguments": {}}]),
+        _make_raw_llm_response(tool_calls=[{"id": "reply-recovery", "name": name, "arguments": arguments}]),
     ]
     if after_advisor_repair:
-        scripted_replies.insert(0, _make_llm_response(content="The draft is ready for your review."))
+        scripted_replies.insert(0, _make_raw_llm_response(content="The draft is ready for your review."))
     replies = iter(scripted_replies)
     advertised: list[list[dict[str, Any]]] = []
 
@@ -282,7 +283,7 @@ async def test_final_preview_reply_still_accepts_recovery_without_advisor_reentr
         return next(replies)
 
     with (
-        patch.object(service._provider_gateway, "_call_llm", side_effect=provider) as completion,
+        patch("litellm.acompletion", side_effect=provider) as completion,
         patch.object(
             service._preflight,
             "runtime_preflight",
@@ -325,7 +326,7 @@ async def test_pending_review_reply_accepts_recovery_without_completion_gate(tmp
     service = _build_composer(tmp_path, sessions)
     replies = iter(
         [
-            _make_llm_response(
+            _make_raw_llm_response(
                 tool_calls=[
                     {
                         "id": "review",
@@ -339,7 +340,7 @@ async def test_pending_review_reply_accepts_recovery_without_completion_gate(tmp
                     }
                 ]
             ),
-            _make_llm_response(
+            _make_raw_llm_response(
                 tool_calls=[
                     {
                         "id": "review-recovery",
@@ -357,7 +358,7 @@ async def test_pending_review_reply_accepts_recovery_without_completion_gate(tmp
         return next(replies)
 
     with (
-        patch.object(service._provider_gateway, "_call_llm", side_effect=provider) as completion,
+        patch("litellm.acompletion", side_effect=provider) as completion,
         patch.object(
             service._completion,
             "_surface_and_finalize_no_tools",

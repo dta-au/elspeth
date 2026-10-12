@@ -1,16 +1,15 @@
-"""The one derivation of the release/schema facts a compatibility record attests.
+"""Shared new-store admission and release/schema facts for deployment receipts.
 
-Moved verbatim from ``_aws_ecs_acceptance/receipt_contracts.py``. Both
-providers' compatibility receipts, the ECS runbook's Scenario B record
-(``tests/unit/docs/test_release_version_surfaces.py``) and the shared gate
-predicate read these facts from here and nowhere else, so "session 35→N,
-landscape 29→M, same ``structural_changes`` label" has exactly one source.
+Scenario B facts describe historical rollback-refusal diagnostics only. They
+do not authorize an upgrade during the temporary compatibility window.
 """
 
 from __future__ import annotations
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
+
+from .errors import AcceptanceCheckError
 
 _CANDIDATE_PACKAGE_VERSION = "0.8.3"
 
@@ -20,14 +19,35 @@ _ROLLBACK_BASELINE_SESSION_EPOCH = 35
 
 _ROLLBACK_BASELINE_LANDSCAPE_EPOCH = 29
 
-# Derived from the live epoch constants: a schema bump must rotate the label a
-# compatibility receipt attests, otherwise a stale receipt keeps validating
-# against a transition the candidate no longer performs.
+# Scenario B is retained only for historical rollback-refusal diagnostics.
+# It is not a supported deployment transition during the temporary
+# no-backwards-compatibility window; no expiry has been specified.
 _SCENARIO_B_STRUCTURAL_CHANGES = (
-    f"session_epoch_{_ROLLBACK_BASELINE_SESSION_EPOCH}_to_{SESSION_SCHEMA_EPOCH}"
+    f"unsupported_session_epoch_{_ROLLBACK_BASELINE_SESSION_EPOCH}_to_{SESSION_SCHEMA_EPOCH}"
     f"_landscape_epoch_{_ROLLBACK_BASELINE_LANDSCAPE_EPOCH}_to_{SQLITE_SCHEMA_EPOCH}"
-    "_blob_cleanup_row_union_barrier_and_coordination_schema"
+    "_preserve_existing_stores"
 )
+
+
+def _require_supported_deployment_scenario(scenario_id: str) -> None:
+    """Require explicit Scenario A before application deployment or writes.
+
+    Cleanup and historical diagnostics do not call this admission guard.
+    Infrastructure-only scopes remain validated by their owning entry point.
+    """
+    if scenario_id != "A":
+        raise AcceptanceCheckError("compatibility_transition_unsupported")
+
+
+def _schema_facts_equal(value: object, expected: object) -> bool:
+    """Compare the closed derived JSON facts without bool/int/float coercion."""
+
+    if type(value) is not type(expected):
+        return False
+    if type(expected) is dict:
+        assert type(value) is dict
+        return value.keys() == expected.keys() and all(_schema_facts_equal(value[key], fact) for key, fact in expected.items())
+    return value == expected
 
 
 def _expected_schema_facts(scenario_id: str) -> dict[str, object]:
@@ -53,7 +73,10 @@ def _expected_schema_facts(scenario_id: str) -> dict[str, object]:
             else None
         ),
         "structural_changes": (_SCENARIO_B_STRUCTURAL_CHANGES if scenario_id == "B" else "initial_create"),
-        "semantics_only_changes": ("coalesce_timeout_seconds_and_node_options_summary_required" if scenario_id == "B" else "none"),
-        "archive_export_decision": ("required_before_forward_migration" if scenario_id == "B" else "not_applicable"),
+        "semantics_only_changes": ("not_applicable" if scenario_id == "B" else "none"),
+        "archive_export_decision": ("preserve_existing_store" if scenario_id == "B" else "not_applicable"),
         "destructive_reset_required": False,
+        "store_policy": "new_store_only",
+        "existing_store_action": "preserve_and_refuse",
+        "in_place_upgrade_supported": False,
     }

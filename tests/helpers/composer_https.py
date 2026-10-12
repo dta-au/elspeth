@@ -236,13 +236,22 @@ def local_composer_tls(
         owners.server_thread.start()
         _raise_tls_originals(owners)
         configuration = directory / "Caddyfile"
-        transport = "" if upstream_read_timeout is None else f" transport http {{\n read_timeout {upstream_read_timeout}\n }}\n"
         buffering = "" if response_buffer_bytes is None else f" response_buffers {response_buffer_bytes}\n"
+        proxy = f" reverse_proxy 127.0.0.1:{upstream_port} {{\n flush_interval {flush_interval}\n{buffering} }}\n"
+        if upstream_read_timeout is not None:
+            # The short timeout deliberately cuts off observation. Admission,
+            # status and replay must not inherit that stream-only fault.
+            proxy = (
+                " handle /api/sessions/*/operations/*/stream {\n"
+                f" reverse_proxy 127.0.0.1:{upstream_port} {{\n flush_interval {flush_interval}\n{buffering}"
+                f" transport http {{\n read_timeout {upstream_read_timeout}\n }}\n }}\n }}\n"
+                f" handle {{\n{proxy} }}\n"
+            )
         configuration.write_text(
             "{\n admin off\n auto_https off\n servers {\n protocols h1 h2\n }\n}\n"
             f"https://127.0.0.1:{proxy_port} {{\n bind 127.0.0.1\n"
             f" tls {certificate} {private_key}\n"
-            f" reverse_proxy 127.0.0.1:{upstream_port} {{\n flush_interval {flush_interval}\n{transport}{buffering} }}\n}}\n",
+            f"{proxy}}}\n",
             encoding="utf-8",
         )
         proxy_log = directory / "caddy.log"

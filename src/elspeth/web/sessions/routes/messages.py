@@ -121,7 +121,7 @@ def register_message_routes(router: APIRouter) -> None:
         # model/usage/cost metadata and closed decision classifications, but
         # not raw prompts, provider reasoning artifacts, tool arguments,
         # candidate values, or tool results.
-        messages = await service.get_messages(session.id, limit=None)
+        messages = await service.get_messages(session.id, limit=None, include_private_evidence=False)
         if include_tool_rows and include_llm_audit:
             conversation_messages = _composer_conversation_tool_or_llm_audit_messages(messages)
         elif include_tool_rows:

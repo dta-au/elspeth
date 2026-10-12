@@ -782,26 +782,31 @@ def _init_control_manifest(
                 )
             )
             os.chmod(approval_path, 0o600)
-            approval_hash = acceptance.approval_verify(
-                path,
-                scenario_id=scenario,
-                kind="terraform-plan",
-                plan_receipt_hash=plan_receipt_hash,
-                approval_file=approval_path,
-                signature_verifier=lambda _payload, _signature, _key_id: True,
-                now=lambda: datetime(2026, 7, 14, 1, 0, 20, tzinfo=UTC),
-            )
+            if scenario == "A":
+                approval_hash = acceptance.approval_verify(
+                    path,
+                    scenario_id=scenario,
+                    kind="terraform-plan",
+                    plan_receipt_hash=plan_receipt_hash,
+                    approval_file=approval_path,
+                    signature_verifier=lambda _payload, _signature, _key_id: True,
+                    now=lambda: datetime(2026, 7, 14, 1, 0, 20, tzinfo=UTC),
+                )
+            else:
+                historical_approval = json.loads(approval_path.read_text())
+                approval_hash = hashlib.sha256(json.dumps(historical_approval, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             plan_binding = f"{scenario}:{plan_sha}:{plan_receipt_hash}:{approval_hash}"
-            acceptance.control_manifest_update(
-                path,
-                terraform_plan_receipt=plan_binding,
-                now=lambda: datetime(2026, 7, 14, 1, 0, 30, tzinfo=UTC),
-            )
-            acceptance.control_manifest_update(
-                path,
-                terraform_applied=plan_binding,
-                now=lambda: datetime(2026, 7, 14, 1, 0, 40, tzinfo=UTC),
-            )
+            if scenario == "A":
+                acceptance.control_manifest_update(
+                    path,
+                    terraform_plan_receipt=plan_binding,
+                    now=lambda: datetime(2026, 7, 14, 1, 0, 30, tzinfo=UTC),
+                )
+                acceptance.control_manifest_update(
+                    path,
+                    terraform_applied=plan_binding,
+                    now=lambda: datetime(2026, 7, 14, 1, 0, 40, tzinfo=UTC),
+                )
             noop_sha = noop_character * 64
             noop_path = path.parent / f"{scenario.lower()}-noop-receipt.json"
             noop_path.write_text(json.dumps(_terraform_receipt(plan_sha256=noop_sha)))
@@ -814,11 +819,37 @@ def _init_control_manifest(
                 receipt_file=noop_path,
                 now=lambda: datetime(2026, 7, 14, 1, 0, 50, tzinfo=UTC),
             )
-            acceptance.control_manifest_update(
-                path,
-                terraform_noop_receipt=f"{scenario}:{noop_sha}:{noop_receipt_hash}",
-                now=lambda: datetime(2026, 7, 14, 1, 0, 55, tzinfo=UTC),
-            )
+            if scenario == "A":
+                acceptance.control_manifest_update(
+                    path,
+                    terraform_noop_receipt=f"{scenario}:{noop_sha}:{noop_receipt_hash}",
+                    now=lambda: datetime(2026, 7, 14, 1, 0, 55, tzinfo=UTC),
+                )
+            else:
+                # Deliberately seed prior B state for cleanup/isolation tests.
+                # Current deployment admission must never create this state;
+                # A above still exercises real approval and activation paths.
+                historical_manifest = json.loads(path.read_text())
+                historical_manifest["evidence"]["approvals"].append(
+                    {
+                        "scenario_id": "B",
+                        "kind": "terraform-plan",
+                        "plan_receipt_sha256": plan_receipt_hash,
+                        "approval_sha256": approval_hash,
+                        "approval_path": str(approval_path),
+                        "expires_at": "2026-07-14T04:00:00Z",
+                        "verified_at": "2026-07-14T01:00:20Z",
+                    }
+                )
+                historical_manifest["scenarios"]["B"].update(
+                    {
+                        "terraform_plan_receipt": f"{plan_sha}:{plan_receipt_hash}:{approval_hash}",
+                        "terraform_applied": True,
+                        "terraform_noop_receipt": f"{noop_sha}:{noop_receipt_hash}",
+                    }
+                )
+                manifest_schema._validate_control_manifest(historical_manifest)
+                path.write_text(json.dumps(historical_manifest))
     if bind_resolved:
         acceptance.control_manifest_bind_scenario(
             path,

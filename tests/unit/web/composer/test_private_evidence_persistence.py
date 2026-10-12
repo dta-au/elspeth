@@ -271,6 +271,55 @@ async def test_normal_private_evidence_retains_monotone_contiguous_cohort(privat
 
 
 @pytest.mark.asyncio
+async def test_transcript_sql_excludes_dedicated_private_payload_before_hydration(private_writer, monkeypatch):
+    service, session, context, evidence = private_writer
+    await service.persist_compose_turn_async(**_normal_kwargs(session, context, evidence))
+    rows = await service.get_messages(session.id, limit=None)
+    private_row = rows[2]
+    calls = [{"_kind": "composer_diagnostic_evidence", "damaged_body": "x" * (1024 * 1024)}]
+    with service._engine.begin() as conn:
+        conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == str(private_row.id)).values(tool_calls=calls))
+    raw = await service.get_messages(session.id, limit=None)
+    assert raw[2].tool_calls[0]["damaged_body"] == "x" * (1024 * 1024)
+    convert = service._row_to_chat_message_record
+
+    def reject_private_hydration(row, *, operation_id=None):
+        assert row.id != str(private_row.id)
+        return convert(row, operation_id=operation_id)
+
+    monkeypatch.setattr(service, "_row_to_chat_message_record", reject_private_hydration)
+    transcript = await service.get_messages(session.id, limit=None, include_private_evidence=False)
+    assert [row.id for row in transcript] == [row.id for row in rows[:2]]
+    assert [row.role for row in transcript] == ["assistant", "tool"]
+    assert await service.get_messages(session.id, limit=1, offset=1, include_private_evidence=False) == transcript[1:]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("violation", ["mixed_first", "mixed_last", "wrong_role", "wrong_writer"])
+async def test_transcript_sql_refuses_corrupt_private_custody_without_hydration(private_writer, violation, monkeypatch):
+    service, session, context, evidence = private_writer
+    await service.persist_compose_turn_async(**_normal_kwargs(session, context, evidence))
+    rows = await service.get_messages(session.id, limit=None)
+    calls = [evidence.to_envelope()]
+    values = {"tool_calls": calls}
+    if violation.startswith("mixed"):
+        calls.insert(0 if violation == "mixed_last" else 1, {"_kind": "llm_call_audit"})
+    elif violation == "wrong_role":
+        values["role"] = "assistant"
+    else:
+        values["writer_principal"] = "route_user_message"
+    with service._engine.begin() as conn:
+        conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == str(rows[2].id)).values(**values))
+
+    def forbid_hydration(*args, **kwargs):
+        raise AssertionError("Corrupt custody must refuse before payload hydration")
+
+    monkeypatch.setattr(service, "_row_to_chat_message_record", forbid_hydration)
+    with pytest.raises(AuditIntegrityError, match="dedicated Composer audit row"):
+        await service.get_messages(session.id, limit=None, include_private_evidence=False)
+
+
+@pytest.mark.asyncio
 async def test_numeric_domain_argument_error_keeps_checkpoint_and_explicit_unavailable_evidence(private_writer):
     service, session, context, _ = private_writer
     call = _AdmittedToolCall("numeric-call", _AdmittedToolFunction("get_pipeline_state", json.dumps({"limit": 2**60})))

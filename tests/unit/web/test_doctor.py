@@ -977,16 +977,21 @@ def test_bad_url_contract_prevents_target_comparison_and_all_database_work(tmp_p
             "session_schema",
             SchemaState.STALE,
             False,
-            "stale; drop and recreate the session database, then rerun doctor",
+            "stale; preserve the session database; select an explicitly new compatible store, then rerun doctor",
         ),
         ("landscape_schema", SchemaState.CURRENT, True, "current"),
         ("landscape_schema", SchemaState.MISSING, False, "missing; rerun with --init-schema"),
-        ("landscape_schema", SchemaState.PARTIAL, False, "partial; rerun with --init-schema"),
+        (
+            "landscape_schema",
+            SchemaState.PARTIAL,
+            False,
+            "partial; preserve the Landscape database; select an explicitly new compatible store, then rerun doctor",
+        ),
         (
             "landscape_schema",
             SchemaState.STALE,
             False,
-            "stale; drop and recreate the Landscape database, then rerun doctor",
+            "stale; preserve the Landscape database; select an explicitly new compatible store, then rerun doctor",
         ),
     ],
 )
@@ -1187,7 +1192,7 @@ def test_inspect_database_stale_schema_after_proven_tls_does_not_read_as_transpo
     assert check == ContractCheck(
         "session_schema",
         False,
-        "stale; drop and recreate the session database, then rerun doctor",
+        "stale; preserve the session database; select an explicitly new compatible store, then rerun doctor",
     )
     assert tls_check == ContractCheck(
         "session_tls",
@@ -1239,11 +1244,11 @@ def test_initialize_database_runs_initializer_then_final_probe_on_new_connection
         ),
         (
             SessionSchemaError("secret compatibility cause"),
-            "stale; drop and recreate the session database, then rerun doctor",
+            "stale; preserve the session database; select an explicitly new compatible store, then rerun doctor",
         ),
         (
             SchemaCompatibilityError("secret compatibility cause"),
-            "stale; drop and recreate the session database, then rerun doctor",
+            "stale; preserve the session database; select an explicitly new compatible store, then rerun doctor",
         ),
         (RuntimeError("secret operational cause"), "session schema initialization failed (RuntimeError)"),
     ],
@@ -1330,7 +1335,7 @@ def test_init_mode_inspects_both_before_initializing_both_repairable_targets(tmp
 
     events: list[str] = []
     _patch_auxiliary_checks_green(monkeypatch)
-    _patch_database_states(monkeypatch, SchemaState.MISSING, SchemaState.PARTIAL, events)
+    _patch_database_states(monkeypatch, SchemaState.MISSING, SchemaState.MISSING, events)
 
     def initialize(label: str, _url: str, _probe: object, _init: object) -> ContractCheck:
         events.append(f"init:{label}")
@@ -1354,6 +1359,7 @@ def test_init_mode_inspects_both_before_initializing_both_repairable_targets(tmp
     ("session", "landscape"),
     [
         (SchemaState.MISSING, SchemaState.STALE),
+        (SchemaState.MISSING, SchemaState.PARTIAL),
         (SchemaState.MISSING, None),
     ],
 )
@@ -1389,7 +1395,7 @@ def test_any_auxiliary_preflight_failure_blocks_all_initializers(
 
     events: list[str] = []
     _patch_auxiliary_checks_green(monkeypatch)
-    _patch_database_states(monkeypatch, SchemaState.MISSING, SchemaState.PARTIAL, events)
+    _patch_database_states(monkeypatch, SchemaState.MISSING, SchemaState.MISSING, events)
     if failed_kind == "filesystem":
         monkeypatch.setattr(
             doctor,
@@ -1453,7 +1459,7 @@ def test_first_init_success_and_second_failure_are_reported_truthfully(tmp_path:
 
     events: list[str] = []
     _patch_auxiliary_checks_green(monkeypatch)
-    _patch_database_states(monkeypatch, SchemaState.MISSING, SchemaState.PARTIAL, events)
+    _patch_database_states(monkeypatch, SchemaState.MISSING, SchemaState.MISSING, events)
 
     def initialize(label: str, _url: str, _probe: object, _init: object) -> ContractCheck:
         events.append(f"init:{label}")

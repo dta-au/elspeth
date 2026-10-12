@@ -6,6 +6,7 @@ import asyncio
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, Final, cast
 
@@ -19,6 +20,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedAssistantMessage,
     _AdmittedLLMCompletion,
     _AdmittedLLMProviderMetadata,
+    _AdmittedToolBatch,
 )
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import (
@@ -28,6 +30,7 @@ from elspeth.web.composer.llm_response_parsing import (
     build_llm_call_record,
     supports_anthropic_prompt_cache_markers,
 )
+from elspeth.web.composer.private_diagnostic_facts import bind_received_response, capture_received_response
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
@@ -643,6 +646,7 @@ class ProviderGateway:
         error_class: str | None = None
         error_message: str | None = None
         failure_to_capture: Exception | None = None
+        recovery_batch: _AdmittedToolBatch | None = None
         try:
             completion = await asyncio.wait_for(
                 self._call_llm(wire_messages, wire_tools, provider_custody=provider_custody)
@@ -657,6 +661,8 @@ class ProviderGateway:
             response_metadata = completion.provider_metadata
             from elspeth.web.composer.recovery_controls import RECOVERY_TOOL_NAMES
 
+            if any(tool.function.name in RECOVERY_TOOL_NAMES for tool in completion.tool_batch.calls):
+                recovery_batch = completion.tool_batch
             recovery_only = bool(wire_tools) and all(tool["function"]["name"] in RECOVERY_TOOL_NAMES for tool in wire_tools)
             if recovery_only and (
                 any(call.function.name not in RECOVERY_TOOL_NAMES for call in completion.tool_batch.calls)
@@ -748,6 +754,43 @@ class ProviderGateway:
                             failure=failure_to_capture,
                             private_request=private_request,
                         )
+                        if recovery_batch is not None:
+                            if call.call_id is None:
+                                raise AuditIntegrityError("Received recovery control has no physical provider call identity")
+                            # Terminal controls bypass ordinary dispatch. Retain
+                            # their received arguments through the same bounded,
+                            # credential-filtered private evidence channel.
+                            received = capture_received_response(
+                                {
+                                    "choices": [
+                                        {
+                                            "message": {
+                                                "tool_calls": [
+                                                    {
+                                                        "id": tool.id,
+                                                        "function": {
+                                                            "name": tool.function.name,
+                                                            "arguments": tool.function.arguments,
+                                                        },
+                                                    }
+                                                    for tool in recovery_batch.calls
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                },
+                                namespace=call.call_id,
+                                ordinal=1,
+                                known_tools=frozenset(tool["function"]["name"] for tool in wire_tools),
+                            )
+                            call = replace(
+                                call,
+                                private_diagnostics=bind_received_response(
+                                    received,
+                                    physical_call_id=call.call_id,
+                                    refusal_code=None if status is ComposerLLMCallStatus.SUCCESS else error_message,
+                                ),
+                            )
                         if provider_custody is not None:
                             provider_custody.retain_audit(call)
                         if recorder is not None:

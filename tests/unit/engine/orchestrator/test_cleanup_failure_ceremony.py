@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -529,7 +530,22 @@ class TestCleanupDiagnosticAttribution:
             code = code.replace(co_name=HostileString("generated"))
         else:
             code = code.replace(co_qualname=HostileString("generated"))
-        record, summary = self._capture_failure(FunctionType(code, globals()))
+        generated = FunctionType(code, globals())
+
+        def invoke_generated_without_tracing() -> None:
+            # Coverage indexes frame filenames before application code runs,
+            # invoking a hostile str subclass itself. Only the synthetic frame
+            # is untraced; restore the tracer before cleanup handles its error.
+            tracer = sys.gettrace()
+            sys.settrace(None)
+            try:
+                generated()
+            finally:
+                sys.settrace(tracer)
+
+        original_tracer = sys.gettrace()
+        record, summary = self._capture_failure(invoke_generated_without_tracing)
+        assert sys.gettrace() is original_tracer
         assert not invoked
         assert record["node_id"] == "node-a"
         assert "ordinary" in summary

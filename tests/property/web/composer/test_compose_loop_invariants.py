@@ -9,7 +9,7 @@ import os
 import sqlite3
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -132,6 +132,8 @@ class _Harness:
 @dataclass(frozen=True, slots=True)
 class _TraceOutcome:
     cancellation_arrival_time: CancellationArrivalTime
+    operation_id: str
+    operation_epoch: int
     cancelled: bool
     assistant_ids: frozenset[str]
     tool_call_ids: frozenset[str]
@@ -271,7 +273,8 @@ def _chat_rows(harness: _Harness) -> tuple[Any, ...]:
         return tuple(
             conn.execute(
                 text(
-                    "SELECT id, role, sequence_no, tool_calls, tool_call_id, parent_assistant_id, composition_state_id, content "
+                    "SELECT id, session_id, role, sequence_no, tool_calls, tool_call_id, "
+                    "parent_assistant_id, composition_state_id, content "
                     "FROM chat_messages WHERE session_id = :session_id ORDER BY sequence_no"
                 ),
                 {"session_id": harness.session_id},
@@ -356,6 +359,34 @@ def _tool_call_payload(tool_call: ToolCallSpec, argument_dict: Mapping[str, obje
     return {"id": tool_call.call_id, "name": "get_pipeline_state", "arguments": {}}
 
 
+@contextlib.contextmanager
+def _instrument_tool_turn_commits(harness: _Harness, instrument: Callable[[Any], None]) -> Iterator[None]:
+    """Instrument the tool persistence worker, never an unrelated checkpoint."""
+    service = harness.sessions_service
+    real_persist = service.persist_compose_turn
+    real_commit = service._engine.dialect.do_commit
+    active_threads: set[int] = set()
+
+    def persist(**kwargs: Any) -> Any:
+        thread_id = threading.get_ident()
+        assert thread_id not in active_threads
+        active_threads.add(thread_id)
+        try:
+            return real_persist(**kwargs)
+        finally:
+            active_threads.remove(thread_id)
+
+    def commit(connection: Any) -> None:
+        if threading.get_ident() in active_threads:
+            instrument(connection)
+        else:
+            real_commit(connection)
+
+    with patch.object(service, "persist_compose_turn", side_effect=persist), patch.object(service._engine.dialect, "do_commit", commit):
+        yield
+    assert not active_threads
+
+
 async def _drive_trace_async(
     harness: _Harness,
     *,
@@ -416,8 +447,11 @@ async def _drive_trace_async(
         release_commit = threading.Event()
         commit_finished = threading.Event()
         commit_errors: list[BaseException] = []
+        target_commits = 0
 
         def _gated_commit(dbapi_conn: object) -> None:
+            nonlocal target_commits
+            target_commits += 1
             try:
                 commit_started.set()
                 if not release_commit.wait(timeout=10.0):
@@ -429,8 +463,7 @@ async def _drive_trace_async(
             finally:
                 commit_finished.set()
 
-        harness.sessions_service._engine.dialect.do_commit = _gated_commit
-        try:
+        with _instrument_tool_turn_commits(harness, _gated_commit):
             task = asyncio.create_task(_run_one_turn(harness, llm))
             for _ in range(200):
                 if commit_started.is_set():
@@ -453,8 +486,7 @@ async def _drive_trace_async(
             if commit_errors:
                 raise AssertionError("property trace shielded COMMIT failed after caller cancellation") from commit_errors[0]
             await _wait_for_tool_rows(harness)
-        finally:
-            harness.sessions_service._engine.dialect.do_commit = original_do_commit
+        assert target_commits == 1
         return True
 
     if cancellation_arrival_time == "during_advisory_lock_acquisition":
@@ -530,14 +562,33 @@ async def _drive_trace_async(
 
 async def _wait_for_tool_rows(harness: _Harness) -> None:
     for _ in range(1000):
-        # Tail check, not exact-equality: when session_state='has_prior_state'
-        # the harness pre-inserts a legitimate 'user' chat row, so a successful
-        # turn persists ['user', 'assistant', 'tool']. The invariant under test
-        # is that the assistant+tool pair was persisted, regardless of prior rows.
-        if [row.role for row in _chat_rows(harness)][-2:] == ["assistant", "tool"]:
+        # Private evidence is a third atomic sibling, not conversation text.
+        rows = _chat_rows(harness)
+        if [row.role for row in rows][-3:] == ["assistant", "tool", "audit"]:
+            _assert_private_tool_cohort(
+                rows[-3:], harness.compose_context.fence.operation_id, harness.compose_context.fence.operation_epoch
+            )
             return
         await asyncio.sleep(0.01)
     pytest.fail("property trace did not persist assistant/tool rows within 10s")
+
+
+def _assert_private_tool_cohort(rows: tuple[Any, ...], operation_id: str, operation_epoch: int) -> None:
+    from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+
+    assistant, tool, private = rows
+    assert tool.parent_assistant_id == assistant.id
+    assert assistant.session_id == tool.session_id == private.session_id
+    envelopes = json.loads(private.tool_calls)
+    assert len(envelopes) == 1
+    evidence = ComposerDiagnosticEvidence.from_envelope(
+        envelopes[0],
+        expected_session_id=tool.session_id,
+        expected_operation_id=operation_id,
+        expected_tool_call_id=tool.tool_call_id,
+    )
+    assert evidence.status == "success"
+    assert evidence.operation_epoch == operation_epoch
 
 
 def _drive_single_example_trace(
@@ -599,6 +650,8 @@ def _drive_single_example_trace_with(
             )
     outcome = _TraceOutcome(
         cancellation_arrival_time=cancellation_arrival_time,
+        operation_id=harness.compose_context.fence.operation_id,
+        operation_epoch=harness.compose_context.fence.operation_epoch,
         cancelled=cancelled,
         assistant_ids=frozenset(row.id for row in _chat_rows(harness) if row.role == "assistant"),
         tool_call_ids=frozenset(row.tool_call_id for row in _chat_rows(harness) if row.role == "tool"),
@@ -671,14 +724,12 @@ def _drive_commit_failure_trace(
             _make_llm_response(content="Done."),
         )
     )
-    harness.sessions_service._engine.dialect.do_commit = _fail_once
-    try:
+    with _instrument_tool_turn_commits(harness, _fail_once):
         from elspeth.contracts.errors import AuditIntegrityError
 
         with pytest.raises(AuditIntegrityError):
             asyncio.run(_run_one_turn(harness, llm))
-    finally:
-        harness.sessions_service._engine.dialect.do_commit = original_do_commit
+    assert fired, "failure injection must reach the tool persistence commit"
 
 
 def _drive_tool_call_cap_trace(harness: _Harness) -> None:
@@ -820,7 +871,8 @@ def test_compose_loop_audit_machine_examples(cancellation_arrival_time: Cancella
         "after_commit_before_response_yielded",
         "after_response_yielded",
     }:
-        assert [row.role for row in outcome.rows] == ["assistant", "tool"]
+        assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit"]
+        _assert_private_tool_cohort(outcome.rows, outcome.operation_id, outcome.operation_epoch)
     if cancellation_arrival_time in {
         "before_llm_call",
         "during_llm_call",

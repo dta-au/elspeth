@@ -37,6 +37,51 @@ from sqlalchemy.sql.schema import Constraint, Table
 
 from elspeth.contracts.trust_boundary import trust_boundary
 
+
+def database_target_is_empty(bind: Engine | Connection) -> bool:
+    """Prove an empty application target, allowing preconfigured default ACLs."""
+    if isinstance(bind, Engine):
+        with bind.connect() as connection:
+            return _connection_target_is_empty(connection)
+    return _connection_target_is_empty(bind)
+
+
+def _connection_target_is_empty(bind: Connection) -> bool:
+    """Read target occupancy without acquiring or exporting a connection."""
+    if bind.dialect.name == "sqlite":
+        return (
+            bind.exec_driver_sql("SELECT 1 FROM sqlite_master LIMIT 1").first() is None
+            and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0
+            and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0
+        )
+    if bind.dialect.name == "postgresql":
+        # Namespace dependencies cover all schema-owned object families. Default
+        # ACLs are permission policy installed by supported provisioning before
+        # initialization; preserve them without treating them as application data.
+        return (
+            bind.execute(
+                text(
+                    """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_namespace AS namespace
+                    WHERE namespace.nspname = pg_catalog.current_schema()
+                      AND namespace.nspname <> 'information_schema'
+                      AND pg_catalog.left(namespace.nspname::text, 3) <> 'pg_'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_depend AS dependency
+                          WHERE dependency.refclassid = 'pg_catalog.pg_namespace'::pg_catalog.regclass
+                            AND dependency.refobjid = namespace.oid
+                            AND dependency.classid <> 'pg_catalog.pg_default_acl'::pg_catalog.regclass
+                      )
+                )
+                """
+                )
+            ).scalar_one()
+            is True
+        )
+    return False
+
+
 if TYPE_CHECKING:
     from sqlalchemy.engine.interfaces import (
         ReflectedCheckConstraint,

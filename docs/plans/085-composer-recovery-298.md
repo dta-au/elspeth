@@ -1,10 +1,15 @@
 # Composer graph recovery (#298)
 
-Implement the reviewed 0.8.5 requirement: the provider can end any authoring
+Implement the reviewed Composer fix: the provider can end any authoring
 turn by parking a graph, resetting to the exact turn start or the latest safe
 editable checkpoint, or restoring an explicitly selected parked graph. The
 same response carries its message to the user. Accepted controls cannot
 re-enter the provider, advisor or repair loop.
+
+John's 13 October direction places this fix in the combined diagnostics landing;
+the next release is 0.8.4. The historical worktree and document names do not
+defer this fix to 0.8.5. Unrelated release work remains paused until Composer
+lands on main.
 
 The isolated implementation starts at `e6554404344d47ad94567f395339b02b4c13dd31`
 (the committed #297 fixes). This is an older emergency precursor, not the final

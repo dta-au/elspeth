@@ -872,7 +872,7 @@ async def _run_composer_turn(
     else:
         # E5 verified exact latest-user and saved-outcome guards, including
         # interrupted tool prefixes. Assert that same target under our lease.
-        records = await service.get_messages(session.id, limit=None)
+        records = await service.get_messages(session.id, limit=None, include_private_evidence=False)
         recompose_conversation = _composer_conversation_messages(records)
         latest_user = next((row for row in reversed(recompose_conversation) if row.role == "user"), None)
         if latest_user is None or latest_user.id != request.expected_user_message_id:
@@ -994,7 +994,8 @@ async def _run_composer_turn(
                 )
                 parent_id = uuid4()
                 # A refused action cannot publish prospective success wording.
-                # The provider's original words remain in its audited call.
+                # The received control arguments remain in private diagnostic
+                # evidence, bound to the physical provider call and operation.
                 content = recovery_intent.message if recovery.failure_reason is None else compose_graph_recovery_refusal_message()
                 recovery_assistant_write = ComposerOperationAssistantWrite(
                     message_id=parent_id,

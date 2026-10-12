@@ -347,7 +347,7 @@ async def _preflight_session_tool_call_ids(
     if sessions_service is None or session_id is None:
         return
 
-    prior_messages = await sessions_service.get_messages(session_id, limit=None)
+    prior_messages = await sessions_service.get_messages(session_id, limit=None, include_private_evidence=False)
     prior_tool_call_ids = {
         message.tool_call_id for message in prior_messages if message.role == "tool" and message.tool_call_id is not None
     }

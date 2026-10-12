@@ -176,9 +176,10 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert f"From 0.8.0 to {CURRENT_VERSION}" in current_text
     assert f"Sessions epoch {SESSION_SCHEMA_EPOCH}" in current_text
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_text
-    assert "Upgrades from 0.8.1 or 0.8.2 advance the session store from epoch 71 to 72" in current_text
+    assert "Qualification uses explicitly new compatible stores" in current_text
     assert f"Keep a Landscape database already at epoch {SQLITE_SCHEMA_EPOCH}" in current_text
-    assert "recreate the session database and its sidecars" in current_text
+    assert "preserved and refused before incompatible writes" in current_text
+    assert "Do not recreate, delete, restamp or migrate them" in current_text
     assert "ordinary freeform composition" in current_text
     release_082 = soup.select('[data-release="0.8.2"]')
     assert len(release_082) == 1

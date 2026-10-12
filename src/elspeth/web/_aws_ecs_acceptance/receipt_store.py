@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import stat
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
+
+from elspeth.web._acceptance_common.schema_facts import _require_supported_deployment_scenario
 
 from .contracts import MAX_CONTROL_DOCUMENT_BYTES, AcceptanceCheckError, _control_timestamp, _sha256, _utc_timestamp
 from .manifest_schema import (
@@ -35,6 +36,8 @@ def receipt_store(
 ) -> str:
     """Persist one receipt while serializing its manifest state transition."""
 
+    if kind == "compatibility-record":
+        _require_supported_deployment_scenario(scenario_id)
     with _receipt_manifest_write_lock(manifest_path, check="receipt_store_write"):
         return _receipt_store_locked(
             manifest_path,
@@ -56,23 +59,19 @@ def _require_compatibility_receipt_binding(
 ) -> None:
     """Bind one schema-validated compatibility receipt to the resolved scenario, image, and clock."""
 
+    _require_supported_deployment_scenario(scenario_id)
     inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
     values = cast(dict[str, object], inventory["values"])
     ecr = cast(dict[str, object], manifest["ecr"])
-    previous = values["PREVIOUS_TASK_DEFINITION"] if scenario_id == "B" else ""
-    rollback_doctor = values["ROLLBACK_DOCTOR_TASK_DEFINITION"] if scenario_id == "B" else ""
-    baseline_tag = ecr["baseline_tag"] if scenario_id == "B" else ""
-    baseline_match = re.search(r"baseline-([0-9a-f]{40})$", cast(str, baseline_tag)) if baseline_tag else None
-    previous_source_sha = baseline_match.group(1) if baseline_match is not None else None
     if (
         document["acceptance_run_id_sha256"] != _sha256(cast(str, manifest["acceptance_run_id"]).encode())
         or document["candidate_image_digest"] != ecr["candidate_digest"]
         or document["candidate_task_definition_sha256"] != _sha256(cast(str, values["CANDIDATE_TASK_DEFINITION"]).encode())
         or document["candidate_doctor_task_definition_sha256"] != _sha256(cast(str, values["DOCTOR_TASK_DEFINITION"]).encode())
-        or document["previous_source_sha"] != previous_source_sha
-        or document["previous_image_digest"] != (ecr["baseline_digest"] if scenario_id == "B" else None)
-        or document["previous_task_definition_sha256"] != (_sha256(cast(str, previous).encode()) if previous else None)
-        or document["rollback_doctor_task_definition_sha256"] != (_sha256(cast(str, rollback_doctor).encode()) if rollback_doctor else None)
+        or document["previous_source_sha"] is not None
+        or document["previous_image_digest"] is not None
+        or document["previous_task_definition_sha256"] is not None
+        or document["rollback_doctor_task_definition_sha256"] is not None
         or _control_timestamp(document["expires_at"]) <= now()
     ):
         raise AcceptanceCheckError("receipt_store_binding")

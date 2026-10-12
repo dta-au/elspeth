@@ -897,7 +897,7 @@ def register_session_routes(router: APIRouter) -> None:
         # Give structurally invalid fork targets their stable public status
         # before reserving durable retry state. The service rechecks under the
         # parent write lock so this read is never relied on for integrity.
-        parent_messages = await service.get_messages(session_id, limit=None)
+        parent_messages = await service.get_messages(session_id, limit=None, include_private_evidence=False)
         fork_target = next((message for message in parent_messages if message.id == body.from_message_id), None)
         if fork_target is None:
             raise HTTPException(status_code=404, detail=f"Message {body.from_message_id} not found")

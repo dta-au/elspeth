@@ -17,6 +17,16 @@ fact, the receipt records a sanitized projection of it.
 > a receipt is an outstanding closure condition. See
 > [Deployment Platforms](../reference/deployment-platforms.md) for support scope.
 
+> **Temporary deployment policy:** only fresh/new stores are supported until
+> this policy is explicitly revised; there is no fixed expiry. Scenario A
+> attests initial creation only. Existing-store transitions are unsupported,
+> including old approved receipts. Compatibility receipt envelopes for an
+> unsupported scenario fail with `compatibility_transition_unsupported`;
+> records with a foreign scenario or obsolete format fail schema validation.
+> Preserve existing stores: do not delete, recreate, restamp, migrate or
+> silently modify them to satisfy the candidate. This document's examples are
+> prospective contract examples, not cloud acceptance evidence.
+
 The supported configuration retains `Single` revision mode, `sticky` session
 affinity and 2–4 replicas with one web process per replica. External PostgreSQL
 provides single-use tickets and durable run-event replay on authorized peer
@@ -106,7 +116,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The exact published candidate image digest (session epoch 72, Landscape epoch 49), once available, in the registry.
+- The exact published candidate image digest (session epoch 74, Landscape epoch 49), once available, in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -471,8 +481,8 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   `/mnt/elspeth/data`, `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads`
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
-  with the schema-owner URLs and initializes both schemas at session epoch 72
-  and Landscape epoch 49.
+  with the schema-owner URLs and initializes both fresh schemas at session epoch 74
+  and Landscape epoch 49. Existing stores must be preserved and refused.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
   `session_tls`, `landscape_tls`, `payload_store_writable` and
@@ -484,7 +494,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   where the process runs.
 
 > **LIVE:** for 0.8.3 acceptance, run the Jobs with the candidate digest and
-> require both schema checks to pass after initialization at session epoch 72
+> require both schema checks to pass after initial creation at session epoch 74
 > and Landscape epoch 49. Record the execution names. Any no-schema dry run
 > against a `release/0.8.0` image is predecessor-only wiring evidence; it
 > cannot establish the candidate's schema compatibility or acceptance.
@@ -536,14 +546,14 @@ digest) is what makes the custody serialisation claim hold.
 
 ## Bound release/schema compatibility record
 
-Scenario A only. The controller validates the record with
+Fresh/new-store Scenario A only. The controller validates the record with
 `compatibility-record-validate` and passes it through the shared
 `compatibility-record-gate` command (the ECS runbook keeps its `jq` fence; a
 parity test feeds one corpus through both).
 
 ```json
 {
-  "schema": "elspeth.azure-container-apps-compatibility-receipt.v1",
+  "schema": "elspeth.azure-container-apps-compatibility-receipt.v2",
   "record_id": "change-record-id",
   "acceptance_run_id": "acceptance-run-id",
   "scenario_id": "A",
@@ -558,14 +568,17 @@ parity test feeds one corpus through both).
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 72, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 74, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",
     "archive_export_decision": "not_applicable",
-    "destructive_reset_required": false
+    "destructive_reset_required": false,
+    "store_policy": "new_store_only",
+    "existing_store_action": "preserve_and_refuse",
+    "in_place_upgrade_supported": false
   },
-  "forward_compatible": true,
+  "new_store_compatible": true,
   "backward_compatible": false,
   "rollback_permitted": false,
   "decision": "approved",
@@ -576,6 +589,11 @@ parity test feeds one corpus through both).
   "expires_at": "RFC3339-UTC"
 }
 ```
+
+`new_store_compatible: true` attests initial creation, not forward migration.
+Legacy v1 compatibility receipts and Scenario B records/receipts are rejected;
+an approval does not override the policy. This is a prospective example and
+does not establish operator approval or live cloud acceptance.
 
 The `schema_facts` object is the one shared derivation (`_expected_schema_facts`
 in the acceptance package); the literals above are byte-bound to it by the

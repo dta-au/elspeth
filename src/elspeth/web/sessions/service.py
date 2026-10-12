@@ -396,6 +396,7 @@ from elspeth.web.sessions.skill_markdown_history import (
 from elspeth.web.sessions.state_envelope import envelope_state_column, unwrap_state_column
 from elspeth.web.sessions.telemetry import _SessionsTelemetry
 from elspeth.web.sessions.time_normalization import restore_utc
+from elspeth.web.sessions.transcript_reads import non_private_message_predicate, validate_transcript_private_custody
 from elspeth.web.validation import _validate_accepted_value_content
 
 if TYPE_CHECKING:
@@ -5965,8 +5966,11 @@ class SessionServiceImpl:
                 # Transcript snapshot on the SAME connection, inside the
                 # SAME transaction as the insert — this read sees its own
                 # write on every dialect, which is the entire point.
+                validate_transcript_private_custody(conn, sid)
                 message_rows = conn.execute(
-                    select(chat_messages_table).where(chat_messages_table.c.session_id == sid).order_by(chat_messages_table.c.sequence_no)
+                    select(chat_messages_table)
+                    .where(chat_messages_table.c.session_id == sid, non_private_message_predicate(conn.dialect.name))
+                    .order_by(chat_messages_table.c.sequence_no)
                 ).fetchall()
                 return message_rows
 
@@ -6014,9 +6018,13 @@ class SessionServiceImpl:
         limit: int | None = 100,
         offset: int = 0,
         *,
+        include_private_evidence: bool = True,
         required_work: RequiredWorkTicket | None = None,
     ) -> list[ChatMessageRecord]:
-        """Get messages for a session, ordered by ``sequence_no`` ascending.
+        """Get durable messages, with an explicit SQL-filtered transcript view.
+
+        Audit readers retain private custody by default. Public and provider
+        transcript readers must set ``include_private_evidence=False``.
 
         Rev-4 (B2): the canonical ordering key is ``sequence_no``, allocated
         under the per-session advisory/process write lock. ``created_at`` is
@@ -6031,7 +6039,9 @@ class SessionServiceImpl:
 
         def _sync() -> Sequence[Any]:
             with self._engine.connect() as conn:
-                message_rows = conn.execute(
+                if not include_private_evidence:
+                    validate_transcript_private_custody(conn, str(session_id))
+                statement = (
                     select(chat_messages_table, message_ingress_receipts_table.c.operation_id)
                     .select_from(
                         chat_messages_table.outerjoin(
@@ -6044,8 +6054,10 @@ class SessionServiceImpl:
                     .order_by(chat_messages_table.c.sequence_no)
                     .limit(limit)
                     .offset(offset)
-                ).fetchall()
-                return message_rows
+                )
+                if not include_private_evidence:
+                    statement = statement.where(non_private_message_predicate(conn.dialect.name))
+                return conn.execute(statement).fetchall()
 
         rows = await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync)
 
@@ -7958,7 +7970,7 @@ class SessionServiceImpl:
         fence = authority.receipt_fence
         source_session_id = fence.session_id
         source_session = await self.get_session(source_session_id)
-        source_messages = await self.get_messages(source_session_id, limit=None)
+        source_messages = await self.get_messages(source_session_id, limit=None, include_private_evidence=False)
 
         # Find the fork message — must be a user message
         fork_msg = None

@@ -64,18 +64,19 @@ All notable changes to ELSPETH are documented here.
   The image Dockerfile also requires Node 24.18.0 for the build; that
   image has not been qualified or published.
 
-**Upgrade and publication notes.** Session epoch 72 adds durable Composer jobs
-and ingress bindings; it advances from epoch 71 in the 0.8.2 candidate. The
-Landscape epoch 49 remains unchanged. Upgrading a 0.8.1/0.8.2 session store requires a
-stopped service, archive/export of needed session evidence, and recreation of
-the session database and its sidecars; there is no in-place migration. A
-Landscape database already at epoch 49 remains usable and must not be reset
-solely for this session-only change. Installations still on 0.8.0 have session
-epoch 53 and Landscape epoch 38 and must recreate both stale databases in the
-same service-stop window, as described in the
-[0.8.1 notes](#081---2026-09-10-replica-recovery-and-deployment-hardening) and
-[cutover runbook](docs/runbooks/staging-session-db-recreation.md). This is an
-unreleased source candidate. No 0.8.3 tag, image digest, registry publication,
+**Composer fixes and store compatibility.** The combined source candidate adds
+private failure evidence, ordered CSV lookups, clarification fixes and terminal
+park/reset/restore controls. Session epoch 74 adds immutable graph parks and
+operation-bound recovery checkpoints. Session epoch 72 adds durable Composer jobs
+and ingress bindings in the preceding candidate. Landscape epoch 49 remains unchanged.
+A Landscape database already at epoch 49 remains usable if its complete schema
+matches current admission. Qualification uses explicitly new compatible stores.
+Unsupported session, Landscape and local-auth stores must be preserved and refused
+before incompatible writes. Do not migrate, recreate, delete or restamp an existing
+store to satisfy this candidate; select a separately provisioned new target.
+The temporary no-backwards-compatibility window has no fixed expiry. Historical
+cutover instructions are not authority to modify existing stores for this fix.
+This is an unreleased source candidate. No 0.8.3 tag, image digest, registry publication,
 live cloud qualification or production readiness is established here. The
 streaming work retains all 102 original obligations and four supplemental
 collections; two original reports remain unavailable. Final default Python,

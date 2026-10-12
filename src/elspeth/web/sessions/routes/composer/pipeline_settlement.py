@@ -217,11 +217,11 @@ async def _proposal_user_message_content(
     if proposal.user_message_id is None:
         return None
     if required_work is None:
-        messages = await service.get_messages(proposal.session_id, limit=None)
+        messages = await service.get_messages(proposal.session_id, limit=None, include_private_evidence=False)
     else:
         messages = await _required_preparation_read(
             required_work,
-            lambda ticket: service.get_messages(proposal.session_id, limit=None, required_work=ticket),
+            lambda ticket: service.get_messages(proposal.session_id, limit=None, include_private_evidence=False, required_work=ticket),
             lambda value: _project_preparation_messages(value, proposal.session_id),
             state=cancellation_state,
         )
@@ -253,11 +253,11 @@ async def _proposal_chat_ingress_inputs(
     if proposal.user_message_id is None:
         return []
     if required_work is None:
-        messages = await service.get_messages(proposal.session_id, limit=None)
+        messages = await service.get_messages(proposal.session_id, limit=None, include_private_evidence=False)
     else:
         messages = await _required_preparation_read(
             required_work,
-            lambda ticket: service.get_messages(proposal.session_id, limit=None, required_work=ticket),
+            lambda ticket: service.get_messages(proposal.session_id, limit=None, include_private_evidence=False, required_work=ticket),
             lambda value: _project_preparation_messages(value, proposal.session_id),
             state=cancellation_state,
         )

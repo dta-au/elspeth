@@ -21,6 +21,13 @@ post-enable acceptance program, Scenario B, and upgrade/teardown lifecycle.
 
 ## Choose a topology
 
+**Temporary deployment policy:** only fresh/new stores are supported until
+explicit revision; this policy has no fixed expiry. Preserve existing stores:
+do not delete, recreate, restamp, migrate or silently modify them to satisfy a
+candidate. An approved historical compatibility record does not authorize an
+existing-store transition. The acceptance controller refuses Scenario B with
+`compatibility_transition_unsupported` before compatibility admission.
+
 ### Scenario A: cold install (recommended)
 
 `scenario-a/` is the normal path. It creates a fresh VPC, ECS service, Aurora
@@ -36,6 +43,11 @@ ELSPETH scheduler leaders, multi-host followers, or multiple web replicas. See
 [ADR-041](../../../docs/architecture/adr/041-state-engine-supported-profiles.md).
 
 ### Scenario B: OIDC acceptance variant
+
+**Historical reference — currently unsupported.** Do not apply Scenario B or
+run its upgrade/rollback exercises. Its retained inputs and procedures describe
+the legacy acceptance topology; they do not authorize provisioning or schema
+initialization under the current fresh-store-only policy.
 
 `scenario-b/` exists only for acceptance of the Cognito/OIDC path and upgrade
 or rollback exercises. Its state key, namespace, networking, database, secrets,
@@ -518,7 +530,8 @@ inventory derives the candidate baseline and absolute tracked source paths from
 the package itself. `scenario-a/codeblind-compatibility.json` records the
 standalone-install facts and the absence of a pre-existing transaction-search
 baseline. It is deterministic package metadata, not an acceptance binding
-artifact. Scenario B retains its acceptance-only inputs.
+artifact. Scenario B retains historical acceptance-only inputs but is not an
+admissible current deployment.
 
 Use only an explicitly selected workspace. The `default` workspace is the
 documented cold-install choice. Re-run the account and region checks before
@@ -1260,12 +1273,18 @@ verify_candidate_service "$ECS_CLUSTER" "$ECS_SERVICE" \
 
 ## Scenario B
 
+**Historical reference — unsupported.** Do not execute the following commands.
+Scenario B stops before storage provisioning or schema initialization; neither
+a fresh account nor an old approved receipt enables this transition.
+
 Use the B backend and tfvars examples only when the OIDC acceptance variant is
 required. Reuse the same `run_id` and permissions-boundary output from the
 single bootstrap; `scenario_id` already isolates Scenario B's names, networks,
 state, and resources from Scenario A:
 
 ```sh
+printf '%s\n' compatibility_transition_unsupported >&2
+exit 64
 terraform -chdir=scenario-b init \
   -backend-config=../examples/scenario-b.s3.tfbackend
 terraform -chdir=scenario-b workspace show
@@ -1281,6 +1300,8 @@ re-apply with the value to bind the acceptance identity; the acceptance
 inventory check refuses to run while the pool has no bound subject:
 
 ```sh
+printf '%s\n' compatibility_transition_unsupported >&2
+exit 64
 POOL_ID=$(terraform -chdir=scenario-b output -json resolved_inventory \
   | jq -er '.values.COGNITO_USER_POOL_ID')
 aws cognito-idp admin-create-user \

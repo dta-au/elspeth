@@ -21,6 +21,7 @@ from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.web._acceptance_common.schema_facts import _require_supported_deployment_scenario
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.config import settings_from_env
@@ -759,6 +760,11 @@ def _storage_metadata(path: Path) -> os.stat_result:
 def provision_storage() -> dict[str, object]:
     """Create and prove the required EFS-backed directories as the image user."""
 
+    try:
+        scenario_id = os.environ["ELSPETH_ACCEPTANCE_SCENARIO_ID"]
+    except KeyError:
+        raise AcceptanceCheckError("compatibility_transition_unsupported") from None
+    _require_supported_deployment_scenario(scenario_id)
     try:
         settings = settings_from_env()
         data_dir = settings.data_dir

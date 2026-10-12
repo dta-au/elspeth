@@ -41,6 +41,7 @@ from elspeth.web._acceptance_common.schema_facts import _ROLLBACK_BASELINE_SESSI
 from elspeth.web._acceptance_common.schema_facts import _ROLLBACK_PACKAGE_VERSION as _ROLLBACK_PACKAGE_VERSION
 from elspeth.web._acceptance_common.schema_facts import _SCENARIO_B_STRUCTURAL_CHANGES as _SCENARIO_B_STRUCTURAL_CHANGES
 from elspeth.web._acceptance_common.schema_facts import _expected_schema_facts as _expected_schema_facts
+from elspeth.web._acceptance_common.schema_facts import _require_supported_deployment_scenario, _schema_facts_equal
 from elspeth.web._acceptance_common.testcontainer_run import TESTCONTAINER_RUN_RECEIPT_KIND as TESTCONTAINER_RUN_RECEIPT_KIND
 from elspeth.web._acceptance_common.testcontainer_run import validate_testcontainer_run_receipt as validate_testcontainer_run_receipt
 
@@ -708,14 +709,14 @@ def _validate_event_canary_receipt(payload: object) -> dict[str, object]:
 
 @trust_boundary(
     tier=3,
-    source="an untrusted forward/backward compatibility receipt read back from the acceptance receipt store",
+    source="an untrusted new-store compatibility receipt read back from the acceptance receipt store",
     source_param="payload",
     suppresses=("R1", "R5"),
     invariant=(
-        "raises AcceptanceCheckError('receipt_store_schema' or 'receipt_store_binding') before use unless the payload "
-        "is a dict with exactly the v2 compatibility fields bound to the caller's record hash, scenario, and candidate "
-        "sha, carries the rollback identity the scenario demands and no other, and attests exactly the truthful "
-        "release and schema-epoch facts this build derives"
+        "raises AcceptanceCheckError('receipt_store_schema', 'receipt_store_binding' or 'compatibility_transition_unsupported') before use unless the payload "
+        "is a dict with exactly the v3 compatibility fields bound to the caller's record hash, scenario, and candidate "
+        "sha under Scenario A, carries only null predecessor identities, and attests exactly the truthful "
+        "release and schema-epoch facts this build derives with exact JSON types and closed nested keys"
     ),
     test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_compatibility_receipt_rejects_open_field_set"),
     test_fingerprint="c88526cfd7860bc509d5e173514fcc2858128e9131c7b47aa1ebe69be348323d",
@@ -727,6 +728,7 @@ def _validate_compatibility_receipt(
     candidate_sha: str,
     subject_id: str | None,
 ) -> dict[str, object]:
+    _require_supported_deployment_scenario(scenario_id)
     fields = {
         "schema",
         "record_sha256",
@@ -743,7 +745,7 @@ def _validate_compatibility_receipt(
         "rollback_doctor_task_definition_sha256",
         "previous_package_version",
         "schema_facts",
-        "forward_compatible",
+        "new_store_compatible",
         "backward_compatible",
         "rollback_permitted",
         "decision",
@@ -755,14 +757,15 @@ def _validate_compatibility_receipt(
     if (
         subject_id is None
         or _SHA256_PATTERN.fullmatch(subject_id) is None
-        or payload["schema"] != "elspeth.aws-ecs-compatibility-receipt.v2"
+        or scenario_id != "A"
+        or payload["schema"] != "elspeth.aws-ecs-compatibility-receipt.v3"
         or payload["record_sha256"] != subject_id
         or payload["scenario_id"] != scenario_id
         or payload["candidate_sha"] != candidate_sha
         or type(payload["candidate_image_digest"]) is not str
         or re.fullmatch(r"sha256:[0-9a-f]{64}", payload["candidate_image_digest"]) is None
         or payload["candidate_package_version"] != _CANDIDATE_PACKAGE_VERSION
-        or payload["forward_compatible"] is not True
+        or payload["new_store_compatible"] is not True
         or payload["decision"] != "approved"
         or payload["approvals_present"] is not True
     ):
@@ -775,23 +778,7 @@ def _validate_compatibility_receipt(
     ):
         if type(payload[field]) is not str or _SHA256_PATTERN.fullmatch(payload[field]) is None:
             raise AcceptanceCheckError("receipt_store_schema")
-    previous_hash = payload["previous_task_definition_sha256"]
-    rollback_doctor_hash = payload["rollback_doctor_task_definition_sha256"]
-    previous_source_sha = payload["previous_source_sha"]
-    previous_image_digest = payload["previous_image_digest"]
-    if (scenario_id == "B") != (
-        type(previous_hash) is str
-        and _SHA256_PATTERN.fullmatch(previous_hash) is not None
-        and type(rollback_doctor_hash) is str
-        and _SHA256_PATTERN.fullmatch(rollback_doctor_hash) is not None
-        and type(previous_source_sha) is str
-        and re.fullmatch(r"[0-9a-f]{40}", previous_source_sha) is not None
-        and type(previous_image_digest) is str
-        and re.fullmatch(r"sha256:[0-9a-f]{64}", previous_image_digest) is not None
-        and payload["previous_package_version"] == _ROLLBACK_PACKAGE_VERSION
-    ):
-        raise AcceptanceCheckError("receipt_store_binding")
-    if scenario_id == "A" and any(
+    if any(
         payload[field] is not None
         for field in (
             "previous_source_sha",
@@ -809,7 +796,7 @@ def _validate_compatibility_receipt(
     ):
         raise AcceptanceCheckError("receipt_store_schema")
     expected_schema_facts = _expected_schema_facts(scenario_id)
-    if payload["schema_facts"] != expected_schema_facts:
+    if not _schema_facts_equal(payload["schema_facts"], expected_schema_facts):
         raise AcceptanceCheckError("receipt_store_binding")
     _receipt_timestamp(payload["expires_at"])
     return payload

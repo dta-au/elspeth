@@ -21,6 +21,7 @@ def engine() -> Engine:
 def _create_full(engine: Engine) -> None:
     metadata.create_all(engine)
     with engine.begin() as connection:
+        connection.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")
         insert_schema_identity(
             connection,
             schema_identity_table,
@@ -31,6 +32,25 @@ def _create_full(engine: Engine) -> None:
 
 def test_zero_user_tables_are_empty(engine: Engine) -> None:
     assert probe_schema_shape(engine) is LandscapeSchemaShape.EMPTY
+
+
+@pytest.mark.parametrize(
+    "statements",
+    [
+        ("CREATE VIEW retained AS SELECT 1 AS value",),
+        (
+            "CREATE VIEW retained AS SELECT 1 AS value",
+            "CREATE TRIGGER retained_trigger INSTEAD OF INSERT ON retained BEGIN SELECT 1; END",
+        ),
+        ("PRAGMA application_id = 12345",),
+        (f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}",),
+    ],
+)
+def test_tableless_objects_or_stamps_are_not_empty(engine: Engine, statements: tuple[str, ...]) -> None:
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.exec_driver_sql(statement)
+    assert probe_schema_shape(engine) is LandscapeSchemaShape.DIVERGENT
 
 
 def test_tableless_incompatible_epoch_is_divergent(engine: Engine) -> None:
