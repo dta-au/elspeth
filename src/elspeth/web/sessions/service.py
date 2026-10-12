@@ -57,6 +57,8 @@ from elspeth.web.async_workers import (
     run_sync_in_worker,
 )
 from elspeth.web.composer.authority_hashing import composer_authority_hash
+from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent, GraphRecoveryPark, qualify_editable_checkpoint
+from elspeth.web.composer.no_tool_policy import visible_message_segments
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import (
@@ -180,6 +182,16 @@ from elspeth.web.sessions.fork_custody import (
     _refuse_unrewritable_fork_custody,
     _verify_fork_settlement_blob_custody,
 )
+from elspeth.web.sessions.graph_recovery import (
+    CompositionGraphRead,
+    CompositionStateHead,
+    GraphRecoveryAdmission,
+    GraphRecoverySettlement,
+    checkpoint_data,
+    empty_recovery_state,
+    read_editable_checkpoint,
+    recovery_identity,
+)
 from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, SessionInlineBlobSnapshot, prepare_session_inline_blob_snapshot
 from elspeth.web.sessions.interpretation_validation import (
     SessionInterpretationValidationInputs,
@@ -198,6 +210,7 @@ from elspeth.web.sessions.models import (
     audit_access_log_table,
     blobs_table,
     chat_messages_table,
+    composition_graph_parks_table,
     composition_proposals_table,
     composition_rejection_events_table,
     composition_states_table,
@@ -375,7 +388,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.protocol import (
     InterpretationResolveError as InterpretationResolveError,
 )
-from elspeth.web.sessions.schemas import MessageWithStateResponse
+from elspeth.web.sessions.schemas import ChatMessageResponse, ChatMessageSegmentResponse, MessageWithStateResponse
 from elspeth.web.sessions.skill_markdown_history import (
     RepositorySkillMarkdownHistoryAuthority,
     SkillMarkdownHistoryAuthority,
@@ -1762,6 +1775,9 @@ class SessionServiceImpl:
                 is_valid=state.is_valid,
                 validation_errors=serialize_composition_validation_errors(state.validation_errors),
                 composer_meta=_enveloped_state_column(state.composer_meta),
+                creator_operation_id=(
+                    session_operation_context.fence.operation_id if isinstance(session_operation_context, SessionOperationContext) else None
+                ),
                 derived_from_state_id=derived_from_state_id,
                 provenance=provenance,
                 created_at=created_at if created_at is not None else datetime.now(UTC),
@@ -6429,6 +6445,268 @@ class SessionServiceImpl:
         )
         return TransitionResponseSettlement(state=state_record, message=message_record)
 
+    async def get_composition_head(self, session_id: UUID) -> CompositionStateHead:
+        """Return trusted scalar graph identity without decoding graph JSON."""
+
+        def _sync() -> CompositionStateHead:
+            with self._engine.begin() as conn:
+                head = conn.execute(
+                    select(composition_states_table.c.id, composition_states_table.c.version)
+                    .where(composition_states_table.c.session_id == str(session_id))
+                    .order_by(composition_states_table.c.version.desc())
+                    .limit(1)
+                ).one_or_none()
+                if head is None:
+                    return CompositionStateHead(state_id=None, version=0)
+                if type(head.version) is not int or head.version < 1:
+                    raise AuditIntegrityError("Composition head version is invalid")
+                return CompositionStateHead(state_id=recovery_identity(head.id), version=head.version)
+
+        return cast(CompositionStateHead, await self._run_sync(_sync))
+
+    async def read_current_composition_graph(self, session_id: UUID) -> CompositionGraphRead:
+        """Hydrate the exact immutable row named by the scalar head read."""
+        from elspeth.web.execution.completion_gates import parse_completion_gates
+
+        def _sync() -> CompositionGraphRead:
+            with self._engine.begin() as conn:
+                scalar = conn.execute(
+                    select(composition_states_table.c.id, composition_states_table.c.version)
+                    .where(composition_states_table.c.session_id == str(session_id))
+                    .order_by(composition_states_table.c.version.desc())
+                    .limit(1)
+                ).one_or_none()
+                if scalar is None:
+                    return CompositionGraphRead(CompositionStateHead(None, 0), None)
+                if type(scalar.version) is not int or scalar.version < 1:
+                    raise AuditIntegrityError("Composition head version is invalid")
+                head = CompositionStateHead(recovery_identity(scalar.id), scalar.version)
+                try:
+                    row = conn.execute(
+                        select(composition_states_table).where(
+                            composition_states_table.c.id == str(head.state_id),
+                            composition_states_table.c.session_id == str(session_id),
+                        )
+                    ).one()
+                    record = self._row_to_state_record(row)
+                    if not qualify_editable_checkpoint(state_from_record(record)).eligible:
+                        raise ValueError("Stored graph cannot be reconstructed as an editable draft")
+                    parse_completion_gates(record.composer_meta)
+                except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError) as exc:
+                    return CompositionGraphRead(head, None, type(exc).__name__)
+                return CompositionGraphRead(head, record)
+
+        return cast(CompositionGraphRead, await self._run_sync(_sync))
+
+    async def load_graph_recovery_context(
+        self,
+        session_id: UUID,
+        *,
+        turn_start_state_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+    ) -> GraphRecoveryAdmission:
+        """Admit the bound scalar head before decoding any graph/gate JSON."""
+        from elspeth.web.execution.completion_gates import parse_completion_gates
+        from elspeth.web.sessions.converters import state_from_record
+
+        sid = str(session_id)
+
+        def _sync() -> GraphRecoveryAdmission:
+            with self._engine.begin() as conn:
+                self._require_session_operation_context_on_connection(
+                    conn,
+                    session_operation_context,
+                    session_id=sid,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    now=database_now(conn),
+                )
+                head = conn.execute(
+                    select(composition_states_table.c.id, composition_states_table.c.version)
+                    .where(composition_states_table.c.session_id == sid)
+                    .order_by(composition_states_table.c.version.desc())
+                    .limit(1)
+                ).one_or_none()
+                current_id = recovery_identity(head.id) if head is not None else None
+                version = head.version if head is not None else 0
+                if current_id != turn_start_state_id:
+                    raise AuditIntegrityError("Recovery admission head differs from the bound base verified under this COMPOSE lease")
+                if type(version) is not int or version < (1 if head is not None else 0):
+                    raise AuditIntegrityError("Recovery admission has invalid head version")
+                parks = []
+                for row in conn.execute(
+                    select(composition_graph_parks_table.c.id, composition_graph_parks_table.c.state_id, composition_states_table.c.version)
+                    .join(
+                        composition_states_table,
+                        and_(
+                            composition_states_table.c.id == composition_graph_parks_table.c.state_id,
+                            composition_states_table.c.session_id == composition_graph_parks_table.c.session_id,
+                        ),
+                    )
+                    .where(composition_graph_parks_table.c.session_id == sid)
+                    .order_by(composition_graph_parks_table.c.created_at.desc(), composition_graph_parks_table.c.id)
+                    .limit(100)
+                ):
+                    park_id = recovery_identity(row.id)
+                    state_id = recovery_identity(row.state_id)
+                    if type(row.version) is not int or row.version < 1:
+                        raise AuditIntegrityError("Parked graph version is invalid")
+                    parks.append(GraphRecoveryPark(park_id=str(park_id), state_id=str(state_id), version=row.version))
+                record = None
+                malformed = False
+                if current_id is not None:
+                    try:
+                        row = conn.execute(
+                            select(composition_states_table).where(
+                                composition_states_table.c.id == str(current_id),
+                                composition_states_table.c.session_id == sid,
+                            )
+                        ).one()
+                        record = self._row_to_state_record(row)
+                        if not qualify_editable_checkpoint(state_from_record(record)).eligible:
+                            raise ValueError("Stored graph cannot be reconstructed as an editable draft")
+                        parse_completion_gates(record.composer_meta)
+                    except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                        # Scope is only graph decoding, after scalar custody was
+                        # established. The damaged payload is never sent to a model.
+                        record = None
+                        malformed = True
+                return GraphRecoveryAdmission(
+                    context=GraphRecoveryContext(
+                        turn_start_state_id=str(current_id) if current_id is not None else None,
+                        turn_start_version=version,
+                        current_state_id=str(current_id) if current_id is not None else None,
+                        current_version=version,
+                        malformed_head=malformed,
+                        parked_graphs=tuple(parks),
+                    ),
+                    record=record,
+                )
+
+        return cast(GraphRecoveryAdmission, await self._run_sync(_sync))
+
+    async def prepare_graph_recovery(
+        self,
+        session_id: UUID,
+        *,
+        context: GraphRecoveryContext,
+        intent: GraphRecoveryIntent,
+        session_operation_context: SessionOperationContext,
+        candidate_state: CompositionState | None = None,
+    ) -> GraphRecoverySettlement:
+        """Freeze a qualified target without reading the abandoned candidate."""
+        sid = str(session_id)
+        operation_id = session_operation_context.fence.operation_id
+
+        def _sync() -> GraphRecoverySettlement:
+            with self._engine.begin() as conn:
+                self._require_session_operation_context_on_connection(
+                    conn,
+                    session_operation_context,
+                    session_id=sid,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    now=database_now(conn),
+                )
+                heads = conn.execute(
+                    select(
+                        composition_states_table.c.id, composition_states_table.c.version, composition_states_table.c.creator_operation_id
+                    )
+                    .where(composition_states_table.c.session_id == sid)
+                    .order_by(composition_states_table.c.version.desc())
+                ).all()
+                for row in heads:
+                    if row.version > context.turn_start_version and row.creator_operation_id != operation_id:
+                        raise StaleComposeStateError("Recovery cannot overwrite a checkpoint from another operation")
+                head = heads[0] if heads else None
+                expected_id = recovery_identity(head.id) if head is not None else None
+                version = head.version if head is not None else 0
+
+                def _refusal() -> GraphRecoverySettlement:
+                    return GraphRecoverySettlement(
+                        session_id=session_id,
+                        operation_id=operation_id,
+                        intent=intent,
+                        expected_state_id=expected_id,
+                        expected_version=version,
+                        target_state_id=None,
+                        state_id=None,
+                        data=None,
+                        park_id=None,
+                        empty_fallback=False,
+                        failure_reason="target_unavailable",
+                        receipt_id=uuid.uuid4(),
+                        malformed_head=context.malformed_head,
+                    )
+
+                target_id: UUID | None = None
+                state = None
+                park_changes_head = context.malformed_head
+                if intent.action == "park":
+                    target_id = expected_id
+                    if candidate_state is not None:
+                        try:
+                            candidate_data = checkpoint_data(candidate_state)
+                        except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                            return _refusal()
+                        state = candidate_state
+                        try:
+                            current_data = (
+                                checkpoint_data(read_editable_checkpoint(conn, session_id, expected_id))
+                                if expected_id is not None
+                                else checkpoint_data(empty_recovery_state())
+                            )
+                        except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                            park_changes_head = True
+                        else:
+                            park_changes_head = park_changes_head or candidate_data != current_data
+                elif intent.action == "reset_to_turn_start":
+                    target_id = UUID(context.turn_start_state_id) if context.turn_start_state_id is not None else None
+                elif intent.action == "restore_parked_graph":
+                    target = conn.execute(
+                        select(composition_graph_parks_table.c.state_id).where(
+                            composition_graph_parks_table.c.id == intent.park_id,
+                            composition_graph_parks_table.c.session_id == sid,
+                        )
+                    ).scalar_one_or_none()
+                    if target is None:
+                        return _refusal()
+                    target_id = UUID(target)
+                elif intent.action == "reset_to_safe_checkpoint":
+                    for row in heads:
+                        try:
+                            state = read_editable_checkpoint(conn, session_id, UUID(row.id))
+                        except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                            continue
+                        target_id = UUID(row.id)
+                        break
+                else:
+                    raise ValueError("Unknown graph recovery action")
+                if state is None and target_id is not None:
+                    try:
+                        state = read_editable_checkpoint(conn, session_id, target_id)
+                    except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                        return _refusal()
+                empty_fallback = state is None
+                if state is None:
+                    state = empty_recovery_state()
+                return GraphRecoverySettlement(
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    intent=intent,
+                    expected_state_id=expected_id,
+                    expected_version=version,
+                    target_state_id=target_id,
+                    state_id=(
+                        expected_id if intent.action == "park" and expected_id is not None and not park_changes_head else uuid.uuid4()
+                    ),
+                    data=checkpoint_data(state),
+                    park_id=uuid.uuid4() if intent.action == "park" else None,
+                    empty_fallback=empty_fallback,
+                    receipt_id=uuid.uuid4(),
+                    malformed_head=context.malformed_head,
+                )
+
+        return cast(GraphRecoverySettlement, await self._run_sync(_sync))
+
     async def get_current_state(
         self,
         session_id: UUID,
@@ -8440,6 +8718,184 @@ class SessionServiceImpl:
                 raise
         raise AuditIntegrityError("terminal retry exceeded its closed bound")
 
+    def _settle_graph_recovery_on_connection(
+        self,
+        conn: Connection,
+        *,
+        recovery: GraphRecoverySettlement,
+        context: SessionOperationContext,
+        created_at: datetime,
+    ) -> UUID | None:
+        """Apply the frozen recovery selection in the terminal transaction."""
+        sid = str(recovery.session_id)
+        if recovery.operation_id != context.fence.operation_id or sid != context.fence.session_id:
+            raise AuditIntegrityError("Graph recovery authority does not match the terminal operation")
+        head = conn.execute(
+            select(composition_states_table.c.id, composition_states_table.c.version)
+            .where(composition_states_table.c.session_id == sid)
+            .order_by(composition_states_table.c.version.desc())
+            .limit(1)
+        ).one_or_none()
+        current_id = recovery_identity(head.id) if head is not None else None
+        current_version = head.version if head is not None else 0
+        if current_id != recovery.expected_state_id or current_version != recovery.expected_version:
+            raise StaleComposeStateError("Graph recovery expected head changed before settlement")
+
+        if recovery.failure_reason is not None:
+            self._write_graph_recovery_receipt(conn, recovery=recovery, context=context, created_at=created_at)
+            return None
+        if recovery.state_id is None or recovery.data is None:
+            raise AuditIntegrityError("Successful graph recovery requires a frozen checkpoint")
+
+        if recovery.intent.action != "park" or recovery.state_id != current_id:
+            # Validate pending proposal authority before invalidating it. This
+            # retains all creation evidence and never resurrects old approvals.
+            for proposal_row in conn.execute(
+                select(composition_proposals_table)
+                .where(
+                    composition_proposals_table.c.session_id == sid,
+                    composition_proposals_table.c.tool_name == "set_pipeline",
+                    composition_proposals_table.c.status == "pending",
+                )
+                .order_by(composition_proposals_table.c.id)
+            ).all():
+                creation_rows = conn.execute(
+                    select(proposal_events_table).where(
+                        proposal_events_table.c.session_id == sid,
+                        proposal_events_table.c.proposal_id == proposal_row.id,
+                        proposal_events_table.c.event_type == "proposal.created",
+                    )
+                ).all()
+                if len(creation_rows) != 1:
+                    raise AuditIntegrityError("Recovery proposal must have exactly one creation event")
+                authority = _restore_authoritative_pipeline_proposal(
+                    row=_proposal_record_from_row(proposal_row),
+                    creation_event=_proposal_event_record_from_row(creation_rows[0]),
+                )
+                _verify_pipeline_lifecycle_authority(conn, service=self, authority=authority)
+                event_id = str(uuid.uuid5(recovery.state_id, f"supersede:{proposal_row.id}"))
+                conn.execute(
+                    insert(proposal_events_table).values(
+                        id=event_id,
+                        session_id=sid,
+                        proposal_id=proposal_row.id,
+                        event_type="proposal.rejected",
+                        actor="composer_graph_recovery",
+                        payload=_pipeline_rejected_payload(authority=authority, reason="superseded", dispatch=None),
+                        created_at=created_at,
+                    )
+                )
+                changed = conn.execute(
+                    update(composition_proposals_table)
+                    .where(
+                        composition_proposals_table.c.session_id == sid,
+                        composition_proposals_table.c.id == proposal_row.id,
+                        composition_proposals_table.c.status == "pending",
+                    )
+                    .values(status="rejected", audit_event_id=event_id, updated_at=created_at)
+                )
+                if changed.rowcount != 1:
+                    raise AuditIntegrityError("Recovery proposal disposition lost its pending authority")
+            self._insert_composition_checkpoint(
+                conn,
+                session_id=sid,
+                state=recovery.data,
+                provenance="graph_recovery",
+                created_at=created_at,
+                session_operation_context=context,
+                state_id=recovery.state_id,
+                derived_from_state_id=str(recovery.target_state_id) if recovery.target_state_id is not None else None,
+            )
+        if recovery.park_id is not None:
+            conn.execute(
+                insert(composition_graph_parks_table).values(
+                    id=str(recovery.park_id),
+                    session_id=sid,
+                    state_id=str(recovery.state_id),
+                    operation_id=recovery.operation_id,
+                    created_at=created_at,
+                )
+            )
+        self._write_graph_recovery_receipt(conn, recovery=recovery, context=context, created_at=created_at)
+        return recovery.state_id
+
+    def _write_graph_recovery_receipt(
+        self,
+        conn: Connection,
+        *,
+        recovery: GraphRecoverySettlement,
+        context: SessionOperationContext,
+        created_at: datetime,
+    ) -> None:
+        sid = str(recovery.session_id)
+        bound_state_id = recovery.state_id if recovery.state_id is not None else recovery.expected_state_id
+        receipt_id = recovery.receipt_id
+        if receipt_id is None:
+            raise AuditIntegrityError("Graph recovery receipt identity is missing")
+        if recovery.failure_reason is not None:
+            notice = (
+                "Graph recovery did not complete: the requested draft could not be preserved or restored. The current graph is unchanged."
+            )
+        elif recovery.intent.action == "park":
+            notice = f"Draft parked as {recovery.park_id}. The graph remains visible."
+        elif recovery.empty_fallback:
+            notice = (
+                "No eligible saved draft was available; an empty authoring workspace was opened. "
+                "Uploads and history remain. The abandoned working candidate was not captured."
+            )
+        else:
+            notice = (
+                f"Restored saved draft {recovery.target_state_id} as a new editable version. "
+                "Execution readiness and approvals require current checks. "
+                "The abandoned working candidate was not captured. Uploads and history remain."
+            )
+        if recovery.malformed_head:
+            notice += " The previous stored graph or its completion metadata could not be decoded; its historical row was preserved."
+        self._insert_chat_message(
+            conn,
+            session_id=sid,
+            role="system",
+            content=notice,
+            raw_content=None,
+            tool_calls=None,
+            sequence_no=self._reserve_sequence_range(conn, sid, count=1),
+            writer_principal="compose_loop",
+            composition_state_id=str(bound_state_id) if bound_state_id is not None else None,
+            tool_call_id=None,
+            parent_assistant_id=None,
+            created_at=created_at,
+            session_operation_context=context,
+            message_id=str(receipt_id),
+        )
+        self._insert_chat_message(
+            conn,
+            session_id=sid,
+            role="audit",
+            content=canonical_json(
+                {
+                    "event": "graph_recovery",
+                    "action": recovery.intent.action,
+                    "target_state_id": str(recovery.target_state_id) if recovery.target_state_id is not None else None,
+                    "state_id": str(recovery.state_id) if recovery.state_id is not None else None,
+                    "empty_fallback": recovery.empty_fallback,
+                    "park_id": str(recovery.park_id) if recovery.park_id is not None else None,
+                    "displaced_candidate_captured": False,
+                    "failure_reason": recovery.failure_reason,
+                    "malformed_head": recovery.malformed_head,
+                }
+            ),
+            raw_content=None,
+            tool_calls=None,
+            sequence_no=self._reserve_sequence_range(conn, sid, count=1),
+            writer_principal="compose_loop",
+            composition_state_id=str(bound_state_id) if bound_state_id is not None else None,
+            tool_call_id=None,
+            parent_assistant_id=None,
+            created_at=created_at,
+            session_operation_context=context,
+            message_id=str(uuid.uuid5(receipt_id, "audit")),
+        )
+
     async def complete_composer_async_operation(
         self,
         running: ComposerOperationRunning,
@@ -8452,6 +8908,7 @@ class SessionServiceImpl:
             [ChatMessageRecord, tuple[CompositionProposalRecord, ...], CompositionStateRecord | None], MessageWithStateResponse
         ],
         required_work: RequiredWorkCoordinator | None = None,
+        recovery: GraphRecoverySettlement | None = None,
     ) -> ComposerOperationRecord:
         """Publish final assistant/audit/snapshot/result in one exact COMPOSE transaction."""
         if (assistant is None) == (assistant_record is None):
@@ -8499,8 +8956,19 @@ class SessionServiceImpl:
                 if attempted_response is not None and not _can_retry(current_job, now):
                     raise _ComposerTerminalRetryStateChanged("immutable terminal retry driving state changed")
                 attempted_deadline_expired = current_job.deadline_at <= now
+                recovery_state_id = (
+                    self._settle_graph_recovery_on_connection(
+                        conn,
+                        recovery=recovery,
+                        context=context,
+                        created_at=frozen_created_at,
+                    )
+                    if recovery is not None
+                    else None
+                )
                 if assistant is not None:
-                    csid = str(assistant.composition_state_id) if assistant.composition_state_id is not None else None
+                    bound_assistant_state_id = recovery_state_id if recovery_state_id is not None else assistant.composition_state_id
+                    csid = str(bound_assistant_state_id) if bound_assistant_state_id is not None else None
                     if csid is not None:
                         _assert_state_in_session(conn, state_id=csid, expected_session_id=sid, caller="complete_composer_async_operation")
                     message_id = self._insert_chat_message(
@@ -8545,7 +9013,7 @@ class SessionServiceImpl:
                         session_id=running.claim.session_id,
                         drafts=audit_cohort,
                         writer_principal="compose_loop",
-                        composition_state_id=audit_composition_state_id,
+                        composition_state_id=recovery_state_id if recovery_state_id is not None else audit_composition_state_id,
                         session_operation_context=context,
                         audit_only=False,
                         message_ids=frozen_audit_ids,
@@ -8569,17 +9037,51 @@ class SessionServiceImpl:
                     raise _ComposerTerminalRetryStateChanged("immutable terminal audit bundle changed")
                 attempted_audit_rows = audit_rows
                 proposals = self._list_composition_proposals_on_connection(conn, session_id=running.claim.session_id)
-                state_row = conn.execute(
-                    select(composition_states_table)
-                    .where(composition_states_table.c.session_id == sid)
-                    .order_by(composition_states_table.c.version.desc())
-                    .limit(1)
-                ).one_or_none()
-                state = self._row_to_state_record(state_row) if state_row is not None else None
+                if recovery is not None and recovery.failure_reason is not None:
+                    # A refused recovery must still publish conversation even
+                    # when the unchanged durable head cannot be hydrated.
+                    state = None
+                else:
+                    state_row = conn.execute(
+                        select(composition_states_table)
+                        .where(composition_states_table.c.session_id == sid)
+                        .order_by(composition_states_table.c.version.desc())
+                        .limit(1)
+                    ).one_or_none()
+                    state = self._row_to_state_record(state_row) if state_row is not None else None
                 if attempted_response is not None and (proposals != attempted_proposals or state != attempted_state):
                     raise _ComposerTerminalRetryStateChanged("immutable terminal response snapshot changed")
                 attempted_proposals, attempted_state = proposals, state
                 response = attempted_response if attempted_response is not None else build_response(message, proposals, state)
+                if recovery is not None:
+                    receipt_row = conn.execute(
+                        select(chat_messages_table).where(
+                            chat_messages_table.c.id == str(recovery.receipt_id),
+                            chat_messages_table.c.session_id == sid,
+                        )
+                    ).one()
+                    receipt = self._row_to_chat_message_record(receipt_row)
+                    notice = ChatMessageResponse(
+                        id=str(receipt.id),
+                        session_id=str(receipt.session_id),
+                        operation_id=running.claim.operation_id,
+                        role=receipt.role,
+                        content=receipt.content,
+                        raw_content=None,
+                        segments=[
+                            ChatMessageSegmentResponse(kind=segment.kind, content=segment.content)
+                            for segment in visible_message_segments(content=receipt.content, raw_content=None)
+                        ],
+                        created_at=receipt.created_at,
+                        composition_state_id=str(receipt.composition_state_id) if receipt.composition_state_id is not None else None,
+                        sequence_no=receipt.sequence_no,
+                    )
+                    response = response.model_copy(
+                        update={
+                            "recovery_notice": notice,
+                            "message": response.message.model_copy(update={"operation_id": running.claim.operation_id}),
+                        }
+                    )
                 response = MessageWithStateResponse.model_validate(response.model_dump(mode="python"), strict=True)
                 attempted_response = response
                 result = settle_composer_operation_on_connection(conn, running, outcome=response, settled_at=frozen_created_at)

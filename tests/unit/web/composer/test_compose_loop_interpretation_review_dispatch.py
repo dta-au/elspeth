@@ -55,6 +55,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.web.composer import provider_gateway
+from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.composition_completion import _pending_interpretation_review_repair_message
 from elspeth.web.composer.interpretation_surfacing import _has_pending_prompt_template_requirement
@@ -1214,7 +1215,7 @@ async def test_successful_interpretation_review_rejects_reply_tool_calls_without
     assert isinstance(segments[-1], TrustedSystemNoticeSegment)
     assert "final reply is unavailable" in segments[-1].content
     assert len(llm.messages) == 3
-    assert llm.tools[-1] == []
+    assert {tool["function"]["name"] for tool in llm.tools[-1]} == {"handoff_to_user", "restore_parked_graph"}
     assert "review" in result.assistant_message.lower()
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     vague_events = [e for e in events if e.kind is InterpretationKind.VAGUE_TERM]
@@ -1302,7 +1303,8 @@ async def test_staged_review_reply_only_withholds_internal_protocol_echo(
             session_operation_context=context,
         )
     assert [item.tool_name for item in result.tool_invocations] == ["set_pipeline", "request_interpretation_review"]
-    assert len(llm.messages) == 3 and llm.tools[-1] == []
+    assert len(llm.messages) == 3
+    assert {tool["function"]["name"] for tool in llm.tools[-1]} == {"handoff_to_user", "restore_parked_graph"}
     assert result.assistant_message.count("Interpretation review cards are ready") == 1
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     assert len(events) >= 1
@@ -2129,12 +2131,9 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
     state = _state_with_prompt_template_review_node()
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    class _AssistantMessage:
-        content = "Done — the pipeline is ready."
-
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
-            assistant_message=_AssistantMessage(),
+            assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
             message="rate how cool the pages are",
             llm_messages=[],
             state=state,
@@ -3670,12 +3669,9 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
     composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
-    class _AssistantMessage:
-        content = "Done — the pipeline is ready."
-
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
-            assistant_message=_AssistantMessage(),
+            assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
             message="rate how cool the pages are",
             llm_messages=[],
             state=state,
@@ -3727,13 +3723,10 @@ async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_mode
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
     composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
-    class _AssistantMessage:
-        content = "Done — the pipeline is ready for review."
-
     llm_messages: list[dict[str, Any]] = []
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
-            assistant_message=_AssistantMessage(),
+            assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready for review."),
             message="Select the colour column.",
             llm_messages=llm_messages,
             state=state,
@@ -3781,12 +3774,9 @@ async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
         AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the source contract")
     )
 
-    class _AssistantMessage:
-        content = "Done — the pipeline is ready for review."
-
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
-            assistant_message=_AssistantMessage(),
+            assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready for review."),
             message="Select the colour column.",
             llm_messages=[],
             state=state,
@@ -3933,12 +3923,9 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
         AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="unavailable")
     )
 
-    class _AssistantMessage:
-        content = "Done — the pipeline is ready."
-
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
-            assistant_message=_AssistantMessage(),
+            assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
             message="rate how cool the pages are",
             llm_messages=[],
             state=state,
@@ -4018,12 +4005,9 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
         AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the prompt")
     )
 
-    class _AssistantMessage:
-        content = "Done — the pipeline is ready."
-
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
-            assistant_message=_AssistantMessage(),
+            assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
             message="rate how cool the pages are",
             llm_messages=[],
             state=state,
@@ -4147,12 +4131,9 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
         AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="unavailable")
     )
 
-    class _AssistantMessage:
-        content = "Done — the pipeline is ready."
-
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
-            assistant_message=_AssistantMessage(),
+            assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
             message="rate how cool the pages are",
             llm_messages=[],
             state=state,
@@ -4386,7 +4367,7 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
     )
 
     async def observed_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
-        if not tools:
+        if {tool["function"]["name"] for tool in tools} == {"handoff_to_user", "restore_parked_graph"}:
             snapshot = await progress_registry.get_latest("reply-progress")
             assert snapshot.phase == "calling_model"
             assert "reply" in snapshot.headline
@@ -4409,7 +4390,7 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
     # Two authoring calls and exactly one reply-only call.
     assert len(llm.messages) == 3
     assert _FINAL_REPLY_PROSE in result.assistant_message
-    assert llm.tools[-1] == []
+    assert {tool["function"]["name"] for tool in llm.tools[-1]} == {"handoff_to_user", "restore_parked_graph"}
     assert llm.tools[0]
 
     # Tool narration remains recorded once, distinct from the fresh reply.
@@ -4751,7 +4732,7 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
 
     async def reply(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
         nonlocal reply_calls
-        if tools:
+        if {tool["function"]["name"] for tool in tools} != {"handoff_to_user", "restore_parked_graph"}:
             return await prefix(messages, tools)
         reply_calls += 1
         if mode == "timeout":
@@ -4782,7 +4763,7 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
     recorder = recorded[-1]
     assert len(recorder.llm_calls) == (2 if mode == "expired" else 3)
     if mode != "expired":
-        assert recorder.llm_calls[-1].tools_spec_hash is None
+        assert recorder.llm_calls[-1].tools_spec_hash is not None
         expected = {
             "text": ComposerLLMCallStatus.SUCCESS,
             "empty": ComposerLLMCallStatus.MALFORMED_RESPONSE,
@@ -4845,7 +4826,7 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
     )
 
     async def installed_adapter_completion(**kwargs: Any) -> Any:
-        if "tools" in kwargs:
+        if {tool["function"]["name"] for tool in kwargs["tools"]} != {"handoff_to_user", "restore_parked_graph"}:
             return scripted._responses.pop(0)
         reply_wire.extend(deepcopy(kwargs["messages"]))
         wire = adapter.transform_request(

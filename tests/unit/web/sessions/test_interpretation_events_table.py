@@ -205,7 +205,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_71() -> None:
+def test_current_session_schema_epoch() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -247,7 +247,7 @@ def test_current_session_schema_epoch_is_71() -> None:
     # 68: ordinary proposal checkpoint rebase reasons are persisted.
     # 69: freeform message ingress receipts bind retry UUIDs to accepted user rows.
     # 71: ordinary fork/revert receipts move to a mode-neutral durable ledger.
-    assert SESSION_SCHEMA_EPOCH == 72
+    assert SESSION_SCHEMA_EPOCH == 74
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

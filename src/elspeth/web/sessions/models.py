@@ -56,9 +56,9 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # but is independent: the Landscape and session DBs are separate files
 # with separate lifecycles and separate epochs.
 #
-# Epoch 72 adds durable composer jobs and their ingress bindings. Stores are
-# recreated on mismatch; there is no in-place migration or legacy decoder.
-SESSION_SCHEMA_EPOCH = 72
+# Epoch 74 adds graph recovery parks and checkpoint operation ownership.
+# There is no migration path; preserve incompatible stores and prior access.
+SESSION_SCHEMA_EPOCH = 74
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -544,6 +544,7 @@ composition_states_table = Table(
     # for writer paths that predate the marker or copy an existing row
     # (revert and fork).
     Column("composer_meta", JSON, nullable=True),
+    Column("creator_operation_id", String, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column(
         "derived_from_state_id",
@@ -634,8 +635,23 @@ composition_states_table = Table(
     # IN PHASE 1A" block below for the same closed-list-of-permitted-
     # writers posture.
     CheckConstraint(
-        "provenance IN ('tool_call', 'convergence_persist', 'plugin_crash_persist', 'preflight_persist', 'tutorial_normalization', 'post_compose', 'session_seed', 'session_fork', 'interpretation_resolve')",
+        "provenance IN ('tool_call', 'convergence_persist', 'plugin_crash_persist', 'preflight_persist', 'tutorial_normalization', 'post_compose', 'session_seed', 'session_fork', 'interpretation_resolve', 'graph_recovery')",
         name="ck_composition_states_provenance",
+    ),
+)
+
+composition_graph_parks_table = Table(
+    "composition_graph_parks",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("state_id", String, nullable=False),
+    Column("operation_id", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_graph_park_state_session",
     ),
 )
 

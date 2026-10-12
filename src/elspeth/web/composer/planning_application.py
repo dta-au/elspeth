@@ -7,12 +7,15 @@ import functools
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import UUID
 
 import structlog
 from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ToolContractDialect
@@ -43,6 +46,7 @@ from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
+from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import (
     is_pending_interpretation_handoff,
@@ -55,6 +59,7 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerConversationContext,
     PlannerCustodyConfig,
     PlannerDeclined,
+    PlannerHandoff,
     PlannerModelConfig,
     PlannerOriginatingMessage,
     PlannerPriorUserRequest,
@@ -310,11 +315,10 @@ class PlanningApplication:
             progress=progress,
         )
 
-    async def _persist_pipeline_planner_audit(
+    def _pipeline_planner_audit_drafts(
         self,
         *,
         session_id: UUID,
-        current_state_id: UUID | None,
         llm_calls: tuple[ComposerLLMCall, ...],
         planner_attempts: tuple[ComposerPlannerAttempt, ...],
         invocations: tuple[ComposerToolInvocation, ...],
@@ -325,9 +329,8 @@ class PlanningApplication:
         withheld_replies: tuple[WithheldReply, ...],
         private_candidates: tuple[PrivatePlannerCandidate, ...],
         session_operation_context: SessionOperationContext | None,
-        required_work: RequiredWorkBinding | None = None,
-    ) -> None:
-        """Make planner LLM/discovery evidence durable before proposal authority.
+    ) -> tuple[AuditMessageDraft, ...]:
+        """Build required planner evidence without writing or touching graph state.
 
         The whole evidence set — every physical LLM call, every value-free
         semantic response disposition, and every discovery invocation of one
@@ -342,7 +345,6 @@ class PlanningApplication:
 
         from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
-        sessions = self._sessions_service
         drafts: list[AuditMessageDraft] = []
         for record in interleave_planner_audit_records(llm_calls, planner_attempts):
             if type(record) is ComposerLLMCall:
@@ -413,6 +415,34 @@ class PlanningApplication:
                     role="audit", content="Private credential-filtered planner candidate", tool_calls=(evidence.to_envelope(),)
                 )
             )
+        return tuple(drafts)
+
+    async def _persist_pipeline_planner_audit(
+        self,
+        *,
+        session_id: UUID,
+        current_state_id: UUID | None,
+        llm_calls: tuple[ComposerLLMCall, ...],
+        planner_attempts: tuple[ComposerPlannerAttempt, ...],
+        invocations: tuple[ComposerToolInvocation, ...],
+        withheld_replies: tuple[WithheldReply, ...],
+        private_candidates: tuple[PrivatePlannerCandidate, ...],
+        session_operation_context: SessionOperationContext | None,
+        required_work: RequiredWorkBinding | None = None,
+    ) -> None:
+        """Settle the planner evidence cohort before creating proposal authority."""
+        if session_operation_context is None:
+            raise TypeError("pipeline planner audit requires the turn's session_operation_context")
+        drafts = self._pipeline_planner_audit_drafts(
+            session_id=session_id,
+            llm_calls=llm_calls,
+            planner_attempts=planner_attempts,
+            invocations=invocations,
+            withheld_replies=withheld_replies,
+            private_candidates=private_candidates,
+            session_operation_context=session_operation_context,
+        )
+        sessions = self._sessions_service
         audit_sql = audit_projection = None
         if required_work is not None:
             required_work.validate_context(session_operation_context)
@@ -834,6 +864,7 @@ class PlanningApplication:
         budget_seconds: float | None = None,
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        recovery_context: GraphRecoveryContext | None = None,
     ) -> ComposerResult:
         """Build one canonical full-pipeline proposal for an empty topology."""
 
@@ -886,6 +917,7 @@ class PlanningApplication:
             plan = await plan_pipeline(
                 intent=message,
                 conversation_context=_freeform_planner_conversation_context(message, messages),
+                recovery_context=recovery_context,
                 current_state=state,
                 # Round-trippable planner projection (elspeth-c67fbbbd83).
                 provider_current_state=project_server_owned_option_metadata(state.to_dict()),
@@ -937,6 +969,25 @@ class PlanningApplication:
                     policy_catalog=policy_catalog,
                     plugin_snapshot=plugin_snapshot,
                 ),
+            )
+        except PlannerHandoff as handoff:
+            # The owning route settles required evidence with recovery and
+            # the assistant message. Capturing the abandoned candidate is
+            # optional and must never become a prerequisite for recovery.
+            drafts = self._pipeline_planner_audit_drafts(
+                session_id=session_uuid,
+                llm_calls=recorder.llm_calls[planner_llm_start:],
+                planner_attempts=recorder.planner_attempts[planner_attempt_start:],
+                invocations=recorder.invocations[planner_invocation_start:],
+                withheld_replies=recorder.withheld_replies[planner_withheld_start:],
+                private_candidates=(),
+                session_operation_context=session_operation_context,
+            )
+            return ComposerResult(
+                message=handoff.intent.message,
+                state=state,
+                graph_recovery_intent=handoff.intent,
+                recovery_audit_drafts=drafts,
             )
         except PlannerDeclined as declined:
             # Honest decline — from an ordinary manifest-satisfied turn

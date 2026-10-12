@@ -35,6 +35,7 @@ PLANNER_DISCOVERY_TOOL_NAMES: Final[tuple[str, ...]] = (
     "validate_secret_ref",
 )
 PLANNER_TERMINAL_TOOL_NAME: Final[str] = "emit_pipeline_proposal"
+PLANNER_RECOVERY_TOOL_NAMES: Final[tuple[str, ...]] = ("handoff_to_user", "restore_parked_graph")
 PLANNER_IMPLEMENTATION_ID: Final[str] = "elspeth.web.composer.pipeline_planner.plan_pipeline"
 
 # HAND-WRITTEN ON PURPOSE — the keys are the operand the capability-skill
@@ -190,8 +191,9 @@ def build_planner_capability_manifest(
     """Validate and hash the exact messages/tools used by one planner call.
 
     ``tool_surface`` names the advertised palette: ``"full"`` accepts the
-    request-owned, order-preserving discovery subset followed by the terminal;
-    ``"terminal_only"`` is the escape-hatch overtime turn.
+    request-owned, order-preserving discovery subset followed by recovery
+    controls and the proposal terminal; ``"terminal_only"`` retains both
+    recovery controls and the proposal on the escape-hatch overtime turn.
     """
     if tool_surface not in {"full", "terminal_only"}:
         raise ValueError("tool_surface must be 'full' or 'terminal_only'")
@@ -210,14 +212,15 @@ def build_planner_capability_manifest(
         tool_names = tuple(cast(str, tool["function"]["name"]) for tool in tools)
     except (KeyError, TypeError) as exc:
         raise AuditIntegrityError("planner advertised tool definitions are malformed") from exc
+    terminal_names = (*PLANNER_RECOVERY_TOOL_NAMES, PLANNER_TERMINAL_TOOL_NAME)
     if tool_surface == "terminal_only":
-        valid_names = tool_names == (PLANNER_TERMINAL_TOOL_NAME,)
+        valid_names = tool_names == terminal_names
     else:
-        discovery_names = tool_names[:-1]
+        discovery_names = tool_names[: -len(terminal_names)]
         positions = tuple(PLANNER_DISCOVERY_TOOL_NAMES.index(name) for name in discovery_names if name in PLANNER_DISCOVERY_TOOL_NAMES)
         valid_names = (
             bool(tool_names)
-            and tool_names[-1] == PLANNER_TERMINAL_TOOL_NAME
+            and tool_names[-len(terminal_names) :] == terminal_names
             and len(positions) == len(discovery_names)
             and len(set(discovery_names)) == len(discovery_names)
             and positions == tuple(sorted(positions))
@@ -251,6 +254,7 @@ __all__ = [
     "CAPABILITY_CORE_NODE_GUIDANCE",
     "PLANNER_DISCOVERY_TOOL_NAMES",
     "PLANNER_IMPLEMENTATION_ID",
+    "PLANNER_RECOVERY_TOOL_NAMES",
     "PLANNER_TERMINAL_TOOL_NAME",
     "PlannerCapabilityManifest",
     "build_planner_capability_manifest",

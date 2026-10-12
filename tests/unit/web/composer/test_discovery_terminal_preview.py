@@ -168,7 +168,7 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
     if final_kind == "quoted_log":
         user_message += " Please quote this log exactly:\n" + _PROTOCOL_ECHO
     if final_kind == "tools":
-        with pytest.raises(_MalformedLLMResponseError, match="Reply-only completion must contain text and no tool calls"):
+        with pytest.raises(_MalformedLLMResponseError, match="Reply stage requires text or a terminal recovery control"):
             await service.compose(user_message, [], state, session_id=session_id)
         assert state.metadata.name != "must not apply"
     elif final_kind in {"timeout", "expired"}:
@@ -214,7 +214,7 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
     assert dispatched_batches == [("preview_pipeline",)]
     assert advertised_tools[0]
     if len(advertised_tools) == 2:
-        assert advertised_tools[1] == []
+        assert {tool["function"]["name"] for tool in advertised_tools[1]} == {"handoff_to_user", "restore_parked_graph"}
         assert all(message["role"] != "tool" and "tool_calls" not in message for message in provider_messages[1])
         assert any("Historical tool protocol record" in message["content"] for message in provider_messages[1])
 

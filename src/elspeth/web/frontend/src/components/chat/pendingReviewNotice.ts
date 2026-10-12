@@ -6,4 +6,4 @@
 // pendingReviewNotice.test.ts reads both: reword one without the other and the
 // stale notice comes back, silently, which is what the test is for.
 export const PENDING_REVIEW_NOTICE =
-  "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue.";
+  "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue. Approval does not establish execution readiness; remaining validation and required advisor checks must pass before execution.";

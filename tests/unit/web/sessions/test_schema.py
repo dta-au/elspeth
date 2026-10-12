@@ -367,7 +367,11 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 71 removes the Composer mode preference and adds mode-neutral
     # fork/revert receipts.
     # Epoch 72 persists durable composer operations and exact operation ingress binding.
-    assert SESSION_SCHEMA_EPOCH == 72
+    # Epoch 73 is retired: independent recovery and auth branches used it for
+    # different shapes. Epoch 74 adds recovery bookmarks and checkpoint owners.
+    assert SESSION_SCHEMA_EPOCH == 74
+    assert "composition_graph_parks" in inspector.get_table_names()
+    assert "creator_operation_id" in {column["name"] for column in inspector.get_columns("composition_states")}
     expected_tables = frozenset(
         {
             "web_instances",
@@ -539,10 +543,10 @@ def test_session_operation_authority_shape_retains_exact_nonnull_fields() -> Non
     assert session_operation_fences_table.primary_key.columns.keys() == ["session_id"]
 
 
-def test_previous_epoch_rejection_does_not_rewrite_store() -> None:
+@pytest.mark.parametrize("previous", [72, 73])
+def test_previous_epoch_rejection_does_not_rewrite_store(previous: int) -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
-    previous = SESSION_SCHEMA_EPOCH - 1
     with eng.begin() as conn:
         conn.execute(
             text("UPDATE elspeth_schema_identity SET schema_epoch = :previous WHERE store_kind = 'session'"), {"previous": previous}
@@ -556,6 +560,21 @@ def test_previous_epoch_rejection_does_not_rewrite_store() -> None:
         assert conn.execute(text("SELECT * FROM elspeth_schema_identity")).all() == before
         assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == schema_before
         assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == previous
+
+
+def test_current_epoch_rejects_missing_recovery_table_without_rewriting_store() -> None:
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    with eng.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE composition_graph_parks")
+        before = conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all()
+        identities = conn.execute(text("SELECT * FROM elspeth_schema_identity")).all()
+    with pytest.raises(SessionSchemaError):
+        initialize_session_schema(eng)
+    with eng.connect() as conn:
+        assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == before
+        assert conn.execute(text("SELECT * FROM elspeth_schema_identity")).all() == identities
+        assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == SESSION_SCHEMA_EPOCH
 
 
 def test_epoch_61_is_rejected_before_reading_old_advisor_gate_grammar() -> None:

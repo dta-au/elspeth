@@ -2271,6 +2271,7 @@ async def _persist_turn_audit_cohort(
     required_audit: bool = False,
     required_work: RequiredWorkCoordinator | None = None,
     session_operation_context: SessionOperationContext,
+    additional_drafts: tuple[AuditMessageDraft, ...] = (),
 ) -> tuple[PipelineDispatchAuditBinding, ...]:
     """Settle one turn's tool AND LLM audit rows as a single atomic cohort.
 
@@ -2302,7 +2303,7 @@ async def _persist_turn_audit_cohort(
     were already committed by ``persist_compose_turn`` drain only LLM
     calls here); both empty is a no-op.
     """
-    if not tool_invocations and not llm_calls:
+    if not tool_invocations and not llm_calls and not additional_drafts:
         return ()
     producer = sql = projection = None
     if required_work is not None:
@@ -2318,7 +2319,7 @@ async def _persist_turn_audit_cohort(
         role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
         tool_csid = str(tool_composition_state_id) if tool_composition_state_id else None
         llm_csid = str(llm_composition_state_id) if llm_composition_state_id else None
-        drafts: list[AuditMessageDraft] = []
+        drafts: list[AuditMessageDraft] = list(additional_drafts)
         pipeline_bindings: list[PipelineDispatchAuditBinding] = []
         for invocation in tool_invocations:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)

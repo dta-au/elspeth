@@ -78,6 +78,22 @@ def _bare_trusted_suffix(notice: str) -> str:
     return _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + notice
 
 
+_GRAPH_RECOVERY_REFUSAL_NOTICE: Final = (
+    "The requested graph recovery did not complete. Choose another saved draft or clarify how to continue."
+)
+_GRAPH_RECOVERY_REFUSAL_SUFFIX = _bare_trusted_suffix(_GRAPH_RECOVERY_REFUSAL_NOTICE)
+
+
+def compose_graph_recovery_refusal_message() -> str:
+    """Publish a terminal recovery refusal without prospective success prose.
+
+    The caller retains provider text in the tool/call audit and persists this
+    message with ``raw_content=''``. No provider-authored reply is attributed
+    to this fixed, provenance-bearing system notice.
+    """
+    return _GRAPH_RECOVERY_REFUSAL_SUFFIX
+
+
 _REVIEW_REPLY_UNAVAILABLE_NOTICE: Final = "The model's final reply is unavailable. Please retry your question."
 _REVIEW_REPLY_UNAVAILABLE_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_UNAVAILABLE_NOTICE)
 
@@ -791,6 +807,8 @@ _ADVISOR_PUBLISHED_WRAPPED_SHAPES: Final[tuple[tuple[str, str], ...]] = (
 
 def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
     """Recognize the closed set of canonical composer synthesis suffixes."""
+    if suffix == _GRAPH_RECOVERY_REFUSAL_SUFFIX:
+        return (TrustedSystemNoticeSegment(_GRAPH_RECOVERY_REFUSAL_NOTICE),)
     if suffix == _REVIEW_REPLY_UNAVAILABLE_SUFFIX:
         return (TrustedSystemNoticeSegment(_REVIEW_REPLY_UNAVAILABLE_NOTICE),)
     if suffix.endswith(_REVIEW_REPLY_UNAVAILABLE_SUFFIX):

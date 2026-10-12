@@ -43,6 +43,7 @@ from elspeth.web.composer.pipeline_planner import (
     planner_terminal_tool_definition,
     planner_tool_definitions,
 )
+from elspeth.web.composer.recovery_controls import recovery_tool_definitions
 from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments, stamp_planner_terminal
@@ -319,13 +320,18 @@ def _base_planner_list(policy: PlannerDiscoveryPolicy | None = None) -> list[dic
         }
         for name in names
     ]
-    return [*discovery, planner_terminal_tool_definition(dialect=_NONE)]
+    return [*discovery, *recovery_tool_definitions(_NONE), planner_terminal_tool_definition(dialect=_NONE)]
 
 
-def test_policy_none_planner_list_is_19_strict_true_plus_a_strict_false_terminal() -> None:
+def test_planner_list_stamps_discovery_and_recovery_strict_and_proposal_non_strict() -> None:
     tools = planner_tool_definitions(dialect=_STRICT)
-    assert [tool["function"]["name"] for tool in tools] == [*PLANNER_DISCOVERY_TOOL_NAMES, _TERMINAL]
-    assert [tool["function"]["strict"] for tool in tools] == [True] * 19 + [False]
+    assert [tool["function"]["name"] for tool in tools] == [
+        *PLANNER_DISCOVERY_TOOL_NAMES,
+        "handoff_to_user",
+        "restore_parked_graph",
+        _TERMINAL,
+    ]
+    assert [tool["function"]["strict"] for tool in tools] == [True] * 21 + [False]
 
 
 @pytest.mark.parametrize(
@@ -398,10 +404,10 @@ async def test_hatch_turn_uses_the_hatch_dialect_and_endpoint(
     assert hatch_request["model"] == _HATCH_MODEL
     assert hatch_request["api_base"] == "https://advisor-gateway.example.test/v1"
     assert hatch_request["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
-    assert _sent_names(hatch_request) == [_TERMINAL]
-    assert _strict_keys(hatch_request) == ([False] if hatch is _STRICT else ["omitted"])
+    assert _sent_names(hatch_request) == ["handoff_to_user", "restore_parked_graph", _TERMINAL]
+    assert _strict_keys(hatch_request) == ([True, True, False] if hatch is _STRICT else ["omitted"] * 3)
     assert [call.tool_contract_dialect for call in recorder.llm_calls] == [planner, planner, hatch]
-    assert recorder.llm_calls[2].strict_tool_count == 0
+    assert recorder.llm_calls[2].strict_tool_count == (2 if hatch is _STRICT else 0)
 
 
 # ---------------------------------------------------------------- the stamp assertion

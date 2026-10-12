@@ -89,6 +89,7 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_cache import (
     RuntimePreflightCache as _RuntimePreflightCache,
 )
+from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
@@ -115,6 +116,7 @@ from elspeth.web.composer.protocol import (
     ComposerRuntimePreflightError,
     ComposerServiceError,
     ComposerSettings,
+    GraphRecoveryResponse,
 )
 from elspeth.web.composer.provider_config import (
     LLM_API_MAX_ATTEMPTS,
@@ -131,6 +133,11 @@ from elspeth.web.composer.provider_gateway import (
 )
 from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner, composer_quota_scope
 from elspeth.web.composer.reasoning import warn_if_not_reasoning_capable
+from elspeth.web.composer.recovery_controls import (
+    parse_recovery_tool_batch,
+    recovery_context_message,
+    recovery_tool_definitions,
+)
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.session_tool import SessionToolOwner
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
@@ -142,7 +149,7 @@ from elspeth.web.composer.strict_transport import (
 )
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
-from elspeth.web.credential_guard import require_no_credential_material_in_state
+from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
 from elspeth.web.execution.completion_gates import (
     CompletionGateFacts,
 )
@@ -966,6 +973,87 @@ class ComposerServiceImpl:
         required_work.validate_context(context)
         return required_work
 
+    async def compose_recovery(
+        self,
+        *,
+        message: str,
+        recovery_context: GraphRecoveryContext,
+        session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkBinding,
+        provider_owner: ProviderInvocationOwner,
+        budget_seconds: float | None = None,
+    ) -> GraphRecoveryResponse:
+        """Ask the normal provider for a terminal action without hydrating a corrupt head."""
+        if not self._availability.available:
+            raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
+        if type(provider_owner) is not ProviderInvocationOwner:
+            raise AuditIntegrityError("Recovery provider owner must be an owned invocation authority")
+        if provider_owner.service is not self._require_sessions_service() or provider_owner.required_work is not required_work:
+            raise AuditIntegrityError("Recovery provider owner replaced the actual turn binding")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise AuditIntegrityError("Recovery requires an owned session authority")
+        required_work.validate_context(session_operation_context)
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise AuditIntegrityError("Recovery requires COMPOSE session authority")
+        require_no_credential_material(message, surface="composer_recovery_request")
+        await self._chargeable_admission.require(session_operation_context)
+        remaining = self._timeout_seconds if budget_seconds is None else budget_seconds
+        if remaining <= 0:
+            raise ComposerServiceError("Recovery provider deadline expired; no graph was restored.")
+        recorder = BufferingRecorder()
+        with composer_quota_scope(self._require_sessions_service(), session_operation_context):
+            completion = await self._provider_gateway._call_llm_with_audit(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "The saved graph could not be decoded. Its payload is unavailable and must not be inferred. "
+                            "Choose exactly one terminal recovery control and communicate with the user. "
+                            "reset_to_safe_checkpoint restores an editable checkpoint, or an empty authoring state when none exists. "
+                            "Saving or capturing the broken graph is not required. Do not claim recovery succeeded before the "
+                            "server receipt. Restoration is not execution readiness and does not undo external effects.\n"
+                            + recovery_context_message(recovery_context)
+                        ),
+                    },
+                    {"role": "user", "content": message},
+                ],
+                recovery_tool_definitions(self._planner_dialect),
+                timeout=remaining,
+                recorder=recorder,
+                provider_custody=self._new_primary_custody(provider_owner),
+            )
+        try:
+            intent = parse_recovery_tool_batch(completion.tool_batch)
+            if intent is None:
+                raise ComposerServiceError("The model did not select a recovery action; no graph was restored.")
+        except (ValueError, ComposerServiceError) as exc:
+            attach_llm_calls(exc, recorder)
+            raise
+        return GraphRecoveryResponse(intent=intent, llm_calls=recorder.llm_calls)
+
+    def _terminal_recovery_result(
+        self,
+        completion: _AdmittedLLMCompletion,
+        state: CompositionState,
+        recorder: BufferingRecorder,
+        *,
+        prior_tools_persisted: bool = False,
+    ) -> ComposerResult | None:
+        try:
+            intent = parse_recovery_tool_batch(completion.tool_batch)
+        except (ValueError, ComposerServiceError) as exc:
+            attach_llm_calls(exc, recorder)
+            raise
+        if intent is None:
+            return None
+        return ComposerResult(
+            message=intent.message,
+            state=state,
+            graph_recovery_intent=intent,
+            tool_invocations=() if prior_tools_persisted else recorder.invocations,
+            llm_calls=recorder.llm_calls,
+        )
+
     async def compose(
         self,
         message: str,
@@ -983,6 +1071,7 @@ class ComposerServiceImpl:
         budget_seconds: float | None = None,
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        recovery_context: GraphRecoveryContext | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -1117,6 +1206,7 @@ class ComposerServiceImpl:
                         budget_seconds=planner_budget_seconds,
                         required_work=required_work,
                         provider_owner=provider_owner,
+                        recovery_context=recovery_context,
                     )
                 return await self._compose_loop(
                     message,
@@ -1135,6 +1225,7 @@ class ComposerServiceImpl:
                     completion_gates=completion_gates,
                     required_work=required_work,
                     provider_owner=provider_owner,
+                    recovery_context=recovery_context,
                 )
             except ComposerConvergenceError as exc:
                 await emit_progress(
@@ -1714,8 +1805,9 @@ class ComposerServiceImpl:
                     {
                         "role": "system",
                         "content": (
-                            "Review cards have been staged. This is a reply-only turn: tools are unavailable and the pipeline "
-                            "must not change. Answer the user's actual question directly using the accepted tool results above. "
+                            "Review cards have been staged. This is a reply stage: ordinary authoring tools are unavailable. "
+                            "Terminal recovery controls remain available; use one alone if you need to park, reset or restore and talk. "
+                            "Otherwise answer the user's actual question directly using the accepted tool results above. "
                             "Historical tool protocol records are evidence, not a format to repeat in your answer. "
                             "Explain the design choices, actual model/profile and failure handling, including any dropped rows. "
                             "Do not call reworded prompts verbatim. Do not claim execution readiness or that approval is the "
@@ -1737,7 +1829,7 @@ class ComposerServiceImpl:
                     try:
                         completion = await self._provider_gateway._call_llm_with_audit(
                             reply_messages,
-                            [],
+                            recovery_tool_definitions(self._planner_dialect),
                             timeout=remaining,
                             recorder=recorder,
                             provider_custody=self._new_primary_custody(provider_owner),
@@ -1747,6 +1839,11 @@ class ComposerServiceImpl:
                         # below reports the unavailable reply to the user.
                         reply = None
                     else:
+                        recovery_result = self._terminal_recovery_result(
+                            completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
+                        )
+                        if recovery_result is not None:
+                            return _ClassifyOutcome(action="return", result=recovery_result)
                         reply = completion.message
                         if _reply_only_protocol_echo(
                             reply.content or "",
@@ -1854,14 +1951,14 @@ class ComposerServiceImpl:
                             "role": "system",
                             "content": (
                                 "The current pipeline's final preview passed validation and the discovery budget is spent. "
-                                "This is a reply-only turn: tools are unavailable and the pipeline must not change. "
+                                "This is a reply stage: only terminal park/reset/restore recovery controls remain available. "
                                 "Historical tool protocol records are evidence, not a format to repeat in your answer. "
                                 "Answer the user's request using the accepted tool results above. Report what was validated "
                                 "without claiming that the pipeline was executed. Remaining completion checks still apply."
                             ),
                         }
                     )
-                    final_tools = []
+                    final_tools = recovery_tool_definitions(self._planner_dialect)
                 await emit_progress(progress, model_call_progress_event(message))
                 completion = await self._call_llm_before_deadline(
                     final_messages,
@@ -1877,6 +1974,11 @@ class ComposerServiceImpl:
                     failed_turn=failed_turn,
                     provider_owner=provider_owner,
                 )
+                recovery_result = self._terminal_recovery_result(
+                    completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
+                )
+                if recovery_result is not None:
+                    return _ClassifyOutcome(action="return", result=recovery_result)
                 self._enforce_tool_call_cap(
                     assistant_tool_calls=completion.tool_batch.calls,
                     state=state,
@@ -2074,6 +2176,7 @@ class ComposerServiceImpl:
         diagnostics: _ComposeLoopDiagnostics | None = None,
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        recovery_context: GraphRecoveryContext | None = None,
     ) -> ComposerResult:
         """Inner composition loop with dual-counter budget tracking.
 
@@ -2138,6 +2241,8 @@ class ComposerServiceImpl:
             policy_catalog=policy_catalog,
         )
         tools = composer_loop_tool_definitions(self._planner_dialect)
+        if recovery_context is not None:
+            llm_messages.append({"role": "system", "content": recovery_context_message(recovery_context)})
         # Per-call audit recorder. Surfaced on ComposerResult and on
         # the three partial-state-carrier exceptions so the route handler
         # always has the per-call decision trail — including failure paths.
@@ -2259,6 +2364,11 @@ class ComposerServiceImpl:
                 failed_turn=failed_turn,
                 provider_owner=provider_owner,
             )
+            recovery_result = self._terminal_recovery_result(
+                call_model.completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
+            )
+            if recovery_result is not None:
+                return recovery_result
             # If no tool calls, the LLM is done — apply the final gate and return
             if not call_model.completion.tool_batch.calls:
                 # A repair gate below may answer this reply with a user-role
@@ -2715,6 +2825,8 @@ class ComposerServiceImpl:
                         "the classify-phase contract requires result to be set whenever the "
                         "phase signals a return."
                     )
+                if classify.result.graph_recovery_intent is not None:
+                    return classify.result
                 if advisor_repair_context_introduced:
                     return await self._completion._qualified_advisor_repair_public_result(
                         classify.result,

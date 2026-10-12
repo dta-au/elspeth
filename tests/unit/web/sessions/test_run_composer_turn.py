@@ -832,13 +832,13 @@ async def test_compose_budget_is_measured_immediately_before_compose(tmp_path: P
     app.state.composer_service = composer
     session = await service.create_session("alice", "Slow preamble", "local")
     async with _running_job(app, service, session.id, kind="compose_message", content="Go.") as job:
-        real_get_current_state = service.get_current_state
+        real_load_context = service.load_graph_recovery_context
 
-        async def _slow_get_current_state(session_id: uuid.UUID) -> Any:
+        async def _slow_load_context(session_id: uuid.UUID, **kwargs: Any) -> Any:
             await asyncio.sleep(0.5)
-            return await real_get_current_state(session_id)
+            return await real_load_context(session_id, **kwargs)
 
-        monkeypatch.setattr(service, "get_current_state", _slow_get_current_state)
+        monkeypatch.setattr(service, "load_graph_recovery_context", _slow_load_context)
         record = await _run(app, job)
 
     assert record.status == "completed"

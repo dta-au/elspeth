@@ -35,6 +35,8 @@ def state_from_record(record: CompositionStateRecord) -> CompositionState:
     sources = deep_thaw(record.sources) if record.sources is not None else None
     if sources is None and record.source is not None:
         sources = {"source": deep_thaw(record.source)}
+    if sources is not None and type(sources) is not dict:
+        raise ValueError("Composition state sources must be a mapping")
 
     state_dict = {
         "version": record.version,

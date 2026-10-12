@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MessageBubble } from "./MessageBubble";
+import { PENDING_REVIEW_NOTICE } from "./pendingReviewNotice";
 import type { ChatMessage, CompositionProposal } from "@/types/api";
 
 // This file no longer reads chat.css. It used to scrape rule bodies with a
@@ -341,7 +342,7 @@ describe("MessageBubble", () => {
       Object.defineProperty(navigator, "clipboard", {
         value: { writeText }, writable: true, configurable: true,
       });
-      const notice = "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue.";
+      const notice = PENDING_REVIEW_NOTICE;
       const message = makeMessage({
         role: "assistant",
         created_at: "2026-09-20T07:24:00Z",

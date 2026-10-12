@@ -442,6 +442,11 @@ class TestWrappedDiagnosticWireShapeLinkage:
 # family stayed on hand-maintained equality checks until elspeth-25f7b757e7).
 _BARE_SUFFIX_ROUND_TRIP_CASES = [
     pytest.param(
+        no_tool_policy._GRAPH_RECOVERY_REFUSAL_SUFFIX,
+        no_tool_policy._GRAPH_RECOVERY_REFUSAL_NOTICE,
+        id="_GRAPH_RECOVERY_REFUSAL_SUFFIX",
+    ),
+    pytest.param(
         no_tool_policy._CLARIFICATION_FINALIZE_SUFFIX,
         no_tool_policy._CLARIFICATION_NOTICE,
         id="_CLARIFICATION_FINALIZE_SUFFIX",
@@ -762,6 +767,19 @@ def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
     assert len(segments) == 2
     assert all(isinstance(segment, no_tool_policy.TrustedSystemNoticeSegment) for segment in segments)
     assert segments[-1].content == no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE
+
+
+def test_failed_graph_recovery_publishes_only_a_trusted_refusal() -> None:
+    content = no_tool_policy.compose_graph_recovery_refusal_message()
+    assert visible_message_segments(content=content, raw_content="") == (
+        TrustedSystemNoticeSegment(no_tool_policy._GRAPH_RECOVERY_REFUSAL_NOTICE),
+    )
+    assert "did not complete" in content
+
+
+def test_model_authored_recovery_refusal_text_does_not_gain_system_provenance() -> None:
+    content = no_tool_policy.compose_graph_recovery_refusal_message()
+    assert visible_message_segments(content=content, raw_content=content) == (AssistantTextSegment(content),)
 
 
 # Ruling 2026-09-22 (elspeth-032ec69c41): the END gate stands aside for an

@@ -40,9 +40,9 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # Epoch 69 adds immutable freeform message ingress receipts and their same-session
 # bindings. Existing session stores cannot satisfy the new admission contract.
 # Epoch 70 replaces the persisted tutorial Build stage's old label with build.
-# Epoch 71 is freeform-only, removes the Composer mode preference, and adds
-# ordinary fork/revert receipts. Existing stores are recreated.
-_COORDINATION_HARD_CUT_EPOCH = 72
+# Epoch 74 adds graph recovery parks and checkpoint operation ownership.
+# Incompatible stores require a separately reviewed compatibility disposition.
+_COORDINATION_HARD_CUT_EPOCH = 74
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",

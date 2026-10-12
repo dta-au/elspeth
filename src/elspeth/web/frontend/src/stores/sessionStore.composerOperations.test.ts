@@ -26,6 +26,86 @@ beforeEach(() => {
   vi.mocked(api.fetchCurrentUser).mockResolvedValue({ user_id: scope.principalId, username: "principal", display_name: null, email: null, groups: [], dev_admin: false }); vi.mocked(api.fetchAuthConfig).mockResolvedValue({ provider: "local", registration_mode: "closed", sso_start_url: null });
 });
 afterEach(() => { detachComposerObservers(); vi.useRealTimers(); purgeComposerCustody(); });
+describe("unavailable graph recovery admission", () => {
+  const unavailable = { status: 409, error_type: "composition_state_unavailable", detail: "Saved graph unavailable", unavailable_state_head: { state_id: stateId, version: 7 } };
+
+  it("allows a fresh browser to request recovery against the exact unreadable head", async () => {
+    vi.mocked(api.fetchCompositionState).mockRejectedValueOnce(unavailable);
+    await useSessionStore.getState().selectSession(sid);
+    expect(useSessionStore.getState().compositionState).toBeNull();
+    expect(useSessionStore.getState().compositionStateLoaded).toBe(true);
+    expect(useSessionStore.getState().error).toContain("saved graph is unavailable");
+    expect(useSessionStore.getState().unavailableCompositionHead).toEqual({ sessionId: sid, ...unavailable.unavailable_state_head });
+    vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => ({ ...snapshot(operationId), result: { message: assistant, state: composition(8), proposals: [] } }));
+    vi.mocked(api.fetchCompositionState).mockResolvedValue(composition(8));
+    await useSessionStore.getState().sendMessage("Restore a safe draft and explain what happened");
+    expect(api.submitComposerOperation).toHaveBeenCalledWith(expect.objectContaining({ body: expect.objectContaining({ state_id: stateId }) }));
+    expect(useSessionStore.getState().compositionState?.version).toBe(8);
+    expect(useSessionStore.getState().unavailableCompositionHead).toBeNull();
+    expect(useSessionStore.getState().isComposing).toBe(false);
+  });
+
+  it.each([{ status: 403 }, { status: 500 }, { status: 409, error_type: "stale_compose_state" }, { status: 409, error_type: "composition_state_unavailable" }])("keeps ordinary or malformed failures gated: %j", async (error) => {
+    vi.mocked(api.fetchCompositionState).mockRejectedValueOnce(error);
+    await useSessionStore.getState().selectSession(sid);
+    expect(useSessionStore.getState().compositionStateLoaded).toBe(false);
+    expect(useSessionStore.getState().unavailableCompositionHead).toBeNull();
+    await useSessionStore.getState().sendMessage("Recovery");
+    expect(api.submitComposerOperation).not.toHaveBeenCalled();
+  });
+
+  it("does not publish a late unreadable-head response into another session", async () => {
+    let rejectOld!: (error: unknown) => void;
+    vi.mocked(api.fetchCompositionState).mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOld = reject; }));
+    const selectingOld = useSessionStore.getState().selectSession(sid);
+    const other = "55555555-5555-4555-8555-555555555555";
+    vi.mocked(api.fetchCompositionState).mockResolvedValueOnce(null);
+    await useSessionStore.getState().selectSession(other);
+    rejectOld(unavailable);
+    await selectingOld;
+    expect(useSessionStore.getState().activeSessionId).toBe(other);
+    expect(useSessionStore.getState().compositionState).toBeNull();
+    expect(useSessionStore.getState().unavailableCompositionHead).toBeNull();
+    expect(useSessionStore.getState().error).toBeNull();
+  });
+
+  it("retains system receipts when the independent graph refresh fails", async () => {
+    const receipt: ChatMessage = { ...assistant, id: "66666666-6666-4666-8666-666666666666", role: "system", content: "Restored a saved draft. The broken candidate was not retained." };
+    vi.mocked(api.fetchMessages).mockResolvedValue([receipt, assistant]);
+    vi.mocked(api.fetchCompositionState).mockRejectedValue(new Error("refresh failed"));
+    await useSessionStore.getState().sendMessage("Recovery");
+    expect(useSessionStore.getState().messages).toEqual(expect.arrayContaining([receipt, assistant]));
+    expect(useSessionStore.getState().compositionStateLoaded).toBe(false);
+    expect(useSessionStore.getState().isComposing).toBe(false);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("publishes the actual terminal receipt during total refresh failure and permits fenced continuation", async () => {
+    const receipt: ChatMessage = { ...assistant, id: "66666666-6666-4666-8666-666666666666", role: "system", content: "Restored a saved draft. The broken candidate was not retained." };
+    vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => ({ ...snapshot(operationId), result: { message: assistant, state: composition(8), proposals: [], recovery_notice: receipt } }));
+    vi.mocked(api.fetchMessages).mockRejectedValue(new Error("refresh failed"));
+    vi.mocked(api.fetchCompositionState).mockRejectedValue(new Error("refresh failed"));
+    vi.mocked(api.fetchCompositionProposals).mockRejectedValue(new Error("refresh failed"));
+    await useSessionStore.getState().sendMessage("Recovery");
+    expect(useSessionStore.getState().messages).toEqual(expect.arrayContaining([receipt, assistant]));
+    expect(useSessionStore.getState().compositionStateLoaded).toBe(true);
+    expect(useSessionStore.getState().compositionState?.version).toBe(8);
+    expect(useSessionStore.getState().isComposing).toBe(false);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+    await useSessionStore.getState().sendMessage("Continue editing");
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(2);
+    expect(useSessionStore.getState().messages.filter((row) => row.id === receipt.id)).toHaveLength(1);
+  });
+
+  it("does not resurrect an older decoded graph over a newer unavailable head", async () => {
+    vi.mocked(api.fetchCompositionState).mockRejectedValue(unavailable);
+    await useSessionStore.getState().sendMessage("Recovery");
+    expect(useSessionStore.getState().compositionState).toBeNull();
+    expect(useSessionStore.getState().unavailableCompositionHead?.version).toBe(7);
+    expect(useSessionStore.getState().error).toContain("saved graph is unavailable");
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+  });
+});
 describe("expired live composer observation", () => {
   function holdLiveStream(): void {
     vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (sessionId, operationId, signal) => {
@@ -233,11 +313,21 @@ it("older unresolved failed terminal hydrates saved state before reopening Send"
   expect(useSessionStore.getState().compositionState?.version).toBe(2);
   expect(api.fetchCompositionProposals).toHaveBeenCalledWith(sid); expect(api.submitComposerOperation).not.toHaveBeenCalled();
 });
-it("failed terminal refresh leaves authoring gated until authoritative refresh succeeds", async () => {
+it("failed graph refresh leaves authoring gated until authoritative refresh succeeds", async () => {
+  vi.mocked(api.fetchCompositionState).mockRejectedValue(new Error("head unavailable"));
   vi.mocked(api.fetchMessages).mockRejectedValue(new Error("partial traversal"));
   await useSessionStore.getState().sendMessage("hello");
   expect(useSessionStore.getState().compositionStateLoaded).toBe(false);
   await useSessionStore.getState().sendMessage("blocked"); expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+});
+
+it("message refresh failure does not discard an independently refreshed head", async () => {
+  vi.mocked(api.fetchMessages).mockRejectedValue(new Error("partial traversal"));
+  await useSessionStore.getState().sendMessage("hello");
+  expect(useSessionStore.getState().compositionStateLoaded).toBe(true);
+  expect(useSessionStore.getState().messages).toContainEqual(assistant);
+  await useSessionStore.getState().sendMessage("continue");
+  expect(api.submitComposerOperation).toHaveBeenCalledTimes(2);
 });
 
 it("scope recovery reaches an inactive deleted expired session without discarding its valid sibling", async () => {
