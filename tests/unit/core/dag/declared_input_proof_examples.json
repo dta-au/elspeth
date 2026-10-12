@@ -382,6 +382,9 @@
   "examples/reference_join/settings_missing_product.yaml": {
     "transform:enrich_products": []
   },
+  "examples/reference_join/settings_multi.yaml": {
+    "transform:enrich_order": []
+  },
   "examples/reference_join/settings_nested.yaml": {
     "transform:enrich_products": []
   },

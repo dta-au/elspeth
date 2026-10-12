@@ -21,6 +21,7 @@ from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, Charg
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import admit_provider_attempt, composer_quota_scope, quota_provider_calls
@@ -297,7 +298,22 @@ async def test_retry_settlement_failure_preserves_original_provider_evidence(
     with engine.connect() as connection:
         attempt = connection.execute(select(quota_provider_attempts_table)).one()
         usage = connection.execute(select(token_usage_ledger_table)).one()
-        message = connection.execute(select(chat_messages_table).where(chat_messages_table.c.role == "audit")).one()
+        messages = connection.execute(
+            select(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id), chat_messages_table.c.role == "audit")
+        ).all()
+    assert len(messages) == 2
+    assert all(message.writer_principal == "compose_loop" and len(message.tool_calls) == 1 for message in messages)
+    by_kind = {message.tool_calls[0]["_kind"]: message for message in messages}
+    assert set(by_kind) == {"llm_call_audit", DIAGNOSTIC_EVIDENCE_KIND}
+    message = by_kind["llm_call_audit"]
+    evidence = ComposerDiagnosticEvidence.from_envelope(
+        by_kind[DIAGNOSTIC_EVIDENCE_KIND].tool_calls[0],
+        expected_session_id=str(session.id),
+        expected_operation_id=lease.context.fence.operation_id,
+        expected_tool_call_id=attempt.attempt_id,
+    )
+    assert evidence.status == "provider_failure" and evidence.tool_name == "composer_failure"
+    assert by_kind[DIAGNOSTIC_EVIDENCE_KIND].composition_state_id is None
     persisted_call = message.tool_calls[0]["call"]
     assert persisted_call["planner_call_ordinal"] == 1
     assert persisted_call["error_class"] == "APIError"

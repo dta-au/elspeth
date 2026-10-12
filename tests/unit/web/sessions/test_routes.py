@@ -57,6 +57,7 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
+from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult, ComposerService, PipelineCommitIntent
@@ -586,6 +587,24 @@ def _llm_call_audit_rows(messages: Sequence[ChatMessageRecord]) -> list[tuple[Ch
         if first_tool_call.get("_kind") == "llm_call_audit":
             rows.append((message, first_tool_call))
     return rows
+
+
+def _single_tool_audit_cohort(messages: Sequence[ChatMessageRecord], session_id: uuid.UUID, tool_call_id: str) -> ChatMessageRecord:
+    rows = [message for message in messages if message.role == "audit"]
+    assert len(rows) == 2
+    assert all(message.session_id == session_id and message.writer_principal == "compose_loop" for message in rows)
+    assert all(message.tool_calls is not None and len(message.tool_calls) == 1 for message in rows)
+    by_kind = {message.tool_calls[0]["_kind"]: message for message in rows}
+    assert set(by_kind) == {"audit", DIAGNOSTIC_EVIDENCE_KIND}
+    invocation = by_kind["audit"].tool_calls[0]["invocation"]
+    assert invocation["tool_call_id"] == tool_call_id
+    evidence = ComposerDiagnosticEvidence.from_envelope(
+        by_kind[DIAGNOSTIC_EVIDENCE_KIND].tool_calls[0],
+        expected_session_id=str(session_id),
+        expected_tool_call_id=tool_call_id,
+    )
+    assert evidence.tool_name == invocation["tool_name"] and evidence.status == invocation["status"]
+    return by_kind["audit"]
 
 
 class _BlockingRecordingComposer:
@@ -2337,9 +2356,18 @@ def test_canonical_pipeline_accept_terminalizes_audited_executor_failure(
     assert events[-1].payload["reason_code"] == reason_code
     assert events[-1].payload["dispatch"] is not None
     audit_messages = [message for message in asyncio.run(service.get_messages(session_id, limit=None)) if message.role == "audit"]
-    assert len(audit_messages) == 1
-    assert audit_messages[0].tool_calls is not None
-    invocation = audit_messages[0].tool_calls[0]["invocation"]
+    assert len(audit_messages) == 2
+    assert all(message.tool_calls is not None and len(message.tool_calls) == 1 for message in audit_messages)
+    by_kind = {message.tool_calls[0]["_kind"]: message for message in audit_messages}
+    assert set(by_kind) == {DIAGNOSTIC_EVIDENCE_KIND, "audit"}
+    invocation = by_kind["audit"].tool_calls[0]["invocation"]
+    assert invocation["tool_call_id"] == f"canonical-{failure_mode}-call"
+    evidence = ComposerDiagnosticEvidence.from_envelope(
+        by_kind[DIAGNOSTIC_EVIDENCE_KIND].tool_calls[0],
+        expected_session_id=str(session_id),
+        expected_tool_call_id=invocation["tool_call_id"],
+    )
+    assert evidence.tool_name == "set_pipeline" and evidence.status == invocation["status"]
     assert invocation["result_canonical"] is not None
     result_payload = json.loads(invocation["result_canonical"])
     assert result_payload["pipeline_content_hash_schema"] == "composer.pipeline-dispatch-result.v1"
@@ -2617,7 +2645,9 @@ async def test_canonical_pipeline_cancel_during_failed_dispatch_audit_persist_te
     assert proposals[0].status == "rejected"
     terminal = (await service.list_proposal_events(session_id))[-1].payload
     assert terminal["reason_code"] == "validation_failed"
-    audit_messages = [message for message in await service.get_messages(session_id, limit=None) if message.role == "audit"]
+    audit_messages = [
+        _single_tool_audit_cohort(await service.get_messages(session_id, limit=None), session_id, recorder_invocation.tool_call_id)
+    ]
     assert len(audit_messages) == 1
     assert audit_messages[0].tool_calls is not None
     persisted_envelope = audit_messages[0].tool_calls[0]
@@ -2726,7 +2756,7 @@ async def test_canonical_pipeline_cancel_then_settlement_failure_preserves_cance
     assert len(proposals) == 1
     assert proposals[0].status == "pending"
     assert await service.get_current_state(session_id) is None
-    audit_messages = [message for message in await service.get_messages(session_id, limit=None) if message.role == "audit"]
+    audit_messages = [_single_tool_audit_cohort(await service.get_messages(session_id, limit=None), session_id, row.tool_call_id)]
     assert len(audit_messages) == 1
 
 
@@ -2829,9 +2859,8 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
     assert str(original_failure) not in failed.text
     assert app.state.manual_proposal_originals[-1] is original_failure
     assert asyncio.run(service.get_current_state(session_id)) is None
-    audit_rows_before_retry = [
-        message for message in asyncio.run(service.get_messages(session_id, limit=None)) if message.role == "audit" and message.tool_calls
-    ]
+    messages_before_retry = asyncio.run(service.get_messages(session_id, limit=None))
+    audit_rows_before_retry = [_single_tool_audit_cohort(messages_before_retry, session_id, row.tool_call_id)]
     assert len(audit_rows_before_retry) == 1
     monkeypatch.setattr(service_module, "run_required_sql_finish_once", original_sql)
     prepared_states = []
@@ -2871,10 +2900,12 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
     current_after_retry = asyncio.run(service.get_current_state(session_id))
     assert current_after_retry is not None
     assert current_after_retry.id == committed_state.id
-    audit_rows_after_retry = [
-        message for message in asyncio.run(service.get_messages(session_id, limit=None)) if message.role == "audit" and message.tool_calls
-    ]
+    messages_after_retry = asyncio.run(service.get_messages(session_id, limit=None))
+    audit_rows_after_retry = [_single_tool_audit_cohort(messages_after_retry, session_id, row.tool_call_id)]
     assert len(audit_rows_after_retry) == 1
+    assert [message for message in messages_after_retry if message.role == "audit"] == [
+        message for message in messages_before_retry if message.role == "audit"
+    ]
     # Publication prepares real review drafts atomically; exact replay prepares
     # the same candidate and validates its stored cohort without another write.
     assert len(prepared_states) == 2
@@ -2928,8 +2959,9 @@ async def test_canonical_pipeline_recovery_rejects_tampered_bound_content_hash(t
         assert str(original_failure) not in failed.text
         assert app.state.manual_proposal_originals[-1] is original_failure
 
+        target = _single_tool_audit_cohort(await service.get_messages(session_id, limit=None), session_id, row.tool_call_id)
         with service._engine.begin() as conn:
-            audit_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "audit")).one()
+            audit_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.id == str(target.id))).one()
             envelopes = list(audit_row.tool_calls)
             invocation = envelopes[0]["invocation"]
             result_payload = json.loads(invocation["result_canonical"])
@@ -2977,8 +3009,9 @@ async def test_canonical_pipeline_http_readback_rejects_malformed_bound_content_
 
         hash_canary = "RAW_CANARY_" + "A" * 53
         assert len(hash_canary) == 64
+        target = _single_tool_audit_cohort(await service.get_messages(session_id, limit=None), session_id, row.tool_call_id)
         with service._engine.begin() as conn:
-            audit_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "audit")).one()
+            audit_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.id == str(target.id))).one()
             envelopes = list(audit_row.tool_calls)
             invocation = envelopes[0]["invocation"]
             result_payload = json.loads(invocation["result_canonical"])
@@ -5871,7 +5904,20 @@ class TestMessageRoutes:
         assert validator_message_canary in validator_feedback
 
         persisted_messages = asyncio.run(service.get_messages(uuid.UUID(session_id), limit=None))
-        persisted_audit = [message for message in persisted_messages if message.role == "audit"]
+        private_audit = [
+            message for message in persisted_messages if message.tool_calls and message.tool_calls[0]["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
+        ]
+        private_evidence = [
+            ComposerDiagnosticEvidence.from_envelope(message.tool_calls[0], expected_session_id=session_id) for message in private_audit
+        ]
+        assert private_evidence
+        assert any(evidence.status == "received_response" for evidence in private_evidence)
+        assert any(evidence.status == "rejected" for evidence in private_evidence)
+        private_payload = json.dumps([deep_thaw(message.tool_calls) for message in private_audit])
+        assert prompt_canary not in private_payload
+        for canary_name in ("option", "path", "validator_message"):
+            assert canaries[canary_name] in private_payload
+        persisted_audit = [message for message in persisted_messages if message.role == "audit" and message not in private_audit]
         included = client.get(f"/api/sessions/{session_id}/messages?include_llm_audit=true")
         assert included.status_code == 200, included.json()
         returned_audit = [message for message in included.json() if message["role"] == "audit"]
@@ -15677,7 +15723,7 @@ async def test_get_state_yaml_is_409_while_another_compose_is_live(tmp_path) -> 
 
 @pytest.mark.asyncio
 async def test_send_message_shielded_llm_call_persist_completes_under_a_real_outer_cancel(tmp_path, monkeypatch) -> None:
-    """The shielded join of ``_persist_llm_calls`` in send_message's cancel handler.
+    """The shielded audit-cohort join in send_message's cancel handler.
 
     ``test_send_message_persists_cancelled_llm_call_audit_sidecar`` proves the
     sidecar row lands on the cancelled path, but the composer's own
@@ -15717,16 +15763,18 @@ async def test_send_message_shielded_llm_call_persist_completes_under_a_real_out
     entered_persist = asyncio.Event()
     release_persist = asyncio.Event()
     persist_completed = asyncio.Event()
-    real_persist = messages_module._persist_llm_calls
+    real_persist = messages_module._persist_turn_audit_cohort
 
     async def _paused_persist(*args, **kwargs):
+        assert args[2] == () and args[3] == (llm_call,)
+        assert kwargs["required_audit"] is True
         entered_persist.set()
         await release_persist.wait()
         result = await real_persist(*args, **kwargs)
         persist_completed.set()
         return result
 
-    monkeypatch.setattr(messages_module, "_persist_llm_calls", _paused_persist)
+    monkeypatch.setattr(messages_module, "_persist_turn_audit_cohort", _paused_persist)
 
     async with (
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
@@ -15801,16 +15849,18 @@ async def test_recompose_repeat_cancel_joins_cleanup_before_releasing_lease(tmp_
     completed = asyncio.Event()
 
     if blocked_write == "audit":
-        real_write = compose_module._persist_llm_calls
+        real_write = compose_module._persist_turn_audit_cohort
 
         async def paused_write(*args, **kwargs):
+            assert args[2] == () and args[3] == (llm_call,)
+            assert kwargs["required_audit"] is True
             entered.set()
             await release.wait()
             result = await real_write(*args, **kwargs)
             completed.set()
             return result
 
-        monkeypatch.setattr(compose_module, "_persist_llm_calls", paused_write)
+        monkeypatch.setattr(compose_module, "_persist_turn_audit_cohort", paused_write)
     else:
         real_publish = compose_module._publish_progress
 
@@ -15870,18 +15920,17 @@ async def test_compose_cancel_preserves_original_when_cleanup_child_fails(tmp_pa
     app, service = _make_progress_route_app(tmp_path)
     if route == "recompose":
         user_msg = await service.add_message(service.session.id, "user", "Retry", writer_principal="route_user_message")
-    original = _cancelled_error_with_llm_call(
-        _llm_call(
-            status=ComposerLLMCallStatus.CANCELLED,
-            model_returned=None,
-            prompt_tokens=None,
-            completion_tokens=None,
-            total_tokens=None,
-            provider_request_id=None,
-            error_class="CancelledError",
-            error_message="CancelledError",
-        )
+    llm_call = _llm_call(
+        status=ComposerLLMCallStatus.CANCELLED,
+        model_returned=None,
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+        provider_request_id=None,
+        error_class="CancelledError",
+        error_message="CancelledError",
     )
+    original = _cancelled_error_with_llm_call(llm_call)
     original.args = ("original composer cancellation",)
 
     from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED
@@ -15890,14 +15939,23 @@ async def test_compose_cancel_preserves_original_when_cleanup_child_fails(tmp_pa
     composer = _CancellableComposer(original)
     captured = _capture_turn_exception(monkeypatch)
 
+    injected = []
+
     async def failing_persist(*args, **kwargs) -> None:
-        del args, kwargs
+        assert args[0] is service and args[1] == service.session.id
+        assert args[2] == () and args[3] == (llm_call,)
+        assert args[3][0] is llm_call
+        assert kwargs["required_audit"] is True
+        assert kwargs["session_operation_context"].fence.session_id == str(service.session.id)
+        task = asyncio.current_task()
+        assert task is not None
+        injected.append((task.get_name(), args[3], kwargs["session_operation_context"], kwargs["required_work"]))
         if secondary == "self_cancel":
             raise asyncio.CancelledError("cleanup self-cancelled")
         raise RuntimeError("cleanup failed")
 
     app.state.composer_service = composer
-    monkeypatch.setattr(messages_module if route == "messages" else compose_module, "_persist_llm_calls", failing_persist)
+    monkeypatch.setattr(messages_module if route == "messages" else compose_module, "_persist_turn_audit_cohort", failing_persist)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         body = message_body("Hello") if route == "messages" else recompose_body(str(user_msg.id))
         async with running_operation_async(client, app, path=f"/api/sessions/{service.session.id}/{route}", body=body) as operation:
@@ -15909,10 +15967,18 @@ async def test_compose_cancel_preserves_original_when_cleanup_child_fails(tmp_pa
             assert terminal.status_code == 200
             assert terminal.json()["status"] == "failed"
     assert len(captured) == 1
+    route_task_name = f"{'send-message' if route == 'messages' else 'recompose'}-cancelled-llm-call-persist"
     if secondary == "self_cancel":
+        # A self-cancelled route cleanup has no durable receipt. The worker
+        # retries that exact pending cohort before publishing a failed terminal.
+        assert [attempt[0] for attempt in injected] == [route_task_name, "composer-operation-cancelled-turn-audit-persist"]
+        assert injected[1][1] is injected[0][1]
+        assert injected[1][2] is injected[0][2]
+        assert injected[1][3] is injected[0][3]
         assert isinstance(captured[0], AuditIntegrityError)
         assert captured[0].__cause__ is original
     else:
+        assert [attempt[0] for attempt in injected] == [route_task_name]
         assert captured[0] is original
         assert isinstance(original.__cause__, RuntimeError)
 

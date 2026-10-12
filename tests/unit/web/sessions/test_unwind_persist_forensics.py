@@ -9,8 +9,10 @@ to ``.add(1)`` per cohort and a single log line carrying only
 indistinguishable from a 1-row loss on dashboards calibrated to the old
 per-row unit, and the log lost every model but the first.
 
-These tests pin the restored contract: the counter records the number of
-rows that failed to become durable, and the log lists the full cohort
+These tests pin the current contract: the counter records prepared rows
+in a failed persistence attempt, including private diagnostic siblings.
+Replay deduplication means this is not necessarily newly lost durable evidence.
+The log lists the full cohort
 (``models_requested`` / ``statuses`` mirroring the tool path's
 ``tool_names``).
 """
@@ -20,7 +22,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -29,7 +31,7 @@ import pytest
 import structlog
 from sqlalchemy.exc import OperationalError
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, PrivateFailureFacts, PrivateReceivedDiagnostic
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
@@ -90,6 +92,7 @@ class _FailingService:
     """Raises the configured exception from every atomic-persist entrypoint."""
 
     raise_on_call: Exception = field(default_factory=lambda: OperationalError("INSERT", {}, Exception("db down")))
+    attempted_drafts: list[tuple[AuditMessageDraft, ...]] = field(default_factory=list)
 
     async def add_messages_atomic(
         self,
@@ -100,6 +103,7 @@ class _FailingService:
         composition_state_id: UUID | None = None,
         **_fenced_kwargs: object,
     ) -> None:
+        self.attempted_drafts.append(tuple(drafts))
         raise self.raise_on_call
 
     async def add_run_diagnostics_audit_messages_atomic(
@@ -199,7 +203,7 @@ async def test_tool_invocations_unwind_counts_every_lost_row(unwind_counter: _Re
         )
 
     assert result == ()
-    assert unwind_counter.adds == [(2, {"helper": "tool_invocations"})]
+    assert unwind_counter.adds == [(4, {"helper": "tool_invocations"})]
     event = _event(captured, "composer_tool_invocation_persist_failed_during_unwind")
     assert event["tool_names"] == ["preview_pipeline", "upsert_node"]
 
@@ -226,11 +230,55 @@ async def test_turn_cohort_unwind_counts_both_groups_and_names_every_model(unwin
         )
 
     assert result == ()
-    # The whole turn failed to become durable: 1 tool row + 2 LLM sidecars.
-    assert unwind_counter.adds == [(3, {"helper": "turn_audit_cohort"})]
+    # Prepared attempt: one public + one private tool row, and two LLM sidecars.
+    assert unwind_counter.adds == [(4, {"helper": "turn_audit_cohort"})]
     event = _event(captured, "composer_turn_audit_cohort_persist_failed_during_unwind")
     assert event["tool_names"] == ["preview_pipeline"]
     assert event["models_requested"] == ["provider/model-a", "provider/model-b"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("helper", "expected_rows"), [("tool_invocations", 3), ("llm_calls", 4), ("turn_audit_cohort", 7)])
+async def test_unwind_counter_counts_prepared_variable_private_diagnostics(
+    unwind_counter: _RecordingCounter, helper: str, expected_rows: int
+) -> None:
+    facts = PrivateFailureFacts(canonical_json({"nodes": [{"class": "ValueError", "arguments": ["ordinary cause"]}]}))
+    tool = replace(_tool_invocation("preview_pipeline"), private_failure=facts)
+    call = replace(
+        _llm_call("provider/model-a"),
+        private_failure=facts,
+        private_diagnostics=tuple(
+            PrivateReceivedDiagnostic(
+                f"received:{index}", f"received:{index}", "list_sources", canonical_json({}), canonical_json({"slot_index": index}), None
+            )
+            for index in range(2)
+        ),
+    )
+    service = _FailingService()
+    session_id = uuid4()
+    context = _compose_context(session_id)
+    if helper == "tool_invocations":
+        await _persist_tool_invocations(
+            cast(SessionServiceProtocol, service), session_id, (tool,), None, plugin_crash_pending=True, session_operation_context=context
+        )
+    elif helper == "llm_calls":
+        await _persist_llm_calls(
+            cast(SessionServiceProtocol, service), session_id, (call,), None, plugin_crash_pending=True, session_operation_context=context
+        )
+    else:
+        await _persist_turn_audit_cohort(
+            cast(SessionServiceProtocol, service),
+            session_id,
+            (tool,),
+            (call,),
+            tool_composition_state_id=None,
+            llm_composition_state_id=None,
+            plugin_crash_pending=True,
+            session_operation_context=context,
+        )
+    assert len(service.attempted_drafts) == 1
+    assert len(service.attempted_drafts[0]) == expected_rows
+    assert unwind_counter.adds == [(expected_rows, {"helper": helper})]
 
 
 @pytest.mark.asyncio

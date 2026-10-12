@@ -17,6 +17,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
+from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, is_diagnostic_evidence_envelope
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -99,6 +100,39 @@ def _hash_canonical(canonical: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _public_invocation_message(
+    service: _CapturingSessionService, session_id: UUID, invocation: ComposerToolInvocation, *, linked: bool = False
+) -> _CapturedMessage:
+    assert len(service.messages) == 2
+    private, public = [], []
+    for message in service.messages:
+        assert message.session_id == session_id and message.kwargs["writer_principal"] == "compose_loop"
+        envelopes = message.kwargs["tool_calls"]
+        assert len(envelopes) == 1
+        if is_diagnostic_evidence_envelope(envelopes[0]):
+            assert message.role == "audit"
+            evidence = ComposerDiagnosticEvidence.from_envelope(
+                envelopes[0],
+                expected_session_id=str(session_id),
+                expected_operation_id=_compose_context(session_id).fence.operation_id,
+                expected_tool_call_id=invocation.tool_call_id,
+            )
+            assert evidence.tool_name == invocation.tool_name and evidence.status == invocation.status.value
+            private.append(message)
+        else:
+            assert envelopes[0]["_kind"] == "audit"
+            assert envelopes[0]["invocation"]["tool_call_id"] == invocation.tool_call_id
+            assert message.role == ("tool" if linked else "audit")
+            if linked:
+                assert message.kwargs["tool_call_id"] == invocation.tool_call_id
+                assert message.kwargs["parent_assistant_id"] is not None
+            else:
+                assert message.kwargs["tool_call_id"] is None and message.kwargs["parent_assistant_id"] is None
+            public.append(message)
+    assert len(private) == len(public) == 1
+    return public[0]
+
+
 @pytest.mark.asyncio
 async def test_legacy_tool_invocation_persistence_redacts_advisor_payloads() -> None:
     """Legacy route drains must not mirror raw advisor arguments or guidance."""
@@ -161,8 +195,7 @@ async def test_legacy_tool_invocation_persistence_redacts_advisor_payloads() -> 
         session_operation_context=_compose_context(session_id),
     )
 
-    assert len(service.messages) == 1
-    message = service.messages[0]
+    message = _public_invocation_message(service, session_id, invocation, linked=True)
     persisted_blob = json.dumps(
         {
             "content": json.loads(message.content),
@@ -249,8 +282,7 @@ async def test_legacy_tool_invocation_persistence_scrubs_type_driven_response_ca
         session_operation_context=_compose_context(session_id),
     )
 
-    assert len(service.messages) == 1
-    message = service.messages[0]
+    message = _public_invocation_message(service, session_id, invocation, linked=True)
     serialized_http_and_audit = json.dumps(
         {
             "content": json.loads(message.content),
@@ -309,7 +341,7 @@ async def test_legacy_persistence_aggregates_unknown_top_level_response_key_name
         session_operation_context=_compose_context(session_id),
     )
 
-    message = service.messages[0]
+    message = _public_invocation_message(service, session_id, invocation)
     persisted_invocation = message.kwargs["tool_calls"][0]["invocation"]
     expected = {"success": True, "_unknown_response": "<redacted-unknown-response-key>"}
     assert json.loads(message.content) == expected
@@ -374,7 +406,7 @@ async def test_legacy_persistence_bounds_deep_response_before_recursive_projecti
         session_operation_context=_compose_context(session_id),
     )
 
-    message = service.messages[0]
+    message = _public_invocation_message(service, session_id, invocation)
     # upsert_node declares ``data`` known, so the over-depth value degrades to
     # the per-key sentinel and the envelope framing survives; the canary is
     # never walked into the persisted row or the invocation projection.
@@ -464,21 +496,24 @@ async def test_legacy_persistence_scrubs_repair_argument_key_canaries(
     )
     service = _CapturingSessionService()
     session_id = uuid4()
+    parent_assistant_id = uuid4()
 
     await _persist_tool_invocations(
         cast(SessionServiceProtocol, service),
         session_id,
         (invocation,),
         composition_state_id=None,
-        parent_assistant_id=uuid4(),
+        parent_assistant_id=parent_assistant_id,
         plugin_crash_pending=False,
         session_operation_context=_compose_context(session_id),
     )
 
+    public = _public_invocation_message(service, session_id, invocation, linked=True)
+    assert public.kwargs["parent_assistant_id"] == str(parent_assistant_id)
     persisted_blob = json.dumps(
         {
-            "content": json.loads(service.messages[0].content),
-            "tool_calls": service.messages[0].kwargs["tool_calls"],
+            "content": json.loads(public.content),
+            "tool_calls": public.kwargs["tool_calls"],
         },
         sort_keys=True,
     )
@@ -530,7 +565,7 @@ async def test_schema_valid_semantic_arg_error_persists_only_closed_argument_pro
         session_operation_context=_compose_context(session_id),
     )
 
-    message = service.messages[0]
+    message = _public_invocation_message(service, session_id, invocation)
     envelope = message.kwargs["tool_calls"][0]
     persisted_invocation = envelope["invocation"]
     expected_arguments = {
@@ -690,7 +725,7 @@ async def test_legacy_non_arg_failures_use_closed_content_and_envelope_projectio
         session_operation_context=_compose_context(session_id),
     )
 
-    message = service.messages[0]
+    message = _public_invocation_message(service, session_id, invocation)
     persisted_invocation = message.kwargs["tool_calls"][0]["invocation"]
     assert json.loads(message.content) == expected
     assert persisted_invocation["error_class"] == expected["error_class"]
@@ -744,8 +779,7 @@ async def test_arg_error_result_for_response_model_tool_persists_without_success
         session_operation_context=_compose_context(session_id),
     )
 
-    assert len(service.messages) == 1
-    message = service.messages[0]
+    message = _public_invocation_message(service, session_id, invocation)
     persisted_content = json.loads(message.content)
     envelope = message.kwargs["tool_calls"][0]
 

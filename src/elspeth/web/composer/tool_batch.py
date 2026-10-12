@@ -1048,7 +1048,7 @@ async def run_tool_batch(
     private_authorings_by_call: dict[str, PrivateToolAuthoring] = {}
     proposals_this_turn = 0
     mutation_success_observed = False
-    from elspeth.web.composer.redaction import MANIFEST
+    from elspeth.web.composer.redaction import MANIFEST, redact_tool_call_arguments
 
     for tool_call in assistant_tool_calls:
         if ctx.cancellation_requested.is_set():
@@ -1619,10 +1619,15 @@ async def run_tool_batch(
                     audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
                     audit = rebind_dispatch_arguments(audit, audit_arguments)
                     decoded_args_by_call_id[tool_call.id] = audit_arguments
+                    transcript_arguments = (
+                        redact_tool_call_arguments(tool_name, arguments, telemetry=ctx.redaction_telemetry)
+                        if candidate.prepared_inline_blob is not None
+                        else audit_arguments
+                    )
                     _replace_llm_tool_call_arguments(
                         llm_messages,
                         tool_call_id=tool_call.id,
-                        arguments=audit_arguments,
+                        arguments=transcript_arguments,
                         dialect=ctx.tool_contract_dialect,
                         semantic=True,
                     )
@@ -1643,8 +1648,6 @@ async def run_tool_batch(
                 raise _pending_proposal_cap_error(proposals_this_turn + 1, ctx=ctx, state=state)
 
             from pydantic import ValidationError as PydanticValidationError
-
-            from elspeth.web.composer.redaction import redact_tool_call_arguments
 
             # The LLM may produce arguments that fail the redaction
             # MANIFEST's argument_model — most commonly a misplaced
@@ -1723,19 +1726,19 @@ async def run_tool_batch(
                             audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
                             audit = rebind_dispatch_arguments(audit, audit_arguments)
                             decoded_args_by_call_id[tool_call.id] = audit_arguments
-                            _replace_llm_tool_call_arguments(
-                                llm_messages,
-                                tool_call_id=tool_call.id,
-                                arguments=audit_arguments,
-                                dialect=ctx.tool_contract_dialect,
-                                semantic=True,
-                            )
-                            interpretation_requirements_are_internal = True
                             redacted_arguments = redact_tool_call_arguments(
                                 tool_name,
                                 arguments,
                                 telemetry=ctx.redaction_telemetry,
                             )
+                            _replace_llm_tool_call_arguments(
+                                llm_messages,
+                                tool_call_id=tool_call.id,
+                                arguments=redacted_arguments if candidate.prepared_inline_blob is not None else audit_arguments,
+                                dialect=ctx.tool_contract_dialect,
+                                semantic=True,
+                            )
+                            interpretation_requirements_are_internal = True
                         finalized_candidate_result = finalize_tool_result(
                             candidate.result,
                             tool_name=tool_name,
@@ -1759,10 +1762,17 @@ async def run_tool_batch(
                             arguments = cast(dict[str, Any], deep_thaw(custody.arguments))
                             audit = rebind_dispatch_arguments(audit, arguments)
                             decoded_args_by_call_id[tool_call.id] = arguments
+                            # Authority retains the exact review draft. Only its
+                            # redacted projection belongs in provider history.
+                            redacted_arguments = redact_tool_call_arguments(
+                                tool_name,
+                                arguments,
+                                telemetry=ctx.redaction_telemetry,
+                            )
                             _replace_llm_tool_call_arguments(
                                 llm_messages,
                                 tool_call_id=tool_call.id,
-                                arguments=arguments,
+                                arguments=redacted_arguments,
                                 dialect=ctx.tool_contract_dialect,
                                 semantic=True,
                             )
@@ -1808,12 +1818,6 @@ async def run_tool_batch(
                                 )
                                 proposal_acceptable = candidate.acceptable
 
-                            # Re-run the manifest against the final safe shape.
-                            redacted_arguments = redact_tool_call_arguments(
-                                tool_name,
-                                arguments,
-                                telemetry=ctx.redaction_telemetry,
-                            )
                     except BaseException as exc:
                         # Candidate finalization is one-time pre-proposal work.
                         # Re-raise it inside dispatch_with_audit below without

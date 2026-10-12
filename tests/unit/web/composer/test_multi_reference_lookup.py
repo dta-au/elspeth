@@ -78,7 +78,30 @@ def test_deferred_named_table_keeps_other_authoring_errors(invalid: str) -> None
         options["lookups"][0]["on_miss"] = "default"
         options["lookups"][0]["default_values"] = {"description": "${REFERENCE_SECRET}"}
 
-    assert _prevalidate_plugin_options("transform", "reference_join", options) is not None
+    error = _prevalidate_plugin_options("transform", "reference_join", options)
+    assert error is not None
+    if invalid == "emitted_default":
+        assert "lookups[0].default_values must not contain environment-variable placeholders" in error
+
+
+@pytest.mark.parametrize("deferred", [False, True], ids=["inline", "blob"])
+@pytest.mark.parametrize("field", ["default_values", "output"])
+@pytest.mark.parametrize("placeholder", [False, True], ids=["ordinary", "environment-placeholder"])
+def test_nested_emitted_placeholder_parity_preserves_literal_reference_content(deferred: bool, field: str, placeholder: bool) -> None:
+    options = _uploaded_table_options()
+    if not deferred:
+        options["tables"]["products"]["reference_content"] = "sku,description\nhat,${REFERENCE_SECRET}\n"
+    lookup = options["lookups"][0]
+    lookup["on_miss"] = "default"
+    lookup["default_values"] = {"description": "ordinary fallback"}
+    if placeholder:
+        lookup[field] = {"description": "'${REFERENCE_SECRET}'"}
+    error = _prevalidate_plugin_options("transform", "reference_join", options)
+    if placeholder:
+        assert error is not None
+        assert f"lookups[0].{field} must not contain environment-variable placeholders" in error
+    else:
+        assert error is None
 
 
 def test_named_uploaded_table_materializes_for_multiple_lookups(tmp_path: Path) -> None:

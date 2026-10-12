@@ -13,6 +13,7 @@ from structlog.testing import capture_logs
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.audit import llm_call_audit_envelope
+from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError, ComposerRuntimePreflightError
 from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerRequiredRecoveryFailure
@@ -236,9 +237,21 @@ async def test_recovery_and_actual_audit_sql_failure_retain_group_and_recover_on
 
         tool_content, tool_envelope = redacted_tool_invocation_content_and_envelope(tool)
         cohort = tuple(message for message in await service.get_messages(session.id, limit=None) if message.role == "audit")
-        assert len(cohort) == 2
-        assert cohort[0].content == tool_content
-        assert deep_thaw(cohort[0].tool_calls) == [tool_envelope]
+        assert len(cohort) == 3
+        assert all(message.tool_calls is not None and len(message.tool_calls) == 1 for message in cohort)
+        by_kind = {message.tool_calls[0]["_kind"]: message for message in cohort}
+        assert set(by_kind) == {DIAGNOSTIC_EVIDENCE_KIND, "audit", "llm_call_audit"}
+        assert by_kind["audit"].content == tool_content
+        assert deep_thaw(by_kind["audit"].tool_calls) == [tool_envelope]
+        evidence = ComposerDiagnosticEvidence.from_envelope(
+            by_kind[DIAGNOSTIC_EVIDENCE_KIND].tool_calls[0],
+            expected_session_id=str(session.id),
+            expected_operation_id=job.lease.context.fence.operation_id,
+            expected_tool_call_id=tool.tool_call_id,
+        )
+        assert evidence.operation_epoch == job.lease.context.fence.operation_epoch
+        assert evidence.tool_name == tool.tool_name and evidence.status == tool.status.value
+        assert deep_thaw(by_kind["llm_call_audit"].tool_calls) == [llm_call_audit_envelope(call)]
         ledger = ledger_snapshot()
         assert len(ledger) == 1
         assert str(UUID(ledger[0]["entry_id"])) == ledger[0]["entry_id"]

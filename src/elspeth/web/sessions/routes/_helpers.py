@@ -1548,11 +1548,11 @@ _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER = metrics.get_meter(__name__).cre
     "composer.audit.tool_row_persist_failed_during_unwind_total",
     unit="1",
     description=(
-        "Count of audit ROWS that failed to become durable on the unwind "
+        "Count of prepared audit rows in failed persistence attempts on the unwind "
         "path (a primary failure was already in flight; the failure is "
         "recorded but does not raise so it cannot mask the primary "
-        "exception). Cohort persistence adds the cohort's row count per "
-        "failure, preserving the per-row unit of the loop it replaced."
+        "exception). Includes private diagnostic drafts; replay deduplication "
+        "means this is not a count of newly lost durable rows."
     ),
 )
 
@@ -2090,13 +2090,11 @@ async def _persist_tool_invocations(
         if plugin_crash_pending and not required_audit:
             # Unwind path: a primary failure is already in flight.
             # Counting + slog preserves audibility without masking
-            # the original exception. The counter unit is ROWS lost,
-            # not cohorts: the atomic cohort makes every buffered row
-            # non-durable at once, and dashboards calibrated to the
-            # per-row loop this replaced must keep reading evidence
-            # loss at the same magnitude.
+            # the original exception. Count every prepared row in the
+            # failed attempt, including variable diagnostic siblings.
+            # Replay deduplication may find some rows already durable.
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                2 * len(tool_invocations),
+                len(drafts),
                 {"helper": "tool_invocations"},
             )
             slog.error(
@@ -2227,11 +2225,10 @@ async def _persist_llm_calls(
         if sql is not None and projection is not None and sql.complete:
             projection.complete_without_submission()
         if plugin_crash_pending and not required_audit:
-            # Counter unit is ROWS lost (see _persist_tool_invocations);
-            # the log lists the full cohort so a 12-call loss stays
-            # forensically distinct from a 1-call loss.
+            # Count prepared rows in the failed attempt (see
+            # _persist_tool_invocations); the log lists every model.
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                len(llm_calls),
+                len(drafts),
                 {"helper": "llm_calls"},
             )
             slog.error(
@@ -2388,11 +2385,10 @@ async def _persist_turn_audit_cohort(
         if sql is not None and projection is not None and sql.complete:
             projection.complete_without_submission()
         if plugin_crash_pending and not required_audit:
-            # Counter unit is ROWS lost (see _persist_tool_invocations):
-            # the whole turn — tool rows AND LLM sidecars — failed to
-            # become durable together.
+            # Count prepared rows in the failed attempt, including tool,
+            # LLM and private diagnostic siblings (see _persist_tool_invocations).
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                2 * len(tool_invocations) + len(llm_calls),
+                len(drafts),
                 {"helper": "turn_audit_cohort"},
             )
             slog.error(

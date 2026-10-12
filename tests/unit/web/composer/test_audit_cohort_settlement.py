@@ -37,7 +37,8 @@ from sqlalchemy.exc import OperationalError
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.core.canonical import canonical_json, stable_hash
-from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
+from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult, PlannerDeclined
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.protocol import ComposerConvergenceError
@@ -282,11 +283,22 @@ async def test_provider_timeout_after_inline_tool_turn_persists_each_record_exac
     assert _invocation_occurrences(after) == {"call_turn1_metadata": 1}, "the inline-persisted tool turn was drained a second time"
     llm_rows = _llm_audit_rows(after)
     assert len(llm_rows) == 2, "each buffered LLM call must be durable exactly once"
-    sequence_numbers = [row["sequence_no"] for row in llm_rows]
-    assert sequence_numbers == list(range(sequence_numbers[0], sequence_numbers[0] + 2)), (
-        "the sidecar cohort settles as one contiguous block"
+    assert [row["tool_calls"][0] for row in llm_rows] == [llm_call_audit_envelope(call) for call in exc.llm_calls]
+    assert after[: len(before)] == before, "the already committed tool/private cohort must remain unchanged"
+    appended = after[len(before) :]
+    assert [_envelope_kind(row) for row in appended] == ["llm_call_audit", DIAGNOSTIC_EVIDENCE_KIND, "llm_call_audit"]
+    timeout_call = exc.llm_calls[1]
+    timeout_identity = timeout_call.call_id or f"legacy:{timeout_call.started_at.isoformat()}:{timeout_call.planner_call_ordinal}"
+    failure = ComposerDiagnosticEvidence.from_envelope(
+        appended[1]["tool_calls"][0], expected_session_id=result_session_id, expected_tool_call_id=timeout_identity
     )
-    assert len({row["created_at"] for row in llm_rows}) == 1, "one transaction stamps one created_at across the cohort"
+    assert failure.status == "provider_failure" and failure.tool_name == "composer_failure"
+    assert failure.result.content is not None and "TimeoutError" in failure.result.content
+    sequence_numbers = [row["sequence_no"] for row in appended]
+    assert sequence_numbers == list(range(sequence_numbers[0], sequence_numbers[0] + len(appended))), (
+        "the complete public/private sidecar cohort settles as one contiguous block"
+    )
+    assert len({row["created_at"] for row in appended}) == 1, "one transaction stamps one created_at across the cohort"
 
 
 @pytest.mark.asyncio

@@ -277,16 +277,17 @@ async def test_auto_commit_finalization_replay_keeps_coalesce_order(tmp_path: Pa
         density_default="high",
         actor="user:proposal-prevalidation-user",
     )
-    llm = _ScriptedLLM(
-        _tool_turn("call_auto", "set_pipeline", _with_reversed_coalesce(_textract_llm_mapper_args(tmp_path), sink="output_rows"))
-    )
+    args = _with_reversed_coalesce(_textract_llm_mapper_args(tmp_path), sink="output_rows")
+    canary = "private-inline-auto-7f45"
+    args["source"]["inline_blob"]["content"] = f"doc_key\ninbox/{canary}.pdf\n"
+    llm = _ScriptedLLM(_tool_turn("call_auto", "set_pipeline", args))
     caller_lines = _record_replay_callers(monkeypatch)
 
     with (
         patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
     ):
-        await harness.service.compose(
+        result = await harness.service.compose(
             "Build and apply a Textract to LLM pipeline.",
             [],
             _empty_state(),
@@ -298,6 +299,10 @@ async def test_auto_commit_finalization_replay_keeps_coalesce_order(tmp_path: Pa
     # Success-path rewrite, then the finalization rewrite (the controls were wired).
     assert len(caller_lines) == 2, caller_lines
     replayed = _replayed_pipeline(llm.message_snapshots[1], "call_auto")
+    assert canary not in json.dumps(llm.message_snapshots[1])
+    invocation = next(invocation for invocation in result.tool_invocations if invocation.tool_call_id == "call_auto")
+    authority = json.loads(invocation.arguments_canonical)
+    assert authority["source"]["options"]["interpretation_requirements"][0]["draft"] == args["source"]["inline_blob"]["content"]
     assert _node_plugins(replayed) == _WIRED_PLUGINS, "the transcript must be the finalized (auto-wired) arguments"
     assert list(_node(replayed, "merge")["branches"]) == _MODEL_ORDER
 
@@ -409,6 +414,8 @@ async def test_inline_custody_replay_keeps_coalesce_order(tmp_path: Path, monkey
     """Inline custody alone (no required controls): ``inline_blob`` becomes ``blob_id`` in the transcript."""
     harness = _harness(tmp_path)
     args = _inline_pipeline_args(tmp_path)
+    canary = "private-inline-custody-7f45"
+    args["source"]["inline_blob"]["content"] = f"{canary}\n42\n"
     args["source"]["on_success"] = "mapped_rows"
     args["nodes"] = [
         {
@@ -431,7 +438,7 @@ async def test_inline_custody_replay_keeps_coalesce_order(tmp_path: Path, monkey
     caller_lines = _record_replay_callers(monkeypatch)
 
     with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
-        await harness.service.compose(
+        result = await harness.service.compose(
             "Prepare this pipeline for review.",
             [],
             _empty_state(),
@@ -443,5 +450,9 @@ async def test_inline_custody_replay_keeps_coalesce_order(tmp_path: Path, monkey
     # Success-path rewrite, canonical review finalization, then inline custody.
     assert len(caller_lines) == 3, caller_lines
     replayed = _replayed_pipeline(llm.message_snapshots[1], "call_inline")
+    assert canary not in json.dumps(llm.message_snapshots[1])
+    invocation = next(invocation for invocation in result.tool_invocations if invocation.tool_call_id == "call_inline")
+    authority = json.loads(invocation.arguments_canonical)
+    assert authority["source"]["options"]["interpretation_requirements"][0]["draft"] == args["source"]["inline_blob"]["content"]
     assert "blob_id" in replayed["source"] and "inline_blob" not in replayed["source"]
     assert list(_node(replayed, "merge")["branches"]) == _MODEL_ORDER
