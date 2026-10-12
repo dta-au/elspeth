@@ -4401,6 +4401,7 @@ class TestIDORCoverageDrift:
             "reject_composition_proposal",
             "list_session_runs",
             "get_current_state",
+            "get_composition_head",
             "get_state_versions",
             "revert_state",
             "get_state_yaml",
@@ -4658,6 +4659,7 @@ class TestIDORProtection:
     - ``POST /{session_id}/recompose``       (recompose)
     - ``GET  /{session_id}/runs``            (list_session_runs)
     - ``GET  /{session_id}/state``           (get_current_state)
+    - ``GET  /{session_id}/state/head``      (get_composition_head)
     - ``GET  /{session_id}/state/versions``  (get_state_versions)
     - ``POST /{session_id}/state/revert``    (revert_state)
     - ``GET  /{session_id}/state/yaml``      (get_state_yaml)
@@ -4767,6 +4769,13 @@ class TestIDORProtection:
 
         # Bob tries to GET state -- should be 404
         resp = bob_client.get(f"/api/sessions/{session_id}/state")
+        assert resp.status_code == 404
+
+        # Head identity must be available only to the session owner.
+        resp = alice_client.get(f"/api/sessions/{session_id}/state/head")
+        assert resp.status_code == 200
+        assert resp.json() == {"state_id": None, "version": 0}
+        resp = bob_client.get(f"/api/sessions/{session_id}/state/head")
         assert resp.status_code == 404
 
         # Bob tries to GET state versions -- should be 404
