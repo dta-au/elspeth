@@ -15,10 +15,45 @@ ROOT = Path(__file__).parents[3]
 TURN = "src/elspeth/web/sessions/composer_turn.py"
 SERVICE = "src/elspeth/web/sessions/service.py"
 PROTOCOL = "src/elspeth/web/sessions/protocol.py"
+COMPOSER_PROTOCOL = "src/elspeth/web/composer/protocol.py"
 
 
 def _source_units(paths: tuple[str, ...]) -> tuple[fencing.SourceUnit, ...]:
     return tuple(fencing._parse_source(path, (ROOT / path).read_text()) for path in paths)
+
+
+@pytest.mark.parametrize("fault", ("recovery_guard", "recovery_default", "recovery_import"))
+def test_reviewed_writer_recipes_match_live_source_and_refuse_recovery_drift(fault: str) -> None:
+    canonical_units = fencing._production_units()
+    assert fencing._reserve_recipe_failures(canonical_units) == []
+    units = tuple(fencing._parse_source(item.path, item.source) if item.path == COMPOSER_PROTOCOL else item for item in canonical_units)
+    unit = next(item for item in units if item.path == COMPOSER_PROTOCOL)
+    symbol = "ComposerResult"
+    if fault == "recovery_guard":
+        method = fencing._reserve_node_at(unit, "ComposerResult.__post_init__")
+        guard = method.body[0]
+        assert isinstance(guard, ast.If)
+        assert ast.unparse(guard.test).startswith("self.graph_recovery_intent is not None and ")
+        guard.test = ast.Constant(value=False)
+    elif fault == "recovery_default":
+        owner = fencing._reserve_node_at(unit, symbol)
+        field = next(
+            node
+            for node in owner.body
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "recovery_audit_drafts"
+        )
+        assert isinstance(field.value, ast.Tuple) and field.value.elts == []
+        field.value = ast.Constant(value=None)
+    else:
+        symbol = "module-bindings"
+        imported = next(
+            node
+            for node in ast.walk(unit.tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "elspeth.web.composer.graph_recovery"
+        )
+        imported.module = "unreviewed.recovery"
+    assert fencing._reserve_recipe_failures(units) == ["writer target/field recipe changed " + COMPOSER_PROTOCOL + ":" + symbol]
+    assert fencing._reserve_recipe_failures(canonical_units) == []
 
 
 @pytest.mark.parametrize("path", (TURN, SERVICE, PROTOCOL))
