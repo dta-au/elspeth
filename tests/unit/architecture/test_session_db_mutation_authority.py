@@ -5898,7 +5898,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "44c4543542ceeb85",
         1,
         None,
-        line=2234,
+        line=2242,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5909,7 +5909,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "222b5f4b0d258dbe",
         1,
         None,
-        line=2216,
+        line=2224,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6027,7 +6027,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "40f92c2195132323",
         1,
         None,
-        line=1950,
+        line=1958,
     ),
     # The reference schema exists only in a private sqlite3 :memory: store.
     WriterIdentity(
