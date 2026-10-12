@@ -9,6 +9,7 @@ from tests.helpers import web_reserve_composer_receiver as receiver
 from tests.helpers import web_reserve_provider_mint_contract as provider
 from tests.helpers import web_reserve_route_helper as route
 from tests.helpers import web_reserve_terminal_sql_transfers as terminal
+from tests.helpers import web_worker_whole_scope_origin as worker_origin
 from tests.unit.architecture import test_web_landscape_mutation_fencing as fencing
 
 ROOT = Path(__file__).parents[3]
@@ -20,6 +21,35 @@ COMPOSER_PROTOCOL = "src/elspeth/web/composer/protocol.py"
 
 def _source_units(paths: tuple[str, ...]) -> tuple[fencing.SourceUnit, ...]:
     return tuple(fencing._parse_source(path, (ROOT / path).read_text()) for path in paths)
+
+
+@pytest.mark.parametrize("fault", ("omit_admission", "foreign_worker_app", "foreign_return"))
+def test_reviewed_app_whole_scope_matches_live_source_and_refuses_drift(fault: str) -> None:
+    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_origin.TURN))
+    assert worker_origin.worker_whole_scope_origin_local_contracts(units)[0] == []
+    factory = fencing._reserve_node_at(units[0], "_create_app")
+    if fault == "omit_admission":
+        admission = next(
+            node
+            for node in ast.walk(factory)
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and ast.unparse(node.value.func) == "admit_local_stores"
+        )
+        admission.value = ast.Constant(value=None)
+    elif fault == "foreign_worker_app":
+        constructor = next(
+            node for node in ast.walk(factory) if isinstance(node, ast.Call) and ast.unparse(node.func) == "ComposerAsyncWorker"
+        )
+        argument = next(keyword for keyword in constructor.keywords if keyword.arg == "app")
+        assert ast.unparse(argument.value) == "app"
+        argument.value = ast.Name(id="foreign_app", ctx=ast.Load())
+    else:
+        final_return = factory.body[-1]
+        assert isinstance(final_return, ast.Return) and ast.unparse(final_return.value) == "app"
+        final_return.value = ast.Name(id="foreign_app", ctx=ast.Load())
+    ast.fix_missing_locations(units[0].tree)
+    assert worker_origin.worker_whole_scope_origin_local_contracts(units)[0] == [
+        "worker whole scope: complete finite whole-body grammar changed _create_app"
+    ]
 
 
 @pytest.mark.parametrize("fault", ("recovery_guard", "recovery_default", "recovery_import"))

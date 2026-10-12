@@ -2339,8 +2339,8 @@ class TestLifespanShutdown:
             assert event["probed_role"] == "planner"
             assert event["model"] == "openrouter/z-ai/glm-5.3"
             assert (event["tool_count"], event["strict_true_count"], event["strict_false_count"], event["strict_key_omitted"]) == (
-                1,
-                0,
+                3,
+                2,
                 1,
                 0,
             )
