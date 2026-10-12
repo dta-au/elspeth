@@ -119,6 +119,64 @@ async def test_private_insert_failure_rolls_back_assistant_and_tool(private_writ
 
 
 @pytest.mark.asyncio
+async def test_private_failure_sibling_is_atomic_and_replays_with_primary(private_writer, monkeypatch):
+    from elspeth.web.composer.audit_storage import private_failure_evidence
+    from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
+    from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+
+    service, session, context, evidence = private_writer
+    failure = private_failure_evidence(
+        capture_failure_facts(ValueError("ordinary missing reference")),
+        identity=diagnostic_evidence_identity("tool-failure", evidence.tool_call_id),
+        tool_call_id=evidence.tool_call_id,
+        status="tool_failure",
+        context=context,
+    )
+    original = service._insert_chat_message
+
+    def insert(conn, **kwargs):
+        if kwargs["role"] == "audit" and kwargs["tool_calls"][0]["evidence"]["status"] == "tool_failure":
+            raise AuditIntegrityError("injected private failure sibling insert")
+        return original(conn, **kwargs)
+
+    kwargs = _normal_kwargs(session, context, evidence)
+    kwargs["private_tool_failures"] = (failure,)
+    with monkeypatch.context() as controlled:
+        controlled.setattr(service, "_insert_chat_message", insert)
+        with pytest.raises(AuditIntegrityError, match="injected private failure sibling"):
+            await service.persist_compose_turn_async(**kwargs)
+    assert await service.get_messages(session.id, limit=None) == []
+    await service.persist_compose_turn_async(**kwargs)
+    before = await service.get_messages(session.id, limit=None)
+    assert len(before) == 4
+    await service.add_messages_atomic(
+        session.id,
+        tuple(
+            AuditMessageDraft(role="audit", content="Private credential-filtered tool evidence", tool_calls=(value.to_envelope(),))
+            for value in (evidence, failure)
+        ),
+        writer_principal="compose_loop",
+        session_operation_context=context,
+        audit_only=True,
+    )
+    assert await service.get_messages(session.id, limit=None) == before
+
+
+@pytest.mark.asyncio
+async def test_explicit_unbound_state_cannot_be_claimed_by_tool_evidence(private_writer):
+    service, session, context, evidence = private_writer
+    with pytest.raises(AuditIntegrityError, match="unbound"):
+        await service.add_messages_atomic(
+            session.id,
+            (AuditMessageDraft(role="audit", content="private", tool_calls=(evidence.to_envelope(),), inherit_composition_state=False),),
+            writer_principal="compose_loop",
+            session_operation_context=context,
+            audit_only=True,
+        )
+    assert await service.get_messages(session.id, limit=None) == []
+
+
+@pytest.mark.asyncio
 async def test_private_cohort_exact_replay_deduplicates_and_conflict_fails(private_writer):
     service, session, context, evidence = private_writer
 
@@ -280,6 +338,9 @@ async def test_received_and_accepted_one_shot_candidates_settle_in_actual_planne
         )
     rows = _private_rows(await service.get_messages(UUID(result_session_id), limit=None))
     evidence = [ComposerDiagnosticEvidence.from_envelope(row.tool_calls[0], expected_session_id=result_session_id) for row in rows]
+    received = [item for item in evidence if item.status == "received_response"]
+    assert len(received) == 3
+    evidence = [item for item in evidence if item.status != "received_response"]
     assert [item.status for item in evidence] == ["received_not_dispatched", "accepted"]
     assert all(item.authority_arguments is not None for item in evidence)
     assert all(item.wire_arguments.disposition == "retained" for item in evidence)
@@ -691,12 +752,18 @@ async def test_rejected_receipt_then_fatal_assertion_drains_private_audit_before
     if mode == "caller_cancel_audit_failure":
         assert evidence == []
         return
+    failures = [item for item in evidence if item.status == "tool_failure"]
+    assert len(failures) == 1
+    assert "private primary assertion detail" in failures[0].result.content
+    assert "original cause" in failures[0].result.content
+    evidence = [item for item in evidence if item.status != "tool_failure"]
     assert [item.tool_call_id for item in evidence] == ["fatal-inline", "fatal-current"]
     assert evidence[0].arguments.content == canonical_json(pipeline)
     assert evidence[0].wire_arguments.content == json.dumps(arguments)
     assert evidence[1].status == "plugin_crash"
     assert evidence[1].result.disposition == "not_returned"
-    assert "private primary assertion detail" not in json.dumps(deep_thaw([row.tool_calls for row in rows]))
+    public_rows = [row for row in rows if not row.tool_calls or row.tool_calls[0].get("_kind") != "composer_diagnostic_evidence"]
+    assert "private primary assertion detail" not in json.dumps(deep_thaw([row.tool_calls for row in public_rows]))
 
 
 @pytest.mark.asyncio

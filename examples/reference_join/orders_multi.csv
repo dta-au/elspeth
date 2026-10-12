@@ -1,0 +1,6 @@
+order_id,product,region_code,tax_code,quantity
+M-1001,hats,metro,taxable,2
+M-1002,scarves,metro,taxable,1
+M-1003,socks,remote,exempt,3
+M-1004,gloves,remote,unknown,1
+M-1005,scarves,remote,taxable,4

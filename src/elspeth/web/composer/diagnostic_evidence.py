@@ -409,6 +409,13 @@ def _canonical_payload(
     return _retained(_project(value, tool_name=tool_name, additional_fields=additional_fields, reasons=reasons, root=True), reasons)
 
 
+def diagnostic_evidence_identity(domain: str, correlation: str) -> str:
+    """Keep owned evidence domains disjoint from arbitrary provider call IDs."""
+    if domain not in {"tool-authoring", "tool-failure", "provider-failure", "planner-candidate"}:
+        raise AuditIntegrityError("Unknown private evidence identity domain")
+    return f"{domain}:{hashlib.sha256(correlation.encode('utf-8')).hexdigest()}"
+
+
 def build_private_tool_evidence(
     *,
     session_id: str,
@@ -501,7 +508,7 @@ def build_private_tool_evidence(
         tool_call_id,
         tool_name,
         status,
-        tool_call_id if evidence_id is None else evidence_id,
+        diagnostic_evidence_identity("tool-authoring", tool_call_id) if evidence_id is None else evidence_id,
         arguments,
         authority,
         result,

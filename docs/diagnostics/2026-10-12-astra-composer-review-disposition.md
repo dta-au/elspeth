@@ -19,22 +19,27 @@ not a new runtime acceptance result.
    earlier durable mutation, a useful rejection followed by an assertion,
    exact-once filtered receipts, and unchanged graph state. Source review
    does not establish process-death or resource-exhaustion durability.
-2. **Provider rejection before parsed candidate capture: acknowledged
-   coverage limit, separate scope decision.** D20 captures admitted parsed
+2. **Provider rejection before parsed candidate capture: authorized bounded
+   repair implemented; final qualification pending.** The committed D20 baseline captures admitted parsed
    planner candidates. Output-limit, duplicate-ID and malformed-response
    rejection may happen earlier; existing physical-call and semantic-attempt
    records retain closed failure dispositions, not the rejected arguments.
-   Safely retaining inspectable received arguments independently of admission
-   is a useful extension, but it requires a separate capture contract. This
-   patch does not claim complete raw-response archival or retain unsafe wire
-   as a fallback.
-3. **Class-only failure detail: acknowledged limit, separate scope decision.**
+   The authorized extension captures filtered received slots independently
+   of admission, with request/physical-call/position correlation, at most
+   32 slots, separate shared 1 MiB raw/canonical input budgets and a shared
+   1 MiB final filtered-argument budget per response. Independent security
+   review accepts the final implementation; focused controls pass.
+   It does not claim complete raw-response archival or retain unsafe wire.
+3. **Class-only failure detail: implemented; final qualification pending.**
    Distinct benign exception messages can become indistinguishable in durable
    Composer records. The current private evidence contract preserves authored
-   arguments and returned results, not arbitrary exception text. Bounded,
-   credential-filtered cause facts or a durable correlated diagnostic reference
-   need their own policy and controls. No exception object, locals or transport
-   credentials are admitted by this repair.
+   arguments and returned results. The authorized extension adds bounded,
+   credential-filtered built-in exception facts to private evidence, preserving
+   public class-only errors. Its design limits capture to five cause/context
+   nodes and 8 KiB of facts, without invoking arbitrary string conversion.
+   Final helper controls pass and independent security review accepts the
+   bounded implementation. No exception object, locals or
+   transport credentials are retained.
 4. **Provider context reconstruction: acknowledged limit, separate scope
    decision.** Request and tool-spec hashes identify a request but cannot
    reconstruct its ordered messages, transient feedback and omissions. A safe
@@ -82,3 +87,12 @@ production hashes stayed unchanged. Final production Ruff, mypy and contracts
 passed with frozen fingerprint `91b8bdd3ba8a4a71`; keyless lint stayed at 3188
 with the same reviewed delta. Full default tests,
 PostgreSQL, protected landing and deployment remain separate claims.
+
+The follow-up extension passed 37 final helper/persistence controls after a
+typing-only correction, plus three corrected fatal/cancellation controls.
+An eight-module affected selection passed 269 tests before that typing edit;
+it is behavior evidence, not a frozen-final-tree result. The contract precheck
+passes with the existing 2536-site census unchanged. The provider template
+control passes on actual source and rejects an in-memory removal of required
+lease context. Final combined static, PostgreSQL and broader acceptance gates
+remain pending. These overlapping selections are not an aggregate count.

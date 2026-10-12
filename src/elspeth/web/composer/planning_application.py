@@ -34,7 +34,11 @@ from elspeth.web.composer.audit import (
     planner_attempt_audit_envelope,
     planner_attempt_audit_summary,
 )
-from elspeth.web.composer.audit_storage import private_tool_invocation_draft, redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.audit_storage import (
+    private_diagnostic_drafts,
+    private_tool_invocation_draft,
+    redacted_tool_invocation_content_and_envelope,
+)
 from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.composer_preflight import ComposerPreflight
@@ -342,6 +346,9 @@ class PlanningApplication:
         drafts: list[AuditMessageDraft] = []
         for record in interleave_planner_audit_records(llm_calls, planner_attempts):
             if type(record) is ComposerLLMCall:
+                if session_operation_context is None:
+                    raise AuditIntegrityError("planner diagnostics require operation authority")
+                drafts.extend(private_diagnostic_drafts(record, context=session_operation_context))
                 drafts.append(
                     AuditMessageDraft(
                         role="audit",
@@ -361,6 +368,7 @@ class PlanningApplication:
         for invocation in invocations:
             if session_operation_context is None:
                 raise AuditIntegrityError("planner private evidence requires operation authority")
+            drafts.extend(private_diagnostic_drafts(invocation, context=session_operation_context))
             drafts.append(
                 private_tool_invocation_draft(invocation, session_id=str(session_id), session_operation_context=session_operation_context)
             )

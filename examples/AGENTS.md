@@ -36,7 +36,7 @@ These run immediately with no setup:
 | `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group; run one `settings*.yaml` at a time. `settings_screened.yaml` screens ahead of the fork and ends SUCCESS (3 tickets screened out before forking); `settings_screened_at_settlement.yaml` screens mid-branch on a post-fork field and ends PARTIAL **by design** (3 tickets discarded inside the control branch, their orphaned treatment siblings fail closed) |
 | `json_explode` | 3 | JSON source with array expansion (3→6 output) |
 | `transform_pipeline` | 5 | Type coercion followed by dependent derived-field calculations |
-| `reference_join` | 5 / 5 / 3 | Keyed enrichment from a config-bound reference table; ships three `settings*.yaml` files, run one at a time. `settings.yaml` joins a flat CSV table, `settings_nested.yaml` a nested JSON table with one deliberately sparse entry (`on_miss: default` fills the one missing value per field), and `settings_missing_product.yaml` ends PARTIAL/exit 1 **by design** — one order names a product the table does not list and the default `on_miss: fail` quarantines it. `reference_file` resolves relative to the SETTINGS directory, not the repo root, which is why `products.csv` sits beside `settings.yaml` |
+| `reference_join` | 5 / 5 / 3 / 5 | Keyed enrichment from config-bound reference tables; ships four `settings*.yaml` files, run one at a time. `settings.yaml` joins a flat CSV table, `settings_nested.yaml` a sparse nested JSON table with per-field defaults, and `settings_missing_product.yaml` ends PARTIAL/exit 1 **by design** with one missing product. `settings_multi.yaml` performs three independent lookups across three CSVs, supplies separate product/region defaults, and ends PARTIAL/exit 1 **by design**: four enriched orders and one original whole row quarantined on a later tax lookup miss. `reference_file` resolves relative to the SETTINGS directory, not the repo root |
 | `landscape_journal` | 2 | JSON source, audit journal |
 | `multi_flow` | 4 | Two independent named source flows in one run |
 | `multi_source_queue` | 3 | Multiple named sources fan into a queue |
@@ -55,7 +55,7 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 
 ### Exit 0 is not the corpus gate
 
-Sixteen shipped configs end non-zero **by design**. A runner that treats any
+Seventeen shipped configs end non-zero **by design**. A runner that treats any
 non-zero exit as failure will report phantom defects; encode the expected exit
 per config, not a blanket `-eq 0`:
 
@@ -72,13 +72,14 @@ per config, not a blanket `-eq 0`:
 | `document_review_panel/settings_incomplete.yaml` | 1 | one page loses a reviewer; the page, then the document verdict, fail closed |
 | `document_review_panel/settings_run_as_row.yaml` | 1 | same loss, run encapsulated as one row — the corpus verdict is refused entirely |
 | `reference_join/settings_missing_product.yaml` | 1 | 1 order names a product absent from the reference table; `on_miss: fail` quarantines it |
+| `reference_join/settings_multi.yaml` | 1 | 1 order's tax lookup misses after earlier enrichment/defaults; its whole original row is quarantined |
 | `batch_error_routing/settings.yaml` | 1 | 1 wrongly typed amount fails its batch; all 3 rows of it routed to `failed_batches` |
 | `batch_error_routing/settings_discard.yaml` | 1 | the same failed batch under `on_error: discard`; its 3 rows recorded as quarantined |
 | `batch_error_routing/settings_declared.yaml` | 1 | the declared `amount_cents: int` routes the 1 bad row before the batch |
 | `chaosweb/settings.yaml` | 1, stochastic | injected fetch faults route to `scrape_failures.csv` |
 | `chaosllm_endurance/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
 
-The first fourteen are deterministic fixtures with fixed counts. The last two
+The first fifteen are deterministic fixtures with fixed counts. The last two
 depend on randomly injected faults, so they may also exit 0 — for those the
 acceptance criterion is **conservation**, not the exit code: every source row
 reaches either the result sink or the error sink, with the failure reason

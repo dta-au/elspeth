@@ -10,16 +10,29 @@ incident repairs preserved. No duplicate cherry-pick or shared-checkout edit
 was needed. This chat owns integration; implementation subagents have bounded
 file ownership and do not move branches or publish.
 
+The operator's subsequent scope decision keeps website work with 0.8.5 and
+closes that release's scope except for P0/P1 changes. Website/Pages remains
+outside this emergency/CSV delivery. The two authorized P1 diagnostic
+extensions and their qualification continue; the publication-hold
+coordination is unchanged.
+
+Publication must use the operator-designated `johnm-dta` account. Before
+publication, resolve Git's actual HTTPS credential under operation-scoped
+helper settings and verify that credential against GitHub's authenticated
+user endpoint. The initial check returned `johnm-dta`; a read-only remote
+check found no emergency branch. No global account switch or fallback to
+another account is permitted. Preserve existing commit attribution.
+
 ## Current disposition
 
 - CSV multi-lookup: integrated in the committed history. The feature owner's
   independent correctness and security reviews accept the reviewed bytes;
   its 836 focused tests and frozen static gate passed. These precede combined
   qualification and do not substitute for it.
-- D29/D30: local uncommitted repairs distinguish candidate reference errors
+- D29/D30: repairs committed in `48764972c` distinguish candidate reference errors
   from saved-review integrity errors and return valid requirement IDs through
   custody-aware feedback. Focused checks passed before CSV integration.
-- D21/D35: local uncommitted CSV inspection repair excludes incomplete sample
+- D21/D35: the CSV inspection repair committed in `48764972c` excludes incomplete sample
   tails while retaining real jagged-row diagnostics. Its 256 affected checks
   passed before CSV integration.
 - Cleanup P2: implemented locally. Node identity now reaches per-hook and
@@ -56,11 +69,13 @@ file ownership and do not move branches or publish.
   product question is contradicted by its existing marked-clarification path.
   These review findings are not newly implemented repairs or D20 acceptance.
 - Independent Astra high review: the [disposition](2026-10-12-astra-composer-review-disposition.md)
-  confirms the fatal-assertion D20 gap. Pre-admission response retention,
-  exception-detail evidence and provider-context reconstruction are explicit
-  coverage limits requiring separate scope decisions.
+  confirms the fatal-assertion D20 gap, repaired in `48764972c`. Bounded
+  filtered pre-admission response retention and useful cause facts are now
+  implemented bounded repairs, with independent security acceptance and
+  37 passing final helper/persistence controls. Final combined gates remain.
+  Provider-context reconstruction remains a separate coverage limit.
 
-Uncommitted production paths cover `interpretation_state.py`, Composer state,
+Production repairs committed in `48764972c` cover `interpretation_state.py`, Composer state,
 planner, source inspection, tools, skill guidance, diagnostic evidence,
 session persistence/private reads, the internal audit receipt contract and
 `engine/orchestrator/cleanup.py`. Focused regression tests, diagnostic
@@ -70,7 +85,14 @@ states the combined delivery route rather than a standalone feature PR.
 ## Remaining delivery gates
 
 1. D20 implementation and independent security review are complete for the
-   defined filtered-evidence contract. Final failure controls passed 33 tests;
+   filtered-evidence baseline committed in `48764972c`. The authorized
+   pre-admission and cause-fact extension is implemented and independently
+   reviewed. It passed 37 final helper controls and three corrected
+   fatal/cancellation controls. The 269-test affected run passed before the
+   final typing-only correction, so it is not frozen-final-tree evidence.
+   Contract census and controlled provider-template checks pass unchanged.
+   Final combined static and runtime qualification remain pending.
+   Baseline final failure controls passed 33 tests;
    route/cancellation controls passed 46. The full affected service module had
    67 passes and one stale internal exception expectation. Its isolated repair
    passed, retaining original-cause, current-receipt and no-publication checks;
@@ -105,6 +127,36 @@ states the combined delivery route rather than a standalone feature PR.
 6. Commit only owned reviewed paths, publish the combined PR, and require
    current-head checks before normal protected landing. No deployment or
    protection bypass is authorized by this handoff.
+7. Run every self-contained local example on the frozen final combined
+   candidate through one dedicated test subagent. Inventory every entry in
+   `examples/`, following its repository instructions and actual workflows.
+   Exclude Azure, OpenRouter, AWS and every example needing remote APIs,
+   external services/data, credentials, spending or provisioned infrastructure.
+   Preserve isolated outputs and an exact passed/failed/skipped/unrun matrix
+   with commands, exclusion reasons, exit codes and source fingerprint. This
+   is an explicit operator acceptance requirement before landing; inventory
+   preparation does not count as execution, and skipped examples are not
+   passed examples. Coordinate host capacity with existing CI.
+   The operator explicitly classifies genuinely broken eligible examples as
+   P0/P1 blockers belonging in this emergency build. Diagnose setup failures
+   separately; route product/example repairs through the single implementation
+   writer and independent review, then rerun affected workflows and applicable
+   gates on the updated frozen candidate. Do not weaken assertions or silently
+   exclude failures.
+   Treat engine regression as the leading hypothesis, then verify it against
+   the intended contract and available known-good behavior. Preserve original
+   examples and traces, investigate related instances, and distinguish engine
+   defects from stale configurations, fixtures or setup. Never change example
+   expectations merely to accommodate broken engine behavior.
+8. The new `reference_join/settings_multi.yaml` example performs three
+   independent lookups across products, regions and tax-rate CSVs. Its actual
+   CLI regression passed: four exact enriched rows with product/region
+   defaults, and one exact original row quarantined on a later tax miss.
+   The intended partial-run CLI exit is 1. The whole-corpus run must include
+   this variant. Separately, ordinary Composer must author and execute the
+   same synthetic workflow through its normal review and admission paths.
+   That live acceptance remains pending; the deterministic CLI check does
+   not establish it. Existing authorized provider-call/cost/time guards apply.
 
 Outgoing chat controls are unavailable in this repair chat. The parent bridge
 is relaying coordination; read-only chat inspection remains available. This

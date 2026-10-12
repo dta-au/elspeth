@@ -1839,6 +1839,7 @@ class SessionServiceImpl:
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[RedactedToolRow, ...],
         private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
+        private_tool_failures: tuple[ComposerDiagnosticEvidence, ...] = (),
         rejection_records: tuple[RejectionRecord, ...] = (),
         parent_composition_state_id: str | None,
         expected_current_state_id: str | None,
@@ -1912,7 +1913,7 @@ class SessionServiceImpl:
         tool_row_ids = {row.tool_call_id for row in redacted_tool_rows}
         if (tool_row_ids or private_tool_evidence) and writer_principal != "compose_loop":
             raise AuditIntegrityError("private tool evidence requires compose_loop writer custody")
-        from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+        from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
 
         evidence_by_id: dict[str, ComposerDiagnosticEvidence] = {}
         for evidence in private_tool_evidence:
@@ -1929,6 +1930,25 @@ class SessionServiceImpl:
             evidence_by_id[evidence.tool_call_id] = evidence
         if set(evidence_by_id) != tool_row_ids:
             raise AuditIntegrityError("normal tool evidence does not match the exact persisted tool set")
+        if len({evidence.evidence_id for evidence in (*private_tool_evidence, *private_tool_failures)}) != len(private_tool_evidence) + len(
+            private_tool_failures
+        ):
+            raise AuditIntegrityError("private tool authoring and failure evidence identities collide")
+        failure_ids: set[str] = set()
+        for failure in private_tool_failures:
+            if (
+                type(failure) is not ComposerDiagnosticEvidence
+                or failure.tool_call_id not in tool_row_ids
+                or failure.tool_call_id in failure_ids
+                or failure.evidence_id != diagnostic_evidence_identity("tool-failure", failure.tool_call_id)
+                or failure.tool_name != "composer_failure"
+                or failure.status != "tool_failure"
+                or failure.session_id != session_id
+                or failure.operation_id != session_operation_context.fence.operation_id
+                or failure.operation_epoch != session_operation_context.fence.operation_epoch
+            ):
+                raise AuditIntegrityError("private tool failure has unrelated or repeated owned identity")
+            failure_ids.add(failure.tool_call_id)
         for record in rejection_records:
             if record.tool_call_id not in tool_row_ids:
                 raise ValueError(
@@ -1988,7 +2008,9 @@ class SessionServiceImpl:
                             "compose result based on a stale state."
                         )
 
-                    base_seq = self._reserve_sequence_range(conn, session_id, count=1 + 2 * len(redacted_tool_rows))
+                    base_seq = self._reserve_sequence_range(
+                        conn, session_id, count=1 + 2 * len(redacted_tool_rows) + len(private_tool_failures)
+                    )
 
                     assistant_id = self._insert_chat_message(
                         conn,
@@ -2088,6 +2110,22 @@ class SessionServiceImpl:
                                     created_at=now,
                                 )
 
+                    for offset, failure in enumerate(private_tool_failures, start=1):
+                        self._insert_chat_message(
+                            conn,
+                            session_id=session_id,
+                            role="audit",
+                            content="Private credential-filtered failure facts",
+                            raw_content=None,
+                            tool_calls=[failure.to_envelope()],
+                            sequence_no=base_seq + 2 * len(redacted_tool_rows) + offset,
+                            writer_principal=writer_principal,
+                            composition_state_id=current_state_id,
+                            tool_call_id=None,
+                            parent_assistant_id=None,
+                            created_at=now,
+                            session_operation_context=session_operation_context,
+                        )
                 return AuditOutcome(
                     assistant_id=assistant_id,
                     unwind_audit_failed=False,
@@ -2231,6 +2269,7 @@ class SessionServiceImpl:
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[RedactedToolRow, ...],
         private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
+        private_tool_failures: tuple[ComposerDiagnosticEvidence, ...] = (),
         rejection_records: tuple[RejectionRecord, ...] = (),
         parent_composition_state_id: str | None,
         expected_current_state_id: str | None,
@@ -2281,6 +2320,7 @@ class SessionServiceImpl:
                 redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                 redacted_tool_rows=redacted_tool_rows,
                 private_tool_evidence=private_tool_evidence,
+                private_tool_failures=private_tool_failures,
                 rejection_records=rejection_records,
                 parent_composition_state_id=parent_composition_state_id,
                 expected_current_state_id=expected_current_state_id,
@@ -6817,9 +6857,12 @@ class SessionServiceImpl:
         with _required_sql_preflight(required_work):
             if type(call) is not ComposerLLMCall or call.call_id is None:
                 raise AuditIntegrityError("A provider checkpoint requires its pending attempt identity")
-            drafts = (
+            drafts: tuple[AuditMessageDraft, ...] = (
                 AuditMessageDraft(role="audit", content="Provider call result recorded.", tool_calls=(llm_call_audit_envelope(call),)),
             )
+            from elspeth.web.composer.audit_storage import private_diagnostic_drafts
+
+            drafts += private_diagnostic_drafts(call, context=session_operation_context)
         try:
             await self.add_messages_atomic(
                 UUID(session_operation_context.fence.session_id),
@@ -8657,6 +8700,8 @@ class SessionServiceImpl:
         for draft in drafts:
             private = tuple(value for value in draft.tool_calls or () if is_diagnostic_evidence_envelope(value))
             if not private:
+                if not draft.inherit_composition_state:
+                    raise AuditIntegrityError("unbound audit state belongs only to physical private diagnostics")
                 candidates.append((draft, None))
                 continue
             if draft.role != "audit" or writer_principal != "compose_loop" or len(private) != 1 or len(draft.tool_calls or ()) != 1:
@@ -8666,12 +8711,14 @@ class SessionServiceImpl:
             )
             if evidence.operation_epoch != session_operation_context.fence.operation_epoch:
                 raise AuditIntegrityError("private diagnostic draft has another operation epoch")
+            if not draft.inherit_composition_state and evidence.status not in {"received_response", "provider_failure"}:
+                raise AuditIntegrityError("unbound private state belongs only to physical diagnostics")
             key = (evidence.operation_id, evidence.operation_epoch, evidence.evidence_id)
             if key in incoming:
                 raise AuditIntegrityError("private diagnostic cohort repeats an evidence identity")
             incoming[key] = (
                 canonical_json(evidence.to_envelope()),
-                draft.composition_state_id if draft.composition_state_id is not None else composition_state_id,
+                draft.effective_composition_state_id(composition_state_id),
             )
             candidates.append((draft, key))
         if not incoming:
@@ -8741,7 +8788,7 @@ class SessionServiceImpl:
             raise AuditIntegrityError("audit bundle identities do not match its immutable drafts")
         sid = str(session_id)
         csid = str(composition_state_id) if composition_state_id else None
-        effective_state_ids = tuple(d.composition_state_id if d.composition_state_id is not None else csid for d in drafts)
+        effective_state_ids = tuple(d.effective_composition_state_id(csid) for d in drafts)
         if not drafts:
             return ()
         self._assert_session_write_lock_held(
@@ -8795,7 +8842,7 @@ class SessionServiceImpl:
                 tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
                 sequence_no=base_seq + offset,
                 writer_principal=writer_principal,
-                composition_state_id=draft.composition_state_id if draft.composition_state_id is not None else csid,
+                composition_state_id=draft.effective_composition_state_id(csid),
                 tool_call_id=draft.tool_call_id,
                 parent_assistant_id=draft.parent_assistant_id,
                 created_at=now,

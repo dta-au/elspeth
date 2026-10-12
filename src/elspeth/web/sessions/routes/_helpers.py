@@ -66,7 +66,11 @@ from elspeth.web.composer.audit import (
     llm_call_audit_envelope,
     llm_call_audit_summary,
 )
-from elspeth.web.composer.audit_storage import private_tool_invocation_draft, redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.audit_storage import (
+    private_diagnostic_drafts,
+    private_tool_invocation_draft,
+    redacted_tool_invocation_content_and_envelope,
+)
 from elspeth.web.composer.control_messages import replay_composer_control_message
 from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
@@ -2031,6 +2035,7 @@ async def _persist_tool_invocations(
         pipeline_bindings: list[PipelineDispatchAuditBinding] = []
         for invocation in tool_invocations:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            drafts.extend(private_diagnostic_drafts(invocation, context=session_operation_context))
             drafts.append(
                 private_tool_invocation_draft(invocation, session_id=str(session_id), session_operation_context=session_operation_context)
             )
@@ -2189,6 +2194,7 @@ async def _persist_llm_calls(
             )
             for call in llm_calls
         )
+        drafts += tuple(draft for call in llm_calls for draft in private_diagnostic_drafts(call, context=session_operation_context))
     except BaseException as error:
         if producer is not None and sql is not None and projection is not None:
             producer.complete_owned(error)
@@ -2319,6 +2325,7 @@ async def _persist_turn_audit_cohort(
         pipeline_bindings: list[PipelineDispatchAuditBinding] = []
         for invocation in tool_invocations:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            drafts.extend(private_diagnostic_drafts(invocation, context=session_operation_context, composition_state_id=tool_csid))
             drafts.append(
                 private_tool_invocation_draft(
                     invocation,
@@ -2340,6 +2347,7 @@ async def _persist_turn_audit_cohort(
             if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
                 pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
         for call in llm_calls:
+            drafts.extend(private_diagnostic_drafts(call, context=session_operation_context, composition_state_id=llm_csid))
             drafts.append(
                 AuditMessageDraft(
                     role="audit",

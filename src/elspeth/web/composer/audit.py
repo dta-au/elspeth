@@ -988,6 +988,8 @@ def finish_plugin_crash(
     are already in hand, and writing the record is a single in-memory
     list append.
     """
+    from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+
     cls_name = type(exc).__name__
     return ComposerToolInvocation(
         tool_call_id=audit.tool_call_id,
@@ -999,6 +1001,7 @@ def finish_plugin_crash(
         status=ComposerToolStatus.PLUGIN_CRASH,
         error_class=cls_name,
         error_message=cls_name,
+        private_failure=capture_failure_facts(exc),
         version_before=audit.version_before,
         version_after=None,
         started_at=audit.started_at,

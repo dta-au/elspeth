@@ -40,11 +40,21 @@ audit-only drain. The drain preserves failure/cancellation precedence without
 publishing an invalid graph. Explicit cancellation closure covers the direct
 async tool stages outside the existing audited dispatch `finally`.
 
-Planner payload coverage begins at admitted parsed candidates. Pre-parse
-refusals retain existing closed call/attempt failure metadata, not a raw
-response archive. Arbitrary exception text and reconstructable provider
-request snapshots remain outside this contract. Cooperative failure tests
-do not establish process-death or resource-exhaustion durability.
+At committed baseline `48764972c`, planner payload coverage begins at admitted
+parsed candidates. The authorized follow-up extends private evidence to
+bounded filtered received slots before admission and useful filtered failure
+facts. This extension is implemented with independent security acceptance.
+Final helper/persistence controls pass 37 tests; three corrected fatal and
+cancellation controls also pass. Combined qualification remains pending.
+Physical receipt siblings settle atomically with the existing provider
+checkpoint and remain explicitly unbound to graph state during later replay.
+Received payloads have separate shared 1 MiB raw-input, canonical-input and
+final filtered-argument bounds, with at most 32 slots and an omission summary.
+Failure facts have at most five cause/context nodes and 8 KiB canonical facts.
+Unavailable content has an explicit disposition, never a raw fallback.
+It retains neither a complete raw-response
+archive nor reconstructable provider request snapshots. Cooperative failure
+tests do not establish process-death or resource-exhaustion durability.
 
 The explicit diagnostic route reads one storage row at a time, returns one
 private record by default, and permits at most five per page. It validates

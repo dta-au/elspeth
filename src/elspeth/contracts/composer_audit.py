@@ -129,6 +129,37 @@ class ToolArgumentErrorCategory(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class PrivateFailureFacts:
+    """Bounded filtered facts; never part of a public invocation payload."""
+
+    canonical: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.canonical) is not str or len(self.canonical.encode("utf-8")) > 8192:
+            raise TypeError("private failure facts must be bounded canonical text")
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateReceivedDiagnostic:
+    """A bounded received slot independent of provider admission authority."""
+
+    evidence_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments_canonical: str | None = field(repr=False)
+    result_canonical: str = field(repr=False)
+    raw_arguments: str | None = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not str or not value for value in (self.evidence_id, self.tool_call_id, self.tool_name, self.result_canonical)
+        ):
+            raise TypeError("private receipt requires owned scalar identity and facts")
+        if any(value is not None and type(value) is not str for value in (self.arguments_canonical, self.raw_arguments)):
+            raise TypeError("private receipt arguments must be exact strings or absent")
+
+
+@dataclass(frozen=True, slots=True)
 class PrivateToolAuthoring:
     """In-memory received authoring; omitted from invocation wire payloads."""
 
@@ -266,8 +297,11 @@ class ComposerToolInvocation:
     strict_sent: bool | None = None
     wire_conformant: bool | None = None
     private_authoring: PrivateToolAuthoring | None = field(default=None, repr=False)
+    private_failure: PrivateFailureFacts | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.private_failure is not None and type(self.private_failure) is not PrivateFailureFacts:
+            raise TypeError("invocation private failure facts must be owned")
         if self.private_authoring is not None:
             if type(self.private_authoring) is not PrivateToolAuthoring:
                 raise TypeError("invocation private authoring must be an owned receipt")
@@ -298,6 +332,7 @@ class ComposerToolInvocation:
         """
         raw = asdict(self)
         del raw["private_authoring"]
+        del raw["private_failure"]
         raw["status"] = self.status.value
         raw["error_category"] = self.error_category.value if self.error_category is not None else None
         raw["started_at"] = self.started_at.isoformat()

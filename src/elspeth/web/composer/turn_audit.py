@@ -399,8 +399,8 @@ async def persist_turn_audit(
             raise AuditIntegrityError("Compose turn audit persistence requires exact session operation authority")
         if sessions_service is None:
             raise RuntimeError("sessions_service not wired")
-        from elspeth.web.composer.audit_storage import _validated_canonical_mapping_pair
-        from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence
+        from elspeth.web.composer.audit_storage import _validated_canonical_mapping_pair, private_failure_evidence
+        from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence, diagnostic_evidence_identity
 
         authorings = {authoring.tool_call_id: authoring for authoring in private_authorings}
         invocations = {invocation.tool_call_id: invocation for invocation in private_invocations}
@@ -441,6 +441,17 @@ async def persist_turn_audit(
                     error_category=outcome.error_category.value if outcome.error_category is not None else None,
                 )
             )
+        private_tool_failures = tuple(
+            private_failure_evidence(
+                invocation.private_failure,
+                identity=diagnostic_evidence_identity("tool-failure", invocation.tool_call_id),
+                tool_call_id=invocation.tool_call_id,
+                status="tool_failure",
+                context=session_operation_context,
+            )
+            for invocation in private_invocations
+            if invocation.private_failure is not None
+        )
         checkpoint_sql = checkpoint_projection = None
         if required_work is not None:
             if type(required_work) is not RequiredWorkBinding:
@@ -458,6 +469,7 @@ async def persist_turn_audit(
                     redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                     redacted_tool_rows=redacted_tool_rows,
                     private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
                     rejection_records=build_rejection_records(tool_outcomes),
                     parent_composition_state_id=current_state_id,
                     expected_current_state_id=current_state_id,
@@ -473,6 +485,7 @@ async def persist_turn_audit(
                     redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                     redacted_tool_rows=redacted_tool_rows,
                     private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
                     rejection_records=build_rejection_records(tool_outcomes),
                     parent_composition_state_id=current_state_id,
                     expected_current_state_id=current_state_id,

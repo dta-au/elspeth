@@ -3503,6 +3503,7 @@ class SessionServiceProtocol(Protocol):
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[Any, ...],
         private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
+        private_tool_failures: tuple[ComposerDiagnosticEvidence, ...] = (),
         rejection_records: tuple[Any, ...] = (),
         parent_composition_state_id: str | None,
         expected_current_state_id: str | None,

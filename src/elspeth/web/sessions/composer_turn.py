@@ -585,7 +585,15 @@ def _turn_audit_cohort_drafts(
     drafts: list[AuditMessageDraft] = []
     bindings: list[PipelineDispatchAuditBinding] = []
     for invocation in tool_invocations:
-        from elspeth.web.composer.audit_storage import private_tool_invocation_draft
+        from elspeth.web.composer.audit_storage import private_diagnostic_drafts, private_tool_invocation_draft
+
+        drafts.extend(
+            private_diagnostic_drafts(
+                invocation,
+                context=session_operation_context,
+                composition_state_id=str(tool_composition_state_id) if tool_composition_state_id is not None else None,
+            )
+        )
 
         drafts.append(
             private_tool_invocation_draft(
@@ -609,6 +617,15 @@ def _turn_audit_cohort_drafts(
         if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
             bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
     for call in llm_calls:
+        from elspeth.web.composer.audit_storage import private_diagnostic_drafts
+
+        drafts.extend(
+            private_diagnostic_drafts(
+                call,
+                context=session_operation_context,
+                composition_state_id=str(llm_composition_state_id) if llm_composition_state_id is not None else None,
+            )
+        )
         drafts.append(
             AuditMessageDraft(
                 role="audit",
@@ -662,6 +679,9 @@ async def persist_cancelled_turn_audit(
         return
     claim = running.claim
     rows = 2 * len(tool_invocations) + len(llm_calls)
+    rows += sum(record.private_failure is not None for record in tool_invocations)
+    rows += sum(call.private_failure is not None for call in llm_calls)
+    rows += sum(len(call.private_diagnostics) for call in llm_calls)
     if not rows:
         observation.audit_cohort_durable = True
         return

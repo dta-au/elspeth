@@ -635,6 +635,7 @@ class ProviderGateway:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        failure_to_capture: Exception | None = None
         try:
             completion = await asyncio.wait_for(
                 self._call_llm(wire_messages, wire_tools, provider_custody=provider_custody)
@@ -654,7 +655,8 @@ class ProviderGateway:
                 )
             status = ComposerLLMCallStatus.SUCCESS
             return completion
-        except TimeoutError:
+        except TimeoutError as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.TIMEOUT
             error_class = "TimeoutError"
             error_message = "TimeoutError"
@@ -666,6 +668,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except OpenAIError as exc:
+            failure_to_capture = exc
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
@@ -673,6 +676,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except _MalformedLLMResponseError as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             response_metadata = exc.provider_metadata
             error_class = type(exc).__name__
@@ -680,6 +684,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except _BadRequestLLMError as exc:
+            failure_to_capture = exc
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
@@ -687,12 +692,14 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             error_class = type(exc).__name__
             error_message = "credential_material_rejected"
             attach_llm_calls(exc, recorder)
             raise
         except Exception as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
@@ -720,6 +727,7 @@ class ProviderGateway:
                             error_class=error_class,
                             error_message=error_message,
                             provider_custody=provider_custody,
+                            failure=failure_to_capture,
                         )
                         if provider_custody is not None:
                             provider_custody.retain_audit(call)
@@ -744,6 +752,7 @@ class ProviderGateway:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        failure_to_capture: Exception | None = None
         try:
             provider_response = await asyncio.wait_for(
                 self._call_text_llm(messages, provider_custody=provider_custody)
@@ -780,7 +789,8 @@ class ProviderGateway:
             response_metadata = admitted_metadata
             status = ComposerLLMCallStatus.SUCCESS
             return content.strip()
-        except TimeoutError:
+        except TimeoutError as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.TIMEOUT
             error_class = "TimeoutError"
             error_message = "TimeoutError"
@@ -792,6 +802,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except OpenAIError as exc:
+            failure_to_capture = exc
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
@@ -799,6 +810,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except _MalformedLLMResponseError as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             response_metadata = exc.provider_metadata
             error_class = type(exc).__name__
@@ -806,6 +818,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except _BadRequestLLMError as exc:
+            failure_to_capture = exc
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
@@ -813,12 +826,14 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             error_class = type(exc).__name__
             error_message = "credential_material_rejected"
             attach_llm_calls(exc, recorder)
             raise
         except Exception as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
@@ -846,6 +861,7 @@ class ProviderGateway:
                             error_class=error_class,
                             error_message=error_message,
                             provider_custody=provider_custody,
+                            failure=failure_to_capture,
                         )
                         if provider_custody is not None:
                             provider_custody.retain_audit(call)

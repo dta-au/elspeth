@@ -118,8 +118,13 @@ class AuditMessageDraft:
     tool_call_id: str | None = None
     parent_assistant_id: str | None = None
     composition_state_id: str | None = None
+    inherit_composition_state: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.inherit_composition_state) is not bool or (
+            not self.inherit_composition_state and self.composition_state_id is not None
+        ):
+            raise TypeError("explicit unbound audit state requires an exact flag and no state override")
         # ``tool_calls`` carries audit envelopes that must not change between
         # cohort construction and the atomic insert. Both readers already
         # expect frozen shapes: ``add_messages_atomic`` ``deep_thaw``s before
@@ -127,6 +132,11 @@ class AuditMessageDraft:
         # ``MappingProxyType`` alongside ``dict``. ``None`` passes through
         # ``deep_freeze`` unchanged.
         freeze_fields(self, "tool_calls")
+
+    def effective_composition_state_id(self, cohort_state_id: str | None) -> str | None:
+        if not self.inherit_composition_state:
+            return None
+        return self.composition_state_id if self.composition_state_id is not None else cohort_state_id
 
 
 @dataclass(frozen=True, slots=True)

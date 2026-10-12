@@ -17,6 +17,7 @@ lifts named values onto the row.
 elspeth run --settings examples/reference_join/settings.yaml --execute
 elspeth run --settings examples/reference_join/settings_nested.yaml --execute
 elspeth run --settings examples/reference_join/settings_missing_product.yaml --execute   # exits 1 BY DESIGN
+elspeth run --settings examples/reference_join/settings_multi.yaml --execute             # exits 1 BY DESIGN
 ```
 
 | Config | Table | Rows | Ends |
@@ -24,6 +25,40 @@ elspeth run --settings examples/reference_join/settings_missing_product.yaml --e
 | `settings.yaml` | `products.csv` (flat) | 5 | SUCCESS, exit 0 |
 | `settings_nested.yaml` | `products.json` (nested, one sparse entry) | 5 | SUCCESS, exit 0 |
 | `settings_missing_product.yaml` | `products.csv` (flat) | 3 | **PARTIAL, exit 1 by design** |
+| `settings_multi.yaml` | `products.csv`, `regions.csv`, `tax_rates.csv` | 5 | **PARTIAL, exit 1 by design**: 4 enriched, 1 original row quarantined |
+
+## Multiple CSV lookups, independent defaults, atomic quarantine
+
+`settings_multi.yaml` performs three lookups inside one `reference_join`:
+
+| Input key | CSV / reference key | Output | Miss policy |
+|---|---|---|---|
+| `product` | `products.csv` / `sku` | `product_description`, `unit_price` | Defaults `Unlisted product`, `0.00` |
+| `region_code` | `regions.csv` / `code` | `region` | Default `Unmapped region` |
+| `tax_code` | `tax_rates.csv` / `code` | `tax_rate` | Fail the whole row |
+
+Each lookup reads its key from the original arriving row. A lookup cannot use
+another lookup's newly generated output. CSV values and the configured defaults
+here are strings; this variant deliberately does not coerce numeric text.
+
+The deterministic fixture has these outcomes:
+
+| Order | Product result | Region result | Tax result | Destination |
+|---|---|---|---|---|
+| M-1001 | Matched hats | Metropolitan | 0.10 | `output/multi_enriched.csv` |
+| M-1002 | Product defaults | Metropolitan | 0.10 | Enriched |
+| M-1003 | Matched socks | Region default | 0.00 | Enriched |
+| M-1004 | Matched gloves | Region default | Missing `unknown` | `output/multi_quarantine.csv` |
+| M-1005 | Product defaults | Region default | 0.10 | Enriched |
+
+M-1004 demonstrates atomicity: although the first lookup matches and the second
+has a configured default, the third fails. Its quarantine row contains exactly
+the five original columns (`order_id`, `product`, `region_code`, `tax_code`,
+`quantity`), with no partial enrichment or default columns. Landscape attributes
+the error to lookup index 2, table `taxes`, reason `reference_miss`. The successful
+rows record per-lookup match/default attribution. The audit database is
+`runs/multi_audit.db`; the four successful rows plus one quarantined row make the
+run PARTIAL and the CLI exit 1.
 
 ## The three things worth understanding
 
@@ -103,5 +138,7 @@ back onto the main line, which is this transform.
 | `orders_with_unknown.csv` | Main line: 3 orders, one product absent from the table |
 | `products.csv` | Flat reference table |
 | `products.json` | Nested reference table; `socks` deliberately lacks `tax` |
+| `orders_multi.csv` | Five orders exercising three independent CSV lookups |
+| `regions.csv`, `tax_rates.csv` | Additional configuration tables for the multi-lookup variant |
 | `output/` | Written by the runs |
 | `runs/` | Landscape audit databases, one per config |
