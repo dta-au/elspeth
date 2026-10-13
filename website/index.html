@@ -1,172 +1,284 @@
-<!-- @dsCard group="Website" viewport="1280x720" name="Site — Home" subtitle="Project landing page (multi-page set), in-brand, light/dark" -->
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="ELSPETH is an open-source, high-assurance pipeline substrate for consequential workflows." />
-<title>ELSPETH — High-assurance pipelines for consequential work</title>
-<script>(function(){try{var s=localStorage.getItem("elspeth-theme");var t=s||((window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
-<link rel="stylesheet" href="styles.css" />
-<link rel="stylesheet" href="site.css" />
-<link rel="icon" href="favicon.svg" type="image/svg+xml" />
-<script src="vendor/lucide.min.js"></script>
-</head>
-<body>
-<a class="skip-link" href="#main">Skip to content</a>
-
-<header class="nav">
-  <div class="wrap nav-inner">
-    <div class="nav-left">
-      <a class="brand" href="index.html">ELSPETH</a>
-      <nav class="nav-links">
-        <a href="index.html" class="active" aria-current="page">Home</a>
-        <a href="authoring.html">Authoring</a>
-        <a href="assurance.html">Assurance</a>
-        <a href="use-cases.html">Use cases</a>
-        <a href="get-started.html">Get started</a>
+<html data-theme="dark" lang="en">
+ <head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+  <meta content="Build, validate, run and inspect data and LLM workflows. Explore ELSPETH, its evidence model and its pre-release limitations." name="description"/>
+  <title>
+   Data workflows with an audit trail — ELSPETH
+  </title>
+  <script>
+   (function(){try{var s=localStorage.getItem("elspeth-theme");var t=(s==="light"||s==="dark")?s:((window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+  </script>
+  <link href="styles.css" rel="stylesheet"/>
+  <link href="site.css" rel="stylesheet"/>
+  <link href="favicon.svg" rel="icon" type="image/svg+xml"/>
+  <script defer="" src="vendor/lucide.min.js">
+  </script>
+  <script defer="" src="site.js">
+  </script>
+ </head>
+ <body>
+  <a class="skip-link" href="#main">
+   Skip to content
+  </a>
+  <header class="nav">
+   <div class="wrap nav-inner">
+    <a aria-label="ELSPETH home" class="brand" href="index.html">
+     ELSPETH
+     <span class="brand-sub">
+      Data &amp; LLM workflows
+     </span>
+    </a>
+    <nav aria-label="Main navigation" class="nav-links">
+     <a aria-current="page" href="index.html">
+      Overview
+     </a>
+     <a href="authoring.html">
+      Build a workflow
+     </a>
+     <a href="assurance.html">
+      Review the evidence
+     </a>
+     <a href="use-cases.html">
+      Assess a use case
+     </a>
+     <a href="get-started.html">
+      Get started
+     </a>
+    </nav>
+    <div class="nav-actions">
+     <button aria-label="Switch to light theme" class="iconbtn" hidden="" id="theme-toggle">
+      <i aria-hidden="true" data-lucide="moon">
+      </i>
+     </button>
+     <details class="nav-menu">
+      <summary>
+       Menu
+       <i aria-hidden="true" data-lucide="menu">
+       </i>
+      </summary>
+      <nav aria-label="Mobile navigation" class="nav-menu-panel">
+       <a aria-current="page" href="index.html">
+        Overview
+       </a>
+       <a href="authoring.html">
+        Build a workflow
+       </a>
+       <a href="assurance.html">
+        Review the evidence
+       </a>
+       <a href="use-cases.html">
+        Assess a use case
+       </a>
+       <a href="get-started.html">
+        Get started
+       </a>
       </nav>
+     </details>
     </div>
-    <div class="nav-right">
-      <details class="nav-menu">
-        <summary class="iconbtn" aria-label="Open navigation menu"><i data-lucide="menu"></i></summary>
-        <div class="nav-menu-panel">
-          <a href="index.html" class="active" aria-current="page">Home</a>
-          <a href="authoring.html">Authoring</a>
-          <a href="assurance.html">Assurance</a>
-          <a href="use-cases.html">Use cases</a>
-          <a href="get-started.html">Get started</a>
-          <hr />
-          <a href="https://github.com/dta-au/elspeth">GitHub</a>
-        </div>
-      </details>
-      <button class="iconbtn" id="theme-toggle" aria-label="Toggle theme"><i data-lucide="moon"></i></button>
-      <a class="btn-compact" href="https://github.com/dta-au/elspeth" style="gap:8px"><i data-lucide="github" style="width:15px;height:15px"></i> GitHub</a>
-      <a class="btn-compact" href="get-started.html">Get started</a>
-    </div>
-  </div>
-</header>
-
-<main id="main">
-
-<!-- HERO -->
-<div class="hero dotgrid">
-  <div class="wrap hero-grid">
-    <div>
-      <span class="eyebrow">Open source · MIT · Python 3.12+</span>
-      <h1>High-assurance pipelines for decisions you have to defend.</h1>
-      <p class="sub">ELSPETH is open-source software developed and publicly released by staff of the DTA — Australia's Digital Transformation Agency. It's a high-assurance pipeline substrate for consequential workflows, where a wrong output can cause operational, legal, safety, or financial harm. Author in reviewable YAML or the LLM Web Composer; both run on one audited engine.</p>
+   </div>
+  </header>
+  <main id="main" tabindex="-1">
+   <header class="hero">
+    <div class="wrap hero-grid">
+     <div>
+      <p class="eyebrow">
+       Open source · Python · MIT licensed
+      </p>
+      <h1>
+       Build a workflow.
+       <br/>
+       Keep the evidence.
+      </h1>
+      <p class="lead">
+       ELSPETH builds, validates, runs and audits data and LLM workflows. Use it when your team needs to review how information was processed and explain how an output was produced.
+      </p>
       <div class="cta-row">
-        <a class="btn btn-primary btn-lg" href="get-started.html">Get started</a>
-        <a class="btn btn-lg" href="https://github.com/dta-au/elspeth"><i data-lucide="github" style="width:18px;height:18px"></i>&nbsp; View on GitHub</a>
+       <a class="btn btn-primary" href="get-started.html">
+        Try a local example
+        <span aria-hidden="true">
+         →
+        </span>
+       </a>
+       <a class="text-link" href="authoring.html">
+        Explore the workflow
+       </a>
       </div>
+     </div>
+     <aside class="intro-note">
+      <p class="eyebrow">
+       Before you begin
+      </p>
+      <h2>
+       A tool to evaluate carefully.
+      </h2>
+      <p>
+       ELSPETH is a pre-release prototype with limited user testing. It is not ready for general production use.
+      </p>
+      <p>
+       Start with synthetic or public data. People remain responsible for the workflow, the evidence they retain and any decision informed by an output.
+      </p>
+      <a href="assurance.html#limits">
+       Read the limits and responsibilities →
+      </a>
+     </aside>
     </div>
-    <div class="term" aria-hidden="true">
-      <div class="term-bar">
-        <i data-lucide="terminal" style="width:14px;height:14px;color:var(--color-text-muted)"></i>
-        <span class="t">elspeth · validate &amp; run</span>
+   </header>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      From source data to a reviewable result.
+     </h2>
+     <p class="section-intro">
+      Define the processing steps, check their connections, then inspect what happened during a run.
+     </p>
+     <ol class="workflow">
+      <li>
+       <span class="step-label">
+        01 / Author
+       </span>
+       <h3>
+        Describe the work
+       </h3>
+       <p>
+        Write version-controlled YAML or use the Web Composer to propose a pipeline in conversation.
+       </p>
+       <a href="authoring.html">
+        Authoring paths →
+       </a>
+      </li>
+      <li>
+       <span class="step-label">
+        02 / Validate
+       </span>
+       <h3>
+        Check the configuration
+       </h3>
+       <p>
+        Check settings, graph structure, route targets and compatible schemas before execution.
+       </p>
+       <a href="authoring.html#validation">
+        What validation checks →
+       </a>
+      </li>
+      <li>
+       <span class="step-label">
+        03 / Inspect
+       </span>
+       <h3>
+        Follow the record
+       </h3>
+       <p>
+        Use the Landscape audit trail to inspect lineage, routing, external calls and terminal outcomes.
+       </p>
+       <a href="assurance.html">
+        Evidence and recovery →
+       </a>
+      </li>
+     </ol>
+    </div>
+   </section>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      See the working interface.
+     </h2>
+     <div class="section-split">
+      <p>
+       The Web Composer brings the conversation, pipeline graph and review controls into one workspace. Its planner requires configured model providers.
+      </p>
+      <a class="text-link" href="authoring.html#workspace">
+       View the Composer walkthrough →
+      </a>
+     </div>
+     <figure class="product-shot">
+      <a href="images/composer-workspace.webp">
+       <img alt="Composer graph with a CSV source, a review gate and two outputs, in an offline synthetic-data demonstration." height="960" loading="lazy" src="images/composer-workspace.webp" width="1440"/>
+      </a>
+      <figcaption>
+       Current Composer with an imported YAML pipeline and synthetic records. The example routes requests for review; it does not determine eligibility. No model authoring or pipeline execution was used.
+       <a href="authoring.html#workspace">
+        About this demonstration
+       </a>
+       .
+      </figcaption>
+     </figure>
+    </div>
+   </section>
+   <section class="paper">
+    <div class="wrap">
+     <h2>
+      Start with a bounded task.
+     </h2>
+     <div class="two-col">
+      <div>
+       <h3>
+        For analysts and workflow owners
+       </h3>
+       <p>
+        Explore repeatable document checks, data preparation or classification for review. Define what a useful result looks like and how a person will check it.
+       </p>
       </div>
-      <div class="term-body"><span class="pr">$</span> <span class="cmd">elspeth validate --settings pipeline.yaml</span>
-<span class="ok">✓</span> <span class="mut">graph structure · route targets · edge/schema</span>
-<span class="ok">✓</span> <span class="mut">secret references resolved · preflight passed</span>
-
-<span class="pr">$</span> <span class="cmd">elspeth run --settings pipeline.yaml --execute</span>
-<span class="ok">completed</span> <span class="mut">— audit trail written to Landscape</span></div>
+      <div>
+       <h3>
+        For engineers and operators
+       </h3>
+       <p>
+        Review the pipeline configuration, configure access and providers, and plan storage, recovery and retention before operational use.
+       </p>
+      </div>
+     </div>
+     <a class="text-link" href="use-cases.html">
+      Assess a possible use case →
+     </a>
     </div>
-  </div>
-</div>
-
-<section class="release-strip" aria-label="Current ELSPETH release">
+   </section>
+   <section class="release-strip" aria-label="Current ELSPETH release">
   <div class="wrap">
     <p><strong>Current version: 0.8.3 (unreleased candidate)</strong> · <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">Read the changelog</a></p>
     <p>0.7.0 introduced the LLM-primary, staged Composer. 0.7.1 added recoverable publication and shared proposal validation. 0.8.0 added unified lineage and scope-bound collection, document and multimodal transforms, stronger Composer contracts and review surfaces, and production hardening. 0.8.1 extended PostgreSQL replica operation with durable run admission, Composer progress, single-use tickets and shared budgets. 0.8.2 adds bounded Composer validation, resource limits for reference joins, and stricter release-check evidence. The 0.8.3 candidate adds EFS archive recovery and prepares authenticated HTTPS Composer progress, pending final qualification.</p>
-    <p>Pre-1.0 APIs and schemas may change without backward-compatibility guarantees. Some upgrades require operators to recreate incompatible session and Landscape stores. This is a pre-1.0 release. Implemented controls support defensible workflows, not whole-platform certification.</p>
+    <p>Pre-1.0 APIs and schemas may change without backward-compatibility guarantees. Unsupported existing session, Landscape and local-auth stores must be preserved and refused before incompatible writes. Do not recreate, delete, restamp or migrate them for this candidate. This is a pre-1.0 release. Implemented controls support defensible workflows, not whole-platform certification.</p>
   </div>
 </section>
-
-<hr class="divider" />
-
-<!-- THREE PROPS -->
-<section>
-  <div class="wrap">
-    <div class="section-head" style="margin-bottom:36px">
-      <span class="eyebrow">Why ELSPETH</span>
-      <h2>Substrate first. Authoring second.</h2>
-      <p>A pipeline is made of declared primitives carrying schema and semantic contracts. Validation and audit are core product properties — not after-the-fact diagnostics.</p>
+  </main>
+  <footer>
+   <div class="wrap foot">
+    <div>
+     <a class="brand" href="index.html">
+      ELSPETH
+     </a>
+     <p>
+      Open-source software developed and publicly released by staff of Australia's Digital Transformation Agency.
+     </p>
+     <p>
+      Pre-release software. Evaluate it against your requirements before relying on its outputs.
+     </p>
     </div>
-    <div class="props">
-      <div class="prop">
-        <span class="pi"><i data-lucide="git-fork"></i></span>
-        <h3>Two surfaces, one engine</h3>
-        <p>Hand-edit reviewable YAML, or build by conversation in the Web Composer. Both target the same runtime, contracts, and audit trail.</p>
-        <a href="authoring.html">Explore authoring <i data-lucide="arrow-right" style="width:14px;height:14px"></i></a>
-      </div>
-      <div class="prop">
-        <span class="pi"><i data-lucide="scroll-text"></i></span>
-        <h3>Audit is the product</h3>
-        <p>The Landscape database records full row lineage — hashes, route decisions, terminal outcomes, and provenance — as the canonical evidentiary record.</p>
-        <a href="assurance.html">See the assurance model <i data-lucide="arrow-right" style="width:14px;height:14px"></i></a>
-      </div>
-      <div class="prop">
-        <span class="pi"><i data-lucide="briefcase"></i></span>
-        <h3>For high-stakes work</h3>
-        <p>Tender evaluation, document QA, content moderation, financial compliance — same framework, different plugins, full audit trail.</p>
-        <a href="use-cases.html">Browse use cases <i data-lucide="arrow-right" style="width:14px;height:14px"></i></a>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- CTA BAND -->
-<div class="ctaband">
-  <div class="wrap">
-    <h2>Install and run.</h2>
-    <p>Install the CLI, or open the Web Composer and describe what you want. Both end in a pipeline that can be validated, executed, audited, and explained.</p>
-    <div class="cta-row" style="justify-content:center">
-      <a class="btn btn-primary btn-lg" href="get-started.html">Get started</a>
-      <a class="btn btn-lg" href="https://github.com/dta-au/elspeth"><i data-lucide="github" style="width:18px;height:18px"></i>&nbsp; dta-au/elspeth</a>
-    </div>
-  </div>
-</div>
-
-</main>
-
-<footer>
-  <div class="wrap">
-    <div class="foot">
-      <div class="foot-brand">
-        <span class="brand">ELSPETH</span>
-        <p class="foot-prov">Open-source software developed and publicly released by staff of the DTA — the Australian Government's Digital Transformation Agency.</p>
-      </div>
-      <div class="foot-cols">
-        <div class="foot-col">
-          <span class="foot-h">Product</span>
-          <a href="index.html">Home</a>
-          <a href="authoring.html">Authoring</a>
-          <a href="assurance.html">Assurance</a>
-          <a href="use-cases.html">Use cases</a>
-          <a href="get-started.html">Get started</a>
-        </div>
-        <div class="foot-col">
-          <span class="foot-h">Project</span>
-          <a href="https://github.com/dta-au/elspeth">GitHub</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">Changelog · v0.8.3</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">Contributing</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a>
-        </div>
-        <div class="foot-col">
-          <span class="foot-h">Assurance</span>
-          <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">Report a vulnerability</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">MIT license</a>
-        </div>
-      </div>
-    </div>
-    <div class="foot-bottom">
-      <span class="copy"><a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">MIT licensed</a> · ELSPETH 0.8.3 · Built for decisions that must be defensible.</span>
-    </div>
-  </div>
-</footer>
-
-<script src="site.js"></script>
-</body>
+    <nav aria-label="Project resources">
+     <a href="https://github.com/dta-au/elspeth">
+      Source on GitHub
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">
+      Changelog · v0.8.3
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">
+      Contribute
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CODE_OF_CONDUCT.md">
+      Code of conduct
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">
+      Report a vulnerability
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">
+      MIT license
+     </a>
+    </nav>
+   </div>
+   <div class="wrap foot-bottom">
+    ELSPETH 0.8.3 · Documentation describes the source candidate; publication status is recorded in the changelog.
+   </div>
+  </footer>
+ </body>
 </html>

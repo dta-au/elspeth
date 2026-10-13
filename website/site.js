@@ -7,6 +7,7 @@
   // --- theme toggle --------------------------------------------------------
   var t = document.getElementById("theme-toggle");
   if (t) {
+    t.hidden = false;
     setIcon();
     t.addEventListener("click", function () {
       var root = document.documentElement;
@@ -14,6 +15,21 @@
       root.setAttribute("data-theme", next);
       try { localStorage.setItem("elspeth-theme", next); } catch (e) {}
       setIcon();
+    });
+  }
+
+  // Native details keeps navigation usable without JavaScript. Escape closes
+  // it and returns keyboard focus to the control that opened it.
+  var menu = document.querySelector(".nav-menu");
+  if (menu) {
+    menu.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && menu.open) {
+        menu.open = false;
+        menu.querySelector("summary").focus();
+      }
+    });
+    document.addEventListener("click", function (event) {
+      if (!menu.contains(event.target)) menu.open = false;
     });
   }
   function setIcon() {
@@ -25,6 +41,10 @@
   }
 
   // --- copy-to-clipboard ---------------------------------------------------
+  var status = document.createElement("p");
+  status.className = "sr-only";
+  status.setAttribute("role", "status");
+  document.body.appendChild(status);
   document.querySelectorAll("pre.copyable").forEach(function (pre) {
     // Capture the payload before injecting the button; strip leading shell
     // prompts ("$ ") per line so pasted commands are clean. Config blocks have
@@ -38,6 +58,7 @@
     pre.appendChild(btn);
     btn.addEventListener("click", function () {
       copyText(payload).then(function (ok) {
+        status.textContent = ok ? "Copied to clipboard." : "Copy failed. Select the command text and copy it manually.";
         if (!ok) return;
         flash(btn);
       });
@@ -69,8 +90,9 @@
 
   // Fallback for non-secure contexts (e.g. opening the files over file://).
   function fallbackCopy(text) {
+    var previousFocus = document.activeElement;
+    var ta = document.createElement("textarea");
     try {
-      var ta = document.createElement("textarea");
       ta.value = text;
       ta.setAttribute("readonly", "");
       ta.style.position = "absolute";
@@ -78,10 +100,12 @@
       document.body.appendChild(ta);
       ta.select();
       var ok = document.execCommand("copy");
-      document.body.removeChild(ta);
       return ok;
     } catch (e) {
       return false;
+    } finally {
+      ta.remove();
+      if (previousFocus) previousFocus.focus();
     }
   }
 

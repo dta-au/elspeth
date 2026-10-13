@@ -1,29 +1,71 @@
-# ELSPETH project website
+# ELSPETH public website
 
-Standalone static site built on the ELSPETH design tokens. No build step.
-Serve `website/` with any static server (or GitHub Pages); open `index.html`.
+Five static HTML pages; no generator, dependency install or compilation step.
+The published routes remain `index.html`, `authoring.html`, `assurance.html`,
+`use-cases.html` and `get-started.html`. Serve `website/` with a static server:
 
-Pages: index (Home), authoring, assurance, use-cases, get-started.
-Shared: `site.css`, `site.js` (Lucide icons, light/dark toggle, copy-to-clipboard).
+```bash
+python3 -m http.server 8080 --bind 127.0.0.1 --directory website
+node website/check-contrast.mjs
+```
 
-**No third-party requests.** Lucide is vendored at `vendor/lucide.min.js`, and the
-webfonts (Inter + JetBrains Mono, both SIL OFL-1.1) are self-hosted as variable
-woff2 under `fonts/` — so the site loads nothing from a CDN and leaks no visitor
-IPs. Their SIL OFL-1.1 licence (both copyright holders) is bundled at
-`fonts/OFL.txt`.
+The Pages workflow uploads this directory directly. It accepts protected
+repository-default-branch push/manual events and runs on a trusted Nyx runner.
+A local preview is not a deployment. Changes to the tutorial fixture under
+`tutorial-site/` are separate from the public site.
 
-**Design tokens.** `website/styles.css` + `website/tokens/*.css` mirror the
-frontend's canonical styles. The structures differ, so re-syncing is a
-value-by-value copy, **not** a whole-file overwrite:
+## Content and visual sources
 
-- `tokens/{colors,typography,layout,fonts}.css` mirror the app's single
-  `src/elspeth/web/frontend/src/styles/tokens.css` (with fonts self-hosted here
-  rather than loaded from Google Fonts).
-- `tokens/{base,primitives}.css` mirror the app's `shared.css` (reset + shared
-  primitive classes).
+The site explains authoring, evidence review, use-case assessment and local
+setup. Capability and readiness claims follow the repository README,
+`docs/release/guarantees.md`, Composer guide, configuration reference and
+operating runbooks. Illustrative scenarios are not deployed-service claims.
+Release and database-upgrade paragraphs remain under release-coordinator
+custody; reconcile them with the target release before publishing.
 
-**Contrast guard.** `website/tokens/` has no equivalent of the app's
-`colorContrast.test.ts`, so run `node check-contrast.mjs` after any token or
-colour change — it parses the token values plus the `site.css` light-theme
-overrides and exits non-zero if the terminal/code text drops below WCAG AA (4.5:1)
-in either theme. Wire it into CI alongside the site deploy.
+`tokens/colors.css` mirrors the Composer's semantic colour roles from
+`src/elspeth/web/frontend/src/styles/tokens.css`: navy navigation, teal
+workspace and warm paper surfaces. Website badge text retains its existing
+4.5:1 text variants; the application's badge palette has a different non-text
+contrast requirement. `site.css` supplies the reading layout. Fonts (Inter and
+JetBrains Mono, SIL OFL-1.1) and Lucide are served locally; this site contains no
+analytics or third-party asset requests. Outbound documentation links leave
+the site when followed.
+
+Navigation uses native `details` on narrow screens and works without JS.
+`site.js` adds theme persistence, Escape/outside-click menu dismissal and
+clipboard controls with a live status message. Theme and clipboard controls
+are progressive enhancements.
+
+## Verification
+
+Run the existing website contract tests serially, using the intended source
+roots in a worktree. Check internal assets and repository-document links,
+including fragment identifiers. Inspect all five pages at desktop and narrow
+widths in both themes; exercise keyboard navigation, theme persistence and
+clipboard success/failure. Include a no-JavaScript check and a 320 CSS-pixel
+reflow check. Automated accessibility checks supplement visual/keyboard review;
+they do not establish complete accessibility conformance.
+
+`check-contrast.mjs` checks the 44 opaque foreground/background combinations
+used for body, secondary and muted text, links, and primary buttons in the two
+themes. It includes known contrast and parser controls. Actual page composition
+and interactive states still need browser checks.
+
+## Composer screenshots
+
+The images are captures of the actual local Composer at source commit
+`40b0dfb66799e286c97166e08b4286fa26f3fc3f`, using an imported YAML pipeline and
+three wholly synthetic community-facility records. The example routes requests
+above 50,000 to an additional-review output; it does not determine funding
+eligibility. It uses CSV sources/sinks and a configured gate, with no external
+provider call and no pipeline execution. Model authoring was not demonstrated.
+
+Capture used a loopback-only API and Vite instance, isolated SQLite state,
+clean environment, disabled provider boot probes and no provider credentials.
+The visible provider-unavailable notice is retained. No mocked graph, response
+or DOM replacement is used. The original captures are 1440 × 960 CSS pixels;
+WebP assets preserve that size. Links on images open the full-size assets.
+
+The implementation handoff under `docs/reviews/public-site-085-20261011.md`
+records the scenario, captured states, checks and remaining limits.

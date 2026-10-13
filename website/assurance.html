@@ -1,219 +1,300 @@
-<!-- @dsCard group="Website" viewport="1280x720" name="Site — Assurance" subtitle="Landscape audit trail · trust model · terminal statuses" -->
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="See how ELSPETH validates pipelines, records row-level evidence, and recovers durable publication safely." />
-<title>Assurance — ELSPETH</title>
-<script>(function(){try{var s=localStorage.getItem("elspeth-theme");var t=s||((window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
-<link rel="stylesheet" href="styles.css" />
-<link rel="stylesheet" href="site.css" />
-<link rel="icon" href="favicon.svg" />
-<script src="vendor/lucide.min.js"></script>
-</head>
-<body>
-<a class="skip-link" href="#main">Skip to content</a>
-
-<header class="nav">
-  <div class="wrap nav-inner">
-    <div class="nav-left">
-      <a class="brand" href="index.html">ELSPETH</a>
-      <nav class="nav-links">
-        <a href="index.html">Home</a>
-        <a href="authoring.html">Authoring</a>
-        <a href="assurance.html" class="active" aria-current="page">Assurance</a>
-        <a href="use-cases.html">Use cases</a>
-        <a href="get-started.html">Get started</a>
+<html data-theme="dark" lang="en">
+ <head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+  <meta content="Understand ELSPETH lineage, validation and recovery, and the operational and human responsibilities that remain." name="description"/>
+  <title>
+   Review the evidence — ELSPETH
+  </title>
+  <script>
+   (function(){try{var s=localStorage.getItem("elspeth-theme");var t=(s==="light"||s==="dark")?s:((window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+  </script>
+  <link href="styles.css" rel="stylesheet"/>
+  <link href="site.css" rel="stylesheet"/>
+  <link href="favicon.svg" rel="icon" type="image/svg+xml"/>
+  <script defer="" src="vendor/lucide.min.js">
+  </script>
+  <script defer="" src="site.js">
+  </script>
+ </head>
+ <body>
+  <a class="skip-link" href="#main">
+   Skip to content
+  </a>
+  <header class="nav">
+   <div class="wrap nav-inner">
+    <a aria-label="ELSPETH home" class="brand" href="index.html">
+     ELSPETH
+     <span class="brand-sub">
+      Data &amp; LLM workflows
+     </span>
+    </a>
+    <nav aria-label="Main navigation" class="nav-links">
+     <a href="index.html">
+      Overview
+     </a>
+     <a href="authoring.html">
+      Build a workflow
+     </a>
+     <a aria-current="page" href="assurance.html">
+      Review the evidence
+     </a>
+     <a href="use-cases.html">
+      Assess a use case
+     </a>
+     <a href="get-started.html">
+      Get started
+     </a>
+    </nav>
+    <div class="nav-actions">
+     <button aria-label="Switch to light theme" class="iconbtn" hidden="" id="theme-toggle">
+      <i aria-hidden="true" data-lucide="moon">
+      </i>
+     </button>
+     <details class="nav-menu">
+      <summary>
+       Menu
+       <i aria-hidden="true" data-lucide="menu">
+       </i>
+      </summary>
+      <nav aria-label="Mobile navigation" class="nav-menu-panel">
+       <a href="index.html">
+        Overview
+       </a>
+       <a href="authoring.html">
+        Build a workflow
+       </a>
+       <a aria-current="page" href="assurance.html">
+        Review the evidence
+       </a>
+       <a href="use-cases.html">
+        Assess a use case
+       </a>
+       <a href="get-started.html">
+        Get started
+       </a>
       </nav>
+     </details>
     </div>
-    <div class="nav-right">
-      <details class="nav-menu">
-        <summary class="iconbtn" aria-label="Open navigation menu"><i data-lucide="menu"></i></summary>
-        <div class="nav-menu-panel">
-          <a href="index.html">Home</a>
-          <a href="authoring.html">Authoring</a>
-          <a href="assurance.html" class="active" aria-current="page">Assurance</a>
-          <a href="use-cases.html">Use cases</a>
-          <a href="get-started.html">Get started</a>
-          <hr />
-          <a href="https://github.com/dta-au/elspeth">GitHub</a>
-        </div>
-      </details>
-      <button class="iconbtn" id="theme-toggle" aria-label="Toggle theme"><i data-lucide="moon"></i></button>
-      <a class="btn-compact" href="https://github.com/dta-au/elspeth" style="gap:8px"><i data-lucide="github" style="width:15px;height:15px"></i> GitHub</a>
-      <a class="btn-compact" href="get-started.html">Get started</a>
+   </div>
+  </header>
+  <main id="main" tabindex="-1">
+   <header class="page-head">
+    <div class="wrap">
+     <p class="eyebrow">
+      Review the evidence
+     </p>
+     <h1>
+      Understand what happened.
+      <br/>
+      Know what the record can establish.
+     </h1>
+     <p class="lead">
+      ELSPETH records processing evidence as a workflow runs. Use that record to investigate outputs and failures, alongside the source material, your evaluation criteria and human review.
+     </p>
     </div>
-  </div>
-</header>
-
-<main id="main">
-
-<div class="page-head dotgrid">
-  <div class="wrap">
-    <span class="eyebrow">Assurance is the product</span>
-    <h1>Validation and audit are core properties.</h1>
-    <p>The Landscape database is the canonical evidentiary record — source rows, node states, external calls, payload hashes, route decisions, terminal outcomes, and artifact provenance. Telemetry and logs are secondary.</p>
-  </div>
-</div>
-
-<section>
-  <div class="wrap">
-    <h2 class="vh">Assurance properties</h2>
-    <div class="features" style="margin-top:8px">
-      <div class="feature"><span class="fi"><i data-lucide="scroll-text"></i></span><h3>Landscape audit trail</h3><p>Complete row lineage with content hashes. When signing is enabled, exports include an HMAC-SHA256 signature and running hash for chain-of-custody review.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="refresh-cw"></i></span><h3>Recoverable publication</h3><p>ELSPETH stores an immutable plan before external publication through a built-in destination. This covers files, object storage, databases, Dataverse, Chroma, and audit exports.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="git-compare-arrows"></i></span><h3>Two-axis terminal model</h3><p>Lifecycle outcome and path/provenance are separated — "did it succeed?" and "how did it get there?" are both explicit.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="shield-check"></i></span><h3>Declaration-trust + VAL</h3><p>Plugin declarations are checked against runtime VAL manifests and invariant tests. Web execution responses reject unknown fields so contract drift fails loudly.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="fingerprint"></i></span><h3>Secret discipline</h3><p>Secrets resolve at execution boundaries, are fingerprinted for audit, and are never persisted as raw values.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="list-checks"></i></span><h3>Terminal statuses</h3><p>completed · completed_with_failures · failed · empty · cancelled — run accounting never collapses to one number.</p></div>
-    </div>
-    <div class="surface-card" style="margin-top:16px">
-      <h3>Resume only after reconciliation</h3>
-      <p>If a worker loses the response from an external system, ELSPETH checks the saved plan and destination before trying again. When it cannot determine whether the write happened, it stops for operator review rather than risk a duplicate.</p>
-      <p>Audit exports have a dedicated resume command: <code>elspeth export-resume &lt;run-id&gt; --execute</code>. Follow the <a href="https://github.com/dta-au/elspeth/blob/main/docs/runbooks/sink-effect-recovery.md">current sink-effect recovery runbook on GitHub</a> for the operator procedure.</p>
-    </div>
-  </div>
-</section>
-
-<hr class="divider" />
-
-<section>
-  <div class="wrap">
-    <div class="section-head">
-      <span class="eyebrow">Show, don't tell</span>
-      <h2>One row's defensible trail.</h2>
-      <p>This representative <code>explain</code> output shows how ELSPETH reconstructs why a single row reached the <code>approved</code> sink: the source fingerprint it carried, the gate it passed, and the routing decision that sent it there.</p>
-    </div>
-    <div class="proof">
-      <figure class="term" aria-labelledby="explain-proof-caption" style="margin:0">
-        <div class="term-bar">
-          <i data-lucide="scroll-text" style="width:14px;height:14px;color:var(--color-text-muted)"></i>
-          <span class="t">elspeth · explain one row</span>
-        </div>
-        <div class="term-body"><span class="pr">$</span> <span class="cmd">elspeth explain --run &lt;run&gt; --row &lt;row&gt; \
-    --database examples/boolean_routing/runs/audit.db --no-tui</span>
-
-<span class="sec">============================================================</span>
-LINEAGE REPORT
-<span class="sec">============================================================</span>
-
-Token: 5f2754f391ed4195b6d3101f2a3dc2a8
-Row: 4500ad0bc8674d4bae3922300e64dca3
-
-<span class="sec">--- Source ---</span>
-Row Index: 0
-Source Data Hash: <span class="mut">9b3de0ff04d4983f8accfe3e…</span>
-Payload Available: False
-
-<span class="sec">--- Outcome ---</span>
-Outcome: <span class="hl">SUCCESS</span>
-Path: <span class="hl">GATE_ROUTED</span>
-Sink: approved
-Completed: True
-
-<span class="sec">--- Node States ---</span>
-  [0] source_primary…: completed
-  [1] config_gate_approval_check…: completed
-  [2] sink_approved…: completed
-
-<span class="sec">--- Routing Events ---</span>
-  [0] move edge=6b96441565… group=a5441a9c66… reason_hash=<span class="mut">f8fa1fdeab3a…</span></div>
-        <figcaption class="vh" id="explain-proof-caption">Representative ELSPETH lineage report for one routed row</figcaption>
-      </figure>
-      <div class="proof-notes">
-        <div class="proof-note">
-          <h3 class="proof-note-title">Outcome and path are separate axes</h3>
-          <p>The two-axis terminal model in practice: <code>SUCCESS</code> answers <em>did it succeed?</em>; <code>GATE_ROUTED</code> answers <em>how did it get there?</em> "It passed" and "a gate sent it to <code>approved</code>" are recorded as distinct facts.</p>
-        </div>
-        <div class="proof-note">
-          <h3 class="proof-note-title">Every decision is bound to its evidence</h3>
-          <p>The source row carries a content hash; the routing event carries a <code>reason_hash</code> that ties the destination to the exact condition that produced it. Nothing in the path is asserted without a fingerprint.</p>
-        </div>
-        <div class="proof-note">
-          <h3 class="proof-note-title">Reproducible, and exportable as evidence</h3>
-          <p>When signing is enabled, the same records export with an HMAC-SHA256 signature and running hash for chain-of-custody review — the trail an assessment needs to reconstruct a single decision after the fact.</p>
-        </div>
+   </header>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      The Landscape audit trail.
+     </h2>
+     <div class="two-col">
+      <div>
+       <h3>
+        Follow a row through the workflow
+       </h3>
+       <p>
+        Landscape records source and token lineage, route decisions, external calls and terminal outcomes. This lets a reviewer trace how an output relates to its input and processing steps.
+       </p>
       </div>
-    </div>
-    <p class="proof-src">Node ids, source-data and reason hashes are abbreviated here (marked <code>…</code>) for display; actual run records retain their full values.</p>
-  </div>
-</section>
-
-<hr class="divider" />
-
-<section class="dotgrid">
-  <div class="wrap">
-    <div class="section-head">
-      <span class="eyebrow">Data trust model</span>
-      <h2>Three tiers, one rule: coerce only at the boundary.</h2>
-      <p>Once data enters the pipeline with valid types, downstream transforms trust those types and never coerce them. A wrong type downstream is an upstream bug to fix — until it is, the row, or at a batch node the whole batch, fails with a recorded reason and routes through its error route instead of stopping the run.</p>
-    </div>
-    <div class="tiers">
-      <div class="tier">
-        <span class="tlabel">Tier 1</span>
-        <h3>Engine-owned records</h3>
-        <p>Audit database, checkpoints, runtime records. A corrupted audit record means tampering — crash immediately.</p>
-        <span class="trust" style="background:var(--color-error-bg);color:var(--color-text);border:1px solid var(--color-error-border)">Full trust · crash on anomaly</span>
+      <div>
+       <h3>
+        Keep operational logs in context
+       </h3>
+       <p>
+        Logs and telemetry help operators diagnose service behaviour. Landscape is the runtime evidence store; operational logs are not a substitute for the audit record.
+       </p>
       </div>
-      <div class="tier">
-        <span class="tlabel">Tier 2</span>
-        <h3>Validated pipeline data</h3>
-        <p>Rows after source validation. Types are valid; wrap operations where row content can still fail.</p>
-        <span class="trust" style="background:var(--color-warning-bg);color:var(--color-text);border:1px solid var(--color-warning-border)">Elevated trust</span>
-      </div>
-      <div class="tier">
-        <span class="tlabel">Tier 3</span>
-        <h3>External input</h3>
-        <p>Files, API/LLM responses, source data. Validate at the boundary, coerce where allowed, quarantine malformed rows.</p>
-        <span class="trust" style="background:var(--color-success-bg);color:var(--color-text);border:1px solid var(--color-success-border)">Zero trust · quarantine</span>
-      </div>
+     </div>
+     <figure class="term">
+      <figcaption>
+       CLI inspection command · replace the placeholders with identifiers from your own run.
+      </figcaption>
+      <pre class="copyable">elspeth explain --run &lt;run_id&gt; --row &lt;row_id&gt; --database examples/threshold_gate/runs/audit.db --no-tui</pre>
+     </figure>
     </div>
-    <div class="cta-row" style="margin-top:40px">
-      <a class="btn btn-primary" href="get-started.html">Get started</a>
-      <a class="btn" href="use-cases.html">Where it's used</a>
+   </section>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      Checks, evidence and their limits.
+     </h2>
+     <div aria-label="Evidence and limits comparison" class="table-scroll" role="region" tabindex="0">
+      <table>
+       <caption>
+        What a check tells you
+       </caption>
+       <thead>
+        <tr>
+         <th scope="col">
+          Control or record
+         </th>
+         <th scope="col">
+          Purpose
+         </th>
+         <th scope="col">
+          Still requires review
+         </th>
+        </tr>
+       </thead>
+       <tbody>
+        <tr>
+         <th scope="row">
+          Graph and schema validation
+         </th>
+         <td>
+          Detect invalid configuration and incompatible connections.
+         </td>
+         <td>
+          Whether the configured process answers the intended question.
+         </td>
+        </tr>
+        <tr>
+         <th scope="row">
+          Lineage and call records
+         </th>
+         <td>
+          Trace processing, routing and recorded provider interactions.
+         </td>
+         <td>
+          Source quality, interpretation and the correctness of generated content.
+         </td>
+        </tr>
+        <tr>
+         <th scope="row">
+          Audit export and optional signing
+         </th>
+         <td>
+          Support evidence export and integrity checking under the configured policy.
+         </td>
+         <td>
+          Key custody, retention, access and completeness of the evidence needed for your use case.
+         </td>
+        </tr>
+       </tbody>
+      </table>
+     </div>
     </div>
-  </div>
-</section>
-
-</main>
-
-<footer>
-  <div class="wrap">
-    <div class="foot">
-      <div class="foot-brand">
-        <span class="brand">ELSPETH</span>
-        <p class="foot-prov">Open-source software developed and publicly released by staff of the DTA — the Australian Government's Digital Transformation Agency.</p>
+   </section>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      Recoverable publication
+     </h2>
+     <p class="section-intro">
+      Supported sinks record publication intent before external publication. If publication is interrupted, recovery uses the stored effect records and the sink's documented protocol.
+     </p>
+     <figure class="term">
+      <figcaption>
+       Resume an interrupted export · review the run and follow the recovery procedure before executing.
+      </figcaption>
+      <pre>elspeth export-resume &lt;run-id&gt; --execute</pre>
+     </figure>
+     <p>
+      This is a bounded recovery mechanism. It does not promise exactly-once effects for every external system. Follow the
+      <a href="https://github.com/dta-au/elspeth/blob/main/docs/runbooks/sink-effect-recovery.md">
+       sink-effect recovery runbook
+      </a>
+      for the supported cases and operator checks.
+     </p>
+    </div>
+   </section>
+   <section class="paper">
+    <div class="wrap">
+     <h2>
+      People remain responsible for the use.
+     </h2>
+     <div class="two-col" id="limits">
+      <div>
+       <h3>
+        Evaluate before relying on outputs
+       </h3>
+       <p>
+        ELSPETH is an AI-generated and AI-reviewed prototype in active development. Major systems can change, and user testing has covered a limited set of use cases. It is not ready for general production use.
+       </p>
+       <p>
+        Use representative evaluation data, review errors and establish an escalation process. LLM output can be inaccurate or unsupported even when a pipeline executes successfully.
+       </p>
       </div>
-      <div class="foot-cols">
-        <div class="foot-col">
-          <span class="foot-h">Product</span>
-          <a href="index.html">Home</a>
-          <a href="authoring.html">Authoring</a>
-          <a href="assurance.html">Assurance</a>
-          <a href="use-cases.html">Use cases</a>
-          <a href="get-started.html">Get started</a>
-        </div>
-        <div class="foot-col">
-          <span class="foot-h">Project</span>
-          <a href="https://github.com/dta-au/elspeth">GitHub</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">Changelog · v0.8.3</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">Contributing</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a>
-        </div>
-        <div class="foot-col">
-          <span class="foot-h">Assurance</span>
-          <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">Report a vulnerability</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">MIT license</a>
-        </div>
+      <div>
+       <h3>
+        Plan the operating controls
+       </h3>
+       <p>
+        Decide who may author and execute workflows, where data may be sent, what evidence must be retained and how it will be protected. Test failure and recovery procedures for your deployment.
+       </p>
+       <p>
+        The software does not provide whole-platform certification or determine compliance for your organisation.
+       </p>
       </div>
+     </div>
+     <p>
+      Read the
+      <a href="https://github.com/dta-au/elspeth/blob/main/docs/release/guarantees.md">
+       current guarantees and limitations
+      </a>
+      ,
+      <a href="https://github.com/dta-au/elspeth/blob/main/docs/guides/data-trust-and-error-handling.md">
+       data trust model
+      </a>
+      and
+      <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">
+       security policy
+      </a>
+      .
+     </p>
     </div>
-    <div class="foot-bottom">
-      <span class="copy"><a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">MIT licensed</a> · ELSPETH 0.8.3 · Built for decisions that must be defensible.</span>
+   </section>
+  </main>
+  <footer>
+   <div class="wrap foot">
+    <div>
+     <a class="brand" href="index.html">
+      ELSPETH
+     </a>
+     <p>
+      Open-source software developed and publicly released by staff of Australia's Digital Transformation Agency.
+     </p>
+     <p>
+      Pre-release software. Evaluate it against your requirements before relying on its outputs.
+     </p>
     </div>
-  </div>
-</footer>
-
-<script src="site.js"></script>
-</body>
+    <nav aria-label="Project resources">
+     <a href="https://github.com/dta-au/elspeth">
+      Source on GitHub
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">
+      Changelog · v0.8.3
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">
+      Contribute
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CODE_OF_CONDUCT.md">
+      Code of conduct
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">
+      Report a vulnerability
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">
+      MIT license
+     </a>
+    </nav>
+   </div>
+   <div class="wrap foot-bottom">
+    ELSPETH 0.8.3 · Documentation describes the source candidate; publication status is recorded in the changelog.
+   </div>
+  </footer>
+ </body>
 </html>
