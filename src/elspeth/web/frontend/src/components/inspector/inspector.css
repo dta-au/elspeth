@@ -350,6 +350,8 @@
 }
 
 .graph-route-controls {
+  --scroll-owner: graph-routes;
+
   max-height: 12rem;
   overflow: auto;
   padding: var(--space-sm) var(--space-lg);

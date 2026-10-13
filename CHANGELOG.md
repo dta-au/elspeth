@@ -4,6 +4,39 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.5 - Unreleased (LLM compatibility and Composer recovery)
+
+- **Omitted LLM temperature uses the provider default.** Common source and
+  transform configurations now omit temperature when absent or explicitly
+  null. Previously, non-Azure configurations implicitly sent `0.0`. Set
+  `temperature: 0.0` explicitly to retain that request where supported.
+  Explicit numeric settings remain unchanged; unsupported settings are
+  refused without silently stripping them or retrying with different sampling.
+- **Tutorial execution uses ordinary application ownership.** The tutorial
+  acquires the same execution obligation and lease as the normal execute
+  route and uses its transfer-aware cleanup. The ownership guard remains.
+- **Document review accepts legitimate long lines.** The arbitrary 1,024
+  character per-line caps are removed from interpretation and source-artifact
+  review content. Aggregate inline limits and template, control-character and
+  credential safeguards remain. Fixed safe diagnostics identify the actual
+  rejected rule, missing or stale draft, and concrete recovery. Oversized
+  inline drafts can use the exact staged draft; repaired reviews bind afresh.
+- **Recovery advice follows the failed rule.** Repeated content failures no
+  longer prescribe topology restructuring. Advisor calls honor the existing
+  nonretryable classification instead of repeating deterministic refusals.
+- **Shared-sink routes are easier to inspect.** Separate visual arrivals,
+  pointer and keyboard selection, endpoint emphasis and persistent route detail
+  retain the logical graph, conditions and handles.
+
+Session epoch 75 and Landscape epoch 49 are unchanged. Existing unsupported
+stores remain preserved and refused; this release does not authorize migration,
+reset or downgrade. Ordered dependent LLM queries and the quarantine/discard
+visibility toggle are separate 0.8.6 work and are not included.
+
+This is an unreleased source candidate. Focused synthetic checks and independent
+source reviews do not establish final exact-head qualification, live model or
+tutorial acceptance, a release tag, signed image publication or deployment.
+
 ## 0.8.4 - Unreleased (Restricted SQL and credential lifecycle hardening)
 
 - **Live PostgreSQL analysis has a restricted language and database profile.**

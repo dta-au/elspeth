@@ -750,8 +750,8 @@
         }
       },
       {
-        "default": 0.0,
-        "description": "Sampling temperature. Set to null to omit it from the request. Support and valid values depend on the provider, model and reasoning mode; check the provider's documentation before setting an explicit value.",
+        "default": null,
+        "description": "Sampling temperature. Omitted or null leaves the provider default. Explicit numbers are sent unchanged. Support and valid values depend on the provider, model and reasoning mode; check the provider's documentation before setting an explicit value.",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
@@ -1266,8 +1266,8 @@
         }
       },
       {
-        "default": 0.0,
-        "description": "Sampling temperature. Set to null to omit it from the request. Support and valid values depend on the provider, model and reasoning mode; check the provider's documentation before setting an explicit value.",
+        "default": null,
+        "description": "Sampling temperature. Omitted or null leaves the provider default. Explicit numbers are sent unchanged. Support and valid values depend on the provider, model and reasoning mode; check the provider's documentation before setting an explicit value.",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
@@ -1811,8 +1811,8 @@
         }
       },
       {
-        "default": 0.0,
-        "description": "Sampling temperature. Set to null to omit it from the request. Support and valid values depend on the provider, model and reasoning mode; check the provider's documentation before setting an explicit value.",
+        "default": null,
+        "description": "Sampling temperature. Omitted or null leaves the provider default. Explicit numbers are sent unchanged. Support and valid values depend on the provider, model and reasoning mode; check the provider's documentation before setting an explicit value.",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",

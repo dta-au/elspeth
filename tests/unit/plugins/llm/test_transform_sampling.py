@@ -15,11 +15,9 @@ from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
+from tests.fixtures.llm_sampling import _Harness
 from tests.fixtures.mock_audit import mock_audit_authority
 from tests.unit.plugins.llm.test_azure import make_token
-from tests.unit.plugins.llm.test_preflight_sampling import _Harness
-
-pytest_plugins = ["tests.unit.plugins.llm.test_preflight_sampling"]
 
 
 @pytest.mark.parametrize("query_mode", ["single", "sequential", "pooled"])

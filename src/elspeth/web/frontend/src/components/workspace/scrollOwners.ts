@@ -38,6 +38,8 @@ export const WORKSPACE_SCROLL_OWNERS = [
   "artifact",
   // Expanded Workflow Wiring table, capped so it does not consume the graph.
   "wiring",
+  // Keyboard route inspection controls, separately capped beside Wiring.
+  "graph-routes",
 ] as const;
 
 export type WorkspaceScrollOwner = (typeof WORKSPACE_SCROLL_OWNERS)[number];

@@ -2291,10 +2291,10 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
               <ul className="graph-route-controls" aria-label="Inspect pipeline routes">
                 {edges.map((edge) => (
                   <li key={edge.id}>
-                    <button type="button" aria-pressed={edge.id === activeEdge?.id}
+                    <Button variant="bare" type="button" aria-pressed={edge.id === activeEdge?.id}
                       onFocus={() => setActiveEdgeId(edge.id)} onClick={() => setActiveEdgeId(edge.id)}>
                       {edge.source} → {edge.target}: {String(edge.label ?? edge.data.flowType)} ({edge.data.flowType})
-                    </button>
+                    </Button>
                   </li>
                 ))}
               </ul>

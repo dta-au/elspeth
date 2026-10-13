@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.4](https://img.shields.io/badge/status-0.8.4-green.svg)
+![Status: 0.8.5](https://img.shields.io/badge/status-0.8.5-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -98,21 +98,21 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.4
+## What changed in 0.8.5
 
-This unreleased candidate adds restricted PostgreSQL analysis, durable logout
-and password-change revocation, bounded request/provider handling, and image
-evidence refusal. It retains the preceding archive recovery and Composer
-progress work. Composer delivers operation progress followed by the completed
-answer; it does not stream generated answer tokens. Final qualification is
-pending. See the [release notes](CHANGELOG.md).
+This unreleased candidate improves LLM sampling compatibility, ordinary
+execution ownership for the tutorial, document-review recovery, and graph
+route inspection at shared sinks. Omitted sampling now leaves the provider
+default; explicit numbers retain their authored meaning. Composer accepts
+legitimate long review lines and gives actionable feedback for remaining
+constraints. Final qualification is pending. See the [release notes](CHANGELOG.md).
 
 This candidate requires session epoch 75 and Landscape epoch 49. Existing
 unsupported stores are refused before writes: preserve them unchanged and
 configure explicitly new compatible databases. ELSPETH does not migrate either
 store in place or authorize downgrading these stores. This pre-release
-compatibility policy has no fixed expiry. Package metadata remains 0.8.4;
-automatic image publication is held. See the
+compatibility policy has no fixed expiry. Package metadata is 0.8.5;
+this source candidate is not a published release image. See the
 [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.
 

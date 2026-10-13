@@ -972,7 +972,9 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # frozen semantic oracles, behavior, and the resume history pin are unchanged.
 # 0.8.4 version cut: eight virtual-node engine version fields advance; every
 # other manifest byte and case field is unchanged after version normalization.
-EXPECTED_CASE_REGISTRY_SHA256 = "2adc9baa61ce4f054c1735803f90b2c403fe3423ee860144e932a5a7cd8082ce"
+# 0.8.5 version cut: the canonical loader confirms only those eight engine
+# version fields changed; normalized case semantics and every other byte match.
+EXPECTED_CASE_REGISTRY_SHA256 = "e910767698166aae63a071fdcc16653bee89ec423c4193fa0d0060a7b9591267"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
