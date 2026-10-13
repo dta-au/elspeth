@@ -52,6 +52,48 @@ def _make_gateway_config(**overrides: Any) -> GatewayConfig:
     return GatewayConfig(**base)
 
 
+def test_ordered_gateway_constant_first_uses_mode_aware_resolution() -> None:
+    config = _make_gateway_config(
+        query_input_mode="ordered",
+        pool_size=1,
+        required_input_fields=[],
+        queries=[
+            {"name": "constant", "input_fields": {}, "template": "Return five"},
+            {"name": "consume", "input_fields": {"answer": "constant_llm_response"}, "template": "{{ row.answer }}"},
+        ],
+    )
+    assert [spec.name for spec in config.resolved_queries()] == ["constant", "consume"]
+
+
+def test_upstream_gateway_still_refuses_empty_bindings() -> None:
+    with pytest.raises(ValidationError, match="input_fields must be non-empty"):
+        _make_gateway_config(required_input_fields=[], queries=[{"name": "constant", "input_fields": {}, "template": "Return five"}])
+
+
+@pytest.mark.parametrize("json_schema_capability", [False, True])
+def test_ordered_gateway_constant_structured_request_preserves_capability_gate(json_schema_capability: bool) -> None:
+    options = {
+        "query_input_mode": "ordered",
+        "pool_size": 1,
+        "required_input_fields": [],
+        "queries": [
+            {
+                "name": "constant",
+                "input_fields": {},
+                "template": "Return five",
+                "response_format": "structured",
+                "output_fields": [{"suffix": "score", "type": "integer"}],
+            }
+        ],
+        "required_capabilities": ("json_schema",) if json_schema_capability else (),
+    }
+    if json_schema_capability:
+        _make_gateway_config(**options)
+    else:
+        with pytest.raises(ValidationError, match="json_schema"):
+            _make_gateway_config(**options)
+
+
 # ---------------------------------------------------------------------------
 # Endpoint accept/reject matrix
 # ---------------------------------------------------------------------------
@@ -304,6 +346,7 @@ class TestGatewayPrivateOptionsCoverage:
             "output_fields",
             "prompt_template",
             "queries",
+            "query_input_mode",
             "response_format",
             "required_input_fields",
             "response_field",
