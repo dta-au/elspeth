@@ -1,10 +1,10 @@
 name: Deploy website to GitHub Pages
 
-# Publishes the static `website/` tree to GitHub Pages on every push to main
-# that touches it. Replaces the hand-maintained `gh-pages` branch: the first
-# run flips the Pages source from "deploy from branch" to "GitHub Actions" via
-# configure-pages `enablement`, then serves the `website/` directory at the
-# site root (so /tutorial-site/project-N.html resolves as before).
+# Publishes the static `website/` tree only on an authorized manual dispatch
+# from the protected repository default branch. Automatic push publication is
+# held by the deploy job guard. The first deployment selects "GitHub Actions"
+# as the Pages source via configure-pages `enablement`, then serves `website/`
+# at the site root (so /tutorial-site/project-N.html resolves as before).
 
 on:
   push:
