@@ -58,10 +58,10 @@
   },
   "src/elspeth/web/sessions/protocol.py": {
     "protected_exports": [],
-    "sha256": "86394d1d968f41aee842816df7880e93579d9357dffeddfd4360a0abc2605930"
+    "sha256": "175f6ad59656431748d5472fb7892915a9c247641da6944915b2a5d41d046083"
   },
   "src/elspeth/web/sessions/service.py": {
     "protected_exports": [],
-    "sha256": "72a3c18c3811835c4caaa0ae1f78d1d043f7961e88d216c751eeccf82c9ad9c2"
+    "sha256": "45f15a607b271ed709248984e4da55d6aaf6dd52f03a2293159d816fa830eca7"
   }
 }

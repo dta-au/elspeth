@@ -268,7 +268,9 @@ async def test_csv_schema_rejections_repair_without_replacing_prior_scaffold(
                 ]
             )
         assert index == 4, json.dumps(messages[-3:], indent=2)
-        assert not kwargs.get("tools"), "A staged review finishes through the provider's reply-only turn"
+        assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["handoff_to_user", "restore_parked_graph"], (
+            "A staged review permits only recovery controls while the provider prepares its reply"
+        )
         return _make_llm_response(
             content="The assessment graph now reads case studies and evaluates each row; required reviews remain before execution."
         )

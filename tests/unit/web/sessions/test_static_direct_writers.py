@@ -2055,6 +2055,34 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 
 _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
     ReviewedWriter(
+        path="tests/testcontainer/web/test_schema_probe_postgres.py",
+        enclosing_symbol="test_private_transcript_sql_on_postgres_preserves_custody_without_hydration",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose="PostgreSQL custody fixture: one lexical insert seeds public/private rows, including deliberately invalid private ownership.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_composer_recovery_security.py",
+        enclosing_symbol="_checkpoint",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Recovery authority fixture: seeds a version-1 checkpoint with controlled graph and completion-gate evidence.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_graph_recovery_adversarial.py",
+        enclosing_symbol="_insert_unreadable_head",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Corruption fixture: seeds an unreadable graph while retaining valid session and operation authority.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_graph_recovery_adversarial.py",
+        enclosing_symbol="test_graph_read_never_attributes_old_damage_to_newer_healthy_head.publish_new_head_before_old_conversion",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Interleaving fixture: publishes one healthy successor during old-row conversion to verify damaged-head identity binding.",
+    ),
+    ReviewedWriter(
         path="tests/testcontainer/web/test_quota_authority_postgres.py",
         enclosing_symbol="test_undispatched_cancellation_is_atomic_and_idempotent_on_postgres.append_event",
         table="chat_messages",
@@ -3056,6 +3084,55 @@ def test_lock_assertion_must_dominate_and_match_the_writer_arguments(tmp_path: P
         "wrong_connection",
         "wrong_session",
     } <= symbols
+
+
+@pytest.mark.parametrize("fault", ["removed", "wrong_connection", "wrong_session", "late", "unreachable"])
+def test_graph_recovery_receipt_requires_dominating_exact_lock_precondition(tmp_path: Path, fault: str) -> None:
+    source = (_find_repo_root() / "src/elspeth/web/sessions/service.py").read_text()
+    tree = ast.parse(source)
+    owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SessionServiceImpl")
+    method = next(node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == "_write_graph_recovery_receipt")
+    assertion = next(
+        node
+        for node in method.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "_assert_session_write_lock_held"
+    )
+    fixture_root = tmp_path / "src"
+    fixture_root.mkdir()
+    fixture = fixture_root / "recovery_receipt.py"
+
+    def write_fixture() -> None:
+        fixture.write_text(
+            "def _session_write_lock(conn, sid):\n    pass\n\nclass SessionServiceImpl:\n"
+            + textwrap.indent(ast.unparse(method), "    ")
+            + "\n"
+        )
+
+    write_fixture()
+    assert check_lock_discipline([fixture_root], path_anchor=tmp_path) == []
+    if fault == "removed":
+        method.body.remove(assertion)
+    elif fault in {"wrong_connection", "wrong_session"}:
+        index = 0 if fault == "wrong_connection" else 1
+        assertion.value.args[index] = ast.Name(id="foreign_authority", ctx=ast.Load())
+    elif fault == "late":
+        method.body.remove(assertion)
+        method.body.append(assertion)
+    else:
+        index = method.body.index(assertion)
+        method.body[index] = ast.If(test=ast.Constant(False), body=[assertion], orelse=[])
+    ast.fix_missing_locations(method)
+    write_fixture()
+    findings = check_lock_discipline([fixture_root], path_anchor=tmp_path)
+    assert sorted(finding.helper_name for finding in findings) == [
+        "_insert_chat_message",
+        "_insert_chat_message",
+        "_reserve_sequence_range",
+        "_reserve_sequence_range",
+    ]
 
 
 def test_lock_context_must_match_writer_connection_and_session_member(tmp_path: Path) -> None:

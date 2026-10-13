@@ -71,7 +71,12 @@ from elspeth.web._acceptance_common.replica_probes import (
     decide_cross_replica_progress,
     decide_lease_takeover,
 )
-from elspeth.web._acceptance_common.schema_facts import _CANDIDATE_PACKAGE_VERSION, _expected_schema_facts
+from elspeth.web._acceptance_common.schema_facts import (
+    _CANDIDATE_PACKAGE_VERSION,
+    _expected_schema_facts,
+    _require_supported_deployment_scenario,
+    _schema_facts_equal,
+)
 from elspeth.web._acceptance_common.testcontainer_run import (
     TESTCONTAINER_RUN_RECEIPT_KIND,
     validate_testcontainer_run_receipt,
@@ -79,7 +84,7 @@ from elspeth.web._acceptance_common.testcontainer_run import (
 
 PROVIDER: Final = "azure"
 EXEC_RECEIPT_PREFIX: Final = "ELSPETH_ACCEPTANCE_RECEIPT_V1:"
-COMPATIBILITY_RECEIPT_SCHEMA: Final = "elspeth.azure-container-apps-compatibility-receipt.v1"
+COMPATIBILITY_RECEIPT_SCHEMA: Final = "elspeth.azure-container-apps-compatibility-receipt.v2"
 CONNECTION_BUDGET_SCHEMA: Final = "elspeth.postgres-flexible-connection-budget.v1"
 DEPLOYMENT_TARGET: Final = "azure-container-apps"
 
@@ -750,6 +755,8 @@ def _admit_exec_receipt(payload: object) -> StoredReceipt:
         raise AcceptanceCheckError("exec_receipt_schema")
     document = _validate_bounded_receipt_document(payload)
     receipt = validate_exec_receipt_schema(document, descriptor=EXEC_RECEIPT_DESCRIPTOR)
+    if receipt["check"] == "compatibility-record":
+        _require_supported_deployment_scenario(cast(str, receipt["scenario_id"]))
     if receipt["check"] in SINGLE_REVISION_KINDS:
         details = cast(dict[str, object], receipt["details"])
         topology = _single_topology(details["topology"])
@@ -853,9 +860,9 @@ def extract_exec_receipt(
     suppresses=("R1", "R5"),
     invariant=(
         "raises AcceptanceCheckError('receipt_store_schema', 'exec_receipt_schema', 'exec_receipt' or "
-        "'receipt_store_binding') before use unless the payload is a bounded document that the kind's validator admits — the shared testcontainer-run validator under the azure "
+        "'receipt_store_binding' or 'compatibility_transition_unsupported') before use unless the payload is a bounded document that the kind's validator admits — the shared testcontainer-run validator under the azure "
         "schema id, or the Container Apps exec envelope whose check equals the kind — bound to the caller's scenario, "
-        "candidate sha and subject; returns only the owned StoredReceipt"
+        "candidate sha and subject, with compatibility records restricted to Scenario A in both envelope and details; returns only the owned StoredReceipt"
     ),
     test_ref="tests/unit/web/azure_container_apps_acceptance/test_receipt_contracts.py::test_validate_stored_receipt_rejects_foreign_kinds_and_mismatched_bindings",
     test_fingerprint="a32d153d546bd122c2ed782891ca5cad7ed9bcf925e1e3a8047911f5b7d37c23",
@@ -905,7 +912,7 @@ _COMPATIBILITY_RECORD_FIELDS: Final[frozenset[str]] = frozenset(
         "rollback_doctor_job_sha256",
         "previous_package_version",
         "schema_facts",
-        "forward_compatible",
+        "new_store_compatible",
         "backward_compatible",
         "rollback_permitted",
         "decision",
@@ -962,11 +969,11 @@ def _record_timestamp(value: object) -> datetime:
         "raises AcceptanceCheckError('compatibility_record_schema', 'compatibility_record_binding' or "
         "'compatibility_record_expired') before use unless the record is a dict with exactly the runbook's field set "
         "under the Container Apps receipt schema, Scenario A with every previous-release field empty, schema_facts equal "
-        "to the shared derivation, the driver's bindings, two distinct bounded operator identities, boolean verdicts "
-        "of forward true / backward false / rollback false, and approved <= countersigned <= now < expires"
+        "to the shared derivation with exact JSON types and closed nested keys, the driver's bindings, two distinct bounded operator identities, boolean verdicts "
+        "of new-store true / backward false / rollback false, and approved <= countersigned <= now < expires"
     ),
     test_ref="tests/unit/web/azure_container_apps_acceptance/test_receipt_contracts.py::test_compatibility_record_rejects_open_field_sets_and_foreign_facts",
-    test_fingerprint="b0f6298fc323446294e59b5c9ba1886c064587f39e94803779dcae676c653ba6",
+    test_fingerprint="b0f3ecb2322478399f2cc50f82fda8ab5a83779779bef5d7b65a5fdbbbabeb0f",
 )
 def validate_compatibility_record(record: object, *, bindings: CompatibilityRecordBindings, now: datetime) -> ValidatedCompatibilityRecord:
     """Admit the Scenario A record the runbook fixes and bind it to what the driver measured."""
@@ -975,7 +982,7 @@ def validate_compatibility_record(record: object, *, bindings: CompatibilityReco
         raise AcceptanceCheckError("compatibility_record_schema")
     if record["schema"] != COMPATIBILITY_RECEIPT_SCHEMA or record["scenario_id"] != "A":
         raise AcceptanceCheckError("compatibility_record_schema")
-    if any(type(record[field]) is not bool for field in ("forward_compatible", "backward_compatible", "rollback_permitted")):
+    if any(type(record[field]) is not bool for field in ("new_store_compatible", "backward_compatible", "rollback_permitted")):
         raise AcceptanceCheckError("compatibility_record_schema")
     for field in ("record_id", "approver_identity", "countersigner_identity"):
         value = record[field]
@@ -991,9 +998,9 @@ def validate_compatibility_record(record: object, *, bindings: CompatibilityReco
         or record["candidate_doctor_job_sha256"] != bindings.candidate_doctor_job_sha256
         or record["candidate_package_version"] != _CANDIDATE_PACKAGE_VERSION
         or any(record[field] != "" for field in _SCENARIO_A_EMPTY_FIELDS)
-        or record["schema_facts"] != _expected_schema_facts("A")
+        or not _schema_facts_equal(record["schema_facts"], _expected_schema_facts("A"))
         or record["decision"] != "approved"
-        or record["forward_compatible"] is not True
+        or record["new_store_compatible"] is not True
         or record["backward_compatible"] is not False
         or record["rollback_permitted"] is not False
     ):

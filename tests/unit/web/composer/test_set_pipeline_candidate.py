@@ -3125,8 +3125,8 @@ def _builder_rejection_calls() -> list[tuple[str, ast.Call, bool]]:
 
     Returns ``(callee, call, inside_component_body)`` where the third value is
     True when the call sits lexically inside a ``for`` loop body or inside the
-    ``_legacy_source_rejection`` helper — the two places a rejection is about
-    ONE component.
+    ``_legacy_source_rejection`` helper, or the nominal reconciliation-error
+    handler whose guarded component identity names the rejected node.
     """
     tree = ast.parse(Path(sessions_tools.__file__).read_text(encoding="utf-8"))
     builder = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "build_set_pipeline_candidate")
@@ -3138,6 +3138,12 @@ def _builder_rejection_calls() -> list[tuple[str, ast.Call, bool]]:
             if isinstance(child, (ast.For, ast.AsyncFor)):
                 child_in_component = True
             if isinstance(child, ast.FunctionDef) and child.name == "_legacy_source_rejection":
+                child_in_component = True
+            if (
+                isinstance(child, ast.ExceptHandler)
+                and isinstance(child.type, ast.Name)
+                and child.type.id == "UnknownInterpretationRequirementError"
+            ):
                 child_in_component = True
             if (
                 isinstance(child, ast.Call)

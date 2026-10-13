@@ -1135,17 +1135,18 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"review_reconciliation_failed|Authoritative interpretation-review reconciliation failed",
-        "An interpretation review on this pipeline was already APPROVED, and the submitted payload does not reconcile "
-        "with the server's authoritative record of it. The specific invariant is named in the rejection message after "
-        "the colon — read it: it identifies the requirement or node at fault (a drifted artifact hash, a duplicate "
-        "review identity, a resolved row missing its event_id or accepted_value, or a vague-term review that cannot "
-        "round-trip without prompt_template_parts). The reviewed material itself is server-owned; a rebuilt-from-memory "
-        "payload that drops or re-words it will not reconcile.",
-        "Do NOT resubmit the same payload — it will be rejected identically. Call get_pipeline_state with "
-        'component="set_pipeline_arguments" to obtain the exact round-trippable payload for the CURRENT state, apply '
-        "only the change you intend to that payload, and re-emit it as the full set_pipeline call. Never author the "
-        "server-owned review fields (id, status, event_id, accepted_value, resolved_prompt_template_hash); each "
-        "interpretation_requirements entry you send carries only {kind, user_term, draft} plus optional display_title.",
+        "The submitted interpretation-review payload could not be reconciled. This can be an unknown reference "
+        "or duplicate review identity in a NEW candidate, or incoherent evidence for an existing resolved review; "
+        "the code alone does not establish prior approval. Read the rejection message or structured review_reference facts for the specific invariant. "
+        "An unknown prompt reference must match a requirement ID in that same candidate, not a review in the saved graph.",
+        "For an unknown reference, repair the rejected candidate using the exact valid requirement IDs named in the "
+        "message or review_reference.valid_requirement_ids. If that list is empty, add the intended authorable requirement shell first. "
+        "Node requirement IDs are user_term.strip() + ':' + node_id: preserve internal spaces, case and punctuation. "
+        "Keep the intended new node and its requirement shells, then re-emit the corrected candidate. "
+        "Only if the message identifies existing resolved-review evidence, call get_pipeline_state with "
+        'component="set_pipeline_arguments" and preserve that authoritative material while applying the intended change. '
+        "Never author server-owned fields inside interpretation_requirements (id, status, event_id, accepted_value, "
+        "resolved_prompt_template_hash); each shell carries only {kind, user_term, draft} plus optional display_title.",
     ),
     (
         r"vague_term_unwired|Pending vague_term review is not wired for resolution",

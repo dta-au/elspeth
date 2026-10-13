@@ -27,6 +27,7 @@ from ._helpers import (
     require_pipeline_user,
 )
 from .composer.operations import admit, parse_message_body
+from .diagnostics import register_diagnostic_routes
 
 
 def _requests_audit_grade_messages_view(
@@ -40,6 +41,8 @@ def _requests_audit_grade_messages_view(
 
 
 def register_message_routes(router: APIRouter) -> None:
+    register_diagnostic_routes(router)
+
     @router.post("/{session_id}/messages", response_model=ComposerOperationAcceptedResponse, status_code=202)
     async def send_message(
         session_id: UUID,
@@ -118,7 +121,7 @@ def register_message_routes(router: APIRouter) -> None:
         # model/usage/cost metadata and closed decision classifications, but
         # not raw prompts, provider reasoning artifacts, tool arguments,
         # candidate values, or tool results.
-        messages = await service.get_messages(session.id, limit=None)
+        messages = await service.get_messages(session.id, limit=None, include_private_evidence=False)
         if include_tool_rows and include_llm_audit:
             conversation_messages = _composer_conversation_tool_or_llm_audit_messages(messages)
         elif include_tool_rows:

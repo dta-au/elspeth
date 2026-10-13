@@ -8,6 +8,7 @@ from threading import Event
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.protocol import ComposerHistoryMessage, ComposerResult
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState
@@ -38,6 +39,7 @@ class DelayedComposerFake:
         budget_seconds: float | None = None,
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        recovery_context: GraphRecoveryContext | None = None,
     ) -> ComposerResult:
         self.calls += 1
         self.messages.append(message)

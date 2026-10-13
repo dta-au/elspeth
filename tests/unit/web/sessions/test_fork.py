@@ -149,6 +149,38 @@ class TestForkSession:
     """Tests for SessionServiceImpl.fork_session."""
 
     @pytest.mark.asyncio
+    async def test_fork_does_not_copy_private_composer_evidence(self, service) -> None:
+        session = await service.create_session("alice", "Private evidence", "local")
+        await service.add_message(session.id, "user", "First", writer_principal="route_user_message")
+        private = await service.add_message(
+            session.id,
+            "audit",
+            "Private evidence recorded.",
+            tool_calls=({"_kind": "composer_diagnostic_evidence", "evidence": {"private": "source-only"}},),
+            writer_principal="compose_loop",
+        )
+        await service.add_message(session.id, "audit", "Ordinary audit marker", writer_principal="compose_loop")
+        fork_message = await service.add_message(session.id, "user", "Next", writer_principal="route_user_message")
+
+        child, messages, _ = await _fork_session(
+            service,
+            source_session_id=session.id,
+            fork_message_id=fork_message.id,
+            new_message_content="Clarified next step",
+            user_id="alice",
+            auth_provider_type="local",
+        )
+
+        # The private kind is excluded even if its payload is damaged. Forking
+        # does not authorize copying it or reinterpret it as public evidence.
+        assert all(message.content != private.content for message in messages)
+        child_rows = await service.get_messages(child.id, limit=None)
+        assert all(message.content != private.content for message in child_rows)
+        assert any(message.content == "Ordinary audit marker" for message in child_rows)
+        source_rows = await service.get_messages(session.id, limit=None)
+        assert any(message.id == private.id for message in source_rows)
+
+    @pytest.mark.asyncio
     async def test_fork_creates_new_session_with_provenance(self, service) -> None:
         """Forked session has forked_from fields set."""
         session = await service.create_session("alice", "Original", "local")

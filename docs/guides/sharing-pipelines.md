@@ -70,10 +70,21 @@ accept this trade-off.
 ## First-deploy operator action
 
 Since 0.8.1, shareable-review state is part of the broader web session
-database contract. The 0.8.3 candidate expects `SESSION_SCHEMA_EPOCH=72`
+database contract. The 0.8.3 candidate expects `SESSION_SCHEMA_EPOCH=74`
 and `SQLITE_SCHEMA_EPOCH=49`; confirm both against the deployed service's
-live schema constants before recreating a stale store. From 0.8.1 or 0.8.2,
-recreate only the session store when Landscape is already at epoch 49. Landscape epoch 30 adds durable
+live schema constants before a fresh installation.
+
+**Temporary deployment policy:** only fresh/new stores are supported until
+explicit revision; this policy has no fixed expiry. Preserve existing stores:
+do not delete, recreate, restamp, migrate or silently modify them to satisfy
+the candidate. A stale store or predecessor transition is a stop condition,
+not permission to reset it. An approved historical compatibility receipt cannot
+override this policy.
+
+### Historical schema changes
+
+The following records explain earlier schema boundaries; they do not authorize
+an existing-store transition under the current policy. Landscape epoch 30 adds durable
 row_union barrier
 attribution, and epoch 31 closes scheduler work-item status over the public
 six-state vocabulary. Epoch 32 adds atomic, durable aggregation result receipts
@@ -102,7 +113,7 @@ nullable: unknown usage is NULL, never zero. Landscape epoch 42 requires
 admission evidence v2 with per-principal token quota usage and limits; stored
 v1 evidence is incompatible. Session epoch 59 adds timestamp-leading indexes for
 container-wide quota scans. Session epoch 61 established freeform as the
-Composer default; recreate predecessor session databases.
+Composer default; predecessor session databases do not match that schema.
 Session epoch 62 requires nullable backend suggestions in durable advisor
 completion gates and rejects older stores at startup before session reload.
 Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK and the
@@ -114,19 +125,12 @@ It also adds `interpretation_events.surface_origin`: review cards raised by
 the state-revert, YAML-import and E2E-seed routes now record that origin with
 empty LLM provenance, where they previously wrote the route name into the
 model, provider and `composer_skill_hash` columns.
-A Landscape store below the deployed epoch is stale and must be recreated. When
-upgrading from an older pre-1.0 build, stop and
-uninstall the web service, archive/export evidence when required, recreate each
-configured database whose epoch is stale, then reinstall and initialize this
-ELSPETH version. No SQLite or PostgreSQL predecessor schema is transformed in
-place; PostgreSQL recreation remains a schema-owner operation. Deployments
-crossing from an older release must account for the historical 0.7.0 boundary
-as well.
-
-Use [the staging session DB recreation runbook](../runbooks/staging-session-db-recreation.md)
-as the operational source of truth. It covers the matched SQLite sidecars,
-Landscape reset, `data/auth.db` preservation, archive handling, and
-`settings.secret_key` rotation decision.
+A Landscape store below the deployed epoch is stale. Current SQLite and
+PostgreSQL inspection does not transform a predecessor schema in place.
+Preserve the store and stop deployment. The
+[staging session DB recreation runbook](../runbooks/staging-session-db-recreation.md)
+describes a historical reset procedure; it does not authorize deletion,
+recreation, restamping or migration under the current fresh-store-only policy.
 
 The shareable-link signing key is still required. Generate and configure it
 before returning the service to users.
@@ -287,14 +291,13 @@ passphrase or a hex string is refused outright. Regenerate with
 
 ### Service refuses to start with a `SESSION_SCHEMA_EPOCH` mismatch
 
-The sessions DB predates the running code. Archive/export evidence when
-required, stop and uninstall the deployment, recreate the stale session
-database, and reinstall. Preserve Landscape when it is already at epoch 49;
-recreate it in the same stop window only when its own epoch is stale. Writable,
-read-only, and inspection opens do not migrate any predecessor Landscape epoch. PostgreSQL recreation requires the schema-owner
-path. Do not roll older code over a database initialized by newer code; restore
-is not a supported repair path. Keep the service drained, repair the current
-release forward, recreate fresh state, and retry.
+The sessions DB predates the running code. Stop the candidate deployment and
+preserve both stores. Under the temporary fresh-store-only policy, do not
+delete, recreate, restamp, migrate or silently modify either store to satisfy
+the candidate. Writable, read-only and inspection opens do not migrate any
+predecessor Landscape epoch. Do not roll older code over a database initialized
+by newer code. Diagnose the incompatibility with read-only inspection; a reset
+or predecessor transition is outside the current policy.
 
 ### `POST /mark-ready-for-review` returns 409 with "No composition state exists for this session"
 

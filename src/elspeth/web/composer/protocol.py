@@ -22,10 +22,12 @@ if TYPE_CHECKING:
 
     from elspeth.contracts.session_operation import SessionOperationContext
     from elspeth.web.composer.audit import BufferingRecorder
+    from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
     from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.composer.strict_transport import StrictToolsSetting
     from elspeth.web.execution.completion_gates import CompletionGateFacts
     from elspeth.web.required_work import RequiredWorkBinding
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -266,6 +268,8 @@ class ComposerResult:
     advisor_gate_decision: AdvisorGateDecision | None = None
     raw_assistant_content: str | None = None
     pipeline_commit_intent: PipelineCommitIntent | None = None
+    graph_recovery_intent: GraphRecoveryIntent | None = None
+    recovery_audit_drafts: tuple[AuditMessageDraft, ...] = ()
     # Per-tool-call audit trail produced during this compose() invocation.
     # Populated by ComposerServiceImpl._compose_loop via a BufferingRecorder.
     # The route handler persists each entry as a role=tool chat message row.
@@ -334,6 +338,10 @@ class ComposerResult:
         return self.advisor_terminal_publication is not None and self.advisor_terminal_publication.branch == "terminal_block"
 
     def __post_init__(self) -> None:
+        if self.graph_recovery_intent is not None and (
+            self.pipeline_commit_intent is not None or self.advisor_gate_decision is not None or self.runtime_preflight is not None
+        ):
+            raise ValueError("Graph recovery cannot carry a pipeline commit or readiness decision")
         if self.advisor_gate_decision is not None and self.pipeline_commit_intent is not None:
             raise ValueError("An advisor decision cannot accompany an unsettled pipeline commit intent")
 
@@ -450,6 +458,15 @@ class ComposerResult:
                 )
             if not self.message.startswith(self.persisted_assistant_content):
                 raise ValueError("ComposerResult same-turn invariant violated: message must start with persisted_assistant_content.")
+
+
+@dataclass(frozen=True, slots=True)
+class GraphRecoveryResponse:
+    """Provider-authored recovery request without a fabricated current graph."""
+
+    intent: GraphRecoveryIntent
+    llm_calls: tuple[ComposerLLMCall, ...] = ()
+    tool_invocations: tuple[ComposerToolInvocation, ...] = ()
 
 
 class ComposerServiceError(Exception):
@@ -1624,6 +1641,18 @@ class ComposerService(Protocol):
     no-tool assistant messages are still route-persisted (seam contract B).
     """
 
+    async def compose_recovery(
+        self,
+        *,
+        message: str,
+        recovery_context: GraphRecoveryContext,
+        session_operation_context: SessionOperationContext,
+        required_work: RequiredWorkBinding,
+        provider_owner: ProviderInvocationOwner,
+        budget_seconds: float | None = None,
+    ) -> GraphRecoveryResponse:
+        """Request terminal recovery using scalar context before graph hydration."""
+
     async def compose(
         self,
         message: str,
@@ -1641,6 +1670,7 @@ class ComposerService(Protocol):
         budget_seconds: float | None = None,
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        recovery_context: GraphRecoveryContext | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 

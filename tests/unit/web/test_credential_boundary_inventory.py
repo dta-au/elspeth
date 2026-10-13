@@ -592,6 +592,7 @@ def test_common_tool_owners_hold_the_guard_for_new_tools_automatically() -> None
 
 _STATE_GUARD_DISPOSITIONS = {
     "src/elspeth/composer_mcp/server.py:_dispatch_tool": "mcp_dispatch",
+    "src/elspeth/web/composer/graph_recovery.py:qualify_editable_checkpoint": "recovery_checkpoint",
     "src/elspeth/web/composer/service.py:ComposerServiceImpl.compose": "provider_serialization",
     "src/elspeth/web/composer/tools/sessions.py:_execute_get_pipeline_state": "provider_disclosure",
     "src/elspeth/web/execution/service.py:ExecutionServiceImpl._execute_locked": "execution",
@@ -602,6 +603,9 @@ _STATE_GUARD_DISPOSITIONS = {
     "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.publish_entry": "library_publication",
 }
 _STATE_MATERIALIZATION_DISPOSITIONS = {
+    "src/elspeth/web/sessions/graph_recovery.py:read_editable_checkpoint.state_from_record": "recovery_checkpoint_guard",
+    "src/elspeth/web/sessions/service.py:SessionServiceImpl.load_graph_recovery_context._sync.state_from_record": "recovery_checkpoint_guard",
+    "src/elspeth/web/sessions/service.py:SessionServiceImpl.read_current_composition_graph._sync.state_from_record": "recovery_checkpoint_guard",
     "src/elspeth/web/audit_readiness/routes.py:create_audit_readiness_router.explain.state_from_record": "provider_guard_downstream",
     "src/elspeth/web/audit_readiness/service.py:ReadinessService.compute_snapshot._state_from_record": "read_only_diagnostics",
     "src/elspeth/web/composer/tutorial_service.py:_require_tutorial_launch_readiness.state_from_record": "validation_guard_downstream",

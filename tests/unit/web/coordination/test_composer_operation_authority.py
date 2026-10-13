@@ -1304,6 +1304,7 @@ async def test_required_intermediate_cancellation_joins_actual_sql(operation_sto
             assistant_content="Observed",
             redacted_assistant_tool_calls=(),
             redacted_tool_rows=(),
+            private_tool_evidence=(),
             parent_composition_state_id=None,
             expected_current_state_id=None,
             writer_principal="compose_loop",
@@ -1610,9 +1611,13 @@ async def test_expired_job_refuses_business_write_at_database_clock(operation_st
     from elspeth.web.sessions.composer_operations import ComposerTurnDeadlineExpired
 
     engine, repository, _authority, service, sid = operation_store
-    record, running = start(operation_store, deadline_seconds=1.0)
+    # Setup must not race a one-second wall-clock budget under coverage.
+    # The persisted deadline is crossed explicitly below.
+    record, running = start(operation_store)
+    await service.update_session_title(sid, "Before deadline", session_operation_context=running.session_operation_context)
     with engine.connect() as conn:
         deadline = conn.execute(select(jobs.c.deadline_at).where(jobs.c.operation_id == record.operation_id)).scalar_one()
+        assert conn.execute(select(sessions_table.c.title).where(sessions_table.c.id == str(sid))).scalar_one() == "Before deadline"
     from elspeth.web.sessions.time_normalization import restore_utc
 
     monkeypatch.setattr(job_authority, "database_now", lambda conn: restore_utc(deadline) + timedelta(microseconds=1))
@@ -1621,7 +1626,7 @@ async def test_expired_job_refuses_business_write_at_database_clock(operation_st
     assert refused.value.operation_id == record.operation_id
     assert refused.value.session_id == sid
     with engine.connect() as conn:
-        assert conn.execute(select(sessions_table.c.title).where(sessions_table.c.id == str(sid))).scalar_one() == "Durable"
+        assert conn.execute(select(sessions_table.c.title).where(sessions_table.c.id == str(sid))).scalar_one() == "Before deadline"
     # Sealed failure remains available under the exact live fence.
     failure = ComposerOperationError(
         http_status=504,

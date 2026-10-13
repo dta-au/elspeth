@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -11,7 +12,6 @@ from pathlib import Path
 
 import pytest
 
-from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._acceptance_common.schema_facts import _CANDIDATE_PACKAGE_VERSION
 from elspeth.web._aws_ecs_acceptance import cleanup, control_service
@@ -90,42 +90,24 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
         ecr_candidate_digest="sha256:" + "d" * 64,
         now=lambda: datetime(2026, 7, 14, 1, 2, 10, tzinfo=UTC),
     )
-    inventory = json.loads((tmp_path / "scenario-b.json").read_text())
+    inventory = json.loads((tmp_path / "scenario-a.json").read_text())
     record = {
-        "schema": "elspeth.aws-ecs-compatibility-record.v2",
+        "schema": "elspeth.aws-ecs-compatibility-record.v3",
         "record_id": "change-123",
         "acceptance_run_id": inventory["acceptance_run_id"],
-        "scenario_id": "B",
+        "scenario_id": "A",
         "candidate_sha": inventory["candidate_sha"],
         "candidate_image_digest": "sha256:" + "d" * 64,
         "candidate_task_definition": inventory["values"]["CANDIDATE_TASK_DEFINITION"],
         "candidate_doctor_task_definition": inventory["values"]["DOCTOR_TASK_DEFINITION"],
         "candidate_package_version": _CANDIDATE_PACKAGE_VERSION,
-        "previous_source_sha": "a" * 40,
-        "previous_image_digest": "sha256:" + "b" * 64,
-        "previous_task_definition": inventory["values"]["PREVIOUS_TASK_DEFINITION"],
-        "rollback_doctor_task_definition": inventory["values"]["ROLLBACK_DOCTOR_TASK_DEFINITION"],
-        "previous_package_version": "0.7.1",
-        "schema_facts": {
-            "candidate": {
-                "session_epoch": SESSION_SCHEMA_EPOCH,
-                "landscape_epoch": SQLITE_SCHEMA_EPOCH,
-                "run_web_plugin_policy_present": True,
-            },
-            "previous": {
-                "session_epoch": 35,
-                "landscape_epoch": 29,
-                "run_web_plugin_policy_present": True,
-            },
-            "structural_changes": (
-                f"session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
-                "_blob_cleanup_row_union_barrier_and_coordination_schema"
-            ),
-            "semantics_only_changes": "coalesce_timeout_seconds_and_node_options_summary_required",
-            "archive_export_decision": "required_before_forward_migration",
-            "destructive_reset_required": False,
-        },
-        "forward_compatible": True,
+        "previous_source_sha": "",
+        "previous_image_digest": "",
+        "previous_task_definition": "",
+        "rollback_doctor_task_definition": "",
+        "previous_package_version": "",
+        "schema_facts": acceptance._expected_schema_facts("A"),
+        "new_store_compatible": True,
         "backward_compatible": False,
         "rollback_permitted": False,
         "decision": "approved",
@@ -135,16 +117,19 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
         "countersigned_at": "2026-07-14T01:01:00Z",
         "expires_at": "2026-07-14T03:00:00Z",
     }
-    record_path = tmp_path / "compatibility-b.json"
+    record_path = tmp_path / "compatibility-a.json"
     record_path.write_text(json.dumps(record))
     os.chmod(record_path, 0o600)
 
     receipt = acceptance.validate_compatibility_record(
         record_path,
         manifest_path=manifest_path,
-        scenario_id="B",
+        scenario_id="A",
         now=lambda: datetime(2026, 7, 14, 1, 3, tzinfo=UTC),
     )
+    record_sha256 = receipt["record_sha256"]
+    assert isinstance(record_sha256, str)
+    assert record_sha256 == hashlib.sha256(json.dumps(record, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     claimed_safe_rollback = json.loads(json.dumps(record))
     claimed_safe_rollback["backward_compatible"] = True
     claimed_safe_rollback["rollback_permitted"] = True
@@ -153,7 +138,7 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
         acceptance.validate_compatibility_record(
             record_path,
             manifest_path=manifest_path,
-            scenario_id="B",
+            scenario_id="A",
             now=lambda: datetime(2026, 7, 14, 1, 3, tzinfo=UTC),
         )
     claimed_safe_rollback_receipt = json.loads(json.dumps(receipt))
@@ -162,29 +147,26 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
     with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
         acceptance.receipt_store(
             manifest_path,
-            scenario_id="B",
+            scenario_id="A",
             kind="compatibility-record",
-            subject_id=receipt["record_sha256"],  # type: ignore[arg-type]
+            subject_id=record_sha256,
             receipt_bytes=json.dumps(claimed_safe_rollback_receipt).encode(),
             now=lambda: datetime(2026, 7, 14, 1, 3, tzinfo=UTC),
         )
     for path, replacement in (
         (("candidate_package_version",), "0.8.0"),
         (("candidate_doctor_task_definition",), inventory["values"]["CANDIDATE_TASK_DEFINITION"]),
-        (("rollback_doctor_task_definition",), inventory["values"]["PREVIOUS_TASK_DEFINITION"]),
+        (("rollback_doctor_task_definition",), inventory["values"]["DOCTOR_TASK_DEFINITION"]),
         (("previous_source_sha",), "f" * 40),
         (("previous_image_digest",), "sha256:" + "f" * 64),
         (("previous_package_version",), "0.7.0"),
         (("schema_facts", "candidate", "landscape_epoch"), 22),
         (("schema_facts", "candidate", "session_epoch"), SESSION_SCHEMA_EPOCH - 1),
-        (("schema_facts", "previous", "session_epoch"), 34),
-        (
-            ("schema_facts", "structural_changes"),
-            (
-                f"session_epoch_34_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
-                "_blob_cleanup_row_union_barrier_and_coordination_schema"
-            ),
-        ),
+        (("previous_task_definition",), inventory["values"]["CANDIDATE_TASK_DEFINITION"]),
+        (("schema_facts", "previous"), {"session_epoch": 35}),
+        (("schema_facts", "structural_changes"), "upgrade"),
+        (("schema_facts", "in_place_upgrade_supported"), True),
+        (("new_store_compatible",), False),
     ):
         mutated = json.loads(json.dumps(record))
         target = mutated
@@ -196,18 +178,45 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
             acceptance.validate_compatibility_record(
                 record_path,
                 manifest_path=manifest_path,
-                scenario_id="B",
+                scenario_id="A",
                 now=lambda: datetime(2026, 7, 14, 1, 3, tzinfo=UTC),
             )
     record_path.write_text(json.dumps(record))
+    for field, replacement, expected_check in (
+        ("countersigner_identity", "database-operator", "compatibility_record_schema"),
+        ("approver_identity", "invalid identity", "compatibility_record_schema"),
+        ("expires_at", "2026-07-14T01:02:59Z", "compatibility_record_expired"),
+    ):
+        mutated = json.loads(json.dumps(record))
+        mutated[field] = replacement
+        record_path.write_text(json.dumps(mutated))
+        with pytest.raises(acceptance.AcceptanceCheckError, match=expected_check):
+            acceptance.validate_compatibility_record(
+                record_path,
+                manifest_path=manifest_path,
+                scenario_id="A",
+                now=lambda: datetime(2026, 7, 14, 1, 3, tzinfo=UTC),
+            )
+    record_path.write_text(json.dumps(record))
+    expired_receipt = json.loads(json.dumps(receipt))
+    expired_receipt["expires_at"] = "2026-07-14T01:03:59Z"
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_binding"):
+        acceptance.receipt_store(
+            manifest_path,
+            scenario_id="A",
+            kind="compatibility-record",
+            subject_id=record_sha256,
+            receipt_bytes=json.dumps(expired_receipt).encode(),
+            now=lambda: datetime(2026, 7, 14, 1, 4, tzinfo=UTC),
+        )
     wrongly_bound_receipt = json.loads(json.dumps(receipt))
     wrongly_bound_receipt["candidate_image_digest"] = "sha256:" + "e" * 64
     with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_binding"):
         acceptance.receipt_store(
             manifest_path,
-            scenario_id="B",
+            scenario_id="A",
             kind="compatibility-record",
-            subject_id=receipt["record_sha256"],  # type: ignore[arg-type]
+            subject_id=record_sha256,
             receipt_bytes=json.dumps(wrongly_bound_receipt).encode(),
             now=lambda: datetime(2026, 7, 14, 1, 4, tzinfo=UTC),
         )
@@ -216,25 +225,26 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
     with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
         acceptance.receipt_store(
             manifest_path,
-            scenario_id="B",
+            scenario_id="A",
             kind="compatibility-record",
-            subject_id=receipt["record_sha256"],  # type: ignore[arg-type]
+            subject_id=record_sha256,
             receipt_bytes=json.dumps(unbound_receipt).encode(),
             now=lambda: datetime(2026, 7, 14, 1, 4, tzinfo=UTC),
         )
     receipt_hash = acceptance.receipt_store(
         manifest_path,
-        scenario_id="B",
+        scenario_id="A",
         kind="compatibility-record",
-        subject_id=receipt["record_sha256"],  # type: ignore[arg-type]
+        subject_id=record_sha256,
         receipt_bytes=json.dumps(receipt).encode(),
         now=lambda: datetime(2026, 7, 14, 1, 4, tzinfo=UTC),
     )
 
     assert len(receipt_hash) == 64
     assert receipt["approvals_present"] is True
-    assert receipt["previous_package_version"] == "0.7.1"
+    assert receipt["previous_package_version"] is None
     assert "database-operator" not in json.dumps(receipt)
+    assert "release-operator" not in json.dumps(receipt)
 
 
 def test_cleanup_evidence_finalize_is_two_phase_refuses_pending_and_clears_only_after_all_surfaces(

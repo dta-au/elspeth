@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import json
 import threading
-import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -338,28 +337,52 @@ def _settlement_kwargs(session_id: UUID, proposal_id: UUID, plan: PipelinePlanRe
     }
 
 
-def _latest_audit_envelope(service: SessionServiceImpl) -> dict[str, object]:
+def _dispatch_audit_row(service: SessionServiceImpl, session_id: UUID, tool_call_id: str) -> tuple[str, dict[str, object]]:
     with service._engine.begin() as conn:
-        row = conn.execute(
-            select(chat_messages_table.c.tool_calls)
-            .where(chat_messages_table.c.role == "audit")
-            .order_by(chat_messages_table.c.created_at.desc())
-            .limit(1)
-        ).one()
-    envelope = deep_thaw(row.tool_calls[0])
-    assert type(envelope) is dict
-    return envelope
+        rows = conn.execute(
+            select(chat_messages_table).where(chat_messages_table.c.session_id == str(session_id), chat_messages_table.c.role == "audit")
+        ).all()
+    matches = []
+    for row in rows:
+        assert row.tool_calls is not None and len(row.tool_calls) == 1
+        envelope = deep_thaw(row.tool_calls[0])
+        assert type(envelope) is dict
+        if envelope["_kind"] != "audit":
+            continue
+        invocation = envelope["invocation"]
+        assert type(invocation) is dict
+        if invocation["tool_call_id"] != tool_call_id:
+            continue
+        assert row.writer_principal == "compose_loop"
+        assert invocation["tool_name"] == "set_pipeline" and invocation["status"] == "success"
+        assert row.content == invocation["result_canonical"]
+        binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
+        assert binding.tool_call_id == tool_call_id
+        matches.append((row.id, envelope))
+    assert len(matches) == 1
+    return matches[0]
 
 
-def _replace_latest_audit_envelope(service: SessionServiceImpl, envelope: dict[str, object]) -> None:
+def _replace_audit_envelope(service: SessionServiceImpl, session_id: UUID, message_id: str, envelope: dict[str, object]) -> None:
     with service._engine.begin() as conn:
-        audit_row = conn.execute(
-            select(chat_messages_table.c.id)
-            .where(chat_messages_table.c.role == "audit")
-            .order_by(chat_messages_table.c.created_at.desc())
-            .limit(1)
-        ).one()
-        conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit_row.id).values(tool_calls=[envelope]))
+        rows_before = conn.execute(
+            select(chat_messages_table.c.id, chat_messages_table.c.tool_calls).where(chat_messages_table.c.session_id == str(session_id))
+        ).all()
+        updated = conn.execute(
+            update(chat_messages_table)
+            .where(chat_messages_table.c.id == message_id, chat_messages_table.c.session_id == str(session_id))
+            .values(tool_calls=[envelope])
+        )
+        assert updated.rowcount == 1
+        rows_after = conn.execute(
+            select(chat_messages_table.c.id, chat_messages_table.c.tool_calls).where(chat_messages_table.c.session_id == str(session_id))
+        ).all()
+    before = {row.id: deep_thaw(row.tool_calls) for row in rows_before}
+    after = {row.id: deep_thaw(row.tool_calls) for row in rows_after}
+    assert after[message_id] == [envelope]
+    assert {key: value for key, value in before.items() if key != message_id} == {
+        key: value for key, value in after.items() if key != message_id
+    }
 
 
 async def _persist_cloned_audit_envelope(
@@ -374,6 +397,29 @@ async def _persist_cloned_audit_envelope(
         tool_calls=[envelope],
         writer_principal="compose_loop",
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_audit_tamper_targets_public_row_and_preserves_private_siblings(service: SessionServiceImpl) -> None:
+    first_session, second_session = uuid4(), uuid4()
+    for session_id in (first_session, second_session):
+        _insert_session(service, session_id)
+        await _persist_dispatch(service, session_id)
+    first_id, first = _dispatch_audit_row(service, first_session, "planner-terminal-call")
+    second_id, second = _dispatch_audit_row(service, second_session, "planner-terminal-call")
+    assert first_id != second_id
+    with service._engine.begin() as conn:
+        siblings = conn.execute(
+            select(chat_messages_table.c.tool_calls, chat_messages_table.c.created_at).where(
+                chat_messages_table.c.session_id == str(first_session), chat_messages_table.c.role == "audit"
+            )
+        ).all()
+    assert len(siblings) == 2
+    assert {row.tool_calls[0]["_kind"] for row in siblings} == {"audit", "composer_diagnostic_evidence"}
+    assert len({row.created_at for row in siblings}) == 1
+    first["_kind"] = "assistant_tool_call"
+    _replace_audit_envelope(service, first_session, first_id, first)
+    assert _dispatch_audit_row(service, second_session, "planner-terminal-call") == (second_id, second)
 
 
 @pytest.mark.asyncio
@@ -856,11 +902,9 @@ async def test_settlement_rejects_missing_or_tampered_durable_dispatch_audit(ser
     plan = _plan()
     row = await _create(service, session_id, plan)
     binding = await _persist_dispatch(service, session_id)
-    with service._engine.begin() as conn:
-        audit_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "audit")).one()
-        envelope = list(audit_row.tool_calls)
-        envelope[0]["invocation"]["arguments_hash"] = "0" * 64
-        conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit_row.id).values(tool_calls=envelope))
+    message_id, envelope = _dispatch_audit_row(service, session_id, plan.tool_call_id)
+    envelope["invocation"]["arguments_hash"] = "0" * 64
+    _replace_audit_envelope(service, session_id, message_id, envelope)
 
     with pytest.raises(AuditIntegrityError, match="dispatch audit"):
         await service.settle_pipeline_composition_proposal(
@@ -946,7 +990,7 @@ async def test_settlement_rejects_malformed_or_mismatched_success_for_same_call_
     plan = _plan()
     row = await _create(service, session_id, plan)
     binding = await _persist_dispatch(service, session_id)
-    malformed = _latest_audit_envelope(service)
+    _message_id, malformed = _dispatch_audit_row(service, session_id, plan.tool_call_id)
     invocation = malformed["invocation"]
     assert type(invocation) is dict
     if corruption == "wrong_tool":
@@ -970,13 +1014,13 @@ async def test_pipeline_dispatch_recovery_rejects_noncanonical_json_representati
     plan = _plan()
     row = await _create(service, session_id, plan)
     await _persist_dispatch(service, session_id)
-    envelope = _latest_audit_envelope(service)
+    message_id, envelope = _dispatch_audit_row(service, session_id, plan.tool_call_id)
     invocation = envelope["invocation"]
     assert type(invocation) is dict
     result_canonical = invocation["result_canonical"]
     assert type(result_canonical) is str
     invocation["result_canonical"] = f" {result_canonical}"
-    _replace_latest_audit_envelope(service, envelope)
+    _replace_audit_envelope(service, session_id, message_id, envelope)
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
@@ -993,7 +1037,7 @@ async def test_pipeline_dispatch_recovery_rejects_duplicate_json_object_key(serv
     plan = _plan()
     row = await _create(service, session_id, plan)
     await _persist_dispatch(service, session_id)
-    envelope = _latest_audit_envelope(service)
+    message_id, envelope = _dispatch_audit_row(service, session_id, plan.tool_call_id)
     invocation = envelope["invocation"]
     assert type(invocation) is dict
     arguments_canonical = invocation["arguments_canonical"]
@@ -1004,7 +1048,7 @@ async def test_pipeline_dispatch_recovery_rejects_duplicate_json_object_key(serv
         '"sources":{},"sources":{}',
         1,
     )
-    _replace_latest_audit_envelope(service, envelope)
+    _replace_audit_envelope(service, session_id, message_id, envelope)
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
@@ -1073,7 +1117,7 @@ async def test_same_call_success_with_corrupt_audit_kind_fails_closed(
     plan = _plan()
     row = await _create(service, session_id, plan)
     binding = await _persist_dispatch(service, session_id)
-    malformed = _latest_audit_envelope(service)
+    _message_id, malformed = _dispatch_audit_row(service, session_id, plan.tool_call_id)
     if kind_corruption == "missing":
         malformed.pop("_kind")
     else:
@@ -1123,7 +1167,7 @@ async def test_unrelated_non_audit_envelope_remains_ignored_for_settlement(servi
     plan = _plan()
     row = await _create(service, session_id, plan)
     binding = await _persist_dispatch(service, session_id)
-    unrelated = _latest_audit_envelope(service)
+    _message_id, unrelated = _dispatch_audit_row(service, session_id, plan.tool_call_id)
     unrelated["_kind"] = "assistant_tool_call"
     invocation = unrelated["invocation"]
     assert type(invocation) is dict
@@ -1158,7 +1202,8 @@ async def test_committed_retry_rejects_duplicate_successful_dispatch_evidence(se
     binding = await _persist_dispatch(service, session_id)
     kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
     await service.settle_pipeline_composition_proposal(**kwargs)
-    await _persist_cloned_audit_envelope(service, session_id, _latest_audit_envelope(service))
+    _message_id, envelope = _dispatch_audit_row(service, session_id, plan.tool_call_id)
+    await _persist_cloned_audit_envelope(service, session_id, envelope)
 
     with pytest.raises(AuditIntegrityError, match=r"duplicated|duplicate|one durable"):
         await service.settle_pipeline_composition_proposal(**kwargs)
@@ -1171,7 +1216,8 @@ async def test_rejection_rejects_duplicate_successful_dispatch_evidence(service:
     plan = _plan()
     row = await _create(service, session_id, plan)
     binding = await _persist_dispatch(service, session_id)
-    await _persist_cloned_audit_envelope(service, session_id, _latest_audit_envelope(service))
+    _message_id, envelope = _dispatch_audit_row(service, session_id, plan.tool_call_id)
+    await _persist_cloned_audit_envelope(service, session_id, envelope)
 
     with pytest.raises(AuditIntegrityError, match=r"exactly one|duplicate"):
         await service.reject_pipeline_composition_proposal(
@@ -1944,23 +1990,57 @@ async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
     baseline_state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
     delayed_validator_states = []
     delayed_candidate_states = []
+    candidate_entered = asyncio.Event()
+    release_candidate = threading.Event()
+    stage_budgets = []
+
+    class BudgetClock:
+        elapsed = 0.0
+
+        def time(self):
+            return self.elapsed
+
+    clock = BudgetClock()
+
+    class BudgetAsyncio:
+        """Control only preparation's clock; workers and cancellation stay real."""
+
+        def get_running_loop(self):
+            return clock
+
+        async def wait_for(self, awaitable, *, timeout):
+            stage_budgets.append(timeout)
+            if len(stage_budgets) == 1:
+                result = await asyncio.wait_for(awaitable, timeout=5)
+                # Catalogue speed cannot decide which stage times out.
+                clock.elapsed = 6.0
+                return result
+            task = asyncio.create_task(awaitable)
+            try:
+                await asyncio.wait_for(candidate_entered.wait(), timeout=5)
+                # Expire the candidate's wait only after its real worker starts.
+                return await asyncio.wait_for(task, timeout=0)
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     def slow_validate(state: CompositionState):
-        # Delay the initial baseline stage once; candidate validation remains real.
         if state is baseline_state:
             delayed_validator_states.append(state)
-            time.sleep(0.12)
         return original_validate(state)
 
     from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as original_candidate
 
     def slow_candidate(arguments, state, context):
         delayed_candidate_states.append(state)
-        time.sleep(0.12)
+        loop.call_soon_threadsafe(candidate_entered.set)
+        assert release_candidate.wait(timeout=10), "candidate release watchdog expired"
         return original_candidate(arguments, state, context)
 
     monkeypatch.setattr(policy, "validate_composition_state", slow_validate)
     monkeypatch.setattr("elspeth.web.composer.pipeline_commit.build_set_pipeline_candidate", slow_candidate)
+    monkeypatch.setattr("elspeth.web.composer.pipeline_commit.asyncio", BudgetAsyncio())
     with monkeypatch.context() as physical_observer:
         physical_observer.setattr(async_workers, "_submit_shared", observe_submit)
         try:
@@ -1982,7 +2062,7 @@ async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
                             user_message_content=None,
                             max_blob_storage_per_session_bytes=1_000_000,
                             runtime_preflight=None,
-                            timeout_seconds=0.2,
+                            timeout_seconds=10.0,
                         ),
                         recorder=BufferingRecorder(),
                         actor="user:alice",
@@ -1990,7 +2070,9 @@ async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
 
             assert exc_info.value.code == "TIMEOUT"
             assert submitted.is_set()
-            assert 1 <= len(actual_futures) <= 2
+            assert stage_budgets == [10.0, 4.0]
+            assert len(actual_futures) == 2
+            assert not actual_futures[1].done()
             assert len(actual_futures) == len(reservations) == len(submission_states)
             for actual, reservation in zip(actual_futures, reservations, strict=True):
                 if not actual.done():
@@ -2000,11 +2082,17 @@ async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
                 else:
                     assert not actual.cancelled()
         finally:
+            release_candidate.set()
             for actual in actual_futures:
-                await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(actual)), timeout=5)
+                # Keep the selector ticking while the cancelled caller's real
+                # worker drains, as the physical resolver test above does.
+                async with asyncio.timeout(5):
+                    while not actual.done():
+                        await asyncio.sleep(0.01)
+                actual.result()
             if actual_futures:
                 await asyncio.wait_for(physically_done.wait(), timeout=5)
-        assert 1 <= len(actual_futures) <= 2
+        assert len(actual_futures) == 2
         assert len(actual_futures) == len(reservations)
         for actual, reservation in zip(actual_futures, reservations, strict=True):
             assert actual.done() and not actual.cancelled()
@@ -2420,7 +2508,8 @@ async def _create_sparse_presence_dispatch(service: SessionServiceImpl, *, expli
             select(composition_proposals_table.c.arguments_redacted_json).where(composition_proposals_table.c.id == str(row.id))
         ).scalar_one()
     assert stored == display
-    audit_display = json.loads(_latest_audit_envelope(service)["invocation"]["arguments_canonical"])
+    _message_id, envelope = _dispatch_audit_row(service, session_id, plan.tool_call_id)
+    audit_display = json.loads(envelope["invocation"]["arguments_canonical"])
     assert audit_display == display
     assert ("inline_blob" in display["source"]) is explicit_null
     return session_id, plan, row, bindings[0], display
@@ -2468,7 +2557,7 @@ async def test_sparse_presence_durable_recovery_and_terminal_retry(service: Sess
 @pytest.mark.parametrize("tamper", ["result_hash", "arguments_hash", "tool_call_id", "source_field"])
 async def test_sparse_presence_recovery_rejects_tampered_audit(service: SessionServiceImpl, explicit_null: bool, tamper: str) -> None:
     session_id, plan, row, binding, _display = await _create_sparse_presence_dispatch(service, explicit_null=explicit_null)
-    envelope = _latest_audit_envelope(service)
+    message_id, envelope = _dispatch_audit_row(service, session_id, plan.tool_call_id)
     invocation = envelope["invocation"]
     if tamper == "source_field":
         arguments = json.loads(invocation["arguments_canonical"])
@@ -2481,6 +2570,6 @@ async def test_sparse_presence_recovery_rejects_tampered_audit(service: SessionS
         invocation[tamper] = "unrelated-call"
     else:
         invocation[tamper] = "0" * 64
-    _replace_latest_audit_envelope(service, envelope)
+    _replace_audit_envelope(service, session_id, message_id, envelope)
     with pytest.raises(AuditIntegrityError):
         await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))

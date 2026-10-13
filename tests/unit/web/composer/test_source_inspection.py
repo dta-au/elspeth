@@ -18,6 +18,8 @@ Covers:
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 from types import MappingProxyType
 from uuid import uuid4
@@ -423,6 +425,135 @@ class TestCsvInspection:
         f = inspect_blob_content(content=content, filename="data.csv", mime_type="text/csv")
         assert f.observed_headers == ("name", "age", "city"), f.observed_headers
         assert any("utf-32-le" in w and ("encoding" in w or "bom" in w.lower()) for w in f.warnings), f.warnings
+
+
+# --------------------------------------------------------------------------
+# CSV sample record boundaries
+# --------------------------------------------------------------------------
+
+
+class TestCsvSampleRecordBoundaries:
+    def test_valid_multiline_csv_cut_at_byte_limit_is_not_jagged(self) -> None:
+        body = b'first,second,third\nalpha,beta,gamma\ndelta,"' + b"ordinary multiline field\n" * 400 + b'",epsilon\nzeta,eta,theta\n'
+        assert len(body) > 8192
+        assert [len(row) for row in csv.reader(io.StringIO(body.decode(), newline=""), strict=True)] == [3, 3, 3, 3]
+
+        facts = inspect_blob_content(content=body, filename="synthetic.csv", mime_type="text/csv")
+
+        assert facts.byte_range_inspected == (0, 8192)
+        assert facts.runtime_headers == ("first", "second", "third")
+        assert facts.sample_row_count == 1
+        assert any(warning.startswith("csv_sample_record_truncated:") for warning in facts.warnings)
+        assert not any("csv_jagged_rows" in warning for warning in facts.warnings)
+
+    def test_complete_jagged_record_before_cut_still_counts(self) -> None:
+        body = b'first,second,third\nalpha,beta\ndelta,"' + b"ordinary multiline field\n" * 400 + b'",epsilon\nzeta,eta,theta\n'
+        assert [len(row) for row in csv.reader(io.StringIO(body.decode(), newline=""), strict=True)] == [3, 2, 3, 3]
+
+        facts = inspect_blob_content(content=body, filename="synthetic.csv", mime_type="text/csv")
+
+        assert facts.sample_row_count == 1
+        jagged = [warning for warning in facts.warnings if warning.startswith("csv_jagged_rows:")]
+        assert len(jagged) == 1
+        assert "1 row(s)" in jagged[0]
+        assert any(warning.startswith("csv_sample_record_truncated:") for warning in facts.warnings)
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            pytest.param(b"4,5", id="unquoted-tail"),
+            pytest.param(b'4,"unfinished\n', id="newline-inside-open-quote"),
+            pytest.param(b'4,"unfinished\r', id="cr-inside-open-quote"),
+            pytest.param(b'4,"closed"', id="closed-quote-without-record-end"),
+            pytest.param(b'4,"relaxed"suffix,"unfinished\n', id="relaxed-quote-before-open-quote"),
+            pytest.param(b"4,https://tail.example.test/path", id="partial-url"),
+        ],
+    )
+    def test_uncertain_tail_does_not_contribute_to_sample_facts(self, tail: bytes) -> None:
+        body = b"first,second,third\n1,2,3\n" + tail
+        facts = inspect_csv_source_content(
+            content=body,
+            total_size_bytes=len(body) + 100,
+            filename="synthetic.csv",
+            mime_type="text/csv",
+            delimiter=",",
+            skip_rows=0,
+        )
+
+        assert facts.sample_row_count == 1
+        assert facts.inferred_types == {"first": "int", "second": "int", "third": "int"}
+        assert facts.url_candidates == ()
+        assert any(warning.startswith("csv_sample_record_truncated:") for warning in facts.warnings)
+        assert not any("csv_jagged_rows" in warning for warning in facts.warnings)
+        assert "unfinished" not in json.dumps(facts.warnings)
+        assert "tail.example.test" not in json.dumps(facts.warnings)
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            pytest.param(b"4,5,6\n", id="lf-boundary"),
+            pytest.param(b"4,5,6\r", id="split-crlf-boundary"),
+            pytest.param(b"4,5,6\r\n", id="crlf-boundary"),
+            pytest.param(b'4,"5"suffix,6\n', id="complete-relaxed-quote-suffix"),
+            pytest.param(b'4,"multi\nline",6\n', id="complete-multiline-record"),
+            pytest.param(b'4,"escaped""quote",6\n', id="complete-escaped-quote"),
+        ],
+    )
+    def test_complete_record_at_prefix_boundary_is_retained(self, tail: bytes) -> None:
+        body = b"first,second,third\n1,2,3\n" + tail
+        facts = inspect_csv_source_content(
+            content=body,
+            total_size_bytes=len(body) + 100,
+            filename="synthetic.csv",
+            mime_type="text/csv",
+            delimiter=",",
+            skip_rows=0,
+        )
+
+        assert facts.sample_row_count == 2
+        assert not any("csv_sample_record_truncated" in warning for warning in facts.warnings)
+        assert not any("csv_jagged_rows" in warning for warning in facts.warnings)
+
+    def test_complete_record_ending_exactly_at_byte_limit_is_retained(self) -> None:
+        header = b"first,second,third\n"
+        record = b"a," + b"x" * (8192 - len(header) - len(b"a,,c\n")) + b",c\n"
+        assert len(header + record) == 8192
+        facts = inspect_blob_content(content=header + record + b"d,e,f\n", filename="synthetic.csv", mime_type="text/csv")
+
+        assert facts.sample_row_count == 1
+        assert not any("csv_sample_record_truncated" in warning for warning in facts.warnings)
+        assert not any("csv_jagged_rows" in warning for warning in facts.warnings)
+
+    @pytest.mark.parametrize("tail", [b"4,5,6", b'4,"5"suffix,6\n'])
+    def test_real_eof_retains_current_relaxed_record_semantics(self, tail: bytes) -> None:
+        facts = inspect_blob_content(content=b"first,second,third\n" + tail, filename="synthetic.csv", mime_type="text/csv")
+
+        assert facts.sample_row_count == 1
+        assert not any("csv_sample_record_truncated" in warning for warning in facts.warnings)
+
+    def test_row_limit_before_byte_boundary_does_not_drop_complete_record(self) -> None:
+        body = b"first,second,third\n" + b"1,2,3\n" * 105 + b'4,"' + b"x" * 9000 + b'",6\n'
+        facts = inspect_blob_content(content=body, filename="synthetic.csv", mime_type="text/csv")
+
+        assert facts.sample_row_count == 99
+        assert not any("csv_sample_record_truncated" in warning for warning in facts.warnings)
+
+    def test_tab_delimited_explicit_columns_skip_preamble_and_incomplete_tail(self) -> None:
+        body = b'preamble\n1\t2\t3\n4\t"unfinished\n'
+        facts = inspect_csv_source_content(
+            content=body,
+            total_size_bytes=len(body) + 100,
+            filename="synthetic.tsv",
+            mime_type="text/tab-separated-values",
+            delimiter="\t",
+            skip_rows=1,
+            columns=("first", "second", "third"),
+        )
+
+        assert facts.sample_row_count == 1
+        assert facts.inferred_types == {"first": "int", "second": "int", "third": "int"}
+        assert any(warning.startswith("csv_sample_record_truncated:") for warning in facts.warnings)
+        assert not any("csv_jagged_rows" in warning for warning in facts.warnings)
 
 
 # --------------------------------------------------------------------------

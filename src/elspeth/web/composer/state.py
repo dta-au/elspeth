@@ -1529,6 +1529,18 @@ class CoalesceUnionTypeDetail:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateReviewReferenceFacts:
+    """Candidate-local facts stamped only from a typed unknown-reference rejection.
+
+    Internal transport to the planner; disclosure still requires per-entry
+    option custody. Deliberately omitted from validation wire serialization.
+    """
+
+    unknown_requirement_id: str
+    valid_requirement_ids: tuple[str, ...]
+
+
 class ValidationEntryDict(TypedDict):
     """JSON representation of :class:`ValidationEntry`."""
 
@@ -1590,6 +1602,7 @@ class ValidationEntry:
     # ``plugin_identity`` this IS wire-carried — it exists so the model can
     # read it.
     rejected_component: str | None = None
+    review_reference: CandidateReviewReferenceFacts | None = None
 
     def to_dict(self) -> ValidationEntryDict:
         """Serialize to a plain dict for JSON responses."""

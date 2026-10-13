@@ -8,16 +8,25 @@ from typing import Any, cast
 
 from pydantic import ValidationError as PydanticValidationError
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, PrivateFailureFacts
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json as primitive_canonical_json
 from elspeth.contracts.hashing import is_lower_sha256_hex
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.authority_hashing import (
     composer_authority_canonical_json,
     project_composer_authority_payload,
     restore_composer_authority_payload,
 )
+from elspeth.web.composer.diagnostic_evidence import (
+    ComposerDiagnosticEvidence,
+    DiagnosticPayload,
+    build_private_tool_evidence,
+    diagnostic_evidence_identity,
+)
+from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection, inline_custody_manifest_redaction_input
 from elspeth.web.composer.pipeline_proposal import (
     is_owned_composition_state_authority,
     owned_composition_state_review_arguments,
@@ -35,6 +44,120 @@ from elspeth.web.composer.tool_error_payloads import (
     unknown_tool_arguments_redaction,
     unknown_tool_response_redaction,
 )
+from elspeth.web.sessions._persist_payload import AuditMessageDraft
+
+
+def private_failure_evidence(
+    facts: PrivateFailureFacts,
+    *,
+    identity: str,
+    tool_call_id: str,
+    status: str,
+    context: SessionOperationContext,
+) -> ComposerDiagnosticEvidence:
+    if type(facts) is not PrivateFailureFacts:
+        raise AuditIntegrityError("private failure facts are not nominal")
+    return build_private_tool_evidence(
+        session_id=context.fence.session_id,
+        operation_id=context.fence.operation_id,
+        operation_epoch=context.fence.operation_epoch,
+        tool_call_id=tool_call_id,
+        evidence_id=identity,
+        tool_name="composer_failure",
+        status=status,
+        arguments_canonical=None,
+        result_canonical=facts.canonical,
+    )
+
+
+def private_diagnostic_drafts(
+    record: ComposerToolInvocation | ComposerLLMCall,
+    *,
+    context: SessionOperationContext,
+    composition_state_id: str | None = None,
+) -> tuple[AuditMessageDraft, ...]:
+    evidence: list[ComposerDiagnosticEvidence] = []
+    if type(record) is ComposerToolInvocation:
+        identity = diagnostic_evidence_identity("tool-failure", record.tool_call_id)
+        call_id = record.tool_call_id
+        status = "tool_failure"
+    elif type(record) is ComposerLLMCall:
+        call_id = record.call_id or f"legacy:{record.started_at.isoformat()}:{record.planner_call_ordinal}"
+        identity = diagnostic_evidence_identity("provider-failure", call_id)
+        status = "provider_failure"
+        if record.private_request is not None:
+            request = record.private_request
+            evidence.append(
+                ComposerDiagnosticEvidence(
+                    session_id=context.fence.session_id,
+                    operation_id=context.fence.operation_id,
+                    operation_epoch=context.fence.operation_epoch,
+                    tool_call_id=call_id,
+                    evidence_id=diagnostic_evidence_identity("provider-request", call_id),
+                    tool_name="composer_provider_context",
+                    status="provider_request",
+                    arguments=DiagnosticPayload(
+                        request.disposition,
+                        "json",
+                        request.canonical,
+                        hashlib.sha256(request.canonical.encode("utf-8")).hexdigest() if request.canonical is not None else None,
+                        request.reasons,
+                    ),
+                    authority_arguments=None,
+                    result=DiagnosticPayload("not_returned", "json", None, None),
+                    wire_arguments=DiagnosticPayload("unavailable", "wire_text", None, None, ("not_recorded",)),
+                )
+            )
+        retained_arguments_remaining = 1024 * 1024
+        for receipt in record.private_diagnostics:
+            item = build_private_tool_evidence(
+                session_id=context.fence.session_id,
+                operation_id=context.fence.operation_id,
+                operation_epoch=context.fence.operation_epoch,
+                tool_call_id=receipt.tool_call_id,
+                evidence_id=receipt.evidence_id,
+                tool_name=receipt.tool_name,
+                status="received_response",
+                arguments_canonical=receipt.arguments_canonical,
+                result_canonical=receipt.result_canonical,
+                raw_arguments=receipt.raw_arguments,
+            )
+            if item.arguments.content is not None:
+                size = len(item.arguments.content.encode("utf-8"))
+                if size > retained_arguments_remaining:
+                    facts = json.loads(receipt.result_canonical)
+                    facts["argument_disposition"] = "canonical_bounds"
+                    item = build_private_tool_evidence(
+                        session_id=context.fence.session_id,
+                        operation_id=context.fence.operation_id,
+                        operation_epoch=context.fence.operation_epoch,
+                        tool_call_id=receipt.tool_call_id,
+                        evidence_id=receipt.evidence_id,
+                        tool_name=receipt.tool_name,
+                        status="received_response",
+                        arguments_canonical=None,
+                        raw_arguments=None,
+                        result_canonical=canonical_json(facts),
+                    )
+                else:
+                    retained_arguments_remaining -= size
+            evidence.append(item)
+    else:
+        raise AuditIntegrityError("private diagnostic owner is not nominal")
+    if record.private_failure is not None:
+        evidence.append(
+            private_failure_evidence(record.private_failure, identity=identity, tool_call_id=call_id, status=status, context=context)
+        )
+    return tuple(
+        AuditMessageDraft(
+            role="audit",
+            content="Private credential-filtered diagnostic facts",
+            tool_calls=(item.to_envelope(),),
+            composition_state_id=composition_state_id if type(record) is ComposerToolInvocation else None,
+            inherit_composition_state=type(record) is ComposerToolInvocation,
+        )
+        for item in evidence
+    )
 
 
 def _hash_canonical_payload(canonical_payload: str) -> str:
@@ -134,10 +257,14 @@ def _redacted_arguments(
         if invocation.tool_name == "set_pipeline" and is_owned_composition_state_authority(arguments)
         else arguments
     )
+    redaction_input = (
+        inline_custody_manifest_redaction_input(review_arguments) if invocation.tool_name == "set_pipeline" else review_arguments
+    )
+    custody_projection = redaction_input != review_arguments
     try:
         redacted = redact_tool_call_arguments(
             invocation.tool_name,
-            cast(dict[str, Any], review_arguments),
+            cast(dict[str, Any], redaction_input),
             telemetry=telemetry,
         )
     except PydanticValidationError:
@@ -153,7 +280,7 @@ def _redacted_arguments(
             "error_class": failure_projection["error_class"],
             "field_count": len(arguments),
         }
-    return redacted
+    return dict(inline_custody_audit_projection(redacted)) if custody_projection else redacted
 
 
 def _redacted_result_canonical(
@@ -276,4 +403,46 @@ def redacted_tool_invocation_content_and_envelope(
     return content, {"_kind": "audit", "invocation": invocation_payload}
 
 
-__all__ = ["redacted_tool_invocation_content_and_envelope"]
+def private_tool_invocation_draft(
+    invocation: ComposerToolInvocation,
+    *,
+    session_id: str,
+    session_operation_context: SessionOperationContext,
+    composition_state_id: str | None = None,
+) -> AuditMessageDraft:
+    """Keep credential-filtered authoring beside its display in one cohort."""
+    from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence
+
+    _validated_invocation_arguments(invocation)
+    if invocation.result_canonical is not None:
+        if invocation.result_hash is None:
+            raise AuditIntegrityError("private tool evidence result has no binding")
+        _validated_canonical_mapping_pair(invocation.result_canonical, invocation.result_hash, label="private tool result")
+    fence = session_operation_context.fence
+    if fence.session_id != session_id:
+        raise AuditIntegrityError("private tool evidence belongs to another session")
+    authoring = invocation.private_authoring
+    evidence = build_private_tool_evidence(
+        session_id=session_id,
+        operation_id=fence.operation_id,
+        operation_epoch=fence.operation_epoch,
+        tool_call_id=invocation.tool_call_id,
+        tool_name=invocation.tool_name,
+        status=invocation.status.value,
+        arguments_canonical=authoring.arguments_canonical if authoring is not None else invocation.arguments_canonical,
+        authority_arguments_canonical=(
+            authoring.authority_arguments_canonical if authoring is not None else invocation.authority_arguments_canonical
+        ),
+        raw_arguments=authoring.raw_arguments if authoring is not None else None,
+        result_canonical=invocation.result_canonical,
+        error_category=invocation.error_category.value if invocation.error_category is not None else None,
+    )
+    return AuditMessageDraft(
+        role="audit",
+        content="Private credential-filtered tool evidence",
+        tool_calls=(evidence.to_envelope(),),
+        composition_state_id=composition_state_id,
+    )
+
+
+__all__ = ["private_tool_invocation_draft", "redacted_tool_invocation_content_and_envelope"]

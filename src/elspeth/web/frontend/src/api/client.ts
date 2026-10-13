@@ -319,6 +319,7 @@ function buildApiError(status: number, errorBody: unknown, statusText: string, s
     let detail = statusText;
     let errorType: string | undefined;
     let currentState: string | undefined;
+    let unavailableStateHead: ApiError["unavailable_state_head"];
     let storageQuota: ApiError["storage_quota"];
     let sources: string[] | undefined;
     let requestId: string | undefined;
@@ -353,6 +354,14 @@ function buildApiError(status: number, errorBody: unknown, statusText: string, s
         ["error_type", "error_code", "refusal", "code", "kind"],
       );
       currentState = firstStringField([body, nestedDetail], ["current_state"]);
+      if (status === 409 && errorType === "composition_state_unavailable") {
+        const stateId = firstStringField([body, nestedDetail], ["state_id"]);
+        const version = firstDefined(ownField(body, "version"), ownField(nestedDetail, "version"));
+        if (stateId !== undefined && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(stateId)
+          && typeof version === "number" && Number.isSafeInteger(version) && version > 0) {
+          unavailableStateHead = { state_id: stateId, version };
+        }
+      }
       if (status === 413 && errorType === "storage_quota_exceeded") {
         const dimension = firstDefined(ownField(nestedDetail, "dimension"), ownField(body, "dimension"));
         const cap = firstDefined(ownField(nestedDetail, "cap"), ownField(body, "cap"));
@@ -518,6 +527,7 @@ function buildApiError(status: number, errorBody: unknown, statusText: string, s
       detail,
       error_type: errorType,
       current_state: currentState,
+      unavailable_state_head: unavailableStateHead,
       storage_quota: storageQuota,
       sources,
       request_id: requestId,

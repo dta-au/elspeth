@@ -18,6 +18,16 @@ Every platform literal below is measured in the
 > `docs/operator/evidence/azure-container-apps/0.8.3.json` is no longer a tracker
 > closure or documentation-promotion condition.
 
+> **Temporary deployment hold:** the current candidate supports only fresh/new
+> stores until explicit policy revision, with no fixed expiry. An existing-store
+> candidate transition is unsupported, even with an old approved receipt.
+> Do not execute the retained redeploy or rollback procedure below under this
+> policy. Preserve existing stores: do not delete, recreate, restamp, migrate
+> or silently modify them to satisfy the candidate. Use the
+> [cold-install runbook](azure-container-apps-cold-install.md) only for a separate
+> genuinely fresh deployment. The following procedure remains historical
+> operational reference, not current deployment authorization.
+
 The supported configuration retains `Single` revision mode, `sticky` session
 affinity and 2–4 replicas with one web process per replica. External PostgreSQL
 provides single-use tickets and durable run-event replay on authorized peer
@@ -78,6 +88,8 @@ vault access, Job identities or the web container's `AZURE_CLIENT_ID`.
   approved fresh database reported `MISSING`, and `STALE` is a stop.
 
 ```bash
+printf '%s\n' compatibility_transition_unsupported >&2
+exit 64
 set -Eeuo pipefail
 umask 077
 export AZURE_CORE_OUTPUT=json
@@ -293,18 +305,17 @@ status; health alone does not prove LLM or login setup.
 > **LIVE:** the console-log query by revision name that shows no new
 > unhandled startup or runtime failure.
 
-An epoch-crossing candidate needs the database owner to drain the old
-revision, export the stopped Sessions store's identity/grant/edge cohort,
-archive and recreate each stale store, and rerun the schema Job from the
-[cold-install runbook](azure-container-apps-cold-install.md). For 0.8.1 or
-0.8.2 to 0.8.3, only the session store changes from epoch 71 to 72; preserve
-a Landscape store already at epoch 49. Then apply the candidate revision and complete the
-[identity workflow cutover handoff](identity-workflow-cutover.md): bootstrap,
-re-admit, check authenticated behavior, and send the notice before ordinary
-traffic resumes. This image-only path assumes already-current schemas and
-cannot turn a `STALE` doctor result into an initialized store.
+The 0.8.3 candidate expects session epoch 74 and Landscape epoch 49. An
+epoch-crossing candidate is unsupported under the temporary fresh-store-only
+policy. Stop without applying the candidate or altering either existing store.
+The [identity workflow cutover handoff](identity-workflow-cutover.md) is
+historical context, not authority to recreate a store. This retained image-only
+procedure cannot turn a `STALE` doctor result into an initialized store.
 
 ## Rollback
+
+**Current policy stop:** no current candidate receipt permits rollback.
+The retained compatibility-conditional procedure below is historical reference.
 
 Rollback is permitted only when the compatibility record for this candidate
 says `rollback_permitted: true`, meaning the previous image understands the
@@ -312,6 +323,8 @@ current schemas. For a Scenario A install that is `false` by the record's
 own rule: keep the candidate and repair forward. When it is permitted:
 
 ```bash
+printf '%s\n' compatibility_transition_unsupported >&2
+exit 64
 az containerapp revision activate --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" --revision "$PREVIOUS_REVISION"
 az containerapp ingress traffic set --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
   --revision-weight "${PREVIOUS_REVISION}=100"

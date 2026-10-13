@@ -32,7 +32,7 @@ not from this module — that keeps the leaf clean.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol, TypedDict
@@ -129,6 +129,56 @@ class ToolArgumentErrorCategory(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class PrivateFailureFacts:
+    """Bounded filtered facts; never part of a public invocation payload."""
+
+    canonical: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.canonical) is not str or len(self.canonical.encode("utf-8")) > 8192:
+            raise TypeError("private failure facts must be bounded canonical text")
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateReceivedDiagnostic:
+    """A bounded received slot independent of provider admission authority."""
+
+    evidence_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments_canonical: str | None = field(repr=False)
+    result_canonical: str = field(repr=False)
+    raw_arguments: str | None = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not str or not value for value in (self.evidence_id, self.tool_call_id, self.tool_name, self.result_canonical)
+        ):
+            raise TypeError("private receipt requires owned scalar identity and facts")
+        if any(value is not None and type(value) is not str for value in (self.arguments_canonical, self.raw_arguments)):
+            raise TypeError("private receipt arguments must be exact strings or absent")
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateToolAuthoring:
+    """In-memory received authoring; omitted from invocation wire payloads."""
+
+    tool_call_id: str
+    tool_name: str
+    arguments_canonical: str | None = field(repr=False)
+    authority_arguments_canonical: str | None = field(repr=False)
+    raw_arguments: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.tool_call_id) is not str or not self.tool_call_id or type(self.tool_name) is not str or not self.tool_name:
+            raise TypeError("private authoring requires exact call and tool identity")
+        if type(self.raw_arguments) is not str:
+            raise TypeError("private authoring wire must be an exact string")
+        if any(value is not None and type(value) is not str for value in (self.arguments_canonical, self.authority_arguments_canonical)):
+            raise TypeError("private authoring canonical payloads must be exact strings or absent")
+
+
+@dataclass(frozen=True, slots=True)
 class ComposerToolInvocation:
     """One composer tool dispatch as recorded for audit.
 
@@ -214,10 +264,11 @@ class ComposerToolInvocation:
 
     Immutability and the cross-field check
     --------------------------------------
-    Every field is a scalar, ``StrEnum``, ``datetime``, or ``str|None``, so
-    ``frozen=True`` alone is sufficient. Deep-freezing exists because
+    Public fields are scalars, ``StrEnum``, or ``datetime``; the optional
+    internal authoring receipt is itself an immutable scalar record.
+    ``frozen=True`` is sufficient. Deep-freezing exists because
     ``frozen=True`` leaves container contents mutable through the attribute
-    reference; a scalar-only record has no container to reach through, so
+    reference; these records have no container to reach through, so
     no freeze guard is defined. ``__post_init__`` exists for the
     status/category cross-field check (an argument rejection must say which
     closed category rejected it, and no other status may carry one) and for
@@ -245,8 +296,17 @@ class ComposerToolInvocation:
     error_category: ToolArgumentErrorCategory | None = None
     strict_sent: bool | None = None
     wire_conformant: bool | None = None
+    private_authoring: PrivateToolAuthoring | None = field(default=None, repr=False)
+    private_failure: PrivateFailureFacts | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.private_failure is not None and type(self.private_failure) is not PrivateFailureFacts:
+            raise TypeError("invocation private failure facts must be owned")
+        if self.private_authoring is not None:
+            if type(self.private_authoring) is not PrivateToolAuthoring:
+                raise TypeError("invocation private authoring must be an owned receipt")
+            if self.private_authoring.tool_call_id != self.tool_call_id or self.private_authoring.tool_name != self.tool_name:
+                raise ValueError("invocation private authoring names another dispatch")
         if self.error_category is not None and type(self.error_category) is not ToolArgumentErrorCategory:
             raise TypeError("ComposerToolInvocation.error_category must be a ToolArgumentErrorCategory")
         if self.strict_sent is not None and type(self.strict_sent) is not bool:
@@ -271,6 +331,8 @@ class ComposerToolInvocation:
         serialize this complete record.
         """
         raw = asdict(self)
+        del raw["private_authoring"]
+        del raw["private_failure"]
         raw["status"] = self.status.value
         raw["error_category"] = self.error_category.value if self.error_category is not None else None
         raw["started_at"] = self.started_at.isoformat()

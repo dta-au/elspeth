@@ -16,9 +16,11 @@ from sqlalchemy import Engine
 from tests.helpers.composer_operations import SettledComposerOperation, message_body, running_operation_async, submit_and_settle
 from tests.helpers.postgres_target import postgres_test_target
 from tests.integration.web.conftest import _ensure_released_session_operation_fence, _make_session
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_routes import _make_app
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
@@ -174,6 +176,7 @@ class _BlockingSpliceComposer:
         budget_seconds: float | None = None,
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        recovery_context: GraphRecoveryContext | None = None,
     ) -> ComposerResult:
         del (
             message,
@@ -188,6 +191,7 @@ class _BlockingSpliceComposer:
             budget_seconds,
             required_work,
             provider_owner,
+            recovery_context,
         )
         result = execute_tool(
             "splice_transform",
@@ -287,7 +291,7 @@ def postgres_engine() -> Iterator[Engine]:
 
 @pytest.fixture
 def postgres_service(postgres_engine: Engine, tmp_path: Path) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return FencedSessionServiceHarness(
         postgres_engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

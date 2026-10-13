@@ -77,18 +77,18 @@ function decodeError(value: unknown, sessionId: string): ComposerOperationError 
   if ((code === "operation_failed") !== (diagnostic_id !== null)) throw new ComposerOperationDecodeError("Invalid diagnostic binding");
   return { http_status: status, body: record.body as Record<string, unknown>, error_type: record.error_type === null ? null : text(record.error_type), failure_code: code, diagnostic_id };
 }
-export function decodeComposerResult(value: unknown, sessionId: string): MessageWithStateResponse {
-  const record = exactRecord(value, ["message", "state", "proposals"]);
-  const message = exactRecord(record.message, ["id", "operation_id", "session_id", "role", "content", "raw_content", "segments", "tool_calls", "created_at", "composition_state_id", "tool_call_id", "parent_assistant_id", "sequence_no", "rejection"]);
+function decodeTerminalMessage(value: unknown, sessionId: string, role: "assistant" | "system"): ChatMessage {
+  const message = exactRecord(value, ["id", "operation_id", "session_id", "role", "content", "raw_content", "segments", "tool_calls", "created_at", "composition_state_id", "tool_call_id", "parent_assistant_id", "sequence_no", "rejection"]);
   canonicalUuid(message.id);
-  if (message.session_id !== sessionId || message.role !== "assistant") throw new ComposerOperationDecodeError("Final message scope mismatch");
+  if (message.session_id !== sessionId || message.role !== role) throw new ComposerOperationDecodeError("Final message scope mismatch");
   text(message.content);
   timestamp(message.created_at);
   if (message.operation_id !== undefined && message.operation_id !== null) canonicalUuid(message.operation_id);
   for (const field of ["composition_state_id", "tool_call_id", "parent_assistant_id"]) if (message[field] !== undefined && message[field] !== null) text(message[field]);
   if (message.raw_content !== undefined && message.raw_content !== null) text(message.raw_content);
   if (message.sequence_no !== undefined && message.sequence_no !== null) integer(message.sequence_no);
-  if (!Array.isArray(message.segments) || !Array.isArray(record.proposals) || (message.tool_calls !== null && !Array.isArray(message.tool_calls))) throw new ComposerOperationDecodeError("Invalid final lists");
+  if (!Array.isArray(message.segments) || (message.tool_calls !== null && !Array.isArray(message.tool_calls))) throw new ComposerOperationDecodeError("Invalid final lists");
+  if (role === "system" && message.tool_calls !== null) throw new ComposerOperationDecodeError("Recovery receipt cannot carry tool calls");
   if (Array.isArray(message.tool_calls)) for (const value of message.tool_calls) {
     const call = exactRecord(value, ["id", "type", "function", "outcome", "applied_state_version", "related_proposal_id"], ["id", "type", "function"]);
     text(call.id); text(call.type);
@@ -103,6 +103,14 @@ export function decodeComposerResult(value: unknown, sessionId: string): Message
     if (item.kind !== "text" && item.kind !== "trusted_system_notice") throw new ComposerOperationDecodeError("Unknown segment");
     text(item.content);
   }
+  return message as unknown as ChatMessage;
+}
+export function decodeComposerResult(value: unknown, sessionId: string): MessageWithStateResponse {
+  const record = exactRecord(value, ["message", "state", "proposals", "recovery_notice"], ["message", "state", "proposals"]);
+  const message = decodeTerminalMessage(record.message, sessionId, "assistant");
+  const recoveryNotice = record.recovery_notice == null ? null : decodeTerminalMessage(record.recovery_notice, sessionId, "system");
+  if (recoveryNotice !== null && (recoveryNotice.id === message.id || recoveryNotice.operation_id !== message.operation_id)) throw new ComposerOperationDecodeError("Recovery receipt binding mismatch");
+  if (!Array.isArray(record.proposals)) throw new ComposerOperationDecodeError("Invalid final lists");
   for (const value of record.proposals) {
     const proposal = exactRecord(value, ["id", "session_id", "tool_call_id", "tool_name", "status", "summary", "rationale", "affects", "arguments_redacted_json", "base_state_id", "committed_state_id", "audit_event_id", "pipeline_metadata", "created_at", "updated_at"]);
     canonicalUuid(proposal.id);
@@ -122,7 +130,8 @@ export function decodeComposerResult(value: unknown, sessionId: string): Message
   }
   const state = record.state === null ? null : decodeCompositionState(record.state);
   if (state !== null && state.session_id !== sessionId) throw new ComposerOperationDecodeError("Final state scope mismatch");
-  return { message: message as unknown as ChatMessage, state, proposals: record.proposals as MessageWithStateResponse["proposals"] };
+  if (recoveryNotice !== null && state !== null && recoveryNotice.composition_state_id !== state.id) throw new ComposerOperationDecodeError("Recovery receipt state mismatch");
+  return { message, state, proposals: record.proposals as MessageWithStateResponse["proposals"], ...(record.recovery_notice === undefined ? {} : { recovery_notice: recoveryNotice }) };
 }
 export function decodeComposerOperationSnapshot(value: unknown, sessionId: string, operationId: string): ComposerOperationSnapshot {
   const record = exactRecord(value, ["operation_id", "kind", "status", "poll_after_ms", "cancel_requested", "deadline_at", "deadline_remaining_ms", "result", "error"]);
@@ -136,7 +145,9 @@ export function decodeComposerOperationSnapshot(value: unknown, sessionId: strin
   if (status === "completed" && record.cancel_requested) throw new ComposerOperationDecodeError("Completed cancellation conflict");
   if (!Number.isFinite(Date.parse(deadline_at))) throw new ComposerOperationDecodeError("Invalid deadline");
   if ((status === "completed" && (record.result === null || record.error !== null)) || (status === "failed" && (record.error === null || record.result !== null)) || ((status === "queued" || status === "running") && (record.result !== null || record.error !== null))) throw new ComposerOperationDecodeError("Invalid terminal payload");
-  return { operation_id, kind: operationKind(record.kind), status, poll_after_ms: pollAfter(record.poll_after_ms), cancel_requested: record.cancel_requested, deadline_at, deadline_remaining_ms: integer(record.deadline_remaining_ms), result: record.result === null ? null : decodeComposerResult(record.result, sessionId), error: record.error === null ? null : decodeError(record.error, sessionId) };
+  const result = record.result === null ? null : decodeComposerResult(record.result, sessionId);
+  if (result?.recovery_notice != null && (result.message.operation_id !== operation_id || result.recovery_notice.operation_id !== operation_id)) throw new ComposerOperationDecodeError("Recovery receipt operation mismatch");
+  return { operation_id, kind: operationKind(record.kind), status, poll_after_ms: pollAfter(record.poll_after_ms), cancel_requested: record.cancel_requested, deadline_at, deadline_remaining_ms: integer(record.deadline_remaining_ms), result, error: record.error === null ? null : decodeError(record.error, sessionId) };
 }
 
 /** Bounded incremental SSE framing. UTF-8 is admitted before any JSON is parsed. */

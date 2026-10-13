@@ -162,7 +162,7 @@ async def _run_production_turn(
 
     With ``reach_the_hatch``, every full-palette planner request is answered
     with a discovery call, so the planner exhausts its discovery budget and
-    takes the escape-hatch turn (a terminal-only tool list), which is answered
+    takes the escape-hatch turn (recovery controls plus proposal), which is answered
     with the terminal proposal.
     """
     engine = create_session_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -187,7 +187,9 @@ async def _run_production_turn(
 
     async def completion(**kwargs: Any) -> _Response:
         requests.append(kwargs)
-        if reach_the_hatch and "max_tokens" in kwargs and len(kwargs["tools"]) > 1:
+        names = {tool["function"]["name"] for tool in kwargs.get("tools", [])}
+        hatch_names = {"handoff_to_user", "restore_parked_graph", "emit_pipeline_proposal"}
+        if reach_the_hatch and "max_tokens" in kwargs and names != hatch_names:
             discovery = _ToolCall(id=f"parity-discovery-{len(requests)}", function=_Function(name="list_sources", arguments="{}"))
             return _Response(choices=[_Choice(message=_Message(content=None, tool_calls=[discovery]))], usage=_usage())
         if "tools" in kwargs and any(tool["function"]["name"] == "emit_pipeline_proposal" for tool in kwargs["tools"]):
@@ -237,8 +239,8 @@ def _without(kwargs: Mapping[str, Any], *keys: str) -> dict[str, Any]:
 
 
 def _loop_request(requests: list[dict[str, Any]]) -> dict[str, Any]:
-    loop_requests = [request for request in requests if "tools" in request and len(request["tools"]) == 42]
-    assert loop_requests, "the ordinary compose loop made no 42-tool request"
+    loop_requests = [request for request in requests if "tools" in request and len(request["tools"]) == 44]
+    assert loop_requests, "the ordinary compose loop made no 44-tool request"
     return loop_requests[0]
 
 
@@ -386,7 +388,7 @@ async def test_probe_and_production_send_the_same_strict_flags_on_a_forwarding_r
     assert (
         _strict_map(probe["hatch_terminal"]["tools"])
         == _strict_map(_hatch_request(planner_requests)["tools"])
-        == {"emit_pipeline_proposal": False}
+        == {"handoff_to_user": True, "restore_parked_graph": True, "emit_pipeline_proposal": False}
     )
 
 
@@ -421,7 +423,11 @@ async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_not_the_planner
     )
     hatch_i = _hatch_request(requests_i)
     assert hatch_i["api_base"] == _PROXY
-    assert _strict_map(hatch_i["tools"]) == {"emit_pipeline_proposal": "omitted"}
+    assert _strict_map(hatch_i["tools"]) == {
+        "handoff_to_user": "omitted",
+        "restore_parked_graph": "omitted",
+        "emit_pipeline_proposal": "omitted",
+    }
     assert _hatch_call(recorded_i).tool_contract_dialect.value == "none"
 
 
@@ -447,12 +453,16 @@ async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_when_only_the_h
     assert set(_strict_map(probe_ii["loop_tools"]["tools"]).values()) == {"omitted"}
     assert set(_strict_map(probe_ii["planner_tools"]["tools"]).values()) == {"omitted"}
     assert "api_base" not in probe_ii["hatch_terminal"]
-    assert _strict_map(probe_ii["hatch_terminal"]["tools"]) == {"emit_pipeline_proposal": False}
+    assert _strict_map(probe_ii["hatch_terminal"]["tools"]) == {
+        "handoff_to_user": True,
+        "restore_parked_graph": True,
+        "emit_pipeline_proposal": False,
+    }
     recorded_ii = _record_planner_llm_calls(monkeypatch)
     requests_ii, _composer_ii, _result_ii = await _run_production_turn(
         tmp_path, monkeypatch, settings_ii, message="Build a CSV to JSONL pipeline.", reach_the_hatch=True
     )
     hatch_ii = _hatch_request(requests_ii)
     assert "api_base" not in hatch_ii
-    assert _strict_map(hatch_ii["tools"]) == {"emit_pipeline_proposal": False}
+    assert _strict_map(hatch_ii["tools"]) == {"handoff_to_user": True, "restore_parked_graph": True, "emit_pipeline_proposal": False}
     assert _hatch_call(recorded_ii).tool_contract_dialect.value == "openai_strict"

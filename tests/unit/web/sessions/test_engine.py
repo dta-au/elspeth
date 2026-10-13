@@ -15,7 +15,7 @@ The five tests below cover:
    user_version carry the project's SESSION_DB_APPLICATION_ID and
    SESSION_SCHEMA_EPOCH sentinels.
 5. A stale DB (correct application_id but mismatched user_version) is
-   rejected with the actionable "Delete the session DB file and restart"
+   rejected with the actionable "Preserve this store unchanged"
    message rather than failing later with a cryptic SQLAlchemy error.
 
 In-memory DBs are deliberately avoided for the WAL test: SQLite reports
@@ -218,7 +218,7 @@ def test_initialize_session_schema_rejects_stale_user_version(
         conn.execute(text(f"PRAGMA user_version = {SESSION_SCHEMA_EPOCH - 1}"))
         conn.commit()
 
-    with pytest.raises(SessionSchemaError, match="Delete the session DB file and restart"):
+    with pytest.raises(SessionSchemaError, match="Preserve this store unchanged"):
         initialize_session_schema(engine)
 
 
@@ -241,5 +241,5 @@ def test_initialize_session_schema_rejects_foreign_application_id(
         conn.execute(text("CREATE TABLE _foreign_marker (id INTEGER)"))
         conn.commit()
 
-    with pytest.raises(SessionSchemaError, match="Delete the session DB file and restart"):
+    with pytest.raises(SessionSchemaError, match="Preserve this store unchanged"):
         initialize_session_schema(engine)

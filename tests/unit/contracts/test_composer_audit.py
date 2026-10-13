@@ -21,6 +21,7 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolRecorder,
     ComposerToolStatus,
+    PrivateToolAuthoring,
     ToolArgumentErrorCategory,
 )
 from elspeth.core.canonical import canonical_json, stable_hash
@@ -72,6 +73,36 @@ def test_cache_hit_defaults_false() -> None:
     inv = _make_invocation()
     assert inv.cache_hit is False
     assert inv.to_dict()["cache_hit"] is False
+
+
+def test_internal_authoring_receipt_does_not_change_public_bytes_or_repr() -> None:
+    receipt = PrivateToolAuthoring(
+        "tc-abc", "upsert_node", '"PRIVATE RECEIPT CANARY"', '"PRIVATE RECEIPT CANARY"', "PRIVATE RECEIPT CANARY"
+    )
+    original = _make_invocation()
+    with_receipt = dataclasses.replace(original, private_authoring=receipt)
+    assert with_receipt.private_authoring is receipt
+    assert with_receipt.to_dict() == original.to_dict()
+    assert canonical_json(with_receipt.to_dict()) == canonical_json(original.to_dict())
+    assert stable_hash(with_receipt.to_dict()) == stable_hash(original.to_dict())
+    assert "private_authoring" not in with_receipt.to_dict()
+    assert "PRIVATE RECEIPT CANARY" not in repr(receipt)
+    assert "PRIVATE RECEIPT CANARY" not in repr(with_receipt)
+    stamped = dataclasses.replace(with_receipt, strict_sent=True)
+    assert stamped.private_authoring is receipt
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        receipt.__setattr__("raw_arguments", "changed")
+
+
+@pytest.mark.parametrize("call_id,tool_name", [("another-call", "upsert_node"), ("tc-abc", "another-tool")])
+def test_internal_authoring_receipt_must_name_its_invocation(call_id: str, tool_name: str) -> None:
+    with pytest.raises(ValueError, match="another dispatch"):
+        _make_invocation(private_authoring=PrivateToolAuthoring(call_id, tool_name, "{}", None, "{}"))
+
+
+def test_internal_authoring_receipt_requires_owned_nominal_type() -> None:
+    with pytest.raises(TypeError, match="owned receipt"):
+        _make_invocation(private_authoring=object())
 
 
 def test_cache_hit_set_true_serializes_correctly() -> None:

@@ -451,6 +451,8 @@ def test_unknown_exception_cannot_masquerade_as_an_owned_acceptance_error() -> N
 def test_provision_storage_settings_failure_names_cause(monkeypatch: pytest.MonkeyPatch) -> None:
     from elspeth.web._aws_ecs_acceptance import capture
 
+    monkeypatch.setenv("ELSPETH_ACCEPTANCE_SCENARIO_ID", "A")
+
     def _boom() -> None:
         raise RuntimeError("Unknown ELSPETH_WEB__ setting: ELSPETH_WEB__DEFAULT_LLM_PROFILE")
 

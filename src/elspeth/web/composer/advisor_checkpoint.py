@@ -70,6 +70,7 @@ from elspeth.web.composer.no_tool_policy import (
 )
 from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emit_progress
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
@@ -382,6 +383,7 @@ class AdvisorCheckpointOwner:
             structured_output=structured_output,
         )
         kwargs["messages"] = messages
+        private_request = capture_provider_context(messages=messages, tools=None)
         try:
             response = await asyncio.wait_for(
                 provider_gateway._litellm_acompletion(
@@ -509,6 +511,7 @@ class AdvisorCheckpointOwner:
                             error_message=error_message,
                             credential_surface="composer_advisor_response",
                             provider_custody=provider_custody,
+                            private_request=private_request,
                         )
                         if provider_custody is not None:
                             provider_custody.retain_audit(call)

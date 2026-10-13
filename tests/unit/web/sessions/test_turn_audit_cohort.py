@@ -23,6 +23,7 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToo
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
+from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
@@ -152,7 +153,17 @@ async def test_tool_and_llm_groups_settle_as_one_cohort_with_their_own_state_ids
     assert cohort.session_operation_context == _compose_context(session_id)
     # The cohort-level state id stays None; each group binds per-draft.
     assert cohort.composition_state_id is None
-    tool_draft, llm_draft = cohort.drafts
+    private_draft, tool_draft, llm_draft = cohort.drafts
+    assert private_draft.role == "audit"
+    assert private_draft.tool_call_id is None
+    assert private_draft.parent_assistant_id is None
+    assert private_draft.composition_state_id == str(post_state_id)
+    (private_envelope,) = private_draft.tool_calls or ()
+    private = ComposerDiagnosticEvidence.from_envelope(
+        private_envelope, expected_session_id=str(session_id), expected_tool_call_id="call_preview_pipeline_1"
+    )
+    assert private.tool_name == "preview_pipeline"
+    assert private.status == "success"
     assert tool_draft.role == "tool"
     assert tool_draft.tool_call_id == "call_preview_pipeline_1"
     assert tool_draft.parent_assistant_id == str(assistant_id)
@@ -181,7 +192,17 @@ async def test_no_parent_assistant_uses_audit_role_for_tool_rows() -> None:
         session_operation_context=_compose_context(session_id),
     )
 
-    ((tool_draft,),) = [c.drafts for c in service.cohorts]
+    (cohort,) = service.cohorts
+    private_draft, tool_draft = cohort.drafts
+    assert private_draft.role == "audit"
+    assert private_draft.tool_call_id is None
+    assert private_draft.parent_assistant_id is None
+    assert private_draft.composition_state_id is None
+    (private_envelope,) = private_draft.tool_calls or ()
+    private = ComposerDiagnosticEvidence.from_envelope(
+        private_envelope, expected_session_id=str(session_id), expected_tool_call_id="call_preview_pipeline_1"
+    )
+    assert private.tool_name == "preview_pipeline"
     assert tool_draft.role == "audit"
     assert tool_draft.tool_call_id is None
     assert tool_draft.parent_assistant_id is None

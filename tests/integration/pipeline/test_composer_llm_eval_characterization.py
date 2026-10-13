@@ -38,6 +38,7 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import (
@@ -684,11 +685,20 @@ async def test_cl_pp_10c_cancellation_during_shielded_sync_dispatch_commits_rows
         raise AssertionError("CL-PP-10c shielded worker failed after caller cancellation") from worker_errors[0]
 
     rows = _chat_rows(sessions_service, session_id=session_id)
-    assert len(rows) == 2
-    assert [row.role for row in rows] == ["assistant", "tool"]
+    assert len(rows) == 3
+    assert [row.role for row in rows] == ["assistant", "tool", "audit"]
     assert rows[0].tool_calls is not None
     assert rows[1].tool_call_id == "call_cancel_during_dispatch"
     assert rows[1].parent_assistant_id == rows[0].id
+    (private_envelope,) = json.loads(rows[2].tool_calls)
+    private = ComposerDiagnosticEvidence.from_envelope(
+        private_envelope, expected_session_id=session_id, expected_tool_call_id="call_cancel_during_dispatch"
+    )
+    assert private.tool_name == "set_metadata"
+    assert private.status == "success"
+    assert rows[2].composition_state_id == rows[1].composition_state_id
+    assert rows[2].tool_call_id is None
+    assert rows[2].parent_assistant_id is None
     assert observed_value(telemetry.tool_row_integrity_violation_total) == starting_integrity_violations
 
 
@@ -732,7 +742,7 @@ async def test_cl_pp_10d_cancellation_after_commit_before_response_yield_keeps_s
 
     await asyncio.wait_for(commit_returned.wait(), timeout=2.0)
     rows_after_commit = _chat_rows(sessions_service, session_id=session_id)
-    assert [row.role for row in rows_after_commit] == ["assistant", "tool"]
+    assert [row.role for row in rows_after_commit] == ["assistant", "tool", "audit"]
 
     compose_task.cancel()
     release_response.set()
@@ -740,7 +750,8 @@ async def test_cl_pp_10d_cancellation_after_commit_before_response_yield_keeps_s
         await compose_task
 
     rows = _chat_rows(sessions_service, session_id=session_id)
-    assert [row.role for row in rows] == ["assistant", "tool"]
+    assert rows == rows_after_commit
+    assert [row.role for row in rows] == ["assistant", "tool", "audit"]
     assert rows[0].tool_calls is not None
     assert rows[1].tool_call_id == "call_cancel_after_commit"
     assert rows[1].parent_assistant_id == rows[0].id
@@ -748,7 +759,16 @@ async def test_cl_pp_10d_cancellation_after_commit_before_response_yield_keeps_s
     state_rows = _composition_state_rows(sessions_service, session_id=session_id)
     assert [row.provenance for row in state_rows] == ["tool_call"]
     assert rows[1].composition_state_id == state_rows[0].id
-    assert len(rows) == 2
+    assert len(rows) == 3
+    (private_envelope,) = json.loads(rows[2].tool_calls)
+    private = ComposerDiagnosticEvidence.from_envelope(
+        private_envelope, expected_session_id=session_id, expected_tool_call_id="call_cancel_after_commit"
+    )
+    assert private.tool_name == "set_metadata"
+    assert private.status == "success"
+    assert rows[2].composition_state_id == state_rows[0].id
+    assert rows[2].tool_call_id is None
+    assert rows[2].parent_assistant_id is None
 
 
 @pytest.mark.asyncio

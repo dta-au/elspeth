@@ -5,8 +5,9 @@ Cognito/OIDC, task-role S3 and Bedrock access, and CloudWatch operator
 telemetry. This runbook permits planned downtime: it deliberately uses a
 zero-overlap, single-task deployment.
 
-> **Scope:** This is the exhaustive, release-specific, two-scenario acceptance
-> and teardown program. Its supported Terraform source IS tracked in this
+> **Scope:** This is the exhaustive, release-specific acceptance and teardown
+> program for fresh Scenario A, with historical Scenario B procedures retained
+> below. Its supported Terraform source IS tracked in this
 > repository at [`deploy/aws-ecs/terraform/`](../../deploy/aws-ecs/terraform/README.md)
 > — start a cold install from that package's README. Only the owning remote
 > state (the per-run S3 state bucket and its contents) lives outside the
@@ -16,13 +17,22 @@ zero-overlap, single-task deployment.
 > Reconcile every schema epoch, task-definition input, and external Terraform
 > path with the selected release before using this acceptance program.
 
+> **Temporary deployment policy:** only fresh/new stores are supported. This
+> policy remains in force until explicitly revised; it has no fixed expiry.
+> Scenario A is the supported path. Scenario B and its upgrade/rollback
+> procedures below are retained as historical reference and must not execute.
+> The controller refuses Scenario B with `compatibility_transition_unsupported`
+> before compatibility admission. An old approved record cannot authorize it.
+> Preserve existing stores: do not delete, recreate, restamp, migrate, or
+> silently modify them to make the candidate pass.
+
 ---
 
 ## Symptoms
 
 Use this runbook when you need to:
 
-- provision, deploy, upgrade, and destroy the disposable two-scenario ECS
+- provision, deploy, and destroy the disposable fresh-store ECS
   acceptance environment;
 - prove schema, persistence, authentication, S3, Bedrock, Guardrail, and
   operator-telemetry behavior before admitting traffic;
@@ -622,8 +632,9 @@ assignment set, including the protected binding-receipt path. The initial
 immutable `preapply` document leaves provider-generated identities empty; a
 different immutable `resolved` document is bound after apply through
 `control-manifest bind-scenario` only after plan, exact apply, and no-op
-receipts are present. The bind happens for Scenario A before Scenario B begins,
-preserves the pre-apply document, and rejects deterministic identity changes;
+receipts are present. The current bind is for fresh Scenario A only; Scenario B
+remains unsupported. The bind preserves the pre-apply document and rejects
+deterministic identity changes;
 ordinary scenario loads reject an unresolved inventory. Its additional closed
 `orphan_sweep` object records
 `tag_key: ACCEPTANCE_RUN_ID`, a non-secret cleanup owner, ECS task-definition
@@ -934,7 +945,7 @@ Use these transitions around the real deployment, not as a substitute for it:
 1. Reserve unique run-scoped ECR tags, call `arm_external_cleanup`, then push.
 2. Resolve and verify both registry digests, then call
    `checkpoint_ecr_digests`.
-3. For Scenario A and then Scenario B, store the sanitized plan receipt and
+3. For fresh Scenario A only, store the sanitized plan receipt and
    signed approval, call `checkpoint_terraform_plan`, recheck the approval,
    apply that exact saved plan, and call `checkpoint_terraform_apply`.
 4. Run a no-change plan, store its sanitized receipt, create the protected
@@ -1183,7 +1194,7 @@ checkpoint_ecr_digests
 
 ### Saved-plan apply and scenario binding
 
-Apply Scenario A completely before Scenario B. Terraform plan files may
+Apply only fresh Scenario A under the current policy. Terraform plan files may
 contain secrets: keep them mode 0600 under `/tmp`, apply only the reviewed
 saved plan, and delete them immediately. The durable receipt is a sanitized
 projection and hash, not the plan itself. `TERRAFORM_APPROVAL_HANDOFF` is the
@@ -1195,6 +1206,8 @@ exists.
 ```bash
 provision_scenario_b_test_identity() (
   set -Eeuo pipefail
+  printf '%s\n' compatibility_transition_unsupported >&2
+  exit 64
   local pool_id="$1" users count work create_input password_input verified subject
   test -n "$pool_id"
   work=$(mktemp -d -p /tmp elspeth-oidc-identity.XXXXXX)
@@ -1284,6 +1297,10 @@ plan_and_apply_scenario() {
   local scenario_id="$1" directory="$2" vars="$3" expected_binding="$4"
   local binding_file="$5" resolved_inventory="$6"
   local work plan receipt plan_sha receipt_hash approval_hash noop_sha
+  if test "$scenario_id" = B; then
+    printf '%s\n' compatibility_transition_unsupported >&2
+    return 64
+  fi
   work="$(mktemp -d -p /tmp "elspeth-${scenario_id}-tf.XXXXXX")"
   chmod 700 "$work"
   plan="$work/apply.tfplan"
@@ -1338,6 +1355,10 @@ plan_and_apply_scenario() {
 
 activate_scenario_stack() {
   local scenario_id="$1" directory vars binding binding_file inventory
+  if test "$scenario_id" = B; then
+    printf '%s\n' compatibility_transition_unsupported >&2
+    return 64
+  fi
   case "$scenario_id" in
     A)
       directory="$SCENARIO_A_TF_DIR"
@@ -1362,18 +1383,21 @@ activate_scenario_stack() {
   activate_scenario_tls "$scenario_id"
 }
 
-# First pass only. Do not apply B until A has completed rollback section 7.
+# Scenario B is unsupported; activate only the fresh Scenario A stack.
 activate_scenario_stack A
 ```
 
-After Scenario A completes section 7, return here once and run
-`activate_scenario_stack B`; then execute only the Scenario B baseline and
-repeat sections 1 through 7. The B backend was initialized in the pre-push
-bootstrap gate, but no B application plan is applied while A acceptance is in
-progress. Cleanup remains deferred until both isolated scenarios have
-completed or an interruption/failure requires Task 6.
+After Scenario A completes section 7, proceed to the applicable disposable
+acceptance cleanup. Do not activate Scenario B. Its retained procedures are
+historical reference, not authorization to create an upgrade environment.
+An interruption/failure still requires Task 6 cleanup of resources this run owns.
 
 ## Authentication and secret injection
+
+The Cognito/OIDC upgrade instructions in this section are historical Scenario
+B reference and are disabled by the current policy. Fresh Scenario A retains
+local authentication. Do not provision a pool, identity or predecessor store
+using these retained instructions.
 
 A cold install (`first` mode) comes up on `auth_provider=local`, because it
 has no user pool yet and an operator has to be able to sign in to it. The
@@ -1440,17 +1464,11 @@ background, including the alternative seed path and its hazards, is in the
 [Identity Providers guide](../guides/identity-providers.md), §Admitting the
 first person.
 
-For an existing pool crossing a pre-1.0 schema boundary, stop the old tasks
-and export the identity, grant and approver-edge cohort from the stopped
-Sessions store **before** the database owner drops it in the schema
-compatibility step. After initializing the recreated stores and bootstrapping
-the administrator, restore the eligible cohort and record the mapping, then
-send the operator notice. Follow the
-[identity workflow cutover handoff](identity-workflow-cutover.md); this is
-required before ordinary traffic and authenticated acceptance. If workflow
-governance is on, verify readiness, an active non-author approver and a fresh
-approval for a representative recreated composition. Former approvals,
-attestations and library rows remain only in the archive.
+An existing pool crossing a schema boundary is outside the current deployment
+policy. Stop candidate deployment and preserve its existing Sessions and
+Landscape stores. The [identity workflow cutover handoff](identity-workflow-cutover.md)
+is historical context, not permission to drop, recreate, restamp or restore
+those stores under this policy.
 
 The legacy browser-client settings (`oidc_*`), the browser-origin allowlist
 and the Cognito access-token audience-claim mode are deleted; a task
@@ -1464,6 +1482,8 @@ protected capture wrapper and project only booleans and counts:
 ```bash
 prepare_scenario_b_oidc() {
   local cognito_client_json identity_json inventory_path expected_sub OIDC_REDIRECT_URI
+  printf '%s\n' compatibility_transition_unsupported >&2
+  return 64
   test "$ACTIVE_SCENARIO_ID" = B
   cognito_client_json=$(aws_capture aws cognito-idp describe-user-pool-client \
     --user-pool-id "$COGNITO_USER_POOL_ID" \
@@ -1596,36 +1616,41 @@ cookie, header, page HTML, or artifact path.
 
 ### Bound release/schema compatibility record
 
-Before either storage provisioner or schema initializer runs, the database
-operator supplies a protected mode-0600 JSON record and the release operator
-countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
-`SCENARIO_B_COMPATIBILITY_RECORD_FILE`. Scenario B has exactly this shape:
+Before either storage provisioner or schema initializer runs for a fresh
+Scenario A, the database operator supplies a protected mode-0600 JSON record
+and the release operator countersigns it. Set
+`SCENARIO_A_COMPATIBILITY_RECORD_FILE`. This prospective example describes
+the accepted current contract; fill it with measured run identities and real
+approvals, not invented evidence:
 
 ```json
 {
-  "schema": "elspeth.aws-ecs-compatibility-record.v2",
+  "schema": "elspeth.aws-ecs-compatibility-record.v3",
   "record_id": "change-record-id",
   "acceptance_run_id": "manifest-run-uuid",
-  "scenario_id": "B",
+  "scenario_id": "A",
   "candidate_sha": "40-lowercase-hex",
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_task_definition": "exact-candidate-task-definition-arn",
   "candidate_doctor_task_definition": "exact-candidate-doctor-task-definition-arn",
   "candidate_package_version": "0.8.3",
-  "previous_source_sha": "40-lowercase-hex",
-  "previous_image_digest": "sha256:64-lowercase-hex",
-  "previous_task_definition": "exact-previous-task-definition-arn",
-  "rollback_doctor_task_definition": "exact-rollback-doctor-task-definition-arn",
-  "previous_package_version": "0.7.1",
+  "previous_source_sha": "",
+  "previous_image_digest": "",
+  "previous_task_definition": "",
+  "rollback_doctor_task_definition": "",
+  "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 72, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
-    "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
-    "structural_changes": "session_epoch_35_to_72_landscape_epoch_29_to_49_blob_cleanup_row_union_barrier_and_coordination_schema",
-    "semantics_only_changes": "coalesce_timeout_seconds_and_node_options_summary_required",
-    "archive_export_decision": "required_before_forward_migration",
-    "destructive_reset_required": false
+    "candidate": {"session_epoch": 74, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
+    "previous": null,
+    "structural_changes": "initial_create",
+    "semantics_only_changes": "none",
+    "archive_export_decision": "not_applicable",
+    "destructive_reset_required": false,
+    "store_policy": "new_store_only",
+    "existing_store_action": "preserve_and_refuse",
+    "in_place_upgrade_supported": false
   },
-  "forward_compatible": true,
+  "new_store_compatible": true,
   "backward_compatible": false,
   "rollback_permitted": false,
   "decision": "approved",
@@ -1637,26 +1662,22 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
 }
 ```
 
-Scenario A uses the same field set with `scenario_id: "A"`; empty strings for
-`previous_source_sha`, `previous_image_digest`, `previous_task_definition`,
-`rollback_doctor_task_definition`, and `previous_package_version`;
-`schema_facts.previous: null`; `structural_changes: "initial_create"`;
-`archive_export_decision: "not_applicable"`; and both
-`backward_compatible` and `rollback_permitted` false.
+`new_store_compatible: true` asserts only fresh-store initial creation.
+It makes no forward-migration claim. `backward_compatible` and
+`rollback_permitted` remain false. Scenario B has no admissible current
+record; old approved B records and stored B receipts are rejected. Legacy
+v2 records/receipts do not satisfy the current v3 contract.
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 72, Landscape epoch 49 and `run_web_plugin_policy` presence,
+session epoch 74, Landscape epoch 49 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and
-any later deployment action. The 0.7.1 image understands session epoch 35,
-not epoch 72. Pre-1.0 candidates do not migrate predecessor schemas: the old
-deployment is stopped and uninstalled, required evidence is archived/exported,
-and the databases are recreated before the candidate is installed. The previous
-image cannot reopen the recreated current database, so Scenario B rollback is
-forbidden after recreation. Unknown or unapproved compatibility is NO-GO;
-expiry or identity drift is also NO-GO.
+any later deployment action. Existing-store transitions are unsupported and
+must stop without mutation; do not uninstall or recreate a predecessor store
+to convert it into a fresh-store claim.
+Unknown or unapproved compatibility is NO-GO; expiry or identity drift is also NO-GO.
 
 Before either schema initializer runs, create and prove the required EFS
 children with the candidate image's explicit `1654:1654` one-shot definition.
@@ -1757,7 +1778,7 @@ require_compatibility_record_current() {
     --scenario-id "$ACTIVE_SCENARIO_ID" --record "$COMPATIBILITY_RECORD_FILE" >"$receipt"
   test "$(jq -er '.record_sha256' "$receipt")" = "$COMPATIBILITY_RECORD_SHA256"
   jq -e '
-    .forward_compatible == true
+    .new_store_compatible == true
     and .backward_compatible == false
     and .rollback_permitted == false
   ' "$receipt" >/dev/null
@@ -1881,6 +1902,10 @@ require_stopped_task_success() {
 
 provision_scenario_storage() {
   local overrides task
+  if test "$ACTIVE_SCENARIO_ID" = B; then
+    printf '%s\n' compatibility_transition_unsupported >&2
+    return 64
+  fi
   overrides=$(jq -cn --arg name "$WEB_CONTAINER_NAME" \
     '{containerOverrides:[{name:$name,command:["provision-storage"]}]}')
   task=$(aws_capture aws ecs run-task \
@@ -1942,8 +1967,13 @@ and schema compatibility gate both pass.
 
 ### Fresh Scenario B upgrade baseline
 
-Scenario B proves an upgrade, but a fresh account has neither schema nor a
-running previous revision. Its Terraform stack therefore creates the service
+**Historical reference — unsupported under the current policy.** Do not run
+this procedure, even against an empty account. It creates predecessor state
+for a transition the candidate does not support. The explicit stop below
+precedes storage provisioning and schema initialization.
+
+The legacy Scenario B procedure targeted an upgrade, but a fresh account has
+neither schema nor a running previous revision. Its Terraform stack therefore creates the service
 at desired count zero while registering both the rollback-baseline web task
 and its database-operator-approved init-capable doctor definition. After the
 resolved inventory, TLS material, and test identity are bound, initialize the
@@ -1952,11 +1982,11 @@ revision. Only this bootstrap establishes the pre-candidate state; it is not a
 candidate deployment or a substitute for the later rollback-refusal and
 forward-recovery proof.
 
-Execute this block only after Scenario A has completed section 7 and the
-operator has returned to the saved-plan section to run
-`activate_scenario_stack B`. Do not rerun the Scenario A baseline.
+The following retained block must stop before loading or mutating Scenario B.
 
 ```bash
+printf '%s\n' compatibility_transition_unsupported >&2
+exit 64
 load_scenario B
 test "$ACTIVE_SCENARIO_ID" = B
 validate_scenario_task_definitions
@@ -2932,21 +2962,21 @@ this doctor step.
 ### 3. Apply the schema compatibility gate
 
 `--init-schema` may initialize a session or Landscape schema only when it is
-MISSING; a partially present or predecessor schema is STALE. Before 1.0 there
-are no SQLite or PostgreSQL in-place exceptions. Read-only and
-`create_tables=False` inspection opens report incompatibility without mutation.
-The database owner archives/exports required evidence, drops and recreates the
-store, then initializes the current release. Aurora detection is
-structural-only: a semantics-only schema-epoch change can still appear CURRENT.
+MISSING and belongs to a genuinely fresh/new deployment; a partially present
+or predecessor schema is STALE. Read-only and `create_tables=False` inspection
+opens report incompatibility without mutation. Aurora detection is
+structural-only: a semantics-only schema-epoch change can still appear CURRENT,
+so structural inspection alone does not authorize an existing-store transition.
 
 Attach the approved release/schema compatibility record before deployment.
 AWS ECS validate-only startup must fail closed before uvicorn binds for
 missing, partial, stale, or incompatible state. Code rollback cannot undo an
-incompatible database schema. STALE/incompatible state requires the
-database-operator-owned archive decision and drop/recreate procedure followed
-by `--init-schema`; never automate it. Predecessor archives are evidence, not
-recovery inputs for the current release. If the fresh candidate fails, fix it
-forward and repeat the uninstall/recreate/reinstall procedure.
+incompatible database schema. For existing, STALE or incompatible stores, STOP
+without mutation. Do not delete, recreate, restamp, migrate or silently modify
+them. A fresh-store compatibility record authorizes initial creation only; it
+does not authorize a predecessor transition or an existing-store reset. If a
+fresh candidate fails, preserve its state and diagnose it before any further
+operator action.
 
 Record the testcontainer run before any image is deployed: it is the gate
 ledger's `tests` stage, and `evidence-export-receipt` later refuses the
@@ -3309,17 +3339,15 @@ Retain only allowlisted checks, classes, counts, and hashes.
 
 ### 7. Prove rollback refusal without crossing the schema stop
 
-The current upgrade record proves the opposite of rollback authorization. Once
-the candidate has recreated Landscape at epoch 42, the 0.7.1 image must
-never be deployed against that database. Scenario B therefore exercises a
-fail-closed rollback refusal and forward recovery: revalidate and persist the
-sanitized compatibility receipt, prove the candidate task remains the active
-target, repeat its role/public probes, and capture fresh OIDC evidence. Do not
-disable traffic, invoke `update-service`, or start
-`PREVIOUS_TASK_DEFINITION` in this phase.
+**Historical Scenario B reference — unsupported under the current policy.**
+No current upgrade record is admissible. The retained upgrade branch stops
+before receipt processing, role probes or deployment actions. Scenario A's
+first/first-recovery safeguards below remain applicable to the fresh deployment.
 
 ```bash
 if test "$DEPLOYMENT_MODE" = upgrade; then
+  printf '%s\n' compatibility_transition_unsupported >&2
+  exit 64
   require_compatibility_record_current
   ROLLBACK_REFUSAL_RECEIPT=$(mktemp -p /tmp \
     "elspeth-rollback-refusal-${ACTIVE_SCENARIO_ID}.XXXXXX")
@@ -3348,11 +3376,10 @@ if test "$DEPLOYMENT_MODE" = upgrade; then
 fi
 ```
 
-The compatibility receipt plus `candidate-after-rollback-refusal` evidence is
-the refusal/forward-recovery record. If the candidate is unhealthy, keep traffic
-drained and repair forward with epoch-51 session/epoch-36 Landscape code.
-Predecessor database restoration and code downgrade are not supported repair
-paths. Never roll old code over the recreated schema.
+The legacy compatibility receipt plus `candidate-after-rollback-refusal`
+evidence does not authorize a current deployment. Preserve existing stores
+and keep the unsupported transition stopped. No cloud acceptance or recovery
+evidence is created by retaining this historical procedure.
 
 No image digest that predates the immutable trust-root contract is
 rollback-eligible: such images lack the baked bundle and are rejected by the

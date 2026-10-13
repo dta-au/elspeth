@@ -30,6 +30,11 @@ from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.authority_hashing import composer_authority_hash
+from elspeth.web.composer.diagnostic_evidence import (
+    ComposerDiagnosticEvidence,
+    diagnostic_evidence_identity,
+    is_diagnostic_evidence_envelope,
+)
 from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
@@ -495,7 +500,8 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
         version=4,
     )
     args = _inline_pipeline_args(tmp_path)
-    raw_content = "private-inline-value-7f45\n42\n"
+    raw_canary = "private-inline-value-7f45"
+    raw_content = f"{raw_canary}\n42\n"
     args["source"]["inline_blob"]["content"] = raw_content
     raw_responses = [
         _raw_fake_llm_response(tool_calls=({"id": "call_inline", "name": "set_pipeline", "arguments": args},)),
@@ -580,30 +586,64 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
     assert int(quota_bytes) == len(raw_content.encode("utf-8"))
     assert blob_row.id == safe_arguments["source"]["blob_id"]
     assert blob_row.creating_arguments_hash == stable_hash(safe_arguments)
-    assert raw_content not in json.dumps(event_payloads)
-    assert raw_content not in json.dumps(tuple(tuple(row) for row in persisted_messages))
-    assert raw_content not in json.dumps(safe_arguments)
+    assert raw_canary not in json.dumps(event_payloads)
+    private_rows = [row for row in persisted_messages if row.tool_calls and is_diagnostic_evidence_envelope(row.tool_calls[0])]
+    public_rows = [row for row in persisted_messages if row not in private_rows]
+    assert raw_canary not in json.dumps(tuple(tuple(row) for row in public_rows))
+    assert len(private_rows) == 3
+    evidence = [ComposerDiagnosticEvidence.from_envelope(row.tool_calls[0], expected_session_id=harness.session_id) for row in private_rows]
+    by_identity = {item.evidence_id: item for item in evidence}
+    assert len(by_identity) == len(evidence)
+    assert len(result.llm_calls) == 2
+    request_ids = {diagnostic_evidence_identity("provider-request", call.call_id) for call in result.llm_calls}
+    authoring_id = diagnostic_evidence_identity("tool-authoring", "call_inline")
+    assert set(by_identity) == request_ids | {authoring_id}
+    for call in result.llm_calls:
+        request = by_identity[diagnostic_evidence_identity("provider-request", call.call_id)]
+        assert request.status == "provider_request"
+        assert request.tool_name == "composer_provider_context"
+        assert request.tool_call_id == call.call_id
+        assert request.arguments.disposition == "retained"
+        assert request.arguments.content is not None
+        assert raw_canary not in request.arguments.content
+    assert all(item.operation_id == compose_lease.context.fence.operation_id for item in evidence)
+    assert all(item.operation_epoch == compose_lease.context.fence.operation_epoch for item in evidence)
+    private = by_identity[authoring_id]
+    assert private.tool_call_id == "call_inline"
+    assert private.tool_name == "set_pipeline"
+    assert private.status == result.tool_invocations[0].status.value
+    assert private.arguments.disposition == "retained"
+    assert private.arguments.encoding == "json"
+    assert private.arguments.content is not None
+    assert json.loads(private.arguments.content)["source"]["inline_blob"]["content"] == raw_content
+    # Private proposal authority retains the exact source draft for review;
+    # published tool history must use the separately redacted projection.
+    requirements = safe_arguments["source"]["options"]["interpretation_requirements"]
+    assert len(requirements) == 1
+    assert requirements[0]["draft"] == raw_content
+    assert raw_canary not in json.dumps(safe_redacted_arguments)
     assert len(result.tool_invocations) == 1
     assert result.tool_invocations[0].version_after == state.version
     assert result.tool_invocations[0].arguments_canonical == canonical_json(safe_arguments)
     assert result.tool_invocations[0].arguments_hash == stable_hash(safe_arguments)
-    api_facing_result = {
+    published_reply = {
         "message": result.message,
         "tool_invocations": [
             {
-                "arguments_canonical": invocation.arguments_canonical,
                 "result_canonical": invocation.result_canonical,
                 "error_message": invocation.error_message,
             }
             for invocation in result.tool_invocations
         ],
     }
-    assert raw_content not in json.dumps(api_facing_result)
-    assert "[redacted inline content held for custody]" not in json.dumps(api_facing_result)
-    assert raw_content not in caplog.text
+    # arguments_canonical above is an internal authority carrier; the public
+    # persisted projection is checked independently in public_rows.
+    assert raw_canary not in json.dumps(published_reply)
+    assert "[redacted inline content held for custody]" not in json.dumps(published_reply)
+    assert raw_canary not in caplog.text
     assert "[redacted inline content held for custody]" not in caplog.text
     assert len(message_snapshots) == 2
-    assert raw_content not in json.dumps(message_snapshots[1])
+    assert raw_canary not in json.dumps(message_snapshots[1])
     assert result.llm_calls[1].messages_hash == stable_hash(message_snapshots[1])
 
     blob_service = BlobServiceImpl(harness.engine, tmp_path)
@@ -965,14 +1005,26 @@ async def test_malformed_inline_blob_never_survives_full_compose_surfaces(
     assert private_value not in json.dumps([invocation.arguments_canonical for invocation in result.tool_invocations])
     assert private_value not in caplog.text
     with harness.engine.connect() as conn:
-        persisted = tuple(
-            conn.execute(
-                select(chat_messages_table.c.content, chat_messages_table.c.raw_content, chat_messages_table.c.tool_calls).where(
-                    chat_messages_table.c.session_id == harness.session_id
-                )
-            )
-        )
-    assert private_value not in json.dumps(tuple(tuple(row) for row in persisted))
+        persisted = tuple(conn.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == harness.session_id)))
+    public_rows = []
+    private_records = []
+    for row in persisted:
+        envelopes = row.tool_calls or []
+        if any(is_diagnostic_evidence_envelope(envelope) for envelope in envelopes):
+            assert len(envelopes) == 1 and row.role == "audit" and row.writer_principal == "compose_loop"
+            private_records.append(ComposerDiagnosticEvidence.from_envelope(envelopes[0], expected_session_id=harness.session_id))
+        else:
+            public_rows.append(row)
+    assert private_value not in json.dumps([(row.content, row.raw_content, row.tool_calls) for row in public_rows])
+    rejected_call_id = f"call_malformed_{malformed_shape}"
+    rejected_public = [row for row in public_rows if row.role == "tool" and row.tool_call_id == rejected_call_id]
+    assert len(rejected_public) == 1 and rejected_public[0].parent_assistant_id is not None
+    rejected_records = [record for record in private_records if record.tool_call_id == rejected_call_id]
+    assert len(rejected_records) == 1
+    rejected = rejected_records[0]
+    assert rejected.tool_name == "set_pipeline" and rejected.status == ComposerToolStatus.ARG_ERROR.value
+    assert rejected.arguments.disposition == "retained" and rejected.arguments.content is not None
+    assert json.loads(rejected.arguments.content) == invalid
 
 
 @pytest.mark.asyncio

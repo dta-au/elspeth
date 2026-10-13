@@ -66,6 +66,28 @@ sites:
     It rejects effective settings changes beyond run_mode, replay_from and the deliberate serial worker
     invocation. Composer YAML has no run_mode or replay_from surface and supplies no archive; these are
     run invocation concerns explicitly refused by yaml_importer and the web runtime loader.
+- key: fe6f2834f0f46258
+  path: src/elspeth/config_loading.py
+  qualname: _reject_sensitive_plugin_env_placeholders_before_expansion
+  exception: TypeError
+  message: '{} configuration model must inherit BaseModel'
+  ordinal: 0
+  disposition: structural
+  note: The registered plugin class owns get_config_model; Composer authoring cannot replace its internal
+    config-model type.
+- key: 0b794c28de95c59d
+  path: src/elspeth/config_loading.py
+  qualname: _reject_sensitive_plugin_env_placeholders_before_expansion
+  exception: ValueError
+  message: '{}[{}] {} option {} must not contain environment-variable placeholders before env expansion:
+    as a {} plugin, {}. Env expansion runs before plugin validation on '
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fn:_prevalidate_plugin_options
+  note: Normal plugin config validation rejects nested emitted placeholders. Deferred blob authoring checks
+    the same metadata before construction; pre-expansion-only reference content remains literal when Web
+    loading disables environment expansion.
 - key: d5d21ee28663e6cf
   path: src/elspeth/config_loading.py
   qualname: _reject_sensitive_plugin_env_placeholders_before_expansion

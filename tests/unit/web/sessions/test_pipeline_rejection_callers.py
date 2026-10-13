@@ -410,6 +410,7 @@ async def test_actual_planner_creation_cancel_retains_nonzero_child_rejection_sc
             preferences=preferences,
             recorder=BufferingRecorder(),
             planner_llm_calls=(),
+            planner_private_candidates=(),
             planner_attempts=(),
             planner_invocations=(),
             planner_withheld_replies=(),

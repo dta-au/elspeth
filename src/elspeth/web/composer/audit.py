@@ -58,6 +58,7 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolRecorder,
     ComposerToolStatus,
+    PrivateToolAuthoring,
     ToolArgumentErrorCategory,
 )
 from elspeth.contracts.composer_llm_audit import (
@@ -214,12 +215,58 @@ def build_canonicalization_sentinel(
     return sentinel
 
 
+@dataclass(frozen=True, slots=True)
+class PrivatePlannerCandidate:
+    """Immutable received candidate; never a public audit or replay carrier."""
+
+    evidence_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments_canonical: str
+    authority_arguments_canonical: str
+    raw_arguments: str
+    status: str = "received_not_dispatched"
+    result_canonical: str | None = None
+
+
+class ComposerToolFailure(Exception):
+    """Recorded tool evidence awaiting an audit-only fatal unwind drain."""
+
+    def __init__(
+        self,
+        original_exception: Exception,
+        *,
+        tool_invocations: tuple[ComposerToolInvocation, ...],
+        llm_calls: tuple[ComposerLLMCall, ...],
+    ) -> None:
+        super().__init__("Composer tool failed before its audit checkpoint.")
+        self.original_exception = original_exception
+        self.tool_invocations = tool_invocations
+        self.llm_calls = llm_calls
+
+
+class ComposerToolCancellation(asyncio.CancelledError):
+    """A child dispatch cancelled before its current batch reached P4."""
+
+    def __init__(
+        self,
+        original_cancellation: asyncio.CancelledError,
+        *,
+        tool_invocations: tuple[ComposerToolInvocation, ...],
+        llm_calls: tuple[ComposerLLMCall, ...],
+    ) -> None:
+        super().__init__()
+        self.original_cancellation = original_cancellation
+        self.tool_invocations = tool_invocations
+        self.llm_calls = llm_calls
+
+
 class BufferingRecorder(
     ComposerToolRecorder,
     ComposerLLMCallRecorder,
     ComposerPlannerAttemptRecorder,
 ):
-    """Append-only in-memory buffer for composer audit records.
+    """In-memory buffer for composer audit records and candidate dispositions.
 
     Used inside :meth:`ComposerServiceImpl._compose_loop`. After Phase 3,
     compose-loop tool rows are committed by
@@ -227,7 +274,8 @@ class BufferingRecorder(
     the route-layer ``tool_invocations`` drain is retained only for older
     non-loop carriers. LLM calls, their exact-once semantic planner attempts,
     and withheld replies still use this buffer as their
-    route-persisted staging area. All four channels use the same locking
+    route-persisted staging area. Private candidates retain received arguments
+    while their explicit disposition settles. All channels use the same locking
     discipline, and each exposed tuple is an immutable point-in-time snapshot.
 
     Threading: ``record()`` is safe to call from any thread. The compose
@@ -241,11 +289,47 @@ class BufferingRecorder(
         self._llm_calls: list[ComposerLLMCall] = []
         self._planner_attempts: list[ComposerPlannerAttempt] = []
         self._withheld_replies: list[WithheldReply] = []
+        self._private_candidates: list[PrivatePlannerCandidate] = []
+        self._private_authorings: dict[str, PrivateToolAuthoring] = {}
         self._lock = threading.Lock()
 
     def record(self, invocation: ComposerToolInvocation) -> None:
         with self._lock:
+            authoring = self._private_authorings.get(invocation.tool_call_id)
+            if authoring is not None:
+                invocation = replace(invocation, private_authoring=authoring)
             self._invocations.append(invocation)
+
+    def record_private_tool_authoring(self, authoring: PrivateToolAuthoring) -> None:
+        """Bind receipt stages before any invocation can escape through unwind."""
+        if type(authoring) is not PrivateToolAuthoring:
+            raise TypeError("private authoring must be an owned receipt")
+        with self._lock:
+            previous = self._private_authorings.get(authoring.tool_call_id)
+            if previous is not None and (previous.tool_name != authoring.tool_name or previous.raw_arguments != authoring.raw_arguments):
+                raise AuditIntegrityError("private authoring changed its received dispatch identity")
+            if any(invocation.tool_call_id == authoring.tool_call_id for invocation in self._invocations):
+                raise AuditIntegrityError("private authoring changed after its invocation closed")
+            self._private_authorings[authoring.tool_call_id] = authoring
+
+    def record_private_candidate(self, candidate: PrivatePlannerCandidate) -> None:
+        with self._lock:
+            if any(existing.evidence_id == candidate.evidence_id for existing in self._private_candidates):
+                raise AuditIntegrityError("planner private candidate identity repeats")
+            self._private_candidates.append(candidate)
+
+    def settle_private_candidate(self, evidence_id: str, *, status: str, result_canonical: str | None = None) -> None:
+        with self._lock:
+            for index, candidate in enumerate(self._private_candidates):
+                if candidate.evidence_id == evidence_id:
+                    self._private_candidates[index] = replace(candidate, status=status, result_canonical=result_canonical)
+                    return
+            raise AuditIntegrityError("planner private candidate identity is absent")
+
+    @property
+    def private_candidates(self) -> tuple[PrivatePlannerCandidate, ...]:
+        with self._lock:
+            return tuple(self._private_candidates)
 
     def record_llm_call(self, call: ComposerLLMCall, *, provider_custody: ProviderCallCustody | None = None) -> None:
         from elspeth.web.composer.provider_quota import retain_provider_audit
@@ -904,6 +988,8 @@ def finish_plugin_crash(
     are already in hand, and writing the record is a single in-memory
     list append.
     """
+    from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+
     cls_name = type(exc).__name__
     return ComposerToolInvocation(
         tool_call_id=audit.tool_call_id,
@@ -915,6 +1001,7 @@ def finish_plugin_crash(
         status=ComposerToolStatus.PLUGIN_CRASH,
         error_class=cls_name,
         error_message=cls_name,
+        private_failure=capture_failure_facts(exc),
         version_before=audit.version_before,
         version_after=None,
         started_at=audit.started_at,

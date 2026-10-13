@@ -106,16 +106,12 @@ transport is under final integration and acceptance review. It delivers
 operation progress followed by the completed answer; it does not stream
 generated answer tokens. See the [release notes](CHANGELOG.md).
 
-Session epoch 72 adds durable Composer operations and advances from 71 in
-0.8.2; Landscape remains at epoch 49. Upgrades from 0.8.1 or 0.8.2 must
-stop the service, archive or export needed session evidence, and recreate
-the session database and its SQLite sidecars or PostgreSQL schema. Keep a
-Landscape database already at epoch 49. Installations still on 0.8.0
-require a cutover from session epoch 53 to 72 and Landscape epoch 38 to 49;
-ELSPETH does not migrate either store in place. Once a 0.8.3 image is
-published, archive or export evidence you need, stop the old service,
-recreate both stale databases in the same service-stop window, and
-install 0.8.3. See the
+This candidate requires session epoch 74 and Landscape epoch 49. Existing
+unsupported stores are refused before writes: preserve them unchanged and
+configure explicitly new compatible databases. ELSPETH does not migrate either
+store in place or authorize downgrading these stores. This pre-release
+compatibility policy has no fixed expiry. Package metadata remains 0.8.3;
+automatic image publication is held. See the
 [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.
 

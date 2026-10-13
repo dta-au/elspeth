@@ -194,10 +194,16 @@ _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES = 823
 # zero initial-request bytes. Keep the prior 72 B headroom and original 10%
 # scaffolding band instead of trimming actionable CSV guidance to fit it.
 _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES = 580
+# #298 mandates always-available recovery controls. Measured canonical growth:
+# 1,319 bytes for the two tool declarations including list separators, plus
+# 219 bytes for the recovery instruction in the nested request JSON. Preserve
+# the prior ceiling/headroom and its negative padding control.
+_GRAPH_RECOVERY_CONTROLS_CANONICAL_BYTES = 1538
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
     + _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES
+    + _GRAPH_RECOVERY_CONTROLS_CANONICAL_BYTES
 )
 
 
@@ -809,7 +815,7 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
     assert set(PLANNER_DISCOVERY_TOOL_NAMES) == expected_discovery
 
     tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-    assert {tool["function"]["name"] for tool in tools[:-1]} == expected_discovery
+    assert {tool["function"]["name"] for tool in tools[:-1]} == expected_discovery | {"handoff_to_user", "restore_parked_graph"}
     terminal = tools[-1]["function"]
     assert terminal["name"] == "emit_pipeline_proposal"
     assert terminal["parameters"] == {
@@ -1404,14 +1410,17 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
         "messages": [request["messages"][0], {"role": "user", "content": canonical_json(fixed_payload)}],
         "tools": request["tools"],
     }
-    assert len(canonical_json(fixed_scaffolding).encode("utf-8")) <= _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
+    fixed_bytes = len(canonical_json(fixed_scaffolding).encode("utf-8"))
+    assert fixed_bytes <= _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
     if catalog_inventory == "live":
-        # Positive control for the byte gate: the measured 72 B headroom
-        # cannot silently absorb unrelated static-guidance growth. Mutate a
-        # real declaration, keeping request data and the other tools fixed.
+        # Exercise the fixed byte ceiling against the current catalog rather
+        # than assuming a historical amount of headroom. Mutate a real tool
+        # declaration; ASCII padding adds exactly one canonical byte per x.
         enlarged_scaffolding = deepcopy(fixed_scaffolding)
         source_tool = next(tool for tool in enlarged_scaffolding["tools"] if tool["function"]["name"] == "inspect_source")
-        source_tool["function"]["description"] += "x" * 73
+        source_tool["function"]["description"] += "x" * (_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES - fixed_bytes)
+        assert len(canonical_json(enlarged_scaffolding).encode("utf-8")) == _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
+        source_tool["function"]["description"] += "x"
         assert len(canonical_json(enlarged_scaffolding).encode("utf-8")) > _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
 
 
@@ -5441,7 +5450,11 @@ async def test_escape_hatch_overtime_turn_runs_advisor_with_terminal_tool_only(
     assert len(completion.requests) == 3
     hatch_request = completion.requests[2]
     assert hatch_request["model"] == "openrouter/advisor-under-test"
-    assert [tool["function"]["name"] for tool in hatch_request["tools"]] == ["emit_pipeline_proposal"]
+    assert [tool["function"]["name"] for tool in hatch_request["tools"]] == [
+        "handoff_to_user",
+        "restore_parked_graph",
+        "emit_pipeline_proposal",
+    ]
     notices = [
         message for message in hatch_request["messages"] if message["role"] == "user" and "escape hatch" in str(message.get("content"))
     ]
@@ -5796,7 +5809,11 @@ async def test_escape_hatch_fires_on_repair_exhaustion(
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
     assert completion.requests[2]["model"] == "openrouter/advisor-under-test"
-    assert [tool["function"]["name"] for tool in completion.requests[2]["tools"]] == ["emit_pipeline_proposal"]
+    assert [tool["function"]["name"] for tool in completion.requests[2]["tools"]] == [
+        "handoff_to_user",
+        "restore_parked_graph",
+        "emit_pipeline_proposal",
+    ]
 
 
 @pytest.mark.asyncio
@@ -6945,7 +6962,11 @@ async def test_escape_hatch_fires_on_discovery_cycle(
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
     assert completion.requests[3]["model"] == "openrouter/advisor-under-test"
-    assert [tool["function"]["name"] for tool in completion.requests[3]["tools"]] == ["emit_pipeline_proposal"]
+    assert [tool["function"]["name"] for tool in completion.requests[3]["tools"]] == [
+        "handoff_to_user",
+        "restore_parked_graph",
+        "emit_pipeline_proposal",
+    ]
     # The repeated discovery batch is never dispatched.
     assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
     retained_call_ids = [call["id"] for message in completion.requests[3]["messages"] for call in message.get("tool_calls", ())]
@@ -7966,7 +7987,11 @@ async def test_prose_overrun_engages_the_hatch_when_available(
     assert len(completion.requests) == 4
     hatch_request = completion.requests[3]
     assert hatch_request["model"] == "openrouter/advisor-under-test"
-    assert [tool["function"]["name"] for tool in hatch_request["tools"]] == ["emit_pipeline_proposal"]
+    assert [tool["function"]["name"] for tool in hatch_request["tools"]] == [
+        "handoff_to_user",
+        "restore_parked_graph",
+        "emit_pipeline_proposal",
+    ]
     notices = [
         message for message in hatch_request["messages"] if message["role"] == "user" and "escape hatch" in str(message.get("content"))
     ]
@@ -8036,6 +8061,10 @@ async def test_cancellation_after_response_closes_the_active_semantic_attempt(
     assert attempt.outcome is ComposerPlannerAttemptOutcome.CANCELLED
     assert attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
     assert caught.value.planner_attempts == (attempt,)  # type: ignore[attr-defined]
+    (candidate,) = recorder.private_candidates
+    assert candidate.status == "candidate_evaluation_started"
+    assert candidate.result_canonical is None
+    assert "pipeline" in json.loads(candidate.arguments_canonical)
 
 
 @pytest.mark.asyncio

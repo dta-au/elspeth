@@ -44,6 +44,7 @@ from elspeth.contracts.composer_llm_audit import (
     ToolContractDialect,
     is_provider_served_name,
 )
+from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary
@@ -673,7 +674,11 @@ def build_llm_call_record(
     planner_call_ordinal: int | None = None,
     credential_surface: str = "composer_provider_response",
     provider_custody: ProviderCallCustody | None = None,
+    failure: BaseException | None = None,
+    private_request: PrivateProviderContext | None = None,
 ) -> ComposerLLMCall:
+    from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+
     if response_metadata is None:
         usage = token_usage_from_response(response)
         provider_cost, provider_cost_source = _provider_cost_from_response(
@@ -752,6 +757,8 @@ def build_llm_call_record(
         finished_at=datetime.now(UTC),
         error_class=error_class,
         error_message=_safe_llm_error_message(error_message),
+        private_failure=capture_failure_facts(failure) if failure is not None else None,
+        private_request=private_request,
         temperature=temperature,
         seed=seed,
         max_completion_tokens_requested=max_completion_tokens_requested,

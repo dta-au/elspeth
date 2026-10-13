@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Final, Literal, Protocol
 
+from elspeth.contracts.composer_audit import PrivateFailureFacts, PrivateReceivedDiagnostic
+from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.freeze import deep_thaw, freeze_fields, require_int
 
 ComposerLLMProviderCostSource = Literal[
@@ -230,8 +232,19 @@ class ComposerLLMCall:
     provider_served: str | None = None
     tool_contract_dialect: ToolContractDialect | None = None
     strict_tool_count: int | None = None
+    private_failure: PrivateFailureFacts | None = field(default=None, repr=False)
+    private_diagnostics: tuple[PrivateReceivedDiagnostic, ...] = field(default=(), repr=False)
+    private_request: PrivateProviderContext | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.private_request is not None and type(self.private_request) is not PrivateProviderContext:
+            raise TypeError("LLM private request context must be owned")
+        if self.private_failure is not None and type(self.private_failure) is not PrivateFailureFacts:
+            raise TypeError("LLM private failure facts must be owned")
+        if type(self.private_diagnostics) is not tuple or any(
+            type(item) is not PrivateReceivedDiagnostic for item in self.private_diagnostics
+        ):
+            raise TypeError("LLM private diagnostics must be an owned tuple")
         if type(self.status) is not ComposerLLMCallStatus:
             raise TypeError(f"status must be ComposerLLMCallStatus, got {type(self.status).__name__}: {self.status!r}")
         if self.tool_contract_dialect is not None and type(self.tool_contract_dialect) is not ToolContractDialect:
@@ -336,7 +349,11 @@ class ComposerLLMCall:
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-friendly dict for sidecar serialization."""
-        raw = {field.name: deep_thaw(getattr(self, field.name)) for field in fields(self)}
+        raw = {
+            field.name: deep_thaw(getattr(self, field.name))
+            for field in fields(self)
+            if field.name not in {"private_failure", "private_diagnostics", "private_request"}
+        }
         raw["status"] = self.status.value
         raw["tool_contract_dialect"] = self.tool_contract_dialect.value if self.tool_contract_dialect is not None else None
         raw["started_at"] = self.started_at.isoformat()

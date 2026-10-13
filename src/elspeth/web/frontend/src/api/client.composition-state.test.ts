@@ -70,6 +70,36 @@ describe("composition state HTTP admission", () => {
     expect(await fetchCompositionState("session-1")).toBeNull();
   });
 
+  it("preserves the explicitly unavailable graph's scalar identity", async () => {
+    const head = { state_id: "44444444-4444-4444-8444-444444444444", version: 7 };
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ detail: {
+      error_type: "composition_state_unavailable", detail: "Saved graph unavailable", ...head,
+    } }), { status: 409 }));
+    await expect(fetchCompositionState("session-1")).rejects.toMatchObject({
+      status: 409, error_type: "composition_state_unavailable", unavailable_state_head: head,
+    });
+  });
+
+  it.each([
+    { state_id: "invalid", version: 7 },
+    { state_id: "44444444-4444-4444-8444-444444444444", version: 0 },
+    { state_id: "44444444-4444-4444-8444-444444444444", version: 1.5 },
+    { state_id: null, version: 7 },
+  ])("refuses malformed unavailable graph identity %j", async (head) => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ detail: {
+      error_type: "composition_state_unavailable", detail: "Saved graph unavailable", ...head,
+    } }), { status: 409 }));
+    await expect(fetchCompositionState("session-1")).rejects.toMatchObject({ unavailable_state_head: undefined });
+  });
+
+  it.each([401, 403, 500])("does not admit graph recovery for status %s", async (status) => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ detail: {
+      error_type: "composition_state_unavailable", detail: "Unavailable",
+      state_id: "44444444-4444-4444-8444-444444444444", version: 7,
+    } }), { status }));
+    await expect(fetchCompositionState("session-1")).rejects.toMatchObject({ unavailable_state_head: undefined });
+  });
+
   it("decodes full state history records using the same contract", async () => {
     const states = fixture.versions;
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(states)));

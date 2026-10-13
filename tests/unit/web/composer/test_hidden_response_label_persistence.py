@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from uuid import UUID
 
 import pytest
 from sqlalchemy import select
@@ -12,6 +13,7 @@ from sqlalchemy.engine import Engine
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
 from elspeth.web.composer.redaction import redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.tools._common import ToolResult
@@ -124,18 +126,33 @@ async def test_real_rejection_schema_labels_and_persisted_associations(
             session_operation_context=context,
         )
     with engine.connect() as connection:
-        row = connection.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id))).one()
+        rows = connection.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id))).all()
+    assert len(rows) == 2
+    assert all(row.role == "audit" and row.writer_principal == "compose_loop" and len(row.tool_calls) == 1 for row in rows)
+    by_kind = {row.tool_calls[0]["_kind"]: row for row in rows}
+    assert set(by_kind) == {"audit", DIAGNOSTIC_EVIDENCE_KIND}
+    row = by_kind["audit"]
+    assert row.tool_calls[0]["invocation"]["tool_call_id"] == invocation.tool_call_id
+    evidence = ComposerDiagnosticEvidence.from_envelope(
+        by_kind[DIAGNOSTIC_EVIDENCE_KIND].tool_calls[0],
+        expected_session_id=str(session.id),
+        expected_operation_id=context.fence.operation_id,
+        expected_tool_call_id=invocation.tool_call_id,
+    )
+    assert evidence.tool_name == "upsert_node" and evidence.status == invocation.status.value
     assert row.role == "audit"
     assert row.content == content
     assert row.tool_calls == [envelope]
     loaded = await service.get_messages(session.id)
-    assert len(loaded) == 1
-    assert loaded[0].content == row.content
-    assert loaded[0].tool_calls == tuple(row.tool_calls)
-    reloaded_properties = json.loads(loaded[0].content)["plugin_schemas"][_LABEL_1]["_redacted_response_field_3"]["properties"]
+    assert len(loaded) == 2
+    public = [message for message in loaded if message.id == UUID(row.id)]
+    assert len(public) == 1
+    assert public[0].content == row.content
+    assert public[0].tool_calls == tuple(row.tool_calls)
+    reloaded_properties = json.loads(public[0].content)["plugin_schemas"][_LABEL_1]["_redacted_response_field_3"]["properties"]
     assert reloaded_properties == expected_stored
     assert list(reloaded_properties) == list(stored_properties)
-    persisted = json.dumps({"content": loaded[0].content, "envelopes": row.tool_calls})
+    persisted = json.dumps({"content": public[0].content, "envelopes": row.tool_calls})
     for canary in (_FIRST_KEY, _SECOND_KEY, _NESTED_KEY, _VALUE):
         assert canary not in json.dumps(direct)
         assert canary not in persisted

@@ -968,6 +968,7 @@ def _assume_published_image_identity(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_provision_storage_creates_and_probes_required_non_root_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_ACCEPTANCE_SCENARIO_ID", "A")
     _assume_published_image_identity(monkeypatch)
     data_dir = tmp_path / "data"
     data_dir.mkdir(mode=0o700)
@@ -999,6 +1000,7 @@ def test_provision_storage_creates_and_probes_required_non_root_directories(tmp_
 
 @pytest.mark.parametrize("payload_kind", ["data", "blobs"])
 def test_provision_storage_rejects_duplicate_required_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload_kind: str) -> None:
+    monkeypatch.setenv("ELSPETH_ACCEPTANCE_SCENARIO_ID", "A")
     _assume_published_image_identity(monkeypatch)
     data_dir = tmp_path / "data"
     data_dir.mkdir(mode=0o700)
@@ -1018,6 +1020,7 @@ def test_provision_storage_rejects_duplicate_required_roots(tmp_path: Path, monk
 
 
 def test_provision_storage_rejects_outside_payload_root_without_creating_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_ACCEPTANCE_SCENARIO_ID", "A")
     _assume_published_image_identity(monkeypatch)
     data_dir = tmp_path / "data"
     data_dir.mkdir(mode=0o700)

@@ -51,6 +51,7 @@ from elspeth.web.composer.source_demand import (
     sample_header_for_source,
 )
 from elspeth.web.composer.state import (
+    CandidateReviewReferenceFacts,
     CompositionState,
     EdgeSpec,
     NodeSpec,
@@ -157,6 +158,7 @@ from elspeth.web.interpretation_state import (
     SOURCE_AUTHORING_KEY,
     VAGUE_TERM_UNWIRED_PREFIX,
     InterpretationReviewCapacityError,
+    UnknownInterpretationRequirementError,
     composition_review_contract_error,
     current_source_data_contract_demand,
     interpretation_sites,
@@ -690,6 +692,7 @@ def build_set_pipeline_candidate(
         rejected_component: str | None,
         error_code: str | None = None,
         plugin_identity: tuple[str, str] | None = None,
+        review_reference: CandidateReviewReferenceFacts | None = None,
     ) -> SetPipelineCandidate:
         # set_pipeline authors a full replacement: the pre-mutation state's
         # validate() entries are phantom repair targets for this candidate
@@ -719,6 +722,7 @@ def build_set_pipeline_candidate(
                 with_state_validation=False,
                 plugin_identity=plugin_identity,
                 rejected_component=rejected_component,
+                review_reference=review_reference,
             )
         )
 
@@ -1830,6 +1834,21 @@ def build_set_pipeline_candidate(
         return _failure_result(state, message, error_code=error_code, rejected_component=None)
     try:
         new_state = reconcile_authoritative_reviews(state, new_state)
+    except UnknownInterpretationRequirementError as exc:
+        # Only the proposed-node renderer stamps component_id. Unattributed
+        # failures must not disclose an inventory from an unknown custodian.
+        reference = None
+        rejected_component = None
+        if exc.component_id is not None:
+            rejected_component = f"node:{exc.component_id}"
+            reference = CandidateReviewReferenceFacts(exc.requirement_id, exc.valid_requirement_ids)
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the exact set_pipeline_arguments payload and retry."),
+            error_code="review_reconciliation_failed",
+            rejected_component=rejected_component,
+            review_reference=reference,
+        )
     except (KeyError, TypeError, ValueError) as exc:
         # The list-shape TypeError keeps its own bare message: it names the
         # payload key the planner must fix and carries no error_code, so the

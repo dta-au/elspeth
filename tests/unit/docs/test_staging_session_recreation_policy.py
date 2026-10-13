@@ -13,25 +13,26 @@ _RUNBOOK = Path("docs/runbooks/staging-session-db-recreation.md")
 def test_current_cutover_and_verification_use_live_schema_epochs() -> None:
     runbook = _RUNBOOK.read_text(encoding="utf-8")
     current_cutover = runbook.split("## Current Cutover:", maxsplit=1)[1].split("## Prior Cutover:", maxsplit=1)[0]
-    current_procedure = runbook.split("### Procedure", maxsplit=1)[1].split(
-        "#### Current epoch + Composer smoke verification",
-        maxsplit=1,
-    )[0]
+    current_procedure = current_cutover.split("### Current Procedure", maxsplit=1)[1]
     session_expectations = re.findall(
-        r'^sqlite3 "\$DB_PATH" \'PRAGMA user_version;\'\s+# expect (\d+) \(== SESSION_SCHEMA_EPOCH\)$',
+        r'^sqlite3 -readonly "\$DB_PATH" \'PRAGMA user_version;\'\s+# expect (\d+) \(== SESSION_SCHEMA_EPOCH\)$',
         current_procedure,
         flags=re.MULTILINE,
     )
     landscape_expectations = re.findall(
-        r'^sqlite3 "\$LANDSCAPE_PATH" \'PRAGMA user_version;\'\s+# expect (\d+) \(== SQLITE_SCHEMA_EPOCH\)$',
+        r'^sqlite3 -readonly "\$LANDSCAPE_PATH" \'PRAGMA user_version;\'\s+# expect (\d+) \(== SQLITE_SCHEMA_EPOCH\)$',
         current_procedure,
         flags=re.MULTILINE,
     )
 
     assert f"session epoch {SESSION_SCHEMA_EPOCH}" in current_cutover
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_cutover
-    assert f"session-epoch-{SESSION_SCHEMA_EPOCH}/Landscape-epoch-{SQLITE_SCHEMA_EPOCH} record" in current_cutover
-    assert f"repair the epoch-{SESSION_SCHEMA_EPOCH} release forward" in current_cutover
+    assert f"session-epoch-{SESSION_SCHEMA_EPOCH}/Landscape-epoch-{SQLITE_SCHEMA_EPOCH} result" in current_cutover
+    assert "Unsupported stores remain unchanged" in current_cutover
+    assert "explicitly new database target" in current_cutover
+    assert "object-free, unstamped target" in current_cutover
+    assert "do not run any\n   historical reset procedure below" in current_procedure
+    assert "reset, deletion, and recreation instructions are not applicable" in current_cutover
     assert session_expectations == [str(SESSION_SCHEMA_EPOCH)]
     assert landscape_expectations == [str(SQLITE_SCHEMA_EPOCH)]
     assert "guided" not in runbook.lower()
@@ -45,7 +46,8 @@ def test_replica_schema_cutover_belongs_to_0_8_1() -> None:
     release_0_8_1, release_0_8_0 = changelog.split("## 0.8.1 -", maxsplit=1)[1].split("## 0.8.0 -", maxsplit=1)
     release_0_8_0 = release_0_8_0.split("\n## ", maxsplit=1)[0]
 
-    assert "## Current Cutover: 0.8.3 candidate" in runbook
+    assert "## Current Cutover: 0.8.3 candidate for next 0.8.4" in runbook
+    assert "## Prior Cutover: 0.8.3 candidate (session epoch 72, Landscape epoch 49)" in runbook
     assert "## Prior Cutover: 0.8.1" in runbook
     assert "install 0.8.1" in runbook
     assert "`SESSION_SCHEMA_EPOCH` advances from 53\nto 71" in release_0_8_1

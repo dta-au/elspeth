@@ -37,7 +37,12 @@ from sqlalchemy.exc import OperationalError
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.core.canonical import canonical_json, stable_hash
-from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
+from elspeth.web.composer.diagnostic_evidence import (
+    DIAGNOSTIC_EVIDENCE_KIND,
+    ComposerDiagnosticEvidence,
+    diagnostic_evidence_identity,
+)
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult, PlannerDeclined
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.protocol import ComposerConvergenceError
@@ -282,11 +287,55 @@ async def test_provider_timeout_after_inline_tool_turn_persists_each_record_exac
     assert _invocation_occurrences(after) == {"call_turn1_metadata": 1}, "the inline-persisted tool turn was drained a second time"
     llm_rows = _llm_audit_rows(after)
     assert len(llm_rows) == 2, "each buffered LLM call must be durable exactly once"
-    sequence_numbers = [row["sequence_no"] for row in llm_rows]
-    assert sequence_numbers == list(range(sequence_numbers[0], sequence_numbers[0] + 2)), (
-        "the sidecar cohort settles as one contiguous block"
+    assert [row["tool_calls"][0] for row in llm_rows] == [llm_call_audit_envelope(call) for call in exc.llm_calls]
+    assert after[: len(before)] == before, "the already committed tool/private cohort must remain unchanged"
+    appended = after[len(before) :]
+    assert [_envelope_kind(row) for row in appended] == [
+        DIAGNOSTIC_EVIDENCE_KIND,
+        "llm_call_audit",
+        DIAGNOSTIC_EVIDENCE_KIND,
+        DIAGNOSTIC_EVIDENCE_KIND,
+        "llm_call_audit",
+    ]
+    requests = []
+    for row, call in zip((appended[0], appended[2]), exc.llm_calls, strict=True):
+        call_identity = call.call_id or f"legacy:{call.started_at.isoformat()}:{call.planner_call_ordinal}"
+        assert len(row["tool_calls"]) == 1
+        request = ComposerDiagnosticEvidence.from_envelope(
+            row["tool_calls"][0], expected_session_id=result_session_id, expected_tool_call_id=call_identity
+        )
+        assert request.evidence_id == diagnostic_evidence_identity("provider-request", call_identity)
+        assert request.status == "provider_request" and request.tool_name == "composer_provider_context"
+        assert call.private_request is not None
+        assert request.arguments.disposition == call.private_request.disposition == "retained"
+        assert request.arguments.content == call.private_request.canonical
+        assert request.arguments.content is not None
+        context = json.loads(request.arguments.content)
+        assert stable_hash(context["messages"]) == call.messages_hash
+        assert stable_hash(context["tools"]) == call.tools_spec_hash
+        assert request.authority_arguments is None
+        assert request.result.disposition == "not_returned"
+        assert request.result.content is None
+        assert request.wire_arguments.disposition == "unavailable"
+        assert request.wire_arguments.content is None
+        requests.append(request)
+    timeout_call = exc.llm_calls[1]
+    timeout_identity = timeout_call.call_id or f"legacy:{timeout_call.started_at.isoformat()}:{timeout_call.planner_call_ordinal}"
+    failure = ComposerDiagnosticEvidence.from_envelope(
+        appended[3]["tool_calls"][0], expected_session_id=result_session_id, expected_tool_call_id=timeout_identity
     )
-    assert len({row["created_at"] for row in llm_rows}) == 1, "one transaction stamps one created_at across the cohort"
+    assert len(appended[3]["tool_calls"]) == 1
+    assert failure.evidence_id == diagnostic_evidence_identity("provider-failure", timeout_identity)
+    assert failure.status == "provider_failure" and failure.tool_name == "composer_failure"
+    assert len({request.evidence_id for request in requests} | {failure.evidence_id}) == 3
+    assert all(request.operation_id == failure.operation_id for request in requests)
+    assert all(request.operation_epoch == failure.operation_epoch for request in requests)
+    assert failure.result.content is not None and "TimeoutError" in failure.result.content
+    sequence_numbers = [row["sequence_no"] for row in appended]
+    assert sequence_numbers == list(range(sequence_numbers[0], sequence_numbers[0] + len(appended))), (
+        "the complete public/private sidecar cohort settles as one contiguous block"
+    )
+    assert len({row["created_at"] for row in appended}) == 1, "one transaction stamps one created_at across the cohort"
 
 
 @pytest.mark.asyncio
@@ -364,7 +413,7 @@ class _FakePreferences:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fail_at", [None, 0, 1, 2], ids=["control", "index0", "index1", "index2"])
+@pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
 async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
@@ -392,6 +441,7 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
                 preferences=_FakePreferences(trust_mode="explicit_approve"),
                 recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
                 planner_llm_calls=(),
+                planner_private_candidates=(),
                 planner_attempts=(),
                 planner_invocations=_PLANNER_COHORT,
                 planner_withheld_replies=(),
@@ -405,7 +455,7 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
             rows = _chat_rows(sessions_service, result_session_id)
             assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
             assert _proposal_count(sessions_service, result_session_id) == 1
-            assert injector.calls == len(_PLANNER_COHORT)
+            assert injector.calls == 2 * len(_PLANNER_COHORT)
             return
 
         with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
@@ -442,7 +492,7 @@ async def _plan_and_stage_empty(service: ComposerServiceImpl, session_id: str, r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fail_at", [None, 0, 1, 2], ids=["control", "index0", "index1", "index2"])
+@pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
 async def test_planner_decline_path_cohort_is_all_or_nothing_at_every_write_index(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
@@ -470,7 +520,7 @@ async def test_planner_decline_path_cohort_is_all_or_nothing_at_every_write_inde
         assert result.message == "I cannot build that from the available components."
         rows = _chat_rows(sessions_service, result_session_id)
         assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
-        assert injector.calls == len(_PLANNER_COHORT)
+        assert injector.calls == 2 * len(_PLANNER_COHORT)
         return
 
     with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
@@ -610,6 +660,7 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
                 preferences=_FakePreferences(trust_mode="explicit_approve"),
                 recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
                 planner_llm_calls=(),
+                planner_private_candidates=(),
                 planner_attempts=(),
                 planner_invocations=_PLANNER_COHORT,
                 planner_withheld_replies=(),

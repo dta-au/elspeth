@@ -901,6 +901,7 @@ class _RepositoryCompositionStateMutations:
                 is_valid=data.is_valid,
                 validation_errors=serialize_composition_validation_errors(data.validation_errors),
                 composer_meta=_composition_state_column(data.composer_meta),
+                creator_operation_id=context.fence.operation_id,
                 derived_from_state_id=(str(derived_from_state_id) if derived_from_state_id is not None else None),
                 provenance=creation.provenance,
                 created_at=creation.created_at,

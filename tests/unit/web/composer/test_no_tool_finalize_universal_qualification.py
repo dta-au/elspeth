@@ -464,7 +464,7 @@ class TestCleanNoToolTailQualifiesTheHandoff:
     async def test_bare_suffix_is_appended_when_the_masked_pass_is_green(
         self, tmp_path: Path, sessions_service: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        prose = "All set — I mapped the text field across."
+        prose = "Approve these cards and the pipeline is ready to run."
         fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_valid_result())
         result = await _run_no_tool_turn(tmp_path, sessions_service, monkeypatch, fake=fake, max_composition_turns=15, prose=prose)
 
@@ -473,6 +473,9 @@ class TestCleanNoToolTailQualifiesTheHandoff:
         # The whole defect: pre-fix this path returned the model's prose verbatim.
         assert _HANDOFF_SUFFIX in result.assistant_message
         assert result.assistant_message.startswith(prose)
+        assert result.assistant_message.count("Approval does not establish execution readiness") == 1
+        assert result.runtime_preflight.readiness is not None
+        assert result.runtime_preflight.readiness.execution_ready is False
         assert _QUALIFIED_MARKER not in result.assistant_message
         # Strict pass, then the tolerant qualification pass this fix introduces.
         assert fake.calls == [False, True]
@@ -507,7 +510,7 @@ class TestBudgetExhaustionFinalizeQualifiesTheHandoff:
     async def test_bare_suffix_is_appended_when_the_masked_pass_is_green(
         self, tmp_path: Path, sessions_service: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        prose = "All set — I mapped the text field across."
+        prose = "Approve these cards and the pipeline is ready to run."
         fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_valid_result())
         # max_composition_turns=1: the single set_pipeline mutation exhausts the
         # composition budget, so the bonus call's no-tool response finalizes
@@ -518,6 +521,9 @@ class TestBudgetExhaustionFinalizeQualifiesTheHandoff:
         assert is_pending_interpretation_handoff(result.runtime_preflight)
         assert _HANDOFF_SUFFIX in result.assistant_message
         assert result.assistant_message.startswith(prose)
+        assert result.assistant_message.count("Approval does not establish execution readiness") == 1
+        assert result.runtime_preflight.readiness is not None
+        assert result.runtime_preflight.readiness.execution_ready is False
         assert fake.calls == [False, True]
 
     @pytest.mark.asyncio

@@ -806,6 +806,8 @@ class TransformErrorReason(TypedDict):
 
     # Reference-table join context (reference_join)
     unresolved_fields: NotRequired[list[str]]  # Output fields the lookup could not produce
+    lookup_index: NotRequired[int]  # Position of the failed independent reference lookup
+    table: NotRequired[str]  # Authored table name, never reference contents or a row key value
 
     # PDF rasterization context
     detail: NotRequired[str]  # Renderer-supplied detail string (document or page refusal)

@@ -23,12 +23,13 @@
         "tier": "common"
       },
       {
+        "default": null,
         "description": "The reference table as raw text. Written by the settings loader from 'reference_file' on the CLI, or by inline_content blob substitution on the web. Authoring it directly inline is legal but usually means a file was intended.",
         "kind": "text",
         "label": "Reference Content",
         "name": "reference_content",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common"
       },
       {
@@ -42,6 +43,7 @@
         "tier": "common"
       },
       {
+        "default": null,
         "description": "How to parse reference_content. Never inferred \u2014 a blob carries no reliable type. CSV cells remain strings, including numeric-looking cells; JSON numbers retain numeric types.",
         "enum": [
           "csv",
@@ -50,35 +52,38 @@
         "kind": "enum",
         "label": "Reference Format",
         "name": "reference_format",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common"
       },
       {
+        "default": null,
         "description": "Input field whose value is matched against the reference table key.",
         "kind": "text",
         "label": "Key Field",
         "name": "key_field",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common"
       },
       {
+        "default": null,
         "description": "Name of the key WITHIN each reference entry (a CSV header, or a JSON object member). Deliberately not named '*_field': it names a column of the reference table, not of the row.",
         "kind": "text",
         "label": "Reference Key Name",
         "name": "reference_key_name",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common"
       },
       {
+        "default": null,
         "description": "Map of output field name to an expression over the matched entry, bound as 'ref' (for example \"ref['description']\" or \"ref['tax']['rate']\"). A stored result cannot be a set because it has no canonical order; build a list instead.",
         "kind": "json-object",
         "label": "Output",
         "name": "output",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common"
       },
       {
@@ -102,6 +107,26 @@
         "label": "Default Values",
         "name": "default_values",
         "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Named configuration-bound reference tables.",
+        "kind": "json-object",
+        "label": "Tables",
+        "name": "tables",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Lookups evaluated in configuration order; later keys may consume earlier outputs.",
+        "kind": "json-array",
+        "label": "Lookups",
+        "name": "lookups",
+        "nullable": true,
         "required": false,
         "tier": "common"
       }

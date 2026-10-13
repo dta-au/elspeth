@@ -255,6 +255,13 @@ class ChatMessageResponse(_StrictResponse):
     rejection: ToolRejectionResponse | None = None
 
 
+class CompositionHeadResponse(_StrictResponse):
+    """Scalar current-state locator, independent of graph payload hydration."""
+
+    state_id: str | None
+    version: int
+
+
 class MessageWithStateResponse(_StrictResponse):
     """Response for POST /api/sessions/{id}/messages.
 
@@ -265,6 +272,7 @@ class MessageWithStateResponse(_StrictResponse):
     message: ChatMessageResponse
     state: CompositionStateResponse | None = None
     proposals: list[CompositionProposalResponse]
+    recovery_notice: ChatMessageResponse | None = None
 
 
 class ValidationEntryResponse(_StrictResponse):

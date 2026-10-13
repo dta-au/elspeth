@@ -5,7 +5,7 @@ From T8 the service resolves each route's dialect from ``composer_model`` /
 (``strict_transport.resolve_composer_tool_contract``). Under the default
 ``preferred``:
 
-- an OpenRouter planner with no custom base (row 4) sends the 32 mechanical
+- an OpenRouter planner with no custom base (row 4) sends the 34 mechanical
   tools with ``strict: true`` and the 10 option tools with ``strict: false``,
   and each LLM call records ``openai_strict`` with its strict-tool count;
 - ``composer_strict_tools="off"`` and the default ``gpt-5.5`` (row 7, ruling 7)
@@ -99,10 +99,10 @@ def _strict_flags(tools: list[dict[str, Any]]) -> list[object]:
 @pytest.mark.parametrize(
     ("overrides", "dialect", "strict_count"),
     [
-        ({"composer_model": _OPENROUTER_PLANNER}, _STRICT, 32),
+        ({"composer_model": _OPENROUTER_PLANNER}, _STRICT, 34),
         ({"composer_model": _OPENROUTER_PLANNER, "composer_strict_tools": "off"}, _NONE, 0),
         ({}, _NONE, 0),
-        ({"composer_strict_tools": "forward_to_endpoint"}, _STRICT, 32),
+        ({"composer_strict_tools": "forward_to_endpoint"}, _STRICT, 34),
     ],
     ids=["openrouter_preferred", "openrouter_off", "default_gpt_5_5", "gpt_5_5_forward_to_endpoint"],
 )
@@ -120,9 +120,9 @@ async def test_compose_turn_sends_and_records_the_resolved_dialect(
     assert result.repair_turns_used == 1
     for request, call in zip(completion.call_args_list, result.llm_calls, strict=True):
         sent = request.kwargs["tools"]
-        assert len(sent) == 42
+        assert len(sent) == 44
         if dialect is _STRICT:
-            assert _strict_flags(sent).count(True) == 32
+            assert _strict_flags(sent).count(True) == 34
             assert _strict_flags(sent).count(False) == 10
         else:
             assert set(_strict_flags(sent)) == {"omitted"}
@@ -173,7 +173,7 @@ def test_openai_strict_set_pipeline_keeps_the_envelope_and_an_explicit_strict_fa
 
 
 def test_openai_strict_list_keeps_registry_order_and_cache_marker_placement() -> None:
-    """Names and order are the registry's; the Anthropic cache marker lands beside ``function`` on the last tool.
+    """Recovery controls preserve registry order and the final Anthropic cache anchor.
 
     D8 means no production route carries both; this pins the function only.
     """
@@ -182,7 +182,12 @@ def test_openai_strict_list_keeps_registry_order_and_cache_marker_placement() ->
     from elspeth.web.composer.tools import get_tool_definitions
 
     tools = composer_loop_tool_definitions(_STRICT)
-    assert [tool["function"]["name"] for tool in tools] == [definition["name"] for definition in get_tool_definitions()]
+    registry_names = [definition["name"] for definition in get_tool_definitions()]
+    recovery_names = ["handoff_to_user", "restore_parked_graph"]
+    assert set(recovery_names).isdisjoint(registry_names)
+    tool_names = [tool["function"]["name"] for tool in tools]
+    assert len(tool_names) == len(set(tool_names))
+    assert tool_names == [*registry_names[:-1], *recovery_names, registry_names[-1]]
     _, marked = apply_anthropic_cache_markers([], tools)
     assert marked is not None
     assert ["cache_control" in tool for tool in marked] == [False] * (len(marked) - 1) + [True]

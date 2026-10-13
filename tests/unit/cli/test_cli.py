@@ -228,13 +228,18 @@ landscape:
         """
         from elspeth.cli import app
 
-        # Create an empty SQLite file (exists but has no tables)
+        # Create a foreign SQLite database containing user data.
         empty_db = tmp_path / "not_landscape.db"
         import sqlite3
 
         conn = sqlite3.connect(str(empty_db))
         conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO unrelated (id) VALUES (7)")
+        conn.commit()
         conn.close()
+        before = empty_db.read_bytes()
+        for suffix in ("-wal", "-shm", "-journal"):
+            assert not Path(f"{empty_db}{suffix}").exists()
 
         settings_content = f"""
 sources:
@@ -261,11 +266,14 @@ landscape:
         result = runner.invoke(app, ["resume", "fake-run-id", "-s", str(settings_file)])
 
         assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
-        assert "contains foreign tables and cannot be opened as an ELSPETH audit database" in result.output, (
-            f"Expected clear error about foreign tables, got: {result.output}"
-        )
-        # Must NOT have crashed with a traceback
+        assert "Landscape database is unsupported" in result.output
+        assert "Preserve this store unchanged" in result.output
+        assert "configure an explicitly new Landscape database" in result.output
+        # Must NOT have crashed with a traceback or modified the foreign store.
         assert "Traceback" not in result.output, f"Should not show traceback: {result.output}"
+        assert empty_db.read_bytes() == before
+        for suffix in ("-wal", "-shm", "-journal"):
+            assert not Path(f"{empty_db}{suffix}").exists()
 
 
 class TestExplainPassphraseResolution:

@@ -898,7 +898,7 @@ def _record() -> dict[str, object]:
         "rollback_doctor_job_sha256": "",
         "previous_package_version": "",
         "schema_facts": _expected_schema_facts("A"),
-        "forward_compatible": True,
+        "new_store_compatible": True,
         "backward_compatible": False,
         "rollback_permitted": False,
         "decision": "approved",
@@ -930,7 +930,7 @@ def test_compatibility_record_rejects_open_field_sets_and_foreign_facts() -> Non
         (lambda r: r.__setitem__("extra", 1), "compatibility_record_schema"),
         (lambda r: r.__setitem__("schema", "elspeth.aws-ecs-compatibility-record.v2"), "compatibility_record_schema"),
         (lambda r: r.__setitem__("scenario_id", "B"), "compatibility_record_schema"),
-        (lambda r: r.__setitem__("forward_compatible", 1), "compatibility_record_schema"),
+        (lambda r: r.__setitem__("new_store_compatible", 1), "compatibility_record_schema"),
         (lambda r: r.__setitem__("countersigner_identity", "database-operator"), "compatibility_record_schema"),
         (lambda r: r.__setitem__("schema_facts", facts_b), "compatibility_record_binding"),
         (lambda r: r.__setitem__("schema_facts", _expected_schema_facts("B")), "compatibility_record_binding"),
@@ -973,3 +973,121 @@ def test_gate_verdict_on_the_validated_record_is_the_shared_predicates() -> None
     record["rollback_permitted"] = True
     assert compatibility_record_gate(record, scenario_id="A").failed_clauses == ("rollback_permitted",)
     assert compatibility_record_gate(_record(), scenario_id="B").failed_clauses == ("previous_landscape_epoch",)
+
+
+@pytest.mark.parametrize(("kind", "scenario_id"), [("compatibility-record", "A"), ("resource-graph-cleanup", "B")])
+def test_compatibility_a_and_noncompatibility_cleanup_b_round_trip(kind: str, scenario_id: str) -> None:
+    details = VALID[kind]()
+    line = encode_exec_receipt(
+        kind, cast(contracts.CheckDetails, details), candidate_sha=CANDIDATE, binding=BINDING, scenario_id=scenario_id
+    )
+    extracted = extract_exec_receipt(
+        line, expected_candidate_sha=CANDIDATE, expected_binding=BINDING, expected_scenario_id=scenario_id, expected_check=kind
+    )
+    stored = validate_stored_receipt(
+        json.loads(extracted.canonical_json), kind=kind, scenario_id=scenario_id, subject_sha256=BINDING.sha256, candidate_sha=CANDIDATE
+    )
+    assert stored == extracted
+    assert stored.scenario_id == scenario_id
+
+
+@pytest.mark.parametrize("boundary", ["encode", "extract", "stored"])
+@pytest.mark.parametrize("guard_enabled", [True, False], ids=["policy-enforced", "guard-removal-negative-control"])
+def test_compatibility_receipt_rejects_b_envelope_with_valid_a_details(
+    monkeypatch: pytest.MonkeyPatch, boundary: str, guard_enabled: bool
+) -> None:
+    """Without the envelope guard all three paths admitted the unsupported transition."""
+    details = VALID["compatibility-record"]()
+    payload = _envelope("compatibility-record", details, scenario_id="B")
+    if not guard_enabled:
+        monkeypatch.setattr(contracts, "_require_supported_deployment_scenario", lambda scenario: None)
+
+    def admit() -> object:
+        if boundary == "encode":
+            return encode_exec_receipt(
+                "compatibility-record", cast(contracts.CheckDetails, details), candidate_sha=CANDIDATE, binding=BINDING, scenario_id="B"
+            )
+        if boundary == "extract":
+            return extract_exec_receipt(
+                _line("compatibility-record", scenario_id="B"),
+                expected_candidate_sha=CANDIDATE,
+                expected_binding=BINDING,
+                expected_scenario_id="B",
+                expected_check="compatibility-record",
+            )
+        return validate_stored_receipt(
+            payload, kind="compatibility-record", scenario_id="B", subject_sha256=BINDING.sha256, candidate_sha=CANDIDATE
+        )
+
+    if guard_enabled:
+        with pytest.raises(AcceptanceCheckError, match="compatibility_transition_unsupported"):
+            admit()
+    else:
+        accepted = admit()
+        if boundary == "encode":
+            assert isinstance(accepted, str)
+            encoded = accepted[len(EXEC_RECEIPT_PREFIX) :]
+            assert json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))["scenario_id"] == "B"
+        else:
+            assert isinstance(accepted, contracts.StoredReceipt)
+            assert accepted.scenario_id == "B"
+
+
+@pytest.mark.parametrize("boundary", ["extract", "stored"])
+@pytest.mark.parametrize(
+    ("mutation", "expected_check"),
+    [
+        ("missing-envelope", "exec_receipt_schema"),
+        ("none-envelope", "exec_receipt_schema"),
+        ("empty-envelope", "exec_receipt_schema"),
+        ("padded-envelope", "exec_receipt_schema"),
+        ("unknown-envelope", "compatibility_transition_unsupported"),
+        ("detail-b", "exec_receipt_schema"),
+    ],
+)
+def test_external_compatibility_receipt_refuses_missing_unsupported_or_mismatched_scenarios(
+    boundary: str, mutation: str, expected_check: str
+) -> None:
+    details = VALID["compatibility-record"]()
+    payload = _envelope("compatibility-record", details)
+    if mutation == "missing-envelope":
+        del payload["scenario_id"]
+    elif mutation == "none-envelope":
+        payload["scenario_id"] = None
+    elif mutation == "empty-envelope":
+        payload["scenario_id"] = ""
+    elif mutation == "padded-envelope":
+        payload["scenario_id"] = " A "
+    elif mutation == "unknown-envelope":
+        payload["scenario_id"] = "unknown"
+    else:
+        details["scenario_id"] = "B"
+    external = base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).decode().rstrip("=")
+    with pytest.raises(AcceptanceCheckError, match=expected_check):
+        if boundary == "extract":
+            extract_exec_receipt(
+                f"{EXEC_RECEIPT_PREFIX}{external}",
+                expected_candidate_sha=CANDIDATE,
+                expected_binding=BINDING,
+                expected_scenario_id="A",
+                expected_check="compatibility-record",
+            )
+        else:
+            validate_stored_receipt(
+                payload, kind="compatibility-record", scenario_id="A", subject_sha256=BINDING.sha256, candidate_sha=CANDIDATE
+            )
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "expected_check"),
+    [("unknown", "compatibility_transition_unsupported"), (" A ", "exec_receipt_binding"), ("", "exec_receipt_binding")],
+)
+def test_compatibility_receipt_encode_refuses_non_a_scenarios(scenario_id: str, expected_check: str) -> None:
+    with pytest.raises(AcceptanceCheckError, match=expected_check):
+        encode_exec_receipt(
+            "compatibility-record",
+            cast(contracts.CheckDetails, VALID["compatibility-record"]()),
+            candidate_sha=CANDIDATE,
+            binding=BINDING,
+            scenario_id=scenario_id,
+        )

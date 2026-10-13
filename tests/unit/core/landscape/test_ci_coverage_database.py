@@ -231,8 +231,16 @@ def test_schema_admission_refuses_an_empty_file_stamped_for_another_epoch(tmp_pa
     path = tmp_path / "empty-stale.db"
     with closing(sqlite3.connect(path)) as conn:
         conn.execute("PRAGMA user_version = 1")
-    with pytest.raises(SchemaCompatibilityError, match="schema epoch is incompatible"):
+    before = path.read_bytes()
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not Path(f"{path}{suffix}").exists()
+    with pytest.raises(SchemaCompatibilityError, match="unstamped, object-free target") as raised:
         LandscapeDB.from_url(f"sqlite:///{path}")
+    assert "Preserve this store unchanged" in str(raised.value)
+    assert "configure an explicitly new Landscape database" in str(raised.value)
+    assert path.read_bytes() == before
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not Path(f"{path}{suffix}").exists()
     with closing(sqlite3.connect(path)) as conn:
         assert conn.execute("PRAGMA user_version").fetchone() == (1,)
         assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []

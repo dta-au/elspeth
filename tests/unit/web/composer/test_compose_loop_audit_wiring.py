@@ -378,9 +378,9 @@ async def test_compose_loop_records_assertion_error_before_reraise() -> None:
     before re-raise — building a frozen dataclass from pre-captured
     scalars is not poisoned-memory work.
 
-    AssertionError propagates as ``AssertionError`` (NOT wrapped in
-    ``ComposerPluginCrashError``) — the policy that interpreter-level
-    invariant breaches MUST NOT be laundered is preserved.
+    The direct service returns the typed evidence carrier. Its original
+    AssertionError is retained unchanged for the turn coordinator to drain
+    durably and re-raise; it must never become a successful tool outcome.
     """
     catalog = _mock_catalog()
     settings = _make_settings()
@@ -424,8 +424,14 @@ async def test_compose_loop_records_assertion_error_before_reraise() -> None:
         patch("elspeth.web.composer.service.BufferingRecorder", _SpyRecorder),
     ):
         mock_llm.return_value = turn
-        with pytest.raises(AssertionError):
+        from elspeth.web.composer.audit import ComposerToolFailure
+
+        with pytest.raises(ComposerToolFailure) as raised:
             await service.compose("Trigger invariant", [], state, session_id=session_id)
+
+    assert type(raised.value.original_exception) is AssertionError
+    assert str(raised.value.original_exception) == "Tier-1 invariant breach"
+    assert raised.value.__cause__ is raised.value.original_exception
 
     spy = captured_recorder["instance"]
     invocations = spy.invocations
@@ -435,6 +441,7 @@ async def test_compose_loop_records_assertion_error_before_reraise() -> None:
     assert inv.error_class == "AssertionError"
     assert inv.error_message == "AssertionError"
     assert inv.version_after is None
+    assert raised.value.tool_invocations == invocations
 
 
 @pytest.mark.asyncio

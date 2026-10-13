@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
-from elspeth.contracts.composer_audit import ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, PrivateToolAuthoring
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -213,6 +213,8 @@ async def persist_turn_audit(
     redaction_telemetry: RedactionTelemetry,
     tool_outcomes: tuple[_ToolOutcome, ...],
     decoded_args_by_call_id: Mapping[str, Mapping[str, Any]],
+    private_authorings: tuple[PrivateToolAuthoring, ...],
+    private_invocations: tuple[ComposerToolInvocation, ...],
     assistant_message: _AdmittedAssistantMessage,
     raw_assistant_content: str | None,
     assistant_tool_calls: tuple[_AdmittedToolCall, ...],
@@ -397,6 +399,59 @@ async def persist_turn_audit(
             raise AuditIntegrityError("Compose turn audit persistence requires exact session operation authority")
         if sessions_service is None:
             raise RuntimeError("sessions_service not wired")
+        from elspeth.web.composer.audit_storage import _validated_canonical_mapping_pair, private_failure_evidence
+        from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence, diagnostic_evidence_identity
+
+        authorings = {authoring.tool_call_id: authoring for authoring in private_authorings}
+        invocations = {invocation.tool_call_id: invocation for invocation in private_invocations}
+        expected_ids = {outcome.call.id for outcome in tool_outcomes}
+        if (
+            set(authorings) != expected_ids
+            or len(authorings) != len(private_authorings)
+            or set(invocations) != expected_ids
+            or len(invocations) != len(private_invocations)
+        ):
+            raise AuditIntegrityError("private tool checkpoint lost its exact authoring or invocation set")
+        private_tool_evidence = []
+        for outcome in tool_outcomes:
+            authoring = authorings[outcome.call.id]
+            invocation = invocations[outcome.call.id]
+            if invocation.tool_name != outcome.call.function.name:
+                raise AuditIntegrityError("private tool checkpoint invocation names another tool")
+            if invocation.private_authoring is not None and invocation.private_authoring != authoring:
+                raise AuditIntegrityError("private tool checkpoint receipt differs from its invocation")
+            if invocation.result_canonical is not None:
+                if invocation.result_hash is None:
+                    raise AuditIntegrityError("private tool checkpoint result has no binding")
+                _validated_canonical_mapping_pair(invocation.result_canonical, invocation.result_hash, label="private checkpoint result")
+            elif invocation.result_hash is not None:
+                raise AuditIntegrityError("private tool checkpoint absent result has a hash")
+            private_tool_evidence.append(
+                build_private_tool_evidence(
+                    session_id=session_id,
+                    operation_id=session_operation_context.fence.operation_id,
+                    operation_epoch=session_operation_context.fence.operation_epoch,
+                    tool_call_id=outcome.call.id,
+                    tool_name=outcome.call.function.name,
+                    status=invocation.status.value,
+                    arguments_canonical=authoring.arguments_canonical,
+                    authority_arguments_canonical=authoring.authority_arguments_canonical,
+                    raw_arguments=authoring.raw_arguments,
+                    result_canonical=invocation.result_canonical,
+                    error_category=outcome.error_category.value if outcome.error_category is not None else None,
+                )
+            )
+        private_tool_failures = tuple(
+            private_failure_evidence(
+                invocation.private_failure,
+                identity=diagnostic_evidence_identity("tool-failure", invocation.tool_call_id),
+                tool_call_id=invocation.tool_call_id,
+                status="tool_failure",
+                context=session_operation_context,
+            )
+            for invocation in private_invocations
+            if invocation.private_failure is not None
+        )
         checkpoint_sql = checkpoint_projection = None
         if required_work is not None:
             if type(required_work) is not RequiredWorkBinding:
@@ -413,6 +468,8 @@ async def persist_turn_audit(
                     raw_content=raw_assistant_content,
                     redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                     redacted_tool_rows=redacted_tool_rows,
+                    private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
                     rejection_records=build_rejection_records(tool_outcomes),
                     parent_composition_state_id=current_state_id,
                     expected_current_state_id=current_state_id,
@@ -427,6 +484,8 @@ async def persist_turn_audit(
                     raw_content=raw_assistant_content,
                     redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                     redacted_tool_rows=redacted_tool_rows,
+                    private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
                     rejection_records=build_rejection_records(tool_outcomes),
                     parent_composition_state_id=current_state_id,
                     expected_current_state_id=current_state_id,

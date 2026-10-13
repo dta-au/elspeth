@@ -36,7 +36,7 @@ from elspeth.core.schema_identity import (
     read_schema_identities,
     schema_identity_mismatch,
 )
-from elspeth.core.schema_shape import collect_metadata_shape_issues
+from elspeth.core.schema_shape import collect_metadata_shape_issues, database_target_is_empty
 
 # Tier-1 branded Engine type.
 #
@@ -928,7 +928,15 @@ def probe_schema_shape(bind: Engine | Connection) -> LandscapeSchemaShape:
     if _sqlite_epoch_is_incompatible(bind):
         return LandscapeSchemaShape.DIVERGENT
     if not existing:
-        return LandscapeSchemaShape.EMPTY
+        return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT
+    if bind.dialect.name == "sqlite" and existing & expected:
+        if isinstance(bind, Engine):
+            with bind.connect() as connection:
+                epoch = connection.exec_driver_sql("PRAGMA user_version").scalar_one()
+        else:
+            epoch = bind.exec_driver_sql("PRAGMA user_version").scalar_one()
+        if epoch != SQLITE_SCHEMA_EPOCH:
+            return LandscapeSchemaShape.DIVERGENT
     if _landscape_identity_issue(bind, inspector, existing) is not None:
         return LandscapeSchemaShape.DIVERGENT
     if existing - expected:
@@ -1038,6 +1046,7 @@ class LandscapeDB:
             dump_to_jsonl_include_payloads: Inline payloads in journal records
             dump_to_jsonl_payload_base_path: Payload store base path for inlining
         """
+        self._admit_sqlite_target(connection_string, passphrase=passphrase)
         self.connection_string = connection_string
         self._passphrase = passphrase
         self._engine: Engine | None = None
@@ -1057,10 +1066,8 @@ class LandscapeDB:
             )
         self._setup_engine(**engine_kwargs)
         self._validate_schema()  # Check BEFORE create_tables
-        # Pre-1.0 schema changes are deliberate recreate boundaries. Never
-        # transform a populated older epoch in place: validation rejects it
-        # with delete/recreate guidance; only a fresh/unstamped schema reaches
-        # creation and current-epoch stamping below.
+        # Existing targets must already be current; only proven empty targets
+        # may receive their first epoch and schema.
         self._sync_sqlite_schema_epoch()
         self._create_tables()
         self._create_additive_indexes()
@@ -1393,7 +1400,7 @@ class LandscapeDB:
         if rows:
             raise SchemaCompatibilityError(
                 f"Landscape database schema identity mismatch ({mismatch}); "
-                "uninstall this pre-1.0 deployment, delete/recreate the Landscape database, and reinstall."
+                "preserve this store unchanged and configure an explicitly new Landscape database."
             )
 
         # Re-read under write intent so concurrent fresh initializers cannot
@@ -1412,7 +1419,7 @@ class LandscapeDB:
         if mismatch is not None:
             raise SchemaCompatibilityError(
                 f"Landscape database schema identity mismatch ({mismatch}); "
-                "uninstall this pre-1.0 deployment, delete/recreate the Landscape database, and reinstall."
+                "preserve this store unchanged and configure an explicitly new Landscape database."
             )
 
     def _get_sqlite_schema_epoch(self) -> int:
@@ -1441,13 +1448,10 @@ class LandscapeDB:
             conn.exec_driver_sql(f"PRAGMA user_version = {int(epoch)}")
 
     def _sync_sqlite_schema_epoch(self) -> None:
-        """Stamp compatible SQLite databases with the current schema epoch.
+        """Stamp only an empty, unstamped SQLite target before creation.
 
-        New databases get the epoch immediately after create_all(). Existing
-        compatible databases without an epoch are stamped in place. Any
-        populated database carrying an older non-zero epoch is rejected at the
-        one-way schema boundary. Call this only from schema-managing paths;
-        read-only/inspection opens must not mutate the database.
+        Existing targets must already carry the current epoch. Read-only and
+        inspection opens never call this schema-managing method.
 
         Raises:
             SchemaCompatibilityError: If the database has a non-zero epoch
@@ -1477,20 +1481,18 @@ class LandscapeDB:
                     "the current one-way schema boundary. ELSPETH does not migrate it in place.\n\n"
                     f"Database epoch: {current_epoch}\n"
                     f"Current epoch: {SQLITE_SCHEMA_EPOCH}\n\n"
-                    "Obtain archive/export approval where retention applies, then have the "
-                    "database operator drop/recreate the Landscape database and initialize "
-                    "a fresh schema. Rolling code back over the recreated database is unsafe.\n\n"
+                    "Preserve this store unchanged and configure an explicitly new Landscape database.\n\n"
                     f"Database: {_safe_database_descriptor(self.connection_string)}"
                 )
 
         if current_epoch == 0:
             from sqlalchemy import inspect
 
-            # A genuinely fresh file is stamped only after create_all has
-            # installed the complete current shape. Existing unstamped schemas
-            # reach this point only after _validate_schema proved compatibility.
-            if not (set(inspect(self.engine).get_table_names()) & set(metadata.tables)):
-                return
+            if not database_target_is_empty(self.engine):
+                raise SchemaCompatibilityError(
+                    "Cannot stamp an existing Landscape database. Preserve this store unchanged "
+                    "and configure an explicitly new Landscape database."
+                )
 
         if current_epoch < SQLITE_SCHEMA_EPOCH:
             self._set_sqlite_schema_epoch(SQLITE_SCHEMA_EPOCH)
@@ -1530,6 +1532,11 @@ class LandscapeDB:
                 ) from e
             raise
         validation_metadata = metadata
+        if not existing_tables and not database_target_is_empty(self.engine):
+            raise SchemaCompatibilityError(
+                "Landscape creation requires an unstamped, object-free target. Preserve this store unchanged "
+                "and configure an explicitly new Landscape database."
+            )
         expected_tables = set(validation_metadata.tables.keys())
         present_landscape_tables = existing_tables & expected_tables
         schema_epoch = self._get_sqlite_schema_epoch() if self.connection_string.startswith("sqlite") else 0
@@ -1545,7 +1552,7 @@ class LandscapeDB:
             else None
         )
 
-        epoch_incompatible = schema_epoch not in (0, SQLITE_SCHEMA_EPOCH)
+        epoch_incompatible = self.connection_string.startswith("sqlite") and schema_epoch != (SQLITE_SCHEMA_EPOCH if existing_tables else 0)
         if epoch_incompatible and not present_landscape_tables:
             raise SchemaCompatibilityError(
                 "Landscape database schema is outdated.\n\n"
@@ -1574,15 +1581,13 @@ class LandscapeDB:
                 "Verify the database path is correct.\n\n"
                 f"Database: {_safe_database_descriptor(self.connection_string)}"
             )
-        allowed_missing_tables = frozenset() if self._require_existing_schema else _ADDITIVE_TABLE_NAMES
-        missing_tables = sorted((expected_tables - existing_tables) - allowed_missing_tables) if present_landscape_tables else []
+        missing_tables = sorted(expected_tables - existing_tables) if present_landscape_tables else []
 
         shape_issues = collect_metadata_shape_issues(
             inspector,
             validation_metadata,
             dialect=self.engine.dialect,
             present_tables=present_landscape_tables,
-            allowed_missing_index_names=_ADDITIVE_INDEX_NAMES,
         )
 
         # Full shape validation already covers every predecessor column. The
@@ -1791,14 +1796,14 @@ class LandscapeDB:
                 error_parts.append(
                     "ADR-019 changed token_outcomes from the old single-axis outcome/is_terminal to "
                     "(TerminalOutcome, TerminalPath, completed). See "
-                    f"{ADR019_CUTOVER_GUIDE} and replace the stale audit.db "
-                    "before starting this ELSPETH version."
+                    f"{ADR019_CUTOVER_GUIDE}. Preserve the stale audit.db unchanged and select "
+                    "an explicitly new database before starting this ELSPETH version."
                 )
 
             raise SchemaCompatibilityError(
                 "Landscape database schema is outdated.\n\n" + "\n".join(error_parts) + "\n\n"
-                f"Pre-1.0 schemas are not migrated in place. Uninstall the deployment,\n"
-                f"delete/recreate the database, and reinstall this ELSPETH version.\n\n"
+                "Pre-1.0 schemas are not migrated in place. Preserve this store unchanged\n"
+                "and configure an explicitly new Landscape database.\n\n"
                 f"Database: {_safe_database_descriptor(self.connection_string)}"
             )
 
@@ -1882,8 +1887,9 @@ class LandscapeDB:
         )
         cls._configure_sqlite(engine)
         cls._verify_sqlite_pragmas(engine, "sqlite:///:memory:")
-        metadata.create_all(engine)
         instance = cls._from_parts("sqlite:///:memory:", engine)
+        instance._sync_sqlite_schema_epoch()
+        metadata.create_all(engine)
         instance._sync_schema_identity()
         instance._sync_sqlite_schema_epoch()
         return instance
@@ -1915,6 +1921,66 @@ class LandscapeDB:
         if immutable:
             return f"{parsed.drivername}:///file:{uri_path}?mode=ro&immutable=1&uri=true"
         return f"{parsed.drivername}:///file:{uri_path}?mode=ro&uri=true"
+
+    @classmethod
+    def _admit_sqlite_target(cls, url: str, *, passphrase: str | None) -> None:
+        parsed = make_url(url)
+        if parsed.get_backend_name() != "sqlite" or parsed.database in (None, ":memory:"):
+            return
+        assert parsed.database is not None
+        if parsed.database.startswith("file:"):
+            raise ValueError("Landscape database admission requires a plain SQLite file URL; preserve existing stores")
+        if passphrase is not None:
+            # Reuse the SQLCipher boundary's option validation before any
+            # connection or file creation. Engine construction is lazy; the
+            # existing-store probe below opens this same target read-only.
+            validation_engine = cls._create_sqlcipher_engine(url, passphrase, read_only=True)
+            validation_engine.dispose()
+        elif parsed.query:
+            raise ValueError("Landscape database admission requires a plain SQLite file URL; preserve existing stores")
+        if Path(parsed.database).is_symlink():
+            raise ValueError("Landscape database target must not be a symlink; preserve existing stores")
+        if Path(parsed.database).exists():
+            cls.admit_existing_sqlite_store(url, passphrase=passphrase)
+
+    @classmethod
+    def admit_existing_sqlite_store(cls, url: str, *, passphrase: str | None = None) -> None:
+        """Admit a current store or pristine allocation without bootstrap writes."""
+        from sqlalchemy import inspect
+
+        engine = (
+            cls._create_sqlcipher_engine(url, passphrase, read_only=True)
+            if passphrase is not None
+            else create_engine(cls._sqlite_read_only_url(url))
+        )
+        try:
+            cls._configure_sqlite(engine, read_only=True)
+            with engine.connect() as connection:
+                objects = connection.exec_driver_sql("SELECT name FROM sqlite_master").all()
+                application_id = connection.exec_driver_sql("PRAGMA application_id").scalar_one()
+                epoch = connection.exec_driver_sql("PRAGMA user_version").scalar_one()
+                if not objects:
+                    if application_id != 0 or epoch != 0:
+                        raise SchemaCompatibilityError(
+                            "Landscape creation requires an unstamped, object-free target. "
+                            "Preserve this store unchanged and configure an explicitly new Landscape database."
+                        )
+                    return
+                inspector = inspect(connection)
+                if inspector.get_view_names():
+                    raise SchemaCompatibilityError(
+                        "Landscape database contains unsupported views. Preserve this store unchanged "
+                        "and configure an explicitly new Landscape database."
+                    )
+            instance = cls._from_parts(url, engine, passphrase=passphrase, require_existing_schema=True, read_only=True)
+            instance._validate_schema()
+        except SchemaCompatibilityError as exc:
+            raise SchemaCompatibilityError(
+                "Landscape database is unsupported. Preserve this store unchanged and configure an explicitly new "
+                f"Landscape database. Detail: {exc}"
+            ) from exc
+        finally:
+            engine.dispose()
 
     @classmethod
     def from_url(
@@ -1966,6 +2032,9 @@ class LandscapeDB:
             raise ValueError("read_only=True requires create_tables=False")
         if read_only and dump_to_jsonl:
             raise ValueError("read_only=True cannot enable dump_to_jsonl")
+
+        if not read_only:
+            cls._admit_sqlite_target(url, passphrase=passphrase)
 
         if passphrase is not None:
             if engine_kwargs:

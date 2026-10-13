@@ -158,7 +158,7 @@ def test_documented_capture_preserves_child_file_size_limit_and_failure_status()
 def test_compatibility_record_is_byte_bound_to_the_live_derivation() -> None:
     record = _compatibility_record()
 
-    assert record["schema"] == "elspeth.azure-container-apps-compatibility-receipt.v1"
+    assert record["schema"] == "elspeth.azure-container-apps-compatibility-receipt.v2"
     assert record["scenario_id"] == "A"
     assert record["schema_facts"] == receipt_contracts._expected_schema_facts("A")
     assert record["candidate_package_version"] == receipt_contracts._CANDIDATE_PACKAGE_VERSION
@@ -174,7 +174,8 @@ def test_compatibility_record_is_byte_bound_to_the_live_derivation() -> None:
         assert subject in record, subject
     assert record["backward_compatible"] is False
     assert record["rollback_permitted"] is False
-    assert record["forward_compatible"] is True
+    assert record["new_store_compatible"] is True
+    assert "forward_compatible" not in record
     for stale_subject in ("task_definition", "task_arn"):
         assert stale_subject not in json.dumps(record), stale_subject
 

@@ -12,6 +12,7 @@ from tests.helpers.session_fences import fenced_operation_context
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
 
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -32,6 +33,7 @@ async def test_adapter_forwards_exact_remaining_budget_and_owned_provider_pair(t
     state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
     history = []
     calls = []
+    recovery = GraphRecoveryContext(None, 0, None, 0, False)
 
     async def capture(
         self,
@@ -48,8 +50,10 @@ async def test_adapter_forwards_exact_remaining_budget_and_owned_provider_pair(t
         budget_seconds=None,
         required_work=None,
         provider_owner=None,
+        recovery_context=None,
     ):
         calls.append((self, message, messages, state, session_operation_context, budget_seconds, required_work, provider_owner))
+        assert recovery_context is recovery
         return ComposerResult(message="Captured adapter forwarding.", state=state)
 
     monkeypatch.setattr(ComposerServiceImpl, "compose", capture)
@@ -72,6 +76,7 @@ async def test_adapter_forwards_exact_remaining_budget_and_owned_provider_pair(t
                 budget_seconds=0.125,
                 required_work=work,
                 provider_owner=owner,
+                recovery_context=recovery,
             )
             assert result.state is state
             assert len(calls) == 1
@@ -114,10 +119,11 @@ async def test_adapter_legacy_call_preserves_budget_and_closes_actual_owned_leas
         budget_seconds=None,
         required_work=None,
         provider_owner=None,
+        recovery_context=None,
     ):
         contexts.append(session_operation_context)
         budgets.append(budget_seconds)
-        assert required_work is provider_owner is None
+        assert required_work is provider_owner is recovery_context is None
         self._sessions_service.session_operation_authority.compare_and_swap(session_operation_context)
         return ComposerResult(message="Captured legacy forwarding.", state=state)
 

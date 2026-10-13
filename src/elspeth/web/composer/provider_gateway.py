@@ -6,6 +6,7 @@ import asyncio
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, Final, cast
 
@@ -19,6 +20,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedAssistantMessage,
     _AdmittedLLMCompletion,
     _AdmittedLLMProviderMetadata,
+    _AdmittedToolBatch,
 )
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import (
@@ -28,7 +30,9 @@ from elspeth.web.composer.llm_response_parsing import (
     build_llm_call_record,
     supports_anthropic_prompt_cache_markers,
 )
+from elspeth.web.composer.private_diagnostic_facts import bind_received_response, capture_received_response
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -384,7 +388,11 @@ def composer_loop_tool_definitions(dialect: ToolContractDialect) -> list[dict[st
     affected; advisor is web-composer only by design (the tool is not
     registered in the CLI dispatch tables).
     """
-    return wire_tool_definitions(dialect)
+    from elspeth.web.composer.recovery_controls import recovery_tool_definitions
+
+    tools = wire_tool_definitions(dialect)
+    # Preserve the established trailing cache anchor.
+    return [*tools[:-1], *recovery_tool_definitions(dialect), tools[-1]]
 
 
 def build_composer_loop_request_kwargs(
@@ -629,12 +637,16 @@ class ProviderGateway:
             wire_messages, tools_or_none = apply_anthropic_cache_markers(wire_messages, wire_tools, mark_history_tail=True)
             wire_tools = tools_or_none if tools_or_none is not None else wire_tools
 
+        private_request = capture_provider_context(messages=wire_messages, tools=wire_tools or None)
+
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        failure_to_capture: Exception | None = None
+        recovery_batch: _AdmittedToolBatch | None = None
         try:
             completion = await asyncio.wait_for(
                 self._call_llm(wire_messages, wire_tools, provider_custody=provider_custody)
@@ -647,6 +659,19 @@ class ProviderGateway:
                 surface="composer_provider_response",
             )
             response_metadata = completion.provider_metadata
+            from elspeth.web.composer.recovery_controls import RECOVERY_TOOL_NAMES
+
+            if any(tool.function.name in RECOVERY_TOOL_NAMES for tool in completion.tool_batch.calls):
+                recovery_batch = completion.tool_batch
+            recovery_only = bool(wire_tools) and all(tool["function"]["name"] in RECOVERY_TOOL_NAMES for tool in wire_tools)
+            if recovery_only and (
+                any(call.function.name not in RECOVERY_TOOL_NAMES for call in completion.tool_batch.calls)
+                or (not completion.tool_batch.calls and not (completion.message.content or "").strip())
+            ):
+                raise _MalformedLLMResponseError(
+                    "Reply stage requires text or a terminal recovery control",
+                    provider_metadata=completion.provider_metadata,
+                )
             if not wire_tools and (completion.tool_batch.calls or not (completion.message.content or "").strip()):
                 raise _MalformedLLMResponseError(
                     "Reply-only completion must contain text and no tool calls",
@@ -654,7 +679,8 @@ class ProviderGateway:
                 )
             status = ComposerLLMCallStatus.SUCCESS
             return completion
-        except TimeoutError:
+        except TimeoutError as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.TIMEOUT
             error_class = "TimeoutError"
             error_message = "TimeoutError"
@@ -666,6 +692,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except OpenAIError as exc:
+            failure_to_capture = exc
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
@@ -673,6 +700,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except _MalformedLLMResponseError as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             response_metadata = exc.provider_metadata
             error_class = type(exc).__name__
@@ -680,6 +708,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except _BadRequestLLMError as exc:
+            failure_to_capture = exc
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
@@ -687,12 +716,14 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             error_class = type(exc).__name__
             error_message = "credential_material_rejected"
             attach_llm_calls(exc, recorder)
             raise
         except Exception as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
@@ -720,7 +751,46 @@ class ProviderGateway:
                             error_class=error_class,
                             error_message=error_message,
                             provider_custody=provider_custody,
+                            failure=failure_to_capture,
+                            private_request=private_request,
                         )
+                        if recovery_batch is not None:
+                            if call.call_id is None:
+                                raise AuditIntegrityError("Received recovery control has no physical provider call identity")
+                            # Terminal controls bypass ordinary dispatch. Retain
+                            # their received arguments through the same bounded,
+                            # credential-filtered private evidence channel.
+                            received = capture_received_response(
+                                {
+                                    "choices": [
+                                        {
+                                            "message": {
+                                                "tool_calls": [
+                                                    {
+                                                        "id": tool.id,
+                                                        "function": {
+                                                            "name": tool.function.name,
+                                                            "arguments": tool.function.arguments,
+                                                        },
+                                                    }
+                                                    for tool in recovery_batch.calls
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                },
+                                namespace=call.call_id,
+                                ordinal=1,
+                                known_tools=frozenset(tool["function"]["name"] for tool in wire_tools),
+                            )
+                            call = replace(
+                                call,
+                                private_diagnostics=bind_received_response(
+                                    received,
+                                    physical_call_id=call.call_id,
+                                    refusal_code=None if status is ComposerLLMCallStatus.SUCCESS else error_message,
+                                ),
+                            )
                         if provider_custody is not None:
                             provider_custody.retain_audit(call)
                         if recorder is not None:
@@ -738,12 +808,14 @@ class ProviderGateway:
         provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Call the diagnostics text model and record one redacted audit row."""
+        private_request = capture_provider_context(messages=messages, tools=None)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        failure_to_capture: Exception | None = None
         try:
             provider_response = await asyncio.wait_for(
                 self._call_text_llm(messages, provider_custody=provider_custody)
@@ -780,7 +852,8 @@ class ProviderGateway:
             response_metadata = admitted_metadata
             status = ComposerLLMCallStatus.SUCCESS
             return content.strip()
-        except TimeoutError:
+        except TimeoutError as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.TIMEOUT
             error_class = "TimeoutError"
             error_message = "TimeoutError"
@@ -792,6 +865,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except OpenAIError as exc:
+            failure_to_capture = exc
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
@@ -799,6 +873,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except _MalformedLLMResponseError as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             response_metadata = exc.provider_metadata
             error_class = type(exc).__name__
@@ -806,6 +881,7 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except _BadRequestLLMError as exc:
+            failure_to_capture = exc
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
@@ -813,12 +889,14 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             error_class = type(exc).__name__
             error_message = "credential_material_rejected"
             attach_llm_calls(exc, recorder)
             raise
         except Exception as exc:
+            failure_to_capture = exc
             status = ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
@@ -846,6 +924,8 @@ class ProviderGateway:
                             error_class=error_class,
                             error_message=error_message,
                             provider_custody=provider_custody,
+                            failure=failure_to_capture,
+                            private_request=private_request,
                         )
                         if provider_custody is not None:
                             provider_custody.retain_audit(call)

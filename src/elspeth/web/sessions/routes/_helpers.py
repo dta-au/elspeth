@@ -66,7 +66,11 @@ from elspeth.web.composer.audit import (
     llm_call_audit_envelope,
     llm_call_audit_summary,
 )
-from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.audit_storage import (
+    private_diagnostic_drafts,
+    private_tool_invocation_draft,
+    redacted_tool_invocation_content_and_envelope,
+)
 from elspeth.web.composer.control_messages import replay_composer_control_message
 from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
@@ -589,6 +593,10 @@ def _message_response(
     row whose call id has a rejection row carries it as ``rejection``. Every
     other caller omits it and the field stays ``None``.
     """
+    from elspeth.web.composer.diagnostic_evidence import is_diagnostic_evidence_envelope
+
+    if msg.tool_calls is not None and any(is_diagnostic_evidence_envelope(envelope) for envelope in msg.tool_calls):
+        raise AuditIntegrityError("Private Composer evidence cannot be projected into a public message")
     tool_calls = deep_thaw(msg.tool_calls) if msg.tool_calls is not None else None
     if tool_calls is not None and tool_outcomes:
         stamped: list[Any] = []
@@ -1540,11 +1548,11 @@ _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER = metrics.get_meter(__name__).cre
     "composer.audit.tool_row_persist_failed_during_unwind_total",
     unit="1",
     description=(
-        "Count of audit ROWS that failed to become durable on the unwind "
+        "Count of prepared audit rows in failed persistence attempts on the unwind "
         "path (a primary failure was already in flight; the failure is "
         "recorded but does not raise so it cannot mask the primary "
-        "exception). Cohort persistence adds the cohort's row count per "
-        "failure, preserving the per-row unit of the loop it replaced."
+        "exception). Includes private diagnostic drafts; replay deduplication "
+        "means this is not a count of newly lost durable rows."
     ),
 )
 
@@ -1831,8 +1839,14 @@ def _composer_chat_history(messages: Sequence[ChatMessageRecord]) -> list[Compos
     request that produced them creates orphan OpenAI tool messages. Keep them
     in storage, but exclude them from prompt history and normal chat responses.
     """
+    from elspeth.web.composer.diagnostic_evidence import is_diagnostic_evidence_envelope
+
     history: list[ComposerHistoryMessage] = []
     for message in messages:
+        if message.tool_calls is not None and any(is_diagnostic_evidence_envelope(envelope) for envelope in message.tool_calls):
+            if message.role != "audit" or len(message.tool_calls) != 1 or message.writer_principal != "compose_loop":
+                raise AuditIntegrityError("Private Composer evidence requires a dedicated Composer audit row")
+            continue
         control = replay_composer_control_message(
             stored_role=message.role,
             writer_principal=message.writer_principal,
@@ -2021,6 +2035,10 @@ async def _persist_tool_invocations(
         pipeline_bindings: list[PipelineDispatchAuditBinding] = []
         for invocation in tool_invocations:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            drafts.extend(private_diagnostic_drafts(invocation, context=session_operation_context))
+            drafts.append(
+                private_tool_invocation_draft(invocation, session_id=str(session_id), session_operation_context=session_operation_context)
+            )
             drafts.append(
                 AuditMessageDraft(
                     role=role,
@@ -2072,13 +2090,11 @@ async def _persist_tool_invocations(
         if plugin_crash_pending and not required_audit:
             # Unwind path: a primary failure is already in flight.
             # Counting + slog preserves audibility without masking
-            # the original exception. The counter unit is ROWS lost,
-            # not cohorts: the atomic cohort makes every buffered row
-            # non-durable at once, and dashboards calibrated to the
-            # per-row loop this replaced must keep reading evidence
-            # loss at the same magnitude.
+            # the original exception. Count every prepared row in the
+            # failed attempt, including variable diagnostic siblings.
+            # Replay deduplication may find some rows already durable.
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                len(tool_invocations),
+                len(drafts),
                 {"helper": "tool_invocations"},
             )
             slog.error(
@@ -2176,6 +2192,7 @@ async def _persist_llm_calls(
             )
             for call in llm_calls
         )
+        drafts += tuple(draft for call in llm_calls for draft in private_diagnostic_drafts(call, context=session_operation_context))
     except BaseException as error:
         if producer is not None and sql is not None and projection is not None:
             producer.complete_owned(error)
@@ -2208,11 +2225,10 @@ async def _persist_llm_calls(
         if sql is not None and projection is not None and sql.complete:
             projection.complete_without_submission()
         if plugin_crash_pending and not required_audit:
-            # Counter unit is ROWS lost (see _persist_tool_invocations);
-            # the log lists the full cohort so a 12-call loss stays
-            # forensically distinct from a 1-call loss.
+            # Count prepared rows in the failed attempt (see
+            # _persist_tool_invocations); the log lists every model.
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                len(llm_calls),
+                len(drafts),
                 {"helper": "llm_calls"},
             )
             slog.error(
@@ -2255,6 +2271,7 @@ async def _persist_turn_audit_cohort(
     required_audit: bool = False,
     required_work: RequiredWorkCoordinator | None = None,
     session_operation_context: SessionOperationContext,
+    additional_drafts: tuple[AuditMessageDraft, ...] = (),
 ) -> tuple[PipelineDispatchAuditBinding, ...]:
     """Settle one turn's tool AND LLM audit rows as a single atomic cohort.
 
@@ -2286,7 +2303,7 @@ async def _persist_turn_audit_cohort(
     were already committed by ``persist_compose_turn`` drain only LLM
     calls here); both empty is a no-op.
     """
-    if not tool_invocations and not llm_calls:
+    if not tool_invocations and not llm_calls and not additional_drafts:
         return ()
     producer = sql = projection = None
     if required_work is not None:
@@ -2302,10 +2319,19 @@ async def _persist_turn_audit_cohort(
         role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
         tool_csid = str(tool_composition_state_id) if tool_composition_state_id else None
         llm_csid = str(llm_composition_state_id) if llm_composition_state_id else None
-        drafts: list[AuditMessageDraft] = []
+        drafts: list[AuditMessageDraft] = list(additional_drafts)
         pipeline_bindings: list[PipelineDispatchAuditBinding] = []
         for invocation in tool_invocations:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            drafts.extend(private_diagnostic_drafts(invocation, context=session_operation_context, composition_state_id=tool_csid))
+            drafts.append(
+                private_tool_invocation_draft(
+                    invocation,
+                    session_id=str(session_id),
+                    session_operation_context=session_operation_context,
+                    composition_state_id=tool_csid,
+                )
+            )
             drafts.append(
                 AuditMessageDraft(
                     role=role,
@@ -2319,6 +2345,7 @@ async def _persist_turn_audit_cohort(
             if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
                 pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
         for call in llm_calls:
+            drafts.extend(private_diagnostic_drafts(call, context=session_operation_context, composition_state_id=llm_csid))
             drafts.append(
                 AuditMessageDraft(
                     role="audit",
@@ -2359,11 +2386,10 @@ async def _persist_turn_audit_cohort(
         if sql is not None and projection is not None and sql.complete:
             projection.complete_without_submission()
         if plugin_crash_pending and not required_audit:
-            # Counter unit is ROWS lost (see _persist_tool_invocations):
-            # the whole turn — tool rows AND LLM sidecars — failed to
-            # become durable together.
+            # Count prepared rows in the failed attempt, including tool,
+            # LLM and private diagnostic siblings (see _persist_tool_invocations).
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                len(tool_invocations) + len(llm_calls),
+                len(drafts),
                 {"helper": "turn_audit_cohort"},
             )
             slog.error(

@@ -30,11 +30,13 @@ from typing import Any, Final, NotRequired, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 from pydantic import ValidationError as PydanticValidationError
+from pydantic_core import ErrorDetails
 from sqlalchemy import Engine
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.emitted_option import emitted_option_values, env_placeholders_in
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
@@ -63,6 +65,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._producer_resolver import published_success_connection
+from elspeth.web.composer._validation_probe import is_inline_content_reference
 from elspeth.web.composer.plugin_policy_disclosure import (
     WEB_PROHIBITED_PLUGIN_EXPLANATION,
     ProhibitedPluginDisclosure,
@@ -71,6 +74,7 @@ from elspeth.web.composer.plugin_policy_disclosure import (
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import (
+    CandidateReviewReferenceFacts,
     CompositionState,
     EdgeSpec,
     NodeSpec,
@@ -93,6 +97,7 @@ from elspeth.web.interpretation_state import (
     SOURCE_COMPONENT_ID,
     InterpretationRequirement,
     ServerStagedRequiredControlUserTerm,
+    UnknownInterpretationRequirementError,
     composer_pipeline_decision_user_term_error,
     parse_interpretation_requirements,
     project_planner_context_interpretation_requirement,
@@ -224,7 +229,7 @@ def _authored_interpretation_requirement_id(
     user_term: str,
     source: bool = False,
 ) -> str:
-    """Project one admitted author shell onto its canonical server-owned ID."""
+    """Project the ID using user_term.strip() only; preserve internal spaces and case."""
     normalized_user_term = user_term.strip()
     return f"source_review:{normalized_user_term}" if source else f"{normalized_user_term}:{component_id}"
 
@@ -1288,6 +1293,7 @@ def _failure_result(
     with_state_validation: bool = True,
     plugin_identity: tuple[str, str] | None = None,
     rejected_component: str | None = None,
+    review_reference: CandidateReviewReferenceFacts | None = None,
 ) -> ToolResult:
     """Build a ToolResult for a failed mutation.
 
@@ -1320,6 +1326,7 @@ def _failure_result(
             error_code=error_code,
             plugin_identity=plugin_identity,
             rejected_component=rejected_component,
+            review_reference=review_reference,
         )
     else:
         validation = _rejection_only_validation(
@@ -1327,6 +1334,7 @@ def _failure_result(
             error_code=error_code,
             plugin_identity=plugin_identity,
             rejected_component=rejected_component,
+            review_reference=review_reference,
         )
     return ToolResult(
         success=False,
@@ -1363,6 +1371,13 @@ def review_reconciliation_failure_message(exc: BaseException, *, retry_hint: str
     rejected option keys and VALUES from plugin prevalidation (the
     ``_prevalidate_plugin_options`` message family).
     """
+    if isinstance(exc, UnknownInterpretationRequirementError):
+        retry_hint = (
+            "Repair the rejected candidate's prompt_template_parts using one of its exact valid requirement IDs, "
+            "or add the intended authorable requirement shell to that candidate. "
+            "Node requirement IDs use user_term.strip() + ':' + node_id; internal spaces, case and punctuation "
+            "are unchanged. Re-emit the intended candidate; the current saved graph does not contain a rejected new node."
+        )
     reason = str(exc).strip().rstrip(".")
     if not reason:
         return f"{REVIEW_RECONCILIATION_FAILURE_PREFIX}. {retry_hint}"
@@ -1481,6 +1496,7 @@ def _prepend_rejection_entry(
     error_code: str | None = None,
     plugin_identity: tuple[str, str] | None = None,
     rejected_component: str | None = None,
+    review_reference: CandidateReviewReferenceFacts | None = None,
 ) -> ValidationSummary:
     """Return a ValidationSummary with a leading rejected_mutation entry.
 
@@ -1496,6 +1512,7 @@ def _prepend_rejection_entry(
         error_code=error_code,
         plugin_identity=plugin_identity,
         rejected_component=rejected_component,
+        review_reference=review_reference,
     )
     return ValidationSummary(
         is_valid=False,
@@ -1513,6 +1530,7 @@ def _rejection_only_validation(
     error_code: str | None = None,
     plugin_identity: tuple[str, str] | None = None,
     rejected_component: str | None = None,
+    review_reference: CandidateReviewReferenceFacts | None = None,
 ) -> ValidationSummary:
     """Return a ValidationSummary holding only a rejected_mutation entry.
 
@@ -1530,6 +1548,7 @@ def _rejection_only_validation(
         error_code=error_code,
         plugin_identity=plugin_identity,
         rejected_component=rejected_component,
+        review_reference=review_reference,
     )
     return ValidationSummary(is_valid=False, errors=(rejection,))
 
@@ -2216,7 +2235,7 @@ def _deferred_value_source_error(
     plugin_type: PluginKind,
     plugin_name: str,
 ) -> str | None:
-    """Enforce ``VALUE_SOURCES`` when a deferred value made validated construction impossible.
+    """Enforce knowable declarations when a deferred value prevents construction.
 
     A deferred field (``secret_ref`` marker, ``inline_content`` blob) is withheld
     before construction, so a config model that requires it cannot be built and
@@ -2246,6 +2265,13 @@ def _deferred_value_source_error(
         # before, and not a claim that they pass.
         return None
 
+    # After-model validators cannot run while a nested blob string is deferred.
+    # Emitted-value declarations can still inspect the authored sibling options
+    # without inventing blob contents or relaxing placeholder protection.
+    for path, value, reason in emitted_option_values(config_cls, options):
+        if env_placeholders_in(value):
+            return f"Invalid options for {plugin_type} '{plugin_name}': {path} must not contain environment-variable placeholders; {reason}"
+
     shaped_options = dict(options)
     for key in deferred_keys:
         shaped_options[key] = _DEFERRED_FIELD_SHAPE_PLACEHOLDER
@@ -2256,6 +2282,24 @@ def _deferred_value_source_error(
     if not findings:
         return None
     return f"Invalid options for {plugin_type} '{plugin_name}': " + "; ".join(f.reason for f in findings)
+
+
+def _deferred_nested_blob_key(error: ErrorDetails) -> str | None:
+    """Identify only a deferred string value at a supported nested mapping path.
+
+    Keep sibling, container and extra-field errors. No replacement content is
+    invented, and list paths remain outside the inline-blob field-path protocol.
+    """
+    location = error["loc"]
+    if (
+        len(location) > 1
+        and type(location[0]) is str
+        and all(type(part) is str for part in location)
+        and error["type"] == "string_type"
+        and is_inline_content_reference(error["input"])
+    ):
+        return location[0]
+    return None
 
 
 def _prevalidate_plugin_options(
@@ -2353,7 +2397,13 @@ def _prevalidate_plugin_options(
     try:
         config = config_cls.from_dict(merged, plugin_name=plugin_name)
     except PluginConfigError as exc:
-        if not secret_ref_keys and not blob_inline_ref_keys:
+        cause = exc.__cause__
+        nested_blob_keys = (
+            {key for error in cause.errors() if (key := _deferred_nested_blob_key(error)) is not None}
+            if isinstance(cause, PydanticValidationError)
+            else set()
+        )
+        if not secret_ref_keys and not blob_inline_ref_keys and not nested_blob_keys:
             # No secret refs were stripped — report the error as-is.
             msg = exc.cause if exc.cause is not None else str(exc)
             return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
@@ -2372,15 +2422,24 @@ def _prevalidate_plugin_options(
                 # type-safe generic placeholder. Preserve its established
                 # field-level filtering while retaining every unrelated error
                 # discovered after the secret placeholder unblocked validation.
-                if blob_inline_ref_keys:
-                    placeholder_cause = placeholder_exc.__cause__
-                    if isinstance(placeholder_cause, PydanticValidationError):
+                placeholder_cause = placeholder_exc.__cause__
+                if isinstance(placeholder_cause, PydanticValidationError):
+                    placeholder_nested_keys = {
+                        key for error in placeholder_cause.errors() if (key := _deferred_nested_blob_key(error)) is not None
+                    }
+                    if blob_inline_ref_keys or placeholder_nested_keys:
                         remaining = [
-                            error for error in placeholder_cause.errors() if not (error["loc"] and error["loc"][0] in blob_inline_ref_keys)
+                            error
+                            for error in placeholder_cause.errors()
+                            if not (error["loc"] and error["loc"][0] in blob_inline_ref_keys) and _deferred_nested_blob_key(error) is None
                         ]
                         if not remaining:
                             return _deferred_value_source_error(
-                                config_cls, placeholder_options, secret_ref_keys | blob_inline_ref_keys, plugin_type, plugin_name
+                                config_cls,
+                                placeholder_options,
+                                secret_ref_keys | blob_inline_ref_keys | placeholder_nested_keys,
+                                plugin_type,
+                                plugin_name,
                             )
                         lines = "; ".join(f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}" for error in remaining)
                         return f"Invalid options for {plugin_type} '{plugin_name}': {lines}"
@@ -2391,15 +2450,18 @@ def _prevalidate_plugin_options(
             # Only inline blob refs were withheld. Filter out field-level
             # errors on those deferred fields while retaining every unrelated
             # validation failure.
-            cause = exc.__cause__
             if not isinstance(cause, PydanticValidationError):
                 # ValueError path (model validators) — can't filter per-field.
                 msg = exc.cause if exc.cause is not None else str(exc)
                 return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
-            remaining = [e for e in cause.errors() if not (e["loc"] and e["loc"][0] in blob_inline_ref_keys)]
+            remaining = [
+                e for e in cause.errors() if not (e["loc"] and e["loc"][0] in blob_inline_ref_keys) and _deferred_nested_blob_key(e) is None
+            ]
             if not remaining:
-                return _deferred_value_source_error(config_cls, placeholder_options, blob_inline_ref_keys, plugin_type, plugin_name)
+                return _deferred_value_source_error(
+                    config_cls, placeholder_options, blob_inline_ref_keys | nested_blob_keys, plugin_type, plugin_name
+                )
 
             # Re-format only the non-deferred errors.
             lines = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in remaining)

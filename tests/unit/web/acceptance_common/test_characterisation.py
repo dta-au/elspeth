@@ -6,13 +6,11 @@ stored receipt per ECS ``_RECEIPT_KINDS`` member (both compatibility-record
 scenarios), the exec-receipt sentinel each exec kind encodes to, the two
 compatibility records the gate reads, and the schema facts, each as byte-exact
 canonical JSON with its sha256 pinned. These tests replay every entry through
-the validators as they stand now and demand the same bytes back.
-
-Two of the pins depend on the live schema epochs (the compatibility receipts
-and the schema facts). While the live epochs equal the recorded ones the bytes
-must match exactly; once a schema bump moves them the corpus entry must be
-REFUSED (``receipt_store_binding``) — the property the structural-changes label
-exists to guarantee — and the epoch-independent entries must still match.
+the validators as they stand now. Unchanged receipt contracts retain their
+bytes. Historical v2 compatibility receipts remain evidence of the former
+upgrade policy and are refused by the current new-store-only authority:
+Scenario A has an obsolete schema, and Scenario B is unsupported. The corpus
+is deliberately preserved rather than rewritten into evidence of today's policy.
 """
 
 from __future__ import annotations
@@ -23,17 +21,17 @@ from pathlib import Path
 
 import pytest
 
-from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._acceptance_common import receipt_validation, schema_facts
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError
 from elspeth.web._aws_ecs_acceptance import receipt_contracts
-from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 CORPUS_PATH = Path(__file__).parent / "corpus" / "ecs_receipts.json"
 CORPUS = json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
-EPOCHS_UNCHANGED = CORPUS["live_epochs_at_generation"] == {"session_epoch": SESSION_SCHEMA_EPOCH, "landscape_epoch": SQLITE_SCHEMA_EPOCH}
-EPOCH_DEPENDENT = frozenset({"compatibility-record:A", "compatibility-record:B"})
+HISTORICAL_COMPATIBILITY_REFUSALS = {
+    "compatibility-record:A": "receipt_store_schema",
+    "compatibility-record:B": "compatibility_transition_unsupported",
+}
 
 
 def _canonical(document: object) -> str:
@@ -47,10 +45,10 @@ def _sha256(text: str) -> str:
 INTRODUCED_AFTER_CORPUS = frozenset({"testcontainer-run"})
 """Receipt kinds added to the ECS binding after the corpus was generated (6b-4 option (b)).
 
-The corpus is never regenerated, so a kind introduced later has no entry; it is
-NEW, not a field on an existing receipt, which is why every pre-existing entry
-still validates byte-for-byte. Widening this set is a deliberate act, never a
-side effect of adding a kind.
+The corpus is never regenerated, so a kind introduced later has no entry.
+Existing compatibility entries retain their former bytes and now assert
+refusal. Widening this set is a deliberate act, never a side effect of adding
+a kind.
 """
 
 
@@ -70,8 +68,8 @@ def test_corpus_is_the_pre_extraction_tree_and_self_consistent() -> None:
 def test_stored_receipt_bytes_are_identical_after_extraction(key: str) -> None:
     entry = CORPUS["stored_receipts"][key]
     payload = json.loads(entry["canonical"])
-    if key in EPOCH_DEPENDENT and not EPOCHS_UNCHANGED:
-        with pytest.raises(AcceptanceCheckError, match="receipt_store_binding"):
+    if key in HISTORICAL_COMPATIBILITY_REFUSALS:
+        with pytest.raises(AcceptanceCheckError, match=HISTORICAL_COMPATIBILITY_REFUSALS[key]):
             receipt_contracts._validate_stored_receipt(payload, **entry["validate_kwargs"])
         return
     accepted = receipt_contracts._validate_stored_receipt(payload, **entry["validate_kwargs"])
@@ -102,19 +100,20 @@ def test_exec_receipt_sentinels_encode_and_extract_to_the_same_bytes(key: str) -
 
 @pytest.mark.parametrize("scenario_id", ["A", "B"])
 def test_schema_facts_have_one_source(scenario_id: str) -> None:
-    """The ECS module, the shared module and the corpus agree byte-for-byte (while the epochs stand)."""
+    """Live facts have one authority; the immutable corpus records the former policy."""
     live = _canonical(schema_facts._expected_schema_facts(scenario_id))
     assert _canonical(receipt_contracts._expected_schema_facts(scenario_id)) == live
     assert receipt_contracts._expected_schema_facts is schema_facts._expected_schema_facts
     recorded = CORPUS["expected_schema_facts"][scenario_id]
-    if EPOCHS_UNCHANGED:
-        assert live == recorded["canonical"]
-        assert _sha256(live) == recorded["sha256"]
-    else:
-        assert live != recorded["canonical"]
+    assert live != recorded["canonical"]
+    assert _canonical(json.loads(recorded["canonical"])) == recorded["canonical"]
+    assert _sha256(recorded["canonical"]) == recorded["sha256"]
+    facts = json.loads(live)
+    assert facts["store_policy"] == "new_store_only"
+    assert facts["existing_store_action"] == "preserve_and_refuse"
+    assert facts["in_place_upgrade_supported"] is False
     assert receipt_contracts._SCENARIO_B_STRUCTURAL_CHANGES is schema_facts._SCENARIO_B_STRUCTURAL_CHANGES
-    if EPOCHS_UNCHANGED:
-        assert CORPUS["scenario_b_structural_changes"] == schema_facts._SCENARIO_B_STRUCTURAL_CHANGES
+    assert CORPUS["scenario_b_structural_changes"] != schema_facts._SCENARIO_B_STRUCTURAL_CHANGES
 
 
 def test_ecs_module_reaches_the_shared_validators_by_identity() -> None:

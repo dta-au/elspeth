@@ -38,7 +38,7 @@ from elspeth.core.landscape.run_coordination_repository import fenced_leader_tra
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, audit_export_snapshot_chunks_table
 from elspeth.core.landscape.schema import schema_identity_table as landscape_schema_identity_table
 from elspeth.core.schema_identity import SCHEMA_IDENTITY_APPLICATION_ID
-from elspeth.core.schema_shape import _text_builtin_identity_rows_on_connection
+from elspeth.core.schema_shape import _text_builtin_identity_rows_on_connection, database_target_is_empty
 from elspeth.web import schema_probe as schema_probe_module
 from elspeth.web.preferences.models import UpdateComposerPreferencesRequest
 from elspeth.web.preferences.service import PreferencesService, TutorialProgressConflict
@@ -55,6 +55,7 @@ from elspeth.web.sessions.models import (
     SESSION_SCHEMA_EPOCH,
     blob_inline_resolutions_table,
     blob_replacement_cleanups_table,
+    chat_messages_table,
     session_operation_receipts_table,
     skill_markdown_history_table,
     user_preferences_table,
@@ -335,7 +336,7 @@ def test_a_drifted_check_constraint_names_itself_on_postgresql(postgres_engine: 
     assert "identity_relationships.ck_identity_relationships_type" in message
     assert "CHECK constraint SQL mismatch" in message
     assert "sponsor" in message, "the FOUND side must survive the reflection round trip"
-    assert "Delete the old session database and restart" in message
+    assert "Preserve this store unchanged and configure an explicitly new session database" in message
     assert "did not produce the current schema" not in message
 
 
@@ -1298,7 +1299,7 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
 
 
 @pytest.mark.parametrize("object_name", ["auth_events", "run_attributions", "ix_tokens_run_id"])
-def test_additive_gap_is_repaired(postgres_engine: Engine, object_name: str) -> None:
+def test_additive_gap_is_preserved(postgres_engine: Engine, object_name: str) -> None:
     init_landscape_schema(postgres_engine)
     with postgres_engine.begin() as conn:
         if object_name.startswith("ix_"):
@@ -1306,8 +1307,134 @@ def test_additive_gap_is_repaired(postgres_engine: Engine, object_name: str) -> 
         else:
             conn.exec_driver_sql(f"DROP TABLE {object_name}")
     assert probe_landscape_schema(postgres_engine) is SchemaState.PARTIAL
-    init_landscape_schema(postgres_engine)
-    assert probe_landscape_schema(postgres_engine) is SchemaState.CURRENT
+    before_tables = inspect(postgres_engine).get_table_names()
+    before_indexes = inspect(postgres_engine).get_indexes("tokens")
+    with pytest.raises(SchemaCompatibilityError, match="Preserve this store unchanged"):
+        init_landscape_schema(postgres_engine)
+    assert probe_landscape_schema(postgres_engine) is SchemaState.PARTIAL
+    assert inspect(postgres_engine).get_table_names() == before_tables
+    assert inspect(postgres_engine).get_indexes("tokens") == before_indexes
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        "CREATE VIEW retained AS SELECT 1 AS value",
+        "CREATE TYPE retained AS ENUM ('kept')",
+        "CREATE SEQUENCE retained",
+        "CREATE FUNCTION retained() RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+        "CREATE TEXT SEARCH CONFIGURATION retained (COPY = pg_catalog.simple)",
+    ],
+)
+@pytest.mark.parametrize("store", ["session", "landscape"])
+def test_tableless_postgres_objects_refuse_initialization(postgres_engine: Engine, ddl: str, store: str) -> None:
+    with postgres_engine.begin() as conn:
+        conn.exec_driver_sql(ddl)
+    probe, initialize, error = (
+        (probe_session_schema, init_session_schema, SessionSchemaError)
+        if store == "session"
+        else (probe_landscape_schema, init_landscape_schema, SchemaCompatibilityError)
+    )
+    assert probe(postgres_engine) is SchemaState.STALE
+    with pytest.raises(error):
+        initialize(postgres_engine)
+    assert inspect(postgres_engine).get_table_names() == []
+
+
+@pytest.mark.parametrize("schema", ["public", "Mixed Case"])
+@pytest.mark.parametrize("store", ["session", "landscape"])
+def test_empty_postgres_target_accepts_and_preserves_bootstrap_default_privileges(postgres_engine: Engine, schema: str, store: str):
+    acl_query = text("SELECT oid, defaclrole, defaclnamespace, defaclobjtype, defaclacl::text FROM pg_catalog.pg_default_acl ORDER BY oid")
+    with postgres_engine.begin() as conn:
+        if schema != "public":
+            conn.exec_driver_sql('CREATE SCHEMA "Mixed Case"')
+        conn.exec_driver_sql(f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" GRANT SELECT ON TABLES TO PUBLIC')
+        before = conn.execute(acl_query).all()
+        assert before
+    target = create_engine(postgres_engine.url)
+
+    @event.listens_for(target, "connect")
+    def select_schema(dbapi_connection, _connection_record):
+        with dbapi_connection.cursor() as cursor:
+            cursor.execute(f'SET search_path TO "{schema}"')
+        dbapi_connection.commit()
+
+    try:
+        assert database_target_is_empty(target)
+        if store == "session":
+            init_session_schema(target)
+        else:
+            init_landscape_schema(target)
+        with target.connect() as conn:
+            assert conn.execute(acl_query).all() == before
+            assert not database_target_is_empty(conn)
+    finally:
+        target.dispose()
+
+
+@pytest.mark.parametrize("schema", ["pg_catalog", "information_schema", "missing_application_schema"])
+def test_system_or_missing_postgres_target_is_not_empty(postgres_engine: Engine, schema: str):
+    with postgres_engine.begin() as conn:
+        conn.exec_driver_sql(f'SET search_path TO "{schema}"')
+        assert not database_target_is_empty(conn)
+
+
+def test_quoted_postgres_target_with_existing_object_is_not_empty(postgres_engine: Engine):
+    with postgres_engine.begin() as conn:
+        conn.exec_driver_sql('CREATE SCHEMA "Mixed Case"')
+        conn.exec_driver_sql('SET search_path TO "Mixed Case"')
+        assert database_target_is_empty(conn)
+        conn.exec_driver_sql("CREATE TEXT SEARCH CONFIGURATION retained (COPY = pg_catalog.simple)")
+        assert not database_target_is_empty(conn)
+
+
+@pytest.mark.parametrize("violation", [None, "mixed_first", "mixed_last", "wrong_role", "wrong_writer"])
+def test_private_transcript_sql_on_postgres_preserves_custody_without_hydration(postgres_engine: Engine, violation, monkeypatch):
+    init_session_schema(postgres_engine)
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="reader")
+    service = SessionServiceImpl(postgres_engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session = asyncio.run(service.create_session("reader", "Private transcript", "local"))
+    public_id, private_id = str(uuid.uuid4()), str(uuid.uuid4())
+    calls = [{"_kind": "composer_diagnostic_evidence", "damaged_body": "x" * (1024 * 1024)}]
+    if violation in {"mixed_first", "mixed_last"}:
+        calls.insert(0 if violation == "mixed_last" else 1, {"_kind": "llm_call_audit"})
+    with postgres_engine.begin() as conn:
+        for message_id, sequence, role, writer, tool_calls in [
+            (public_id, 1, "user", "route_user_message", None),
+            (
+                private_id,
+                2,
+                "assistant" if violation == "wrong_role" else "audit",
+                "route_user_message" if violation == "wrong_writer" else "compose_loop",
+                calls,
+            ),
+        ]:
+            conn.execute(
+                insert(chat_messages_table).values(
+                    id=message_id,
+                    session_id=str(session.id),
+                    sequence_no=sequence,
+                    role=role,
+                    writer_principal=writer,
+                    content="retained",
+                    tool_calls=tool_calls,
+                    created_at=datetime.now(UTC),
+                )
+            )
+    convert = service._row_to_chat_message_record
+
+    def reject_private_hydration(row, *, operation_id=None):
+        assert row.id != private_id
+        return convert(row, operation_id=operation_id)
+
+    monkeypatch.setattr(service, "_row_to_chat_message_record", reject_private_hydration)
+    if violation is None:
+        transcript = asyncio.run(service.get_messages(session.id, limit=None, include_private_evidence=False))
+        assert [str(row.id) for row in transcript] == [public_id]
+    else:
+        with pytest.raises(AuditIntegrityError, match="dedicated Composer audit row"):
+            asyncio.run(service.get_messages(session.id, limit=None, include_private_evidence=False))
 
 
 def test_missing_core_landscape_table_is_stale_and_not_repaired(postgres_engine: Engine) -> None:

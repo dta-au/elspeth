@@ -244,7 +244,7 @@ files:
   src/elspeth/core/secrets.py:
     dict[str, Any]: 4
   src/elspeth/core/template_materialization.py:
-    Mapping[str, Any]: 2
+    Mapping[str, Any]: 3
     Mapping[str, object]: 1
     dict[str, Any]: 4
   src/elspeth/engine/coalesce_executor.py:
@@ -602,8 +602,8 @@ files:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/reference_join.py:
     Mapping[str, Any]: 1
-    Mapping[str, object]: 3
-    dict[str, Any]: 6
+    Mapping[str, object]: 4
+    dict[str, Any]: 11
     dict[str, object]: 2
   src/elspeth/plugins/transforms/report_assemble.py:
     dict[str, Any]: 2
@@ -664,7 +664,7 @@ files:
     Mapping[str, object]: 5
     dict[str, object]: 2
   src/elspeth/web/_aws_ecs_acceptance/control_service.py:
-    dict[str, object]: 4
+    dict[str, object]: 5
   src/elspeth/web/_aws_ecs_acceptance/ecs_metadata.py:
     dict[str, object]: 2
   src/elspeth/web/_aws_ecs_acceptance/evidence.py:
@@ -830,6 +830,9 @@ files:
     Mapping[str, object]: 1
   src/elspeth/web/composer/reasoning.py:
     dict[str, object]: 1
+  src/elspeth/web/composer/recovery_controls.py:
+    Mapping[str, Any]: 1
+    dict[str, object]: 3
   src/elspeth/web/composer/redaction.py:
     Mapping[str, Any]: 1
     Mapping[str, object]: 3
@@ -1054,10 +1057,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 751
-  Mapping[str, object]: 312
+  Mapping[str, Any]: 753
+  Mapping[str, object]: 313
   MutableMapping[str, Any]: 8
   boundary: 59
-  dict[str, Any]: 1068
-  dict[str, object]: 390
-  soft: 2529
+  dict[str, Any]: 1073
+  dict[str, object]: 394
+  soft: 2541

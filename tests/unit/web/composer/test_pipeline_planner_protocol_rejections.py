@@ -127,6 +127,9 @@ async def test_terminal_batched_with_discovery_is_repaired_without_dispatch(
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
     assert len(completion.requests) == 2
+    assert [candidate.status for candidate in recorder.private_candidates] == ["received_not_dispatched", "accepted"]
+    assert recorder.private_candidates[0].result_canonical is None
+    assert "pipeline" in json.loads(recorder.private_candidates[0].arguments_canonical)
     assert recorder.llm_calls[0].status is ComposerLLMCallStatus.SUCCESS
     # Neither the discovery sibling nor the batched proposal was executed.
     assert [invocation.tool_name for invocation in recorder.invocations if invocation.tool_name == "list_sources"] == []
@@ -169,6 +172,7 @@ async def test_terminal_batched_with_discovery_spends_repair_budget_then_termina
 
     assert caught.value.code == "REPAIR_EXHAUSTED"
     assert len(completion.requests) == 1
+    assert [candidate.status for candidate in recorder.private_candidates] == ["received_not_dispatched"]
     (attempt,) = recorder.planner_attempts
     assert attempt.outcome is ComposerPlannerAttemptOutcome.GUARD_FIRED
     assert attempt.planner_code is ComposerPlannerCode.REPAIR_EXHAUSTED

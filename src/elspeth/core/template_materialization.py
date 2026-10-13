@@ -49,6 +49,12 @@ class FileBackedTemplateOption:
     content_kind: ContentKind
 
 
+@dataclass(frozen=True, slots=True)
+class MaterializedFileOption:
+    content: object
+    source: str
+
+
 FILE_BACKED_TEMPLATE_OPTION_REGISTRY: tuple[FileBackedTemplateOption, ...] = (
     FileBackedTemplateOption(
         file_key="template_file",
@@ -123,6 +129,7 @@ class TemplateOptionMaterializer:
         source_settings: object | None = None,
     ) -> dict[str, Any]:
         config = dict(raw_config)
+        reference_contents: dict[Path, str] = {}
         for collection_name in PLUGIN_OPTION_COLLECTIONS:
             if collection_name not in config or type(config[collection_name]) is not list:
                 continue
@@ -137,6 +144,7 @@ class TemplateOptionMaterializer:
                     source_plugin=(
                         source_collection[index] if type(source_collection) is list and index < len(source_collection) else None
                     ),
+                    reference_contents=reference_contents,
                 )
                 for index, plugin_config in enumerate(collection)
             ]
@@ -151,35 +159,56 @@ class TemplateOptionMaterializer:
     ) -> dict[str, Any]:
         result = dict(options)
         for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY:
-            if rule.file_key not in result:
-                continue
-            if rule.content_key in result:
-                raise TemplateFileError(f"Cannot specify both '{rule.content_key}' and '{rule.file_key}'")
-            file_ref = result.pop(rule.file_key)
-            archived_content: Any = None
-            if run_mode is not RunMode.LIVE:
-                if (
-                    type(source_options) is not dict
-                    or rule.source_key not in source_options
-                    or source_options[rule.source_key] != file_ref
-                    or rule.content_key not in source_options
-                ):
-                    raise TemplateFileError(
-                        f"{rule.label} has no matching materialized content in the source run; replay/verify cannot read an unbound file"
-                    )
-                archived_content = source_options[rule.content_key]
-                if rule.content_kind == "text" and type(archived_content) is not str:
-                    raise TemplateFileError(f"{rule.label} source-run content is not retained as text")
-            if run_mode is RunMode.REPLAY:
-                result[rule.content_key] = archived_content
-            else:
-                file_path = _resolve_template_path(file_ref, self._settings_path, rule.label)
-                live_content = self._load_content(rule, file_path)
-                if run_mode is RunMode.VERIFY and live_content != archived_content:
-                    raise TemplateFileError(f"{rule.label} differs from source-run materialized content")
-                result[rule.content_key] = live_content
-            result[rule.source_key] = file_ref
+            materialized = self._materialize_file_option(result, rule, run_mode=run_mode, source_options=source_options)
+            if materialized is not None:
+                result.pop(rule.file_key)
+                result[rule.content_key] = materialized.content
+                result[rule.source_key] = materialized.source
         return result
+
+    def _materialize_file_option(
+        self,
+        options: Mapping[str, Any],
+        rule: FileBackedTemplateOption,
+        *,
+        run_mode: RunMode,
+        source_options: object | None,
+        reference_contents: dict[Path, str] | None = None,
+    ) -> MaterializedFileOption | None:
+        if rule.file_key not in options:
+            return None
+        if rule.content_key in options:
+            raise TemplateFileError(f"Cannot specify both '{rule.content_key}' and '{rule.file_key}'")
+        file_ref = options[rule.file_key]
+        if type(file_ref) is not str:
+            raise TemplateFileError(f"'{rule.file_key}' must be a string")
+        archived_content: Any = None
+        if run_mode is not RunMode.LIVE:
+            if (
+                type(source_options) is not dict
+                or rule.source_key not in source_options
+                or source_options[rule.source_key] != file_ref
+                or rule.content_key not in source_options
+            ):
+                raise TemplateFileError(
+                    f"{rule.label} has no matching materialized content in the source run; replay/verify cannot read an unbound file"
+                )
+            archived_content = source_options[rule.content_key]
+            if rule.content_kind == "text" and type(archived_content) is not str:
+                raise TemplateFileError(f"{rule.label} source-run content is not retained as text")
+        if run_mode is RunMode.REPLAY:
+            return MaterializedFileOption(content=archived_content, source=file_ref)
+        else:
+            file_path = _resolve_template_path(file_ref, self._settings_path, rule.label)
+            if reference_contents is None:
+                live_content = self._load_content(rule, file_path)
+            else:
+                if file_path not in reference_contents:
+                    reference_contents[file_path] = file_path.read_text(encoding="utf-8")
+                live_content = reference_contents[file_path]
+            if run_mode is RunMode.VERIFY and live_content != archived_content:
+                raise TemplateFileError(f"{rule.label} differs from source-run materialized content")
+            return MaterializedFileOption(content=live_content, source=file_ref)
 
     @staticmethod
     def reject_file_backed_options(raw_config: Mapping[str, object]) -> None:
@@ -194,6 +223,12 @@ class TemplateOptionMaterializer:
                 if type(options) is not dict:
                     continue
                 present = sorted(key for key in FILE_BACKED_TEMPLATE_OPTION_KEYS if key in options)
+                plugin_name = plugin_config["plugin"] if "plugin" in plugin_config else None
+                tables = options["tables"] if "tables" in options else None
+                if plugin_name == "reference_join" and type(tables) is dict:
+                    for table_name, table in tables.items():
+                        if type(table) is dict and "reference_file" in table:
+                            present.append(f"tables[{table_name!r}].reference_file")
                 if not present:
                     continue
                 raw_name = plugin_config["name"] if "name" in plugin_config else index
@@ -214,6 +249,7 @@ class TemplateOptionMaterializer:
         *,
         run_mode: RunMode,
         source_plugin: Any,
+        reference_contents: dict[Path, str],
     ) -> Any:
         if type(plugin_config) is not dict:
             return plugin_config
@@ -229,7 +265,35 @@ class TemplateOptionMaterializer:
                 candidate = source_plugin["options"] if "options" in source_plugin else None
                 if type(candidate) is dict:
                     source_options = candidate
-            plugin["options"] = self.materialize_options(options, run_mode=run_mode, source_options=source_options)
+            materialized = self.materialize_options(options, run_mode=run_mode, source_options=source_options)
+            plugin_name = plugin["plugin"] if "plugin" in plugin else None
+            raw_tables = options["tables"] if "tables" in options else None
+            if plugin_name == "reference_join" and type(raw_tables) is dict:
+                source_tables = source_options["tables"] if type(source_options) is dict and "tables" in source_options else None
+                tables = dict(raw_tables)
+                reference_rule = next(rule for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY if rule.file_key == "reference_file")
+                for table_name, table in tables.items():
+                    if type(table) is not dict:
+                        continue
+                    table_result = dict(table)
+                    source_table = source_tables[table_name] if type(source_tables) is dict and table_name in source_tables else None
+                    try:
+                        materialized_table = self._materialize_file_option(
+                            table_result,
+                            reference_rule,
+                            run_mode=run_mode,
+                            source_options=source_table,
+                            reference_contents=reference_contents,
+                        )
+                    except TemplateFileError as exc:
+                        raise TemplateFileError(f"Reference table {table_name!r}: {exc}") from exc
+                    if materialized_table is not None:
+                        table_result.pop(reference_rule.file_key)
+                        table_result[reference_rule.content_key] = materialized_table.content
+                        table_result[reference_rule.source_key] = materialized_table.source
+                    tables[table_name] = table_result
+                materialized["tables"] = tables
+            plugin["options"] = materialized
         return plugin
 
     def _load_content(self, rule: FileBackedTemplateOption, file_path: Path) -> Any:

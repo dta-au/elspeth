@@ -1328,10 +1328,12 @@ def test_persist_compose_turn_happy_path(service):
         rows = conn.execute(
             text("SELECT role, sequence_no, tool_call_id FROM chat_messages WHERE session_id='s6' ORDER BY sequence_no")
         ).fetchall()
-        assert [r.role for r in rows] == ["assistant", "tool"]
+        assert [r.role for r in rows] == ["assistant", "tool", "audit"]
         assert rows[0].sequence_no == 1
         assert rows[1].sequence_no == 2
         assert rows[1].tool_call_id == "tc_1"
+        assert rows[2].sequence_no == 3
+        assert rows[2].tool_call_id is None
 
         states = conn.execute(text("SELECT version, provenance FROM composition_states WHERE session_id='s6'")).fetchall()
         assert len(states) == 1
@@ -2050,7 +2052,7 @@ async def test_persist_compose_turn_async_caller_cancellation_commits_anyway(ser
 
     with service._engine.begin() as conn:
         count = conn.execute(text("SELECT COUNT(*) FROM chat_messages WHERE session_id='s_cancel'")).scalar()
-    assert count == 2  # assistant + tool
+    assert count == 3  # assistant + tool + private evidence
 
     # Counter MUST NOT have moved -- there was no IntegrityError, no
     # benign "fabricated Tier-1" event from the cancel path.
@@ -2137,8 +2139,8 @@ def test_persist_compose_turn_integrity_error_propagates(service):
         pytest.param(
             "unknown_writer_principal",
             {"writer_principal": "rogue_caller"},
-            r"ck_chat_messages_writer_principal",
-            id="ck_chat_messages_writer_principal",
+            r"compose_loop writer custody",
+            id="private_writer_custody",
         ),
     ],
 )
@@ -2148,11 +2150,7 @@ def test_persist_compose_turn_integrity_error_matrix(
     setup_kwargs,
     expected_match,
 ):
-    """Each scenario triggers a distinct §4.5 source via
-    persist_compose_turn's parameter surface; all flow through the
-    same handler. Asserts both the counter increments AND the
-    constraint name appears in the raised exception message."""
-    from sqlalchemy.exc import IntegrityError
+    """Private evidence rejects an unrelated writer before SQL or loss counters."""
 
     from elspeth.web.sessions._persist_payload import RedactedToolRow
     from elspeth.web.sessions.telemetry import observed_value
@@ -2174,12 +2172,10 @@ def test_persist_compose_turn_integrity_error_matrix(
     }
     base_kwargs.update(setup_kwargs)
 
-    with pytest.raises(IntegrityError, match=expected_match):
+    with pytest.raises(AuditIntegrityError, match=expected_match):
         service.persist_compose_turn(**base_kwargs)
 
-    assert observed_value(service._telemetry.tool_row_integrity_violation_total) == starting + 1, (
-        f"counter must increment for {scenario_name}"
-    )
+    assert observed_value(service._telemetry.tool_row_integrity_violation_total) == starting
 
 
 def test_persist_compose_turn_rejects_missing_parent_state_before_insert(service):

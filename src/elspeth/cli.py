@@ -2682,7 +2682,11 @@ def composer_users_remove(
         typer.echo("Aborted.")
         raise typer.Exit(1)
     resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
-    session_engine = _composer_session_engine(resolved_session_db_url)
+    try:
+        session_engine = _composer_session_engine(resolved_session_db_url)
+    except SessionSchemaError as exc:
+        typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
+        raise typer.Exit(1) from exc
     # The store must carry the current schema BEFORE the credential goes:
     # a deletion whose retirement then fails is the inheritance defect with
     # extra steps. Same create-or-validate rule the web app applies to this

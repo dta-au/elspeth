@@ -474,15 +474,19 @@ them; verification is an operator step in a trusted context [EV-221].
 Secret names referenced by `.github/workflows/*` at
 `487ac85a377f135e012bb206e3769cd65f6fadb8` (names only) [EV-223]:
 
-| Workflow | Trigger | Secrets referenced | Use |
+| Workflow | Trigger at snapshot (current hold noted) | Secrets referenced | Use |
 |---|---|---|---|
 | `ci.yaml` | Push and pull request to protected branches | `OPENROUTER_API_KEY` | Integration tests that call a live model |
 | `enforce-allowlist-judge-gates.yaml` | Push and pull request | `OPENROUTER_API_KEY` | Judge-quality policy check (no signing) |
-| `build-push.yaml` | After CI on `main`, version tags, manual | `GITHUB_TOKEN`, `ACR_REGISTRY`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | Push images to GHCR and Azure Container Registry; images are signed keyless with cosign through the workflow's OIDC token [EV-626] |
+| `build-push.yaml` | After CI on `main` (automatic publication now held), version tags, manual | `GITHUB_TOKEN`, `ACR_REGISTRY`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | Push images to GHCR and Azure Container Registry; images are signed keyless with cosign through the workflow's OIDC token [EV-626] |
 | `state-engine-live-provider.yml` | Manual only | `OPENROUTER_API_KEY`, `AZURE_API_KEY`, `AZURE_CLIENT_SECRET`, `AZURE_CONTENT_SAFETY_KEY`, `AZURE_DOCUMENT_INTELLIGENCE_KEY`, `AZURE_SEARCH_API_KEY`, `ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL`, `GATEWAY_BEARER` | Live-provider tests; each job runs in a named GitHub environment |
 | `codeql.yaml`, `composer-redaction-gate.yml`, `enforce-telemetry-backfill-trailer.yaml`, `mutation-testing.yaml`, `pages.yaml` | — | None | — |
 
-The table above records the historical snapshot. Automatic judge-quality
+The secret names above record the historical snapshot. Current
+[`build-push.yaml`](../../.github/workflows/build-push.yaml) still observes main
+CI completion, but its automatic build job is held; dependent smoke/release
+jobs are skipped on that path. Version-tag and admitted manual publication
+retain their existing qualification and signing checks. Automatic judge-quality
 validation has since been removed: the current `enforce-allowlist-judge-gates.yaml`
 runs deterministic C3 without provider credentials. The corpus and CLI remain
 available only by [explicit operator opt-in](../../config/cicd/judge-quality-corpus/README.md).

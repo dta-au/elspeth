@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.audit import begin_dispatch, finish_success
+from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
     RequiredWorkAuthority,
@@ -118,7 +119,25 @@ async def test_required_audit_owner_prepares_and_joins_actual_sql(tmp_path, monk
     }
     assert len(entered_sql) == (0 if failure_phase == "preparation" else 1)
     with engine.connect() as connection:
-        rows = connection.execute(select(chat_messages_table)).all()
-    assert len(rows) == (1 if failure_phase is None else 0)
+        rows = connection.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).all()
+    expected_count = (2 if helper == "dispatch" else 1) if failure_phase is None else 0
+    assert len(rows) == expected_count
+    if failure_phase is None:
+        assert all(row.role == "audit" and row.writer_principal == "compose_loop" and len(row.tool_calls) == 1 for row in rows)
+        envelopes = [row.tool_calls[0] for row in rows]
+        if helper == "dispatch":
+            assert [envelope["_kind"] for envelope in envelopes] == [DIAGNOSTIC_EVIDENCE_KIND, "audit"]
+            evidence = ComposerDiagnosticEvidence.from_envelope(
+                envelopes[0],
+                expected_session_id=str(session.id),
+                expected_operation_id=context.fence.operation_id,
+                expected_tool_call_id=invocation.tool_call_id,
+            )
+            assert evidence.operation_epoch == context.fence.operation_epoch
+            assert evidence.tool_name == invocation.tool_name and evidence.status == invocation.status.value
+            assert envelopes[1]["invocation"]["tool_call_id"] == invocation.tool_call_id
+        else:
+            assert [envelope["_kind"] for envelope in envelopes] == ["llm_call_audit"]
+            assert envelopes[0]["call"]["call_id"] == call.call_id
     authority.release(context)
     engine.dispose()

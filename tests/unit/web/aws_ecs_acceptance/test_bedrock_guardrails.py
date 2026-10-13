@@ -256,6 +256,8 @@ async def test_verify_bedrock_suppresses_fd_output_on_success(capfd: pytest.Capt
         os.write(2, b"raw-success-provider-model-request-id-content-stderr\n")
         return _bedrock_response()
 
+    # Measure acceptance output after the async runner's setup output.
+    capfd.readouterr()
     receipt = await acceptance.verify_bedrock(_bedrock_env(), completion=noisy_success)
 
     captured = capfd.readouterr()

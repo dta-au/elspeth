@@ -1515,7 +1515,81 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `pdf_rasterize` | Render each page of a payload-store PDF into a PNG payload, one output row per page — the on-ramp for multipage PDFs into `aws_textract_inline_analysis` |
 | `azure_ai_search` | Azure RAG: enriches rows with ranked, cited context from an existing Azure AI Search index ([example](../../examples/azure_search_rag/README.md)) |
 | `rag_retrieval` | Enriches rows with retrieval-augmented context from a Chroma collection |
-| `reference_join` | Add named fields to a row by matching one of its values against a key in a reference table bound as configuration (`reference_file` on the CLI, an `inline_content` blob on the web) — fixed at run start, never read at row time |
+| `reference_join` | Add named fields through one or several independent lookups against configuration-bound reference tables (`reference_file` on the CLI, an `inline_content` blob on the web) — fixed at run start, never read at row time |
+
+### Multiple reference lookups
+
+Use `tables` to name each reference table once and `lookups` to select the
+matches and fields to add. Several lookups can share a table. This transform
+fragment assumes the pipeline also defines a sink named `quarantine`:
+
+```yaml
+name: enrich_order
+plugin: reference_join
+input: orders
+on_success: enriched_orders
+on_error: quarantine
+options:
+  schema: {mode: observed}
+  tables:
+    products:
+      reference_file: products.csv
+      reference_format: csv
+    regions:
+      reference_file: regions.csv
+      reference_format: csv
+  lookups:
+    - table: products
+      key_field: product_code
+      reference_key_name: sku
+      output:
+        product_description: "ref['description']"
+      on_miss: default
+      default_values:
+        product_description: Unknown product
+    - table: products
+      key_field: product_code
+      reference_key_name: sku
+      output:
+        product_price: "ref['price']"
+      on_miss: fail
+    - table: regions
+      key_field: postcode
+      reference_key_name: postcode
+      output:
+        region: "ref['region']"
+      on_miss: fail
+```
+
+File paths resolve relative to the settings file and must stay inside its
+directory. In Composer, wire an uploaded table into
+`node:<node_id>.options.tables.<table_name>.reference_content` and set
+`reference_format` explicitly. `reference_content` can also hold inline CSV
+text or JSON array text. CSV values remain strings; convert numeric output
+explicitly with `type_coerce` when a downstream consumer requires numbers.
+
+Loaders that expand environment variables reject `${VAR}` placeholders in
+inline reference text before expansion. Reference files and Composer uploads
+preserve that text literally.
+
+Each lookup reads the original input row. Its `output` map names distinct
+fields to add; output names cannot be reused by another lookup or read as
+another lookup's key. Use separate nodes for chained lookups. Existing
+single-table options remain supported, but cannot be mixed with `tables` and
+`lookups`.
+
+`on_miss: default` writes the configured `default_values` for unresolved output
+fields. `on_miss: null` writes null instead. The default, `on_miss: fail`, sends
+the whole original row through the node's `on_error`; point that connection at
+a quarantine sink to retain it. A later failed lookup never emits earlier
+enrichment downstream. Audit metadata identifies the failed lookup by its
+zero-based list position and table name without recording the row's key value.
+
+Malformed or empty tables, duplicate reference keys, invalid expressions, and
+missing files fail configuration loading. They are not missing matches and
+cannot be hidden by a default. Output field collisions are rejected by the
+normal pipeline checks. There is no fixed lookup-count limit; the combined
+materialized indexes must fit the node's cell and byte safeguards.
 
 ### AWS Bedrock LLM
 

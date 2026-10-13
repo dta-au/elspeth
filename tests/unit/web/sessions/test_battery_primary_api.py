@@ -7,6 +7,7 @@ import asyncio
 import json
 from uuid import UUID
 
+import pytest
 from evals.lib.battery_capture import tool_outcomes
 from evals.lib.battery_score import score_path
 from fastapi import APIRouter
@@ -65,19 +66,29 @@ def test_real_primary_writer_stamps_only_applied_call(service):
     assert [r["composition_state_id"] for r in tool] == [state_ids[0], None, None]
     assert [r["tool_calls"] for r in tool] == [None, None, None]
     records = asyncio.run(service.get_messages(UUID(session_id)))
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.routes._helpers import _composer_conversation_or_tool_messages
+
+    public_records = _composer_conversation_or_tool_messages(records)
+    private_records = [record for record in records if record not in public_records]
+    assert private_records
+    for record in private_records:
+        with pytest.raises(AuditIntegrityError):
+            _message_response(record)
     router = APIRouter()
     register_message_routes(router)
     route = next(r for r in router.routes if isinstance(r, APIRoute) and r.path == "/{session_id}/messages" and "GET" in r.methods)
     wire = asyncio.run(
         serialize_response(
             field=route.response_field,
-            response_content=[_message_response(r) for r in records],
+            response_content=[_message_response(r) for r in public_records],
             exclude_unset=route.response_model_exclude_unset,
             exclude_defaults=route.response_model_exclude_defaults,
             exclude_none=route.response_model_exclude_none,
         )
     )
     assert [r["tool_calls"] for r in wire if r["role"] == "tool"] == [None, None, None]
+    assert {str(record.id) for record in private_records}.isdisjoint(row["id"] for row in wire)
     print("ACTUAL_ROUTE_EXPLICIT_NULL", True)
     cap = tg.capture(wire, state=None)
     print("ACTUAL_PRIMARY", tool_outcomes(cap))

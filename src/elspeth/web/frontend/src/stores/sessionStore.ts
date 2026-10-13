@@ -50,6 +50,23 @@ const LLM_UNAVAILABLE_MESSAGE =
   "The AI service is temporarily unavailable. Please try again in a moment.";
 const LLM_AUTH_ERROR_MESSAGE =
   "The AI service configuration is invalid. Please contact your administrator.";
+const GRAPH_UNAVAILABLE_MESSAGE =
+  "The saved graph is unavailable. You can ask Composer to recover a saved draft.";
+
+type UnavailableCompositionHead = { sessionId: string; state_id: string; version: number };
+
+async function readCompositionSnapshot(sessionId: string): Promise<{
+  compositionState: CompositionState | null;
+  unavailableCompositionHead: UnavailableCompositionHead | null;
+}> {
+  try {
+    return { compositionState: await api.fetchCompositionState(sessionId), unavailableCompositionHead: null };
+  } catch (error) {
+    const apiError = error as ApiError;
+    if (apiError.status !== 409 || apiError.error_type !== "composition_state_unavailable" || !apiError.unavailable_state_head) throw error;
+    return { compositionState: null, unavailableCompositionHead: { sessionId, ...apiError.unavailable_state_head } };
+  }
+}
 // Surfaced when the client-side AbortController fires (typically the
 // COMPOSE_TIMEOUT_MS guard in useComposer). Distinct from the backend's
 // 422/convergence_wall_clock_timeout copy because the cause is different:
@@ -156,6 +173,7 @@ async function reconcileOrphanedSessionOperationRetry(
     if (useSessionStore.getState().activeSessionId === requestedSessionId) {
       useSessionStore.setState({
         compositionState,
+        unavailableCompositionHead: null,
         compositionStateLoaded: true,
         sessions,
       });
@@ -424,12 +442,19 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   const proposalSnapshot = beginProposalSnapshot();
   let authoritativeMessages: ChatMessage[] | null = null;
   let authoritativeState: CompositionState | null | undefined;
+  let unavailableHead: UnavailableCompositionHead | null | undefined;
   let proposals: CompositionProposal[] | null = null;
   let refreshed = false;
-  try {
-    [authoritativeMessages, authoritativeState, proposals] = await Promise.all([api.fetchMessages(sessionId), api.fetchCompositionState(sessionId), api.fetchCompositionProposals(sessionId)]);
+  const [messagesRead, stateRead, proposalsRead] = await Promise.allSettled([
+    api.fetchMessages(sessionId), readCompositionSnapshot(sessionId), api.fetchCompositionProposals(sessionId),
+  ]);
+  if (messagesRead.status === "fulfilled") authoritativeMessages = messagesRead.value;
+  if (proposalsRead.status === "fulfilled") proposals = proposalsRead.value;
+  if (stateRead.status === "fulfilled") {
+    authoritativeState = stateRead.value.compositionState;
+    unavailableHead = stateRead.value.unavailableCompositionHead;
     refreshed = true;
-  } catch { /* Preserve the terminal result; a failed reload never authorizes a replay. */ }
+  }
   if (!current()) return;
   const error = failure as ApiError | null;
   const errorText = error === null ? null : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
@@ -447,6 +472,11 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
     }
     if (local && !messages.some((row) => row.id === local.id || (row.operation_id != null && row.operation_id === local.operation_id))) messages = [...messages, local];
     if (result) messages = messages.some((row) => row.id === result!.message.id) ? messages.map((row) => row.id === result!.message.id ? result!.message : row) : [...messages, result.message];
+    if (result?.recovery_notice) {
+      const receipt = result.recovery_notice;
+      messages = messages.some((row) => row.id === receipt.id) ? messages.map((row) => row.id === receipt.id ? receipt : row) : [...messages, receipt];
+      messages = [...messages].sort((a, b) => a.sequence_no != null && b.sequence_no != null ? a.sequence_no - b.sequence_no : 0);
+    }
     messages = messages.map((row, index) => {
       if (!(row.id === localMessageId || (row.role === "user" && row.operation_id === descriptor.operationId))) return row;
       if (error && error.error_type !== "audit_integrity_error" && !hasGenuineReplyForUser(messages, index)) return { ...row, local_status: "failed", local_error: errorText ?? undefined, local_failure_code: error.error_type === "stale_compose_state" ? "stale_compose_state" : error.failure_code ?? error.error_type };
@@ -454,7 +484,10 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
     });
     const savedPartial = error?.partial_state_save_failed !== true ? error?.partial_state : null;
     const candidates = [state.compositionState, result?.state, authoritativeState, savedPartial].filter((candidate): candidate is CompositionState => candidate !== null && candidate !== undefined && candidate.session_id === sessionId);
-    const nextState = candidates.reduce<CompositionState | null>((latest, candidate) => latest === null || candidate.version > latest.version ? candidate : latest, null);
+    const latestState = candidates.reduce<CompositionState | null>((latest, candidate) => latest === null || candidate.version > latest.version ? candidate : latest, null);
+    const retainedHead = unavailableHead ?? (unavailableHead === undefined ? state.unavailableCompositionHead : null);
+    const nextUnavailableHead = retainedHead?.sessionId === sessionId && (latestState === null || retainedHead.version >= latestState.version) ? retainedHead : null;
+    const nextState = nextUnavailableHead === null ? latestState : null;
     const changed = nextState?.version !== beforeVersion && nextState !== null;
     const savedChanges = nextState !== null && beforeVersion !== null ? Math.max(0, nextState.version - beforeVersion) : 0;
     const terminalErrorText = error?.error_type === "request_cancelled"
@@ -464,7 +497,8 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
       : errorText;
     if (changed) getExecutionStore().clearValidation();
     const recovery = error && isComposerRecoveryError(error) ? { recoveryError: error, recoveryStartedCompositionVersion: nextState?.id === error.partial_state.id ? nextState.version : beforeVersion } : {};
-    return { messages, compositionState: nextState, compositionStateLoaded: refreshed, compositionProposals: proposals !== null ? proposalSnapshot.reconcile(state.compositionProposals, mergeCompositionProposals(proposals, result?.proposals ?? [])) : proposalSnapshot.isCurrent() ? mergeCompositionProposals(state.compositionProposals, result?.proposals ?? []) : state.compositionProposals, isComposing: composerSessionHasCustody(sessionId), error: composerCustodyRecoveryNotice() ?? (reconciliationOnly ? state.error : terminalErrorText), lastComposeChangedPipeline: reconciliationOnly ? state.lastComposeChangedPipeline : failure === null ? changed : null, ...(state.selectedNodeId && !nextState?.nodes.some((node) => node.id === state.selectedNodeId) ? { selectedNodeId: null } : {}), ...recovery };
+    const confirmedRecovery = result?.recovery_notice != null && result.state != null && nextState !== null;
+    return { messages, compositionState: nextState, unavailableCompositionHead: nextUnavailableHead, compositionStateLoaded: refreshed || confirmedRecovery, compositionProposals: proposals !== null ? proposalSnapshot.reconcile(state.compositionProposals, mergeCompositionProposals(proposals, result?.proposals ?? [])) : proposalSnapshot.isCurrent() ? mergeCompositionProposals(state.compositionProposals, result?.proposals ?? []) : state.compositionProposals, isComposing: composerSessionHasCustody(sessionId), error: composerCustodyRecoveryNotice() ?? (reconciliationOnly ? state.error : terminalErrorText ?? (nextUnavailableHead === null ? null : GRAPH_UNAVAILABLE_MESSAGE)), lastComposeChangedPipeline: reconciliationOnly ? state.lastComposeChangedPipeline : failure === null ? changed : null, ...(state.selectedNodeId && !nextState?.nodes.some((node) => node.id === state.selectedNodeId) ? { selectedNodeId: null } : {}), ...recovery };
   });
   const pendingScope = composerCustodyScope();
   if (!reconciliationOnly && pendingScope !== null) {
@@ -558,11 +592,12 @@ function mergeAuthoritativeForkChild(
 
 function clearedRecoveryState(): Pick<
   SessionState,
-  "recoveryError" | "recoveryStartedCompositionVersion"
+  "recoveryError" | "recoveryStartedCompositionVersion" | "unavailableCompositionHead"
 > {
   return {
     recoveryError: null,
     recoveryStartedCompositionVersion: null,
+    unavailableCompositionHead: null,
   };
 }
 
@@ -610,6 +645,8 @@ interface SessionState {
   activeSessionId: string | null;
   messages: ChatMessage[];
   compositionState: CompositionState | null;
+  /** Known scalar head when graph hydration failed; enables fenced recovery chat. */
+  unavailableCompositionHead: UnavailableCompositionHead | null;
   /**
    * Whether the LAST completed freeform compose turn changed the
    * composition-state version (elspeth-bf9c296ee5). `null` means unknown: no
@@ -621,11 +658,11 @@ interface SessionState {
    */
   lastComposeChangedPipeline: boolean | null;
   /**
-   * True once the active session's composition state is KNOWN — i.e. the
-   * selectSession fetch settled (success, 404, or failure), or the session
+   * True once the active session's composition head is KNOWN — i.e. the
+   * fetch returned a graph, no graph, or an explicit unavailable scalar head; or the session
    * was just created/forked (fresh state is known by construction).
    * `compositionState === null` alone is ambiguous: it means both "still
-   * fetching" and "loaded, and this session has no pipeline yet". The
+   * fetching", "no pipeline yet", and "unavailableCompositionHead is set". The
    * #/{id}/yaml hash route gates the Export-YAML modal on content
    * (elspeth-bff8043d33) and needs the disambiguation to avoid either
    * breaking the deep link or opening the modal on an empty pipeline.
@@ -1036,18 +1073,19 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     });
 
     try {
-      const [messages, compositionState, compositionProposals, composerPreferences] =
+      const [messages, snapshot, compositionProposals, composerPreferences] =
         await Promise.all([
           api.fetchMessages(id),
-          api.fetchCompositionState(id),
+          readCompositionSnapshot(id),
           api.fetchCompositionProposals(id),
           api.fetchComposerPreferences(id),
         ]);
       if (!sessionPublicationIsCurrent(id, selectionGeneration)) return;
       set({
         messages,
-        compositionState,
+        ...snapshot,
         compositionStateLoaded: true,
+        error: snapshot.unavailableCompositionHead === null ? null : GRAPH_UNAVAILABLE_MESSAGE,
         compositionProposals: compositionProposals ?? [],
         composerPreferences: composerPreferences ?? null,
       });
@@ -1143,7 +1181,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       ...(existing ?? { session_id: state.activeSessionId, role: "user", tool_calls: null, created_at: new Date().toISOString() }),
       id: existing?.id ?? `local-${operationId}`, content, operation_id: operationId, local_status: "pending", local_error: undefined, local_failure_code: undefined,
     };
-    const descriptor: SubmittedCustody = { mode: "submitted", scope, sessionId: state.activeSessionId, operationId, kind: "compose_message", createdAt: Date.now(), body: { operation_id: operationId, content, state_id: state.compositionState?.id ?? null } };
+    const descriptor: SubmittedCustody = { mode: "submitted", scope, sessionId: state.activeSessionId, operationId, kind: "compose_message", createdAt: Date.now(), body: { operation_id: operationId, content, state_id: state.compositionState?.id ?? (state.unavailableCompositionHead?.sessionId === state.activeSessionId ? state.unavailableCompositionHead.state_id : null) } };
     set((current) => ({ isComposing: true, error: null, composerProgress: null, lastComposeChangedPipeline: null, messages: existing ? current.messages.map((row) => row.id === existing.id ? optimistic : row) : [...current.messages, optimistic] }));
     await runDurableComposerTurn(descriptor, optimistic.id, signal, true);
   },
@@ -1241,6 +1279,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // Do not expose the pre-accept pipeline as the accepted composition.
       set((state) => ({
         compositionState: null,
+        unavailableCompositionHead: null,
         compositionStateLoaded: false,
         compositionProposals: mergeCompositionProposals(state.compositionProposals, [proposal]),
       }));
@@ -1263,6 +1302,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         compositionState: state.compositionState !== null && (
           compositionState === null || state.compositionState.version > compositionState.version
         ) ? state.compositionState : compositionState,
+        unavailableCompositionHead: null,
         compositionStateLoaded: true,
         compositionProposals: mergeCompositionProposals(
           snapshot.reconcile(state.compositionProposals, proposals ?? []),
@@ -1618,7 +1658,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     const scope = composerCustodyScope();
     if (scope === null) return;
     const operationId = crypto.randomUUID();
-    const descriptor: SubmittedCustody = { mode: "submitted", scope, sessionId: state.activeSessionId, operationId, kind: "compose_recompose", createdAt: Date.now(), body: { operation_id: operationId, expected_user_message_id: message.id, state_id: state.compositionState?.id ?? null } };
+    const descriptor: SubmittedCustody = { mode: "submitted", scope, sessionId: state.activeSessionId, operationId, kind: "compose_recompose", createdAt: Date.now(), body: { operation_id: operationId, expected_user_message_id: message.id, state_id: state.compositionState?.id ?? (state.unavailableCompositionHead?.sessionId === state.activeSessionId ? state.unavailableCompositionHead.state_id : null) } };
     set((current) => ({ isComposing: true, error: null, composerProgress: null, lastComposeChangedPipeline: null, messages: current.messages.map((row) => row.id === message.id ? { ...row, local_status: "pending", local_error: undefined } : row) }));
     await runDurableComposerTurn(descriptor, message.id, signal, true);
   },
@@ -1798,7 +1838,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   discardRecovery() {
-    set(clearedRecoveryState());
+    set({ recoveryError: null, recoveryStartedCompositionVersion: null });
   },
 
 
@@ -1893,6 +1933,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     if (newState !== null) {
       set((s) => ({
         compositionState: newState,
+        unavailableCompositionHead: null,
         selectedNodeId:
           !s.selectedNodeId ||
           newState.nodes.some((n) => n.id === s.selectedNodeId)

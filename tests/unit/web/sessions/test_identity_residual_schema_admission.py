@@ -23,12 +23,12 @@ def _create_stamped_database(path: Path, declarations: MetaData) -> str:
 
 
 def _assert_refused(url: str, *, detail: str) -> None:
-    engine = create_session_engine(url)
-    try:
-        with pytest.raises(SessionSchemaError, match=detail):
+    with pytest.raises(SessionSchemaError, match=detail):
+        engine = create_session_engine(url)
+        try:
             initialize_session_schema(engine)
-    finally:
-        engine.dispose()
+        finally:
+            engine.dispose()
 
 
 def test_complete_residual_schema_is_admitted(tmp_path: Path) -> None:
