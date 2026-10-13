@@ -317,8 +317,46 @@ for name and value pairs `row | items | list` or `row | dictsort`, for a mapping
 name as `row['contract']`. A method on a field's value (`row.note.upper()`)
 is fine. With `required_input_fields` omitted, a model prompt may not use
 `row` as a whole (`{{ row }}`, `row | dictsort`): declare the fields it shows.
-For a multi-query template, `row.source_row` contains only columns the node
-declares in `required_input_fields`, including query `input_fields` values.
+For a multi-query template, `row.source_row` contains only original upstream
+columns the node declares in `required_input_fields`. The explicit `[]` opt-out
+keeps its existing whole-original-row visibility.
+`query_input_mode: upstream` is the default: every query reads the original row.
+`query_input_mode: ordered` requires list-form named queries and `pool_size: 1`.
+Its `input_fields` may bind an exact generated name from an earlier successful,
+validated query, including `<query>_<suffix>` structured outputs and
+`<query>_<response_field>` raw/usage/model fields. Self/forward bindings and
+collisions are refused. Those internal dependencies are not upstream requirements.
+`source_row` and images always remain original-only. A constant first ordered
+query may use `input_fields: {}`; do not invent an external input for it.
+No query publishes a partial output row. Failure discards local results and
+routes the original entry row, while completed provider calls and charges remain.
+Recovery restarts at the node boundary and may repeat calls.
+
+### Optional operator-led chain compaction
+
+You may offer an optional combined LLM step after inspecting the complete linear
+chain and consumers. Existing independent queries must read only segment-entry
+fields; dependent queries require explicit ordered mode and earlier guaranteed
+outputs. Check exact output names/types/nullability, actual rendered prompts,
+effective provider/model/profile/sampling/system/image settings and runtime limits.
+Do not offer a simple combination across intermediate consumers, shields, mappers,
+gates, branches, sinks, conditional calls, incompatible settings/error policies,
+or requirements to retain partial results. Missing evidence means keep the chain.
+
+Explain that there are still the same queries/model calls, with no promised token
+or cost reduction; atomic failure changes the quarantine row, audit grouping and
+checkpoint identity. This is a new pipeline version/run, never an old-checkpoint
+resume. Preserve interpretation tokens and fresh prompt/semantics review: per-query
+templates cannot carry interpretation tokens. Ask whether the operator wants to
+review a combined version before changing graph or settings. Decline leaves both
+unchanged; do not pressure or compact automatically. Only the provider planner
+authors the proposal through ordinary node/edge tools, then preview and diff it.
+
+Independent example: two unconditional tone/topic assessments of entry `text`
+with identical effective settings and already compatible prefixed outputs.
+Dependent example: extract an entity, then assess that earlier typed result via
+an explicit ordered binding. Both require the failure/audit/checkpoint disclosures.
+
 A multi-query `input_fields` variable may not be named `source_row` or like a
 mapping method (`items`, `keys`, `values`, `get`).
 Besides the names it binds itself, a template reads `row`, `lookup` in a model

@@ -8,7 +8,7 @@ ResponseFormat) used by both single and multi-query modes.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
@@ -41,6 +41,13 @@ class ResponseFormat(StrEnum):
 
     STANDARD = "standard"
     STRUCTURED = "structured"
+
+
+class QueryInputMode(StrEnum):
+    """Whether explicit bindings can consume previously validated query outputs."""
+
+    UPSTREAM = "upstream"
+    ORDERED = "ordered"
 
 
 class OutputFieldConfig(PluginConfig):
@@ -250,11 +257,12 @@ class QuerySpec:
     output_fields: tuple[OutputFieldConfig, ...] | None = None
     template: str | None = None
     max_tokens: int | None = None
+    allow_empty_inputs: InitVar[bool] = False
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, allow_empty_inputs: bool) -> None:
         if not self.name:
             raise ValueError("name must be non-empty")
-        if not self.input_fields:
+        if not self.input_fields and not allow_empty_inputs:
             raise ValueError("input_fields must be non-empty")
         if self.max_tokens is not None:
             if isinstance(self.max_tokens, bool):
@@ -267,7 +275,9 @@ class QuerySpec:
         if self.output_fields is not None:
             object.__setattr__(self, "output_fields", tuple(self.output_fields))
 
-    def build_template_context(self, row: PipelineRow, projection: RowProjection) -> dict[str, Any]:
+    def build_template_context(
+        self, row: PipelineRow, projection: RowProjection, *, original_row: PipelineRow | None = None
+    ) -> dict[str, Any]:
         """Build template context mapping named variables to row values.
 
         Args:
@@ -286,7 +296,7 @@ class QuerySpec:
         context: dict[str, Any] = {}
         for template_var, row_column in self.input_fields.items():
             context[template_var] = row[row_column]
-        context["source_row"] = TemplateRow.project(row, projection)
+        context["source_row"] = TemplateRow.project(row if original_row is None else original_row, projection)
         return context
 
 
@@ -294,7 +304,7 @@ class QuerySpec:
 _POSITIONAL_VAR_PATTERN = re.compile(r"\{\{\s*input_\d+\s*\}\}")
 
 
-def _query_spec_from_definition(name: str, definition: QueryDefinition) -> QuerySpec:
+def _query_spec_from_definition(name: str, definition: QueryDefinition, *, allow_empty_inputs: bool) -> QuerySpec:
     """Build the frozen runtime :class:`QuerySpec` from a typed authoring model."""
     output_fields = tuple(definition.output_fields) if definition.output_fields is not None else None
     return QuerySpec(
@@ -304,11 +314,14 @@ def _query_spec_from_definition(name: str, definition: QueryDefinition) -> Query
         output_fields=output_fields,
         template=definition.template,
         max_tokens=definition.max_tokens,
+        allow_empty_inputs=allow_empty_inputs,
     )
 
 
 def resolve_queries(
     queries: list[QuerySpec] | list[QueryDefinition] | dict[str, QueryDefinition],
+    *,
+    allow_empty_inputs: bool = False,
 ) -> list[QuerySpec]:
     """Normalize typed query definitions into a list of QuerySpec.
 
@@ -346,7 +359,7 @@ def resolve_queries(
         if not queries:
             raise ValueError("no queries configured")
         for name, definition in queries.items():
-            specs.append(_query_spec_from_definition(name, definition))
+            specs.append(_query_spec_from_definition(name, definition, allow_empty_inputs=allow_empty_inputs))
     elif isinstance(queries, list):
         if not queries:
             raise ValueError("no queries configured")
@@ -359,9 +372,12 @@ def resolve_queries(
                         "List-form query entries must include a 'name'. Add 'name' to each "
                         "query, or author the queries as a mapping keyed by query name."
                     )
-                specs.append(_query_spec_from_definition(item.name, item))
+                specs.append(_query_spec_from_definition(item.name, item, allow_empty_inputs=allow_empty_inputs))
     else:
         raise TypeError(f"queries must be list or dict, got {type(queries).__name__}")
+
+    if not allow_empty_inputs and any(not spec.input_fields for spec in specs):
+        raise ValueError("input_fields must be non-empty")
 
     # Validate: reject duplicate query names.
     # Dict-form configs are naturally unique (Python dict keys), but list-form
@@ -418,3 +434,71 @@ def resolve_queries(
                 seen_output_keys[output_key] = spec.name
 
     return specs
+
+
+@dataclass(frozen=True, slots=True)
+class OrderedQueryPlan:
+    """Compiled immutable publication and binding identities in authored list order."""
+
+    specs: tuple[QuerySpec, ...]
+    generated_by_query: tuple[frozenset[str], ...]
+    external_by_query: tuple[frozenset[str], ...]
+
+    @property
+    def generated_fields(self) -> frozenset[str]:
+        return frozenset().union(*self.generated_by_query)
+
+
+class OrderedQueryPlanError(ValueError):
+    """A compiler diagnostic containing structural field/query identities only."""
+
+
+def compile_ordered_query_plan(
+    specs: tuple[QuerySpec, ...],
+    response_field: str,
+    original_only_fields: frozenset[str] = frozenset(),
+    *,
+    list_form: bool = True,
+    pool_size: int = 1,
+) -> OrderedQueryPlan:
+    """Reject ambiguous producers and self/forward reads before provider execution.
+
+    Header aliases resolving to generated names are refused rather than assigned
+    dictionary precedence. Per-row admission additionally checks actual aliases.
+    """
+    from elspeth.plugins.sources.field_normalization import normalize_field_name
+    from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES
+
+    if not list_form:
+        raise OrderedQueryPlanError("ordered query_input_mode requires list-form queries")
+    if pool_size != 1:
+        raise OrderedQueryPlanError("ordered query_input_mode requires pool_size=1")
+    producers: dict[str, int] = {}
+    generated_by_query: list[frozenset[str]] = []
+    for index, spec in enumerate(specs):
+        prefix = f"{spec.name}_{response_field}"
+        names = [f"{prefix}{suffix}" for suffix in LLM_GUARANTEED_SUFFIXES]
+        names.extend(f"{spec.name}_{field.suffix}" for field in spec.output_fields or ())
+        for name in names:
+            if name in producers:
+                raise OrderedQueryPlanError(f"Generated output field collision: '{name}' in query '{spec.name}'")
+            producers[name] = index
+        generated_by_query.append(frozenset(names))
+    for name in original_only_fields:
+        canonical = normalize_field_name(name)
+        if name in producers or canonical in producers:
+            raise OrderedQueryPlanError(f"Field '{name}' is generated by this node and cannot be read from the original row")
+    external_by_query: list[frozenset[str]] = []
+    for index, spec in enumerate(specs):
+        external: set[str] = set()
+        for name in spec.input_fields.values():
+            canonical = normalize_field_name(name)
+            if name not in producers and canonical in producers:
+                raise OrderedQueryPlanError(f"Binding '{name}' ambiguously names a generated field; use its exact canonical name")
+            if name in producers:
+                if producers[name] >= index:
+                    raise OrderedQueryPlanError(f"Query '{spec.name}' binding '{name}' must refer to an earlier query")
+            else:
+                external.add(name)
+        external_by_query.append(frozenset(external))
+    return OrderedQueryPlan(specs, tuple(generated_by_query), tuple(external_by_query))

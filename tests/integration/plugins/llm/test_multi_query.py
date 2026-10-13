@@ -359,8 +359,191 @@ def _claim_context(factory: RecorderFactory, run_id: str, node_id: str, token: T
     )
 
 
+def attribute_ordered_semantic_calls(transform, original_row, calls, factory, *, completed):
+    """Test-local reconstruction from the recorded stream, with no publication claim for a crash prefix."""
+    from elspeth.contracts import CallStatus, CallType, propagate_contract
+    from elspeth.contracts.errors import DeclaredOutputTypeViolation
+    from elspeth.contracts.schema_contract import PipelineRow
+    from elspeth.contracts.token_usage import TokenUsage
+    from elspeth.plugins.transforms.llm import populate_llm_operational_fields
+    from elspeth.plugins.transforms.llm.provider import classify_finish_reason_failure, finish_reason_from_raw_response
+    from elspeth.plugins.transforms.llm.validation import extract_structured_fields, strip_markdown_fences
+
+    plan = transform._config.ordered_query_plan()
+    semantic = sorted((call for call in calls if call.call_type is CallType.LLM), key=lambda call: call.call_index)
+    accepted_row = original_row
+    query_index = 0
+    attributed = []
+    for call_index, call in enumerate(semantic):
+        spec = plan.specs[query_index]
+        if call.status is CallStatus.ERROR:
+            error = json.loads(call.error_json)
+            attributed.append((spec.name, "retry" if error["retryable"] else "rejected"))
+            if not error["retryable"]:
+                break
+            continue
+        assert call.response_ref is not None
+        response = json.loads(factory.payload_store.retrieve(call.response_ref))
+        if classify_finish_reason_failure(finish_reason_from_raw_response(response["raw_response"])) is not None:
+            attributed.append((spec.name, "rejected"))
+            break
+        content = strip_markdown_fences(response["content"])
+        extracted, error = extract_structured_fields(content, spec.output_fields) if spec.output_fields else ({}, None)
+        if error is not None:
+            attributed.append((spec.name, "rejected"))
+            break
+        fields = {f"{spec.name}_{suffix}": value for suffix, value in extracted.items()}
+        prefix = f"{spec.name}_{transform._config.response_field}"
+        fields[prefix] = content
+        populate_llm_operational_fields(fields, prefix, usage=TokenUsage.from_dict(response["usage"]), model=response["model"])
+        output = {**accepted_row.to_dict(), **fields}
+        contract = propagate_contract(input_contract=accepted_row.contract, output_row=output, transform_adds_fields=True)
+        candidate = PipelineRow(output, transform._apply_declared_output_field_contracts(contract))
+        try:
+            transform._verify_intermediate_output(accepted_row, candidate)
+        except DeclaredOutputTypeViolation:
+            attributed.append((spec.name, "rejected"))
+            break
+        accepted = completed or call_index < len(semantic) - 1
+        attributed.append((spec.name, "accepted" if accepted else "unknown"))
+        accepted_row = candidate
+        query_index += 1
+    return attributed
+
+
 class TestMultiQueryIntegration:
     """Full integration tests for multi-query transform via TransformExecutor."""
+
+    def test_ordered_identical_requests_retries_and_transport_filtering(
+        self, factory: RecorderFactory, executor: TransformExecutor, run_id: str, node_id: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dataclasses import replace
+
+        import httpx
+        import openai
+
+        from elspeth.contracts import CallType
+        from tests.unit.plugins.llm.test_ordered_query_contract import ordered_options
+
+        config = ordered_options()
+        config.update(deployment_name="gpt-4o", endpoint="https://test.openai.azure.com", api_key="test-key", required_input_fields=[])
+        for query in config["queries"]:
+            query.update(input_fields={"text": "text"}, template="{{ row.text }}", output_fields=[{"suffix": "score", "type": "integer"}])
+        node_id = factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, run_id),
+            plugin_name="llm",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0",
+            config=config,
+            schema_config=SchemaConfig.from_dict(DYNAMIC_SCHEMA),
+        ).node_id
+        monkeypatch.setattr("elspeth.plugins.transforms.llm.transform.time.sleep", lambda _: None)
+        with mock_azure_openai_multi_query([{"score": 5}, {"score": 6}]) as client, closing(LLMTransform(config)) as transform:
+            create = client.chat.completions.create.side_effect
+            attempts = 0
+
+            def retry_b(**kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts in (2, 3):
+                    raise openai.RateLimitError(
+                        "synthetic capacity",
+                        response=httpx.Response(429, request=httpx.Request("POST", "https://test.openai.azure.com")),
+                        body={},
+                    )
+                return create(**kwargs)
+
+            client.chat.completions.create.side_effect = retry_b
+            transform.node_id = node_id
+            transform.on_error = "discard"
+            transform.on_start(
+                make_context(
+                    run_id=run_id, landscape=factory.plugin_audit_writer(), coordination_token=leader_coordination_token(factory, run_id)
+                )
+            )
+            token = create_token_in_factory(factory, run_id, node_id, "retry-row", "retry-token", {"text": "identical"})
+            result, _, _ = executor.execute_transform(
+                transform=transform, token=token, ctx=_claim_context(factory, run_id, node_id, token), attempt=0
+            )
+            assert result.status == "success"
+            (state,) = factory.query.get_node_states_for_token(token.token_id)
+            calls = factory.query.get_calls(state.state_id)
+            assert len(calls) == 4
+            assert len({call.request_hash for call in calls}) == 1
+            assert attribute_ordered_semantic_calls(transform, token.row_data, calls, factory, completed=True) == [
+                ("extract", "accepted"),
+                ("assess", "retry"),
+                ("assess", "retry"),
+                ("assess", "accepted"),
+            ]
+            transport = replace(calls[0], call_type=CallType.HTTP, call_id="synthetic-transport")
+            assert attribute_ordered_semantic_calls(
+                transform, token.row_data, [transport, *calls], factory, completed=True
+            ) == attribute_ordered_semantic_calls(transform, token.row_data, calls, factory, completed=True)
+
+    @pytest.mark.parametrize("bad_query", [None, 0, 1])
+    def test_ordered_dependency_audit_and_original_failure_row(
+        self, factory: RecorderFactory, executor: TransformExecutor, run_id: str, node_id: str, bad_query: int | None
+    ) -> None:
+        from elspeth.contracts import CallStatus, CallType
+        from tests.unit.plugins.llm.test_ordered_query_contract import ordered_options
+
+        config = ordered_options()
+        # This executor fixture deliberately has no graph-proven input table.
+        config["required_input_fields"] = []
+        config.update(deployment_name="gpt-4o", endpoint="https://test.openai.azure.com", api_key="test-key")
+        config["queries"][0]["response_format"] = "structured"
+        config["queries"][1]["output_fields"] = [{"suffix": "verdict", "type": "boolean"}]
+        config["queries"][1]["response_format"] = "structured"
+        node_id = factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, run_id),
+            plugin_name="llm",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0",
+            config=config,
+            schema_config=SchemaConfig.from_dict(DYNAMIC_SCHEMA),
+        ).node_id
+        responses = [{"score": None if bad_query == 0 else 5.0}, {"verdict": None if bad_query == 1 else True}]
+        with mock_azure_openai_multi_query(responses) as client, closing(LLMTransform(config)) as transform:
+            transform.node_id = node_id
+            transform.on_error = "discard"
+            transform.on_start(
+                make_context(
+                    run_id=run_id,
+                    landscape=factory.plugin_audit_writer(),
+                    coordination_token=leader_coordination_token(factory, run_id),
+                )
+            )
+            token = create_token_in_factory(factory, run_id, node_id, "ordered-row", "ordered-token", {"text": "original"})
+            result, _, _error_sink = executor.execute_transform(
+                transform=transform, token=token, ctx=_claim_context(factory, run_id, node_id, token), attempt=0
+            )
+            assert result.status == ("success" if bad_query is None else "error")
+            assert token.row_data.to_dict() == {"text": "original"}
+            expected_calls = 1 if bad_query == 0 else 2
+            assert client.chat.completions.create.call_count == expected_calls
+            (state,) = factory.query.get_node_states_for_token(token.token_id)
+            calls = [call for call in factory.query.get_calls(state.state_id) if call.call_type is CallType.LLM]
+            assert len(calls) == expected_calls
+            assert all(call.status is CallStatus.SUCCESS for call in calls)
+            assert all(call.prompt_tokens == 50 and call.completion_tokens == 20 for call in calls)
+            recorded_node = factory.data_flow.get_node(node_id, run_id)
+            assert recorded_node is not None
+            recorded_config = json.loads(recorded_node.config_json)
+            assert recorded_config["queries"] == config["queries"]
+            attribution = attribute_ordered_semantic_calls(transform, token.row_data, calls, factory, completed=bad_query is None)
+            assert [entry[0] for entry in attribution] == (["extract"] if bad_query == 0 else ["extract", "assess"])
+            assert attribution[-1][1] == ("accepted" if bad_query is None else "rejected")
+            # A persisted successful response alone is not durable acceptance.
+            prefix = attribute_ordered_semantic_calls(transform, token.row_data, calls[:1], factory, completed=False)
+            assert prefix[-1][1] == ("rejected" if bad_query == 0 else "unknown")
+            if bad_query is None:
+                assert result.row["extract_score"] == 5
+                assert result.row["assess_verdict"] is True
+            else:
+                assert result.row is None
+                assert result.reason["query_index"] == bad_query
+                assert result.reason["discarded_successful_queries"] == bad_query
 
     def test_full_assessment_matrix(
         self,
