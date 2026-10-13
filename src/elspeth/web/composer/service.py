@@ -1688,7 +1688,7 @@ class ComposerServiceImpl:
                         (
                             "The last 3 tool calls used different arguments but failed the same repair loop."
                             if is_drift_hint
-                            else "The last 3 tool calls used identical arguments and produced the same error."
+                            else "The last 3 tool calls used identical arguments and failed."
                         ),
                         "A structural hint was injected to help the model converge.",
                     ),

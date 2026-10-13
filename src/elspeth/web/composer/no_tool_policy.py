@@ -201,11 +201,10 @@ _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_AD
 # operator-authored prose: no advisor output is interpolated (R2-F13), and the
 # absent variants keep the facet B discipline of making no readiness claim.
 _ADVISOR_SIGNOFF_UNAVAILABLE_CAUSE: Final = (
-    "Completion advisory review could not be obtained: the advisor model was unavailable after retry. Composer completion is withheld."
+    "Completion advisory review could not be obtained: the advisor model was unavailable. Composer completion is withheld."
 )
 _ADVISOR_SIGNOFF_MALFORMED_CAUSE: Final = (
-    "Completion advisory review could not be obtained: the advisor returned no usable verdict after a format retry. "
-    "Composer completion is withheld."
+    "Completion advisory review could not be obtained: the advisor returned no usable verdict. Composer completion is withheld."
 )
 # Provider failures are retried on a later turn even when the graph is unchanged.
 _ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP: Final = (

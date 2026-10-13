@@ -23,6 +23,71 @@ make_service = checkpoint_fixtures.make_service
 simple_state = checkpoint_fixtures.simple_state
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retryable", [False, True])
+async def test_unavailable_public_detail_does_not_invent_a_retry(make_service, simple_state, retryable):
+    import httpx
+    from litellm.exceptions import ServiceUnavailableError
+    from openai import APITimeoutError
+
+    service = make_service()
+    failure = (
+        ServiceUnavailableError(message="private-provider-marker", llm_provider="test", model="test/advisor")
+        if retryable
+        else APITimeoutError(request=httpx.Request("POST", "https://example.test"))
+    )
+    physical_calls = 0
+
+    async def fail(*args, on_provider_dispatch=None, **kwargs):
+        nonlocal physical_calls
+        physical_calls += 1
+        if on_provider_dispatch is not None:
+            on_provider_dispatch()
+        raise failure
+
+    service._advisor_checkpoint._call_advisor_with_audit = fail
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, recorder=None, **_fenced_session(service)
+    )
+    expected_attempts = 2 if retryable else 1
+    assert physical_calls == expected_attempts
+    assert verdict.failure_class == "unavailable"
+    assert verdict.findings_text == "advisor model was unavailable"
+    record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
+    assert record["provider_attempts"] == expected_attempts
+    assert "private-provider-marker" not in repr(verdict)
+
+
+@pytest.mark.asyncio
+async def test_nonretryable_malformed_failure_does_not_invent_a_format_retry(make_service, simple_state):
+    from litellm.exceptions import BadGatewayError
+
+    from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
+
+    service = make_service()
+    physical_calls = 0
+
+    async def fail(*args, on_provider_dispatch=None, **kwargs):
+        nonlocal physical_calls
+        physical_calls += 1
+        if on_provider_dispatch is not None:
+            on_provider_dispatch()
+        raise BadGatewayError(message="private-malformed-marker", llm_provider="test", model="test/advisor")
+
+    service._advisor_checkpoint._call_advisor_with_audit = fail
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, recorder=None, **_fenced_session(service)
+    )
+    assert physical_calls == 1
+    assert verdict.failure_class == "malformed"
+    record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
+    assert record["provider_attempts"] == 1
+    assert record["format_reprompt_sent"] is False
+    detail, suggestion = advisor_signoff_blocked_wording(reason="malformed", findings=verdict.findings_text)
+    assert "after a format retry" not in suggestion
+    assert "private-malformed-marker" not in detail + suggestion
+
+
 def _reply(**changes: object) -> str:
     fields: dict[str, object] = {
         "verdict": "FLAGGED",

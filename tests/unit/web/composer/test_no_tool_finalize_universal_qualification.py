@@ -658,9 +658,7 @@ class TestAdvisorBlockedTerminalPreservesPendingHandoff:
         A fix scoped to the ``flagged_*`` reasons only would fail here.
         """
         advisor = _RecordingAdvisor(
-            AdvisorCheckpointVerdict(
-                ok=False, blocking=False, findings_text="advisor model was unavailable after retry", failure_class="unavailable"
-            )
+            AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="advisor model was unavailable", failure_class="unavailable")
         )
         fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_valid_result())
         result = await _run_no_tool_turn(tmp_path, sessions_service, monkeypatch, fake=fake, max_composition_turns=1, advisor=advisor)
@@ -671,7 +669,7 @@ class TestAdvisorBlockedTerminalPreservesPendingHandoff:
         # the fixed backend classification naming the class, not advisor-model
         # prose — so the pending-specific wording must not have dropped it.
         detail = next(check.detail for check in result.runtime_preflight.checks if check.name == CHECK_ADVISOR_SIGNOFF)
-        assert "advisor model was unavailable after retry" in detail
+        assert "advisor model was unavailable" in detail
         assert detail.startswith("The evidence-scoped completion advisory review could not be obtained.")
 
     @pytest.mark.asyncio

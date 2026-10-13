@@ -55,7 +55,7 @@ _ADVISOR_SIGNOFF_BLOCKED_CODE: Final[str] = ADVISOR_SIGNOFF_BLOCKED_CODE
 # Mirrors the orphan gate's check-name convention so the synthetic fail-closed
 # result names a stable check the UI/audit can key on.
 _ADVISOR_SIGNOFF_BLOCKED_CHECK_NAME: Final[ValidationCheckName] = CHECK_ADVISOR_SIGNOFF
-ADVISOR_UNAVAILABLE_USER_DETAIL: Final[str] = "advisor model was unavailable after retry"
+ADVISOR_UNAVAILABLE_USER_DETAIL: Final[str] = "advisor model was unavailable"
 # Fixed user-facing detail for a MALFORMED advisor failure (parse/shape error, or
 # any unclassified exception). Like the unavailable detail it carries NO provider
 # SDK text, exception class name, message, URL, or credential — the raw exception
@@ -478,12 +478,12 @@ def advisor_signoff_blocked_wording(
     if reason == "unavailable":
         return (
             f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
-            "The advisor model was unavailable after retry; check the advisor model configuration. "
+            "The advisor model was unavailable; check the advisor model configuration. "
             "Validation and the advisory review run again on your next message.",
         )
     return (
         f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
-        "The advisor returned no usable verdict after a format retry; check the advisor model configuration. "
+        "The advisor returned no usable verdict; check the advisor model configuration. "
         "Validation and the advisory review run again on your next message.",
     )
 

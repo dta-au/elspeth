@@ -74,6 +74,6 @@ def arg_error_payload(exc: ToolArgumentError, tool_name: str) -> Mapping[str, An
         payload["repair_instruction"] = (
             f"Inline llm_draft must contain {minimum} to {maximum} characters. "
             "Omit llm_draft to use the exact staged draft. If there is no staged draft, "
-            "ask the user for a shorter review draft. Keep the existing document and pipeline content unchanged."
+            "ask the user for a nonempty review draft within these bounds. Keep the existing document and pipeline content unchanged."
         )
     return payload

@@ -64,6 +64,8 @@ def test_review_draft_bounds_have_owned_safe_recovery(draft):
     payload = arg_error_payload(caught.value, "request_interpretation_review")
     assert "1 to 8192" in payload["repair_instruction"]
     assert "Omit llm_draft to use the exact staged draft" in payload["repair_instruction"]
+    assert "nonempty review draft within these bounds" in payload["repair_instruction"]
+    assert "shorter" not in payload["repair_instruction"]
     assert "LEGITIMATE_DOCUMENT_TEXT" not in json.dumps(payload)
 
 
