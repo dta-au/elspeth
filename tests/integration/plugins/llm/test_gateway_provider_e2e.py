@@ -721,6 +721,7 @@ class TestRuntimePreflight:
         main_provider.runtime_preflight(
             operation_id="op-preflight-ok",
             model=_MODEL_ALIAS,
+            temperature=0.0,
             coordination_token=CoordinationToken(run_id=_RUN_ID, worker_id="mock-worker", leader_epoch=1),
         )
 
@@ -729,6 +730,7 @@ class TestRuntimePreflight:
             main_provider.runtime_preflight(
                 operation_id="op-preflight-bad-model",
                 model="never-published-alias",
+                temperature=0.0,
                 coordination_token=CoordinationToken(run_id=_RUN_ID, worker_id="mock-worker", leader_epoch=1),
             )
 

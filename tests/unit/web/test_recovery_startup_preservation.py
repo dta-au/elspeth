@@ -37,8 +37,8 @@ def _snapshot(path: Path):
 def _unsupported(path: Path, kind: str, *, current_epoch: int):
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path)) as connection:
-        if kind in {"old72", "old73", "future"}:
-            epoch = {"old72": 72, "old73": 73, "future": current_epoch + 1}[kind]
+        if kind in {"old72", "old73", "old74", "future"}:
+            epoch = {"old72": 72, "old73": 73, "old74": 74, "future": current_epoch + 1}[kind]
             connection.execute(f"PRAGMA user_version = {epoch}")
             connection.execute("CREATE TABLE retained_user_data (value TEXT NOT NULL)")
             connection.execute("INSERT INTO retained_user_data VALUES ('keep this row')")
@@ -61,7 +61,9 @@ def _unsupported(path: Path, kind: str, *, current_epoch: int):
     path.chmod(0o600)
 
 
-@pytest.mark.parametrize("kind", ["old72", "old73", "future", "foreign", "partial", "stamped-empty", "foreign-empty", "views-only"])
+@pytest.mark.parametrize(
+    "kind", ["old72", "old73", "old74", "future", "foreign", "partial", "stamped-empty", "foreign-empty", "views-only"]
+)
 def test_session_writer_admission_refuses_before_wal_or_bootstrap(tmp_path, kind):
     path = tmp_path / "sessions.db"
     _unsupported(path, kind, current_epoch=SESSION_SCHEMA_EPOCH)
@@ -166,7 +168,7 @@ def test_absent_targets_admit_without_creation_then_fresh_current_stores_reopen(
     with closing(sqlite3.connect(auth_path)) as connection:
         for statement in AUTH_SCHEMA_STATEMENTS:
             connection.execute(statement)
-        connection.execute("INSERT INTO users VALUES ('kept-user', 'synthetic-hash', 'Kept', NULL, 1)")
+        connection.execute("INSERT INTO users VALUES ('kept-user', 'synthetic-hash', 'Kept', NULL, 1, 0)")
         connection.commit()
     auth_path.chmod(0o600)
     before = _snapshot(auth_path)

@@ -364,7 +364,7 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request. Support and valid values depend on the provider, model and reasoning mode; check the provider's documentation before setting an explicit value.",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
@@ -630,7 +630,7 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request. Support and valid values depend on the provider, model and reasoning mode; check the provider's documentation before setting an explicit value.",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
@@ -925,7 +925,7 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request. Support and valid values depend on the provider, model and reasoning mode; check the provider's documentation before setting an explicit value.",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",

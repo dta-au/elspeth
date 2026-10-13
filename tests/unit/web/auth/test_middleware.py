@@ -25,6 +25,9 @@ class _FakeAuthProvider:
     error: AuthenticationError | None = None
     authenticated_tokens: list[str] = field(default_factory=list)
 
+    async def logout(self, _token: str) -> None:
+        raise AssertionError("Authentication middleware must not revoke sessions")
+
     async def authenticate(self, token: str) -> UserIdentity:
         self.authenticated_tokens.append(token)
         if self.error is not None:

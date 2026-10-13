@@ -894,7 +894,7 @@ wheels = [
 
 [[package]]
 name = "elspeth"
-version = "0.8.3"
+version = "0.8.4"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -956,6 +956,7 @@ all = [
     { name = "pandas-stubs" },
     { name = "pre-commit" },
     { name = "prometheus-client" },
+    { name = "psqlparse2" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg2-binary" },
     { name = "pyjwt", extra = ["crypto"] },
@@ -1003,6 +1004,7 @@ dev = [
     { name = "mypy" },
     { name = "pandas-stubs" },
     { name = "pre-commit" },
+    { name = "psqlparse2" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg2-binary" },
     { name = "pytest" },
@@ -1031,6 +1033,7 @@ mcp = [
     { name = "mcp" },
 ]
 postgres = [
+    { name = "psqlparse2" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg2-binary" },
 ]
@@ -1150,6 +1153,9 @@ requires-dist = [
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.6,<5" },
     { name = "prometheus-client", marker = "extra == 'all'", specifier = ">=0.21,<1" },
     { name = "prometheus-client", marker = "extra == 'webui'", specifier = ">=0.21,<1" },
+    { name = "psqlparse2", marker = "extra == 'all'", specifier = "==0.0.17" },
+    { name = "psqlparse2", marker = "extra == 'dev'", specifier = "==0.0.17" },
+    { name = "psqlparse2", marker = "extra == 'postgres'", specifier = "==0.0.17" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'all'", specifier = ">=3.2,<4" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'dev'", specifier = ">=3.2,<4" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2,<4" },
@@ -3467,17 +3473,34 @@ wheels = [
 
 [[package]]
 name = "protobuf"
-version = "6.33.6"
+version = "5.29.6"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/66/70/e908e9c5e52ef7c3a6c7902c9dfbb34c7e29c25d2f81ade3856445fd5c94/protobuf-6.33.6.tar.gz", hash = "sha256:a6768d25248312c297558af96a9f9c929e8c4cee0659cb07e780731095f38135", size = 444531, upload-time = "2026-03-18T19:05:00.988Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7e/57/394a763c103e0edf87f0938dafcd918d53b4c011dfc5c8ae80f3b0452dbb/protobuf-5.29.6.tar.gz", hash = "sha256:da9ee6a5424b6b30fd5e45c5ea663aef540ca95f9ad99d1e887e819cdf9b8723", size = 425623, upload-time = "2026-02-04T22:54:40.584Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fc/9f/2f509339e89cfa6f6a4c4ff50438db9ca488dec341f7e454adad60150b00/protobuf-6.33.6-cp310-abi3-win32.whl", hash = "sha256:7d29d9b65f8afef196f8334e80d6bc1d5d4adedb449971fefd3723824e6e77d3", size = 425739, upload-time = "2026-03-18T19:04:48.373Z" },
-    { url = "https://files.pythonhosted.org/packages/76/5d/683efcd4798e0030c1bab27374fd13a89f7c2515fb1f3123efdfaa5eab57/protobuf-6.33.6-cp310-abi3-win_amd64.whl", hash = "sha256:0cd27b587afca21b7cfa59a74dcbd48a50f0a6400cfb59391340ad729d91d326", size = 437089, upload-time = "2026-03-18T19:04:50.381Z" },
-    { url = "https://files.pythonhosted.org/packages/5c/01/a3c3ed5cd186f39e7880f8303cc51385a198a81469d53d0fdecf1f64d929/protobuf-6.33.6-cp39-abi3-macosx_10_9_universal2.whl", hash = "sha256:9720e6961b251bde64edfdab7d500725a2af5280f3f4c87e57c0208376aa8c3a", size = 427737, upload-time = "2026-03-18T19:04:51.866Z" },
-    { url = "https://files.pythonhosted.org/packages/ee/90/b3c01fdec7d2f627b3a6884243ba328c1217ed2d978def5c12dc50d328a3/protobuf-6.33.6-cp39-abi3-manylinux2014_aarch64.whl", hash = "sha256:e2afbae9b8e1825e3529f88d514754e094278bb95eadc0e199751cdd9a2e82a2", size = 324610, upload-time = "2026-03-18T19:04:53.096Z" },
-    { url = "https://files.pythonhosted.org/packages/9b/ca/25afc144934014700c52e05103c2421997482d561f3101ff352e1292fb81/protobuf-6.33.6-cp39-abi3-manylinux2014_s390x.whl", hash = "sha256:c96c37eec15086b79762ed265d59ab204dabc53056e3443e702d2681f4b39ce3", size = 339381, upload-time = "2026-03-18T19:04:54.616Z" },
-    { url = "https://files.pythonhosted.org/packages/16/92/d1e32e3e0d894fe00b15ce28ad4944ab692713f2e7f0a99787405e43533a/protobuf-6.33.6-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:e9db7e292e0ab79dd108d7f1a94fe31601ce1ee3f7b79e0692043423020b0593", size = 323436, upload-time = "2026-03-18T19:04:55.768Z" },
-    { url = "https://files.pythonhosted.org/packages/c4/72/02445137af02769918a93807b2b7890047c32bfb9f90371cbc12688819eb/protobuf-6.33.6-py3-none-any.whl", hash = "sha256:77179e006c476e69bf8e8ce866640091ec42e1beb80b213c3900006ecfba6901", size = 170656, upload-time = "2026-03-18T19:04:59.826Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/88/9ee58ff7863c479d6f8346686d4636dd4c415b0cbeed7a6a7d0617639c2a/protobuf-5.29.6-cp310-abi3-win32.whl", hash = "sha256:62e8a3114992c7c647bce37dcc93647575fc52d50e48de30c6fcb28a6a291eb1", size = 423357, upload-time = "2026-02-04T22:54:25.805Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/66/2dc736a4d576847134fb6d80bd995c569b13cdc7b815d669050bf0ce2d2c/protobuf-5.29.6-cp310-abi3-win_amd64.whl", hash = "sha256:7e6ad413275be172f67fdee0f43484b6de5a904cc1c3ea9804cb6fe2ff366eda", size = 435175, upload-time = "2026-02-04T22:54:28.592Z" },
+    { url = "https://files.pythonhosted.org/packages/06/db/49b05966fd208ae3f44dcd33837b6243b4915c57561d730a43f881f24dea/protobuf-5.29.6-cp38-abi3-macosx_10_9_universal2.whl", hash = "sha256:b5a169e664b4057183a34bdc424540e86eea47560f3c123a0d64de4e137f9269", size = 418619, upload-time = "2026-02-04T22:54:30.266Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/d7/48cbf6b0c3c39761e47a99cb483405f0fde2be22cf00d71ef316ce52b458/protobuf-5.29.6-cp38-abi3-manylinux2014_aarch64.whl", hash = "sha256:a8866b2cff111f0f863c1b3b9e7572dc7eaea23a7fae27f6fc613304046483e6", size = 320284, upload-time = "2026-02-04T22:54:31.782Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/dd/cadd6ec43069247d91f6345fa7a0d2858bef6af366dbd7ba8f05d2c77d3b/protobuf-5.29.6-cp38-abi3-manylinux2014_x86_64.whl", hash = "sha256:e3387f44798ac1106af0233c04fb8abf543772ff241169946f698b3a9a3d3ab9", size = 320478, upload-time = "2026-02-04T22:54:32.909Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/cb/e3065b447186cb70aa65acc70c86baf482d82bf75625bf5a2c4f6919c6a3/protobuf-5.29.6-py3-none-any.whl", hash = "sha256:6b9edb641441b2da9fa8f428760fc136a49cf97a52076010cf22a2ff73438a86", size = 173126, upload-time = "2026-02-04T22:54:39.462Z" },
+]
+
+[[package]]
+name = "psqlparse2"
+version = "0.0.17"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "protobuf" },
+    { name = "types-protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cf/4e/0a642acfdc92ba7ab5a14c020d840dd57562d5f32ee41c647520dbea080f/psqlparse2-0.0.17.tar.gz", hash = "sha256:a2dc5674eb6300aa48fc236a013939c455d795ef5294b6994480c92781079443", size = 4349907, upload-time = "2024-11-22T02:07:21.949Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/94/43/00b12dc6fc78ec6acd9aa5ffb0b707337a5734a9078056a71f71ae97fe44/psqlparse2-0.0.17-cp312-cp312-macosx_10_9_x86_64.whl", hash = "sha256:28da4d09a9ee0cc9cb8b9881951e8e1e2b961c90cbf1a0f388224d88cdb53e12", size = 119477, upload-time = "2024-11-22T02:06:27.205Z" },
+    { url = "https://files.pythonhosted.org/packages/71/79/fbd505a0929d74458732642fcd43c11cbcb0f2988a2ebb1e0e785e346d50/psqlparse2-0.0.17-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:f7eb9d6e39569c1e67956562d9a44484f85ee79e14d0474f3f535d5e6ae5e4b1", size = 876626, upload-time = "2024-11-22T02:06:28.454Z" },
+    { url = "https://files.pythonhosted.org/packages/df/55/a6dee1a6e2a1971ef1e31aa897605990a5f14052ec26f9831ca3ff061e1e/psqlparse2-0.0.17-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:f24db6c1b45249d36718614165ed00d6991b5948051fc08ad6feb9574e870223", size = 1746482, upload-time = "2024-11-22T02:06:29.952Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/be/d4596dd96a5776df61834c5f2365d2e3f3683f89135e66cdfe54148e22b3/psqlparse2-0.0.17-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:44e96b89276c8636d8aa429ea40e0f64ec62e919ea489b10d4e237e6ce94ed3b", size = 1823324, upload-time = "2024-11-22T02:06:31.437Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/3f/82a2a69d7c1c6fcec587e6b0d2add82cc92baccb866cf8b24f52acbb67e9/psqlparse2-0.0.17-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:91657e67ff5750bc10b3d52ea74af1b8761ac434880cbf71badc8505b465e75f", size = 1709882, upload-time = "2024-11-22T02:06:33.28Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/55/55662a22aab0b23916929a0c34e74bbd3d9aa1d9b3973356070849f1ec15/psqlparse2-0.0.17-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:af5cd1627ba6ba92793edaafdd5574d041080b0ec6df1258579fbf4d259bc4c2", size = 1792300, upload-time = "2024-11-22T02:06:34.809Z" },
 ]
 
 [[package]]
@@ -4845,6 +4868,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/07/e3/dcc20d645dc0631b0df263959b8dde49dc47ad3c0537d8958bfefe692380/types_networkx-3.6.1.20251220.tar.gz", hash = "sha256:caf95e0d7777b969e50ceeb2c430d9d4dfe6b7bdee43c42dc9879a2d4408a790", size = 73500, upload-time = "2025-12-20T03:07:47.933Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/65/e7/fe40cfe7ba384d1f46fee835eb7727a4ee2fd80021a69add9553197b69a1/types_networkx-3.6.1.20251220-py3-none-any.whl", hash = "sha256:417ccbe7841f335a4c2b8e7515c3bc97a00fb5f686f399a763ef64392b209eac", size = 162715, upload-time = "2025-12-20T03:07:46.882Z" },
+]
+
+[[package]]
+name = "types-protobuf"
+version = "5.29.1.20250403"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/78/6d/62a2e73b966c77609560800004dd49a926920dd4976a9fdd86cf998e7048/types_protobuf-5.29.1.20250403.tar.gz", hash = "sha256:7ff44f15022119c9d7558ce16e78b2d485bf7040b4fadced4dd069bb5faf77a2", size = 59413, upload-time = "2025-04-02T10:07:17.138Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/69/e3/b74dcc2797b21b39d5a4f08a8b08e20369b4ca250d718df7af41a60dd9f0/types_protobuf-5.29.1.20250403-py3-none-any.whl", hash = "sha256:c71de04106a2d54e5b2173d0a422058fae0ef2d058d70cf369fb797bf61ffa59", size = 73874, upload-time = "2025-04-02T10:07:15.755Z" },
 ]
 
 [[package]]

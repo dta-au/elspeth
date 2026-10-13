@@ -282,6 +282,15 @@ class FakeHTTPClient:
             raise AssertionError("FakeHTTPClient.response must be set before post()")
         return self.response
 
+    @contextmanager
+    def stream(self, method: str, url: str, **kwargs: Any) -> Iterator[httpx.Response]:
+        assert method == "POST"
+        response = self.post(url, **kwargs)
+        try:
+            yield response
+        finally:
+            response.close()
+
     def close(self) -> None:
         self.close_calls += 1
         self.closed = True
@@ -365,7 +374,7 @@ def test_governance_admits_before_dispatch_and_settles_recorded_outcomes(
 
     def invoke() -> None:
         if preflight:
-            provider.runtime_preflight(operation_id="op-1", model="gpt-4o", coordination_token=_LEADER_TOKEN)
+            provider.runtime_preflight(operation_id="op-1", temperature=0.0, model="gpt-4o", coordination_token=_LEADER_TOKEN)
         else:
             provider.execute_query(
                 [ChatMessage(role="user", content="hello")],
@@ -1300,7 +1309,9 @@ class TestRuntimePreflight:
         with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient", autospec=True) as client_cls:
             client_cls.return_value = http_client
             with pytest.raises(expected_type, match=diagnostic) as exc_info:
-                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="test-reasoning-model")
+                provider.runtime_preflight(
+                    coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="test-reasoning-model"
+                )
         assert type(exc_info.value) is expected_type
         assert exc_info.value.retryable is False
         assert "private refusal detail" not in str(exc_info.value)
@@ -1325,7 +1336,7 @@ class TestRuntimePreflight:
         http_client = FakeHTTPClient(response=response)
         with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient", autospec=True) as client_cls:
             client_cls.return_value = http_client
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="test-reasoning-model")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="test-reasoning-model")
         assert http_client.last_post.kwargs["json"]["max_tokens"] == 256
 
     def test_preflight_request_max_tokens_meets_azure_floor(self, provider: OpenRouterLLMProvider) -> None:
@@ -1334,7 +1345,7 @@ class TestRuntimePreflight:
         with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient", autospec=True) as client_cls:
             client_cls.return_value = http_client
 
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="gpt-4o")
 
             request_body = http_client.last_post.kwargs["json"]
             assert "max_tokens" in request_body, (
@@ -1357,7 +1368,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="gpt-4o")
 
             message = str(exc_info.value)
             assert "HTTP 400" in message
@@ -1377,7 +1388,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(RateLimitError) as exc_info:
-                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="gpt-4o")
 
             message = str(exc_info.value)
             assert "Rate limited" in message
@@ -1394,7 +1405,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(ServerError) as exc_info:
-                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="gpt-4o")
 
             message = str(exc_info.value)
             assert "Server error (HTTP 500)" in message
@@ -1441,7 +1452,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="gpt-4o")
 
             message = str(exc_info.value)
             assert len(message) < 600, (
@@ -1460,7 +1471,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="gpt-4o")
 
             message = str(exc_info.value)
             _assert_provider_body_redacted(message, "authorization", "sk-or-v1-header-secret")
@@ -1478,7 +1489,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="gpt-4o")
 
             message = str(exc_info.value)
             _assert_provider_body_redacted(message, "application/sk-or-v1-header-secret", "sk-or-v1-header-secret")
@@ -1500,7 +1511,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="gpt-4o")
 
             message = str(exc_info.value)
             assert "HTTP 400" in message

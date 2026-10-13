@@ -11,8 +11,9 @@ from uuid import UUID
 from sqlalchemy import Engine, delete, insert, select, update
 
 from elspeth.web.auth.models import AuthenticationError, UserIdentity
+from elspeth.web.auth.session_token import SessionBinding
 from elspeth.web.coordination.membership_authority import _DATABASE_CLOCK_SQL, _database_clock_value, _ensure_utc
-from elspeth.web.execution.websocket_ticket import WebSocketTicket
+from elspeth.web.execution.websocket_ticket import WebSocketCredential, WebSocketTicket
 from elspeth.web.sessions.models import identities_table, identity_roles_table, runs_table, sessions_table, websocket_tickets_table
 
 _EXPIRY_CLEANUP_BATCH_SIZE = 100
@@ -41,7 +42,7 @@ class RepositorySessionWebsocketTicketAuthority:
         self._clock_sql = _DATABASE_CLOCK_SQL[engine.dialect.name]
         self._ttl = timedelta(seconds=ttl_seconds)
 
-    def issue(self, *, run_id: str | UUID, user: UserIdentity) -> WebSocketTicket:
+    def issue(self, *, run_id: str | UUID, user: UserIdentity, binding: SessionBinding) -> WebSocketTicket:
         """Issue only after proving current active identity and session ownership."""
         with self._engine.begin() as conn:
             session = conn.execute(
@@ -101,13 +102,16 @@ class RepositorySessionWebsocketTicketAuthority:
                     run_id=str(run_id),
                     user_id=identity.identity_id,
                     auth_provider_type=identity.provider,
+                    session_family_id=binding.family_id,
+                    credential_generation=binding.credential_generation,
+                    token_expires_at=binding.expires_at,
                     issued_at=now,
                     expires_at=expires_at,
                 )
             )
-            return WebSocketTicket(raw_ticket, str(run_id), UserIdentity(identity.identity_id, identity.username), expires_at)
+            return WebSocketTicket(raw_ticket, str(run_id), UserIdentity(identity.identity_id, identity.username), expires_at, binding)
 
-    def consume(self, *, ticket: str, run_id: str | UUID) -> UserIdentity | None:
+    def consume(self, *, ticket: str, run_id: str | UUID) -> WebSocketCredential | None:
         """Atomically burn one credential, returning only a currently authorized user."""
         if not ticket.strip():
             return None
@@ -165,4 +169,7 @@ class RepositorySessionWebsocketTicketAuthority:
                 or session.archived_at is not None
             ):
                 return None
-            return UserIdentity(identity.identity_id, identity.username)
+            return WebSocketCredential(
+                UserIdentity(identity.identity_id, identity.username),
+                SessionBinding(record.session_family_id, record.credential_generation, record.token_expires_at),
+            )

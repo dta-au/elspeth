@@ -80,7 +80,7 @@ class FakeProvider:
         messages: Any,
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: Any,
         response_format: dict[str, Any] | None = None,
@@ -96,7 +96,7 @@ class FakeProvider:
         )
         return self._result
 
-    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str, temperature: float | None) -> None:
         raise AssertionError("not exercised in these tests")
 
     def close(self) -> None:

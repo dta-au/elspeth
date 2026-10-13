@@ -18,7 +18,7 @@ interface AuthState {
 
   login: (username: string, password: string) => Promise<boolean>;
   loginWithToken: (token: string) => Promise<void>;
-  logout: () => Promise<void>;
+  logout: (options?: { revoke?: boolean }) => Promise<void>;
   loadFromStorage: () => Promise<void>;
 }
 
@@ -127,14 +127,21 @@ export const useAuthStore = create<AuthState>((set) => ({
     }
   },
 
-  async logout() {
-    advanceAuthGeneration();
+  async logout(options) {
+    if (pendingLogoutCleanup) return pendingLogoutCleanup;
+    const token = localStorage.getItem(TOKEN_KEY);
+    const generation = advanceAuthGeneration();
+    const revocation = options?.revoke !== false && token !== null
+      ? Promise.resolve().then(() => api.logoutSession(token)).catch(() => {
+          if (isCurrentAuthGeneration(generation)) set({ loginError: "Signed out locally. Server session revocation could not be confirmed." });
+        })
+      : Promise.resolve();
     usePreferencesStore.getState().reset();
     detachComposerObservers();
     purgeComposerCustody();
     // New logins await this barrier before publishing their credentials. The
     // old principal's caches must be cleared, not abandoned on replacement.
-    const cleanup = pendingLogoutCleanup ?? Promise.all([
+    const storeCleanup = Promise.all([
       import("./sessionStore"),
       import("./executionStore"),
       import("./blobStore"),
@@ -157,6 +164,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       useInterpretationEventsStore.setState(useInterpretationEventsStore.getInitialState(), true);
       usePreferencesStore.getState().reset();
     });
+    const cleanup = Promise.all([storeCleanup, revocation]).then(() => undefined);
     pendingLogoutCleanup = cleanup;
     localStorage.removeItem(TOKEN_KEY);
     usePluginCatalogStore.getState().clear();

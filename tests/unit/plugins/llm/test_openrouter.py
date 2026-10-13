@@ -191,7 +191,6 @@ def _create_mock_response(
     status_code: int = 200,
     headers: dict[str, str] | None = None,
     raw_body: str | bytes | None = None,
-    raise_for_status_error: Exception | None = None,
 ) -> httpx.Response:
     """Create an httpx.Response using ChaosLLM response generation."""
     request = {
@@ -208,12 +207,6 @@ def _create_mock_response(
         raw_body=raw_body,
         usage_override=usage,
     )
-    if raise_for_status_error is not None:
-
-        def raise_for_status() -> None:
-            raise raise_for_status_error
-
-        response.raise_for_status = raise_for_status  # type: ignore[method-assign]
     return response
 
 
@@ -978,14 +971,12 @@ class TestLLMTransformOpenRouterPipelining:
         assert result.row is not None
         assert result.row["llm_response_model"] == "anthropic/claude-3-opus-20240229"
 
-    def test_raise_for_status_called(
-        self, ctx: PluginContext, transform: LLMTransform, collector: CollectorOutputPort, chaosllm_server
+    @pytest.mark.parametrize("status_code", [200, 400])
+    def test_buffered_http_response_preserves_status_for_row_routing(
+        self, ctx: PluginContext, transform: LLMTransform, collector: CollectorOutputPort, chaosllm_server, status_code: int
     ) -> None:
-        """raise_for_status is called on response to check errors."""
-        mock_response = _create_mock_response(
-            chaosllm_server,
-            raise_for_status_error=_http_status_error("400 Bad Request", 400, "Bad Request"),
-        )
+        """Bounded buffering preserves the actual HTTP status used to route a row."""
+        mock_response = _create_mock_response(chaosllm_server, status_code=status_code)
         with mock_httpx_client(chaosllm_server, response=mock_response):
             transform.accept(make_pipeline_row({"text": "hello"}), ctx)
             transform.flush_batch_processing(timeout=10.0)
@@ -993,7 +984,11 @@ class TestLLMTransformOpenRouterPipelining:
         assert len(collector.results) == 1
         _, result, _state_id = collector.results[0]
         assert isinstance(result, TransformResult)
-        assert result.status == "error"
+        assert result.status == ("success" if status_code == 200 else "error")
+        if status_code == 400:
+            assert result.reason is not None
+            assert result.reason["reason"] == "llm_call_failed"
+            assert result.retryable is False
 
     def test_connect_output_required_before_accept(self) -> None:
         """accept() raises RuntimeError if connect_output() not called."""
@@ -2149,5 +2144,6 @@ class TestOpenRouterRuntimePreflightValidation:
             provider.runtime_preflight(
                 operation_id="op-preflight",
                 model=_OPENROUTER_MODEL,
+                temperature=0.0,
                 coordination_token=mock_audit_authority()["coordination_token"],
             )

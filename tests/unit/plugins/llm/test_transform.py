@@ -458,6 +458,7 @@ class TestTransformProperties:
         mock_provider.runtime_preflight.assert_called_once_with(
             operation_id="op-runtime-preflight",
             model="gpt-4o",
+            temperature=None,
             coordination_token=ctx.require_coordination_token(),
         )
 

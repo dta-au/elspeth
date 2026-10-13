@@ -22,7 +22,11 @@ from tests.unit.web.execution.test_websocket import FakeBroadcaster, FakeSetting
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.auth.models import IdentityClaims, UserIdentity
+from elspeth.web.auth.session_token import SessionTokenIssuer
+from elspeth.web.auth.sso import SsoAuthProvider
+from elspeth.web.composer_stream_auth import ComposerStreamAuthServices
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.auth_session_authority import RepositoryAuthSessionAuthority
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
@@ -205,8 +209,34 @@ def _websocket_route_process(url: str, identity_id: str, run_id: str, pipe: Conn
         )
         app.state.settings = FakeSettings(auth_provider="vanguard")
         app.state.websocket_ticket_store = WebSocketTicketStore()
+        issuer = SessionTokenIssuer(
+            signing_key=b"progress-test-session-signing-key!",
+            provider="vanguard",
+            audience="progress-test",
+            token_expiry_hours=24,
+            max_refresh_chain_hours=168,
+            principal_is_active=lambda identity: app.state.identity_authority.is_active_human_identity(
+                identity_id=identity, provider="vanguard"
+            ),
+            sessions=RepositoryAuthSessionAuthority(engine),
+        )
+        provider = SsoAuthProvider(
+            issuer=issuer, read_identity=lambda identity: app.state.identity_authority.read_identity(identity_id=identity)
+        )
+        app.state.composer_stream_auth = ComposerStreamAuthServices(
+            provider=provider,
+            decode=issuer.decode,
+            identity_authority=app.state.identity_authority,
+            sessions=app.state.session_service,
+            provider_type="vanguard",
+        )
+        token = issuer.mint(identity_id=identity_id, username=identity_id)
         app.include_router(create_execution_router())
-        ticket = app.state.websocket_ticket_store.issue(run_id=run_id, user=UserIdentity(user_id=identity_id, username=identity_id)).ticket
+        ticket = app.state.websocket_ticket_store.issue(
+            run_id=run_id,
+            user=UserIdentity(user_id=identity_id, username=identity_id),
+            binding=issuer.decode(token).binding,
+        ).ticket
         try:
             sent_count = 0
             with TestClient(app) as client, client.websocket_connect(f"/ws/runs/{run_id}?ticket={ticket}&after_sequence=0") as websocket:
@@ -411,6 +441,6 @@ def test_websocket_route_streams_peer_commit_without_local_broadcast(
                     assert outcome.rebound_refused
                 finally:
                     engine.dispose()
-                assert _receive(read) == ("closed", 4004, 1)
+                assert _receive(read) == ("closed", 4001, 1)
             reader.join(30)
             assert reader.exitcode == 0

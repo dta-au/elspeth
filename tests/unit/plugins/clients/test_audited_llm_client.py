@@ -2,6 +2,7 @@
 """Tests for AuditedLLMClient."""
 
 import base64
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ import pytest
 from litellm.types.utils import ModelResponse
 
 from elspeth.contracts import CallStatus, CallType
-from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.chat_parts import ChatMessage, ImagePart
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError
@@ -569,6 +570,172 @@ def empty_choices_response(
     )
 
 
+@pytest.mark.parametrize("echo_form", ["content", "metadata", "empty", "malformed", "dump_error"])
+@pytest.mark.parametrize("separator", ["", " \n\t"])
+@pytest.mark.parametrize("encoding_variant", ["standard", "unpadded", "urlsafe_unpadded", "hex", "byte_array", "unicode_malformed"])
+def test_sdk_image_echo_refuses_every_response_branch_before_egress(echo_form: str, separator: str, encoding_variant: str) -> None:
+    image = ImagePart.from_bytes(format="png", data=PNG_BYTES, blob_ref=None)
+    encoded = base64.b64encode(image.data).decode()
+    if encoding_variant == "unpadded":
+        encoded = encoded.rstrip("=")
+    elif encoding_variant == "urlsafe_unpadded":
+        encoded = base64.urlsafe_b64encode(image.data).decode().rstrip("=")
+    elif encoding_variant in {"hex", "unicode_malformed"}:
+        encoded = image.data.hex().upper()
+    elif encoding_variant == "byte_array":
+        encoded = json.dumps(list(image.data), separators=(",", ":"))
+    echo = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
+    if encoding_variant == "byte_array":
+        echo = encoded.replace(",", "," + separator)
+    elif encoding_variant == "unicode_malformed":
+        echo = '"broken "' + "".join(f"\\u{ord(char):04x}" for char in echo) + '"'
+    response = provider_response(content=echo if echo_form == "content" else "ordinary output")
+    if echo_form in {"metadata", "empty", "malformed"}:
+        response.raw_response = {"debug": {"image": json.loads(echo) if encoding_variant == "byte_array" else echo}}
+    if echo_form == "empty":
+        response.choices = []
+    elif echo_form == "malformed":
+        response.model = None
+    elif echo_form == "dump_error":
+        response.model_dump_error = ValueError(echo)
+    execution = FakeExecutionRepository()
+    events: list[ExternalCallCompleted] = []
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=events.append,
+        underlying_client=FakeOpenAIClient(response=response),
+    )
+    with pytest.raises(LLMClientError) as caught:
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content=(image,))])
+    assert not caught.value.retryable
+    assert encoded not in "".join(str(caught.value).split())
+    execution.assert_recorded_once()
+    call = execution.last_record_call_kwargs
+    assert call["status"] is CallStatus.ERROR
+    assert call.get("response_data") is None
+    assert call["error"].to_dict()["type"] == "ImageResponsePolicyError"
+    assert encoded not in "".join(json.dumps(call["error"].to_dict()).split())
+    assert len(events) == 1
+    assert events[0].status is CallStatus.ERROR
+    assert events[0].response_payload is None
+
+
+@pytest.mark.parametrize("mode", [RunMode.REPLAY, RunMode.VERIFY])
+@pytest.mark.parametrize("echo_location", ["content", "raw_response", "error"])
+@pytest.mark.parametrize("encoding_variant", ["standard", "urlsafe_unpadded", "hex", "byte_array", "unicode_malformed"])
+def test_sdk_image_echo_cannot_be_copied_by_replay_or_verify(mode: RunMode, echo_location: str, encoding_variant: str) -> None:
+    image = ImagePart.from_bytes(format="png", data=PNG_BYTES, blob_ref=None)
+    encoded = base64.b64encode(image.data).decode()
+    if encoding_variant == "urlsafe_unpadded":
+        encoded = base64.urlsafe_b64encode(image.data).decode().rstrip("=")
+    elif encoding_variant in {"hex", "unicode_malformed"}:
+        encoded = image.data.hex()
+    elif encoding_variant == "byte_array":
+        encoded = json.dumps(list(image.data), separators=(",", ":"))
+    echo = "\n".join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
+    if encoding_variant == "byte_array":
+        echo = encoded.replace(",", ",\n")
+    elif encoding_variant == "unicode_malformed":
+        echo = '"broken "' + "".join(f"\\u{ord(char):04x}" for char in echo) + '"'
+    comparisons: list[dict[str, Any]] = []
+
+    class Session:
+        def __init__(self) -> None:
+            self.mode = mode
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                source_call_id="source",
+                status=CallStatus.ERROR if echo_location == "error" else CallStatus.SUCCESS,
+                response_data=None
+                if echo_location == "error"
+                else {
+                    "content": echo if echo_location == "content" else "ok",
+                    "model": "gpt-4",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                    "raw_response": {"debug": echo} if echo_location == "raw_response" else {},
+                    "pricing_model": "gpt-4",
+                    "provider_cost": None,
+                    "provider_cost_source": "not_available",
+                },
+                error_data={
+                    "type": "ClientError",
+                    "message": echo,
+                    "retryable": False,
+                    "pricing_model": "gpt-4",
+                    "provider_cost": None,
+                    "provider_cost_source": "not_available",
+                    "category": "client",
+                }
+                if echo_location == "error"
+                else None,
+                latency_ms=0.1,
+            )
+
+        def admit_verify_call(self, **kwargs: Any) -> str:
+            return "source"
+
+        def verify_call(self, **kwargs: Any) -> None:
+            comparisons.append(kwargs)
+
+    response = provider_response(
+        content=echo if echo_location == "content" else "ok", raw_response={"debug": echo} if echo_location == "raw_response" else {}
+    )
+    if echo_location == "error":
+        response.model_dump_error = ValueError(echo)
+    sdk = FakeOpenAIClient(response=response)
+    execution = FakeExecutionRepository()
+    events: list[ExternalCallCompleted] = []
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=events.append,
+        underlying_client=sdk,
+        call_mode_session=Session(),
+    )
+    with pytest.raises(AuditIntegrityError if mode is RunMode.REPLAY else LLMClientError):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content=(image,))])
+    if mode is RunMode.REPLAY:
+        assert not sdk.create_calls
+        assert not execution.recorded_calls
+        assert not events
+    else:
+        execution.assert_recorded_once()
+        assert comparisons[0]["live_status"] is CallStatus.ERROR
+        assert comparisons[0]["live_response_data"] is None
+        assert comparisons[0]["live_error_data"]["type"] == "ImageResponsePolicyError"
+        assert encoded not in "".join(json.dumps(comparisons[0]["live_error_data"]).split())
+
+
+@pytest.mark.parametrize("unsafe_pricing_model", [False, True])
+def test_sdk_image_refusal_preserves_safe_pricing_evidence(unsafe_pricing_model: bool) -> None:
+    image = ImagePart.from_bytes(format="png", data=PNG_BYTES, blob_ref=None)
+    encoded = base64.b64encode(image.data).decode()
+    execution = FakeExecutionRepository()
+    response = provider_response(raw_response={"debug": encoded}, usage={"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.25})
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=FakeOpenAIClient(response=response),
+        pricing_model=encoded if unsafe_pricing_model else "azure/gpt-4o",
+    )
+    with pytest.raises(LLMClientError):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content=(image,))])
+    error = execution.last_record_call_kwargs["error"].to_dict()
+    assert error["pricing_model"] == (None if unsafe_pricing_model else "azure/gpt-4o")
+    assert error["provider_cost"] == 0.25
+    assert error["provider_cost_source"] == "response_usage.cost"
+    assert execution.last_record_call_kwargs["token_usage"] == TokenUsage.known(10, 5)
+
+
 @pytest.mark.parametrize("processing_error", [None, ValueError("unserializable response")])
 @pytest.mark.parametrize("sdk_usage", [False, True])
 def test_provider_usage_reaches_audit_even_when_response_processing_fails(processing_error: Exception | None, sdk_usage: bool) -> None:
@@ -805,7 +972,8 @@ class TestAuditedLLMClient:
         from elspeth.contracts.chat_parts import ImagePart, TextPart
 
         execution = self._create_mock_execution()
-        openai_client = self._create_mock_openai_client()
+        ordinary_content = "OCR line one\nline two\twith spaces and other base64: b3RoZXI="
+        openai_client = self._create_mock_openai_client(content=ordinary_content)
         part = ImagePart.from_bytes(format="png", data=PNG_BYTES, blob_ref="a" * 64)
         msgs = [ChatMessage(role="user", content=(TextPart(text="t"), part))]
 
@@ -819,7 +987,8 @@ class TestAuditedLLMClient:
             provider="openai",
         )
 
-        client.chat_completion(model="gpt-4", messages=msgs)
+        result = client.chat_completion(model="gpt-4", messages=msgs)
+        assert result.content == ordinary_content
 
         sdk_messages = openai_client.single_create_kwargs()["messages"]
         assert sdk_messages[0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")

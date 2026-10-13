@@ -18,6 +18,10 @@ from elspeth.web.auth.models import UserIdentity, UserProfile
 class AuthProvider(Protocol):
     """Protocol for pluggable authentication providers."""
 
+    async def logout(self, token: str) -> None:
+        """Durably revoke this token's entire refresh family."""
+        ...
+
     async def authenticate(self, token: str) -> UserIdentity:
         """Validate a token and return the authenticated identity.
 

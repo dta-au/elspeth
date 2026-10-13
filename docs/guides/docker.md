@@ -281,7 +281,28 @@ Run the shipped bundle from the repository root. It starts one web process,
 PostgreSQL 16, distinct session and Landscape databases, schema initialization,
 and separate PostgreSQL and ELSPETH state volumes.
 The `web-init` service runs `doctor deployment --init-schema` before the web
-service starts.
+service starts, using separate session and Landscape schema owners. The web
+process receives only separate non-owner runtime credentials with table DML,
+sequence usage, and application-function execution privileges. Neither runtime
+can create databases, roles, schemas, or tables, disable audit triggers, or
+connect to the other application database. The operator CLI service uses the
+Landscape schema owner so the two-file CLI bundle can initialize its own store.
+The cluster administrator credential stays in PostgreSQL and its bootstrap job.
+This bundle requires a dedicated PostgreSQL cluster containing only its two
+application databases and PostgreSQL's `postgres`, `template0`, and `template1`
+databases. Bootstrap refuses unrelated databases without changing them. It
+revokes PUBLIC access to the administrative/template databases, keeping access
+with their bootstrap administrator owner; application credentials can connect
+only to their respective application database.
+Application objects live in `public`; unexpected extension schemas and
+privilege expansions also stop bootstrap and require operator repair or
+investigation while preserving the existing stores.
+Bootstrap is a maintenance step: stop web and CLI processes before rerunning
+it. It disables login for the four application roles, terminates their prior
+connections, and reseals credentials and grants. Login is restored only after
+both stores pass admission and grant sealing; a later failure leaves login
+disabled until bootstrap succeeds. Start application services afterward; they
+must establish fresh connections.
 
 1. Create the repository-root `.env`:
 
@@ -290,15 +311,18 @@ service starts.
    chmod 600 .env
    ```
 
-2. Generate the database password:
+2. Generate each of the five database passwords independently:
 
    ```bash
    openssl rand -hex 24
    ```
 
-   Put the result in `.env` as `POSTGRES_PASSWORD`. It must remain a
-   48-character lowercase hexadecimal value. The bundle uses this same
-   URL-unreserved value for the PostgreSQL role and connection URLs; do not
+   Store distinct results in `.env` as `POSTGRES_PASSWORD`,
+   `POSTGRES_SESSION_SCHEMA_PASSWORD`, `POSTGRES_LANDSCAPE_SCHEMA_PASSWORD`,
+   `POSTGRES_SESSION_RUNTIME_PASSWORD`, and `POSTGRES_LANDSCAPE_RUNTIME_PASSWORD`.
+   Each must remain a 48-character lowercase hexadecimal value. Bootstrap
+   rejects shared or malformed passwords before changing state. These
+   URL-unreserved values enter the role passwords and connection URLs; do not
    paste an arbitrary unencoded password into a database URL. Complete the
    other required secrets and set `IMAGE_TAG` to an immutable `sha-*` or `v*`
    release tag.
@@ -327,6 +351,20 @@ The `postgres_data` volume is database persistence. The `elspeth_state`
 volume holds payload persistence and local data. Back up and restore them as
 separate stores. Do not scale `web` beyond one replica or run more than one
 web process.
+
+Existing volumes from the former shared-superuser bundle fail closed with
+`compose_database_legacy_owner`. Unexpected privileged role memberships or
+object ownership also stop bootstrap. During the temporary pre-release
+compatibility window, unsupported stores are refused rather than upgraded.
+Keep existing persisted and user stores intact: do not delete, recreate,
+restamp, or convert them to make this bundle start. Leave an incompatible
+deployment on its compatible application version while its data is preserved.
+For a fresh installation, provision a separate new PostgreSQL volume without
+overwriting existing stores. Any later transition of existing data requires a
+separate operator decision; this guide supplies no migration procedure.
+Preserve `elspeth_state`, payloads, and unrelated volumes as well. Do not use
+`down -v`: it deletes all project volumes. A compliant volume can be reused;
+bootstrap reapplies scoped grants and initializes a missing application database.
 
 ### TLS proxy and WebSocket acceptance
 

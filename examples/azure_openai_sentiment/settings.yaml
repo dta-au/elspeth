@@ -33,6 +33,8 @@ transforms:
       {"sentiment": "positive" or "negative" or "neutral", "confidence": 0.0-1.0, "summary": "brief explanation"}
 
       '
+    # Zero assumes an adjustable-temperature deployment. For deployments
+    # requiring omission, set null; check the model's sampling documentation.
     temperature: 0.0
     response_field: sentiment_analysis
     schema:

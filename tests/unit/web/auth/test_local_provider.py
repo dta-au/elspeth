@@ -124,6 +124,8 @@ def _envelope(**overrides: Any) -> dict[str, Any]:
         "iss": "elspeth",
         "aud": LOCAL_AUDIENCE,
         "jti": "test-jti",
+        "sid": "test-family",
+        "credential_generation": 0,
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
     }
@@ -217,6 +219,7 @@ import sys
 from pathlib import Path
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.session_token import LOCAL_AUDIENCE, SessionTokenIssuer
+from tests.fixtures.auth_sessions import TestSessionFamilies
 
 os.umask(0)
 path = Path(sys.argv[1])
@@ -229,6 +232,7 @@ LocalAuthProvider(
         token_expiry_hours=24,
         max_refresh_chain_hours=168,
         principal_is_active=lambda identity_id: True,
+        sessions=TestSessionFamilies(),
     ),
     admit_identity=lambda claims: (_ for _ in ()).throw(AssertionError("no login happens here")),
     retire_identity=lambda username, reason, credential_exists, delete_credential: (_ for _ in ()).throw(AssertionError("no deletion happens here")),
@@ -1685,6 +1689,8 @@ class TestRefresh:
             identity_id=claims.identity_id,
             username=claims.username,
             issued_at=int(time.time()) - age_seconds,
+            family_id=claims.binding.family_id,
+            credential_generation=claims.binding.credential_generation,
         )
 
     @pytest.mark.asyncio
@@ -1742,7 +1748,11 @@ class TestRefresh:
         """
         token = await self._logged_in(provider)
         claims = provider._token_issuer.decode(token)
-        payload = _envelope(sub=claims.identity_id)
+        payload = _envelope(
+            sub=claims.identity_id,
+            sid=claims.binding.family_id,
+            credential_generation=claims.binding.credential_generation,
+        )
         del payload["iat"]
         no_iat = _signed_local_token(provider, payload)
 
@@ -1778,6 +1788,21 @@ class TestListUsers:
 
 class TestSetPassword:
     """set_password backs the dev-admin reset flow."""
+
+    @pytest.mark.asyncio
+    async def test_reset_revokes_every_old_token_and_refresh_chain(self, provider) -> None:
+        provider.create_user("alice", "old-password-1", display_name="Alice")
+        original = await provider.login("alice", "old-password-1")
+        successor = await provider.refresh(original)
+        independent = await provider.login("alice", "old-password-1")
+        assert (await provider.authenticate(original)).username == "alice"
+        provider.set_password("alice", "new-password-2")
+        for token in (original, successor, independent):
+            with pytest.raises(AuthenticationError):
+                await provider.authenticate(token)
+            with pytest.raises(AuthenticationError):
+                await provider.refresh(token)
+        assert (await provider.authenticate(await provider.login("alice", "new-password-2"))).username == "alice"
 
     @pytest.mark.asyncio
     async def test_new_password_logs_in_and_old_password_fails(self, provider) -> None:

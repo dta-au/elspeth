@@ -13,6 +13,7 @@ from elspeth.web.auth.models import AuthenticationError
 from elspeth.web.auth.session_token import SessionTokenIssuer
 from elspeth.web.auth.sso import SsoAuthProvider
 from elspeth.web.sessions.identity_repository import IdentityRecord
+from tests.fixtures.auth_sessions import TestSessionFamilies
 
 SIGNING_KEY = b"sso-auth-provider-test-signing-key!!"
 AUDIENCE = "https://elspeth.example.gov.au"
@@ -54,6 +55,7 @@ def _issuer(identities: _Identities, *, audience: str = AUDIENCE) -> SessionToke
         token_expiry_hours=24,
         max_refresh_chain_hours=168,
         principal_is_active=identities.is_active,
+        sessions=TestSessionFamilies(),
     )
 
 

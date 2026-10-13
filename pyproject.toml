@@ -1,6 +1,6 @@
 [project]
 name = "elspeth"
-version = "0.8.3"
+version = "0.8.4"
 description = "Auditable Sense/Decide/Act pipelines for high-reliability systems"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -124,11 +124,13 @@ dev = [
     "testcontainers[postgres]>=4.0,<5",  # Docker-backed Postgres for CL-PP-11 dialect-portability tests
     "psycopg[binary]>=3.2,<4",  # Explicit postgresql+psycopg:// URLs (psycopg v3)
     "psycopg2-binary>=2.9,<3",  # Bare postgresql:// URLs and testcontainers' default DB-API driver
+    "psqlparse2==0.0.17",  # PostgreSQL 16 grammar for restricted query-policy tests
 ]
 
 postgres = [
     "psycopg[binary]>=3.2,<4",  # Explicit postgresql+psycopg:// URLs (psycopg v3)
     "psycopg2-binary>=2.9,<3",  # Bare postgresql:// URLs use SQLAlchemy's default psycopg2 driver
+    "psqlparse2==0.0.17",  # PostgreSQL 16 grammar for restricted audit-query admission
 ]
 
 llm = [
@@ -224,6 +226,7 @@ all = [
     "testcontainers[postgres]>=4.0,<5",
     "psycopg[binary]>=3.2,<4",  # Explicit postgresql+psycopg:// URLs (psycopg v3)
     "psycopg2-binary>=2.9,<3",  # Bare postgresql:// URLs use SQLAlchemy's default psycopg2 driver
+    "psqlparse2==0.0.17",  # Same restricted-query grammar as postgres/dev extras
     # llm dependencies
     "jinja2>=3.1,<4",
     "openai>=2.36,<3",
@@ -360,6 +363,7 @@ extend-immutable-calls = ["typer.Option", "typer.Argument"]
 # === Mypy Configuration ===
 [tool.mypy]
 python_version = "3.13"
+mypy_path = ["typings"]
 strict = true
 warn_return_any = true
 warn_unused_configs = true

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchAuthConfig, verifyEmail } from "./client";
+import { fetchAuthConfig, logoutSession, verifyEmail } from "./client";
 import { useAuthStore } from "@/stores/authStore";
 import { resetStore } from "@/test/store-helpers";
 
@@ -8,6 +8,30 @@ describe("api/client auth helpers", () => {
     globalThis.fetch = vi.fn();
     localStorage.clear();
     resetStore(useAuthStore);
+  });
+
+  it("posts the captured logout token after current credential custody changed", async () => {
+    localStorage.setItem("auth_token", "replacement-token");
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await logoutSession("original-token");
+    expect(globalThis.fetch).toHaveBeenCalledWith("/api/auth/logout", expect.objectContaining({
+      method: "POST",
+      headers: { Authorization: "Bearer original-token" },
+      signal: expect.any(AbortSignal),
+    }));
+    expect(localStorage.getItem("auth_token")).toBe("replacement-token");
+  });
+
+  it("reports logout rejection without clearing a replacement session", async () => {
+    localStorage.setItem("auth_token", "replacement-token");
+    useAuthStore.setState({ token: "replacement-token" });
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response(
+      JSON.stringify({ detail: "Invalid token" }),
+      { status: 401, headers: { "content-type": "application/json" } },
+    ));
+    await expect(logoutSession("original-token")).rejects.toMatchObject({ status: 401 });
+    expect(useAuthStore.getState().token).toBe("replacement-token");
+    expect(localStorage.getItem("auth_token")).toBe("replacement-token");
   });
 
   it("does not log out an existing session when email verification returns 401", async () => {

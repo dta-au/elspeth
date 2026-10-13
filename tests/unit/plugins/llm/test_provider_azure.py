@@ -89,7 +89,7 @@ def test_verify_source_request_refusal_precedes_azure_sdk_construction(
 
     with pytest.raises(AuditIntegrityError, match=source_problem):
         if preflight:
-            provider.runtime_preflight(operation_id="op-1", model="gpt-4o", coordination_token=_LEADER_TOKEN)
+            provider.runtime_preflight(operation_id="op-1", temperature=None, model="gpt-4o", coordination_token=_LEADER_TOKEN)
         else:
             provider.execute_query(
                 [ChatMessage(role="user", content="hello")],
@@ -169,7 +169,7 @@ def test_governance_guards_sdk_and_settles_error_once(preflight: bool, refused: 
     provider._underlying_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     with pytest.raises(RuntimeError if refused else LLMClientError, match="quota refused" if refused else "LLM provider request failed"):
         if preflight:
-            provider.runtime_preflight(operation_id="op-1", model="test-model", coordination_token=_LEADER_TOKEN)
+            provider.runtime_preflight(operation_id="op-1", temperature=None, model="test-model", coordination_token=_LEADER_TOKEN)
         else:
             provider.execute_query(
                 [ChatMessage(role="user", content="hello")],
@@ -211,7 +211,7 @@ def test_runtime_preflight_rejects_unusable_completion(
     provider._underlying_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
 
     with pytest.raises(error_type, match=error_message):
-        provider.runtime_preflight(operation_id="op-1", model="test-model", coordination_token=_LEADER_TOKEN)
+        provider.runtime_preflight(operation_id="op-1", temperature=None, model="test-model", coordination_token=_LEADER_TOKEN)
 
     assert len(recorder.operation_calls) == 1
     assert recorder.operation_calls[0]["approved_prompt_artifact_hash"] is None
@@ -252,7 +252,7 @@ def test_runtime_preflight_wire_request_is_accepted_by_reasoning_deployments() -
     create_calls: list[dict[str, Any]] = []
     provider = _recording_azure_provider(create_calls)
 
-    provider.runtime_preflight(operation_id="op-1", model="reasoning-deployment", coordination_token=_LEADER_TOKEN)
+    provider.runtime_preflight(operation_id="op-1", temperature=None, model="reasoning-deployment", coordination_token=_LEADER_TOKEN)
 
     assert len(create_calls) == 1
     assert "temperature" not in create_calls[0]

@@ -305,7 +305,7 @@ status; health alone does not prove LLM or login setup.
 > **LIVE:** the console-log query by revision name that shows no new
 > unhandled startup or runtime failure.
 
-The 0.8.3 candidate expects session epoch 74 and Landscape epoch 49. An
+The 0.8.3 candidate expects session epoch 75 and Landscape epoch 49. An
 epoch-crossing candidate is unsupported under the temporary fresh-store-only
 policy. Stop without applying the candidate or altering either existing store.
 The [identity workflow cutover handoff](identity-workflow-cutover.md) is

@@ -9,11 +9,11 @@ The current guidance below supersedes every legacy reset procedure later in
 this document. Those procedures are historical reference only and do not
 apply to the current candidate. They do not authorize a deployment or a reset.
 
-## Current Cutover: 0.8.3 candidate for next 0.8.4 (session epoch 74, Landscape epoch 49)
+## Current Cutover: 0.8.3 candidate for next 0.8.4 (session epoch 75, Landscape epoch 49)
 
-The current candidate uses session epoch 74 for graph recovery and Landscape
-epoch 49. The ambiguous session epoch 73 is retired; the held authentication
-schema and prospective epoch-75 union are excluded. Existing compatible stores
+The current candidate uses session epoch 75 for graph recovery, authentication
+families, and bound websocket tickets, with Landscape epoch 49. The ambiguous
+session epoch 73 is retired. Existing compatible stores
 may reopen after exact schema admission. Unsupported stores remain unchanged;
 a matching epoch number alone does not establish compatible table, column,
 constraint, or index shape. Startup and schema doctor must refuse incompatible
@@ -41,12 +41,12 @@ preserved store, and it does not make predecessor rows readable by this code.
    create a database:
 
 ```bash
-sqlite3 -readonly "$DB_PATH" 'PRAGMA user_version;'         # expect 74 (== SESSION_SCHEMA_EPOCH)
+sqlite3 -readonly "$DB_PATH" 'PRAGMA user_version;'         # expect 75 (== SESSION_SCHEMA_EPOCH)
 sqlite3 -readonly "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 49 (== SQLITE_SCHEMA_EPOCH)
 ```
 
 These epoch probes supplement exact shape admission; they do not replace it.
-Record the session-epoch-74/Landscape-epoch-49 result for the candidate. On a
+Record the session-epoch-75/Landscape-epoch-49 result for the candidate. On a
 mismatch, preserve both stores and refuse candidate startup against them.
 After separately authorized startup, a fresh test session can complete the
 freeform Build step, run the pipeline, and inspect its recorded audit story.

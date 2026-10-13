@@ -21,6 +21,7 @@ from elspeth.contracts.session_operation import SessionOperationContext, Session
 from elspeth.web.async_workers import outstanding_admissions, run_sync_in_worker
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
+from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
@@ -31,6 +32,7 @@ from elspeth.web.required_work import (
     RequiredWorkSource,
     RequiredWorkTicket,
 )
+from elspeth.web.sessions import composer_async_worker
 from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.composer_async_worker import _owned
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
@@ -176,8 +178,56 @@ async def test_real_quota_settlement_fault_outranks_durable_stop(tmp_path) -> No
         engine.dispose()
 
 
+def _assert_exact_shutdown_outcome(error: BaseException, originals: tuple[asyncio.CancelledError, ...]) -> None:
+    assert len(originals) in (1, 2)
+    assert len({id(original) for original in originals}) == len(originals)
+    for original in originals:
+        assert type(original) is asyncio.CancelledError
+        assert len(original.args) == 1 and original.args[0] is COMPOSER_SHUTDOWN
+    if len(originals) == 1:
+        assert error is originals[0]
+    else:
+        assert type(error) is BaseExceptionGroup
+        assert error.message == "Composer operation retained original outcomes"
+        assert len(error.exceptions) == len(originals)
+        assert all(actual is original for actual, original in zip(error.exceptions, originals, strict=True))
+
+
+@pytest.mark.parametrize("invalid", ["mixed", "foreign-marker", "equal-marker", "extra", "missing", "duplicate", "replaced", "reordered"])
+def test_shutdown_outcome_rejects_unowned_or_missing_originals(invalid: str) -> None:
+    owner = asyncio.CancelledError(COMPOSER_SHUTDOWN)
+    watcher = asyncio.CancelledError(COMPOSER_SHUTDOWN)
+    expected = (owner, watcher)
+    errors: tuple[BaseException, ...] = expected
+    if invalid == "mixed":
+        errors = (owner, AuditIntegrityError("terminal SQL failed"))
+    elif invalid == "foreign-marker":
+        watcher = asyncio.CancelledError("foreign cancellation")
+        expected = (owner, watcher)
+        errors = expected
+    elif invalid == "equal-marker":
+        watcher = asyncio.CancelledError(replace(COMPOSER_SHUTDOWN))
+        expected = (owner, watcher)
+        errors = expected
+    elif invalid == "extra":
+        errors = (*expected, asyncio.CancelledError(COMPOSER_SHUTDOWN))
+    elif invalid == "missing":
+        errors = (owner,)
+    elif invalid == "duplicate":
+        errors = (owner, owner)
+    elif invalid == "replaced":
+        errors = (owner, asyncio.CancelledError(COMPOSER_SHUTDOWN))
+    elif invalid == "reordered":
+        errors = (watcher, owner)
+    else:
+        raise AssertionError("Unknown negative control")
+    with pytest.raises(AssertionError):
+        _assert_exact_shutdown_outcome(BaseExceptionGroup("Composer operation retained original outcomes", errors), expected)
+
+
 @pytest.mark.asyncio
-async def test_shutdown_drain_retains_worker_slot_until_actual_terminal_sql_finishes(tmp_path) -> None:
+@pytest.mark.parametrize("watcher_cutoff", [False, True], ids=["owner-only", "owner-and-watcher-originals"])
+async def test_shutdown_drain_retains_worker_slot_until_actual_terminal_sql_finishes(tmp_path, watcher_cutoff: bool) -> None:
     app, service, engine, composer = _file_app(tmp_path)
     authority = ComposerAsyncOperationAuthority(
         engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
@@ -187,6 +237,38 @@ async def test_shutdown_drain_retains_worker_slot_until_actual_terminal_sql_fini
     baseline = outstanding_admissions()
 
     actual_terminal_sql = service._run_composer_terminal_sql
+    actual_read = ComposerOperationWatchReader.read
+    actual_turn = composer_async_worker.run_composer_turn
+    read_entered = asyncio.Event()
+    permit_read = asyncio.Event()
+    watcher_tasks: list[asyncio.Task[object]] = []
+    watcher_originals: list[asyncio.CancelledError] = []
+    owner_originals: list[asyncio.CancelledError] = []
+
+    async def scheduled_read(reader: ComposerOperationWatchReader):
+        task = asyncio.current_task()
+        assert task is not None
+        watcher_tasks.append(task)
+        read_entered.set()
+        try:
+            await permit_read.wait()
+        except asyncio.CancelledError as original:
+            # This barrier replaces scheduling, not the provenance boundary:
+            # preserve the actual loop delivery for private watcher cleanup.
+            reader.retain_join_loop_delivery(original)
+            raise
+        try:
+            return await actual_read(reader)
+        except asyncio.CancelledError as original:
+            watcher_originals.append(original)
+            raise
+
+    async def observed_turn(*args, **kwargs):
+        try:
+            return await actual_turn(*args, **kwargs)
+        except asyncio.CancelledError as original:
+            owner_originals.append(original)
+            raise
 
     async def retained_terminal_sql(_service, running, func, **kwargs):
         def held_sql():
@@ -199,8 +281,13 @@ async def test_shutdown_drain_retains_worker_slot_until_actual_terminal_sql_fini
     worker = _worker(app, authority)
     try:
         record = await _admit(app, service, authority, operation_id=str(uuid4()))
-        with patch.object(type(service), "_run_composer_terminal_sql", new=retained_terminal_sql):
+        with (
+            patch.object(type(service), "_run_composer_terminal_sql", new=retained_terminal_sql),
+            patch.object(ComposerOperationWatchReader, "read", new=scheduled_read),
+            patch.object(composer_async_worker, "run_composer_turn", new=observed_turn),
+        ):
             assert await worker._claim_once() == 1
+            await read_entered.wait()
             for _ in range(200):
                 if entered.is_set():
                     break
@@ -213,10 +300,19 @@ async def test_shutdown_drain_retains_worker_slot_until_actual_terminal_sql_fini
             assert not owned_jobs[0].done()
             assert len(worker._jobs) == 1
             assert outstanding_admissions() >= baseline + 1
+            assert len(watcher_tasks) == 1
+            if watcher_cutoff:
+                permit_read.set()
+                await asyncio.wait(watcher_tasks)
+                assert len(watcher_originals) == 1
+            else:
+                assert not watcher_tasks[0].done()
             release.set()
-            with pytest.raises(asyncio.CancelledError) as cancellation:
+            with pytest.raises((asyncio.CancelledError, BaseExceptionGroup)) as cancellation:
                 await asyncio.wait_for(asyncio.gather(*owned_jobs), timeout=2)
-            assert cancellation.value.args == (COMPOSER_SHUTDOWN,)
+            assert len(owner_originals) == 1
+            assert len(watcher_originals) == int(watcher_cutoff)
+            _assert_exact_shutdown_outcome(cancellation.value, (*owner_originals, *watcher_originals))
             await asyncio.sleep(0)
             assert not worker._jobs
             assert outstanding_admissions() == baseline
@@ -226,6 +322,7 @@ async def test_shutdown_drain_retains_worker_slot_until_actual_terminal_sql_fini
         assert final.cancel_requested_at is None and composer.calls == 1
     finally:
         release.set()
+        permit_read.set()
         if worker._jobs:
             await asyncio.gather(*worker._jobs.values(), return_exceptions=True)
         engine.dispose()

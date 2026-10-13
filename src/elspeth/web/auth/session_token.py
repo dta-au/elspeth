@@ -24,7 +24,11 @@ CLAIMS
 ``provider``  which IdP issued the login this token descends from.
 ``iss``       always ``elspeth``.
 ``aud``       the deployment's public base URL, or ``elspeth-local``.
-``jti``       a unique token id, so a future denylist has something to name.
+``jti``       a unique token id for audit correlation.
+``sid``       a durable session family, preserved across refresh and revoked
+              by logout independently of other logins.
+``credential_generation`` local password generation, incremented atomically
+              with a password reset and checked by the local provider.
 ``iat``/``exp`` issue and expiry.
 
 THE THREE REFUSALS THAT MATTER
@@ -47,7 +51,7 @@ import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Protocol
 
 import jwt
 from jwt.exceptions import PyJWTError
@@ -93,6 +97,23 @@ that will eventually differ between providers.
 
 
 @dataclass(frozen=True, slots=True)
+class SessionBinding:
+    """Non-secret authorization retained by derived credentials."""
+
+    family_id: str
+    credential_generation: int
+    expires_at: int
+
+
+class SessionFamilyAuthority(Protocol):
+    """Persistent, shared authority; unavailable storage must fail closed."""
+
+    def create(self, *, family_id: str, identity_id: str, provider: AuthProviderType, expires_at: int) -> None: ...
+    def is_active(self, *, family_id: str, identity_id: str, provider: AuthProviderType) -> bool: ...
+    def revoke(self, *, family_id: str, identity_id: str, provider: AuthProviderType) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
 class SessionTokenClaims:
     """A decoded, fully verified session token.
 
@@ -107,6 +128,7 @@ class SessionTokenClaims:
     issued_at: int
     expires_at: int
     token_id: str
+    binding: SessionBinding
 
 
 def _required_visible_claim(payload: dict[str, object], claim: str) -> str:
@@ -154,6 +176,7 @@ class SessionTokenIssuer:
         token_expiry_hours: int,
         max_refresh_chain_hours: int,
         principal_is_active: Callable[[str], bool],
+        sessions: SessionFamilyAuthority,
     ) -> None:
         if type(signing_key) is not bytes or len(signing_key) < 32:
             raise ValueError("session token signing key must be at least 32 bytes")
@@ -169,6 +192,7 @@ class SessionTokenIssuer:
         self._token_expiry_hours = token_expiry_hours
         self._max_refresh_chain_hours = max_refresh_chain_hours
         self._principal_is_active = principal_is_active
+        self._sessions = sessions
 
     @property
     def provider(self) -> AuthProviderType:
@@ -178,7 +202,15 @@ class SessionTokenIssuer:
     def audience(self) -> str:
         return self._audience
 
-    def mint(self, *, identity_id: str, username: str, issued_at: int | None = None) -> str:
+    def mint(
+        self,
+        *,
+        identity_id: str,
+        username: str,
+        issued_at: int | None = None,
+        credential_generation: int = 0,
+        family_id: str | None = None,
+    ) -> str:
         """Issue a token for an identity that the caller has already admitted.
 
         ``issued_at`` carries a refresh chain's ORIGINAL issue time forward so
@@ -189,6 +221,17 @@ class SessionTokenIssuer:
         if not has_visible_content(username):
             raise AuthenticationError("Cannot mint a token without a username")
         now = int(time.time())
+        if type(credential_generation) is not int or credential_generation < 0:
+            raise AuthenticationError("Invalid credential generation")
+        original_issued_at = now if issued_at is None else issued_at
+        if family_id is None:
+            family_id = secrets.token_urlsafe(_JTI_BYTES)
+            self._sessions.create(
+                family_id=family_id,
+                identity_id=identity_id,
+                provider=self._provider,
+                expires_at=original_issued_at + (self._max_refresh_chain_hours + self._token_expiry_hours) * 3600,
+            )
         payload = {
             "sub": identity_id,
             "username": username,
@@ -196,7 +239,9 @@ class SessionTokenIssuer:
             "iss": _ISSUER,
             "aud": self._audience,
             "jti": secrets.token_urlsafe(_JTI_BYTES),
-            "iat": now if issued_at is None else issued_at,
+            "sid": family_id,
+            "credential_generation": credential_generation,
+            "iat": original_issued_at,
             "exp": now + self._token_expiry_hours * 3600,
         }
         token: str = jwt.encode(payload, self._signing_key, algorithm=_SIGNING_ALGORITHM)
@@ -217,7 +262,7 @@ class SessionTokenIssuer:
                 algorithms=[_SIGNING_ALGORITHM],
                 audience=self._audience,
                 issuer=_ISSUER,
-                options={"require": ["exp", "iat", "iss", "aud", "sub", "jti"]},
+                options={"require": ["exp", "iat", "iss", "aud", "sub", "jti", "sid", "credential_generation"]},
             )
         except PyJWTError as exc:
             raise AuthenticationError("Invalid token") from exc
@@ -229,6 +274,9 @@ class SessionTokenIssuer:
             # session to another person's identity.
             raise AuthenticationError("Token was issued for a different authentication provider")
 
+        generation = _required_int_claim(payload, "credential_generation")
+        if generation < 0:
+            raise AuthenticationError("Invalid token")
         return SessionTokenClaims(
             identity_id=_required_visible_claim(payload, "sub"),
             username=_required_visible_claim(payload, "username"),
@@ -236,6 +284,11 @@ class SessionTokenIssuer:
             issued_at=_required_int_claim(payload, "iat"),
             expires_at=_required_int_claim(payload, "exp"),
             token_id=_required_visible_claim(payload, "jti"),
+            binding=SessionBinding(
+                family_id=_required_visible_claim(payload, "sid"),
+                credential_generation=generation,
+                expires_at=_required_int_claim(payload, "exp"),
+            ),
         )
 
     def authenticate(self, token: str) -> SessionTokenClaims:
@@ -245,9 +298,20 @@ class SessionTokenIssuer:
         than one token lifetime.
         """
         claims = self.decode(token)
-        if not self._principal_is_active(claims.identity_id):
-            raise AuthenticationError("Invalid token")
+        self.authorize_binding(identity_id=claims.identity_id, binding=claims.binding)
         return claims
+
+    def authorize_binding(self, *, identity_id: str, binding: SessionBinding) -> None:
+        """Recheck trusted derived credentials without retaining a bearer secret."""
+        if binding.expires_at <= time.time() or not self._principal_is_active(identity_id):
+            raise AuthenticationError("Invalid token")
+        if not self._sessions.is_active(family_id=binding.family_id, identity_id=identity_id, provider=self._provider):
+            raise AuthenticationError("Invalid token")
+
+    def revoke(self, token: str) -> None:
+        """Revoke the entire chain; repeats remain safe after the first commit."""
+        claims = self.decode(token)
+        self._sessions.revoke(family_id=claims.binding.family_id, identity_id=claims.identity_id, provider=self._provider)
 
     def refresh(self, token: str) -> str:
         """Issue a successor token, bounded by the original issue time.
@@ -265,4 +329,6 @@ class SessionTokenIssuer:
             identity_id=claims.identity_id,
             username=claims.username,
             issued_at=claims.issued_at,
+            family_id=claims.binding.family_id,
+            credential_generation=claims.binding.credential_generation,
         )

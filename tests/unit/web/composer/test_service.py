@@ -31,6 +31,7 @@ from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.core.canonical import canonical_json
+from elspeth.web import async_workers
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import no_tool_policy as _no_tool_policy_module
@@ -88,6 +89,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.fixtures.required_executor import assert_owned_executor_fixture_settled
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import (
     FakeChoice,
@@ -6976,18 +6978,28 @@ class TestComposerRuntimePreflightCacheAndTimeout:
         assert mock_preflight.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_runtime_preflight_timeout_is_cached_for_compose_call(self) -> None:
+    @pytest.mark.parametrize("hold_actual_return", [False, True], ids=["join-actual-worker", "release-only-cleanup-rejected"])
+    async def test_runtime_preflight_timeout_is_cached_for_compose_call(self, hold_actual_return: bool) -> None:
         settings = _make_settings(composer_runtime_preflight_timeout_seconds=0.01)
         service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
         state = _empty_state()
         cache = service._preflight.new_cache()
         started = threading.Event()
         release = threading.Event()
+        actual_return = threading.Event()
+        release_observed = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        baseline = async_workers.outstanding_admissions()
+        expected = ValidationResult(is_valid=True, checks=[], errors=[])
+        if not hold_actual_return:
+            actual_return.set()
 
         def slow_preflight(candidate: CompositionState, user_id: str | None, session_id: str | None) -> ValidationResult:
             started.set()
             release.wait(timeout=30)
-            return ValidationResult(is_valid=True, checks=[], errors=[])
+            loop.call_soon_threadsafe(release_observed.set)
+            assert actual_return.wait(timeout=30)
+            return expected
 
         try:
             with patch.object(service._preflight, "runtime_preflight", side_effect=slow_preflight) as mock_preflight:
@@ -7002,6 +7014,9 @@ class TestComposerRuntimePreflightCacheAndTimeout:
                     )
                 assert first.value.exc_class == "TimeoutError"
                 assert started.is_set()
+                key = service._preflight.key(state, session_scope="session:test", plugin_snapshot=None)
+                actual_task = service._preflight._coordinator._inflight[key]
+                assert not actual_task.done()
 
                 with pytest.raises(ComposerRuntimePreflightError) as second:
                     await service._preflight.cached_runtime_preflight(
@@ -7015,8 +7030,30 @@ class TestComposerRuntimePreflightCacheAndTimeout:
 
                 assert second.value.exc_class == "TimeoutError"
                 mock_preflight.assert_called_once()
+                if hold_actual_return:
+                    # The old cleanup stops here: waking the thread is not
+                    # proof of its actual Future's completion or slot release.
+                    release.set()
+                    await release_observed.wait()
+                    assert not actual_task.done()
+                    assert async_workers.outstanding_admissions() == baseline + 1
+                    with pytest.raises(ExceptionGroup) as unsettled:
+                        assert_owned_executor_fixture_settled(async_workers._GENERATION_CUSTODIAN)
+                    assert [str(error) for error in unsettled.value.exceptions] == [
+                        "Executor fixture retained charged invocation",
+                        "Executor fixture retained incomplete actual Future",
+                    ]
         finally:
+            # Capture before releasing: the coordinator evicts completed work.
+            pending = tuple(service._preflight._coordinator._inflight.values())
             release.set()
+            actual_return.set()
+            results = await asyncio.gather(*pending)
+            assert all(result is expected for result in results)
+        assert actual_task.done() and actual_task.result() is expected
+        assert key not in service._preflight._coordinator._inflight
+        assert async_workers.outstanding_admissions() == baseline
+        assert_owned_executor_fixture_settled(async_workers._GENERATION_CUSTODIAN)
 
     @pytest.mark.asyncio
     async def test_timed_out_preflight_stays_admitted_so_a_retry_joins_it(self) -> None:

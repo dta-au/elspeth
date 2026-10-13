@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
@@ -27,6 +29,7 @@ from elspeth.contracts.binary_documents import (
     BINARY_DOCUMENT_MIME_BY_FORMAT,
     binary_document_signature_matches,
 )
+from elspeth.contracts.call_data import CallPayload, HTTPCallResponse
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
 
@@ -37,6 +40,14 @@ widening to pdf is a deliberate later change, not a config knob."""
 IMAGE_FORMATS: frozenset[str] = frozenset(get_args(ImageFormat))
 
 _IMAGE_MIME_BY_FORMAT = {fmt: BINARY_DOCUMENT_MIME_BY_FORMAT[fmt] for fmt in IMAGE_FORMATS}
+_JSON_STRING_DELIMITER = re.compile(r'["\\]')
+_JSON_ASCII_ESCAPE = re.compile(r"\\u00([0-7][0-9a-fA-F])")
+_BASE64_NORMALIZATION = str.maketrans("-_", "+/", " \t\r\n\f\v")
+_BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+_ENCODING_ESCAPED_WHITESPACE = re.compile(r"\\(?:[tnrfv]|x(?:09|0[a-dA-D]|20))")
+_HEX_NORMALIZATION = str.maketrans("ABCDEF", "abcdef", " \t\r\n\f\v:-")
+_JSON_BYTE_INTEGER = r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)"
+_JSON_BYTE_TOKEN = re.compile(r"(?<=[\[,])[ \t\r\n\f\v]*" + _JSON_BYTE_INTEGER + r"(?=[ \t\r\n\f\v]*(?:,|\]|$))")
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +172,149 @@ def wire_messages(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:
 def audit_messages(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:
     """Bytes-free audit form for LLMCallRequest recording."""
     return [{"role": m.role, "content": _audit_content(m.content)} for m in messages]
+
+
+def _image_encoding_probe(data: bytes) -> tuple[str, str]:
+    """Match every base64 representation of the image's significant bits.
+
+    Padding carries no image bits. A decoder also ignores the low bits of the
+    final symbol when the image does not end at a three-byte boundary. Match
+    those equivalent symbols, including when embedded in a larger value, just
+    as the raw-byte check refuses any occurrence of the full submitted image.
+    Keep the literal prefix and final-symbol set local to this call: compiling
+    image-sized regular expressions would retain images in Python's regex cache.
+    """
+    encoded = base64.b64encode(data).decode("ascii")
+    core = encoded.rstrip("=")
+    padding = len(encoded) - len(core)
+    if not padding:
+        return core, ""
+    first = _BASE64_ALPHABET.index(core[-1])
+    final_symbols = _BASE64_ALPHABET[first : first + (1 << (2 * padding))]
+    return core[:-1], final_symbols
+
+
+def _contains_protected_encoding(text: str, protected: tuple[tuple[str, str], ...]) -> bool:
+    for prefix, final_symbols in protected:
+        if not final_symbols:
+            if prefix in text:
+                return True
+        # Search complete literals, one temporary at a time. Restarting a long
+        # prefix search after every wrong final symbol can revisit overlapping
+        # prefixes quadratically; the pad-bit set bounds this to 4 or 16 searches.
+        elif any(prefix + symbol in text for symbol in final_symbols):
+            return True
+    return False
+
+
+def _contains_image_encoding_text(text: str, protected: tuple[tuple[str, str], ...], images: Sequence[ImagePart]) -> bool:
+    # The named encodings use ASCII. Decode its bounded JSON escape form even
+    # in malformed diagnostics: an unmatched quote must not hide a later echo.
+    # Preserve punctuation so distinct fields cannot become one encoding.
+    text = _JSON_ASCII_ESCAPE.sub(lambda match: chr(int(match.group(1), 16)), text)
+    text = _ENCODING_ESCAPED_WHITESPACE.sub("", text)
+    if _contains_protected_encoding(text.translate(_BASE64_NORMALIZATION), protected):
+        return True
+    compact_hex = text.translate(_HEX_NORMALIZATION)
+    # Avoid allocating a full hex copy for images larger than the candidate.
+    if any(2 * image.byte_count <= len(compact_hex) and image.data.hex() in compact_hex for image in images):
+        return True
+    decoded = bytearray()
+    previous_end: int | None = None
+    for token in _JSON_BYTE_TOKEN.finditer(text):
+        # Only JSON byte-integer tokens enter this conversion: no booleans,
+        # floats, negatives, or out-of-range values are coerced into image bytes.
+        # Diagnostic text may wrap them with ASCII whitespace invalid in JSON.
+        # Match one token at a time: repeating the token in one regex retains a
+        # backtracking frame per byte and can dwarf the response's memory size.
+        if previous_end is not None and text[previous_end : token.start()].strip(" \t\r\n\f\v") != ",":
+            if any(image.data in decoded for image in images):
+                return True
+            decoded.clear()
+        decoded.append(int(token.group()))
+        previous_end = token.end()
+    return any(image.data in decoded for image in images)
+
+
+def _contains_image_encoding(text: str, protected: tuple[tuple[str, str], ...], images: Sequence[ImagePart]) -> bool:
+    """Compare complete base64, hex and byte-array echoes without rewriting output.
+
+    Decode individual JSON strings too: serialization escapes embedded tabs
+    and newlines, and whole-document parsing discards duplicate-key values.
+    HTTP protocol errors also carry Python bytes-repr whitespace escapes;
+    fold those specific spellings without decoding arbitrary nested content.
+    Keep JSON syntax intact so separate fields never become one encoding.
+    """
+    if _contains_image_encoding_text(text, protected, images):
+        return True
+    literal_start: int | None = None
+    escaped_at = -1
+    for delimiter in _JSON_STRING_DELIMITER.finditer(text):
+        if delimiter.start() == escaped_at:
+            continue
+        if delimiter.group() == "\\":
+            if literal_start is not None:
+                escaped_at = delimiter.end()
+            continue
+        if literal_start is None:
+            literal_start = delimiter.start()
+            continue
+        literal = text[literal_start : delimiter.end()]
+        literal_start = None
+        try:
+            normalized_string = json.loads(literal)
+        except json.JSONDecodeError:
+            continue
+        if _contains_image_encoding_text(normalized_string, protected, images):
+            return True
+    return False
+
+
+def image_response_is_audit_safe(messages: Sequence[ChatMessage], response: CallPayload, *, body: bytes | None = None) -> bool:
+    """Refuse submitted image bytes echoed anywhere in a candidate call audit.
+
+    Admission never rewrites completion text. A provider echo cannot be retained
+    as a parsed body, a header, or exact replay bytes. JSON string normalization
+    also catches slash/unicode escapes, ASCII wrapping, equivalent alphabets,
+    optional padding and unused pad bits, including malformed/duplicate-key
+    bodies whose diagnostic representation would otherwise retain their raw text.
+    Complete hex strings and contiguous JSON byte integers are compared with the
+    submitted bytes too; this does not decode arbitrary reversible encodings or
+    concatenate separate fields into an image.
+    """
+    images = [
+        part for message in messages if not isinstance(message.content, str) for part in message.content if isinstance(part, ImagePart)
+    ]
+    if not images:
+        return True
+    protected = tuple(_image_encoding_probe(image.data) for image in images)
+    audit_text = canonical_json(response.to_dict())
+    if _contains_image_encoding(audit_text, protected, images):
+        return False
+    bodies = [body] if body is not None else []
+    if body is None and isinstance(response, HTTPCallResponse):
+        for evidence in (response.transport, response.decoded_body):
+            if evidence is not None:
+                bodies.append(base64.b64decode(evidence.body_b64, validate=True))
+    for raw_body in bodies:
+        if any(image.data in raw_body for image in images):
+            return False
+        try:
+            normalized = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        except RecursionError:
+            return False
+        else:
+            normalized_text = json.dumps(normalized, ensure_ascii=True)
+            if _contains_image_encoding(normalized_text, protected, images):
+                return False
+        # Use the JSON byte decoder's encoding detection for the independent
+        # literal scan too; whole-document parsing loses earlier duplicate keys.
+        text = raw_body.decode(json.detect_encoding(raw_body), errors="replace")
+        if _contains_image_encoding(text, protected, images):
+            return False
+    return True
 
 
 def parts_hash(content: tuple[ContentPart, ...]) -> str:

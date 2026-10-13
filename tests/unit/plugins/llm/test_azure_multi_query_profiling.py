@@ -96,7 +96,7 @@ class _QueryExecutor(Protocol):
         messages: list[dict[str, str]],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, object] | None = None,
@@ -113,7 +113,7 @@ class _ProviderDouble:
         messages: list[dict[str, str]],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, object] | None = None,
@@ -127,7 +127,7 @@ class _ProviderDouble:
             response_format=response_format,
         )
 
-    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str, temperature: float | None) -> None:
         pass
 
     def close(self) -> None:

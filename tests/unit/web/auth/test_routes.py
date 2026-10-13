@@ -93,6 +93,9 @@ class _FakeAuthProvider:
     login_calls: int = 0
     refresh_calls: int = 0
 
+    async def logout(self, _token: str) -> None:
+        raise AssertionError("logout should not be called by this route fixture")
+
     async def authenticate(self, _token: str) -> UserIdentity:
         self.authenticate_calls += 1
         if self.authenticate_error is not None:
@@ -1554,7 +1557,47 @@ class TestAuthEventPrincipalConsistency:
 
 
 class TestLogout:
-    """POST /api/auth/logout: the ``logout`` row is the whole effect (spec rev2)."""
+    """POST /api/auth/logout revokes the whole family before auditing success."""
+
+    @pytest.mark.asyncio
+    async def test_logout_audit_failure_cannot_restore_a_revoked_family(self, tmp_path, monkeypatch) -> None:
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        provider.create_user("alice", "password123", display_name="Alice")
+        token = await provider.login("alice", "password123")
+        app = _create_test_app(provider, landscape_url=f"sqlite:///{tmp_path / 'audit.db'}")
+        _enable_auth_audit(app)
+
+        def failed_audit(*args, **kwargs):
+            raise _AuditWriteFailure("logout audit unavailable")
+
+        monkeypatch.setattr(app.state.auth_audit_recorder, "record_logout", failed_audit)
+        async with _client_for(app) as client:
+            with pytest.raises(_AuditWriteFailure, match="logout audit unavailable"):
+                await client.post("/api/auth/logout", headers={"Authorization": f"Bearer {token}"})
+        with pytest.raises(AuthenticationError):
+            await provider.authenticate(token)
+        with pytest.raises(AuthenticationError):
+            await provider.refresh(token)
+
+    @pytest.mark.asyncio
+    async def test_logout_revokes_ancestors_and_successors_but_not_another_login(self, tmp_path) -> None:
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        provider.create_user("alice", "password123", display_name="Alice")
+        app = _create_test_app(provider, landscape_url=f"sqlite:///{tmp_path / 'audit.db'}")
+        _enable_auth_audit(app)
+        async with _client_for(app) as client:
+            first = await client.post("/api/auth/login", json={"username": "alice", "password": "password123"})
+            first_headers = {"Authorization": f"Bearer {first.json()['access_token']}"}
+            successor = await client.post("/api/auth/token", headers=first_headers)
+            successor_headers = {"Authorization": f"Bearer {successor.json()['access_token']}"}
+            independent = await client.post("/api/auth/login", json={"username": "alice", "password": "password123"})
+            independent_headers = {"Authorization": f"Bearer {independent.json()['access_token']}"}
+            assert (await client.get("/api/auth/me", headers=first_headers)).status_code == 200
+            assert (await client.post("/api/auth/logout", headers=successor_headers)).status_code == 204
+            for headers in (first_headers, successor_headers):
+                assert (await client.get("/api/auth/me", headers=headers)).status_code == 401
+                assert (await client.post("/api/auth/token", headers=headers)).status_code == 401
+            assert (await client.get("/api/auth/me", headers=independent_headers)).status_code == 200
 
     @pytest.mark.asyncio
     async def test_logout_records_a_durable_logout_row_and_answers_204(self, tmp_path) -> None:

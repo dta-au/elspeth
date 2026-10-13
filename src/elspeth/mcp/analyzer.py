@@ -168,6 +168,11 @@ class LandscapeAnalyzer:
         return queries.list_collisions(self._db, self._factory, run_id, limit=limit)
 
     def query(self, sql: str, params: dict[str, Any] | None = None, limit: int = MCP_QUERY_DEFAULT_LIMIT) -> list[dict[str, Any]]:
+        """Query directly; PostgreSQL shares the restricted PG16 SQL/profile policy.
+
+        This trusted-process facade retains native values and caller-owned
+        lifecycle. Disposable-worker resource limits apply to MCP dispatch.
+        """
         return queries.query(self._db, self._factory, sql, params=params, limit=limit)
 
     def get_run_summary(self, run_id: str) -> RunSummaryReport | ErrorResult:
