@@ -1,195 +1,287 @@
-<!-- @dsCard group="Website" viewport="1280x720" name="Site — Use cases" subtitle="Same framework, different plugins" -->
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="Explore illustrative ELSPETH workflow patterns and understand which integrations are built in or require custom plugins." />
-<title>Use cases — ELSPETH</title>
-<script>(function(){try{var s=localStorage.getItem("elspeth-theme");var t=s||((window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
-<link rel="stylesheet" href="styles.css" />
-<link rel="stylesheet" href="site.css" />
-<link rel="icon" href="favicon.svg" />
-<script src="vendor/lucide.min.js"></script>
-</head>
-<body>
-<a class="skip-link" href="#main">Skip to content</a>
-
-<header class="nav">
-  <div class="wrap nav-inner">
-    <div class="nav-left">
-      <a class="brand" href="index.html">ELSPETH</a>
-      <nav class="nav-links">
-        <a href="index.html">Home</a>
-        <a href="authoring.html">Authoring</a>
-        <a href="assurance.html">Assurance</a>
-        <a href="use-cases.html" class="active" aria-current="page">Use cases</a>
-        <a href="get-started.html">Get started</a>
+<html data-theme="dark" lang="en">
+ <head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+  <meta content="Evaluate practical data preparation, document review and classification patterns, including the work and safeguards your team must provide." name="description"/>
+  <title>
+   Assess a use case — ELSPETH
+  </title>
+  <script>
+   (function(){try{var s=localStorage.getItem("elspeth-theme");var t=(s==="light"||s==="dark")?s:((window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+  </script>
+  <link href="styles.css" rel="stylesheet"/>
+  <link href="site.css" rel="stylesheet"/>
+  <link href="favicon.svg" rel="icon" type="image/svg+xml"/>
+  <script defer="" src="vendor/lucide.min.js">
+  </script>
+  <script defer="" src="site.js">
+  </script>
+ </head>
+ <body>
+  <a class="skip-link" href="#main">
+   Skip to content
+  </a>
+  <header class="nav">
+   <div class="wrap nav-inner">
+    <a aria-label="ELSPETH home" class="brand" href="index.html">
+     ELSPETH
+     <span class="brand-sub">
+      Data &amp; LLM workflows
+     </span>
+    </a>
+    <nav aria-label="Main navigation" class="nav-links">
+     <a href="index.html">
+      Overview
+     </a>
+     <a href="authoring.html">
+      Build a workflow
+     </a>
+     <a href="assurance.html">
+      Review the evidence
+     </a>
+     <a aria-current="page" href="use-cases.html">
+      Assess a use case
+     </a>
+     <a href="get-started.html">
+      Get started
+     </a>
+    </nav>
+    <div class="nav-actions">
+     <button aria-label="Switch to light theme" class="iconbtn" hidden="" id="theme-toggle">
+      <i aria-hidden="true" data-lucide="moon">
+      </i>
+     </button>
+     <details class="nav-menu">
+      <summary>
+       Menu
+       <i aria-hidden="true" data-lucide="menu">
+       </i>
+      </summary>
+      <nav aria-label="Mobile navigation" class="nav-menu-panel">
+       <a href="index.html">
+        Overview
+       </a>
+       <a href="authoring.html">
+        Build a workflow
+       </a>
+       <a href="assurance.html">
+        Review the evidence
+       </a>
+       <a aria-current="page" href="use-cases.html">
+        Assess a use case
+       </a>
+       <a href="get-started.html">
+        Get started
+       </a>
       </nav>
+     </details>
     </div>
-    <div class="nav-right">
-      <details class="nav-menu">
-        <summary class="iconbtn" aria-label="Open navigation menu"><i data-lucide="menu"></i></summary>
-        <div class="nav-menu-panel">
-          <a href="index.html">Home</a>
-          <a href="authoring.html">Authoring</a>
-          <a href="assurance.html">Assurance</a>
-          <a href="use-cases.html" class="active" aria-current="page">Use cases</a>
-          <a href="get-started.html">Get started</a>
-          <hr />
-          <a href="https://github.com/dta-au/elspeth">GitHub</a>
-        </div>
-      </details>
-      <button class="iconbtn" id="theme-toggle" aria-label="Toggle theme"><i data-lucide="moon"></i></button>
-      <a class="btn-compact" href="https://github.com/dta-au/elspeth" style="gap:8px"><i data-lucide="github" style="width:15px;height:15px"></i> GitHub</a>
-      <a class="btn-compact" href="get-started.html">Get started</a>
+   </div>
+  </header>
+  <main id="main" tabindex="-1">
+   <header class="page-head">
+    <div class="wrap">
+     <p class="eyebrow">
+      Assess a use case
+     </p>
+     <h1>
+      Start with a specific task
+      <br/>
+      and a reviewable outcome.
+     </h1>
+     <p class="lead">
+      The patterns below are examples to evaluate, not claims of deployed services or validated decision systems. Begin with public or synthetic information and a person who can judge the result.
+     </p>
     </div>
-  </div>
-</header>
-
-<main id="main">
-
-<div class="page-head dotgrid">
-  <div class="wrap">
-    <span class="eyebrow">Same framework, different plugins</span>
-    <h1>Built for high-stakes, accountable processing.</h1>
-    <p>Wherever a decision needs to be explainable to an auditor, ELSPETH maps the work onto Sense → Decide → Act and keeps a full audit trail behind it.</p>
-  </div>
-</div>
-
-<section>
-  <div class="wrap">
-    <div class="section-head">
-      <span class="eyebrow">Patterns, not packaged solutions</span>
-      <h2>Illustrative workflow patterns</h2>
-      <p>These patterns show how accountable batch work can map onto Sense → Decide → Act. They are starting points, not claims that every named integration ships in the box.</p>
-    </div>
-    <div class="table-scroll" style="margin-top:28px" tabindex="0" role="region" aria-label="Illustrative workflow patterns by domain">
-    <table class="cases">
-      <caption class="vh">ELSPETH use cases mapped to Sense, Decide, and Act</caption>
-      <thead>
-        <tr><th scope="col">Domain</th><th scope="col">Sense</th><th scope="col">Decide</th><th scope="col">Act</th></tr>
-      </thead>
-      <tbody>
-        <tr><th scope="row" class="dom">Tender evaluation</th><td>CSV submissions</td><td>LLM classification + safety gates</td><td>Results CSV; custom review workflow</td></tr>
-        <tr><th scope="row" class="dom">Document QA</th><td>Text or JSON document records</td><td>Extraction, rubric checks, summaries</td><td>Annotated outputs; custom exception workflow</td></tr>
-        <tr><th scope="row" class="dom">Content moderation</th><td>CSV, JSON, or text submissions</td><td>LLM safety classification</td><td>File or database results; custom human-review process</td></tr>
-        <tr><th scope="row" class="dom">Financial compliance</th><td>CSV or database transaction batch</td><td>Rules + custom domain ML</td><td>Recorded decisions; custom downstream actions</td></tr>
-        <tr><th scope="row" class="dom">Weather monitoring</th><td>Custom API polling plugin</td><td>Threshold + custom anomaly model</td><td>Local/object output; custom alerts</td></tr>
-        <tr><th scope="row" class="dom">Satellite operations</th><td>Telemetry batch or polled feed</td><td>Custom anomaly classifier</td><td>Recorded result; custom investigation ticket</td></tr>
-      </tbody>
-    </table>
-    </div>
-    <div class="features features-two" style="margin-top:20px">
-      <div class="feature">
-        <span class="fi"><i data-lucide="package-check"></i></span>
-        <h3>Built in</h3>
-        <p>Built-in sources read CSV, JSON, text, Azure Blob, and Dataverse data. Built-in destinations write CSV, JSON, text and other local or object-store files, plus Azure Blob, Dataverse, database, and Chroma targets.</p>
+   </header>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      Illustrative workflow patterns
+     </h2>
+     <div class="use-case">
+      <span class="step-label">
+       01 / Data preparation
+      </span>
+      <div>
+       <h3>
+        Prepare a dataset for analysis.
+       </h3>
+       <p>
+        Read a structured file, map or validate fields, and route records that need attention to a separate output.
+       </p>
+       <p>
+        <strong>
+         Human responsibility:
+        </strong>
+        define acceptable values, check rejected records and verify the prepared dataset before using it.
+       </p>
       </div>
-      <div class="feature">
-        <span class="fi"><i data-lucide="blocks"></i></span>
-        <h3>Extend with custom plugins</h3>
-        <p>API feeds, message queues, alerts, tickets, and domain-specific ML models require custom plugins and the operator's own service configuration.</p>
+     </div>
+     <div class="use-case">
+      <span class="step-label">
+       02 / Document review
+      </span>
+      <div>
+       <h3>
+        Assemble material for a reviewer.
+       </h3>
+       <p>
+        Extract text from public documents and organise it for comparison or question answering with configured providers.
+       </p>
+       <p>
+        <strong>
+         Human responsibility:
+        </strong>
+        verify extraction quality, follow source references and check whether a generated statement is supported.
+       </p>
       </div>
-    </div>
-  </div>
-</section>
-
-<hr class="divider" />
-
-<section class="dotgrid">
-  <div class="wrap">
-    <div class="section-head">
-      <span class="eyebrow">When to reach for it</span>
-      <h2>A good fit when "why did it do that?" matters.</h2>
-    </div>
-    <div class="props" style="margin-top:36px">
-      <div class="prop">
-        <span class="pi"><i data-lucide="gavel"></i></span>
-        <h3>Explainable to auditors</h3>
-        <p>Decisions with regulatory or compliance requirements, or legal accountability for the outcome.</p>
+     </div>
+     <div class="use-case">
+      <span class="step-label">
+       03 / Classification
+      </span>
+      <div>
+       <h3>
+        Group information for manual triage.
+       </h3>
+       <p>
+        Apply a configured classification process to a bounded set of public records and send uncertain or failed cases to an output for review.
+       </p>
+       <p>
+        <strong>
+         Human responsibility:
+        </strong>
+        evaluate the categories, review mistakes and decide how the result may be used. A routing gate does not make a model's classification reliable.
+       </p>
       </div>
-      <div class="prop">
-        <span class="pi"><i data-lucide="users"></i></span>
-        <h3>Mixed automated + human review</h3>
-        <p>Workflows that route some rows to people and need an evidentiary record of which went where, and why.</p>
-      </div>
-      <div class="prop">
-        <span class="pi"><i data-lucide="scale"></i></span>
-        <h3>High-stakes processing</h3>
-        <p>Where the wrong output causes operational, legal, safety, financial, or security harm.</p>
-      </div>
+     </div>
     </div>
-  </div>
-</section>
-
-<hr class="divider" />
-
-<section>
-  <div class="wrap">
-    <div class="section-head">
-      <span class="eyebrow">Honest about fit</span>
-      <h2>When to reach for something else.</h2>
-      <p>The audit machinery that makes ELSPETH defensible is overhead you don't want for throughput-first work. If you don't need the trail, a leaner tool will serve you better.</p>
+   </section>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      Check the fit before building.
+     </h2>
+     <div aria-label="Built-in capabilities and additional work" class="table-scroll" role="region" tabindex="0">
+      <table>
+       <caption>
+        Available building blocks and work your team owns
+       </caption>
+       <thead>
+        <tr>
+         <th scope="col">
+          Area
+         </th>
+         <th scope="col">
+          Built in
+         </th>
+         <th scope="col">
+          Your team provides
+         </th>
+        </tr>
+       </thead>
+       <tbody>
+        <tr>
+         <th scope="row">
+          Processing
+         </th>
+         <td>
+          File sources and sinks, field transforms, routing and configured LLM calls.
+         </td>
+         <td>
+          Data contracts, evaluation material, prompts and any custom plugins required by the task.
+         </td>
+        </tr>
+        <tr>
+         <th scope="row">
+          Review
+         </th>
+         <td>
+          Configuration, validation and run-inspection surfaces.
+         </td>
+         <td>
+          Subject-matter review, approval policy and a process for handling errors.
+         </td>
+        </tr>
+        <tr>
+         <th scope="row">
+          Operations
+         </th>
+         <td>
+          Audit records and documented recovery mechanisms.
+         </td>
+         <td>
+          Deployment, provider access, monitoring, retention and tested recovery procedures.
+         </td>
+        </tr>
+       </tbody>
+      </table>
+     </div>
     </div>
-    <div class="table-scroll" style="margin-top:36px" tabindex="0" role="region" aria-label="When to choose a different processing tool">
-    <table class="cases">
-      <caption class="vh">When to choose a different tool</caption>
-      <thead>
-        <tr><th scope="col">If you need…</th><th scope="col">Consider instead</th><th scope="col">Why</th></tr>
-      </thead>
-      <tbody>
-        <tr><th scope="row" class="dom">High-throughput ETL</th><td><code>Spark</code> · <code>dbt</code></td><td>Bulk transformation at scale, where per-row lineage and audit evidence aren't the point.</td></tr>
-        <tr><th scope="row" class="dom">Sub-second streaming</th><td><code>Flink</code> · <code>Kafka Streams</code></td><td>Low-latency event processing. ELSPETH is not a sub-second streaming engine; its orchestrator prioritises deterministic, auditable work.</td></tr>
-        <tr><th scope="row" class="dom">Simple scripts, no audit</th><td>Plain Python</td><td>One-off or low-stakes work where a reviewable trail would be ceremony, not value.</td></tr>
-      </tbody>
-    </table>
+   </section>
+   <section class="paper">
+    <div class="wrap">
+     <h2>
+      When to look elsewhere.
+     </h2>
+     <p>
+      ELSPETH is not a sub-second streaming engine or a complete case-management service. A structural queue is a pipeline connection, not a staffed review inbox.
+     </p>
+     <p>
+      Do not treat a successful run as approval for an automated decision about a person, an assurance of legal compliance or proof of scientific validity. Those claims need evidence and governance beyond the pipeline.
+     </p>
+     <p>
+      The project's current README warns against using Chroma integrations until a fix is adopted and verified. Check the
+      <a href="https://github.com/dta-au/elspeth/blob/main/README.md">
+       current project status and advisories
+      </a>
+      before selecting integrations.
+     </p>
+     <a class="btn" href="get-started.html">
+      Try the bounded CLI example →
+     </a>
     </div>
-    <p class="muted" style="margin-top:20px;font-size:14px;max-width:60ch">ELSPETH trades raw throughput for evidence. That's the right trade only when "why did it do that?" has to have an answer.</p>
-    <div class="cta-row" style="margin-top:32px">
-      <a class="btn btn-primary" href="get-started.html">Start a pipeline</a>
+   </section>
+  </main>
+  <footer>
+   <div class="wrap foot">
+    <div>
+     <a class="brand" href="index.html">
+      ELSPETH
+     </a>
+     <p>
+      Open-source software developed and publicly released by staff of Australia's Digital Transformation Agency.
+     </p>
+     <p>
+      Pre-release software. Evaluate it against your requirements before relying on its outputs.
+     </p>
     </div>
-  </div>
-</section>
-
-</main>
-
-<footer>
-  <div class="wrap">
-    <div class="foot">
-      <div class="foot-brand">
-        <span class="brand">ELSPETH</span>
-        <p class="foot-prov">Open-source software developed and publicly released by staff of the DTA — the Australian Government's Digital Transformation Agency.</p>
-      </div>
-      <div class="foot-cols">
-        <div class="foot-col">
-          <span class="foot-h">Product</span>
-          <a href="index.html">Home</a>
-          <a href="authoring.html">Authoring</a>
-          <a href="assurance.html">Assurance</a>
-          <a href="use-cases.html">Use cases</a>
-          <a href="get-started.html">Get started</a>
-        </div>
-        <div class="foot-col">
-          <span class="foot-h">Project</span>
-          <a href="https://github.com/dta-au/elspeth">GitHub</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">Changelog · v0.8.3</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">Contributing</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a>
-        </div>
-        <div class="foot-col">
-          <span class="foot-h">Assurance</span>
-          <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">Report a vulnerability</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">MIT license</a>
-        </div>
-      </div>
-    </div>
-    <div class="foot-bottom">
-      <span class="copy"><a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">MIT licensed</a> · ELSPETH 0.8.3 · Built for decisions that must be defensible.</span>
-    </div>
-  </div>
-</footer>
-
-<script src="site.js"></script>
-</body>
+    <nav aria-label="Project resources">
+     <a href="https://github.com/dta-au/elspeth">
+      Source on GitHub
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">
+      Changelog · v0.8.3
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">
+      Contribute
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CODE_OF_CONDUCT.md">
+      Code of conduct
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">
+      Report a vulnerability
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">
+      MIT license
+     </a>
+    </nav>
+   </div>
+   <div class="wrap foot-bottom">
+    ELSPETH 0.8.3 · Documentation describes the source candidate; publication status is recorded in the changelog.
+   </div>
+  </footer>
+ </body>
 </html>

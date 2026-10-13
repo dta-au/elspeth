@@ -8,6 +8,7 @@ permissions:
 
 jobs:
   live_aws:
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.ref_protected
     name: live-aws / ${{ matrix.case_id }}
     environment: state-engine-live-aws
     strategy:
@@ -123,6 +124,7 @@ jobs:
           retention-days: 7
 
   live_azure:
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.ref_protected
     name: live-azure / ${{ matrix.case_id }}
     environment: state-engine-live-azure
     strategy:
@@ -234,6 +236,7 @@ jobs:
           retention-days: 7
 
   live_dataverse:
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.ref_protected
     name: live-dataverse / ${{ matrix.case_id }}
     environment: state-engine-live-dataverse
     strategy:
@@ -303,6 +306,7 @@ jobs:
         with: {name: "state-engine-live-${{ steps.lane.outputs.lane_id }}", path: "${{ runner.temp }}/state-engine-evidence", if-no-files-found: error, retention-days: 7}
 
   live_chroma:
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.ref_protected
     name: live-chroma / ${{ matrix.case_id }}
     environment: state-engine-live-chroma
     strategy:
@@ -370,6 +374,7 @@ jobs:
         with: {name: "state-engine-live-${{ steps.lane.outputs.lane_id }}", path: "${{ runner.temp }}/state-engine-evidence", if-no-files-found: error, retention-days: 7}
 
   live_provider:
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.ref_protected
     name: live-provider / ${{ matrix.case_id }}
     environment: state-engine-live-provider
     strategy:

@@ -4,6 +4,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { chromium } from "@playwright/test";
+import { configureStagingOrigin, loginToStaging } from "./staging-origin.mjs";
 import {
   driveFreeformTutorial,
   finishTutorialAndVerifyGraduation,
@@ -188,8 +189,8 @@ function intEnv(name, fallback) {
   return parsed;
 }
 
-const baseURL = requiredEnv("STAGING_BASE_URL").replace(/\/+$/, "");
-const origin = new URL(baseURL).origin;
+const baseURL = configureStagingOrigin();
+const origin = baseURL;
 const username = requiredEnv("STAGING_USERNAME");
 const password = requiredEnv("STAGING_PASSWORD");
 const runs = intEnv("TUTORIAL_RUNS", DEFAULT_RUNS);
@@ -216,36 +217,21 @@ async function apiFetch(token, path, options = {}) {
     ...(options.body === undefined ? {} : { "Content-Type": "application/json" }),
     ...(options.headers ?? {}),
   };
-  const response = await fetch(new URL(path, `${baseURL}/`), {
-    method: options.method ?? "GET",
-    headers,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
-  });
-  const body = await readResponseBody(response);
+  let response;
+  try {
+    response = await fetch(new URL(path, `${baseURL}/`), {
+      method: options.method ?? "GET",
+      headers,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      redirect: "error",
+    });
+  } catch {
+    throw new Error("staging API request failed");
+  }
   if (!response.ok) {
-    const detail =
-      typeof body === "object" && body !== null && "detail" in body
-        ? body.detail
-        : body;
-    throw new Error(`${options.method ?? "GET"} ${path} failed (${response.status}): ${String(detail).slice(0, 500)}`);
+    throw new Error(`${options.method ?? "GET"} ${path} failed (${response.status})`);
   }
-  return body;
-}
-
-async function login() {
-  const response = await fetch(`${baseURL}/api/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password }),
-  });
-  const body = await readResponseBody(response);
-  if (!response.ok) {
-    throw new Error(`login failed (${response.status}): ${JSON.stringify(body).slice(0, 500)}`);
-  }
-  if (typeof body !== "object" || body === null || typeof body.access_token !== "string") {
-    throw new Error("login response missing access_token");
-  }
-  return body.access_token;
+  return readResponseBody(response);
 }
 
 async function resetTutorial(token) {
@@ -349,7 +335,6 @@ async function runOne(browser, token, index) {
   const apiFailures = [];
   const consoleErrors = [];
   const httpConflicts = [];
-  const conflictReads = [];
   let rejectBlockingFailure = null;
   let blockingFailureSettled = false;
   const blockingFailurePromise = new Promise((_, reject) => {
@@ -413,15 +398,7 @@ async function runOne(browser, token, index) {
     const method = response.request().method();
     const url = response.url();
     if (response.status() === 409) {
-      const conflict = { method, url, body: null };
-      httpConflicts.push(conflict);
-      conflictReads.push(
-        readResponseBody(response)
-          .then((body) => {
-            conflict.body = body;
-          })
-          .catch(() => undefined),
-      );
+      httpConflicts.push({ method, url, status: response.status() });
     }
     const isSessionCreate = method === "POST" && url === `${baseURL}/api/sessions`;
     const compose = isComposeRequest(url, method);
@@ -454,31 +431,11 @@ async function runOne(browser, token, index) {
     const isBlockingPost = compose || run;
     if (isBlockingPost && response.status() >= 400 && !blockingFailureSettled) {
       blockingFailureSettled = true;
-      void readResponseBody(response)
-        .then((body) => {
-          const target = compose ? steps.compose : steps.run;
-          target.body = JSON.stringify(body).slice(0, 1000);
-          apiFailures.push({
-            status: response.status(),
-            method,
-            url,
-            body,
-          });
-          rejectBlockingFailure?.(
-            new Error(
-              `tutorial ${compose ? "compose" : "run"} POST failed (${response.status()}): ${JSON.stringify(body).slice(0, 1000)}`,
-            ),
-          );
-        })
-        .catch((error) => {
-          rejectBlockingFailure?.(
-            new Error(
-              `tutorial ${compose ? "compose" : "run"} POST failed (${response.status()}) and body could not be read: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            ),
-          );
-        });
+      const message = `tutorial ${compose ? "compose" : "run"} POST failed (${response.status()})`;
+      const target = compose ? steps.compose : steps.run;
+      target.body = message;
+      apiFailures.push({ status: response.status(), method, url });
+      rejectBlockingFailure?.(new Error(message));
     }
   });
 
@@ -535,7 +492,6 @@ async function runOne(browser, token, index) {
     const landed = completion.landed_session_id === sessionId;
 
     const evidence = sessionId === null ? null : await fetchSessionEvidence(token, sessionId);
-    await Promise.all(conflictReads);
     const ok =
       landed &&
       [steps.compose, steps.run, steps.audit].every(
@@ -591,7 +547,7 @@ async function runOne(browser, token, index) {
 
 async function main() {
   await mkdir(artifactsDir, { recursive: true });
-  const token = await login();
+  const token = await loginToStaging(baseURL, username, password);
   const browser = await chromium.launch({ headless: process.env.PLAYWRIGHT_HEADLESS !== "0" });
   const results = [];
 
@@ -610,7 +566,6 @@ async function main() {
 
   const summary = {
     base_url: baseURL,
-    username,
     expected_vague_term: expectedVagueTerm || null,
     diagnostic_question: diagnosticQuestion || null,
     runs,

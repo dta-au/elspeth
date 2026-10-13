@@ -12,13 +12,16 @@
 //     because the frontend reads auth_token via window.localStorage
 //     scoped by origin.
 
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import fs, {
+  closeSync, constants, fchmodSync, fsyncSync, lstatSync, mkdirSync,
+  openSync, rmSync, writeFileSync,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname, parse, resolve, sep } from "node:path";
 
-import { request } from "@playwright/test";
+import { request, type FullConfig } from "@playwright/test";
 
-const TOKEN_KEY = "auth_token";
+import { configureStagingOrigin } from "../../../scripts/staging-origin.mjs";
 
 function required(name: string): string {
   const v = process.env[name];
@@ -33,21 +36,66 @@ async function obtainToken(
   username: string,
   password: string,
 ): Promise<string> {
-  const ctx = await request.newContext({ baseURL: apiBaseURL });
+  const ctx = await request.newContext({ baseURL: apiBaseURL, ignoreHTTPSErrors: false });
   try {
-    const resp = await ctx.post("/api/auth/login", {
-      data: { username, password },
-    });
-    if (!resp.ok()) {
-      const detail = await resp.text();
-      throw new Error(
-        `staging login failed (${resp.status()}): ${detail.slice(0, 500)}`,
-      );
+    let resp;
+    try {
+      resp = await ctx.post("/api/auth/login", {
+        data: { username, password },
+        maxRedirects: 0,
+      });
+    } catch {
+      // Playwright transport errors can include request details.
+      throw new Error("staging login request failed");
     }
-    const body = (await resp.json()) as { access_token: string };
+    if (!resp.ok()) {
+      throw new Error(`staging login failed (${resp.status()})`);
+    }
+    let body: unknown;
+    try {
+      body = await resp.json();
+    } catch {
+      throw new Error("staging login returned invalid JSON");
+    }
+    if (
+      typeof body !== "object" || body === null || !("access_token" in body) ||
+      typeof body.access_token !== "string" || body.access_token.length === 0
+    ) {
+      throw new Error("staging login returned no access token");
+    }
     return body.access_token;
   } finally {
     await ctx.dispose();
+  }
+}
+
+function prepareStoragePath(path: string): void {
+  const directory = dirname(path);
+  // The checkout is operator-owned. Reject pre-existing directory symlinks
+  // before changing permissions or writing credentials beneath them.
+  const root = parse(directory).root;
+  let current = root;
+  for (const component of directory.slice(root.length).split(sep)) {
+    current = resolve(current, component);
+    try {
+      if (!lstatSync(current).isDirectory()) {
+        throw new Error("staging auth storage requires real directories");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || current !== directory) throw error;
+      mkdirSync(directory, { mode: 0o700 });
+    }
+  }
+  const directoryFd = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    fchmodSync(directoryFd, 0o700);
+  } finally {
+    closeSync(directoryFd);
+  }
+  try {
+    if (!lstatSync(path).isFile()) throw new Error("staging auth storage must be a regular file");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 
@@ -57,24 +105,36 @@ function writeStorageState(path: string, origin: string, token: string): void {
     origins: [
       {
         origin,
-        localStorage: [{ name: TOKEN_KEY, value: token }],
+        localStorage: [{ name: "auth_token", value: token }],
       },
     ],
   };
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(state, null, 2), { encoding: "utf-8" });
+  prepareStoragePath(path);
+  const temporaryPath = resolve(dirname(path), `.staging-${randomUUID()}.tmp`);
+  const fd = openSync(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    try {
+      fchmodSync(fd, 0o600);
+      writeFileSync(fd, JSON.stringify(state, null, 2), { encoding: "utf-8" });
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    // Rename replaces the entry; it never follows a target symlink.
+    fs.renameSync(temporaryPath, path);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
 }
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const STORAGE_STATE_PATH = resolve(HERE, "..", ".auth", "staging-user.json");
-
-export default async function stagingGlobalSetup(): Promise<void> {
-  const baseURL = required("STAGING_BASE_URL");
+export default async function stagingGlobalSetup(config: FullConfig): Promise<void> {
+  const baseURL = configureStagingOrigin();
   const username = required("STAGING_USERNAME");
   const password = required("STAGING_PASSWORD");
+  const storagePath = config.projects[0].use.storageState;
+  if (typeof storagePath !== "string") throw new Error("staging storageState must be a file path");
+  const path = resolve(storagePath);
+  prepareStoragePath(path);
   const token = await obtainToken(baseURL, username, password);
-  writeStorageState(STORAGE_STATE_PATH, baseURL, token);
-  console.log(
-    `[staging-globalSetup] wrote storageState for ${username} @ ${baseURL} → ${STORAGE_STATE_PATH}`,
-  );
+  writeStorageState(path, baseURL, token);
 }

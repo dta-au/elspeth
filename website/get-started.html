@@ -1,103 +1,262 @@
-<!-- @dsCard group="Website" viewport="1280x760" name="Site — Get started" subtitle="Install the CLI, write a pipeline, validate & run" -->
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="Install ELSPETH from source, run a validated example, or set up the local Web Composer." />
-<title>Get started — ELSPETH</title>
-<script>(function(){try{var s=localStorage.getItem("elspeth-theme");var t=s||((window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
-<link rel="stylesheet" href="styles.css" />
-<link rel="stylesheet" href="site.css" />
-<link rel="icon" href="favicon.svg" type="image/svg+xml" />
-<script src="vendor/lucide.min.js"></script>
-</head>
-<body>
-<a class="skip-link" href="#main">Skip to content</a>
-
-<header class="nav">
-  <div class="wrap nav-inner">
-    <div class="nav-left">
-      <a class="brand" href="index.html">ELSPETH</a>
-      <nav class="nav-links">
-        <a href="index.html">Home</a>
-        <a href="authoring.html">Authoring</a>
-        <a href="assurance.html">Assurance</a>
-        <a href="use-cases.html">Use cases</a>
-        <a href="get-started.html" class="active" aria-current="page">Get started</a>
+<html data-theme="dark" lang="en">
+ <head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+  <meta content="Run a local CLI example or configure the Web Composer. Read prerequisites, provider requirements and database upgrade guidance." name="description"/>
+  <title>
+   Get started — ELSPETH
+  </title>
+  <script>
+   (function(){try{var s=localStorage.getItem("elspeth-theme");var t=(s==="light"||s==="dark")?s:((window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+  </script>
+  <link href="styles.css" rel="stylesheet"/>
+  <link href="site.css" rel="stylesheet"/>
+  <link href="favicon.svg" rel="icon" type="image/svg+xml"/>
+  <script defer="" src="vendor/lucide.min.js">
+  </script>
+  <script defer="" src="site.js">
+  </script>
+ </head>
+ <body>
+  <a class="skip-link" href="#main">
+   Skip to content
+  </a>
+  <header class="nav">
+   <div class="wrap nav-inner">
+    <a aria-label="ELSPETH home" class="brand" href="index.html">
+     ELSPETH
+     <span class="brand-sub">
+      Data &amp; LLM workflows
+     </span>
+    </a>
+    <nav aria-label="Main navigation" class="nav-links">
+     <a href="index.html">
+      Overview
+     </a>
+     <a href="authoring.html">
+      Build a workflow
+     </a>
+     <a href="assurance.html">
+      Review the evidence
+     </a>
+     <a href="use-cases.html">
+      Assess a use case
+     </a>
+     <a aria-current="page" href="get-started.html">
+      Get started
+     </a>
+    </nav>
+    <div class="nav-actions">
+     <button aria-label="Switch to light theme" class="iconbtn" hidden="" id="theme-toggle">
+      <i aria-hidden="true" data-lucide="moon">
+      </i>
+     </button>
+     <details class="nav-menu">
+      <summary>
+       Menu
+       <i aria-hidden="true" data-lucide="menu">
+       </i>
+      </summary>
+      <nav aria-label="Mobile navigation" class="nav-menu-panel">
+       <a href="index.html">
+        Overview
+       </a>
+       <a href="authoring.html">
+        Build a workflow
+       </a>
+       <a href="assurance.html">
+        Review the evidence
+       </a>
+       <a href="use-cases.html">
+        Assess a use case
+       </a>
+       <a aria-current="page" href="get-started.html">
+        Get started
+       </a>
       </nav>
+     </details>
     </div>
-    <div class="nav-right">
-      <details class="nav-menu">
-        <summary class="iconbtn" aria-label="Open navigation menu"><i data-lucide="menu"></i></summary>
-        <div class="nav-menu-panel">
-          <a href="index.html">Home</a>
-          <a href="authoring.html">Authoring</a>
-          <a href="assurance.html">Assurance</a>
-          <a href="use-cases.html">Use cases</a>
-          <a href="get-started.html" class="active" aria-current="page">Get started</a>
-          <hr />
-          <a href="https://github.com/dta-au/elspeth">GitHub</a>
-        </div>
-      </details>
-      <button class="iconbtn" id="theme-toggle" aria-label="Toggle theme"><i data-lucide="moon"></i></button>
-      <a class="btn-compact" href="https://github.com/dta-au/elspeth" style="gap:8px"><i data-lucide="github" style="width:15px;height:15px"></i> GitHub</a>
-      <a class="btn-compact" href="get-started.html">Get started</a>
+   </div>
+  </header>
+  <main id="main" tabindex="-1">
+   <header class="page-head">
+    <div class="wrap">
+     <p class="eyebrow">
+      Get started
+     </p>
+     <h1>
+      Run a small example.
+      <br/>
+      Inspect the result.
+     </h1>
+     <p class="lead">
+      Use a local source checkout and the tracked threshold-gate example to learn the CLI. The example needs no model-provider account. Composer setup is a separate path below.
+     </p>
     </div>
-  </div>
-</header>
-
-<main id="main">
-
-<div class="page-head dotgrid">
-  <div class="wrap">
-    <span class="eyebrow">Reviewable by design</span>
-    <h1>From install to a validated run.</h1>
-    <p>Choose the CLI for a reviewable source checkout, or set up the Web Composer for a local, staged authoring experience. Both validate before they run.</p>
-  </div>
-</div>
-
-<section>
-  <div class="wrap">
-    <h2 class="vh">Install and run from the CLI</h2>
-    <div class="steps" style="margin-top:8px">
-      <div class="step">
-        <span class="num">1</span>
-        <div>
-          <h3>Install from a current source checkout</h3>
-          <p>Python 3.12+. Clone the repository and use an editable install with <code>uv</code>. This tracks your current source checkout; it is not an immutable release artifact.</p>
-          <pre class="copyable"><span class="pr">$</span> git clone https://github.com/dta-au/elspeth.git &amp;&amp; cd elspeth
-<span class="pr">$</span> uv venv &amp;&amp; source .venv/bin/activate
-<span class="pr">$</span> uv pip install -e ".[dev]"</pre>
-        </div>
-      </div>
-      <div class="step">
-        <span class="num">2</span>
-        <div>
-          <h3>Validate a tracked example</h3>
-          <p>Start with the repository's <a href="https://github.com/dta-au/elspeth/blob/main/examples/threshold_gate/settings.yaml"><code>examples/threshold_gate/settings.yaml</code></a>. Preflight checks graph structure, route targets, schema compatibility, and secret references.</p>
-          <pre><span class="pr">$</span> elspeth validate --settings examples/threshold_gate/settings.yaml</pre>
-        </div>
-      </div>
-      <div class="step">
-        <span class="num">3</span>
-        <div>
-          <h3>Run &amp; explain</h3>
-          <p>Execute the example, then explore why any row reached its destination.</p>
-          <pre><span class="pr">$</span> elspeth run --settings examples/threshold_gate/settings.yaml --execute
-<span class="pr">$</span> elspeth explain --run &lt;run_id&gt; --row &lt;row_id&gt; --database examples/threshold_gate/runs/audit.db --no-tui
-<span class="mut">Outcome:</span>   <span class="ok">SUCCESS</span>
-<span class="mut">Path:</span>      <span class="ok">GATE_ROUTED</span>
-<span class="mut">Sink:</span>      output</pre>
-        </div>
-      </div>
+   </header>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      Try the CLI.
+     </h2>
+     <div class="steps" id="cli">
+      <article>
+       <span class="step-label">
+        01 / Install
+       </span>
+       <h3>
+        Create an isolated Python environment
+       </h3>
+       <p>
+        You need Python 3.12 or newer, Git and uv. These commands install from your checkout; they do not select an immutable release.
+       </p>
+       <pre class="copyable">git clone https://github.com/dta-au/elspeth.git
+cd elspeth
+uv venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"</pre>
+      </article>
+      <article>
+       <span class="step-label">
+        02 / Validate and run
+       </span>
+       <h3>
+        Use the tracked example
+       </h3>
+       <p>
+        From the repository root, validate the settings, then explicitly execute the pipeline. Output files and audit records are written below the example directory.
+       </p>
+       <pre class="copyable">elspeth validate --settings examples/threshold_gate/settings.yaml
+elspeth run --settings examples/threshold_gate/settings.yaml --execute</pre>
+      </article>
+      <article>
+       <span class="step-label">
+        03 / Inspect
+       </span>
+       <h3>
+        Follow the output back to its input
+       </h3>
+       <p>
+        Use run and row identifiers from your run. The
+        <a href="https://github.com/dta-au/elspeth/blob/main/docs/guides/your-first-pipeline.md">
+         first-pipeline guide
+        </a>
+        explains the configuration and lineage inspection.
+       </p>
+       <pre>elspeth explain --run &lt;run_id&gt; --row &lt;row_id&gt; --database examples/threshold_gate/runs/audit.db --no-tui</pre>
+      </article>
+     </div>
     </div>
-  </div>
-</section>
-
-<hr class="divider" />
-
-<section class="dotgrid">
+   </section>
+   <section class="paper">
+    <div class="wrap">
+     <h2>
+      Set up the Web Composer.
+     </h2>
+     <div id="composer">
+      <p class="section-intro">
+       Composer adds a web service, local authentication and a React frontend. For LLM authoring, configure the primary planner and independent advisor models with their required provider credentials. A local login alone does not enable the planner.
+      </p>
+      <h3>
+       Install and build
+      </h3>
+      <p>
+       In your activated checkout, use Node.js 24 and npm 11. Use the lockfile for the frontend dependency install;
+       <code>
+        npm install
+       </code>
+       is for intentional dependency updates.
+      </p>
+      <pre class="copyable">uv pip install -e ".[webui,dev]"
+npm --prefix src/elspeth/web/frontend ci
+npm --prefix src/elspeth/web/frontend run build</pre>
+      <p>
+       <code>
+        npm run build
+       </code>
+       type-checks and builds the frontend.
+      </p>
+      <h3>
+       Configure a local instance
+      </h3>
+      <p>
+       In the same shell, generate local keys and set the required Composer limits. Keep keys out of shared files and source control.
+      </p>
+      <pre class="copyable">mkdir -p data/blobs data/outputs
+export ELSPETH_WEB__SECRET_KEY="$(openssl rand -hex 32)"
+export ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="$(openssl rand -base64 32)"
+export ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15
+export ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10
+export ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0
+export ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60</pre>
+      <p>
+       Then configure both models using the
+       <a href="https://github.com/dta-au/elspeth/blob/main/docs/reference/environment-variables.md#web-llm-configuration">
+        provider configuration reference
+       </a>
+       . Review which data each provider will receive.
+      </p>
+      <h3>
+       Create an account and start the service
+      </h3>
+      <p>
+       The user command prompts for a password. Avoid the
+       <code>
+        --password
+       </code>
+       option in interactive use so the password does not enter shell history. Follow the
+       <a href="https://github.com/dta-au/elspeth/blob/main/docs/guides/web-local-development.md">
+        local development guide
+       </a>
+       and
+       <a href="https://github.com/dta-au/elspeth/blob/main/docs/guides/identity-providers.md">
+        identity guide
+       </a>
+       for account and workload-role setup.
+      </p>
+      <pre class="copyable">elspeth composer users add demo --display-name "Demo User" --email demo@example.com
+elspeth composer users add demo-admin --display-name "Local administrator"
+elspeth composer users bootstrap-admin local demo-admin --note "First administrator for local evaluation"
+elspeth web --host 127.0.0.1 --port 8451</pre>
+      <p>
+       Open
+       <a href="http://127.0.0.1:8451">
+        127.0.0.1:8451
+       </a>
+       on the machine running the service. Sign in once as
+       <code>
+        demo
+       </code>
+       to create its deployment identity, then sign out. Sign in as
+       <code>
+        demo-admin
+       </code>
+       and use
+       <strong>
+        People &amp; access
+       </strong>
+       to grant
+       <code>
+        demo
+       </code>
+       the deployment-wide
+       <code>
+        user
+       </code>
+       role. Sign back in as
+       <code>
+        demo
+       </code>
+       to author pipelines. The administrator role alone does not permit pipeline work.
+      </p>
+      <p>
+       The bootstrap command is for a new local instance without an existing administrator. This setup binds to loopback for local development.
+      </p>
+     </div>
+    </div>
+   </section>
+   <section class="dotgrid">
   <div class="wrap">
     <div class="section-head" style="max-width:70ch">
       <span class="eyebrow">Important upgrade posture</span>
@@ -111,100 +270,76 @@
     </div>
   </div>
 </section>
-
-<hr class="divider" />
-
-<section id="composer">
-  <div class="wrap">
-    <div class="section-head">
-      <span class="eyebrow">Web Composer setup</span>
-      <h2>Build the local Web Composer.</h2>
-      <p>The Web Composer is a separate local setup path. Build its frontend, configure a secret, create a user, then start the web service.</p>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      Plan deployment separately.
+     </h2>
+     <p>
+      The AWS deployment profile uses one AWS ECS Fargate web task with Aurora PostgreSQL, EFS, task-role access to S3 and Bedrock, Cognito/OIDC, and CloudWatch/X-Ray. Deployments use planned downtime and zero overlap.
+     </p>
+     <p>
+      Review the
+      <a href="https://github.com/dta-au/elspeth/blob/main/docs/reference/deployment-platforms.md">
+       deployment platform reference
+      </a>
+      for available topologies. Use the
+      <a href="https://github.com/dta-au/elspeth/blob/main/docs/runbooks/aws-ecs-deployment.md">
+       AWS ECS deployment runbook
+      </a>
+      for the operating contract. Review access, provider policy, evidence retention and recovery requirements before using your own data.
+     </p>
+     <p>
+      For changes and known limitations, read the
+      <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">
+       changelog
+      </a>
+      and
+      <a href="https://github.com/dta-au/elspeth/blob/main/README.md">
+       project status
+      </a>
+      .
+     </p>
     </div>
-    <div class="steps" style="margin-top:28px">
-      <div class="step">
-        <span class="num"><i data-lucide="arrow-right" style="width:16px;height:16px"></i></span>
-        <div>
-          <h3>Install, build, and run</h3>
-          <p>Start from a fresh source checkout. Node.js 24 and npm 11 are required before building the frontend; then set a local secret before creating the first user.</p>
-          <pre class="copyable"><span class="pr">$</span> git clone https://github.com/dta-au/elspeth.git &amp;&amp; cd elspeth
-<span class="pr">$</span> uv venv &amp;&amp; source .venv/bin/activate
-<span class="pr">$</span> uv pip install -e ".[webui,dev]"
-<span class="pr">$</span> cd src/elspeth/web/frontend
-<span class="pr">$</span> npm install
-<span class="pr">$</span> npm run build
-<span class="pr">$</span> cd ../../../..
-<span class="pr">$</span> export ELSPETH_WEB__SECRET_KEY="$(openssl rand -base64 32)"
-<span class="pr">$</span> elspeth composer users add demo --password "choose-a-strong-password" --display-name "Demo User" --email "demo@example.com"
-<span class="pr">$</span> elspeth web --host 127.0.0.1 --port 8451</pre>
-        </div>
-      </div>
+   </section>
+  </main>
+  <footer>
+   <div class="wrap foot">
+    <div>
+     <a class="brand" href="index.html">
+      ELSPETH
+     </a>
+     <p>
+      Open-source software developed and publicly released by staff of Australia's Digital Transformation Agency.
+     </p>
+     <p>
+      Pre-release software. Evaluate it against your requirements before relying on its outputs.
+     </p>
     </div>
-  </div>
-</section>
-
-<hr class="divider" />
-
-<section>
-  <div class="wrap">
-    <div class="section-head" style="max-width:70ch">
-      <span class="eyebrow">Supported deployment profile</span>
-      <h2>Operate one web task on AWS ECS.</h2>
-      <p>The supported profile is one ECS Fargate web task with Aurora PostgreSQL, EFS, task-role S3 and Bedrock access, Cognito/OIDC, and CloudWatch/X-Ray. Deployments use planned downtime and zero overlap.</p>
-      <p>Follow the <a href="https://github.com/dta-au/elspeth/blob/main/docs/runbooks/aws-ecs-deployment.md"><code>docs/runbooks/aws-ecs-deployment.md</code> runbook</a> for the current operational contract. The current code and runbook are the source of truth.</p>
-    </div>
-  </div>
-</section>
-
-<div class="ctaband">
-  <div class="wrap">
-    <h2>Read the documentation.</h2>
-    <p>Read the docs for a complete walkthrough of every plugin and contract.</p>
-    <div class="cta-row" style="justify-content:center">
-      <a class="btn btn-primary btn-lg" href="https://github.com/dta-au/elspeth/tree/main/docs">Read the docs</a>
-      <a class="btn btn-lg" href="https://github.com/dta-au/elspeth"><i data-lucide="github" style="width:18px;height:18px"></i>&nbsp; dta-au/elspeth</a>
-    </div>
-  </div>
-</div>
-
-</main>
-
-<footer>
-  <div class="wrap">
-    <div class="foot">
-      <div class="foot-brand">
-        <span class="brand">ELSPETH</span>
-        <p class="foot-prov">Open-source software developed and publicly released by staff of the DTA — the Australian Government's Digital Transformation Agency.</p>
-      </div>
-      <div class="foot-cols">
-        <div class="foot-col">
-          <span class="foot-h">Product</span>
-          <a href="index.html">Home</a>
-          <a href="authoring.html">Authoring</a>
-          <a href="assurance.html">Assurance</a>
-          <a href="use-cases.html">Use cases</a>
-          <a href="get-started.html">Get started</a>
-        </div>
-        <div class="foot-col">
-          <span class="foot-h">Project</span>
-          <a href="https://github.com/dta-au/elspeth">GitHub</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">Changelog · v0.8.3</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">Contributing</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a>
-        </div>
-        <div class="foot-col">
-          <span class="foot-h">Assurance</span>
-          <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">Report a vulnerability</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">MIT license</a>
-        </div>
-      </div>
-    </div>
-    <div class="foot-bottom">
-      <span class="copy"><a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">MIT licensed</a> · ELSPETH 0.8.3 · Built for decisions that must be defensible.</span>
-    </div>
-  </div>
-</footer>
-
-<script src="site.js"></script>
-</body>
+    <nav aria-label="Project resources">
+     <a href="https://github.com/dta-au/elspeth">
+      Source on GitHub
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">
+      Changelog · v0.8.3
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">
+      Contribute
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CODE_OF_CONDUCT.md">
+      Code of conduct
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">
+      Report a vulnerability
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">
+      MIT license
+     </a>
+    </nav>
+   </div>
+   <div class="wrap foot-bottom">
+    ELSPETH 0.8.3 · Documentation describes the source candidate; publication status is recorded in the changelog.
+   </div>
+  </footer>
+ </body>
 </html>

@@ -454,11 +454,11 @@ entries:
   - 9ba2120b9748d639f6653118d8bac302816f7903b808af37c2b3878773d4091e
   - ad9c0ba16d3778b1e821aa832a44def9fdd21892f4d7d93797915bb22e8370e1
   classification: approved-introspection
-  justification: Five source-tree probes reject generic AST app, DTO factory and
-    turn definitions and inspect nullable exception/pattern name and mapping rest
-    binders on nominally selected AST kinds. These detect noncanonical definitions
-    or producer rebinding and do not classify runtime service objects. Both
-    selected coroutine descriptors now read their AST type_params directly.
+  justification: Five source-tree probes reject generic AST app, DTO factory and turn
+    definitions and inspect nullable exception/pattern name and mapping rest binders
+    on nominally selected AST kinds. These detect noncanonical definitions or producer
+    rebinding and do not classify runtime service objects. Both selected coroutine
+    descriptors now read their AST type_params directly.
 - path: tests/helpers/web_reserve_composer_receiver.py
   qualname: immediate
   kind: getattr

@@ -1,240 +1,292 @@
-<!-- @dsCard group="Website" viewport="1280x720" name="Site — Authoring" subtitle="Two authoring surfaces · Sense → Decide → Act" -->
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="Author ELSPETH pipelines in reviewable YAML or the staged, LLM-primary Web Composer." />
-<title>Authoring — ELSPETH</title>
-<script>(function(){try{var s=localStorage.getItem("elspeth-theme");var t=s||((window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
-<link rel="stylesheet" href="styles.css" />
-<link rel="stylesheet" href="site.css" />
-<link rel="icon" href="favicon.svg" type="image/svg+xml" />
-<script src="vendor/lucide.min.js"></script>
-</head>
-<body>
-<a class="skip-link" href="#main">Skip to content</a>
-
-<header class="nav">
-  <div class="wrap nav-inner">
-    <div class="nav-left">
-      <a class="brand" href="index.html">ELSPETH</a>
-      <nav class="nav-links">
-        <a href="index.html">Home</a>
-        <a href="authoring.html" class="active" aria-current="page">Authoring</a>
-        <a href="assurance.html">Assurance</a>
-        <a href="use-cases.html">Use cases</a>
-        <a href="get-started.html">Get started</a>
+<html data-theme="dark" lang="en">
+ <head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+  <meta content="Compare YAML and the Web Composer, inspect the current interface and understand what validation establishes." name="description"/>
+  <title>
+   Build a workflow — ELSPETH
+  </title>
+  <script>
+   (function(){try{var s=localStorage.getItem("elspeth-theme");var t=(s==="light"||s==="dark")?s:((window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+  </script>
+  <link href="styles.css" rel="stylesheet"/>
+  <link href="site.css" rel="stylesheet"/>
+  <link href="favicon.svg" rel="icon" type="image/svg+xml"/>
+  <script defer="" src="vendor/lucide.min.js">
+  </script>
+  <script defer="" src="site.js">
+  </script>
+ </head>
+ <body>
+  <a class="skip-link" href="#main">
+   Skip to content
+  </a>
+  <header class="nav">
+   <div class="wrap nav-inner">
+    <a aria-label="ELSPETH home" class="brand" href="index.html">
+     ELSPETH
+     <span class="brand-sub">
+      Data &amp; LLM workflows
+     </span>
+    </a>
+    <nav aria-label="Main navigation" class="nav-links">
+     <a href="index.html">
+      Overview
+     </a>
+     <a aria-current="page" href="authoring.html">
+      Build a workflow
+     </a>
+     <a href="assurance.html">
+      Review the evidence
+     </a>
+     <a href="use-cases.html">
+      Assess a use case
+     </a>
+     <a href="get-started.html">
+      Get started
+     </a>
+    </nav>
+    <div class="nav-actions">
+     <button aria-label="Switch to light theme" class="iconbtn" hidden="" id="theme-toggle">
+      <i aria-hidden="true" data-lucide="moon">
+      </i>
+     </button>
+     <details class="nav-menu">
+      <summary>
+       Menu
+       <i aria-hidden="true" data-lucide="menu">
+       </i>
+      </summary>
+      <nav aria-label="Mobile navigation" class="nav-menu-panel">
+       <a href="index.html">
+        Overview
+       </a>
+       <a aria-current="page" href="authoring.html">
+        Build a workflow
+       </a>
+       <a href="assurance.html">
+        Review the evidence
+       </a>
+       <a href="use-cases.html">
+        Assess a use case
+       </a>
+       <a href="get-started.html">
+        Get started
+       </a>
       </nav>
+     </details>
     </div>
-    <div class="nav-right">
-      <details class="nav-menu">
-        <summary class="iconbtn" aria-label="Open navigation menu"><i data-lucide="menu"></i></summary>
-        <div class="nav-menu-panel">
-          <a href="index.html">Home</a>
-          <a href="authoring.html" class="active" aria-current="page">Authoring</a>
-          <a href="assurance.html">Assurance</a>
-          <a href="use-cases.html">Use cases</a>
-          <a href="get-started.html">Get started</a>
-          <hr />
-          <a href="https://github.com/dta-au/elspeth">GitHub</a>
-        </div>
-      </details>
-      <button class="iconbtn" id="theme-toggle" aria-label="Toggle theme"><i data-lucide="moon"></i></button>
-      <a class="btn-compact" href="https://github.com/dta-au/elspeth" style="gap:8px"><i data-lucide="github" style="width:15px;height:15px"></i> GitHub</a>
-      <a class="btn-compact" href="get-started.html">Get started</a>
+   </div>
+  </header>
+  <main id="main" tabindex="-1">
+   <header class="page-head">
+    <div class="wrap">
+     <p class="eyebrow">
+      Build a workflow
+     </p>
+     <h1>
+      Two ways to author.
+      <br/>
+      One execution engine.
+     </h1>
+     <p class="lead">
+      Choose YAML for direct configuration and version control, or the Web Composer for LLM-assisted authoring. Both use the same plugin contracts, graph validation, executor and Landscape audit trail.
+     </p>
     </div>
-  </div>
-</header>
-
-<main id="main">
-
-<div class="page-head dotgrid">
-  <div class="wrap">
-    <span class="eyebrow">Two authoring surfaces, one engine</span>
-    <h1>Hand-edit YAML, or build by conversation.</h1>
-    <p>Both surfaces target the same primitives, plugin contracts, graph validation, and Landscape audit trail. The Web Composer is an authoring surface over the substrate — not an alternative engine.</p>
-  </div>
-</div>
-
-<section>
-  <div class="wrap">
-    <h2 class="vh">Authoring surfaces</h2>
-    <div class="surfaces" style="margin-top:8px">
-      <div class="surface-card">
-        <span class="ic"><i data-lucide="file-code-2"></i></span>
-        <h3>YAML operator path</h3>
-        <p>For operators in sensitive, regulated, or defence-adjacent workflows. The pipeline can be read, reviewed, versioned, and explained before it ever runs.</p>
-        <ul>
-          <li><i data-lucide="check"></i> Declarative DAG — every edge explicitly named and validated</li>
-          <li><i data-lucide="check"></i> Hierarchical settings with profile overrides</li>
-          <li><i data-lucide="check"></i> <code>validate</code>, <code>run</code>, <code>explain</code>, <code>resume</code> from the CLI</li>
-        </ul>
+   </header>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      Choose the path that fits your team.
+     </h2>
+     <div class="two-col">
+      <article>
+       <p class="eyebrow">
+        YAML + CLI
+       </p>
+       <h3>
+        Review the configuration as code.
+       </h3>
+       <p>
+        Declare sources, processing steps, routes and output destinations. Keep the file in version control and review changes before running it.
+       </p>
+       <p>
+        The CLI provides validation, execution, explanation and documented recovery commands.
+       </p>
+       <a href="get-started.html#cli">
+        Run the tracked example →
+       </a>
+      </article>
+      <article>
+       <p class="eyebrow">
+        Web Composer · LLM-primary authoring
+       </p>
+       <h3>
+        Build and revise in conversation.
+       </h3>
+       <p>
+        The freeform Web Composer uses an LLM to propose pipeline changes. You inspect the graph, configuration and review results before execution.
+       </p>
+       <p>
+        Freeform — one open conversation to build and revise the pipeline.
+       </p>
+       <a href="get-started.html#composer">
+        Set up Composer →
+       </a>
+      </article>
+     </div>
+    </div>
+   </section>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      Inspect the workspace.
+     </h2>
+     <div id="workspace">
+      <p class="section-intro">
+       This local Composer session uses three synthetic community-facility records and an imported YAML pipeline. It routes requests for standard or additional review; it does not determine funding eligibility. Model authoring is unavailable in this offline demonstration. No pipeline was executed.
+      </p>
+      <figure class="product-shot">
+       <a href="images/composer-workspace.webp">
+        <img alt="Composer graph with a CSV source, a review gate and standard and additional review outputs. An offline model-unavailable notice is visible." height="960" loading="lazy" src="images/composer-workspace.webp" width="1440"/>
+       </a>
+       <figcaption>
+        Graph workspace: follow the source through a gate to its two output routes. Open the full-size image to inspect the labels and controls.
+       </figcaption>
+      </figure>
+      <figure class="product-shot">
+       <a href="images/composer-inspection.webp">
+        <img alt="Gate inspection shows the condition requested_amount greater than 50000, with true routed to additional_review and false to standard_review." height="960" loading="lazy" src="images/composer-inspection.webp" width="1440"/>
+       </a>
+       <figcaption>
+        Gate inspection: the example threshold sends requests above 50,000 to additional review. This is an illustrative routing rule. Capture details are documented with the
+        <a href="https://github.com/dta-au/elspeth/blob/main/website/README.md">
+         site sources
+        </a>
+        .
+       </figcaption>
+      </figure>
+     </div>
+    </div>
+   </section>
+   <section class="paper">
+    <div class="wrap">
+     <h2>
+      Review changes before execution.
+     </h2>
+     <div class="two-col" id="validation">
+      <div>
+       <h3>
+        Proposals and validation
+       </h3>
+       <p>
+        A candidate remains separate from the active pipeline until the review and wiring steps are confirmed. Validation checks declared settings, connections and schema compatibility.
+       </p>
+       <p>
+        A passed check is evidence about the configuration. It does not establish that source material is accurate, an LLM answer is correct or the workflow is suitable for a decision.
+       </p>
       </div>
-      <div class="surface-card">
-        <span class="ic"><i data-lucide="messages-square"></i></span>
-        <h3>Web Composer</h3>
-        <p>For knowledge workers building document QA, classification, routing, or review workflows. The freeform Web Composer uses an LLM to propose a pipeline in conversation, then makes the graph, validation, and review visible before execution.</p>
-        <ul>
-          <li><i data-lucide="check"></i> Freeform — one open conversation to build and revise the pipeline</li>
-          <li><i data-lucide="check"></i> Visible graph, preview validation, review, spec, YAML, and repair hints</li>
-          <li><i data-lucide="check"></i> Blob-backed sources and wired <code>{secret_ref: NAME}</code> references</li>
-          <li><i data-lucide="check"></i> Background runs streamed over WebSocket, safely cancellable</li>
-        </ul>
+      <div>
+       <h3>
+        Data and provider access
+       </h3>
+       <p>
+        Operators configure the available plugins, model providers and permitted secret references. Authoring credentials and permission to execute are separate concerns.
+       </p>
+       <p>
+        Inspect the data destinations, error routes and external services before you run a pipeline.
+       </p>
       </div>
+     </div>
     </div>
-  </div>
-</section>
-
-<hr class="divider" />
-
-<section>
-  <div class="wrap">
-    <div class="section-head">
-      <span class="eyebrow">Propose, validate, then wire</span>
-      <h2>Make a durable change without collapsing review.</h2>
-      <p>In 0.7.1, proposal and candidate handling is durable: a candidate remains separate until review and wiring are confirmed. This preserves a clear path from an authoring suggestion to the validated pipeline it changes.</p>
-    </div>
-    <div class="features">
-      <div class="feature"><span class="fi"><i data-lucide="component"></i></span><h3>Components for the graph</h3><p>Across the authoring paths, proposals can include plural sources, transforms, sinks, gates, structural queues, fork, and coalesce nodes.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="file-text"></i></span><h3>Text in and out</h3><p>Use a text source to introduce text into a pipeline and a text sink to write a text result.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="git-merge"></i></span><h3>Structural queue</h3><p>A structural queue fans multiple upstream routes into one downstream node without merging rows or schemas. It is not a human review queue or a message broker.</p></div>
-    </div>
-  </div>
-</section>
-
-<hr class="divider" />
-
-<section class="dotgrid">
-  <div class="wrap">
-    <div class="section-head">
-      <span class="eyebrow">The model</span>
-      <h2>Sense → Decide → Act.</h2>
-      <p>Runtime assembly turns declared primitives into an execution graph; validation checks the wiring, route targets, and schema compatibility before the executor runs it.</p>
-    </div>
-    <div class="sda">
-      <div class="sda-step">
-        <span class="k" style="color:var(--color-badge-source)">Sense</span>
-        <h3>Sources</h3>
-        <p>Load data — CSV, JSON, text/blob, Azure Blob, Dataverse.</p>
+   </section>
+   <section class="">
+    <div class="wrap">
+     <h2>
+      Compose explicit processing steps.
+     </h2>
+     <dl class="definition-list">
+      <div>
+       <dt>
+        Sources and sinks
+       </dt>
+       <dd>
+        Read inputs and write outputs through declared plugins. A text source and text sink support text workflows alongside structured file formats.
+       </dd>
       </div>
-      <div class="sda-arrow">→</div>
-      <div class="sda-step">
-        <span class="k" style="color:var(--color-badge-transform)">Decide</span>
-        <h3>Transforms &amp; gates</h3>
-        <p>Map, coerce, classify, run LLM queries, evaluate pure-config threshold gates.</p>
+      <div>
+       <dt>
+        Transforms and gates
+       </dt>
+       <dd>
+        Map fields, process content or call configured models. Gates route rows using configured expressions.
+       </dd>
       </div>
-      <div class="sda-arrow">→</div>
-      <div class="sda-step">
-        <span class="k k-act">Act</span>
-        <h3>Sinks</h3>
-        <p>Write rows to built-in file, object-storage, database, Dataverse, and Chroma destinations.</p>
+      <div>
+       <dt>
+        Branching and joining
+       </dt>
+       <dd>
+        The graph supports structural queues, fork, and coalesce nodes. A structural queue brings routes to a common downstream node; it is not a human review queue. A fork creates branches; coalesce joins results according to its policy, including
+        <code>
+         require_all
+        </code>
+        .
+       </dd>
       </div>
+     </dl>
+     <p>
+      Consult the
+      <a href="https://github.com/dta-au/elspeth/blob/main/docs/release/composer-guide.md">
+       Composer guide
+      </a>
+      for available controls and the
+      <a href="https://github.com/dta-au/elspeth/blob/main/docs/reference/configuration.md">
+       configuration reference
+      </a>
+      for plugin settings.
+     </p>
     </div>
-    <div class="types">
-      <div class="type-item"><span class="type-badge type-badge-source">Source</span><p>Ingest external data at a zero-trust boundary.</p></div>
-      <div class="type-item"><span class="type-badge type-badge-transform">Transform</span><p>Row-level mapping, coercion, LLM and safety steps.</p></div>
-      <div class="type-item"><span class="type-badge type-badge-gate">Gate</span><p>Pure-config routing by named expression.</p></div>
-      <div class="type-item"><span class="type-badge type-badge-sink">Sink</span><p>Write to a declared built-in or custom destination.</p></div>
-      <div class="type-item"><span class="type-badge type-badge-aggregation">Aggregation</span><p>Batch-aware, audit-attributable analytics.</p></div>
-      <div class="type-item"><span class="type-badge type-badge-coalesce">Coalesce</span><p>Join branches back into a single stream.</p></div>
+   </section>
+  </main>
+  <footer>
+   <div class="wrap foot">
+    <div>
+     <a class="brand" href="index.html">
+      ELSPETH
+     </a>
+     <p>
+      Open-source software developed and publicly released by staff of Australia's Digital Transformation Agency.
+     </p>
+     <p>
+      Pre-release software. Evaluate it against your requirements before relying on its outputs.
+     </p>
     </div>
-    <div class="cta-row" style="margin-top:40px">
-      <a class="btn btn-primary" href="get-started.html">See a pipeline.yaml</a>
-      <a class="btn" href="assurance.html">How it's audited</a>
-    </div>
-  </div>
-</section>
-
-<hr class="divider" />
-
-<section>
-  <div class="wrap">
-    <div class="section-head">
-      <span class="eyebrow">Parallel lineage</span>
-      <h2>Fork into branches — without losing the thread.</h2>
-      <p>A gate can <strong>fork</strong> one row into parallel branches that traverse the DAG independently, then a <strong>coalesce</strong> node joins them back. The audit trail follows every step, so a branched decision is still fully reconstructable.</p>
-    </div>
-    <div class="forkflow">
-      <div class="fork-node"><span class="fn-k">Row</span><span class="fn-v">one source row</span></div>
-      <div class="fork-arrow">→</div>
-      <div class="fork-node"><span class="fn-k">Gate</span><span class="fn-v">fork_gate</span></div>
-      <div class="fork-arrow">⇒</div>
-      <div class="fork-branches">
-        <div class="fork-branch">path_a</div>
-        <div class="fork-branch">path_b</div>
-      </div>
-      <div class="fork-arrow">⇒</div>
-      <div class="fork-node"><span class="fn-k">Coalesce</span><span class="fn-v">require_all</span></div>
-      <div class="fork-arrow">→</div>
-      <div class="fork-node"><span class="fn-k">Sink</span><span class="fn-v">output</span></div>
-    </div>
-    <p class="fork-caption">This diagram is illustrative; Composer can author the <code>require_all</code> shape in freeform conversation. Each branch token carries the same <code>fork_group_id</code>, so the trail knows the two are siblings of one row. When the coalesce node merges them, its lineage names <em>both</em> parent branch token ids, preserving which branch produced each part of the joined result.</p>
-  </div>
-</section>
-
-<hr class="divider" />
-
-<section>
-  <div class="wrap">
-    <div class="section-head">
-      <span class="eyebrow">Execution model</span>
-      <h2>Concurrent, but still deterministic.</h2>
-      <p>LLM calls are the slow part of most pipelines, so an LLM transform fans its per-row requests out across a bounded thread pool — then puts the results back in order. Throughput comes from overlapping I/O-bound model calls inside a transform, not from parallelising the graph, and never at the cost of a reproducible run.</p>
-    </div>
-    <div class="features">
-      <div class="feature"><span class="fi"><i data-lucide="layers"></i></span><h3>Bounded fan-out</h3><p>Per-row LLM and API calls run through a semaphore-bounded ThreadPoolExecutor, so a single LLM transform overlaps in-flight requests up to a fixed ceiling instead of waiting one row at a time.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="gauge"></i></span><h3>AIMD back-pressure</h3><p>Concurrency adapts to the provider: additive-increase while calls succeed, multiplicative-decrease on capacity errors — the pool backs off under load instead of hammering a rate-limited endpoint.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="list-ordered"></i></span><h3>Reorder buffer</h3><p>Concurrent results arrive out of order, then a reorder buffer re-sequences them back to submission order before they flow downstream. Parallel execution never reshuffles your rows.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="snowflake"></i></span><h3>Frozen row contexts</h3><p>Rows crossing a thread boundary are exposed as read-only views (MappingProxyType), so concurrent workers share no mutable state and cannot race each other.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="shield-alert"></i></span><h3>Contained regex, force-killable</h3><p>The only OS-level subprocess is a single-worker, force-killable process that runs regex in isolation, so a catastrophic-backtracking (ReDoS) pattern can be killed rather than hang the run. Containment for safety — not parallelism for speed.</p></div>
-      <div class="feature"><span class="fi"><i data-lucide="scroll-text"></i></span><h3>Preserves the deterministic audit</h3><p>Fan-out lives inside the transform layer; the orchestrator and Landscape audit stay single-writer and ordered. The reorder buffer is what lets concurrency keep the audit reproducible, not undermine it.</p></div>
-    </div>
-    <div class="cta-row" style="margin-top:40px">
-      <a class="btn btn-primary" href="assurance.html">How the audit stays deterministic</a>
-      <a class="btn" href="use-cases.html">Where it's used</a>
-    </div>
-  </div>
-</section>
-
-</main>
-
-<footer>
-  <div class="wrap">
-    <div class="foot">
-      <div class="foot-brand">
-        <span class="brand">ELSPETH</span>
-        <p class="foot-prov">Open-source software developed and publicly released by staff of the DTA — the Australian Government's Digital Transformation Agency.</p>
-      </div>
-      <div class="foot-cols">
-        <div class="foot-col">
-          <span class="foot-h">Product</span>
-          <a href="index.html">Home</a>
-          <a href="authoring.html">Authoring</a>
-          <a href="assurance.html">Assurance</a>
-          <a href="use-cases.html">Use cases</a>
-          <a href="get-started.html">Get started</a>
-        </div>
-        <div class="foot-col">
-          <span class="foot-h">Project</span>
-          <a href="https://github.com/dta-au/elspeth">GitHub</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">Changelog · v0.8.3</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">Contributing</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a>
-        </div>
-        <div class="foot-col">
-          <span class="foot-h">Assurance</span>
-          <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">Report a vulnerability</a>
-          <a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">MIT license</a>
-        </div>
-      </div>
-    </div>
-    <div class="foot-bottom">
-      <span class="copy"><a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">MIT licensed</a> · ELSPETH 0.8.3 · Built for decisions that must be defensible.</span>
-    </div>
-  </div>
-</footer>
-
-<script src="site.js"></script>
-</body>
+    <nav aria-label="Project resources">
+     <a href="https://github.com/dta-au/elspeth">
+      Source on GitHub
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">
+      Changelog · v0.8.3
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">
+      Contribute
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/CODE_OF_CONDUCT.md">
+      Code of conduct
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/SECURITY.md">
+      Report a vulnerability
+     </a>
+     <a href="https://github.com/dta-au/elspeth/blob/main/LICENSE">
+      MIT license
+     </a>
+    </nav>
+   </div>
+   <div class="wrap foot-bottom">
+    ELSPETH 0.8.3 · Documentation describes the source candidate; publication status is recorded in the changelog.
+   </div>
+  </footer>
+ </body>
 </html>

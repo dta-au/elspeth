@@ -118,6 +118,7 @@ class TestCreateTelemetryManagerEnabled:
         try:
             assert manager is not None
             assert isinstance(manager, TelemetryManager)
+            assert {"configured_exporters": 0, "events_attempted": 0}.items() <= manager.health_metrics.items()
         finally:
             if manager is not None:
                 manager.close()
@@ -131,6 +132,7 @@ class TestCreateTelemetryManagerEnabled:
         try:
             assert manager is not None
             assert isinstance(manager, TelemetryManager)
+            assert {"configured_exporters": 1, "events_attempted": 0}.items() <= manager.health_metrics.items()
         finally:
             if manager is not None:
                 manager.close()
