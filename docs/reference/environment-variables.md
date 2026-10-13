@@ -435,7 +435,7 @@ with `-` or `_`).
 | `endpoint`, `deployment_name`, `api_version` | azure | `endpoint` (HTTPS, credential-free) and `deployment_name` are required for Azure; all three are forbidden for other providers. |
 | `timeout_seconds` | openrouter | Only OpenRouter profiles accept an explicit timeout (default 60, max 300 seconds). |
 | `max_tokens` | all | Optional completion-token cap. |
-| `temperature` | all | Optional `0.0`–`2.0` number or `null`. An absent key preserves the ELSPETH provider default (Azure: omitted; others: `0.0`); explicit `null` omits temperature in completion and runtime-preflight requests. Numbers are sent unchanged. Check [model and reasoning-mode compatibility](configuration.md#environment-configuration) before setting a value. |
+| `temperature` | all | Optional `0.0`–`2.0` number or `null`. An absent key or explicit `null` omits temperature in completion and runtime-preflight requests. Numbers are sent unchanged. Before 0.8.5, non-Azure providers implicitly sent `0.0`; set it explicitly to retain that request behavior where supported. Check [model and reasoning-mode compatibility](configuration.md#environment-configuration) before setting a value. |
 
 Credential rules:
 

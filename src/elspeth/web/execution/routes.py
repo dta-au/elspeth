@@ -101,10 +101,9 @@ from elspeth.web.execution.schemas import (
     revalidated_with_discard_summary,
 )
 from elspeth.web.execution.secret_guard import SECRET_GUARD_ERROR_TYPE, ExecutionSecretApprovalRequired
-from elspeth.web.execution.service import close_execute_lease_before_transfer
+from elspeth.web.execution.service import acquire_execute_lease, close_execute_lease_before_transfer
 from elspeth.web.execution.websocket_close import TRANSIENT_BACKEND_FAILURES, RunStreamCloseCode
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
-from elspeth.web.execution_lease_cleanup import ExecutionLeaseReleaseRegistry
 from elspeth.web.interpretation_state import InterpretationReviewCapacityError, InterpretationReviewIntegrityError
 from elspeth.web.middleware.rate_limit import get_rate_limiter
 from elspeth.web.paths import allowed_sink_directories
@@ -1001,22 +1000,10 @@ def create_execution_router() -> APIRouter:
         settings: WebSettings = request.app.state.settings
         fanout_ack_token = execute_request.fanout_ack_token if execute_request is not None else None
         secret_ack_token = execute_request.secret_ack_token if execute_request is not None else None
-        registry = request.app.state.execution_lease_release_registry
-        if type(registry) is not ExecutionLeaseReleaseRegistry:
-            raise contract_errors.AuditIntegrityError("EXECUTE route lacks application cleanup registry")
-        obligation = registry.admit(
-            session_service.session_operation_authority,
+        obligation, lease = await acquire_execute_lease(
+            session_service,
+            request.app.state.execution_lease_release_registry,
             session_id=session_id,
-            owner_instance_id=session_service.session_operation_owner_instance_id,
-            lease_seconds=session_service.session_operation_lease_seconds,
-        )
-        lease = await SessionOperationLease.acquire(
-            session_service.session_operation_authority,
-            session_id=session_id,
-            operation_kind=SessionOperationKind.EXECUTE,
-            owner_instance_id=session_service.session_operation_owner_instance_id,
-            lease_seconds=session_service.session_operation_lease_seconds,
-            execution_obligation=obligation,
         )
         transferred = False
         request_cancellation: asyncio.CancelledError | None = None

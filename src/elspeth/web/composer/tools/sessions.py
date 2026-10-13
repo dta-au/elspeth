@@ -282,6 +282,20 @@ class _RequestInterpretationReviewArgumentsModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    @field_validator("llm_draft", mode="before")
+    @classmethod
+    def _draft_length_recovery(cls, value: object) -> object:
+        if isinstance(value, str) and len(value) > 8192:
+            raise ToolArgumentError(
+                argument="llm_draft",
+                expected=(
+                    "an inline review draft of at most 8192 characters; omit llm_draft to use the exact staged draft, "
+                    "or ask the user for a shorter review draft"
+                ),
+                actual_type="review draft exceeds the 8192-character inline limit",
+            )
+        return value
+
     @field_validator("kind")
     @classmethod
     def _kind_must_be_requestable(cls, value: InterpretationKind) -> InterpretationKind:
@@ -309,9 +323,6 @@ def _validate_source_artifact_review_content(value: str) -> None:
         codepoint = ord(character)
         if codepoint == 0x7F or (codepoint < 0x20 and character not in "\t\n\r"):
             raise ValueError("source artifact review content must not contain non-printable control characters")
-    for line in value.splitlines():
-        if len(line) > 1024:
-            raise ValueError("source artifact review content has a line exceeding the 1024-character limit")
     reject_credential_shaped_content(value)
 
 
@@ -353,8 +364,8 @@ def _validate_review_draft_content(kind: InterpretationKind, draft: str) -> None
         except ValueError as exc:
             raise ToolArgumentError(
                 argument="llm_draft",
-                expected="content without template metacharacters, control characters, or credential patterns",
-                actual_type="rejected by accepted-value content validator",
+                expected="review content that passes the reported rule; correct that issue and request the review again",
+                actual_type=str(exc),
             ) from exc
     elif kind is InterpretationKind.INVENTED_SOURCE:
         try:
@@ -362,8 +373,8 @@ def _validate_review_draft_content(kind: InterpretationKind, draft: str) -> None
         except ValueError as exc:
             raise ToolArgumentError(
                 argument="llm_draft",
-                expected="source artifact content without template metacharacters, credential patterns, or non-printable controls",
-                actual_type="rejected by source-artifact content validator",
+                expected="review content that passes the reported rule; correct that issue and request the review again",
+                actual_type=str(exc),
             ) from exc
 
 

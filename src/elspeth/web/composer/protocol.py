@@ -976,6 +976,13 @@ _SAFE_TOOL_ARGUMENT_EXPECTATIONS = (
             "id of a node whose plugin is 'llm'",
             "only the optional 'source_name' key",
             "source artifact content without template metacharacters, credential patterns, or non-printable controls",
+            "review content that passes the reported rule; correct that issue and request the review again",
+            "an inline review draft of at most 8192 characters; omit llm_draft to use the exact staged draft, or ask the user for a shorter review draft",
+            (
+                "a review draft: this site has no staged requirement draft to resolve, so llm_draft is required — "
+                "either stage a structured interpretation_requirements entry with a draft or provide llm_draft"
+            ),
+            "the current composition state with matching reviewed content; reload the latest state and retry",
             REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
             SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
             SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
@@ -1012,6 +1019,16 @@ _SAFE_TOOL_ARGUMENT_EXPECTATIONS = _SAFE_TOOL_ARGUMENT_EXPECTATIONS | frozenset(
     f"a pending {kind.value} interpretation requirement{suffix}" for kind in InterpretationKind for suffix in ("", " or placeholder")
 )
 
+REVIEW_CONTENT_REJECTION_MESSAGES: Final[frozenset[str]] = frozenset(
+    {
+        "accepted_value must not contain template metacharacters {{ or }}",
+        "accepted_value must not contain non-printable control characters (horizontal tab, newline, and carriage return are permitted)",
+        "source artifact review content must not contain template metacharacters {{ or }}",
+        "source artifact review content must not contain non-printable control characters",
+        "review draft exceeds the 8192-character inline limit",
+    }
+)
+
 _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = frozenset(
     {
         "credential-shaped content rejected at the tool boundary",
@@ -1031,6 +1048,9 @@ _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = frozenset(
         "re-staging an already-resolved interpretation review",
         "rejected by accepted-value content validator",
         "rejected by source-artifact content validator",
+        *REVIEW_CONTENT_REJECTION_MESSAGES,
+        "omitted llm_draft with no staged requirement draft",
+        "stale composition state or reviewed content",
         "source without metadata",
         "stale model-choice draft",
         "stale prompt-template draft",

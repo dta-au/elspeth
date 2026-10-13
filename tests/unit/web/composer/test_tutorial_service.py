@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,10 +12,8 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
-from structlog.testing import capture_logs
 
 from elspeth.contracts import CallStatus, CallType, NodeType
-from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
@@ -35,112 +32,41 @@ from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import RunRecord, SessionRunStatus
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
-from tests.helpers.session_fences import RecordingSessionOperationAuthority, make_execute_context
+from tests.helpers.session_fences import RecordingSessionOperationAuthority
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("timing", ["none", "simultaneous", "waiting", "prior"])
-@pytest.mark.parametrize("error_class", [None, RuntimeError, FrameworkBugError, AuditIntegrityError])
-async def test_pretransfer_cleanup_outcome_is_independent_of_cancel_scheduling(timing, error_class) -> None:
-    failure = error_class("private cleanup detail") if error_class is not None else None
-    cancellation = asyncio.CancelledError("request cancelled") if timing == "prior" else None
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    closing_task: asyncio.Task[None] | None = None
+@pytest.fixture
+def projection_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Projection-only tests stub acquisition; real ownership is tested with SQLite.
 
-    class Lease:
-        context = make_execute_context(uuid4())
-        closed = False
+    These tests deliberately use a fake execution service and do not claim
+    application acquisition or cleanup coverage. The actual consumer tests use
+    the production registry, SQL authority and execution service.
+    """
+    from elspeth.web.coordination.contracts import SessionOperationKind
+    from elspeth.web.coordination.lifecycle import SessionOperationLease
 
-        async def close(self) -> None:
-            entered.set()
-            if timing == "waiting":
-                await release.wait()
-            if timing == "simultaneous":
-                assert closing_task is not None
-                closing_task.cancel()
-            self.closed = True
-            if failure is not None:
-                raise failure
+    class Obligation:
+        completion_required = False
 
-    lease = Lease()
-    with capture_logs() as logs:
-        closing_task = asyncio.create_task(
-            tutorial_service_module._close_tutorial_execute_lease_before_transfer(lease, cancellation=cancellation)
+        def assert_business_dispatch(self, context: Any) -> None:
+            assert context.operation_kind is SessionOperationKind.EXECUTE
+
+    async def acquire(session_service: Any, registry: Any, *, session_id: Any) -> Any:
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
         )
-        if timing == "waiting":
-            await entered.wait()
-            closing_task.cancel()
-            await asyncio.sleep(0)
-            assert not lease.closed
-            release.set()
-        if error_class in (FrameworkBugError, AuditIntegrityError) or (timing == "none" and failure is not None):
-            with pytest.raises(error_class) as caught:
-                await closing_task
-            assert caught.value is failure
-        elif timing != "none":
-            with pytest.raises(asyncio.CancelledError) as caught:
-                await closing_task
-            if cancellation is not None:
-                assert caught.value is cancellation
-        else:
-            await closing_task
-    assert lease.closed
-    if error_class is RuntimeError and timing != "none":
-        assert logs == [
-            {
-                "event": "execution_pretransfer_lease_close_failed",
-                "session_id": lease.context.fence.session_id,
-                "operation_id": lease.context.fence.operation_id,
-                "operation_epoch": lease.context.fence.operation_epoch,
-                "error_type": "RuntimeError",
-                "primary_error_type": "CancelledError",
-                "log_level": "error",
-            }
-        ]
-    else:
-        assert logs == []
+        return Obligation(), lease
 
+    async def close(lease: Any, *, primary: BaseException | None = None) -> None:
+        await lease.close()
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error_class", [RuntimeError, FrameworkBugError, AuditIntegrityError])
-async def test_pretransfer_cleanup_logging_preserves_integrity_priority(monkeypatch, error_class) -> None:
-    failure = error_class("private logging detail")
-    cancellation = asyncio.CancelledError("request cancelled")
-
-    class Lease:
-        context = make_execute_context(uuid4())
-
-        async def close(self) -> None:
-            raise OSError("private lease detail")
-
-    class Logger:
-        def error(self, event, **fields) -> None:
-            raise failure
-
-    monkeypatch.setattr(tutorial_service_module, "slog", Logger())
-    expected = asyncio.CancelledError if error_class is RuntimeError else error_class
-    with pytest.raises(expected) as caught:
-        await tutorial_service_module._close_tutorial_execute_lease_before_transfer(Lease(), cancellation=cancellation)
-    assert caught.value is (cancellation if error_class is RuntimeError else failure)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error_class", [FrameworkBugError, AuditIntegrityError])
-async def test_pretransfer_cleanup_integrity_failure_wins_racing_cancellation(error_class) -> None:
-    failure = error_class("lease cleanup integrity failure")
-    closing_task: asyncio.Task[None] | None = None
-
-    class FailingLease:
-        async def close(self) -> None:
-            assert closing_task is not None
-            closing_task.cancel()
-            raise failure
-
-    closing_task = asyncio.create_task(tutorial_service_module._close_tutorial_execute_lease_before_transfer(FailingLease()))
-    with pytest.raises(error_class) as caught:
-        await closing_task
-    assert caught.value is failure
+    monkeypatch.setattr(tutorial_service_module, "acquire_execute_lease", acquire)
+    monkeypatch.setattr(tutorial_service_module, "close_execute_lease_before_transfer", close)
 
 
 def _make_tutorial_settings(data_dir: Path, **overrides: Any) -> WebSettings:
@@ -353,6 +279,7 @@ def test_launch_blocker_admits_this_deployments_control_transforms() -> None:
 async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    projection_execution: None,
 ) -> None:
     approved_state_id = uuid4()
     newer_state_id = uuid4()
@@ -419,6 +346,7 @@ async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved
                 settings=settings,
                 session_service=session_service,
                 execution_service=FakeExecutionService(),
+                execution_lease_release_registry=None,
                 plugin_snapshot_factory=lambda _user: SimpleNamespace(),
                 web_plugin_policy=SimpleNamespace(),
                 operator_profile_registry=SimpleNamespace(),
@@ -446,7 +374,7 @@ async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved
     [("failed", 0), ("completed_with_failures", 0), ("empty", 0), ("completed", 0), ("completed_with_failures", 1)],
 )
 async def test_failed_live_tutorial_run_response_omits_raw_run_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: SessionRunStatus, rows_succeeded: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: SessionRunStatus, rows_succeeded: int, projection_execution: None
 ) -> None:
     run_id = uuid4()
     session_id = uuid4()
@@ -488,7 +416,9 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(
                 pipeline_yaml=None,
             )
 
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(execution_service=FakeExecutionService())))
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(execution_service=FakeExecutionService(), execution_lease_release_registry=None))
+    )
     settings = _make_tutorial_settings(tmp_path)
     user = SimpleNamespace(user_id="tutorial-user")
 
@@ -534,7 +464,7 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(
 
 
 @pytest.mark.asyncio
-async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tmp_path: Path) -> None:
+async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tmp_path: Path, projection_execution: None) -> None:
     """An unresolved interpretation review is a coded launch blocker, not a 500.
 
     A committed llm node can still carry a pending ``llm_prompt_template`` review, so
@@ -569,7 +499,9 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
                 ),
             )
 
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(execution_service=FakeExecutionService())))
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(execution_service=FakeExecutionService(), execution_lease_release_registry=None))
+    )
     settings = _make_tutorial_settings(tmp_path)
     user = SimpleNamespace(user_id="tutorial-user")
 
@@ -638,7 +570,7 @@ async def test_readiness_refuses_pending_interpretations_before_run(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_cancelled_live_tutorial_run_returns_409_with_machine_code(tmp_path: Path) -> None:
+async def test_cancelled_live_tutorial_run_returns_409_with_machine_code(tmp_path: Path, projection_execution: None) -> None:
     """A run that terminates ``cancelled`` is a deliberate user action, not a
     failure: the route must answer 409 with the stable machine code
     ``tutorial_run_cancelled`` (the frontend switches on it), never the
@@ -682,7 +614,9 @@ async def test_cancelled_live_tutorial_run_returns_409_with_machine_code(tmp_pat
                 pipeline_yaml=None,
             )
 
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(execution_service=FakeExecutionService())))
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(execution_service=FakeExecutionService(), execution_lease_release_registry=None))
+    )
     settings = _make_tutorial_settings(tmp_path)
     user = SimpleNamespace(user_id="tutorial-user")
 
@@ -705,6 +639,7 @@ async def test_cancelled_live_tutorial_run_returns_409_with_machine_code(tmp_pat
 async def test_live_tutorial_wait_uses_transport_ceiling_minus_headroom(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    projection_execution: None,
 ) -> None:
     """The tutorial POST must outlive one slow LLM call without racing the proxy."""
     captured_timeout: list[float | None] = []
@@ -730,7 +665,9 @@ async def test_live_tutorial_wait_uses_transport_ceiling_minus_headroom(
         return SimpleNamespace(status="cancelled")
 
     monkeypatch.setattr(tutorial_service_module, "_wait_for_terminal_run", fake_wait_for_terminal_run)
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(execution_service=FakeExecutionService())))
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(execution_service=FakeExecutionService(), execution_lease_release_registry=None))
+    )
     settings = _make_tutorial_settings(
         tmp_path,
         composer_timeout_seconds=120.0,

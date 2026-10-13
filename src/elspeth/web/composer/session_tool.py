@@ -219,7 +219,7 @@ class SessionToolOwner:
                     error_payload=arg_error_payload,
                 )
             )
-            anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            anti_anchor.record_failure(tool_name, audit.arguments_hash, category=exc.category)
             llm_messages.append(
                 {
                     "role": "tool",
@@ -325,7 +325,7 @@ class SessionToolOwner:
                     error_payload=arg_error_payload,
                 )
             )
-            anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            anti_anchor.record_failure(tool_name, audit.arguments_hash, category=exc.category)
             llm_messages.append(
                 {
                     "role": "tool",

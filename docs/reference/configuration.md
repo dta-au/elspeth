@@ -1163,7 +1163,7 @@ Options common to all providers:
 | `model` | string | provider-dependent | — | Model identifier; required for `openrouter` and `bedrock`, defaulted from `deployment_name` for `azure` |
 | `pricing_model` | string or null | No | (none) | LiteLLM catalogue identity used for cost calculation without changing the routed model. For profile-bound nodes, configure this in the operator's `llm_profiles` entry; it cannot be overridden in node options |
 | `system_prompt` | string | No | (none) | Optional system message |
-| `temperature` | float or null | No | Azure: `null`; other providers: `0.0` | Sampling temperature, `0.0`–`2.0`. Azure omits it by default for compatibility with reasoning deployments. Set an explicit value for a model that supports adjustable temperature; `null` omits the parameter and uses the provider default |
+| `temperature` | float or null | No | `null` | Sampling temperature, `0.0`–`2.0`. Omitted or `null` leaves the provider default. Explicit numbers are sent unchanged and must be supported by the model and reasoning mode. Before 0.8.5, non-Azure providers implicitly sent `0.0`; set `temperature: 0.0` explicitly to retain that request behavior where supported. |
 | `max_tokens` | int | No | (provider default) | Maximum response tokens; must be > 0. The `azure` provider sends it as `max_completion_tokens`, which also counts reasoning tokens |
 | `response_field` | string | No | `llm_response` | Row field for the model response; must be a valid Python identifier |
 | `queries` | list or mapping | No | (none) | Multi-query specs; omit for single-query mode |

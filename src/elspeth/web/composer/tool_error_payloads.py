@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from elspeth.web.composer.audit import canonicalize_pydantic_cause, canonicalize_schema_violations
 from elspeth.web.composer.protocol import SchemaViolationCode, ToolArgumentError
-from elspeth.web.composer.tools._dispatch import declared_argument_names
+from elspeth.web.composer.tools._dispatch import declared_argument_length_bounds, declared_argument_names
 from elspeth.web.composer.tools.wire_projection import EmptyArgumentsMarker, EnvelopeUnwrap, WireTool
 
 INVALID_TOOL_ARGUMENTS_REDACTION_STATUS: Final[str] = "invalid_tool_arguments"
@@ -66,5 +66,14 @@ def arg_error_payload(exc: ToolArgumentError, tool_name: str) -> Mapping[str, An
             f"Remove unsupported root properties. Allowed properties: {', '.join(names)}."
             if names
             else "This tool takes no arguments. Call it with {}."
+        )
+    elif tool_name == "request_interpretation_review" and any(
+        violation.code is SchemaViolationCode.OUT_OF_BOUNDS and violation.loc == ("llm_draft",) for violation in exc.schema_violations
+    ):
+        minimum, maximum = declared_argument_length_bounds(tool_name, "llm_draft")
+        payload["repair_instruction"] = (
+            f"Inline llm_draft must contain {minimum} to {maximum} characters. "
+            "Omit llm_draft to use the exact staged draft. If there is no staged draft, "
+            "ask the user for a shorter review draft. Keep the existing document and pipeline content unchanged."
         )
     return payload

@@ -47,6 +47,7 @@ class _Harness:
     config: dict[str, Any]
     requests: list[dict[str, Any]]
     reject_sampling: list[bool]
+    recorder: FakeAuditRecorder
 
 
 @pytest.fixture(params=["azure", "bedrock", "openrouter", "gateway"])
@@ -59,11 +60,11 @@ def harness(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> 
 
     def create(**kwargs: Any) -> ModelResponse:
         requests.append(kwargs)
-        if reject_sampling[0]:
+        if reject_sampling[0] and kwargs.get("temperature") is not None:
             raise LLMClientError("unsupported sampling", retryable=False)
         return ModelResponse(
             model=kwargs["model"],
-            choices=[{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            choices=[{"index": 0, "message": {"role": "assistant", "content": '{"score":1}'}, "finish_reason": "stop"}],
             usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
         )
 
@@ -114,13 +115,13 @@ def harness(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> 
 
             def respond(http_request: httpx.Request) -> httpx.Response:
                 requests.append(json.loads(http_request.content))
-                if reject_sampling[0]:
+                if reject_sampling[0] and "temperature" in requests[-1]:
                     return httpx.Response(400, json={"error": {"message": "unsupported sampling"}})
-                return _gateway_response(_completion_body(model=requests[-1]["model"], content="ok"))
+                return _gateway_response(_completion_body(model=requests[-1]["model"], content='{"score":1}'))
 
             respx.post(f"{endpoint}/chat/completions").mock(side_effect=respond)
         try:
-            yield _Harness(provider, config, requests, reject_sampling)
+            yield _Harness(provider, config, requests, reject_sampling, recorder)
         finally:
             provider.close()
 
@@ -149,7 +150,7 @@ def test_transform_preflight_matches_normal_completion_sampling(harness: _Harnes
             assert "temperature" not in payload
         else:
             assert payload["temperature"] == resolved
-    expected = (None if config["provider"] == "azure" else 0.0) if temperature == "omitted" else temperature
+    expected = None if temperature == "omitted" else temperature
     assert resolved == expected
 
 
@@ -238,6 +239,6 @@ def test_lowered_profile_preserves_provider_default_and_explicit_omission(temper
         settings,
         {"profile": "operator", "prompt_template": "hello", "schema": {"mode": "observed"}},
     )
-    expected = 0.0 if temperature == "omitted" else temperature
+    expected = None if temperature == "omitted" else temperature
     assert LLMTransform(options).provider_config.temperature == expected
     assert LLMSource({**options, "on_validation_failure": "discard"}).provider_config.temperature == expected

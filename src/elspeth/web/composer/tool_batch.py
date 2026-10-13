@@ -2139,7 +2139,7 @@ async def run_tool_batch(
                     error_message=advisor_arg_error.error,
                     post_version=state.version,
                 )
-                anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                anti_anchor.record_failure(tool_name, audit.arguments_hash, category=advisor_arg_error.category)
                 llm_messages.append(
                     {
                         "role": "tool",
@@ -2845,7 +2845,7 @@ async def run_tool_batch(
                 error_message=str(exc.args[0] if exc.args else "ToolArgumentError"),
                 post_version=state.version,
             )
-            anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            anti_anchor.record_failure(tool_name, audit.arguments_hash, category=exc.category)
             llm_messages.append(
                 {
                     "role": "tool",

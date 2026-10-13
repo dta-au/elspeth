@@ -610,10 +610,7 @@ class InterpretationResolveRequest(BaseModel):
     choice: Literal["accepted_as_drafted", "amended"]
     # Optional from the wire perspective; the model_validator enforces
     # that ``amended`` requires it and ``accepted_as_drafted`` forbids
-    # it.  ``max_length`` is the outer cap; the per-line cap (1024) is
-    # enforced inside ``_validate_accepted_value_content`` to give a
-    # specific error message rather than the generic ``max_length``
-    # rejection.
+    # it. ``max_length`` bounds the whole amendment, including long lines.
     amended_value: str | None = Field(default=None, max_length=8192)
 
     @model_validator(mode="after")

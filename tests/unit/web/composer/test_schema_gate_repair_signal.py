@@ -48,6 +48,46 @@ from .conftest import (
     _FakeToolCall,
 )
 
+
+@pytest.mark.parametrize("draft", ["", "LEGITIMATE_DOCUMENT_TEXT " * 400])
+def test_review_draft_bounds_have_owned_safe_recovery(draft):
+    with pytest.raises(ToolArgumentError) as caught:
+        require_schema_valid_arguments(
+            "request_interpretation_review",
+            {
+                "affected_node_id": "review_node",
+                "kind": "pipeline_decision",
+                "user_term": "drop_raw_html_fields",
+                "llm_draft": draft,
+            },
+        )
+    payload = arg_error_payload(caught.value, "request_interpretation_review")
+    assert "1 to 8192" in payload["repair_instruction"]
+    assert "Omit llm_draft to use the exact staged draft" in payload["repair_instruction"]
+    assert "LEGITIMATE_DOCUMENT_TEXT" not in json.dumps(payload)
+
+
+def test_other_review_field_bounds_do_not_suggest_draft_omission():
+    with pytest.raises(ToolArgumentError) as caught:
+        require_schema_valid_arguments(
+            "request_interpretation_review",
+            {
+                "affected_node_id": "review_node",
+                "kind": "pipeline_decision",
+                "user_term": "x" * 8193,
+            },
+        )
+    assert "repair_instruction" not in arg_error_payload(caught.value, "request_interpretation_review")
+
+
+def test_review_repair_payload_retains_arbitrary_text_privacy():
+    error = ToolArgumentError(argument="llm_draft", expected="PRIVATE_EXPECTATION", actual_type="PRIVATE_ARGUMENT")
+    error.__cause__ = ValueError("PRIVATE_DOCUMENT_CAUSE")
+    encoded = json.dumps(arg_error_payload(error, "request_interpretation_review"))
+    assert "PRIVATE_" not in encoded
+    assert "repair_instruction" not in encoded
+
+
 _KEY_CANARY = "stray_key_canary_sk_live_9Zx4"
 
 _MSG_BOUNDS = "Value is outside allowed bounds"
