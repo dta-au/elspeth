@@ -46,7 +46,7 @@ def test_replica_schema_cutover_belongs_to_0_8_1() -> None:
     release_0_8_1, release_0_8_0 = changelog.split("## 0.8.1 -", maxsplit=1)[1].split("## 0.8.0 -", maxsplit=1)
     release_0_8_0 = release_0_8_0.split("\n## ", maxsplit=1)[0]
 
-    assert "## Current Cutover: 0.8.3 candidate for next 0.8.4" in runbook
+    assert "## Current Cutover: 0.8.4 candidate" in runbook
     assert "## Prior Cutover: 0.8.3 candidate (session epoch 72, Landscape epoch 49)" in runbook
     assert "## Prior Cutover: 0.8.1" in runbook
     assert "install 0.8.1" in runbook

@@ -35,6 +35,7 @@ import elspeth.web.aws_ecs_startup as aws_ecs_startup_module
 import elspeth.web.deployment_contract as deployment_contract_module
 import elspeth.web.external_state_startup as external_state_startup_module
 import elspeth.web.operator_telemetry as operator_telemetry_module
+from elspeth import __version__
 from elspeth.contracts import RunStatus
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -389,7 +390,8 @@ class TestCreateApp:
 
     def test_returns_fastapi_instance_with_correct_version(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))
-        assert app.version == "0.1.0"
+        assert app.version == __version__
+        assert app.openapi()["info"]["version"] == __version__
 
     def test_default_settings_when_none_passed(self, tmp_path) -> None:
         # create_app(None) uses WebSettings() which defaults data_dir to "data".

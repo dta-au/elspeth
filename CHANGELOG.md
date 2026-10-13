@@ -4,6 +4,50 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.4 - Unreleased (Restricted SQL and credential lifecycle hardening)
+
+- **Live PostgreSQL analysis has a restricted language and database profile.**
+  Query APIs admit a bounded PostgreSQL 16 scalar SELECT/CTE subset and check
+  the executing connection's role, catalog and executable dependencies.
+  Caller-directed state, control and notification effects are refused. The
+  direct Python facade applies the same semantic restrictions. This is an
+  API/profile contract, not a guarantee for arbitrary database-password use;
+  bounded read contention remains possible. Raw MCP queries use a disposable
+  worker with finite input, output, memory and time budgets, owned cancellation
+  and joined cleanup. See the [analysis guide](docs/guides/landscape-mcp-analysis.md).
+- **Derived credentials follow durable session authority.** Logout revokes the
+  bearer family, password changes advance its credential generation, and
+  websocket tickets and established progress streams recheck the binding.
+- **External request and provider evidence are bounded.** Received request
+  bytes are checked before downstream dispatch. Provider HTTP responses have
+  transport limits, and submitted image echoes are refused before audit/replay
+  retention across the reviewed raw, base64, hex and byte-array representations.
+  This does not claim universal detection of arbitrary transformed encodings.
+- **Provider sampling preserves omission and explicit zero.** Azure's omitted
+  sampling values remain omitted; explicit values retain their authored meaning.
+- **Compose separates runtime and schema ownership.** Bootstrap refuses unsafe
+  runtime ownership before reopening login. Existing stores are not reset or
+  converted by this release candidate.
+- **Test and tooling maintenance is bounded.** Completed module extractions,
+  focused CI regression repairs and the lint CLI parser extraction retain the
+  current runtime and authority controls. The session-authority scanner
+  extraction remains deferred.
+
+**Store compatibility.** Session epoch 75 combines authentication families and
+bound tickets with graph recovery. Session epoch 72 adds durable Composer jobs
+and ingress bindings in the preceding candidate. Landscape epoch 49 remains unchanged.
+A Landscape database already at epoch 49 remains usable if its complete schema
+matches current admission. Qualification uses explicitly new compatible stores.
+Unsupported session, Landscape and local-auth stores are preserved and refused
+before incompatible writes. Do not migrate, recreate, delete or restamp them.
+The temporary no-backwards-compatibility window has no fixed expiry.
+
+This is an unreleased source candidate. Final exact-head CI remains required;
+no operator signature clearance, tag, image publication, deployment or live
+cloud qualification is claimed. Automatic image and Pages publication remain held.
+The preceding Composer progress and recovery qualifications remain separate
+from a published release claim.
+
 ## 0.8.3 - Unreleased (Archive recovery and Composer HTTPS progress candidate)
 
 - **Session archive and cleanup recover on filesystems without no-replace rename.**

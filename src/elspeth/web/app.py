@@ -1658,7 +1658,7 @@ def _create_app(
         unit="ms",
     )
 
-    app = FastAPI(title="ELSPETH Web", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="ELSPETH Web", version=__version__, lifespan=lifespan)
     app.state.operator_telemetry = operator_runtime
     app.state.process_recovery = process_recovery
     app.state.process_watchdog = watchdog
