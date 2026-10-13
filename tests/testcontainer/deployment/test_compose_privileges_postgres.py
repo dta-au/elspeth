@@ -423,6 +423,60 @@ def test_bootstrap_refuses_unrelated_databases_without_changing_them(compose_pos
         admin.dispose()
 
 
+@pytest.mark.parametrize("database", ["session", "landscape"])
+def test_bootstrap_refuses_schema_owned_public_security_definer(compose_postgres: _ComposePostgres, database: str) -> None:
+    db_name = "elspeth_sessions" if database == "session" else "elspeth_landscape"
+    owner_role = "elspeth_session_schema" if database == "session" else "elspeth_landscape_schema"
+    runtime_role = "elspeth_session_runtime" if database == "session" else "elspeth_landscape_runtime"
+    admin = create_engine(compose_postgres.admin_url.set(database=db_name))
+    owner = compose_postgres.engine("web-init", database)
+    runtime = compose_postgres.engine("web", database)
+    try:
+        with owner.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE FUNCTION public.compose_owner_context() RETURNS text LANGUAGE SQL SECURITY DEFINER "
+                "AS $$ SELECT current_user::text $$"
+            )
+            connection.exec_driver_sql(
+                "CREATE FUNCTION public.compose_invoker_context() RETURNS text LANGUAGE SQL SECURITY INVOKER "
+                "AS $$ SELECT current_user::text $$"
+            )
+        try:
+            # The actual schema-owner defaults expose elevated execution even
+            # though the runtime cannot create objects in public itself.
+            _assert_denied(runtime, "CREATE TABLE public.compose_forbidden_owner_probe (id integer)")
+            with runtime.connect() as connection:
+                assert connection.exec_driver_sql("SELECT public.compose_owner_context()").scalar_one() == owner_role
+                assert connection.exec_driver_sql("SELECT public.compose_invoker_context()").scalar_one() == runtime_role
+            owner.dispose()
+            runtime.dispose()
+            result = compose_postgres.bootstrap()
+            assert result.returncode != 0
+            assert "compose_database_objects_unsafe" in result.stdout + result.stderr
+            with admin.connect() as connection:
+                assert connection.exec_driver_sql(
+                    "SELECT count(*) = 4 AND bool_and(NOT rolcanlogin) FROM pg_roles "
+                    "WHERE rolname IN ('elspeth_session_schema', 'elspeth_landscape_schema', "
+                    "'elspeth_session_runtime', 'elspeth_landscape_runtime')"
+                ).scalar_one()
+                assert connection.exec_driver_sql(
+                    "SELECT prosecdef FROM pg_proc WHERE oid='public.compose_owner_context()'::regprocedure"
+                ).scalar_one()
+        finally:
+            with admin.begin() as connection:
+                connection.exec_driver_sql("DROP FUNCTION public.compose_owner_context()")
+            result = compose_postgres.bootstrap()
+            assert result.returncode == 0, result.stdout + result.stderr
+            with runtime.connect() as connection:
+                assert connection.exec_driver_sql("SELECT public.compose_invoker_context()").scalar_one() == runtime_role
+            with admin.begin() as connection:
+                connection.exec_driver_sql("DROP FUNCTION public.compose_invoker_context()")
+    finally:
+        runtime.dispose()
+        owner.dispose()
+        admin.dispose()
+
+
 def test_bootstrap_refuses_public_security_definer_wrapper_in_an_unknown_schema(compose_postgres: _ComposePostgres) -> None:
     admin = create_engine(compose_postgres.admin_url.set(database="elspeth_sessions"))
     runtime = compose_postgres.engine("web", "session")

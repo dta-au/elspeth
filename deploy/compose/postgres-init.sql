@@ -171,7 +171,7 @@ SELECT NOT EXISTS (
       AND relowner <> 'elspeth_session_schema'::regrole
 ) AND NOT EXISTS (
     SELECT FROM pg_proc WHERE pronamespace = 'public'::regnamespace
-      AND proowner <> 'elspeth_session_schema'::regrole
+      AND (proowner <> 'elspeth_session_schema'::regrole OR prosecdef)
 ) AND (SELECT nspowner IN ('pg_database_owner'::regrole, 'elspeth_session_schema'::regrole)
        FROM pg_namespace WHERE nspname = 'public') AND NOT EXISTS (
     SELECT FROM pg_proc, LATERAL aclexplode(proacl) AS permission
@@ -282,7 +282,7 @@ SELECT NOT EXISTS (
       AND relowner <> 'elspeth_landscape_schema'::regrole
 ) AND NOT EXISTS (
     SELECT FROM pg_proc WHERE pronamespace = 'public'::regnamespace
-      AND proowner <> 'elspeth_landscape_schema'::regrole
+      AND (proowner <> 'elspeth_landscape_schema'::regrole OR prosecdef)
 ) AND (SELECT nspowner IN ('pg_database_owner'::regrole, 'elspeth_landscape_schema'::regrole)
        FROM pg_namespace WHERE nspname = 'public') AND NOT EXISTS (
     SELECT FROM pg_proc, LATERAL aclexplode(proacl) AS permission

@@ -26,6 +26,15 @@ Creation is allowed only for an object-free, unstamped target. PostgreSQL
 requires an empty, supported target namespace. This is not an upgrade of the
 preserved store, and it does not make predecessor rows readable by this code.
 
+The local authentication store has its own exact schema admission. Preserving
+`auth.db` does not make an older credential schema compatible: a legacy `users`
+table without `credential_generation` remains untouched and is refused. A
+compatible session store or identity activation cannot repair that mismatch.
+Keep the compatible prior application available, or obtain separate operator
+authorization for a new authentication target and account re-enrollment. This
+candidate does not migrate credentials or reset the preserved authentication
+store automatically.
+
 ### Current Procedure
 
 1. Identify the configured session and Landscape targets without printing
