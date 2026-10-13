@@ -30,7 +30,7 @@ jobs:
     name: Deploy website/ to Pages
     # Hold automatic publication while Composer fixes land; source integration
     # and schema-preservation guidance do not authorize a Pages deployment.
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.ref_protected
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-pages
