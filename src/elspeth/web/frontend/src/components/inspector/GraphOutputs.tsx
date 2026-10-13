@@ -27,15 +27,16 @@ const NODE_LABELS: Record<NodeType, string> = {
 
 type DestinationName = (route: string, fromNode?: string) => ReactNode;
 
-function successAction(route: string | null | undefined, destinationName: DestinationName, fromNode?: string): ReactNode {
+function successAction(route: string | null | undefined, destinationName: DestinationName, fromNode?: string, showFailureRoutes = true): ReactNode {
+  if (!showFailureRoutes && route === "discard") return "Route hidden";
   if (route === "discard") return "Discard row (audit recorded)";
   if (route) return <>Send to {destinationName(route, fromNode)}</>;
   return "No success route set";
 }
 
-function nodeSuccessActions(node: NodeSpec, destinationName: DestinationName): ReactNode[] {
+function nodeSuccessActions(node: NodeSpec, destinationName: DestinationName, showFailureRoutes: boolean): ReactNode[] {
   if (node.node_type === "gate" && node.routes && Object.keys(node.routes).length > 0) {
-    return Object.entries(node.routes).map(([name, route]) => {
+    return Object.entries(node.routes).filter(([, route]) => showFailureRoutes || route !== "discard").map(([name, route]) => {
       const action = route === FORK_CONNECTION
         ? node.fork_to?.length
           ? <>Fork to {node.fork_to.map((branch, index) => (
@@ -46,16 +47,17 @@ function nodeSuccessActions(node: NodeSpec, destinationName: DestinationName): R
       return <Fragment key={name}>{name}: {action}</Fragment>;
     });
   }
-  return [successAction(publishedSuccessConnection(node), destinationName, node.id)];
+  return [successAction(publishedSuccessConnection(node), destinationName, node.id, showFailureRoutes)];
 }
 
-function failureAction(route: string | null | undefined, destinationName: DestinationName, fromNode?: string): ReactNode {
+function failureAction(route: string | null | undefined, destinationName: DestinationName, fromNode?: string, showFailureRoutes = true): ReactNode {
+  if (!showFailureRoutes && route) return "Route hidden";
   if (route === "discard") return "Discard row (audit recorded)";
   if (route) return <>Send to {destinationName(route, fromNode)}</>;
   return "No failure route set";
 }
 
-function policyRows(state: CompositionState): PolicyRow[] {
+function policyRows(state: CompositionState, showFailureRoutes: boolean, hiddenOutputNames: ReadonlySet<string>): PolicyRow[] {
   const { consumers } = buildConnectionIndex(state);
   const queueIds = new Set(state.nodes.filter((node) => node.node_type === "queue").map((node) => node.id));
   const destinationName: DestinationName = (route, fromNode) => {
@@ -74,37 +76,39 @@ function policyRows(state: CompositionState): PolicyRow[] {
     name,
     plugin: source.plugin,
     binding: pluginBindingLabel(source.plugin, source.options),
-    success: [successAction(source.on_success, destinationName)],
+    success: [successAction(source.on_success, destinationName, undefined, showFailureRoutes)],
     condition: "Row fails validation",
-    action: failureAction(source.on_validation_failure, destinationName),
+    action: failureAction(source.on_validation_failure, destinationName, undefined, showFailureRoutes),
   }));
   const nodes = state.nodes.map((node) => ({
     kind: NODE_LABELS[node.node_type],
     name: node.id,
     plugin: node.plugin,
     binding: pluginBindingLabel(node.plugin, node.options),
-    success: nodeSuccessActions(node, destinationName),
+    success: nodeSuccessActions(node, destinationName, showFailureRoutes),
     condition: node.node_type === "coalesce" && node.policy === "require_all"
       ? "Required branch missing"
       : "Row processing fails",
     action: node.node_type === "coalesce" && node.policy === "require_all"
       ? "No combined row (failure recorded)"
-      : failureAction(node.on_error, destinationName, node.id),
+      : failureAction(node.on_error, destinationName, node.id, showFailureRoutes),
   }));
-  const outputs = state.outputs.map((output) => ({
+  const outputs = state.outputs.filter((output) => !hiddenOutputNames.has(output.name)).map((output) => ({
     kind: "Sink",
     name: output.name,
     plugin: output.plugin,
     binding: pluginBindingLabel(output.plugin, output.options),
     success: ["Row written"],
     condition: "Row write fails",
-    action: failureAction(output.on_write_failure, destinationName, output.name),
+    action: failureAction(output.on_write_failure, destinationName, output.name, showFailureRoutes),
   }));
   return [...sources, ...nodes, ...outputs];
 }
 
-export function GraphOutputs({ state, children }: { state: CompositionState; children?: ReactNode }): JSX.Element {
-  const rows = policyRows(state);
+export function GraphOutputs({ state, children, showFailureRoutes = true, hiddenOutputNames = new Set<string>() }: {
+  state: CompositionState; children?: ReactNode; showFailureRoutes?: boolean; hiddenOutputNames?: ReadonlySet<string>;
+}): JSX.Element {
+  const rows = policyRows(state, showFailureRoutes, hiddenOutputNames);
   return (
     <details className="graph-detail-table">
       {/* Row kinds are the canonical node names (Source, Transform, Gate, ...,

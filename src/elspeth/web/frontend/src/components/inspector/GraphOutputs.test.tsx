@@ -6,6 +6,29 @@ import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { GraphOutputs } from "./GraphOutputs";
 
 describe("GraphOutputs", () => {
+  it("mirrors hidden failure routes while retaining ordinary false branches and structural diagnostics", async () => {
+    const state: CompositionState = {
+      id: "session", ...compositionStateAuthorityFields, version: 1,
+      metadata: { name: null, description: null }, sources: {}, edges: [],
+      nodes: [
+        { id: "decision", node_type: "gate", plugin: null, input: "rows", options: {}, on_success: null, on_error: "quarantine", routes: { false: "business", rejected: "discard" } },
+        { id: "join", node_type: "coalesce", plugin: null, input: "rows", options: {}, on_success: null, on_error: null, policy: "require_all" },
+      ],
+      outputs: [
+        { name: "business", plugin: "json", options: {}, on_write_failure: "discard" },
+        { name: "quarantine", plugin: "json", options: {}, on_write_failure: "discard" },
+      ],
+    };
+    const before = JSON.stringify(state);
+    render(<GraphOutputs state={state} showFailureRoutes={false} hiddenOutputNames={new Set(["quarantine"])} />);
+    await userEvent.setup().click(screen.getByText("Wiring (3)"));
+    expect(screen.getByRole("row", { name: /Gate: decision/ })).toHaveTextContent("false: Send to business");
+    expect(screen.queryByText(/rejected:/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("row", { name: /Sink: quarantine/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("row", { name: /Sink: business/ })).toHaveTextContent("Route hidden");
+    expect(screen.getByRole("row", { name: /Coalesce: join/ })).toHaveTextContent("No combined row (failure recorded)");
+    expect(JSON.stringify(state)).toBe(before);
+  });
   it("shows named gate routes and implicit success connections without counting routes as nodes", async () => {
     const common: NodeSpec = {
       id: "filter", node_type: "gate", plugin: null, input: "source_out",

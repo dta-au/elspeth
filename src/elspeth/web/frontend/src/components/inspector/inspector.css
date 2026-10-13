@@ -298,6 +298,11 @@
   min-height: 0;
 }
 
+.graph-view-toolbar {
+  flex: 0 0 auto;
+  padding: var(--space-xs);
+}
+
 /* Empty canvas (elspeth-1f4b60a492): composes the shared .empty-state
    register (shared.css), which centres content within its own box — but the
    box was content-height, so the one-line message pinned to the top edge of
