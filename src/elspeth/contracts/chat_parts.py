@@ -42,6 +42,7 @@ IMAGE_FORMATS: frozenset[str] = frozenset(get_args(ImageFormat))
 _IMAGE_MIME_BY_FORMAT = {fmt: BINARY_DOCUMENT_MIME_BY_FORMAT[fmt] for fmt in IMAGE_FORMATS}
 _JSON_STRING_DELIMITER = re.compile(r'["\\]')
 _JSON_ASCII_ESCAPE = re.compile(r"\\u00([0-7][0-9a-fA-F])")
+_URL_ASCII_ESCAPE = re.compile(r"%[ \t\r\n\f\v]*([0-7])[ \t\r\n\f\v]*([0-9a-fA-F])")
 _BASE64_NORMALIZATION = str.maketrans("-_", "+/", " \t\r\n\f\v")
 _BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 _ENCODING_ESCAPED_WHITESPACE = re.compile(r"\\(?:[tnrfv]|x(?:09|0[a-dA-D]|20))")
@@ -213,6 +214,16 @@ def _contains_image_encoding_text(text: str, protected: tuple[tuple[str, str], .
     # Preserve punctuation so distinct fields cannot become one encoding.
     text = _JSON_ASCII_ESCAPE.sub(lambda match: chr(int(match.group(1), 16)), text)
     text = _ENCODING_ESCAPED_WHITESPACE.sub("", text)
+    # Compare one ASCII URL-encoding layer as well as the literal text. Keep
+    # '+' literal, preserve field punctuation, and never recursively decode.
+    # ASCII wrapping may split an escape just as it splits base64 symbols.
+    percent_decoded = _URL_ASCII_ESCAPE.sub(lambda match: chr(int(match.group(1) + match.group(2), 16)), text)
+    if percent_decoded != text and _contains_image_encoding_view(percent_decoded, protected, images):
+        return True
+    return _contains_image_encoding_view(text, protected, images)
+
+
+def _contains_image_encoding_view(text: str, protected: tuple[tuple[str, str], ...], images: Sequence[ImagePart]) -> bool:
     if _contains_protected_encoding(text.translate(_BASE64_NORMALIZATION), protected):
         return True
     compact_hex = text.translate(_HEX_NORMALIZATION)
@@ -276,7 +287,8 @@ def image_response_is_audit_safe(messages: Sequence[ChatMessage], response: Call
     Admission never rewrites completion text. A provider echo cannot be retained
     as a parsed body, a header, or exact replay bytes. JSON string normalization
     also catches slash/unicode escapes, ASCII wrapping, equivalent alphabets,
-    optional padding and unused pad bits, including malformed/duplicate-key
+    optional padding, unused pad bits and one ASCII percent-encoding layer,
+    including malformed/duplicate-key
     bodies whose diagnostic representation would otherwise retain their raw text.
     Complete hex strings and contiguous JSON byte integers are compared with the
     submitted bytes too; this does not decode arbitrary reversible encodings or

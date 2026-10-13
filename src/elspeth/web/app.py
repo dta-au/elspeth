@@ -1191,11 +1191,12 @@ class _BodySizeLimitMiddleware:
 
     Content-Length permits early rejection, but the received bytes enforce
     the ceiling even when that header is absent or understates the body.
-    Buffer at most 10 MiB, then replay the body through the normal ASGI path.
+    Buffer at most 10 MiB within 30 seconds, then replay through the normal ASGI path.
     No downstream response has begun when an oversized stream is refused.
     """
 
     _MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
+    _MAX_BODY_READ_SECONDS = 30.0
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -1209,7 +1210,8 @@ class _BodySizeLimitMiddleware:
         suppresses=("R1",),
         invariant="a malformed Content-Length returns 400 before reading; declared or received "
         "bytes over _MAX_BODY_BYTES return 413 before downstream dispatch; absent headers do not "
-        "bypass received-byte accounting",
+        "bypass received-byte accounting; an incomplete body returns 408 within the "
+        "overall read deadline before downstream dispatch",
         non_raising=True,
     )
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -1236,8 +1238,27 @@ class _BodySizeLimitMiddleware:
                 return
 
         body = bytearray()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._MAX_BODY_READ_SECONDS
         while True:
-            message = await receive()
+            # Empty immediately-ready chunks still yield to cancellation
+            # and other requests; awaiting receive alone need not yield.
+            await asyncio.sleep(0)
+            remaining = deadline - loop.time()
+            try:
+                if remaining <= 0:
+                    raise TimeoutError
+                # Join receive cancellation before sending a timeout refusal.
+                message = await asyncio.wait_for(receive(), timeout=remaining)
+            except TimeoutError:
+                response = StarletteResponse(
+                    content='{"error": "Request body read timed out"}',
+                    status_code=408,
+                    media_type="application/json",
+                    headers={"Connection": "close"},
+                )
+                await response(scope, receive, send)
+                return
             if message["type"] == "http.disconnect":
                 return
             chunk = message.get("body", b"")

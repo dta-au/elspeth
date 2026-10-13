@@ -3,6 +3,7 @@
 import base64
 import json
 import tracemalloc
+from urllib.parse import unquote
 
 import pytest
 
@@ -79,8 +80,41 @@ def test_image_response_admission_preserves_unrelated_and_separate_strings() -> 
     assert image_response_is_audit_safe(messages, split, body=b"")
 
 
+@pytest.mark.parametrize("representation", ["base64", "hex", "array"])
+def test_percent_escaped_image_forms_preserve_distinct_fields_and_unrelated_bytes(representation: str) -> None:
+    data = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
+    image = ImagePart.from_bytes(format="png", data=data, blob_ref=None)
+    messages = [ChatMessage(role="user", content=(image,))]
+    values = {
+        "base64": base64.b64encode(data).decode(),
+        "hex": data.hex(),
+        "array": json.dumps(list(data)),
+    }
+    encoded = "".join(f"%{ord(char):02x}" for char in values[representation])
+    assert unquote(encoded) == values[representation]
+    assert not image_response_is_audit_safe(messages, RawCallPayload({"echo": encoded}))
+    assert not image_response_is_audit_safe(messages, HTTPCallResponse(status_code=200, headers={"debug": encoded}))
+    assert not image_response_is_audit_safe(messages, RawCallPayload({"content": "safe"}), body=encoded.encode())
+    split = {"a": encoded[: len(encoded) // 2], "b": encoded[len(encoded) // 2 :]}
+    candidate = RawCallPayload(split)
+    before = candidate.to_dict()
+    assert image_response_is_audit_safe(messages, candidate, body=json.dumps(split).encode())
+    assert candidate.to_dict() == before
+    changed_data = data[:-1] + b"\x00"
+    changed = {
+        "base64": base64.b64encode(changed_data).decode(),
+        "hex": changed_data.hex(),
+        "array": json.dumps(list(changed_data)),
+    }
+    unrelated = "".join(f"%{ord(char):02x}" for char in changed[representation])
+    assert image_response_is_audit_safe(messages, RawCallPayload({"echo": unrelated}))
+
+
 @pytest.mark.parametrize("padding_bytes", [0, 1, 2])
-@pytest.mark.parametrize("variant", ["standard", "unpadded", "urlsafe", "urlsafe_unpadded", "mixed", "partial_padding"])
+@pytest.mark.parametrize(
+    "variant",
+    ["standard", "unpadded", "urlsafe", "urlsafe_unpadded", "mixed", "partial_padding", "percent", "percent_all", "percent_urlsafe"],
+)
 @pytest.mark.parametrize("location", ["value", "unicode", "utf16_duplicate", "utf32_duplicate", "header", "transport", "decoded"])
 def test_image_response_admission_checks_equivalent_base64(padding_bytes: int, variant: str, location: str) -> None:
     data = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) + b"x" * padding_bytes
@@ -98,7 +132,13 @@ def test_image_response_admission_checks_equivalent_base64(padding_bytes: int, v
         assert all(char in encoded for char in "+/-_")
     elif variant == "partial_padding":
         encoded = encoded.removesuffix("=")
-    restored = encoded.translate(str.maketrans("-_", "+/"))
+    elif variant == "percent":
+        encoded = encoded.replace("+", "%2b", 1).replace("/", "%2F", 1).replace("=", "%3d")
+    elif variant == "percent_all":
+        encoded = "".join(f"%{ord(char):02x}" for char in encoded)
+    elif variant == "percent_urlsafe":
+        encoded = base64.urlsafe_b64encode(data).decode().rstrip("=").replace("-", "%2D").replace("_", "%5f")
+    restored = unquote(encoded).translate(str.maketrans("-_", "+/"))
     assert base64.b64decode(restored + "=" * (-len(restored) % 4), validate=True) == data
     wrapped = " \n\t".join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
     messages = [ChatMessage(role="user", content=(image,))]

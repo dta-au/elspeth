@@ -45,13 +45,14 @@ passes.
 
 from __future__ import annotations
 
-import json as jsonlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import pytest
+import respx
 import structlog
 from sqlalchemy import insert, select
 from sqlalchemy.pool import StaticPool
@@ -191,47 +192,6 @@ def _make_fake_openai_response(content: str, model: str) -> _FakeOpenAIResponse:
         choices=[_FakeOpenAIChoice(message=_FakeOpenAIMessage(content=content))],
         model=model,
     )
-
-
-class _FakeHTTPXClient:
-    """Small httpx.Client stand-in for OpenRouter transport tests."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.closed = False
-
-    def post(
-        self,
-        url: str,
-        *,
-        json: dict[str, Any] | None = None,
-        headers: dict[str, str] | None = None,
-        timeout: float | None = None,
-    ) -> Any:
-        body = {
-            "choices": [
-                {
-                    "message": {"content": "7 / 10"},
-                    "finish_reason": "stop",
-                }
-            ],
-            "model": "openrouter/test-model",
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-            },
-        }
-        import httpx
-
-        return httpx.Response(
-            status_code=200,
-            content=jsonlib.dumps(body).encode(),
-            headers={"content-type": "application/json"},
-            request=httpx.Request("POST", url),
-        )
-
-    def close(self) -> None:
-        self.closed = True
 
 
 @pytest.mark.asyncio
@@ -453,7 +413,7 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
 
 @pytest.mark.asyncio
 async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transport(
-    monkeypatch: pytest.MonkeyPatch,
+    respx_mock: respx.MockRouter,
 ) -> None:
     """OpenRouter's HTTP transport must not carry the LLM prompt hash.
 
@@ -524,7 +484,16 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
         telemetry_emit=lambda event: None,
         approved_prompt_artifact_hash=session_hash,
     )
-    monkeypatch.setattr("elspeth.plugins.infrastructure.clients.http.httpx.Client", _FakeHTTPXClient)
+    route = respx_mock.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "7 / 10"}, "finish_reason": "stop"}],
+                "model": "openrouter/test-model",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+    )
 
     result = provider.execute_query(
         messages=[ChatMessage(role="user", content="Rate how modern this is.")],
@@ -540,6 +509,7 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
     )
 
     assert result.content == "7 / 10"
+    assert route.call_count == 1
     with db.connection() as conn:
         rows = conn.execute(
             select(calls_table.c.call_type, calls_table.c.approved_prompt_artifact_hash)

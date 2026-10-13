@@ -153,7 +153,7 @@ def test_image_identity_changes_both_transport_and_semantic_request_hashes(harne
 
 
 @pytest.mark.parametrize("status", [200, 503])
-@pytest.mark.parametrize("encoding_variant", ["standard", "unpadded", "urlsafe_unpadded", "hex", "byte_array"])
+@pytest.mark.parametrize("encoding_variant", ["standard", "unpadded", "urlsafe_unpadded", "hex", "byte_array", "percent"])
 @pytest.mark.parametrize(
     "echo_form",
     [
@@ -185,6 +185,8 @@ def test_submitted_image_echo_is_rejected_before_any_audit_or_telemetry_egress(
         encoded = image.data.hex().upper()
     elif encoding_variant == "byte_array":
         encoded = json.dumps(list(image.data), separators=(",", ":"))
+    elif encoding_variant == "percent":
+        encoded = "".join(f"%{ord(char):02x}" for char in encoded)
     echo = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
     if encoding_variant == "byte_array":
         echo = encoded.replace(",", "," + separator)
@@ -250,7 +252,7 @@ def test_submitted_image_echo_is_rejected_before_any_audit_or_telemetry_egress(
 
 @pytest.mark.parametrize("separator", ["", " ", "\t", "\f", "\v"])
 @pytest.mark.parametrize("error_source", ["literal", "h11_repr"])
-@pytest.mark.parametrize("encoding_variant", ["standard", "urlsafe_unpadded", "hex", "byte_array"])
+@pytest.mark.parametrize("encoding_variant", ["standard", "urlsafe_unpadded", "hex", "byte_array", "percent"])
 @respx.mock
 def test_protocol_error_image_echo_is_refused_before_error_audit_and_tracing(
     harness: _Harness, separator: str, error_source: str, encoding_variant: str
@@ -265,6 +267,8 @@ def test_protocol_error_image_echo_is_refused_before_error_audit_and_tracing(
         encoded = image.data.hex().upper()
     elif encoding_variant == "byte_array":
         encoded = json.dumps(list(image.data), separators=(",", ":"))
+    elif encoding_variant == "percent":
+        encoded = "".join(f"%{ord(char):02x}" for char in encoded)
     echo = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
     if encoding_variant == "byte_array":
         echo = encoded.replace(",", "," + separator)
@@ -501,7 +505,7 @@ def test_runtime_preflight_uses_bounded_transport(harness: _Harness, monkeypatch
 )
 @pytest.mark.parametrize("echo", [False, True])
 @pytest.mark.parametrize("separator", ["", "\n\t"])
-@pytest.mark.parametrize("encoding_variant", ["standard", "urlsafe_unpadded", "hex", "byte_array"])
+@pytest.mark.parametrize("encoding_variant", ["standard", "urlsafe_unpadded", "hex", "byte_array", "percent"])
 @respx.mock
 def test_http_audit_projection_also_binds_replay_verify_and_telemetry(
     mode: RunMode, echo: bool, separator: str, echo_source: str, encoding_variant: str
@@ -517,6 +521,8 @@ def test_http_audit_projection_also_binds_replay_verify_and_telemetry(
         encoded = image.data.hex()
     elif encoding_variant == "byte_array":
         encoded = json.dumps(list(image.data), separators=(",", ":"))
+    elif encoding_variant == "percent":
+        encoded = "".join(f"%{ord(char):02x}" for char in encoded)
     response_body = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4)) if echo else "ok"
     if echo and encoding_variant == "byte_array":
         response_body = encoded.replace(",", "," + separator)
