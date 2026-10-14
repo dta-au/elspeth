@@ -199,11 +199,18 @@ _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES = 580
 # 219 bytes for the recovery instruction in the nested request JSON. Preserve
 # the prior ceiling/headroom and its negative padding control.
 _GRAPH_RECOVERY_CONTROLS_CANONICAL_BYTES = 1538
+# Operator ruling 2026-10-15 (John): main 9d7735c09 -> candidate 85e00d616
+# measured +4,944 canonical bytes: system guidance +3,502, revised blob/proposal
+# declarations +1,222, retained-operation history envelope +220. Add exactly
+# that growth, preserving the baseline, 10% band, 163 B live-case headroom and
+# existing overflow control. This test allowance changes no production limit.
+_RELEASE086_PLANNER_SCAFFOLD_CANONICAL_BYTES = 4944
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
     + _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES
     + _GRAPH_RECOVERY_CONTROLS_CANONICAL_BYTES
+    + _RELEASE086_PLANNER_SCAFFOLD_CANONICAL_BYTES
 )
 
 
