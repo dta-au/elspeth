@@ -3771,11 +3771,11 @@ class TestComposeTimeout:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("error_class", "expected_failure_class"),
-        (("ServiceUnavailableError", "unavailable"), ("Timeout", "unavailable"), ("APIError", "malformed")),
+        ("error_class", "expected_failure_class", "expected_attempts"),
+        (("ServiceUnavailableError", "unavailable", 2), ("Timeout", "unavailable", 1), ("APIError", "malformed", 2)),
     )
     async def test_end_advisor_classifies_real_sdk_failure_by_type(
-        self, monkeypatch: pytest.MonkeyPatch, error_class: str, expected_failure_class: str
+        self, monkeypatch: pytest.MonkeyPatch, error_class: str, expected_failure_class: str, expected_attempts: int
     ) -> None:
         from litellm.exceptions import APIError, ServiceUnavailableError, Timeout
 
@@ -3803,14 +3803,14 @@ class TestComposeTimeout:
                 service._advisor_checkpoint, phase="end", state=_empty_state(), session_id=None, recorder=None
             )
 
-        assert physical_calls == 2
+        assert physical_calls == expected_attempts
         assert verdict.failure_class == expected_failure_class
         assert verdict.findings_text == (
             "advisor model was unavailable after retry" if expected_failure_class == "unavailable" else "advisor response was malformed"
         )
         assert "provider secret" not in repr(verdict)
         assert checkpoint_persist.await_count == 1
-        assert checkpoint_persist.await_args.kwargs["record"].provider_attempts == 2
+        assert checkpoint_persist.await_args.kwargs["record"].provider_attempts == expected_attempts
 
     @pytest.mark.asyncio
     async def test_end_advisor_first_party_same_named_failure_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:

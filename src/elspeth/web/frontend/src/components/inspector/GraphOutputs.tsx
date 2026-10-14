@@ -103,13 +103,14 @@ function policyRows(state: CompositionState): PolicyRow[] {
   return [...sources, ...nodes, ...outputs];
 }
 
-export function GraphOutputs({ state }: { state: CompositionState }): JSX.Element {
+export function GraphOutputs({ state, children }: { state: CompositionState; children?: ReactNode }): JSX.Element {
   const rows = policyRows(state);
   return (
     <details className="graph-detail-table">
       {/* Row kinds are the canonical node names (Source, Transform, Gate, ...,
           Sink); the section and its columns use routing vocabulary. */}
       <summary>Wiring ({rows.length})</summary>
+      {children}
       <div className="graph-detail-table-scroll" tabIndex={0} role="group" aria-label="Wiring table">
         <table>
           <thead>

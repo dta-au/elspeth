@@ -2247,6 +2247,29 @@ async def test_exhausted_litellm_timeout_classified_unavailable(make_service, si
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["auth", "bad_request", "rate_limit", "unavailable", "connection"])
+async def test_advisor_respects_existing_provider_retryability(make_service, simple_state, failure_kind):
+    from litellm.exceptions import AuthenticationError, BadRequestError, RateLimitError, ServiceUnavailableError
+
+    failures = {
+        "auth": AuthenticationError("private provider detail", model="advisor", llm_provider="openai"),
+        "bad_request": BadRequestError("private provider detail", model="advisor", llm_provider="openai"),
+        "rate_limit": RateLimitError("private provider detail", model="advisor", llm_provider="openai"),
+        "unavailable": ServiceUnavailableError("private provider detail", model="advisor", llm_provider="openai"),
+        "connection": ConnectionError("private provider detail"),
+    }
+    service = make_service()
+    call = _AsyncRecorder(side_effect=failures[failure_kind])
+    service._advisor_checkpoint._call_advisor_with_audit = call
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, **_fenced_session(service), recorder=make_recorder()
+    )
+    assert not verdict.ok
+    assert call.await_count == (2 if failure_kind in {"unavailable", "connection"} else 1)
+    assert "private provider detail" not in verdict.findings_text
+
+
+@pytest.mark.asyncio
 async def test_exhausted_litellm_service_unavailable_classified_unavailable(make_service, simple_state):
     """A LiteLLM ``ServiceUnavailableError`` (provider 503) is a genuine outage —
     it must classify UNAVAILABLE (escapable), not fail closed as malformed, so a

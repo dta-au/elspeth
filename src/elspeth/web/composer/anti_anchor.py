@@ -46,6 +46,8 @@ from __future__ import annotations
 
 from collections import deque
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+
 _RETRY_THRESHOLD = 3
 _DEQUE_MAXLEN = 5
 
@@ -132,14 +134,17 @@ class AntiAnchorTracker:
 
     def __init__(self) -> None:
         self._failures: FailureDeque = deque(maxlen=_DEQUE_MAXLEN)
+        self._categories: deque[ToolArgumentErrorCategory | None] = deque(maxlen=_DEQUE_MAXLEN)
 
-    def record_failure(self, tool_name: str, arguments_hash: str) -> None:
+    def record_failure(self, tool_name: str, arguments_hash: str, *, category: ToolArgumentErrorCategory | None = None) -> None:
         """Append a failure. Bounded deque drops the oldest beyond `_DEQUE_MAXLEN`."""
         self._failures.append((tool_name, arguments_hash))
+        self._categories.append(category)
 
     def record_success(self) -> None:
         """Clear the deque. Any tool success means we have made progress."""
         self._failures.clear()
+        self._categories.clear()
 
     def next_hint(self) -> str | None:
         """Return the hint the current failure window earns, or ``None``.
@@ -155,6 +160,33 @@ class AntiAnchorTracker:
         (elspeth-aa459b4dd0). A hint is control text the model acts on;
         prose for a state that did not happen is worse than no prose.
         """
+        if (should_inject_hint(self._failures) or should_inject_drift_hint(self._failures)) and any(
+            category
+            in {
+                ToolArgumentErrorCategory.SEMANTIC_RULE,
+                ToolArgumentErrorCategory.MODEL_VALIDATION,
+                ToolArgumentErrorCategory.SCHEMA_BOUND,
+                ToolArgumentErrorCategory.RATE_CAP_PER_TERM,
+                ToolArgumentErrorCategory.RATE_CAP_PER_SESSION_DAY,
+                ToolArgumentErrorCategory.PROMPT_BUDGET,
+                ToolArgumentErrorCategory.DISCOVERY_ONLY,
+                ToolArgumentErrorCategory.DUPLICATE_RESOLVED_INTERPRETATION,
+            }
+            for category in list(self._categories)[-_RETRY_THRESHOLD:]
+        ):
+            pattern = (
+                "with different arguments (drift without convergence)"
+                if should_inject_drift_hint(self._failures)
+                else "with byte-identical arguments"
+            )
+            return (
+                f"[ELSPETH-SYSTEM-HINT] Your last {_RETRY_THRESHOLD} calls to `{self._failures[-1][0]}` failed {pattern}. "
+                "Re-read the specific reported rule and repair guidance. "
+                "Correct only that issue; preserve valid pipeline topology and document content. "
+                "Do not repeat, quote, summarize, or otherwise reproduce any literal values from prior arguments or errors in assistant prose. "
+                "If the available tools cannot satisfy the rule, explain the named constraint and required user action "
+                "instead of repeating unsupported requests."
+            )
         if should_inject_hint(self._failures):
             return build_anti_anchor_hint(self._failures)
         if should_inject_drift_hint(self._failures):
@@ -187,3 +219,4 @@ class AntiAnchorTracker:
         reset does.
         """
         self._failures.clear()
+        self._categories.clear()

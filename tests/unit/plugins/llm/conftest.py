@@ -22,6 +22,7 @@ from elspeth.testing import make_pipeline_row
 # Re-export chaosllm_server fixture so LLM tests can use it
 # ruff: noqa: F811  # Helper functions receive chaosllm_server as parameter, shadowing the re-export
 from tests.fixtures.chaosllm import chaosllm_server  # noqa: F401
+from tests.fixtures.llm_sampling import harness as harness
 
 # Common schema config used across LLM tests
 DYNAMIC_SCHEMA = {"mode": "observed"}

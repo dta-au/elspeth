@@ -262,12 +262,12 @@ elspeth web --host 127.0.0.1 --port 8451</pre>
       <span class="eyebrow">Important upgrade posture</span>
       <h2>Preserve existing stores; qualify a new compatible target.</h2>
       <p>APIs, interfaces, and schemas are unstable before 1.0; ELSPETH makes no backward-compatibility promise.</p>
-      <p data-release="0.8.4">From 0.8.0 to 0.8.4, this source candidate now requires Sessions epoch 75 and Landscape epoch 49. Qualification uses explicitly new compatible stores. Unsupported existing session, Landscape and local-auth stores must be preserved and refused before incompatible writes. Do not recreate, delete, restamp or migrate them for this candidate. Keep a Landscape database already at epoch 49 only when its complete schema matches current admission. Authentication families and bound tickets join the graph recovery controls; ordinary freeform composition, Run, Audit, and Graduation remain available. Final release and image qualification remain outstanding.</p>
+      <p data-release="0.8.5">From 0.8.0 to 0.8.5, this version requires Sessions epoch 75 and Landscape epoch 49. Qualification uses explicitly new compatible stores. Unsupported existing session, Landscape and local-auth stores must be preserved and refused before incompatible writes. Do not recreate, delete, restamp or migrate them for this version. Keep a Landscape database already at epoch 49 only when its complete schema matches current admission. Authentication families and bound tickets join the graph recovery controls; ordinary freeform composition, Run, Audit, and Graduation remain available. Release tagging, image publication and deployment require separate verification.</p>
       <p data-release="0.8.2">From 0.8.0 to 0.8.2, the current formats are Sessions epoch 71 and Landscape epoch 49, reached by the 0.8.1 cutover. Upgrades from 0.8.1 keep both database epochs unchanged. 0.8.2 adds bounded validation and release-check hardening while retaining ordinary freeform composition, Run, Audit, and Graduation.</p>
       <p data-release="0.8.1">From 0.8.0 to 0.8.1, the Sessions and Landscape schemas change together: Sessions epoch 71 and Landscape epoch 49. This release adds durable Composer request receipts, stronger digest checks, advisor evidence, replay and verification records, and a first-run tutorial built through ordinary freeform composition while retaining Run, Audit, and Graduation. Follow the paired database-recreation runbook; do not relabel or open older stores with the new service.</p>
       <p data-release="0.8.0">The earlier upgrade from 0.7.1 to 0.8.0 also changed both database schemas and required coordinated recreation.</p>
       <p data-release="0.8.3">The preceding 0.8.3 source candidate used Sessions epoch 74 and Landscape epoch 49 for immutable graph parks and operation-bound checkpoints. Its historical schema facts do not authorize converting or resetting existing stores for the current candidate.</p>
-      <p>If upgrading from 0.8.0 or earlier, preserve the existing service and its evidence; qualify a separately provisioned new target before installing 0.8.4 once published. This temporary no-backwards-compatibility window has no fixed expiry and authorizes no existing-store conversion or reset. Preserve the separate <code>auth.db</code>. Follow the current <a href="https://github.com/dta-au/elspeth/blob/main/docs/runbooks/aws-ecs-deployment.md">deployment runbook</a> for admission and operator prerequisites. Historical recreation instructions do not authorize changing existing stores for this fix.</p>
+      <p>If upgrading from 0.8.0 or earlier, preserve the existing service and its evidence; qualify a separately provisioned new target before installing 0.8.5. Current store admission authorizes no existing-store conversion or reset. Preserve the separate <code>auth.db</code>. Follow the current <a href="https://github.com/dta-au/elspeth/blob/main/docs/runbooks/aws-ecs-deployment.md">deployment runbook</a> for admission and operator prerequisites. Historical recreation instructions do not authorize changing existing stores for this fix.</p>
     </div>
   </div>
 </section>
@@ -322,7 +322,7 @@ elspeth web --host 127.0.0.1 --port 8451</pre>
       Source on GitHub
      </a>
      <a href="https://github.com/dta-au/elspeth/blob/main/CHANGELOG.md">
-      Changelog · v0.8.4
+      Changelog · v0.8.5
      </a>
      <a href="https://github.com/dta-au/elspeth/blob/main/CONTRIBUTING.md">
       Contribute
@@ -339,7 +339,7 @@ elspeth web --host 127.0.0.1 --port 8451</pre>
     </nav>
    </div>
    <div class="wrap foot-bottom">
-    ELSPETH 0.8.4 · Documentation describes the source candidate; publication status is recorded in the changelog.
+    ELSPETH 0.8.5 · Package version alone does not establish qualification or image publication.
    </div>
   </footer>
  </body>

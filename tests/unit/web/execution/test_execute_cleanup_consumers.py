@@ -30,6 +30,7 @@ from elspeth.web.application_finalizers import ApplicationFinalizerOwner
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer import yaml_generator
+from elspeth.web.composer.tutorial_service import _run_live_tutorial
 from elspeth.web.coordination.contracts import RecoveryRequiredReason
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -50,6 +51,67 @@ from tests.helpers.session_fences import seed_live_compose_context
 from tests.unit.web.blobs.test_service import _seed_active_run
 from tests.unit.web.blobs.test_service_fencing import _insert_session
 from tests.unit.web.test_app import _settings
+
+
+@pytest.mark.asyncio
+async def test_tutorial_uses_application_execution_obligation_before_state_refusal(actual: _Harness) -> None:
+    """The real service must reach state admission, then release its SQL lease."""
+    sid = _insert_session(actual.sessions._engine)
+    context = seed_live_compose_context(actual.sessions._engine, sid)
+    actual.sessions.session_operation_authority.release(context)
+    app = FastAPI()
+    app.state.execution_service = actual.service
+    app.state.execution_lease_release_registry = actual.registry
+    request = Request({"type": "http", "app": app})
+    with pytest.raises(ValueError, match=r"state|State"):
+        await _run_live_tutorial(
+            request=request,
+            user=UserIdentity(user_id="tutorial-user", username="tutorial-user"),
+            session_id=sid,
+            state_id=None,
+            settings=actual.service._settings,
+            session_service=actual.sessions,
+        )
+    # A subsequent canonical acquisition proves the refused run left no live lease.
+    obligation, lease = await actual.lease(sid)
+    assert obligation.lease is lease
+    await close_execute_lease_before_transfer(lease)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_class", [asyncio.CancelledError, RuntimeError])
+async def test_tutorial_releases_real_acquisition_when_admission_is_interrupted(
+    actual: _Harness, monkeypatch: pytest.MonkeyPatch, failure_class: type[BaseException]
+) -> None:
+    sid = _insert_session(actual.sessions._engine)
+    context = seed_live_compose_context(actual.sessions._engine, sid)
+    actual.sessions.session_operation_authority.release(context)
+    failure = failure_class("synthetic admission interruption")
+    leases: list[SessionOperationLease] = []
+
+    async def interrupt(*args, session_operation_lease, **kwargs):
+        actual.service._execution_obligation(session_operation_lease)
+        leases.append(session_operation_lease)
+        raise failure
+
+    monkeypatch.setattr(actual.service, "_execute_locked", interrupt)
+    app = FastAPI()
+    app.state.execution_service = actual.service
+    app.state.execution_lease_release_registry = actual.registry
+    with pytest.raises(failure_class) as caught:
+        await _run_live_tutorial(
+            request=Request({"type": "http", "app": app}),
+            user=UserIdentity(user_id="tutorial-user", username="tutorial-user"),
+            session_id=sid,
+            state_id=None,
+            settings=actual.service._settings,
+            session_service=actual.sessions,
+        )
+    assert caught.value is failure
+    assert len(leases) == 1
+    obligation, lease = await actual.lease(sid)
+    assert obligation.lease is lease
+    await close_execute_lease_before_transfer(lease)
 
 
 async def _until(predicate) -> None:

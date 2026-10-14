@@ -5505,44 +5505,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[14]/body[2]/body[1]/orelse[0]/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:0ad88fdfd56d780c749caf6667a7ef05477fb601f001d9db4d1f9b964316872a'
-- key: web/composer/tutorial_service.py:R4:_close_tutorial_execute_lease_before_transfer:fp=97ec1b90677b4678
-  owner: john
-  reason: |-
-    The broad Exception handler covers only the last-resort slog.error emission after the exact lease close task has completed and an ordinary close fault has been classified alongside request cancellation. The immediately preceding live contract_errors.TIER_1_ERRORS handler re-raises registered integrity faults unchanged. An ordinary logger failure adds its class name to the retained cancellation, and the function unconditionally raises that cancellation afterward; it cannot fabricate successful cleanup or transfer lease ownership. test_pretransfer_cleanup_logging_preserves_integrity_priority proves ordinary logger failure preserves the exact cancellation while FrameworkBugError and AuditIntegrityError escape by identity.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-08'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-09T02:10:34.615542+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    PRESCRIBED FORM — the broad handler at web/composer/tutorial_service.py:171-172 records the ordinary logging failure on the retained cancellation, and the unconditional raise at lines 174-175 prevents cleanup from appearing successful. The integrity gate `contract_errors.TIER_1_ERRORS` is visibly reached first and re-raises at lines 169-170; I verified tests/unit/web/composer/test_tutorial_service.py::test_pretransfer_cleanup_logging_preserves_integrity_priority at lines 104-124, which proves an ordinary logger failure preserves the exact cancellation while `FrameworkBugError` and `AuditIntegrityError` escape by identity. R4 is not eligible for the trust-boundary decorator.
-  judge_signature_version: 2
-  scope_fingerprint: b1a35095026cadf74d347957c79874c6d72b94b2c0aaa351cb33eb46634d40be
-  judge_transport: codex_cli
-  ast_path: 'body[56]/body[3]/handlers[1]/body[2]/handlers[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:55786637e4031dbd9d175a6fd7bcb554b6cb76cd623b6ce16a6ecfc590f77270'
-- key: web/composer/tutorial_service.py:R6:_close_tutorial_execute_lease_before_transfer:fp=c00a37a8a8a4e667
-  owner: john
-  reason: |-
-    The exact CancelledError catch retains the first request cancellation while asyncio.wait({close_task}) joins the owned close task without cancelling it or propagating its result prematurely. After completion, close_task.result() is classified once: live contract_errors.TIER_1_ERRORS escape unchanged; ordinary close failure without cancellation propagates; ordinary failure alongside cancellation emits execution_pretransfer_lease_close_failed with owned fence identity and exception class names before restoring cancellation. _run_live_tutorial passes cancellation already active on entering its finally. No lease transfer occurs on this cleanup path. test_pretransfer_cleanup_outcome_is_independent_of_cancel_scheduling covers no cancellation, simultaneous completion, suspended cleanup, and cancellation preceding helper entry, each against success, RuntimeError, FrameworkBugError and AuditIntegrityError.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-08'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-09T02:12:36.923324+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    RULE MISFIRES — the CancelledError is temporarily retained at tutorial_service.py:148-151 while the owned close task finishes, then the retained cancellation is explicitly re-raised at line 175, so it is not silently swallowed. The close task’s result is classified at lines 152-173, with Tier-1 failures escaping unchanged and uncancelled ordinary failures propagating. The control-location claim is verified: `_run_live_tutorial` captures cancellation and reaches this helper from its `finally` at tutorial_service.py:386-413, while `tests/unit/web/composer/test_tutorial_service.py::test_pretransfer_cleanup_outcome_is_independent_of_cancel_scheduling` exercises the stated cancellation timings and cleanup outcomes at lines 40-101. The decorator alternative does not apply because the finding is R6 and this helper is not a Tier-3 parameter boundary.
-  judge_signature_version: 2
-  scope_fingerprint: b1a35095026cadf74d347957c79874c6d72b94b2c0aaa351cb33eb46634d40be
-  judge_transport: codex_cli
-  ast_path: 'body[56]/body[2]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:e55f418f9186c22f53717aa7cf968a00560964d3c9ee7f7cb0e5507172cf4a2a'
 - key: web/composer/tutorial_service.py:R6:cleanup_tutorial_orphans:fp=8da4eea793148d0a
   owner: john
   reason: |-

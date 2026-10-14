@@ -12,7 +12,7 @@
 // Empty state when no nodes.
 // ============================================================================
 
-import { useMemo, useCallback, useEffect, useRef, type JSX, type ReactNode } from "react";
+import { useMemo, useCallback, useEffect, useRef, useState, type JSX, type ReactNode } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -234,6 +234,7 @@ interface PipelineEdgeData extends Record<string, unknown> {
 
 interface ParallelLaneEdgeData extends PipelineEdgeData {
   laneOffset: number;
+  arrivalOffset?: number;
 }
 
 interface ParallelHandle {
@@ -291,8 +292,9 @@ function parallelLanePath(
   targetX: number,
   targetY: number,
   laneOffset: number,
+  forceVertical = false,
 ): { path: string; labelX: number; labelY: number } {
-  const horizontal = Math.abs(targetX - sourceX) > Math.abs(targetY - sourceY);
+  const horizontal = !forceVertical && Math.abs(targetX - sourceX) > Math.abs(targetY - sourceY);
   if (horizontal) {
     const bend = Math.max(40, Math.abs(targetX - sourceX) * 0.4);
     const direction = targetX >= sourceX ? 1 : -1;
@@ -385,9 +387,10 @@ function ParallelLaneEdge({
   const { path, labelX, labelY } = parallelLanePath(
     sourceX,
     sourceY,
-    targetX,
+    targetX + (data?.arrivalOffset ?? 0),
     targetY,
     data?.laneOffset ?? 0,
+    data?.arrivalOffset !== undefined,
   );
   return (
     <BaseEdge
@@ -406,6 +409,38 @@ function ParallelLaneEdge({
 const EDGE_TYPES: EdgeTypes = {
   [PARALLEL_EDGE_TYPE]: ParallelLaneEdge,
 };
+
+/** Spread drawn arrivals without changing any logical node, edge or handle. */
+export function withFanInArrivals(nodes: Node[], edges: PipelineGraphEdgeModel[]): PipelineGraphEdgeModel[] {
+  const byTarget = new Map<string, PipelineGraphEdgeModel[]>();
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  for (const edge of edges) {
+    const arrivals = byTarget.get(edge.target) ?? [];
+    arrivals.push(edge);
+    byTarget.set(edge.target, arrivals);
+  }
+  const offsets = new Map<string, number>();
+  for (const [target, arrivals] of byTarget) {
+    if (arrivals.length < 2) continue;
+    const ordered = [...arrivals].sort((left, right) =>
+      (nodeById.get(left.source)?.position.x ?? 0) - (nodeById.get(right.source)?.position.x ?? 0)
+      || left.id.localeCompare(right.id),
+    );
+    const targetNode = nodeById.get(target) as PipelineGraphNodeModel | undefined;
+    const handles = targetNode?.data.parallelTargetHandles ?? [];
+    ordered.forEach((edge, index) => {
+      const desired = PARALLEL_HANDLE_INSET + index * (NODE_WIDTH - 2 * PARALLEL_HANDLE_INSET) / (ordered.length - 1);
+      const handle = handles.find((candidate) => candidate.id === edge.targetHandle);
+      const current = handle ? handle.offsetPercent * NODE_WIDTH / 100 : NODE_WIDTH / 2;
+      offsets.set(edge.id, desired - current);
+    });
+  }
+  return edges.map((edge) => offsets.has(edge.id) ? {
+    ...edge,
+    type: PARALLEL_EDGE_TYPE,
+    data: { ...edge.data, laneOffset: edge.data.laneOffset ?? 0, arrivalOffset: offsets.get(edge.id) },
+  } : edge);
+}
 
 const NODE_TYPES: NodeTypes = {
   [PIPELINE_NODE_TYPE]: PipelineGraphNode,
@@ -846,6 +881,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       ).length,
   );
   const selectedNodeId = useSessionStore((s) => s.selectedNodeId);
+  const [activeEdgeId, setActiveEdgeId] = useState<string | null>(null);
   const selectNode = useSessionStore((s) => s.selectNode);
   const { resolvedTheme } = useTheme();
 
@@ -898,6 +934,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   // Node click handler — toggle selection
   const onNodeClick: NodeMouseHandler = useCallback(
     (_event, node) => {
+      setActiveEdgeId(null);
       selectNode(selectedNodeId === node.id ? null : node.id);
     },
     [selectedNodeId, selectNode],
@@ -905,6 +942,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
 
   // Pane click handler — deselect when clicking background
   const onPaneClick = useCallback(() => {
+    setActiveEdgeId(null);
     selectNode(null);
   }, [selectNode]);
 
@@ -1985,8 +2023,20 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       rfNodes,
       withDirectionMarkers(semanticallyDistinctEdges),
     );
-    return layoutGraph(parallelGeometry.nodes, parallelGeometry.edges);
+    const laidOut = layoutGraph(parallelGeometry.nodes, parallelGeometry.edges);
+    return { nodes: laidOut.nodes, edges: withFanInArrivals(laidOut.nodes, laidOut.edges) };
   }, [compositionState, nodeValidationMap, nodeMessageMap, selectedNodeId]);
+
+  const activeEdge = edges.find((edge) => edge.id === activeEdgeId);
+  const renderedEdges = edges.map((edge) => ({
+    ...edge,
+    selected: edge.id === activeEdge?.id,
+    zIndex: edge.id === activeEdge?.id ? 10 : 0,
+    style: edge.id === activeEdge?.id ? { ...edge.style, strokeWidth: 4 } : edge.style,
+  }));
+  const renderedNodes = nodes.map((node) => activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
+    ? { ...node, style: { ...node.style, boxShadow: "0 0 0 3px var(--color-selected-ring)" } }
+    : node);
 
   // Accessible, keyboard-operable equivalent of the visual DAG. The React Flow
   // diagram is a visual image (role="img", scoped to the diagram element
@@ -2176,8 +2226,8 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
             role="img"
           >
             <ReactFlow
-              nodes={nodes}
-              edges={edges}
+              nodes={renderedNodes}
+              edges={renderedEdges}
               edgeTypes={EDGE_TYPES}
               nodeTypes={NODE_TYPES}
               nodesDraggable={false}
@@ -2191,6 +2241,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
               edgesFocusable={false}
               elementsSelectable={true}
               onNodeClick={onNodeClick}
+              onEdgeClick={(_event, edge) => setActiveEdgeId(edge.id)}
               onPaneClick={onPaneClick}
               colorMode={resolvedTheme}
               onInit={handleInit}
@@ -2236,7 +2287,19 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
         </div>
         {compositionState && (
           <ErrorBoundary label="Wiring table">
-            <GraphOutputs state={compositionState} />
+            <GraphOutputs state={compositionState}>
+              <ul className="graph-route-controls" aria-label="Inspect pipeline routes">
+                {edges.map((edge) => (
+                  <li key={edge.id}>
+                    <Button variant="bare" type="button" aria-pressed={edge.id === activeEdge?.id}
+                      onFocus={() => setActiveEdgeId(edge.id)} onClick={() => setActiveEdgeId(edge.id)}>
+                      {edge.source} → {edge.target}: {String(edge.label ?? edge.data.flowType)} ({edge.data.flowType})
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </GraphOutputs>
+            {activeEdge && <p className="graph-route-detail" role="status">Selected route: {activeEdge.source} → {activeEdge.target}: {String(activeEdge.label ?? activeEdge.data.flowType)} ({activeEdge.data.flowType})</p>}
           </ErrorBoundary>
         )}
         {selectedConfig && (

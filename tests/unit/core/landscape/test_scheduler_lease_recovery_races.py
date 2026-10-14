@@ -108,7 +108,6 @@ from tests.fixtures.landscape import (
     expire_lease,
     landscape_database_now,
     lowered_sqlite_variable_limit,
-    on_fresh_database_second,
 )
 
 RUN_ID = "run-rc6-lease-races"
@@ -680,14 +679,17 @@ def test_ts04_and_ts06_coalesced_sink_redrive_preserves_join_group_and_complete_
     # yet expired (``lease_expires_at < database_now`` is strict).
     events_before_equality = _scheduler_events(engine, "token-0")
 
-    def sweep_at_exact_expiry(database_now: datetime) -> int:
-        assert expire_lease(engine, original.work_item_id, seconds_ago=0) == database_now
-        # Equality is a controlled decision boundary, independent of the
-        # fresh reader's finer resolution and time spent arranging the row.
-        with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=database_now):
-            return repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
-
-    assert on_fresh_database_second(engine, sweep_at_exact_expiry) == 0
+    database_now = landscape_database_now(engine)
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(token_work_items_table)
+            .where(token_work_items_table.c.work_item_id == original.work_item_id)
+            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+            .values(lease_expires_at=database_now)
+        )
+        assert result.rowcount == 1
+    with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=database_now):
+        assert repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0) == 0
     equality_row = _work_item_row(engine, "token-0")
     assert {name: equality_row[name] for name in equality_row if name != "lease_expires_at"} == {
         name: leased_row[name] for name in leased_row if name != "lease_expires_at"
@@ -789,21 +791,42 @@ def test_ts05_and_ts06_expiry_equality_is_not_recoverable_for_either_lease_subty
     assert sink_claim is not None
     before_events = {token_id: _scheduler_events(engine, token_id) for token_id in ("token-transform", "token-sink")}
 
-    # Both deadlines are set EQUAL to the database-derived controlled
-    # decision sample; the sweep's ``lease_expires_at < database_now`` is
-    # strict, so neither subtype is recoverable at exact equality.
-    def sweep_at_exact_expiry(database_now: datetime) -> tuple[int, dict[str, dict[str, object]]]:
-        assert expire_lease(engine, transform_claim.work_item_id, seconds_ago=0) == database_now
-        assert expire_lease(engine, sink_claim.work_item_id, seconds_ago=0) == database_now
-        rows_before = {token_id: _work_item_row(engine, token_id) for token_id in ("token-transform", "token-sink")}
-        with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=database_now):
-            return repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0), rows_before
-
-    recovered, rows_before = on_fresh_database_second(engine, sweep_at_exact_expiry)
-
-    assert recovered == 0
+    # One database-derived instant owns both stored deadlines and the decision
+    # clock. A real second rollover between writes or after the sweep cannot
+    # invalidate this strict-comparison test; no mutating action is retried.
+    expiry = landscape_database_now(engine)
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(token_work_items_table)
+            .where(token_work_items_table.c.work_item_id.in_((transform_claim.work_item_id, sink_claim.work_item_id)))
+            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+            .values(lease_expires_at=expiry)
+        )
+        assert result.rowcount == 2
+    rows_before = {token_id: _work_item_row(engine, token_id) for token_id in ("token-transform", "token-sink")}
+    # SQLAlchemy's SQLite DateTime projection returns naive UTC values.
+    assert all(row["lease_expires_at"] == expiry.replace(tzinfo=None) for row in rows_before.values())
+    for decision_time in (expiry - timedelta(seconds=1), expiry):
+        with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=decision_time) as clock:
+            assert repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0) == 0
+        assert clock.call_count > 0
     assert {token_id: _work_item_row(engine, token_id) for token_id in ("token-transform", "token-sink")} == rows_before
     assert {token_id: _scheduler_events(engine, token_id) for token_id in ("token-transform", "token-sink")} == before_events
+
+    # Positive control: the same stored rows become eligible strictly after
+    # expiry, with the ordinary distinct transform/sink rotation semantics.
+    with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=expiry + timedelta(seconds=1)):
+        assert repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0) == 2
+    transform_after = _work_item_row(engine, "token-transform")
+    sink_after = _work_item_row(engine, "token-sink")
+    assert transform_after["status"] == TokenWorkStatus.READY.value
+    assert transform_after["attempt"] == rows_before["token-transform"]["attempt"] + 1
+    assert transform_after["work_item_id"] != transform_claim.work_item_id
+    assert sink_after["status"] == TokenWorkStatus.PENDING_SINK.value
+    assert sink_after["attempt"] == rows_before["token-sink"]["attempt"]
+    assert sink_after["work_item_id"] == sink_claim.work_item_id
+    for token_id in ("token-transform", "token-sink"):
+        assert _scheduler_events(engine, token_id)[-1]["event_type"] == SchedulerEventType.RECOVER_EXPIRED_LEASE.value
 
 
 def test_ts05_stall_budget_equality_refuses_then_strictly_past_budget_recovers(
@@ -824,13 +847,18 @@ def test_ts05_stall_budget_equality_refuses_then_strictly_past_budget_recovers(
     # The owner is registry-live, so only the stall arm can reap. A lease
     # expired EXACTLY stall_budget_seconds ago sits on the stall threshold
     # (``lease_expires_at < database_now - stall_budget`` is strict): refused.
-    def sweep_at_stall_threshold(database_now: datetime) -> tuple[int, dict[str, object]]:
-        assert expire_lease(engine, claimed.work_item_id, seconds_ago=30) == database_now - timedelta(seconds=30)
-        row_before = _work_item_row(engine, "token-0")
-        with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=database_now):
-            return scheduler.recover_expired_leases(coordination_token=token, grace_seconds=80, stall_budget_seconds=30), row_before
-
-    at_budget, before_row = on_fresh_database_second(engine, sweep_at_stall_threshold)
+    database_now = landscape_database_now(engine)
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(token_work_items_table)
+            .where(token_work_items_table.c.work_item_id == claimed.work_item_id)
+            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+            .values(lease_expires_at=database_now - timedelta(seconds=30))
+        )
+        assert result.rowcount == 1
+    before_row = _work_item_row(engine, "token-0")
+    with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=database_now):
+        at_budget = scheduler.recover_expired_leases(coordination_token=token, grace_seconds=80, stall_budget_seconds=30)
 
     assert at_budget == 0
     assert _work_item_row(engine, "token-0") == before_row
@@ -845,12 +873,12 @@ def test_ts05_stall_budget_equality_refuses_then_strictly_past_budget_recovers(
     assert stalled_before == []
 
     # One second strictly past the stall budget: reaped, with worker_stalled evidence.
-    expire_lease(engine, claimed.work_item_id, seconds_ago=31)
-    after_budget = scheduler.recover_expired_leases(
-        coordination_token=token,
-        grace_seconds=80,
-        stall_budget_seconds=30,
-    )
+    with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=database_now + timedelta(seconds=1)):
+        after_budget = scheduler.recover_expired_leases(
+            coordination_token=token,
+            grace_seconds=80,
+            stall_budget_seconds=30,
+        )
 
     assert after_budget == 1
     recovered = _work_item_row(engine, "token-0")

@@ -7,6 +7,7 @@ import csv
 import hashlib
 import io
 import json
+import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -20,7 +21,6 @@ from fastapi import HTTPException, Request
 from sqlalchemy import func, select
 
 from elspeth.contracts import CallType
-from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
@@ -49,6 +49,7 @@ from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
 from elspeth.web.execution.outputs import filesystem_path_candidates
 from elspeth.web.execution.protocol import ExecutionService
+from elspeth.web.execution.service import acquire_execute_lease, close_execute_lease_before_transfer
 from elspeth.web.landscape_access import open_landscape_db
 from elspeth.web.paths import allowed_sink_directories
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, WebPluginPolicy
@@ -129,49 +130,6 @@ class _LiveTutorialRun:
 class _VerifiedArtifactBytes:
     path: Path
     content: bytes
-
-
-async def _close_tutorial_execute_lease_before_transfer(
-    lease: SessionOperationLease, *, cancellation: asyncio.CancelledError | None = None
-) -> None:
-    """Join exact lease cleanup even when request cancellation repeats."""
-    close_task = asyncio.create_task(
-        lease.close(),
-        name="tutorial-execution-pretransfer-lease-close",
-    )
-    while not close_task.done():
-        try:
-            # Waiting observes completion without propagating the task's error
-            # or cancelling lease cleanup when the request is cancelled.
-            await asyncio.wait({close_task})
-        except asyncio.CancelledError as error:
-            if cancellation is None:
-                cancellation = error
-            continue
-    try:
-        close_task.result()
-    except contract_errors.TIER_1_ERRORS:
-        raise
-    except BaseException as close_error:
-        if cancellation is None:
-            raise
-        fence = lease.context.fence
-        try:
-            slog.error(
-                "execution_pretransfer_lease_close_failed",
-                session_id=fence.session_id,
-                operation_id=fence.operation_id,
-                operation_epoch=fence.operation_epoch,
-                error_type=type(close_error).__name__,
-                primary_error_type=type(cancellation).__name__,
-            )
-        except contract_errors.TIER_1_ERRORS:
-            raise
-        except Exception as logging_error:
-            cancellation.add_note(f"Lease-close failure logging also failed with {type(logging_error).__name__}.")
-        cancellation.add_note(f"Tutorial execution pre-transfer lease close also failed with {type(close_error).__name__}.")
-    if cancellation is not None:
-        raise cancellation from None
 
 
 @trust_boundary(
@@ -395,16 +353,15 @@ async def _run_live_tutorial(
     session_service: SessionServiceProtocol,
 ) -> _LiveTutorialRun:
     execution_service: ExecutionService = request.app.state.execution_service
-    lease = await SessionOperationLease.acquire(
-        session_service.session_operation_authority,
+    obligation, lease = await acquire_execute_lease(
+        session_service,
+        request.app.state.execution_lease_release_registry,
         session_id=session_id,
-        operation_kind=SessionOperationKind.EXECUTE,
-        owner_instance_id=session_service.session_operation_owner_instance_id,
-        lease_seconds=session_service.session_operation_lease_seconds,
     )
     transferred = False
     cancellation: asyncio.CancelledError | None = None
     try:
+        obligation.assert_business_dispatch(lease.context)
         run_id = await execution_service.execute(
             session_id,
             state_id=state_id,
@@ -439,8 +396,8 @@ async def _run_live_tutorial(
             },
         ) from exc
     finally:
-        if not transferred:
-            await _close_tutorial_execute_lease_before_transfer(lease, cancellation=cancellation)
+        if not transferred and not obligation.completion_required:
+            await close_execute_lease_before_transfer(lease, primary=sys.exception() or cancellation)
     run_timeout_seconds = settings.composer_transport_idle_ceiling_seconds - settings.composer_transport_headroom_seconds
     run_record = await _wait_for_terminal_run(
         session_service,

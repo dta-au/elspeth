@@ -280,6 +280,14 @@ working around it.
 
 ## Project delivery posture
 
+From 0.8.5 onward, backwards compatibility is permitted and must be considered
+when changing public interfaces, configuration, persisted data or operator
+workflows. This is not a guarantee of perpetual support for every historical
+version or format. State compatibility decisions and supported boundaries
+explicitly; retain current preserve/refuse contracts unless a separate change
+is approved. This policy alone does not authorize migrations, resets or
+downgrades.
+
 ELSPETH is pre-release software maintained by a single developer. Keep a
 process, gate, or document only when it materially improves at least one of:
 

@@ -12,7 +12,7 @@ fact, the receipt records a sanitized projection of it.
 > **Status.** The implemented ACA slice received desktop acceptance:
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This executable procedure can produce a future receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.4.json`. Steps marked
+> at `docs/operator/evidence/azure-container-apps/0.8.5.json`. Steps marked
 > **LIVE** require measurements from that operator run. Neither a live run nor
 > a receipt is an outstanding closure condition. See
 > [Deployment Platforms](../reference/deployment-platforms.md) for support scope.
@@ -332,7 +332,7 @@ Keep the configured SSO provider throughout these stages. Neither local
 registration credentials nor an anonymous readiness response establishes an
 admitted acceptance user.
 
-### 0.8.4 fix-on-fail cycle
+### 0.8.5 fix-on-fail cycle
 
 Run each acceptance attempt against an exact candidate commit and published
 image digest. Give each attempt a fresh `ACCEPTANCE_RUN_ID` and private
@@ -493,7 +493,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   cases inside the environment, the one auth mode whose truth depends on
   where the process runs.
 
-> **LIVE:** for 0.8.4 acceptance, run the Jobs with the candidate digest and
+> **LIVE:** for 0.8.5 acceptance, run the Jobs with the candidate digest and
 > require both schema checks to pass after initial creation at session epoch 75
 > and Landscape epoch 49. Record the execution names. Any no-schema dry run
 > against a `release/0.8.0` image is predecessor-only wiring evidence; it
@@ -561,7 +561,7 @@ parity test feeds one corpus through both).
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_revision_sha256": "64-lowercase-hex",
   "candidate_doctor_job_sha256": "64-lowercase-hex",
-  "candidate_package_version": "0.8.4",
+  "candidate_package_version": "0.8.5",
   "previous_source_sha": "",
   "previous_image_digest": "",
   "previous_revision_sha256": "",
@@ -951,7 +951,7 @@ run). The driver captures the `bundle-validate` verdict in private
 `$EVIDENCE_DIR/bundle.json` and exits nonzero when validation fails. It does
 not create a public receipt. Review the protected receipts and publish a
 sanitized account of measured facts at
-`docs/operator/evidence/azure-container-apps/0.8.4.json` only after the live
+`docs/operator/evidence/azure-container-apps/0.8.5.json` only after the live
 procedure completes and the bundle passes. Never create a receipt from desktop
 analysis or treat skipped or failed probes as passes. If a run fails, retain
 its diagnostics, fix the defect and rerun before claiming live acceptance.

@@ -349,6 +349,37 @@
   font-weight: var(--font-weight-semibold);
 }
 
+.graph-route-controls {
+  --scroll-owner: graph-routes;
+
+  max-height: 12rem;
+  overflow: auto;
+  padding: var(--space-sm) var(--space-lg);
+}
+
+.graph-route-controls button {
+  border: 0;
+  padding: var(--space-xs);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.graph-route-controls button[aria-pressed="true"] {
+  outline: 2px solid var(--color-selected-ring);
+}
+
+.graph-route-detail {
+  flex: 0 0 auto;
+  padding: var(--space-sm) var(--space-md);
+  overflow-wrap: anywhere;
+}
+
 .graph-detail-table-scroll {
   --scroll-owner: wiring;
 

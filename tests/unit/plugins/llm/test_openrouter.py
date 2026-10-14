@@ -374,7 +374,7 @@ class TestOpenRouterConfig:
         assert config.base_url == "https://openrouter.ai/api/v1"
         assert config.timeout_seconds == 60.0
         # Inherited from LLMConfig
-        assert config.temperature == 0.0
+        assert config.temperature is None
         assert config.max_tokens is None
         assert config.system_prompt is None
         assert config.response_field == "llm_response"

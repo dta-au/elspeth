@@ -443,6 +443,14 @@ def declared_argument_names(tool_name: str) -> tuple[str, ...]:
     return tuple(sorted(_TOOL_SCHEMA_BY_NAME[tool_name]["properties"]))
 
 
+def declared_argument_length_bounds(tool_name: str, argument: str) -> tuple[int, int]:
+    """Read an owned bounded-string schema for value-free repair guidance."""
+    field = _TOOL_SCHEMA_BY_NAME[tool_name]["properties"][argument]
+    minimum, maximum = field["minLength"], field["maxLength"]
+    assert type(minimum) is int and type(maximum) is int
+    return minimum, maximum
+
+
 def _schema_error_path(error: ValidationError) -> str:
     parts = ["arguments"]
     for segment in error.absolute_path:

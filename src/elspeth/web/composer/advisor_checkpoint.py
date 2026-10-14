@@ -1152,12 +1152,17 @@ class AdvisorCheckpointOwner:
                     call_arguments = arguments
                 continue
             except provider_failures as exc:
-                # Only declared provider failures become retryable verdicts.
+                # Only declared provider failures become provider verdicts.
                 # Audit failures and defects in controlled code must propagate.
                 # Retain exceptions only to classify the final outcome.
                 last_exc = exc
                 last_response_unparseable = False
                 call_arguments = arguments
+                failure = classify_provider_failure(exc)
+                if failure is not None and not failure.retryable:
+                    # The primary path uses this same value-free policy.
+                    # Repeating an unchanged rejected request cannot repair it.
+                    break
                 continue
             verdict = _parse_advisor_checkpoint_guidance(guidance)
             if provider_attempts == 1:

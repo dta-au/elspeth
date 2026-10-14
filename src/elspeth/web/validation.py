@@ -227,9 +227,8 @@ def _warn_pii_shaped_content(value: str) -> Iterable[PIIWarning]:
 # kinds carry inherently multi-line content: invented_source drafts are
 # CSV/JSONL artifacts, llm_prompt_template drafts are templates with
 # multi-line instructions, and pipeline_decision drafts are decision
-# rationales that span lines. The 1024-character cap is applied per line
-# (see below) so the original protection against unbounded single-line
-# pastes is preserved.
+# rationales that span lines. Aggregate schema and artifact limits bound
+# content; physical line length is not a validity or resource boundary.
 _FORBIDDEN_CONTROL_CHARS_RE: re.Pattern[str] = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -243,10 +242,6 @@ def _validate_accepted_value_content(value: str) -> None:
     * Non-whitespace control characters (NUL, BEL, VT, FF, ESC, DEL,
       etc.). Horizontal tab, line feed, and carriage return are
       explicitly permitted.
-    * Any single line longer than 1024 characters — pathological and a
-      likely sign of an automated paste-of-large-data. The outer
-      8192-character cap is enforced by the field's ``max_length`` on
-      the schema; this is the per-line cap.
     * Credential-shaped content (delegates to
       :func:`reject_credential_shaped_content`).
 
@@ -262,7 +257,4 @@ def _validate_accepted_value_content(value: str) -> None:
         raise ValueError(
             "accepted_value must not contain non-printable control characters (horizontal tab, newline, and carriage return are permitted)"
         )
-    for line in value.splitlines() or [value]:
-        if len(line) > 1024:
-            raise ValueError("accepted_value has a line exceeding the 1024-character per-line limit")
     reject_credential_shaped_content(value)

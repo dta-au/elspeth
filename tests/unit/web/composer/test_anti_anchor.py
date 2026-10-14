@@ -15,6 +15,7 @@ from collections import deque
 
 import pytest
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.web.composer.anti_anchor import (
     AntiAnchorTracker,
     build_anti_anchor_hint,
@@ -26,6 +27,27 @@ from elspeth.web.composer.anti_anchor import (
 def test_three_identical_consecutive_failures_trigger_hint() -> None:
     failures = deque([("set_pipeline", "hash-a"), ("set_pipeline", "hash-a"), ("set_pipeline", "hash-a")], maxlen=5)
     assert should_inject_hint(failures) is True
+
+
+@pytest.mark.parametrize(
+    "category", [ToolArgumentErrorCategory.SCHEMA_SHAPE, ToolArgumentErrorCategory.SCHEMA_BOUND, ToolArgumentErrorCategory.SEMANTIC_RULE]
+)
+def test_hint_respects_closed_repair_category_and_clears_it_on_success(category):
+    tracker = AntiAnchorTracker()
+    for _ in range(3):
+        tracker.record_failure("request_interpretation_review", "known-hash", category=category)
+    hint = tracker.next_hint()
+    assert hint is not None
+    if category is ToolArgumentErrorCategory.SCHEMA_SHAPE:
+        assert "structural choice" in hint
+    else:
+        assert "reported rule" in hint
+        assert "structural choice" not in hint
+        assert "splice_transform" not in hint
+    tracker.record_success()
+    for _ in range(3):
+        tracker.record_failure("set_pipeline", "shape-hash", category=ToolArgumentErrorCategory.SCHEMA_SHAPE)
+    assert "structural choice" in tracker.next_hint()
 
 
 def test_two_identical_failures_do_not_trigger_hint() -> None:

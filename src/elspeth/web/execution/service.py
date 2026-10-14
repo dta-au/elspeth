@@ -543,6 +543,32 @@ def _discover_blob_rows_sources(config: Mapping[str, Any]) -> list[tuple[str, An
     return found
 
 
+async def acquire_execute_lease(
+    session_service: SessionServiceProtocol,
+    registry: ExecutionLeaseReleaseRegistry,
+    *,
+    session_id: UUID,
+) -> tuple[ExecutionAcquisitionObligation, SessionOperationLease]:
+    """Admit EXECUTE ownership before allocating or dispatching its SQL lease."""
+    if type(registry) is not ExecutionLeaseReleaseRegistry:
+        raise AuditIntegrityError("EXECUTE route lacks application cleanup registry")
+    obligation = registry.admit(
+        session_service.session_operation_authority,
+        session_id=session_id,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=session_service.session_operation_lease_seconds,
+    )
+    lease = await SessionOperationLease.acquire(
+        session_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=session_service.session_operation_lease_seconds,
+        execution_obligation=obligation,
+    )
+    return obligation, lease
+
+
 async def close_execute_lease_before_transfer(
     lease: SessionOperationLease,
     *,

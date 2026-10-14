@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -908,6 +908,93 @@ async def test_pipeline_decision_draft_mismatch_returns_arg_error_not_crash(
     assert len(events) == 1
     assert events[0].llm_draft == "Drop the scraped raw HTML and fingerprint fields before saving the JSON output."
     assert events[0].tool_call_id.startswith("backend_auto_surface:")
+
+
+@pytest.mark.asyncio
+async def test_provider_receives_bounded_review_limit_and_recovers_exact_staged_draft(
+    tmp_path: Path, sessions_service: SessionServiceImpl
+) -> None:
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_pipeline_decision_review()
+    draft = "Preserve the legitimate document wording in the reviewed pipeline decision. " * 130
+    node = state.nodes[0]
+    requirement = {**node.options[INTERPRETATION_REQUIREMENTS_KEY][0], "draft": draft}
+    node = replace(node, options={**node.options, INTERPRETATION_REQUIREMENTS_KEY: [requirement]})
+    state = replace(state, nodes=(node,))
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+    arguments = {"affected_node_id": "drop_raw_html", "kind": "pipeline_decision", "user_term": "drop_raw_html_fields"}
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="oversized_review", tool_name="request_interpretation_review", arguments={**arguments, "llm_draft": draft}
+            ),
+            _fake_response_with_tool_call(tool_call_id="recovered_review", tool_name="request_interpretation_review", arguments=arguments),
+            _fake_text_response("The unchanged staged draft is ready for your review."),
+        ]
+    )
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        initial_state=state,
+    )
+    assert [item.status.value for item in result.tool_invocations] == ["arg_error", "success"]
+    error_messages = [message for message in llm.messages[1] if message.get("tool_call_id") == "oversized_review"]
+    assert len(error_messages) == 1
+    payload = json.loads(error_messages[0]["content"])
+    assert "8192" in payload["repair_instruction"]
+    assert "Omit llm_draft to use the exact staged draft" in payload["repair_instruction"]
+    assert draft not in json.dumps(payload)
+    events = await sessions_service.list_interpretation_events(session_id, status="pending")
+    assert len(events) == 1
+    assert events[0].tool_call_id == "recovered_review"
+    assert events[0].llm_draft == draft
+    assert events[0].composition_state_id == state_id
+
+
+@pytest.mark.asyncio
+async def test_content_repair_hint_preserves_graph_and_fresh_review_binding(tmp_path: Path, sessions_service: SessionServiceImpl) -> None:
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_llm_node()
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+    arguments = {"affected_node_id": "rate_node", "kind": "vague_term", "user_term": "cool"}
+    repaired = ("Preserve the document wording while evaluating its presentation. " * 30)[:1159]
+    llm = _ScriptedLLM(
+        [
+            *[
+                _fake_response_with_tool_call(
+                    tool_call_id=f"bad_content_{index}",
+                    tool_name="request_interpretation_review",
+                    arguments={**arguments, "llm_draft": "{{ PRIVATE_DOCUMENT_MARKER }}"},
+                )
+                for index in range(3)
+            ],
+            _fake_response_with_tool_call(
+                tool_call_id="repaired_content_review",
+                tool_name="request_interpretation_review",
+                arguments={**arguments, "llm_draft": repaired},
+            ),
+            _fake_text_response("The corrected draft is ready for your review."),
+        ]
+    )
+    result = await composer._run_one_turn_for_test(llm=llm, session_id=str(session_id), current_state_id=str(state_id), initial_state=state)
+    assert [item.status.value for item in result.tool_invocations] == ["arg_error", "arg_error", "arg_error", "success"]
+    hints = [message["content"] for message in llm.messages[3] if message["role"] == "user" and "ELSPETH-SYSTEM-HINT" in message["content"]]
+    assert hints
+    assert "reported rule" in hints[-1]
+    assert "structural choice" not in hints[-1]
+    assert "splice_transform" not in hints[-1]
+    assert "PRIVATE_DOCUMENT_MARKER" not in hints[-1]
+    events = await sessions_service.list_interpretation_events(session_id, status="pending")
+    assert len(events) == 1
+    assert events[0].tool_call_id == "repaired_content_review"
+    assert events[0].llm_draft == repaired
+    assert events[0].composition_state_id == state_id
+    from elspeth.web.sessions.converters import state_from_record
+
+    current = await sessions_service.get_current_state(session_id)
+    assert current is not None
+    assert state_from_record(current).nodes == state.nodes
 
 
 @pytest.mark.asyncio

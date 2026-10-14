@@ -220,6 +220,45 @@ def test_all_manual_paths_reject_nondefault_or_unprotected_refs_before_runner_al
     _assert_manual_admission(_workflows())
 
 
+def _assert_pages_publication(workflows: dict[str, dict[str, Any]]) -> None:
+    workflow = workflows["pages.yaml"]
+    events = _events(workflow)
+    assert set(events) == {"push", "workflow_dispatch"}
+    assert events["push"] == {"branches": ["main"], "paths": ["website/**", ".github/workflows/pages.yaml"]}
+    jobs = workflow["jobs"]
+    for event in ("push", "workflow_dispatch"):
+        assert _admitted(jobs, "deploy", _context(event)), "protected-default Pages publication must be admitted"
+        for context in (
+            _context(event, ref="refs/heads/contributor"),
+            _context(event, ref="refs/heads/release/0.8.4"),
+            _context(event, ref="refs/tags/v0.8.4"),
+            _context(event, protected=False),
+        ):
+            assert not _admitted(jobs, "deploy", context), "untrusted Pages event/ref reached runner"
+    for event in ("pull_request", "pull_request_target", "workflow_run", "schedule"):
+        assert not _admitted(jobs, "deploy", _context(event)), "untrusted Pages event/ref reached runner"
+
+
+def test_pages_publication_accepts_only_protected_default_push_and_manual_events() -> None:
+    _assert_pages_publication(_workflows())
+
+
+@pytest.mark.parametrize("fault", ("missing_protection", "missing_ref", "extra_event"))
+def test_pages_publication_refuses_each_trusted_source_guard_regression(fault: str) -> None:
+    workflows = _workflows()
+    _assert_pages_publication(workflows)
+    deploy = workflows["pages.yaml"]["jobs"]["deploy"]
+    if fault == "missing_protection":
+        assert " && github.ref_protected" in deploy["if"]
+        deploy["if"] = deploy["if"].replace(" && github.ref_protected", "")
+    elif fault == "missing_ref":
+        deploy["if"] = "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_protected"
+    else:
+        deploy["if"] = f"github.event_name == 'pull_request' || ({deploy['if']})"
+    with pytest.raises(AssertionError, match="untrusted Pages event/ref"):
+        _assert_pages_publication(workflows)
+
+
 def test_active_inventory_contains_every_reviewed_workflow_and_required_producer() -> None:
     _assert_active_inventory(_workflows())
 

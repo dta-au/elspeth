@@ -30,8 +30,10 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     assert "preserve them unchanged and configure explicitly new compatible databases" in text
     assert "does not migrate either store in place or authorize downgrading these stores" in text
     assert "compatibility policy has no fixed expiry" in text
-    assert f"Package metadata remains {version};" in text
-    assert "automatic image publication is held" in text
+    assert f"Package metadata is {version};" in text
+    assert "the package version alone does not establish qualification or image publication" in text
+    assert "Automatic image publication from main is held" in text
+    assert "verify the release tag and image digest" in text
 
 
 def test_readme_release_links_resolve() -> None:

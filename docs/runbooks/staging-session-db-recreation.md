@@ -9,7 +9,7 @@ The current guidance below supersedes every legacy reset procedure later in
 this document. Those procedures are historical reference only and do not
 apply to the current candidate. They do not authorize a deployment or a reset.
 
-## Current Cutover: 0.8.4 candidate (session epoch 75, Landscape epoch 49)
+## Current Cutover: 0.8.5 candidate (session epoch 75, Landscape epoch 49)
 
 The current candidate uses session epoch 75 for graph recovery, authentication
 families, and bound websocket tickets, with Landscape epoch 49. The ambiguous

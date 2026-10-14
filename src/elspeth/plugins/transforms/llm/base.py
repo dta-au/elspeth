@@ -225,7 +225,7 @@ class LLMConfig(TransformDataConfig):
     - model: Model identifier (optional — Azure uses deployment_name instead)
     - prompt_template: Jinja2 fallback (required unless every query overrides it)
     - system_prompt: Optional system message
-    - temperature: Sampling temperature (default 0.0 for determinism; null = omit, provider default)
+    - temperature: Sampling temperature (omitted or null = provider default)
     - max_tokens: Maximum response tokens
     - response_field: Field name for LLM response in output
     - queries: Multi-query specs (None = single-query mode)
@@ -256,11 +256,11 @@ class LLMConfig(TransformDataConfig):
     prompt_template: str | None = Field(None, description="Jinja2 fallback prompt template; required unless every query has a template")
     system_prompt: str | None = Field(None, description="Optional system prompt")
     temperature: float | None = Field(
-        0.0,
+        None,
         ge=0.0,
         le=2.0,
         description=(
-            "Sampling temperature. Set to null to omit it from the request. Support and valid values depend on "
+            "Sampling temperature. Omitted or null leaves the provider default. Explicit numbers are sent unchanged. Support and valid values depend on "
             "the provider, model and reasoning mode; check the provider's documentation before setting an explicit value."
         ),
         json_schema_extra={"composer_tier": "advanced"},

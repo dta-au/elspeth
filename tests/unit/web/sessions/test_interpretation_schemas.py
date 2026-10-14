@@ -172,8 +172,6 @@ class TestInterpretationEventResponse:
             ("affected_node_id", 257),
             ("tool_call_id", 257),
             ("user_term", 8193),
-            ("llm_draft", 8193),
-            ("accepted_value", 8193),
             ("actor", 257),
             ("model_identifier", 257),
             ("model_version", 129),
@@ -201,6 +199,21 @@ class TestInterpretationEventResponse:
         kwargs["actor"] = ""
         with pytest.raises(ValidationError):
             InterpretationEventResponse(**kwargs)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("content", ["x" * 8193, "界" * 4097, "x" * 262145])
+    def test_owned_artifact_text_is_preserved_without_an_inline_read_cap(self, content: str) -> None:
+        kwargs = _valid_event_kwargs()
+        kwargs.update(llm_draft=content, accepted_value=content)
+        event = InterpretationEventResponse.model_validate(kwargs)
+        assert event.llm_draft == event.accepted_value == content
+
+    @pytest.mark.parametrize("field", ["llm_draft", "accepted_value"])
+    @pytest.mark.parametrize("value", [1, b"text", {}, []])
+    def test_owned_artifact_text_remains_strict(self, field: str, value: object) -> None:
+        kwargs = _valid_event_kwargs()
+        kwargs[field] = value
+        with pytest.raises(ValidationError):
+            InterpretationEventResponse.model_validate(kwargs)
 
     def test_response_is_frozen(self) -> None:
         event = InterpretationEventResponse(**_valid_event_kwargs())  # type: ignore[arg-type]
@@ -282,8 +295,7 @@ class TestInterpretationResolveRequest:
     def test_amended_value_permits_newline(self) -> None:
         # Newlines are permitted: pipeline_decision and vague_term amended
         # values can legitimately span lines (a multi-paragraph rubric or
-        # decision rationale). The per-line length cap below still bounds
-        # pathological single-line pastes.
+        # decision rationale). The aggregate amendment cap bounds content.
         req = InterpretationResolveRequest(
             choice="amended",
             amended_value="line one\nline two",
@@ -316,26 +328,14 @@ class TestInterpretationResolveRequest:
         )
         assert req.amended_value == "prefix\tsuffix"
 
-    def test_amended_value_per_line_length_cap_single_line(self) -> None:
-        long_single_line = "a" * 1025
-        with pytest.raises(ValidationError) as exc:
-            InterpretationResolveRequest(
-                choice="amended",
-                amended_value=long_single_line,
-            )
-        assert "1024-character" in str(exc.value)
+    @pytest.mark.parametrize("content", ["a" * 1024, "a" * 1025, "a" * 8192, "界" * 2048, "ok\n" + "b" * 4096 + "\ntail"])
+    def test_amended_value_accepts_long_lines_within_aggregate_limit(self, content: str) -> None:
+        req = InterpretationResolveRequest(choice="amended", amended_value=content)
+        assert req.amended_value == content
 
-    def test_amended_value_per_line_length_cap_multi_line(self) -> None:
-        # The per-line cap must fire even when the offending line is in
-        # the middle of a multi-line payload — the previous single-line
-        # cap silently allowed this case.
-        payload = "ok\n" + ("b" * 1025) + "\ntail"
-        with pytest.raises(ValidationError) as exc:
-            InterpretationResolveRequest(
-                choice="amended",
-                amended_value=payload,
-            )
-        assert "1024-character" in str(exc.value)
+    def test_amended_value_retains_aggregate_limit(self) -> None:
+        with pytest.raises(ValidationError, match="8192"):
+            InterpretationResolveRequest(choice="amended", amended_value="a" * 8193)
 
     def test_amended_value_rejects_aws_access_key(self) -> None:
         with pytest.raises(ValidationError) as exc:

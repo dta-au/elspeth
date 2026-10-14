@@ -69,11 +69,11 @@ class LLMSourceConfig(DataPluginConfig):
     prompt_template: str = Field(..., description="Static Jinja2 prompt template")
     system_prompt: str | None = Field(default=None, description="Optional system prompt")
     temperature: float | None = Field(
-        default=0.0,
+        default=None,
         ge=0.0,
         le=2.0,
         description=(
-            "Sampling temperature. Set to null to omit it from the request. Support and valid values depend on "
+            "Sampling temperature. Omitted or null leaves the provider default. Explicit numbers are sent unchanged. Support and valid values depend on "
             "the provider, model and reasoning mode; check the provider's documentation before setting an explicit value."
         ),
     )

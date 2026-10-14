@@ -1097,6 +1097,50 @@ async def test_review_event_identity_supersedes_same_text_changed_artifact(
 
 
 @pytest.mark.asyncio
+async def test_oversized_explicit_review_recovers_by_omitting_exact_staged_draft(service: SessionServiceImpl) -> None:
+    from elspeth.web.composer.tool_error_payloads import arg_error_payload
+
+    session_id = uuid4()
+    draft = "url,label\nhttps://example.gov.au/a," + "Synthetic document evidence. " * 400 + "\n"
+    source = _llm_generated_source(draft=draft)
+    state_id = await _seed_source_session(service, session_id, source=source)
+    state = _state_with_source(source)
+    base_arguments = {"affected_node_id": SOURCE_COMPONENT_ID, "kind": "invented_source", "user_term": "inline_source_url_list"}
+
+    async def request_review(arguments: object, tool_call_id: str) -> Any:
+        return await _handle_request_interpretation_review(
+            arguments,
+            state,
+            session_id=session_id,
+            composition_state_id=state_id,
+            tool_call_id=tool_call_id,
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=10,
+            create_pending_interpretation_event=service.create_pending_interpretation_event,
+            list_interpretation_events=service.list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+
+    with pytest.raises(ToolArgumentError) as caught:
+        await request_review({**base_arguments, "llm_draft": draft}, "oversized_explicit_review")
+    projected = arg_error_payload(caught.value, "request_interpretation_review")
+    message = projected["error"]
+    assert "8192" in message
+    assert "omit llm_draft to use the exact staged draft" in message
+    assert draft not in str(projected)
+    assert await service.list_interpretation_events(session_id, status="pending") == []
+
+    result = await request_review(base_arguments, "recovered_staged_review")
+    assert result.success
+    rows = await service.list_interpretation_events(session_id, status="pending")
+    assert len(rows) == 1
+    assert rows[0].llm_draft == draft
+    assert rows[0].composition_state_id == state_id
+    assert rows[0].tool_call_id == "recovered_staged_review"
+
+
+@pytest.mark.asyncio
 async def test_structured_vague_term_identity_tracks_prompt_parts_structure(
     service: SessionServiceImpl,
 ) -> None:
@@ -3564,12 +3608,18 @@ async def test_17_auto_interpreted_no_surfaces_writer(service: SessionServiceImp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("long_label", ["", "a" * 1024, "a" * 1025, "界" * 8000])
+@pytest.mark.parametrize("provided", [False, True])
 async def test_omitted_draft_resolves_staged_invented_source_draft(
     service: SessionServiceImpl,
+    long_label: str,
+    provided: bool,
 ) -> None:
     """Omitting llm_draft surfaces the staged multiline source artifact verbatim."""
     session_id = uuid4()
     draft = 'url,label\nhttps://example.gov.au/a,"first, quoted"\nhttps://example.gov.au/b,plain\n'
+    if long_label:
+        draft = f'url,label\nhttps://example.gov.au/a,"{long_label}"\n'
     source = _llm_generated_source(draft=draft)
     state_id = await _seed_source_session(service, session_id, source=source)
     state = _state_with_source(source)
@@ -3579,6 +3629,7 @@ async def test_omitted_draft_resolves_staged_invented_source_draft(
             "affected_node_id": SOURCE_COMPONENT_ID,
             "kind": "invented_source",
             "user_term": "inline_source_url_list",
+            **({"llm_draft": draft} if provided else {}),
         },
         state,
         session_id=session_id,
@@ -3608,18 +3659,29 @@ async def test_omitted_draft_resolves_staged_invented_source_draft(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("length", [1024, 1025, 1159, 8192])
+@pytest.mark.parametrize("provided", [False, True])
 async def test_omitted_draft_resolves_staged_pipeline_decision_draft(
     service: SessionServiceImpl,
+    length: int,
+    provided: bool,
 ) -> None:
     session_id = uuid4()
-    state_id = await _seed_node_session(service, session_id, node=_pipeline_decision_review_node())
-    state = _state_with(_pipeline_decision_review_node())
+    draft = ("Preserve the document wording and summarize the relevant public material. " * 200)[:length]
+    node = _pipeline_decision_review_node()
+    node = replace(
+        node,
+        options={**node.options, INTERPRETATION_REQUIREMENTS_KEY: [{**node.options[INTERPRETATION_REQUIREMENTS_KEY][0], "draft": draft}]},
+    )
+    state_id = await _seed_node_session(service, session_id, node=node)
+    state = _state_with(node)
 
     result = await _handle_request_interpretation_review(
         {
             "affected_node_id": "drop_raw_html",
             "kind": "pipeline_decision",
             "user_term": "drop_raw_html_fields",
+            **({"llm_draft": draft} if provided else {}),
         },
         state,
         session_id=session_id,
@@ -3636,7 +3698,7 @@ async def test_omitted_draft_resolves_staged_pipeline_decision_draft(
     assert result.success is True
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
-    assert rows[0].llm_draft == ("Drop the scraped raw HTML and fingerprint fields before saving the JSON output.")
+    assert rows[0].llm_draft == draft
 
 
 @pytest.mark.asyncio
@@ -3713,7 +3775,7 @@ async def test_omitted_draft_without_staged_draft_is_arg_error() -> None:
     """Legacy placeholder vague-term sites have no staged draft; llm_draft stays required there."""
     state = _state_with(_llm_node())
 
-    with pytest.raises(ToolArgumentError, match=r"llm_draft"):
+    with pytest.raises(ToolArgumentError, match="no staged requirement draft"):
         await _handle_request_interpretation_review(
             {
                 "affected_node_id": "rate_node",
@@ -3734,13 +3796,50 @@ async def test_omitted_draft_without_staged_draft_is_arg_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_omitted_draft_still_validates_resolved_content() -> None:
+async def test_stale_review_conflict_keeps_safe_reload_action() -> None:
+    from elspeth.web.composer.tool_error_payloads import arg_error_payload
+
+    node = _pipeline_decision_review_node()
+    state = _state_with(node)
+    state_id = uuid4()
+    attempted_state_ids: list[UUID] = []
+
+    async def refuse(**kwargs: Any) -> Any:
+        attempted_state_ids.append(kwargs["composition_state_id"])
+        raise InterpretationDraftMismatchError("PRIVATE_DOCUMENT_DETAIL")
+
+    with pytest.raises(ToolArgumentError) as caught:
+        await _handle_request_interpretation_review(
+            {"affected_node_id": "drop_raw_html", "kind": "pipeline_decision", "user_term": "drop_raw_html_fields"},
+            state,
+            session_id=uuid4(),
+            composition_state_id=state_id,
+            tool_call_id="stale_review",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=10,
+            create_pending_interpretation_event=refuse,
+            list_interpretation_events=_empty_list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+    payload = arg_error_payload(caught.value, "request_interpretation_review")
+    assert "reload the latest state and retry" in payload["error"]
+    assert "PRIVATE_DOCUMENT_DETAIL" not in str(payload)
+    assert attempted_state_ids == [state_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bad_content", "failed_rule"),
+    [("{{ jinja_metacharacters }}", "template metacharacters"), ("bad\x00control", "non-printable control characters")],
+)
+async def test_omitted_draft_still_validates_resolved_content(bad_content: str, failed_rule: str) -> None:
     """A staged draft that fails the content validators must not ride past them
     just because it was resolved server-side rather than submitted."""
-    source = _llm_generated_source(draft="url\n{{ jinja_metacharacters }}\n")
+    source = _llm_generated_source(draft=f"url\n{bad_content}\n")
     state = _state_with_source(source)
 
-    with pytest.raises(ToolArgumentError, match=r"llm_draft"):
+    with pytest.raises(ToolArgumentError, match=failed_rule) as caught:
         await _handle_request_interpretation_review(
             {
                 "affected_node_id": SOURCE_COMPONENT_ID,
@@ -3758,6 +3857,9 @@ async def test_omitted_draft_still_validates_resolved_content() -> None:
             list_interpretation_events=_empty_list_interpretation_events,
             **_provenance_kwargs(),
         )
+    assert "correct that issue and request the review again" in str(caught.value)
+    if "control" in failed_rule:
+        assert "template metacharacters" not in str(caught.value)
 
 
 @pytest.mark.asyncio
