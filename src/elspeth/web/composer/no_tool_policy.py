@@ -1065,7 +1065,9 @@ def compose_advisor_signoff_unverified_message(content: str) -> str:
     return _append_advisor_suffix(content, _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX)
 
 
-def compose_advisor_signoff_unrendered_pending_message(content: str, *, failure_class: Literal["unavailable", "malformed"]) -> str:
+def compose_advisor_signoff_unrendered_pending_message(
+    content: str, *, failure_class: Literal["unavailable", "malformed", "budget_exhausted"]
+) -> str:
     """GREEN preflight + an UNRENDERED advisory verdict (unavailable/malformed).
 
     Sibling of :func:`compose_advisor_signoff_pending_message`, which keeps the
@@ -1073,6 +1075,11 @@ def compose_advisor_signoff_unrendered_pending_message(content: str, *, failure_
     the verdict class and its remedy (retry, or check the advisor model
     configuration). Fixed prose; nothing from the advisor is interpolated.
     """
+    if failure_class == "budget_exhausted":
+        return _append_advisor_suffix(
+            content,
+            "The reply was withheld because the completion review could not run within the existing request limits. Saved draft progress remains available; continue in a new message.",
+        )
     if failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX
     else:
@@ -1080,13 +1087,20 @@ def compose_advisor_signoff_unrendered_pending_message(content: str, *, failure_
     return _append_advisor_suffix(content, suffix)
 
 
-def compose_advisor_signoff_unrendered_unverified_message(content: str, *, failure_class: Literal["unavailable", "malformed"]) -> str:
+def compose_advisor_signoff_unrendered_unverified_message(
+    content: str, *, failure_class: Literal["unavailable", "malformed", "budget_exhausted"]
+) -> str:
     """ABSENT preflight + an UNRENDERED advisory verdict (unavailable/malformed).
 
     Sibling of :func:`compose_advisor_signoff_unverified_message`: the same
     facet B readiness disclosure (no preflight ran, so no pipeline claim), with
     the could-not-be-obtained framing and remedy for the verdict class.
     """
+    if failure_class == "budget_exhausted":
+        return _append_advisor_suffix(
+            content,
+            "The reply was withheld because the completion review could not run within the existing request limits. Saved draft progress remains available; continue in a new message.",
+        )
     if failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
     else:

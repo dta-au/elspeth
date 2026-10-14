@@ -53,6 +53,7 @@ from elspeth.web.composer.protocol import (
     ComposerRuntimePreflightError,
     ComposerServiceError,
     PipelineCommitIntent,
+    RetainedOperationContext,
     ToolArgumentError,
 )
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
@@ -108,6 +109,65 @@ from tests.unit.web.composer._helpers import (
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _REAL_RUN_ADVISOR_CHECKPOINT = AdvisorCheckpointOwner._run_advisor_checkpoint
+
+
+@pytest.mark.parametrize("availability", ["available", "unavailable", "unknown"])
+def test_retained_operation_context_distinguishes_empty_unknown_and_unavailable(
+    availability: Literal["available", "unavailable", "unknown"],
+) -> None:
+    context = RetainedOperationContext(session_id=uuid4(), actor_user_id="test-user", availability=availability)
+    projected = json.loads(context.provider_message())["retained_operation_history"]
+    assert projected["availability"] == availability
+    assert projected["outcomes"] == [] and projected["has_more"] is False
+    assert "not requested edits" in projected["interpretation"]
+    assert "Unknown attribution is not zero" in projected["interpretation"]
+    with pytest.raises(AuditIntegrityError):
+        context.validate_for(session_id=str(uuid4()), actor_user_id="test-user")
+    with pytest.raises(AuditIntegrityError):
+        context.validate_for(session_id=str(context.session_id), actor_user_id="another-user")
+
+
+@pytest.mark.asyncio
+async def test_retained_operation_context_reaches_real_primary_and_reviewed_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+
+    service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
+    context = RetainedOperationContext(session_id=UUID(session_id), actor_user_id="test-user", availability="unavailable")
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(deepcopy(kwargs))
+        content = (
+            json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"})
+            if "response_format" in kwargs
+            else "Prior operation history is unavailable; I cannot establish what happened."
+        )
+        return litellm.ModelResponse(
+            choices=[{"message": {"content": content, "tool_calls": None, "role": "assistant"}, "finish_reason": "stop", "index": 0}],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
+            model=kwargs["model"],
+        )
+
+    # Both primary and the newly reachable END use this explicit finite SDK seam.
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _REAL_RUN_ADVISOR_CHECKPOINT)
+    with fenced_operation_context(service._session_engine, session_id) as authority:
+        result = await service.compose(
+            "What happened to the earlier action?",
+            [],
+            _empty_state(),
+            session_id=session_id,
+            user_id="test-user",
+            session_operation_context=authority,
+            retained_operation_context=context,
+        )
+    primary = [call for call in calls if "response_format" not in call]
+    reviews = [call for call in calls if "response_format" in call]
+    assert len(primary) == len(reviews) == 1
+    assert any(row["content"] == context.provider_message() for row in primary[0]["messages"])
+    assert "retained_operation_history" in json.dumps(reviews[0]["messages"])
+    assert "unavailable" in json.dumps(reviews[0]["messages"])
+    assert result.message == "Prior operation history is unavailable; I cannot establish what happened."
 
 
 def _make_llm_response(
@@ -9384,6 +9444,12 @@ class TestComposeLoopForcedRepair:
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch.object(
+                self.service._advisor_checkpoint,
+                "_run_advisor_checkpoint",
+                autospec=True,
+                return_value=AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="", failure_class="unavailable"),
+            ),
         ):
             mock_llm.side_effect = turns
             result = await self.service.compose(
@@ -9406,8 +9472,8 @@ class TestComposeLoopForcedRepair:
         assert result.state.metadata.name == "attempt-2"
         # The model's final claim is preserved for audit, but a backend-owned
         # blocker prevents ordinary successful finalisation.
-        assert result.raw_assistant_content == "final"
-        assert result.message.startswith("final")
+        assert result.raw_assistant_content != "final"
+        assert not result.message.startswith("final")
         assert result.runtime_preflight is not None
         assert result.runtime_preflight.is_valid is False
         assert result.runtime_preflight.readiness.authoring_valid is False
@@ -9446,6 +9512,12 @@ class TestComposeLoopForcedRepair:
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch.object(
+                self.service._advisor_checkpoint,
+                "_run_advisor_checkpoint",
+                autospec=True,
+                return_value=AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="", failure_class="unavailable"),
+            ),
         ):
             mock_llm.side_effect = turns
             result = await self.service.compose(
@@ -9460,6 +9532,8 @@ class TestComposeLoopForcedRepair:
         # claim-completes fire repair injection, the third is final).
         assert mock_llm.call_count == 4
         assert result.repair_turns_used == _MAX_REPAIR_TURNS
+        assert result.raw_assistant_content != "final"
+        assert not result.message.startswith("final")
         # The model never applied a fix → schema still 'fixed' with the
         # original blocker config; runtime_preflight may still be valid
         # (it was patched to return is_valid=True), but the runtime gate

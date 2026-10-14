@@ -281,6 +281,7 @@ class _TerminateOutcome:
     # user never saw.
     advisor_injection_index: int | None = None
     advisor_review_state: _AdvisorReviewState | None = None
+    publication_binding: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +390,9 @@ class _PersistOutcome:
     redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...]
     redacted_tool_rows: tuple[RedactedToolRow, ...]
     audit_outcome: AuditOutcome | None
+    # The commit metadata remains authoritative if pure effect verification
+    # fails afterward. The driver records it before propagating this failure.
+    effect_verification_failure: AuditIntegrityError | None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "redacted_assistant_tool_calls", "redacted_tool_rows")
@@ -448,3 +452,4 @@ class _ClassifyOutcome:
     # the handoff. Folded into the driver's ``repair_turns_used`` after P5,
     # mirroring the P2 ``_TerminateOutcome.repair_turns_delta`` field.
     repair_turns_delta: int = 0  # 0 or 1
+    publication_binding: str | None = None

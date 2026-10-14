@@ -20,6 +20,8 @@ from starlette.applications import Starlette
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_required_sql_finish_once, run_sync_in_worker
+from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
+from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
 from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
@@ -42,6 +44,7 @@ from elspeth.web.required_work import (
 from elspeth.web.sessions.composer_app_services import ComposerAppServices, composer_app_services
 from elspeth.web.sessions.composer_operation_errors import (
     deadline_expired_error,
+    operation_failure_diagnostic_id,
     project_composer_operation_error,
     request_cancelled_error,
     worker_lost_error,
@@ -1001,6 +1004,14 @@ class ComposerAsyncWorker:
     ) -> ComposerOperationRecord:
         coordinator = self._required_coordinators.get((running.claim.session_id, running.claim.operation_id))
         try:
+            receipts = coordinator.settlement_failure_receipts() if coordinator is not None else ()
+            roots = [exc]
+            for receipt in receipts:
+                if all(receipt.original_root is not root for root in roots):
+                    roots.append(receipt.original_root)
+            captured_facts = capture_failure_facts(
+                roots[0] if len(roots) == 1 else BaseExceptionGroup("Composer retained original failure roots", roots)
+            )
             current, now = await _owned(
                 run_sync_in_worker(
                     self._authority.get_with_database_now,
@@ -1015,7 +1026,13 @@ class ComposerAsyncWorker:
                 raise AuditIntegrityError("Failed composer operation changed its exact job binding")
             if current.status in ("completed", "failed"):
                 return current
-            failure = self._failure_for(current, now, exc)
+            failure = self._failure_for(current, now, exc, recovery_receipts=receipts)
+            operation_facts = ComposerOperationFailureFacts(
+                durable_operation_id=current.operation_id,
+                request_id=current.request_id,
+                context=running.session_operation_context,
+                facts=captured_facts,
+            )
         except BaseException as selection_failure:
             if coordinator is not None:
                 try:
@@ -1030,8 +1047,6 @@ class ComposerAsyncWorker:
                 ) from selection_failure
             raise
         failure_projection = self._reserve_failed_terminal_projection(coordinator) if coordinator is not None else None
-        if failure.diagnostic_id is not None:
-            slog.error("composer_operation.failure", diagnostic_id=failure.diagnostic_id, exc_class=type(exc).__name__)
         try:
             terminal = await _owned(
                 services.session_service.fail_composer_async_operation(
@@ -1040,6 +1055,7 @@ class ComposerAsyncWorker:
                     authoritative_failure=_authoritative_failure(exc),
                     required_work=coordinator,
                     failure_projection_work=failure_projection,
+                    operation_failure_facts=operation_facts,
                 ),
                 cancellation_observations=cancellation_observations,
             )
@@ -1373,6 +1389,7 @@ class ComposerAsyncWorker:
         recovery_receipts: tuple[ComposerFailureReceipt, ...] | None = None,
     ) -> ComposerOperationError:
         leaves = _failure_leaves(exc)
+        diagnostic_id = operation_failure_diagnostic_id(session_id=str(current.session_id), operation_id=current.operation_id)
         coordinator = self._required_coordinators.get((current.session_id, current.operation_id))
         reduction = None
         if coordinator is not None:
@@ -1385,7 +1402,7 @@ class ComposerAsyncWorker:
                 timeout_seconds=(restore_utc(current.deadline_at) - restore_utc(current.created_at)).total_seconds(),
             )
         if _authoritative_failure(exc):
-            return project_composer_operation_error(exc, request_id=current.request_id)
+            return project_composer_operation_error(exc, request_id=current.request_id, diagnostic_id=diagnostic_id)
         if current.cancel_requested_at is not None:
             return request_cancelled_error(request_id=current.request_id)
         if restore_utc(current.deadline_at) <= now or any(isinstance(leaf, ComposerTurnDeadlineExpired) for leaf in leaves):
@@ -1400,7 +1417,7 @@ class ComposerAsyncWorker:
                 request_id=current.request_id,
                 timeout_seconds=(restore_utc(current.deadline_at) - restore_utc(current.created_at)).total_seconds(),
             )
-        return project_composer_operation_error(exc, request_id=current.request_id)
+        return project_composer_operation_error(exc, request_id=current.request_id, diagnostic_id=diagnostic_id)
 
     async def reap_once(self) -> int:
         services = composer_app_services(self._app)

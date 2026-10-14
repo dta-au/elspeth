@@ -62,7 +62,11 @@ ComposerProbeSurface = Literal["loop_tools", "planner_tools", "hatch_terminal", 
 ComposerProbeRole = Literal["planner", "advisor"]
 
 _PLANNER_PROBE_PROMPT: Final = "This is a composer boot-time configuration smoke test. Please reply with ok."
-_ADVISOR_PROBE_PROMPT: Final = "This is a configuration check. Reply with ok."
+_ADVISOR_PROBE_PROMPT: Final = (
+    "This is a configuration capability check, not a pipeline or user-reply approval. "
+    "Return the six-field END JSON schema: verdict, category, steps, findings, note, publication_verdict. "
+    "For this empty probe use CLEAN, other, [], 'Capability probe has no candidate to approve', null, and WITHHOLD respectively."
+)
 
 # The loop-list reply cap. The loop branch never parses the reply, so a 200
 # with a truncated reply still proves the request was accepted.
@@ -241,6 +245,7 @@ def build_composer_probe_requests(settings: ComposerSettings, *, env: Mapping[st
             api_base=settings.composer_advisor_endpoint_base_url,
             api_key=advisor_key,
             structured_output=True,
+            checkpoint_phase="end",
         )
     )
     advisor_kwargs["messages"] = [{"role": "user", "content": _ADVISOR_PROBE_PROMPT}]
@@ -297,6 +302,6 @@ async def probe_composer_config(request: ComposerProbeRequest) -> bool:
             message, tool_calls, _metadata = _capture_composer_llm_completion_fields(response, pricing_model=request.model)
         except _MalformedLLMResponseError as exc:
             raise ComposerBootConfigError(f"advisor {request.model} structured-output probe returned a malformed response") from exc
-        if message.content is None or tool_calls or not parse_advisor_checkpoint_response(message.content).schema_valid:
+        if message.content is None or tool_calls or not parse_advisor_checkpoint_response(message.content, phase="end").schema_valid:
             raise ComposerBootConfigError(f"advisor {request.model} structured-output probe failed JSON/schema admission")
     return True

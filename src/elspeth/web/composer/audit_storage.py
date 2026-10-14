@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, cast
+from dataclasses import dataclass
+from typing import Any, cast, final
 
 from pydantic import ValidationError as PydanticValidationError
 
@@ -45,6 +46,64 @@ from elspeth.web.composer.tool_error_payloads import (
     unknown_tool_response_redaction,
 )
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
+from elspeth.web.sessions.composer_operations import ComposerOperationError
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ComposerOperationFailureFacts:
+    """Immutable private failure capture bound to its original live operation."""
+
+    durable_operation_id: str
+    request_id: str | None
+    context: SessionOperationContext
+    facts: PrivateFailureFacts
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.durable_operation_id) is not str
+            or not self.durable_operation_id
+            or (self.request_id is not None and type(self.request_id) is not str)
+            or type(self.context) is not SessionOperationContext
+            or type(self.facts) is not PrivateFailureFacts
+        ):
+            raise AuditIntegrityError("Operation failure facts lack nominal correlation")
+
+    def validate_for(self, *, durable_operation_id: str, request_id: str | None, context: SessionOperationContext) -> None:
+        if self.durable_operation_id != durable_operation_id or self.request_id != request_id or self.context != context:
+            raise AuditIntegrityError("Operation failure facts belong to another exact request or fence")
+
+
+def private_operation_failure_draft(capture: ComposerOperationFailureFacts, *, failure: ComposerOperationError) -> AuditMessageDraft:
+    """Correlate private captured facts with the actually selected public outcome."""
+    if type(capture) is not ComposerOperationFailureFacts or type(failure) is not ComposerOperationError:
+        raise AuditIntegrityError("Operation failure projection is not nominal")
+    correlation = "operation:" + capture.durable_operation_id
+    evidence = build_private_tool_evidence(
+        session_id=capture.context.fence.session_id,
+        operation_id=capture.context.fence.operation_id,
+        operation_epoch=capture.context.fence.operation_epoch,
+        evidence_id=diagnostic_evidence_identity("operation-failure", correlation),
+        tool_call_id=correlation,
+        tool_name="composer_failure",
+        status="operation_failure",
+        arguments_canonical=canonical_json(
+            {
+                "durable_operation_id": capture.durable_operation_id,
+                "request_id": capture.request_id,
+                "diagnostic_id": failure.diagnostic_id,
+                "failure_code": failure.failure_code,
+                "correlation_kind": "internal_operation",
+            }
+        ),
+        result_canonical=capture.facts.canonical,
+    )
+    return AuditMessageDraft(
+        role="audit",
+        content="Private credential-filtered operation failure facts",
+        tool_calls=(evidence.to_envelope(),),
+        inherit_composition_state=False,
+    )
 
 
 def private_failure_evidence(

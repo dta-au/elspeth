@@ -72,14 +72,30 @@ _PUBLICATION_BRANCHES: Final[frozenset[str]] = frozenset(
 _PREFLIGHT_SHAPES: Final[frozenset[str]] = frozenset({"absent", "green", "pending_handoff", "red"})
 # The END gate's blocked-terminal reasons (``_advisor_blocked_result``). Only
 # the ``terminal_block`` branch carries one; every repair branch passes None.
-AdvisorTerminalBlockReason = Literal["unavailable", "malformed", "flagged_final_pass", "flagged_no_repair", "flagged_unrepairable"]
+AdvisorTerminalBlockReason = Literal[
+    "unavailable",
+    "malformed",
+    "budget_exhausted",
+    "publication_withheld",
+    "flagged_final_pass",
+    "flagged_no_repair",
+    "flagged_unrepairable",
+]
 _TERMINAL_BLOCK_REASONS: Final[frozenset[str]] = frozenset(
-    {"unavailable", "malformed", "flagged_final_pass", "flagged_no_repair", "flagged_unrepairable"}
+    {
+        "unavailable",
+        "malformed",
+        "budget_exhausted",
+        "publication_withheld",
+        "flagged_final_pass",
+        "flagged_no_repair",
+        "flagged_unrepairable",
+    }
 )
 
 
 class AdvisorCheckpointPassData(TypedDict):
-    """Serialised :class:`AdvisorCheckpointPassRecord` — the audit row's and the event's payload."""
+    """Private audit payload; publication identity is excluded from telemetry."""
 
     phase: AdvisorCheckpointPhase
     pass_index: int
@@ -95,6 +111,8 @@ class AdvisorCheckpointPassData(TypedDict):
     note_present: bool | None
     url_redactions: int | None
     email_redactions: int | None
+    publication_verdict: Literal["ADMIT", "WITHHOLD"] | None
+    publication_binding: str | None
 
 
 class AdvisorTerminalPublicationData(TypedDict):
@@ -121,10 +139,15 @@ class AdvisorTerminalPublicationAuditEnvelope(TypedDict):
 AdvisorAuditEnvelope = AdvisorCheckpointPassAuditEnvelope | AdvisorTerminalPublicationAuditEnvelope
 
 
+def _require_publication_verdict(value: object) -> None:
+    if type(value) is not str or value not in ("ADMIT", "WITHHOLD"):
+        raise AuditIntegrityError("Accepted END model pass requires explicit publication permission")
+
+
 @final
 @dataclass(frozen=True, slots=True)
 class AdvisorCheckpointPassRecord:
-    """One completed advisor checkpoint pass, as the audit row and event carry it.
+    """One completed checkpoint, including private END publication identity.
 
     ``findings_hash`` is the canonical hash of the verdict's findings text —
     the text itself never leaves the service. Build through
@@ -146,6 +169,8 @@ class AdvisorCheckpointPassRecord:
     note_present: bool | None
     url_redactions: int | None
     email_redactions: int | None
+    publication_verdict: Literal["ADMIT", "WITHHOLD"] | None
+    publication_binding: str | None
 
     def __post_init__(self) -> None:
         vocabulary_fields: tuple[tuple[str, object, frozenset[str]], ...] = (
@@ -189,6 +214,17 @@ class AdvisorCheckpointPassRecord:
             raise AuditIntegrityError("AdvisorCheckpointPassRecord format reprompt requires a started retry after rejected text")
 
         accepted_response = self.source == "model" and self.verdict in {"clean", "flagged"}
+        publication_applicable = self.phase == "end" and accepted_response
+        if publication_applicable:
+            _require_publication_verdict(self.publication_verdict)
+            if (
+                type(self.publication_binding) is not str
+                or len(self.publication_binding) != 64
+                or any(char not in "0123456789abcdef" for char in self.publication_binding)
+            ):
+                raise AuditIntegrityError("Accepted END model pass requires its canonical owned publication binding")
+        elif self.publication_verdict is not None or self.publication_binding is not None:
+            raise AuditIntegrityError("Publication permission applies only to accepted END model passes")
         if self.first_attempt_accepted is True and (self.provider_attempts != 1 or not accepted_response):
             raise AuditIntegrityError("AdvisorCheckpointPassRecord accepted first attempt must finish the pass")
         if accepted_response and self.provider_attempts == 1 and self.first_attempt_accepted is not True:
@@ -230,6 +266,8 @@ class AdvisorCheckpointPassRecord:
         note_present: bool | None,
         url_redactions: int | None,
         email_redactions: int | None,
+        publication_verdict: Literal["ADMIT", "WITHHOLD"] | None,
+        publication_binding: str | None,
     ) -> AdvisorCheckpointPassRecord:
         # ``stable_hash`` is ELSPETH-owned: a canonicalization refusal is a
         # programmer error about our own payload and propagates from here,
@@ -249,6 +287,8 @@ class AdvisorCheckpointPassRecord:
             note_present=note_present,
             url_redactions=url_redactions,
             email_redactions=email_redactions,
+            publication_verdict=publication_verdict,
+            publication_binding=publication_binding,
         )
 
     def to_dict(self) -> AdvisorCheckpointPassData:
@@ -267,6 +307,8 @@ class AdvisorCheckpointPassRecord:
             "note_present": self.note_present,
             "url_redactions": self.url_redactions,
             "email_redactions": self.email_redactions,
+            "publication_verdict": self.publication_verdict,
+            "publication_binding": self.publication_binding,
         }
 
 

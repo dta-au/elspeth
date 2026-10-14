@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import errno
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
-import structlog
 from pydantic import JsonValue, TypeAdapter, ValidationError
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.exceptions import HTTPException
@@ -80,11 +79,13 @@ def stale_base_error(*, request_id: str | None) -> ComposerOperationError:
     )
 
 
-def _generic_failure(exc: BaseException, *, request_id: str | None) -> ComposerOperationError:
-    diagnostic_id = str(uuid4())
-    structlog.get_logger(__name__).error(
-        "composer_operation.operation_failed", diagnostic_id=diagnostic_id, request_id=request_id, exc_class=type(exc).__name__
-    )
+def operation_failure_diagnostic_id(*, session_id: str, operation_id: str) -> str:
+    """Derive one support identity from the exact durable operation, never prose."""
+    return str(uuid5(NAMESPACE_URL, "elspeth-composer-operation-failure:" + session_id + ":" + operation_id))
+
+
+def _generic_failure(*, request_id: str | None, diagnostic_id: str | None) -> ComposerOperationError:
+    diagnostic_id = diagnostic_id if diagnostic_id is not None else str(uuid4())
     return ComposerOperationError(
         http_status=500,
         failure_code="operation_failed",
@@ -140,7 +141,9 @@ def _integrity_category(exc: BaseException) -> int:
     return 4
 
 
-def project_composer_operation_error(exc: BaseException, *, request_id: str | None) -> ComposerOperationError:
+def project_composer_operation_error(
+    exc: BaseException, *, request_id: str | None, diagnostic_id: str | None = None
+) -> ComposerOperationError:
     """Integrity failures outrank ordinary HTTP or unclassified defect leaves.
 
     Temporal Stop/deadline/lease precedence is decided by worker custody; this
@@ -186,9 +189,9 @@ def project_composer_operation_error(exc: BaseException, *, request_id: str | No
                 "storage_unavailable",
             )
     if any(isinstance(leaf, (SQLAlchemyError, ComposerOwnedSettlementFailure)) for leaf in leaves):
-        return _generic_failure(exc, request_id=request_id)
+        return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
     if len(leaves) != 1:
-        return _generic_failure(exc, request_id=request_id)
+        return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
     leaf = leaves[0]
     if isinstance(leaf, SessionOperationFenceLost):
         return _http_error(404, {"detail": "Session not found"})
@@ -228,7 +231,7 @@ def project_composer_operation_error(exc: BaseException, *, request_id: str | No
         try:
             detail = _JSON.validate_python(scrub_credential_material(leaf.detail), strict=True)
         except ValidationError:
-            return _generic_failure(exc, request_id=request_id)
+            return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
         error_type: str | None = None
         if isinstance(detail, dict):
             candidate = detail["error_type"] if "error_type" in detail else None
@@ -236,4 +239,4 @@ def project_composer_operation_error(exc: BaseException, *, request_id: str | No
                 error_type = candidate
             detail = {**detail, "request_id": request_id}
         return _http_error(leaf.status_code, {"detail": detail}, error_type)
-    return _generic_failure(exc, request_id=request_id)
+    return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)

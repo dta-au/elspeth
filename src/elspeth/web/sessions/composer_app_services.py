@@ -14,6 +14,7 @@ from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacin
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.protocol import ComposerService
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -38,6 +39,7 @@ class ComposerAppServices:
     plugin_snapshot_for_user_id: Callable[[str], PluginAvailabilitySnapshot]
     progress_registry: ComposerProgressRegistry | DatabaseComposerProgressRegistry
     compose_locks: _SessionComposeLockRegistry
+    composer_operation_authority: ComposerAsyncOperationAuthority
 
 
 def composer_app_services(app: Starlette) -> ComposerAppServices:
@@ -56,4 +58,5 @@ def composer_app_services(app: Starlette) -> ComposerAppServices:
         plugin_snapshot_for_user_id=app.state.plugin_snapshot_factory.for_user_id,
         progress_registry=app.state.composer_progress_registry,
         compose_locks=composer_session_lock_registry(app),
+        composer_operation_authority=app.state.composer_async_operation_authority,
     )

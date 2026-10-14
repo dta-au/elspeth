@@ -39,9 +39,9 @@ from elspeth.web.composer.advisor_audit import (
     persist_advisor_checkpoint_pass,
     persist_advisor_terminal_publication,
 )
-from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointVerdictSource
+from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase, AdvisorCheckpointVerdictSource
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorSignoffGateFact
-from elspeth.web.composer.advisor_output import parse_advisor_checkpoint_response, sanitize_advisor_note
+from elspeth.web.composer.advisor_output import AdvisorEndResponse, parse_advisor_checkpoint_response, sanitize_advisor_note
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
@@ -68,6 +68,7 @@ from elspeth.web.composer.no_tool_policy import (
     is_pending_interpretation_handoff,
     state_is_structurally_empty,
 )
+from elspeth.web.composer.pipeline_planner import PlannerContinuationBudget, PlannerContinuationUnavailable
 from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emit_progress
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
 from elspeth.web.composer.provider_context import capture_provider_context
@@ -91,6 +92,7 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
+from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.completion_gates import completion_gate_fingerprint
 from elspeth.web.execution.schemas import ValidationResult
@@ -159,7 +161,7 @@ class AdvisorCheckpointVerdict:
     # value gets the fail-closed malformed wording. The classification is
     # applied inline by ``_run_advisor_checkpoint``'s exception handling and
     # read by ``_evaluate_terminal_no_tool_advisor_gate``.
-    failure_class: Literal["none", "unavailable", "malformed"] = "none"
+    failure_class: Literal["none", "unavailable", "malformed", "budget_exhausted"] = "none"
     # Schema-admitted category and raw step ids; publication revalidates ids
     # against live state. Only the sanitized note may reach user surfaces.
     category: str = "other"
@@ -171,11 +173,13 @@ class AdvisorCheckpointVerdict:
     response_note_present: bool | None = None
     url_redactions: int | None = None
     email_redactions: int | None = None
+    publication_verdict: Literal["ADMIT", "WITHHOLD"] | None = None
+    publication_binding: str | None = None
 
 
-def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdict:
+def _parse_advisor_checkpoint_guidance(guidance: str, *, phase: AdvisorCheckpointPhase) -> AdvisorCheckpointVerdict:
     """Admit the checkpoint JSON contract before constructing an owned verdict."""
-    admission = parse_advisor_checkpoint_response(guidance)
+    admission = parse_advisor_checkpoint_response(guidance, phase=phase)
     response = admission.response
     if response is None:
         return AdvisorCheckpointVerdict(
@@ -197,6 +201,7 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
         response_note_present=response.note is not None,
         url_redactions=sanitized.url_redactions,
         email_redactions=sanitized.email_redactions,
+        publication_verdict=response.publication_verdict if isinstance(response, AdvisorEndResponse) else None,
     )
 
 
@@ -317,6 +322,7 @@ class AdvisorCheckpointOwner:
         structured_output: bool = False,
         on_provider_dispatch: Callable[[], None] | None = None,
         provider_custody: ProviderCallCustody | None = None,
+        continuation_budget: PlannerContinuationBudget | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Phone the configured advisor (frontier) model for a hint.
 
@@ -350,6 +356,8 @@ class AdvisorCheckpointOwner:
         configured_timeout = self._settings.composer_advisor_timeout_seconds
         effective_timeout = configured_timeout if timeout is None else min(configured_timeout, timeout)
         max_completion = self._settings.composer_advisor_max_completion_tokens
+        if continuation_budget is not None:
+            max_completion = min(max_completion, continuation_budget.policy.max_completion_tokens)
 
         trigger = cast(str, arguments["trigger"])
         system_msg = self._composer_skill_text + "\n\n" + _advisor_context.advisor_system_instructions_for_trigger(trigger)
@@ -372,6 +380,14 @@ class AdvisorCheckpointOwner:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        checkpoint_phase: AdvisorCheckpointPhase | None = None
+        if structured_output:
+            if trigger == ADVISOR_TRIGGER_DETERMINISTIC_EARLY:
+                checkpoint_phase = "early"
+            elif trigger == ADVISOR_TRIGGER_DETERMINISTIC_END:
+                checkpoint_phase = "end"
+            else:
+                raise InvariantError("Structured advisor request requires an owned checkpoint trigger")
         kwargs: dict[str, Any] = build_advisor_request_options(
             model=advisor_model,
             temperature=self._settings.composer_temperature,
@@ -381,6 +397,7 @@ class AdvisorCheckpointOwner:
             api_base=self._advisor_endpoint_base_url,
             api_key=self._advisor_endpoint_api_key,
             structured_output=structured_output,
+            checkpoint_phase=checkpoint_phase,
         )
         kwargs["messages"] = messages
         private_request = capture_provider_context(messages=messages, tools=None)
@@ -517,6 +534,10 @@ class AdvisorCheckpointOwner:
                             provider_custody.retain_audit(call)
                         if recorder is not None:
                             recorder.record_llm_call(call, provider_custody=provider_custody)
+                        if continuation_budget is not None:
+                            continuation_budget.consume_call(
+                                call, retained=recorder is not None and any(retained is call for retained in recorder.llm_calls)
+                            )
                     current_exc = sys.exc_info()[1]
                     if current_exc is not None:
                         attach_llm_calls(current_exc, recorder)
@@ -535,9 +556,15 @@ class AdvisorCheckpointOwner:
         timeout: float | None = None,
         structured_output: bool = False,
         on_provider_dispatch: Callable[[], None] | None = None,
+        continuation_budget: PlannerContinuationBudget | None = None,
     ) -> tuple[str, dict[str, Any]]:
         return await self._call_advisor_with_audit_body(
-            arguments, recorder=recorder, timeout=timeout, structured_output=structured_output, on_provider_dispatch=on_provider_dispatch
+            arguments,
+            recorder=recorder,
+            timeout=timeout,
+            structured_output=structured_output,
+            on_provider_dispatch=on_provider_dispatch,
+            continuation_budget=continuation_budget,
         )
 
     async def _call_advisor_with_audit(
@@ -549,6 +576,7 @@ class AdvisorCheckpointOwner:
         structured_output: bool = False,
         on_provider_dispatch: Callable[[], None] | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        continuation_budget: PlannerContinuationBudget | None = None,
     ) -> tuple[str, dict[str, Any]]:
         if provider_owner is None:
             return await self._call_advisor_with_audit_legacy(
@@ -557,6 +585,7 @@ class AdvisorCheckpointOwner:
                 timeout=timeout,
                 structured_output=structured_output,
                 on_provider_dispatch=on_provider_dispatch,
+                continuation_budget=continuation_budget,
             )
         provider_custody = self._new_advisor_custody(provider_owner)
         async with provider_call_scope(provider_custody):
@@ -567,15 +596,17 @@ class AdvisorCheckpointOwner:
                 structured_output=structured_output,
                 on_provider_dispatch=on_provider_dispatch,
                 provider_custody=provider_custody,
+                continuation_budget=continuation_budget,
             )
 
     def _build_checkpoint_arguments(
         self,
         *,
-        phase: str,
+        phase: AdvisorCheckpointPhase,
         state: CompositionState,
         user_message: str | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
+        publication_review: AdvisorPublicationReview | None = None,
     ) -> dict[str, Any]:
         """Synthesize the (Tier-1, trusted) advisor ``arguments`` for a checkpoint.
 
@@ -635,7 +666,7 @@ class AdvisorCheckpointOwner:
                 "Assess the current evidence independently. Clear a prior concern when the current evidence disproves it; "
                 "do not repeat a stale concern merely because it appeared in an earlier pass. "
                 f"Current evidence identity: {current_evidence_hash}. "
-                f"Prior evidence identity: {review_state.previous_evidence_hash or 'none'}. "
+                f"Prior semantic repair evidence identity: {review_state.previous_evidence_hash or 'none'}. "
             )
             recent_errors = [
                 _advisor_context.truncate_advisor_text(
@@ -689,6 +720,10 @@ class AdvisorCheckpointOwner:
         }
         if user_message is not None and user_message.strip():
             end_arguments["user_message"] = _advisor_context.truncate_advisor_text(user_message, _ADVISOR_USER_MESSAGE_MAX_CHARS)
+        if publication_review is not None:
+            if type(publication_review) is not AdvisorPublicationReview:
+                raise TypeError("END publication review must be an owned snapshot")
+            end_arguments["publication_review"] = publication_review.payload_json
         return end_arguments
 
     def _advisor_blocked_result(
@@ -710,15 +745,16 @@ class AdvisorCheckpointOwner:
         persisted_tool_call_turn: bool,
         runtime_preflight: ValidationResult | None,
         outstanding_findings: ValidationResult | None,
+        publication_binding: str | None = None,
+        saved_scope: str = "",
     ) -> ComposerResult:
         """Build the end-gate ``ComposerResult`` for a sign-off that did not pass.
 
-        The model's terminal prose is published with the notice appended,
-        exactly as the preflight-invalid finalize branches do — whether or not
-        advisor findings entered the model's context earlier this turn
-        (operator ruling 2026-09-22, elspeth-032ec69c41). ``assistant_message``
-        may be ``None`` for a turn that produced no admitted reply; it is then
-        empty prose under the same notice. ``reason`` is independent of the
+        The graph outcome does not authorize prose publication. An explicit
+        ADMIT verdict bound to the current candidate and request evidence
+        permits the model's terminal prose beside the notice; otherwise only
+        trusted saved-scope facts may appear. ``assistant_message`` may be
+        ``None`` for a turn that produced no admitted reply. ``reason`` is independent of the
         injection history in both directions: a first-pass advisor outage
         followed by a last-pass FLAG is ``flagged_final_pass`` with nothing
         ever injected, a FLAG-and-repair followed by an outage is
@@ -739,6 +775,7 @@ class AdvisorCheckpointOwner:
         ``"flagged_no_repair"``, or ``"flagged_unrepairable"`` (elspeth-25f7b757e7
         A1: the pre-scan flagged the user's own chat message, a surface repair
         cannot mutate, so the gate blocked on the first pass). The result
+        also distinguishes ``"budget_exhausted"`` and ``"publication_withheld"``.
         is threaded with ``repair_turns_used`` plus the persisted ids so the
         route handler can persist composer_meta uniformly.
 
@@ -747,7 +784,7 @@ class AdvisorCheckpointOwner:
         * a green preflight preserves ``is_valid``, checks, errors, authoring
           validity, and execution readiness, withholding only completion;
         * a pending-interpretation handoff is preserved WHOLE — the advisor
-          verdict is appended as a failed check and nothing is withheld, so
+          verdict is appended as a failed check without changing graph readiness, so
           the resolvable review card the operator can act on survives
           (elspeth-66717f0c99). ``outstanding_findings`` (elspeth-ac85b0ab0e)
           carries the authoring-masked re-validation result when it found
@@ -764,8 +801,8 @@ class AdvisorCheckpointOwner:
         * any other red preflight remains fully red under the
           runtime-preflight header.
 
-        The provider's findings always remain internal; the primary model's
-        terminal prose is published. Every
+        The provider's technical findings remain internal; the primary model's
+        terminal prose requires separate current publication admission. Every
         backend-authored field is synthesized from fixed backend copy — except
         the backend-authored deterministic pre-scan finding, which is itself
         fixed backend copy naming the triggering key/field and rides the
@@ -780,14 +817,15 @@ class AdvisorCheckpointOwner:
             preflight_shape=_advisor_policy.advisor_preflight_shape(runtime_preflight),
             findings_backend_authored=verdict.findings_backend_authored,
         )
-        # Operator ruling 2026-09-22 (elspeth-032ec69c41): a blocked turn
-        # publishes the composer's reply. The withholding existed so prose
-        # written after advisor findings entered context could not leak them;
-        # findings are no longer secret from the user. Case 5 (the repair
-        # replacer) keeps its own withholding and does not pass through here,
-        # which is why the two composers it shares with this builder still
-        # take ``prose_withheld`` and are passed False below.
-        raw_content = (assistant_message.content or "") if assistant_message is not None else ""
+        # Graph findings alone grant no publication permission. A missing or
+        # mismatched binding cannot restore the original candidate through
+        # this renderer; the caller supplies only trusted saved facts then.
+        publication_admitted = (
+            verdict.publication_verdict == "ADMIT"
+            and publication_binding is not None
+            and verdict.publication_binding == publication_binding
+        )
+        raw_content = ((assistant_message.content or "") if assistant_message is not None else "") if publication_admitted else saved_scope
         # elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): computed
         # once for every shape below. The step ids are checked against THIS
         # state — an id the advisor invented, or an injection wearing an id's
@@ -799,6 +837,8 @@ class AdvisorCheckpointOwner:
         cause = {
             "unavailable": AdvisorBlockCause.UNAVAILABLE,
             "malformed": AdvisorBlockCause.MALFORMED,
+            "budget_exhausted": AdvisorBlockCause.BUDGET_EXHAUSTED,
+            "publication_withheld": AdvisorBlockCause.PUBLICATION_REJECTED,
             "flagged_unrepairable": AdvisorBlockCause.MESSAGE_REJECTED,
             "flagged_final_pass": AdvisorBlockCause.GRAPH_REJECTED,
             "flagged_no_repair": AdvisorBlockCause.GRAPH_REJECTED,
@@ -839,7 +879,11 @@ class AdvisorCheckpointOwner:
             else:
                 augmented = compose_advisor_signoff_unrendered_pending_message(
                     raw_content,
-                    failure_class="unavailable" if reason == "unavailable" else "malformed",
+                    failure_class="budget_exhausted"
+                    if reason == "budget_exhausted"
+                    else "unavailable"
+                    if reason == "unavailable"
+                    else "malformed",
                 )
         elif runtime_preflight is not None and is_pending_interpretation_handoff(runtime_preflight):
             # Matches the discriminator EXACTLY, not merely ``not is_valid``:
@@ -870,7 +914,11 @@ class AdvisorCheckpointOwner:
             else:
                 augmented = compose_advisor_signoff_unrendered_unverified_message(
                     raw_content,
-                    failure_class="unavailable" if reason == "unavailable" else "malformed",
+                    failure_class="budget_exhausted"
+                    if reason == "budget_exhausted"
+                    else "unavailable"
+                    if reason == "unavailable"
+                    else "malformed",
                 )
         else:
             runtime_result = _advisor_policy.advisor_signoff_blocked_validation(
@@ -992,7 +1040,7 @@ class AdvisorCheckpointOwner:
     async def _run_advisor_checkpoint(
         self,
         *,
-        phase: str,
+        phase: AdvisorCheckpointPhase,
         state: CompositionState,
         session_id: str | None,
         recorder: BufferingRecorder | None,
@@ -1003,6 +1051,8 @@ class AdvisorCheckpointOwner:
         deadline: float | None = None,
         session_operation_context: SessionOperationContext | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        publication_review: AdvisorPublicationReview | None = None,
+        continuation_budget: PlannerContinuationBudget | None = None,
     ) -> AdvisorCheckpointVerdict:
         """Backend-initiated deterministic advisor checkpoint (early|end).
 
@@ -1036,6 +1086,23 @@ class AdvisorCheckpointOwner:
         """
 
         provider_attempts = 0
+        if continuation_budget is not None:
+            if type(continuation_budget) is not PlannerContinuationBudget or phase != "end":
+                raise AuditIntegrityError("Planner continuation applies only to its owned END checkpoint")
+            if continuation_budget.provider_owner is not provider_owner:
+                raise AuditIntegrityError("Planner continuation changed its actual provider owner")
+            continuation_budget.require_publication(publication_review)
+
+        def continuation_withheld() -> AdvisorCheckpointVerdict:
+            # No schema-admitted model decision is fabricated when accounting
+            # prevents admission. Actual attempted calls retain their own audit.
+            return AdvisorCheckpointVerdict(
+                ok=False,
+                blocking=False,
+                findings_text="Final review cannot be admitted within the existing planner budget.",
+                failure_class="budget_exhausted",
+            )
+
         first_attempt_schema_valid: bool | None = None
         first_attempt_accepted: bool | None = None
         format_reprompt_sent = False
@@ -1051,7 +1118,7 @@ class AdvisorCheckpointOwner:
                 session_id=session_id,
                 session_operation_context=session_operation_context,
                 record=AdvisorCheckpointPassRecord.from_findings(
-                    phase=cast(Literal["early", "end"], phase),
+                    phase=phase,
                     pass_index=pass_index,
                     verdict=audit_verdict,
                     source=source,
@@ -1067,6 +1134,8 @@ class AdvisorCheckpointOwner:
                     note_present=verdict.response_note_present if source == "model" and verdict.ok else None,
                     url_redactions=verdict.url_redactions if source == "model" and verdict.ok else None,
                     email_redactions=verdict.email_redactions if source == "model" and verdict.ok else None,
+                    publication_verdict=verdict.publication_verdict if phase == "end" and source == "model" and verdict.ok else None,
+                    publication_binding=verdict.publication_binding if phase == "end" and source == "model" and verdict.ok else None,
                 ),
             )
             return verdict
@@ -1090,7 +1159,19 @@ class AdvisorCheckpointOwner:
             state=state,
             user_message=user_message,
             advisor_review_state=advisor_review_state,
+            publication_review=publication_review,
         )
+        if phase == "end" and publication_review is not None:
+            char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
+            if len(_advisor_context.build_advisor_user_message(arguments)) > char_cap:
+                # No dispatch and no completed-pass record: the complete reply
+                # cannot be reviewed under this request's existing bound.
+                return AdvisorCheckpointVerdict(
+                    ok=False,
+                    blocking=False,
+                    findings_text="Review input exceeds the existing advisor budget.",
+                    failure_class="budget_exhausted",
+                )
         attempts = 2  # bounded retry; the underlying call wraps its own timeout
         provider_failures: tuple[type[Exception], ...] = (TimeoutError, ConnectionError, *advisor_provider_failure_types())
         last_exc: Exception | None = None
@@ -1099,12 +1180,16 @@ class AdvisorCheckpointOwner:
 
         def provider_dispatched() -> None:
             nonlocal provider_attempts, format_reprompt_sent
+            if continuation_budget is not None:
+                continuation_budget.check_dispatch(now=_compose_deadline_time())
             # Quota admission is awaited before the physical provider call.
             # A timeout there must not fabricate a call or a sent re-prompt.
             provider_attempts += 1
             format_reprompt_sent = format_reprompt_sent or call_arguments is not arguments
 
         for _ in range(attempts):
+            if continuation_budget is not None and not continuation_budget.reserve_attempt(now=_compose_deadline_time()):
+                return continuation_withheld()
             remaining: float | None = None
             if deadline is not None:
                 remaining = deadline - _compose_deadline_time()
@@ -1127,6 +1212,7 @@ class AdvisorCheckpointOwner:
                         structured_output=True,
                         on_provider_dispatch=provider_dispatched,
                         provider_owner=provider_owner,
+                        continuation_budget=continuation_budget,
                     )
                 else:
                     guidance, _meta = await self._call_advisor_with_audit(
@@ -1136,8 +1222,13 @@ class AdvisorCheckpointOwner:
                         structured_output=True,
                         on_provider_dispatch=provider_dispatched,
                         provider_owner=provider_owner,
+                        continuation_budget=continuation_budget,
                     )
+            except PlannerContinuationUnavailable:
+                return continuation_withheld()
             except _MalformedLLMResponseError as exc:
+                if continuation_budget is not None and not continuation_budget.has_cost_headroom():
+                    return continuation_withheld()
                 last_exc = exc
                 last_response_unparseable = False
                 # Empty text is malformed schema evidence; absent/non-text
@@ -1152,6 +1243,8 @@ class AdvisorCheckpointOwner:
                     call_arguments = arguments
                 continue
             except provider_failures as exc:
+                if continuation_budget is not None and not continuation_budget.has_cost_headroom():
+                    return continuation_withheld()
                 # Only declared provider failures become provider verdicts.
                 # Audit failures and defects in controlled code must propagate.
                 # Retain exceptions only to classify the final outcome.
@@ -1164,11 +1257,15 @@ class AdvisorCheckpointOwner:
                     # Repeating an unchanged rejected request cannot repair it.
                     break
                 continue
-            verdict = _parse_advisor_checkpoint_guidance(guidance)
+            if continuation_budget is not None and not continuation_budget.within_cost_cap():
+                return continuation_withheld()
+            verdict = _parse_advisor_checkpoint_guidance(guidance, phase=phase)
             if provider_attempts == 1:
                 first_attempt_schema_valid = verdict.response_schema_valid
                 first_attempt_accepted = verdict.ok
             if verdict.ok:
+                if phase == "end" and publication_review is not None:
+                    verdict = replace(verdict, publication_binding=publication_review.binding)
                 return await completed(verdict, source="model")
             # R2-F14 (elspeth-5403f346c0): a transport-SUCCESSFUL reply that
             # simply did not state a verdict used to be terminal here — the

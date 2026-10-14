@@ -6,7 +6,7 @@ import asyncio
 import functools
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import UUID
 
@@ -15,6 +15,10 @@ from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.advisor_audit import AdvisorTerminalBlockReason
+    from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+    from elspeth.web.composer.composition_completion import CompositionCompletion
+    from elspeth.web.composer.turn_effects import TurnEvidence
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
@@ -23,10 +27,12 @@ from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import provider_gateway
+from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage
 from elspeth.web.composer.application_policy import PluginPolicyContextFactory
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -48,6 +54,7 @@ from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.invariants import InvariantError
+from elspeth.web.composer.llm_response_parsing import attach_llm_calls
 from elspeth.web.composer.no_tool_policy import (
     is_pending_interpretation_handoff,
     is_referential_pipeline_mutation_intent,
@@ -85,6 +92,7 @@ from elspeth.web.composer.protocol import (
     ComposerRuntimePreflightError,
     ComposerSettings,
     PipelineCommitIntent,
+    RetainedOperationContext,
 )
 from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS, LLM_API_RETRY_BASE_DELAY_SECONDS
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
@@ -256,6 +264,8 @@ class PlanningApplication:
         endpoint_api_key: str | None,
         advisor_endpoint_base_url: str | None,
         advisor_endpoint_api_key: str | None,
+        advisor_checkpoint: AdvisorCheckpointOwner,
+        completion: CompositionCompletion,
     ) -> None:
         self._sessions_service_optional = sessions_service
         self._policy_context = policy_context
@@ -275,6 +285,8 @@ class PlanningApplication:
         self._endpoint_api_key = endpoint_api_key
         self._advisor_endpoint_base_url = advisor_endpoint_base_url
         self._advisor_endpoint_api_key = advisor_endpoint_api_key
+        self._advisor_checkpoint = advisor_checkpoint
+        self._completion = completion
         self._model = settings.composer_model
         self._max_composition_turns = settings.composer_max_composition_turns
         self._max_discovery_turns = settings.composer_max_discovery_turns
@@ -846,6 +858,126 @@ class PlanningApplication:
             pipeline_commit_intent=intent,
         )
 
+    async def _review_planner_decline(
+        self,
+        *,
+        declined: PlannerDeclined,
+        candidate: str,
+        request: str,
+        request_id: str,
+        state: CompositionState,
+        session_id: str,
+        session_operation_context: SessionOperationContext | None,
+        recorder: BufferingRecorder,
+        progress: ComposerProgressSink | None,
+        provider_owner: ProviderInvocationOwner | None,
+        turn_evidence: TurnEvidence,
+        deadline: float,
+    ) -> ComposerResult:
+        """Admit final declined prose using this request's remaining existing END limits."""
+        from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict, _AdvisorCheckpointComposeDeadlineExpired
+        from elspeth.web.composer.pipeline_planner import PlannerContinuationBudget
+
+        end_call_start = len(recorder.llm_calls)
+        try:
+            review = turn_evidence.review_candidate(candidate=candidate, request=request, current_state=state, scope="planner")
+            budget = declined.continuation_budget
+            verdict = AdvisorCheckpointVerdict(
+                ok=False,
+                blocking=False,
+                failure_class="budget_exhausted",
+                findings_text="Final review has no valid remaining request allowance.",
+            )
+            if budget is not None:
+                if type(budget) is not PlannerContinuationBudget:
+                    raise AuditIntegrityError("Planner decline carries an unowned continuation budget")
+                budget.validate_for(
+                    session_id=session_id,
+                    request_id=request_id,
+                    request=request,
+                    provider_owner=provider_owner,
+                    evidence_owner=turn_evidence,
+                )
+                if budget.deadline > deadline:
+                    raise AuditIntegrityError("Planner decline extended its original outer request deadline")
+                budget.bind_publication(review)
+                if self._settings.composer_advisor_checkpoint_max_passes > 0:
+                    try:
+                        verdict = await self._advisor_checkpoint._run_advisor_checkpoint(
+                            phase="end",
+                            state=state,
+                            session_id=session_id,
+                            session_operation_context=session_operation_context,
+                            recorder=recorder,
+                            progress=progress,
+                            user_message=request,
+                            pass_index=1,
+                            deadline=budget.deadline,
+                            provider_owner=provider_owner,
+                            publication_review=review,
+                            continuation_budget=budget,
+                        )
+                    except _AdvisorCheckpointComposeDeadlineExpired:
+                        # A deadline race is not a completed model review.
+                        verdict = AdvisorCheckpointVerdict(
+                            ok=False,
+                            blocking=False,
+                            failure_class="budget_exhausted",
+                            findings_text="The original request deadline expired before final review.",
+                        )
+            current = turn_evidence.review_candidate(candidate=candidate, request=request, current_state=state, scope="planner")
+            admitted = (
+                budget is not None
+                and budget.within_cost_cap()
+                and asyncio.get_running_loop().time() < budget.deadline
+                and verdict.ok
+                and verdict.publication_verdict == "ADMIT"
+                and verdict.publication_binding == review.binding == current.binding
+            )
+            if admitted:
+                # No graph pass or saved-revision claim follows prose admission.
+                return ComposerResult(message=candidate, state=state, llm_calls=recorder.llm_calls[end_call_start:])
+            await self._completion._persist_withheld_reply(
+                "advisor_publication_withheld", candidate, session_id=session_id, session_operation_context=session_operation_context
+            )
+            reason: AdvisorTerminalBlockReason = (
+                "budget_exhausted"
+                if budget is None
+                or not budget.within_cost_cap()
+                or asyncio.get_running_loop().time() >= budget.deadline
+                or verdict.failure_class == "budget_exhausted"
+                else "publication_withheld"
+                if verdict.ok
+                else "unavailable"
+                if verdict.failure_class == "unavailable"
+                else "malformed"
+            )
+            blocked = self._advisor_checkpoint._advisor_blocked_result(
+                reason=reason,
+                verdict=verdict,
+                state=state,
+                assistant_message=_AdmittedAssistantMessage(content=turn_evidence.render_saved_scope()),
+                recorder=recorder,
+                repair_turns_used=0,
+                persisted_assistant_message_id=None,
+                persisted_assistant_content=None,
+                persisted_tool_call_turn=False,
+                runtime_preflight=None,
+                outstanding_findings=None,
+                publication_binding=None,
+                saved_scope=turn_evidence.render_saved_scope(),
+            )
+            # Planner audit was already committed. Only the new END call cohort
+            # remains for the ordinary route terminal transaction to persist.
+            blocked = replace(blocked, advisor_gate_decision=None, tool_invocations=(), llm_calls=recorder.llm_calls[end_call_start:])
+            await self._advisor_checkpoint._persist_advisor_terminal_publication(
+                blocked, session_id=session_id, session_operation_context=session_operation_context
+            )
+            return blocked
+        except BaseException as error:
+            attach_llm_calls(error, recorder, start_index=end_call_start)
+            raise
+
     async def _plan_and_stage_empty_pipeline(
         self,
         *,
@@ -865,8 +997,37 @@ class PlanningApplication:
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         recovery_context: GraphRecoveryContext | None = None,
+        retained_operation_context: RetainedOperationContext | None = None,
+        turn_evidence: TurnEvidence | None = None,
+        request_deadline: float | None = None,
     ) -> ComposerResult:
         """Build one canonical full-pipeline proposal for an empty topology."""
+
+        from elspeth.web.composer.turn_effects import TurnEvidence
+
+        deadline = asyncio.get_running_loop().time() + (self._timeout_seconds if budget_seconds is None else budget_seconds)
+        if request_deadline is not None:
+            deadline = min(deadline, request_deadline)
+        if turn_evidence is None:
+            turn_evidence = TurnEvidence(
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                request_id=user_message_id,
+                request=message,
+                initial_state_id=current_state_id,
+                initial_state=state,
+                retained_operation_context=retained_operation_context,
+                actor_user_id=user_id,
+            )
+        elif (
+            type(turn_evidence) is not TurnEvidence
+            or turn_evidence.session_id != session_id
+            or turn_evidence.request_id != user_message_id
+            or turn_evidence.request_hash != stable_hash(message)
+            or turn_evidence.operation_id
+            != (session_operation_context.fence.operation_id if session_operation_context is not None else None)
+        ):
+            raise AuditIntegrityError("Planning application evidence belongs to another actual request")
 
         session_uuid = UUID(session_id)
         message_uuid = UUID(user_message_id)
@@ -918,6 +1079,9 @@ class PlanningApplication:
                 intent=message,
                 conversation_context=_freeform_planner_conversation_context(message, messages),
                 recovery_context=recovery_context,
+                retained_operation_context=retained_operation_context,
+                turn_evidence=turn_evidence,
+                request_deadline=deadline,
                 current_state=state,
                 # Round-trippable planner projection (elspeth-c67fbbbd83).
                 provider_current_state=project_server_owned_option_metadata(state.to_dict()),
@@ -1010,7 +1174,20 @@ class PlanningApplication:
             decline_message = declined.decline_text.strip() or (
                 "I could not find a way to build this pipeline with the available components."
             )
-            return ComposerResult(message=decline_message, state=state)
+            return await self._review_planner_decline(
+                declined=declined,
+                candidate=decline_message,
+                request=message,
+                request_id=user_message_id,
+                state=state,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                recorder=recorder,
+                progress=progress,
+                provider_owner=provider_owner,
+                turn_evidence=turn_evidence,
+                deadline=deadline,
+            )
         except BaseException as exc:
             exc_dict = exc.__dict__
             attached_calls = exc_dict["llm_calls"] if "llm_calls" in exc_dict else ()

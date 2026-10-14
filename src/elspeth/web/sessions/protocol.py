@@ -68,6 +68,7 @@ from elspeth.web.sessions.pipeline_publication import PipelineProposalSettlement
 from elspeth.web.sessions.pipeline_settlement_payloads import ComposerOperationBinding
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -3037,6 +3038,7 @@ class SessionServiceProtocol(Protocol):
         authoritative_failure: bool = False,
         required_work: RequiredWorkCoordinator | None = None,
         failure_projection_work: RequiredWorkTicket | None = None,
+        operation_failure_facts: ComposerOperationFailureFacts | None = None,
     ) -> ComposerOperationRecord: ...
 
     async def add_messages_atomic(

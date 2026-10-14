@@ -20,7 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import structlog
@@ -729,6 +729,8 @@ async def _plan(
     mark_schema_loaded: Any = None,
     catalog_service: Any = None,
     policy_override: Any = None,
+    retained_operation_context: pipeline_planner.RetainedOperationContext | None = None,
+    turn_evidence: pipeline_planner.TurnEvidence | None = None,
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
@@ -775,6 +777,8 @@ async def _plan(
             schemas_loaded=schemas_loaded,
             mark_schema_loaded=mark_schema_loaded,
             conversation_context=conversation_context,
+            retained_operation_context=retained_operation_context,
+            turn_evidence=turn_evidence,
             policy_catalog=policy_catalog,
             plugin_snapshot=plugin_snapshot,
             originating_message=origin,
@@ -835,6 +839,29 @@ def test_planner_has_no_request_selected_terminal_contract() -> None:
     assert "terminal_contract" not in inspect.signature(plan_pipeline).parameters
     assert "terminal_contract" not in inspect.signature(planner_tool_definitions).parameters
     assert "terminal_contract" not in inspect.signature(pipeline_planner.planner_terminal_tool_definition).parameters
+
+
+@pytest.mark.asyncio
+async def test_retained_operation_context_reaches_selected_planner_wire(tmp_path: Path, tool_context: ToolContext) -> None:
+    from elspeth.web.composer.protocol import RetainedOperationContext
+
+    origin = _origin()
+    context = RetainedOperationContext(session_id=UUID(origin.session_id), actor_user_id="planner-user", availability="available")
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+    recorder = BufferingRecorder()
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        originating_message=origin,
+        retained_operation_context=context,
+    )
+    assert len(completion.requests) == 1
+    sent = completion.requests[0]
+    payload = json.loads(sent["messages"][1]["content"])
+    assert payload["retained_operation_history"] == json.loads(context.provider_message())["retained_operation_history"]
+    assert recorder.llm_calls[0].messages_hash == stable_hash(sent["messages"])
 
 
 @pytest.mark.asyncio
@@ -5261,7 +5288,117 @@ async def test_terminal_cannot_replace_server_base_and_proposal_is_created_once(
 
 
 @pytest.mark.asyncio
-async def test_blob_content_discovery_audit_projection_never_retains_content(
+@pytest.mark.parametrize("delivery", ("prefix", "complete", "cost_refused", "malformed"))
+async def test_legacy_planner_blob_pages_do_not_invent_owned_delivery(tmp_path: Path, tool_context: ToolContext, delivery: str) -> None:
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    engine, origin = await _session_context()
+    content = "name,score\n" + "ada,42\n" * 8_000
+    recorder = BufferingRecorder()
+    observed_pages = []
+
+    # Every dispatch is the explicitly injected local completion, including
+    # malformed-response repair attempts. No SDK fallback exists in _plan.
+    async def complete(**kwargs):
+        completion.requests.append(deepcopy(kwargs))
+        selected = [
+            json.loads(message["content"])["data"]
+            for message in kwargs["messages"]
+            if message["role"] == "tool" and message["tool_call_id"].startswith("read-page-")
+        ]
+        observed_pages.append(selected)
+        if not selected:
+            return _response_with_call_id("read-page-1", "get_blob_content", {"blob_id": str(blob.id)})
+        if delivery == "malformed":
+            return _Response(choices=[], usage=_planner_usage())
+        if delivery == "complete" and selected[-1]["next_offset_chars"] is not None:
+            page = selected[-1]
+            return _response_with_call_id(
+                "read-page-2",
+                "get_blob_content",
+                {"blob_id": str(blob.id), "offset_chars": page["next_offset_chars"], "expected_content_hash": page["content_hash"]},
+            )
+        pipeline = _inline_pipeline(tmp_path)
+        del pipeline["source"]["inline_blob"]
+        pipeline["source"]["blob_id"] = str(blob.id)
+        return _response_with_call_id("emit-checked", "emit_pipeline_proposal", {"pipeline": pipeline})
+
+    class _PageCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs):
+            return await complete(**kwargs)
+
+    completion = _PageCompletion()
+    try:
+        with fenced_operation_context(engine, origin.session_id) as context:
+            blob = await BlobServiceImpl(engine, tmp_path).create_blob(
+                UUID(origin.session_id), "coverage.csv", content.encode(), "text/csv", session_operation_context=context
+            )
+            state = _empty_state()
+            evidence = TurnEvidence(
+                session_id=origin.session_id,
+                session_operation_context=context,
+                request_id="actual-planner-pages",
+                request="Inspect the uploaded CSV.",
+                initial_state_id=None,
+                initial_state=state,
+            )
+            custody = replace(
+                _custody(tmp_path),
+                session_engine=engine,
+                session_operation_context=context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+            )
+            budget = _budget(
+                max_total_provider_calls=3 if delivery == "complete" else 2,
+                max_cumulative_provider_cost=Decimal("0.015") if delivery == "cost_refused" else Decimal("1"),
+            )
+            if delivery in ("cost_refused", "malformed"):
+                with pytest.raises(PipelinePlannerError):
+                    await _plan(
+                        tmp_path=tmp_path,
+                        tool_context=tool_context,
+                        completion=completion,
+                        recorder=recorder,
+                        originating_message=origin,
+                        custody_config=custody,
+                        budget=budget,
+                        turn_evidence=evidence,
+                    )
+            else:
+                await _plan(
+                    tmp_path=tmp_path,
+                    tool_context=tool_context,
+                    completion=completion,
+                    recorder=recorder,
+                    originating_message=origin,
+                    custody_config=custody,
+                    budget=budget,
+                    turn_evidence=evidence,
+                )
+            assert len(completion.requests) == (3 if delivery == "complete" else 2)
+            prefix = observed_pages[1][0]
+            assert prefix["start_char"] == 0 < prefix["end_char"] < prefix["total_chars"] == len(content)
+            assert prefix["content"] == content[: prefix["end_char"]]
+            assert prefix["next_offset_chars"] == prefix["end_char"]
+            if delivery == "complete":
+                suffix = observed_pages[2][-1]
+                assert suffix["start_char"] == prefix["end_char"]
+                assert suffix["end_char"] == suffix["total_chars"] == len(content)
+                assert suffix["content_hash"] == prefix["content_hash"]
+            # This legacy direct planner harness has no physical provider owner.
+            # Real selected pages cannot manufacture the missing owned call IDs.
+            assert all(call.call_id is None for call in recorder.llm_calls)
+            assert evidence.inspection_coverage("planner") == evidence.historical_inspection_coverage() == ()
+            # A later primary candidate seeing only a planner summary cannot
+            # borrow nested delivery, even when planner coverage is complete.
+            assert evidence.inspection_coverage("primary") == ()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_blob_content_discovery_buffers_admitted_result_and_redacts_persistence(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
@@ -5302,8 +5439,13 @@ async def test_blob_content_discovery_audit_projection_never_retains_content(
     )
     invocation = recorder.invocations[0]
     assert invocation.tool_name == "get_blob_content"
-    assert "name,score" not in (invocation.result_canonical or "")
-    assert set(json.loads(invocation.result_canonical or "{}")) == {"success", "validation", "version"}
+    buffered = json.loads(invocation.result_canonical or "{}")
+    assert buffered["data"]["content"] == "name,score\nada,42\n"
+    assert "affected_nodes" in buffered and "errors" in buffered["validation"]
+    from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+
+    summary, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+    assert "name,score" not in json.dumps(envelope) and "name,score" not in summary
 
 
 def _text_response(text: str, *, cost: object = 0.01) -> _Response:

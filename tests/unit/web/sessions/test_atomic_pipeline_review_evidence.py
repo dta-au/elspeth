@@ -958,11 +958,26 @@ async def test_atomic_pipeline_required_ticket_refusal_is_completed_without_sql(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retry", [False, True])
-async def test_terminal_failure_required_coordinator_observes_each_actual_attempt(operation_store, monkeypatch, retry):
+@pytest.mark.parametrize("retain_failure_facts", [False, True])
+async def test_terminal_failure_required_coordinator_observes_each_actual_attempt(
+    operation_store, monkeypatch, retry, retain_failure_facts
+):
     import elspeth.web.sessions.service as service_module
+    from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
+    from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
 
     _engine, repository, authority, service, sid = operation_store
     record, running = start(operation_store)
+    capture = (
+        ComposerOperationFailureFacts(
+            record.operation_id,
+            record.request_id,
+            running.session_operation_context,
+            capture_failure_facts(RuntimeError("Synthetic owned finalization failure")),
+        )
+        if retain_failure_facts
+        else None
+    )
     coordinator = RequiredWorkCoordinator(
         RequiredWorkAuthority(
             RequiredAuthorityKind.DURABLE_COMPOSE,
@@ -989,7 +1004,7 @@ async def test_terminal_failure_required_coordinator_observes_each_actual_attemp
         recurrence_ordinal=0,
     )
     terminal = await service.fail_composer_async_operation(
-        running, failure=failed(), required_work=coordinator, failure_projection_work=projection
+        running, failure=failed(), required_work=coordinator, failure_projection_work=projection, operation_failure_facts=capture
     )
     projection.begin_projection()
     assert terminal.status == "failed" and authority.get(session_id=sid, operation_id=record.operation_id) == terminal
@@ -1000,6 +1015,13 @@ async def test_terminal_failure_required_coordinator_observes_each_actual_attemp
     reads = [ticket for ticket in coordinator.tickets if ticket.key.source is RequiredWorkSource.TERMINAL_WRITER_READ_SQL]
     assert len(reads) == int(retry)
     assert len(coordinator.failure_receipts()) == int(retry)
+    diagnostics = [
+        envelope
+        for row in await service.get_messages(sid, limit=None)
+        for envelope in row.tool_calls or ()
+        if envelope.get("_kind") == "composer_diagnostic_evidence"
+    ]
+    assert len(diagnostics) == int(retain_failure_facts)
     repository.release(running.session_operation_context)
 
 

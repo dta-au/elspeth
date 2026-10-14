@@ -105,8 +105,8 @@ async def test_end_checkpoint_retries_clean_content_with_tool_calls(make_service
     service = make_service()
     replies = iter(
         [
-            (_reply(verdict="CLEAN", steps=[], findings="", note=None), [object()]),
-            (_reply(), None),
+            (_reply(verdict="CLEAN", steps=[], findings="", note=None, publication_verdict="ADMIT"), [object()]),
+            (_reply(publication_verdict="WITHHOLD"), None),
         ]
     )
 
@@ -123,7 +123,7 @@ async def test_end_checkpoint_retries_clean_content_with_tool_calls(make_service
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     recorder = BufferingRecorder()
     verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-        phase="end", state=simple_state, recorder=recorder, **_fenced_session(service)
+        phase="end", state=simple_state, recorder=recorder, **_fenced_session(service, review_state=simple_state)
     )
 
     assert verdict.ok and verdict.blocking
@@ -158,8 +158,9 @@ async def test_excessively_nested_json_exhausts_checkpoint_retry_as_malformed(ma
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_structured_reply_records_counts_before_any_terminal_publication(make_service, simple_state, phase):
     service = make_service()
-    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_reply(), {}))
-    fenced = _fenced_session(service)
+    publication_fields = {"publication_verdict": "WITHHOLD"} if phase == "end" else {}
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_reply(**publication_fields), {}))
+    fenced = _fenced_session(service, review_state=simple_state if phase == "end" else None)
     with structlog.testing.capture_logs() as events:
         verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=simple_state, recorder=None, **fenced)
     assert verdict.findings_text == "TECHNICAL_CANARY: rate needs page content."

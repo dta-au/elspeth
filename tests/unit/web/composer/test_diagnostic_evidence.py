@@ -29,6 +29,63 @@ def build(arguments: object, *, wire: str | None = None, result: object = None, 
     )
 
 
+@pytest.mark.parametrize("mismatch", ("operation", "request", "fence", "epoch"))
+def test_operation_failure_capture_rejects_other_request_or_fence(mismatch: str) -> None:
+    from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+    from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
+    from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+
+    context = SessionOperationContext(SessionOperationFence("session-a", "compose-fence", "lease", 4), SessionOperationKind.COMPOSE)
+    capture = ComposerOperationFailureFacts("durable-operation", "request", context, capture_failure_facts(RuntimeError("Private fact")))
+    capture.validate_for(durable_operation_id="durable-operation", request_id="request", context=context)
+    altered = replace(
+        context,
+        fence=replace(
+            context.fence,
+            operation_id="other-fence" if mismatch == "fence" else "compose-fence",
+            operation_epoch=5 if mismatch == "epoch" else 4,
+        ),
+    )
+    with pytest.raises(AuditIntegrityError):
+        capture.validate_for(
+            durable_operation_id="another-operation" if mismatch == "operation" else "durable-operation",
+            request_id="another-request" if mismatch == "request" else "request",
+            context=altered,
+        )
+
+
+def test_operation_failure_draft_preserves_bounded_facts_and_final_support_identity() -> None:
+    from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+    from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts, private_operation_failure_draft
+    from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+    from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
+
+    context = SessionOperationContext(SessionOperationFence("session-a", "compose-fence", "lease", 4), SessionOperationKind.COMPOSE)
+    original = ExceptionGroup("Private group", [RuntimeError("ordinary private detail " * 80) for _ in range(12)])
+    facts = capture_failure_facts(original)
+    capture = ComposerOperationFailureFacts("durable-operation", "request", context, facts)
+    selected = project_composer_operation_error(original, request_id="request", diagnostic_id="11111111-1111-4111-8111-111111111111")
+    draft = private_operation_failure_draft(capture, failure=selected)
+    assert draft.role == "audit" and draft.inherit_composition_state is False
+    assert draft.composition_state_id is None
+    assert len(facts.canonical.encode("utf-8")) <= 8192
+    evidence = ComposerDiagnosticEvidence.from_envelope(
+        draft.tool_calls[0], expected_session_id="session-a", expected_operation_id="compose-fence"
+    )
+    assert evidence.result.content == facts.canonical
+    assert evidence.tool_call_id == "operation:durable-operation"
+    assert evidence.evidence_id.startswith("operation-failure:")
+    assert evidence.status == "operation_failure"
+    assert json.loads(evidence.arguments.content) == {
+        "durable_operation_id": "durable-operation",
+        "request_id": "request",
+        "diagnostic_id": selected.diagnostic_id,
+        "failure_code": "operation_failed",
+        "correlation_kind": "internal_operation",
+    }
+    assert "ordinary private detail" not in selected.model_dump_json()
+
+
 def test_complete_nested_authored_values_and_result_survive() -> None:
     arguments = {
         "options": {

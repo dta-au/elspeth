@@ -19,12 +19,14 @@ import hashlib
 import json
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
+    from elspeth.web.composer.turn_effects import BlobDeliveryAttempt, TurnEvidence
     from elspeth.web.sessions.protocol import (
         SessionServiceProtocol,
     )
@@ -44,6 +46,7 @@ from elspeth.contracts.composer_llm_audit import (
 )
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.async_workers import run_sync_in_worker
@@ -117,6 +120,8 @@ from elspeth.web.composer.protocol import (
     ComposerServiceError,
     ComposerSettings,
     GraphRecoveryResponse,
+    RetainedOperationContext,
+    retained_operation_context_message,
 )
 from elspeth.web.composer.provider_config import (
     LLM_API_MAX_ATTEMPTS,
@@ -765,6 +770,8 @@ class ComposerServiceImpl:
             endpoint_api_key=self._endpoint_api_key,
             advisor_endpoint_base_url=self._advisor_endpoint_base_url,
             advisor_endpoint_api_key=self._advisor_endpoint_api_key,
+            advisor_checkpoint=self._advisor_checkpoint,
+            completion=self._completion,
         )
         # F-5c gate: ensures the first ``compose()`` call upserts
         # the skill markdown into ``skill_markdown_history`` exactly once
@@ -1072,6 +1079,7 @@ class ComposerServiceImpl:
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         recovery_context: GraphRecoveryContext | None = None,
+        retained_operation_context: RetainedOperationContext | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -1092,6 +1100,10 @@ class ComposerServiceImpl:
             ComposerConvergenceError: If a budget is exhausted or
                 the timeout is exceeded.
         """
+        if retained_operation_context is not None:
+            if type(retained_operation_context) is not RetainedOperationContext:
+                raise TypeError("Retained operation context must be an owned value")
+            retained_operation_context.validate_for(session_id=session_id, actor_user_id=user_id)
         if (required_work is None) != (provider_owner is None):
             raise AuditIntegrityError("Required Composer provider ownership must be supplied with its turn binding")
         if provider_owner is not None:
@@ -1136,6 +1148,18 @@ class ComposerServiceImpl:
             # One recorder spans planning or the ordinary loop so every provider
             # and discovery audit for this request is accounted for.
             recorder = BufferingRecorder()
+            from elspeth.web.composer.turn_effects import TurnEvidence
+
+            turn_evidence = TurnEvidence(
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                request_id=user_message_id or str(uuid4()),
+                request=message,
+                initial_state_id=current_state_id,
+                initial_state=state,
+                retained_operation_context=retained_operation_context,
+                actor_user_id=user_id,
+            )
             plugin_snapshot, policy_catalog = self._policy_context.build(user_id)
             try:
                 # Which authoring surface a request gets is decided here, and the
@@ -1207,6 +1231,9 @@ class ComposerServiceImpl:
                         required_work=required_work,
                         provider_owner=provider_owner,
                         recovery_context=recovery_context,
+                        retained_operation_context=retained_operation_context,
+                        turn_evidence=turn_evidence,
+                        request_deadline=deadline,
                     )
                 return await self._compose_loop(
                     message,
@@ -1226,6 +1253,8 @@ class ComposerServiceImpl:
                     required_work=required_work,
                     provider_owner=provider_owner,
                     recovery_context=recovery_context,
+                    retained_operation_context=retained_operation_context,
+                    turn_evidence=turn_evidence,
                 )
             except ComposerConvergenceError as exc:
                 await emit_progress(
@@ -1351,6 +1380,31 @@ class ComposerServiceImpl:
             failed_turn=failed_turn,
         )
 
+    def _prepare_primary_delivery(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        recorder: BufferingRecorder,
+        turn_evidence: TurnEvidence | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], BlobDeliveryAttempt | None]:
+        """Freeze the selected input and derive the gateway's exact marked hash."""
+        from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
+
+        selected_messages, selected_tools = deepcopy(messages), deepcopy(tools)
+        delivery = None
+        if turn_evidence is not None:
+            marked_messages, marked_tools = selected_messages, selected_tools
+            if supports_anthropic_prompt_cache_markers(self._model):
+                marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(
+                    selected_messages, selected_tools, mark_history_tail=True
+                )
+                marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
+            delivery = turn_evidence.prepare_delivery(
+                marked_messages, previous_calls=recorder.llm_calls, tools=marked_tools or None, scope="primary"
+            )
+        return selected_messages, selected_tools, delivery
+
     async def _call_model_turn(
         self,
         *,
@@ -1366,6 +1420,7 @@ class ComposerServiceImpl:
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
         provider_owner: ProviderInvocationOwner | None = None,
+        turn_evidence: TurnEvidence | None = None,
     ) -> _CallModelOutcome:
         """Phase P1 of the compose loop — one LLM call with cap enforcement.
 
@@ -1382,9 +1437,12 @@ class ComposerServiceImpl:
         turn has been persisted yet.
         """
         await emit_progress(progress, model_call_progress_event(message))
+        selected_messages, selected_tools, delivery = self._prepare_primary_delivery(
+            messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence
+        )
         completion = await self._call_llm_before_deadline(
-            llm_messages,
-            tools,
+            selected_messages,
+            selected_tools,
             state,
             initial_version,
             deadline,
@@ -1406,6 +1464,8 @@ class ComposerServiceImpl:
             persisted_tool_call_turn=False,
         )
 
+        if turn_evidence is not None and delivery is not None:
+            turn_evidence.confirm_delivery(delivery, recorder.llm_calls)
         return _CallModelOutcome(completion=completion)
 
     async def _persist_turn_audit(
@@ -1434,6 +1494,7 @@ class ComposerServiceImpl:
         chat_ingress_inputs: list[ChatIngressInput] | None = None,
         advisor_repair_context_introduced: bool = False,
         required_work: RequiredWorkBinding | None = None,
+        turn_evidence: TurnEvidence | None = None,
     ) -> _PersistOutcome:
         """Phase P4 of the compose loop — delegates to :func:`turn_audit.persist_turn_audit`."""
         from elspeth.web.composer.turn_audit import persist_turn_audit
@@ -1475,6 +1536,7 @@ class ComposerServiceImpl:
             chat_ingress_inputs=chat_ingress_inputs,
             assistant_row_uses_current_dispatch=not advisor_repair_context_introduced,
             required_work=required_work,
+            turn_evidence=turn_evidence,
         )
 
     async def _dispatch_tool_batch(
@@ -1508,6 +1570,7 @@ class ComposerServiceImpl:
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
         provider_owner: ProviderInvocationOwner | None = None,
+        turn_evidence: TurnEvidence | None = None,
     ) -> tuple[_DispatchOutcome, int]:
         """Phase P3 of the compose loop — delegates to :func:`tool_batch.run_tool_batch`."""
         from elspeth.web.composer.tool_batch import (
@@ -1572,6 +1635,7 @@ class ComposerServiceImpl:
             composition_turns_used=composition_turns_used,
             discovery_turns_used=discovery_turns_used,
             failed_turn=failed_turn,
+            turn_evidence=turn_evidence,
         )
         acc = BatchAccumulator(
             state=state,
@@ -1590,6 +1654,7 @@ class ComposerServiceImpl:
         self,
         *,
         dispatch: _DispatchOutcome,
+        turn_evidence: TurnEvidence,
         persist: _PersistOutcome,
         llm_messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
@@ -1816,6 +1881,12 @@ class ComposerServiceImpl:
                     }
                 )
                 provider_failures: tuple[type[Exception], ...] = (TimeoutError, _BadRequestLLMError, *advisor_provider_failure_types())
+                selected_reply_messages, selected_reply_tools, reply_delivery = self._prepare_primary_delivery(
+                    messages=reply_messages,
+                    tools=recovery_tool_definitions(self._planner_dialect),
+                    recorder=recorder,
+                    turn_evidence=turn_evidence,
+                )
                 if remaining > 0:
                     await emit_progress(
                         progress,
@@ -1828,8 +1899,8 @@ class ComposerServiceImpl:
                     )
                     try:
                         completion = await self._provider_gateway._call_llm_with_audit(
-                            reply_messages,
-                            recovery_tool_definitions(self._planner_dialect),
+                            selected_reply_messages,
+                            selected_reply_tools,
                             timeout=remaining,
                             recorder=recorder,
                             provider_custody=self._new_primary_custody(provider_owner),
@@ -1851,25 +1922,79 @@ class ComposerServiceImpl:
                             user_message=message,
                         ):
                             reply = None
-                result = await self._completion._surface_and_finalize_no_tools(
-                    session_operation_context=session_operation_context,
-                    assistant_message=reply if reply is not None else _AdmittedAssistantMessage(content=""),
-                    state=state,
-                    session_id=session_id,
-                    current_state_id=persist.current_state_id,
-                    progress=progress,
-                    recorder=recorder,
-                    initial_version=initial_version,
-                    user_id=user_id,
-                    last_runtime_preflight=runtime_result,
-                    runtime_preflight_cache=runtime_preflight_cache,
-                    session_scope=session_scope,
-                    message=message,
-                    mutation_success_seen=mutation_success_seen,
-                    repair_turns_used=repair_turns_used,
-                    plugin_snapshot=plugin_snapshot,
-                    deadline=deadline,
-                )
+                        if reply is not None and not completion.tool_batch.calls and reply_delivery is not None:
+                            turn_evidence.confirm_delivery(reply_delivery, recorder.llm_calls)
+                advisor_gate = None
+                if reply is not None:
+                    try:
+                        advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
+                            state=state,
+                            turn_evidence=turn_evidence,
+                            session_operation_context=session_operation_context,
+                            session_id=session_id,
+                            current_state_id=persist.current_state_id,
+                            assistant_message=reply,
+                            llm_messages=llm_messages,
+                            recorder=recorder,
+                            progress=progress,
+                            advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                            repair_turns_used=repair_turns_used,
+                            persisted_assistant_message_id=persisted_assistant_message_id,
+                            persisted_assistant_content=persisted_assistant_content,
+                            persisted_tool_call_turn=persisted_tool_call_turn,
+                            allow_repair_continue=False,
+                            runtime_preflight=runtime_result,
+                            user_message=message,
+                            user_id=user_id,
+                            runtime_preflight_cache=runtime_preflight_cache,
+                            initial_version=initial_version,
+                            session_scope=session_scope,
+                            plugin_snapshot=plugin_snapshot,
+                            advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+                            deadline=deadline,
+                            completion_gates=completion_gates,
+                            provider_owner=provider_owner,
+                        )
+                    except _AdvisorCheckpointComposeDeadlineExpired:
+                        await self._completion._persist_withheld_reply(
+                            "compose_deadline_expired",
+                            reply.content or "",
+                            session_id=session_id,
+                            session_operation_context=session_operation_context,
+                        )
+                        raise ComposerConvergenceError.capture(
+                            max_turns=composition_turns_used + discovery_turns_used,
+                            budget_exhausted="timeout",
+                            state=state,
+                            initial_version=initial_version,
+                            tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                            llm_calls=recorder.llm_calls,
+                            failed_turn=failed_turn,
+                        ) from None
+                if advisor_gate is not None and advisor_gate.action == "return":
+                    if advisor_gate.result is None:
+                        raise InvariantError("Staged reply review omitted its terminal result")
+                    result = advisor_gate.result
+                else:
+                    result = await self._completion._surface_and_finalize_no_tools(
+                        session_operation_context=session_operation_context,
+                        assistant_message=reply if reply is not None else _AdmittedAssistantMessage(content=""),
+                        state=state,
+                        session_id=session_id,
+                        current_state_id=persist.current_state_id,
+                        progress=progress,
+                        recorder=recorder,
+                        initial_version=initial_version,
+                        user_id=user_id,
+                        last_runtime_preflight=runtime_result,
+                        runtime_preflight_cache=runtime_preflight_cache,
+                        session_scope=session_scope,
+                        message=message,
+                        mutation_success_seen=mutation_success_seen,
+                        repair_turns_used=repair_turns_used,
+                        plugin_snapshot=plugin_snapshot,
+                        deadline=deadline,
+                    )
                 # ``_surface_and_finalize_no_tools`` now owns the announcement
                 # (with its outstanding-findings qualification) for the
                 # pending-handoff preflight shape on EVERY caller
@@ -1893,11 +2018,26 @@ class ComposerServiceImpl:
                 # cross-turn red arm — belongs to
                 # ``_announce_staged_review_handoff`` (elspeth-2ed41f0a4a R1).
                 handoff_result = (
-                    _announce_staged_review_handoff(result, reply.content if reply is not None else "")
+                    _announce_staged_review_handoff(
+                        result,
+                        (result.raw_assistant_content or "")
+                        if advisor_gate is not None and advisor_gate.action == "return"
+                        else reply.content
+                        if reply is not None
+                        else "",
+                    )
                     if (result.runtime_preflight is None or not _is_pending_interpretation_handoff(result.runtime_preflight))
                     else result
                 )
-                handoff_result = _with_advisor_gate_decision(handoff_result, completion_gates, None)
+                handoff_result = _with_advisor_gate_decision(
+                    handoff_result,
+                    completion_gates,
+                    result.advisor_gate_decision
+                    if advisor_gate is not None and advisor_gate.action == "return"
+                    else advisor_gate.advisor_gate_decision
+                    if advisor_gate is not None
+                    else None,
+                )
                 if reply is None:
                     handoff_result = replace(
                         handoff_result,
@@ -1920,6 +2060,8 @@ class ComposerServiceImpl:
                     result=threaded,
                     composition_turns_delta=1 if turn_has_mutation else 0,
                     discovery_turns_delta=1 if turn_has_discovery else 0,
+                    advisor_passes_delta=advisor_gate.advisor_passes_delta if advisor_gate is not None else 0,
+                    publication_binding=advisor_gate.publication_binding if advisor_gate is not None else None,
                 )
 
         # Classify turn and charge the appropriate budget.
@@ -1960,9 +2102,12 @@ class ComposerServiceImpl:
                     )
                     final_tools = recovery_tool_definitions(self._planner_dialect)
                 await emit_progress(progress, model_call_progress_event(message))
+                selected_final_messages, selected_final_tools, final_delivery = self._prepare_primary_delivery(
+                    messages=final_messages, tools=final_tools, recorder=recorder, turn_evidence=turn_evidence
+                )
                 completion = await self._call_llm_before_deadline(
-                    final_messages,
-                    final_tools,
+                    selected_final_messages,
+                    selected_final_tools,
                     state,
                     initial_version,
                     deadline,
@@ -1998,9 +2143,12 @@ class ComposerServiceImpl:
                 if reply_only_echo:
                     assistant_message = _AdmittedAssistantMessage(content="")
                 if not completion.tool_batch.calls:
+                    if not reply_only_echo and final_delivery is not None:
+                        turn_evidence.confirm_delivery(final_delivery, recorder.llm_calls)
                     try:
                         advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
                             state=state,
+                            turn_evidence=turn_evidence,
                             session_operation_context=session_operation_context,
                             session_id=session_id,
                             current_state_id=persist.current_state_id,
@@ -2124,6 +2272,7 @@ class ComposerServiceImpl:
                         result=threaded,
                         composition_turns_delta=int(turn_has_mutation),
                         discovery_turns_delta=int(final_preview_at_discovery_cap),
+                        publication_binding=advisor_gate.publication_binding,
                     )
                 raise ComposerConvergenceError.capture(
                     max_turns=new_composition_turns_used + new_discovery_turns_used,
@@ -2177,6 +2326,8 @@ class ComposerServiceImpl:
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         recovery_context: GraphRecoveryContext | None = None,
+        retained_operation_context: RetainedOperationContext | None = None,
+        turn_evidence: TurnEvidence | None = None,
     ) -> ComposerResult:
         """Inner composition loop with dual-counter budget tracking.
 
@@ -2211,6 +2362,28 @@ class ComposerServiceImpl:
                 a fresh recorder for direct and test-only callers.
         """
         initial_version = state.version
+        from elspeth.web.composer.turn_effects import TurnEvidence
+
+        if turn_evidence is None:
+            turn_evidence = TurnEvidence(
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                request_id=user_message_id or str(uuid4()),
+                request=message,
+                initial_state_id=initial_current_state_id,
+                initial_state=state,
+                retained_operation_context=retained_operation_context,
+                actor_user_id=user_id,
+            )
+        elif (
+            type(turn_evidence) is not TurnEvidence
+            or turn_evidence.session_id != session_id
+            or turn_evidence.request_hash != stable_hash(message)
+            or turn_evidence.operation_id
+            != (session_operation_context.fence.operation_id if session_operation_context is not None else None)
+            or (user_message_id is not None and turn_evidence.request_id != user_message_id)
+        ):
+            raise AuditIntegrityError("Compose loop evidence belongs to a different request")
         ingress = compartment_ingress_record(message, own_compartment_id=self._settings.compartment_id) if session_id is not None else None
         chat_ingress_inputs = (
             _chat_ingress_inputs_for_compose(
@@ -2243,6 +2416,9 @@ class ComposerServiceImpl:
         tools = composer_loop_tool_definitions(self._planner_dialect)
         if recovery_context is not None:
             llm_messages.append({"role": "system", "content": recovery_context_message(recovery_context)})
+        if retained_operation_context is not None:
+            retained_operation_context.validate_for(session_id=session_id, actor_user_id=user_id)
+        llm_messages.append({"role": "system", "content": retained_operation_context_message(retained_operation_context)})
         # Per-call audit recorder. Surfaced on ComposerResult and on
         # the three partial-state-carrier exceptions so the route handler
         # always has the per-call decision trail — including failure paths.
@@ -2363,6 +2539,7 @@ class ComposerServiceImpl:
                 discovery_turns_used=discovery_turns_used,
                 failed_turn=failed_turn,
                 provider_owner=provider_owner,
+                turn_evidence=turn_evidence,
             )
             recovery_result = self._terminal_recovery_result(
                 call_model.completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
@@ -2389,6 +2566,7 @@ class ComposerServiceImpl:
                     llm_messages.append({"role": "assistant", "content": superseded_reply})
                 terminate = await self._completion._try_terminate_no_tools(
                     assistant_message=call_model.completion.message,
+                    turn_evidence=turn_evidence,
                     session_operation_context=session_operation_context,
                     message=message,
                     llm_messages=llm_messages,
@@ -2446,6 +2624,9 @@ class ComposerServiceImpl:
                             initial_version=initial_version,
                             session_scope=session_scope,
                             plugin_snapshot=plugin_snapshot,
+                            publication_binding=terminate.publication_binding,
+                            turn_evidence=turn_evidence,
+                            user_message=message,
                         )
                     return terminate.result
                 repair_turns_used += terminate.repair_turns_delta
@@ -2489,7 +2670,7 @@ class ComposerServiceImpl:
                 _composition_turns_used: int = composition_turns_used,
                 _discovery_turns_used: int = discovery_turns_used,
                 _failed_turn: FailedTurnMetadata | None = failed_turn,
-            ) -> tuple[_DispatchOutcome, _PersistOutcome, int, bool, bool]:
+            ) -> tuple[_DispatchOutcome, _PersistOutcome, int, bool, bool, BaseException | None]:
                 invocation_start = len(recorder.invocations)
                 try:
                     dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
@@ -2521,6 +2702,7 @@ class ComposerServiceImpl:
                         discovery_turns_used=_discovery_turns_used,
                         failed_turn=_failed_turn,
                         provider_owner=provider_owner,
+                        turn_evidence=turn_evidence,
                     )
                 except ComposerRuntimePreflightError as preflight_failure:
                     raise ComposerRuntimePreflightError(
@@ -2557,6 +2739,7 @@ class ComposerServiceImpl:
                 # the completed audit prefix.
                 early_advisor_message_count = len(llm_messages)
                 early_checkpoint_deadline_expired = False
+                early_checkpoint_failure: BaseException | None = None
                 try:
                     if (
                         not _cancellation_requested.is_set()
@@ -2579,6 +2762,11 @@ class ComposerServiceImpl:
                             # The driver converts this signal after persistence
                             # and after plugin/cancellation primacy checks.
                             early_checkpoint_deadline_expired = True
+                        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as checkpoint_failure:
+                            # Defer the exact failure until P4's committed
+                            # metadata has reached the driver. This is cleanup
+                            # custody, not classification as a provider outage.
+                            early_checkpoint_failure = checkpoint_failure
                 finally:
                     # The tool batch already ran. Its audit must be persisted
                     # even when an internal advisor failure unwinds this turn.
@@ -2604,6 +2792,7 @@ class ComposerServiceImpl:
                         chat_ingress_inputs=chat_ingress_inputs,
                         advisor_repair_context_introduced=_advisor_repair_context_introduced,
                         required_work=required_work,
+                        turn_evidence=turn_evidence,
                     )
                     if diagnostics is not None:
                         diagnostics.redacted_assistant_tool_calls = persist_result.redacted_assistant_tool_calls
@@ -2615,6 +2804,7 @@ class ComposerServiceImpl:
                     updated_advisor_calls_used,
                     early_advisor_context_introduced,
                     early_checkpoint_deadline_expired,
+                    early_checkpoint_failure,
                 )
 
             (
@@ -2624,6 +2814,7 @@ class ComposerServiceImpl:
                     advisor_calls_used,
                     early_advisor_context_introduced,
                     early_checkpoint_deadline_expired,
+                    early_checkpoint_failure,
                 ),
                 deferred_cancel,
             ) = await _await_tool_turn_with_deferred_cancellation(
@@ -2649,6 +2840,9 @@ class ComposerServiceImpl:
             persisted_assistant_content = persist.persisted_assistant_content
             persisted_tool_call_turn = persist.persisted_tool_call_turn
             failed_turn = persist.failed_turn
+            pending_checkpoint_failures = tuple(
+                failure for failure in (early_checkpoint_failure, persist.effect_verification_failure) if failure is not None
+            )
             # Finalize-context elision drain (Task 6 Step 3). Gated on
             # ``dispatch.mutation_success_observed`` — NOT merely "a tool-call
             # turn dispatched" — because a discovery-only turn (get_plugin_schema,
@@ -2697,7 +2891,16 @@ class ComposerServiceImpl:
                         failed_turn=failed_turn,
                     )
                     if dispatch.plugin_crash_cause is None:
+                        if pending_checkpoint_failures:
+                            raise persisted_plugin_crash from BaseExceptionGroup(
+                                "Tool failure retained checkpoint failures", pending_checkpoint_failures
+                            )
                         raise persisted_plugin_crash
+                    if pending_checkpoint_failures:
+                        raise persisted_plugin_crash from BaseExceptionGroup(
+                            "Tool failure retained checkpoint failures",
+                            (dispatch.plugin_crash_cause, *pending_checkpoint_failures),
+                        )
                     raise persisted_plugin_crash from dispatch.plugin_crash_cause
                 if persist.unwind_audit_failed:
                     # P4 rolled back. Preserve only this unpersisted turn's
@@ -2717,12 +2920,30 @@ class ComposerServiceImpl:
                         failed_turn=failed_turn,
                     )
                     if dispatch.plugin_crash_cause is None:
+                        if pending_checkpoint_failures:
+                            raise unpersisted_plugin_crash from BaseExceptionGroup(
+                                "Tool failure retained checkpoint failures", pending_checkpoint_failures
+                            )
                         raise unpersisted_plugin_crash
+                    if pending_checkpoint_failures:
+                        raise unpersisted_plugin_crash from BaseExceptionGroup(
+                            "Tool failure retained checkpoint failures",
+                            (dispatch.plugin_crash_cause, *pending_checkpoint_failures),
+                        )
                     raise unpersisted_plugin_crash from dispatch.plugin_crash_cause
                 # No session/audit target was configured, so nothing in the
                 # request-cumulative crash carrier has been persisted yet.
                 if dispatch.plugin_crash_cause is None:
+                    if pending_checkpoint_failures:
+                        raise dispatch.plugin_crash from BaseExceptionGroup(
+                            "Tool failure retained checkpoint failures", pending_checkpoint_failures
+                        )
                     raise dispatch.plugin_crash
+                if pending_checkpoint_failures:
+                    raise dispatch.plugin_crash from BaseExceptionGroup(
+                        "Tool failure retained checkpoint failures",
+                        (dispatch.plugin_crash_cause, *pending_checkpoint_failures),
+                    )
                 raise dispatch.plugin_crash from dispatch.plugin_crash_cause
 
             if dispatch.advisor_failure is not None:
@@ -2737,6 +2958,14 @@ class ComposerServiceImpl:
                         "Advisor failure audit row could not be persisted",
                         failed_turn=failed_turn,
                     ) from dispatch.advisor_failure
+                if persist.effect_verification_failure is not None:
+                    prior_cause = dispatch.advisor_failure.__cause__
+                    raise dispatch.advisor_failure from BaseExceptionGroup(
+                        "Advisor failure and committed effect verification failure",
+                        (persist.effect_verification_failure,)
+                        if prior_cause is None
+                        else (prior_cause, persist.effect_verification_failure),
+                    )
                 raise dispatch.advisor_failure
 
             if deferred_cancel is not None:
@@ -2745,13 +2974,31 @@ class ComposerServiceImpl:
                 # compose request, then resume the original cancellation at
                 # the first safe checkpoint before P5 or another model turn.
                 attach_llm_calls(deferred_cancel, recorder)
+                if pending_checkpoint_failures:
+                    prior_cause = deferred_cancel.__cause__
+                    raise deferred_cancel from BaseExceptionGroup(
+                        "Caller cancellation retained checkpoint failures",
+                        pending_checkpoint_failures if prior_cause is None else (prior_cause, *pending_checkpoint_failures),
+                    )
                 raise deferred_cancel
+
+            if early_checkpoint_failure is not None:
+                attach_llm_calls(early_checkpoint_failure, recorder)
+                if persist.effect_verification_failure is not None:
+                    prior_cause = early_checkpoint_failure.__cause__
+                    raise early_checkpoint_failure from BaseExceptionGroup(
+                        "EARLY checkpoint failure retained committed effect verification failure",
+                        (persist.effect_verification_failure,)
+                        if prior_cause is None
+                        else (prior_cause, persist.effect_verification_failure),
+                    )
+                raise early_checkpoint_failure
 
             if dispatch.advisor_compose_timeout is not None:
                 current_invocation_count = len(dispatch.tool_outcomes)
                 if current_invocation_count == 0 or current_invocation_count > len(recorder.invocations):
                     raise InvariantError("advisor timeout dispatch must carry one invocation per current-turn tool outcome")
-                raise ComposerConvergenceError.capture(
+                advisor_timeout = ComposerConvergenceError.capture(
                     max_turns=composition_turns_used + discovery_turns_used,
                     budget_exhausted="timeout",
                     state=state,
@@ -2764,13 +3011,16 @@ class ComposerServiceImpl:
                     llm_calls=recorder.llm_calls,
                     failed_turn=failed_turn,
                 )
+                if persist.effect_verification_failure is not None:
+                    raise advisor_timeout from persist.effect_verification_failure
+                raise advisor_timeout
 
             if early_checkpoint_deadline_expired:
                 charged_composition_turns = composition_turns_used + (1 if dispatch.turn_has_mutation else 0)
                 charged_discovery_turns = discovery_turns_used + (
                     1 if dispatch.turn_has_discovery and not dispatch.turn_has_mutation else 0
                 )
-                raise ComposerConvergenceError.capture(
+                early_timeout = ComposerConvergenceError.capture(
                     max_turns=charged_composition_turns + charged_discovery_turns,
                     budget_exhausted="timeout",
                     state=state,
@@ -2779,9 +3029,17 @@ class ComposerServiceImpl:
                     llm_calls=recorder.llm_calls,
                     failed_turn=failed_turn,
                 )
+                if persist.effect_verification_failure is not None:
+                    raise early_timeout from persist.effect_verification_failure
+                raise early_timeout
+
+            if persist.effect_verification_failure is not None:
+                attach_llm_calls(persist.effect_verification_failure, recorder)
+                raise persist.effect_verification_failure
 
             classify = await self._classify_and_budget_turn(
                 dispatch=dispatch,
+                turn_evidence=turn_evidence,
                 session_operation_context=session_operation_context,
                 persist=persist,
                 llm_messages=llm_messages,
@@ -2837,6 +3095,9 @@ class ComposerServiceImpl:
                         initial_version=initial_version,
                         session_scope=session_scope,
                         plugin_snapshot=plugin_snapshot,
+                        publication_binding=classify.publication_binding,
+                        turn_evidence=turn_evidence,
+                        user_message=message,
                     )
                 return classify.result
             continue

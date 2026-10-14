@@ -125,6 +125,8 @@ class RequiredWorkSource(IntEnum):
     DEADLINE_SIGNAL = 50
     PROPOSAL_REJECTION_SQL = 51
     PROPOSAL_REJECTION_PROJECTION = 52
+    RETAINED_OPERATION_READ_SQL = 53
+    RETAINED_OPERATION_READ_PROJECTION = 54
 
 
 SOURCE_MAPPING = MappingProxyType(
@@ -215,6 +217,8 @@ SOURCE_MAPPING = MappingProxyType(
         RequiredWorkSource.DEADLINE_SIGNAL: (ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD, RequiredWorkSubphase.CANCELLATION_SIGNAL),
         RequiredWorkSource.PROPOSAL_REJECTION_SQL: (ComposerRequiredStage.PIPELINE_PUBLICATION, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.PROPOSAL_REJECTION_PROJECTION: (ComposerRequiredStage.PIPELINE_PUBLICATION, RequiredWorkSubphase.PROJECTION),
+        RequiredWorkSource.RETAINED_OPERATION_READ_SQL: (ComposerRequiredStage.REQUIRED_TURN_AUDIT, RequiredWorkSubphase.SQL_INITIAL),
+        RequiredWorkSource.RETAINED_OPERATION_READ_PROJECTION: (ComposerRequiredStage.REQUIRED_TURN_AUDIT, RequiredWorkSubphase.PROJECTION),
     }
 )
 
@@ -773,11 +777,6 @@ class ComposerFailureReduction:
     secondary_receipts: tuple[ComposerFailureReceipt, ...]
     original_roots: tuple[BaseException, ...]
 
-    def _project(self, *, request_id: str | None, timeout_seconds: float) -> ComposerOperationError:
-        return _project_composer_failure_witnesses(
-            self.category_rank, self.witnesses, request_id=request_id, timeout_seconds=timeout_seconds
-        )
-
     def project(self, *, request_id: str | None, timeout_seconds: float) -> ComposerOperationError:
         return project_composer_failure_witnesses(
             self.winner.key, self.category_rank, self.witnesses, request_id=request_id, timeout_seconds=timeout_seconds
@@ -785,7 +784,7 @@ class ComposerFailureReduction:
 
 
 def _project_composer_failure_witnesses(
-    category_rank: int, witnesses: tuple[BaseException, ...], *, request_id: str | None, timeout_seconds: float
+    category_rank: int, witnesses: tuple[BaseException, ...], *, request_id: str | None, timeout_seconds: float, diagnostic_id: str
 ) -> ComposerOperationError:
     from elspeth.web.sessions.composer_operation_errors import (
         deadline_expired_error,
@@ -816,18 +815,17 @@ def _project_composer_failure_witnesses(
                 }
             )
     if category_rank == 90 and len(witnesses) > 1:
-        errors = tuple(project_composer_operation_error(w, request_id=request_id) for w in witnesses)
+        errors = tuple(project_composer_operation_error(w, request_id=request_id, diagnostic_id=diagnostic_id) for w in witnesses)
         if any(error != errors[0] for error in errors[1:]):
-            return project_composer_operation_error(RuntimeError("Conflicting public witnesses"), request_id=request_id)
-    return project_composer_operation_error(witnesses[0], request_id=request_id)
+            return project_composer_operation_error(
+                RuntimeError("Conflicting public witnesses"), request_id=request_id, diagnostic_id=diagnostic_id
+            )
+    return project_composer_operation_error(witnesses[0], request_id=request_id, diagnostic_id=diagnostic_id)
 
 
 def project_composer_failure_witnesses(
     key: RequiredWorkKey, category_rank: int, witnesses: tuple[BaseException, ...], *, request_id: str | None, timeout_seconds: float
 ) -> ComposerOperationError:
-    error = _project_composer_failure_witnesses(category_rank, witnesses, request_id=request_id, timeout_seconds=timeout_seconds)
-    if error.failure_code != "operation_failed":
-        return error
     identity = ":".join(
         (
             key.session_id,
@@ -840,18 +838,8 @@ def project_composer_failure_witnesses(
         )
     )
     diagnostic_id = str(uuid5(NAMESPACE_URL, "elspeth-required-failure:" + identity))
-    return error.model_copy(
-        update={
-            "diagnostic_id": diagnostic_id,
-            "body": {
-                "detail": {
-                    "error_type": "operation_failed",
-                    "detail": "The compose operation failed. See the application audit log for diagnostic detail.",
-                    "request_id": request_id,
-                    "diagnostic_id": diagnostic_id,
-                }
-            },
-        }
+    return _project_composer_failure_witnesses(
+        category_rank, witnesses, request_id=request_id, timeout_seconds=timeout_seconds, diagnostic_id=diagnostic_id
     )
 
 

@@ -40,6 +40,63 @@ from tests.unit.web.composer.test_compose_loop_persistence import _run_one_turn,
 from tests.unit.web.sessions.test_token_usage_adapters import _quota_service
 
 
+class _SDKTransportGuard:
+    def __init__(self):
+        self.unexpected_calls = 0
+
+    async def __call__(self, **kwargs):
+        self.unexpected_calls += 1
+        raise AssertionError("Private persistence controls must explicitly mock SDK transport")
+
+    def assert_unused(self):
+        assert self.unexpected_calls == 0, "Unmocked SDK transport was attempted, even if the caller caught its failure"
+
+
+@pytest.fixture(autouse=True)
+def forbid_unmocked_sdk_transport(monkeypatch):
+    import litellm
+
+    guard = _SDKTransportGuard()
+    monkeypatch.setattr(litellm, "acompletion", guard)
+    yield guard
+    guard.assert_unused()
+
+
+@pytest.mark.asyncio
+async def test_private_persistence_guard_refuses_unmocked_sdk_transport(forbid_unmocked_sdk_transport, composer_service_with_real_sessions):
+    import litellm
+
+    from elspeth.web.composer.state import CompositionState, PipelineMetadata
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    evidence = TurnEvidence(
+        session_id=None,
+        session_operation_context=None,
+        request_id="sdk-guard-negative-control",
+        request="Explain",
+        initial_state_id=None,
+        initial_state=state,
+    )
+    assert litellm.acompletion is forbid_unmocked_sdk_transport
+    with pytest.raises(AssertionError, match="must explicitly mock SDK transport"):
+        await composer_service_with_real_sessions._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=state,
+            session_id=None,
+            session_operation_context=None,
+            recorder=BufferingRecorder(),
+            user_message="Explain",
+            publication_review=evidence.review_candidate(candidate="Explanation", request="Explain", current_state=state),
+        )
+    assert forbid_unmocked_sdk_transport.unexpected_calls == 1
+    # The teardown gate rejects an attempted call even after a consumer catches
+    # its exception. Only this deliberate negative control acknowledges it.
+    with pytest.raises(AssertionError, match="even if the caller caught"):
+        forbid_unmocked_sdk_transport.assert_unused()
+    forbid_unmocked_sdk_transport.unexpected_calls = 0
+
+
 @pytest.fixture
 def private_writer(tmp_path):
     engine, authority, service = _quota_service(tmp_path)
@@ -78,6 +135,30 @@ def _normal_kwargs(session, context, evidence):
         "plugin_crash_pending": False,
         "session_operation_context": context,
     }
+
+
+@pytest.mark.asyncio
+async def test_advisor_publication_withheld_origin_preserves_private_hash_and_replay_exclusion(private_writer):
+    from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND, COMPOSER_WITHHELD_REPLY_SCHEMA, withheld_reply_envelope
+
+    service, session, context, _ = private_writer
+    candidate = "UNREVIEWED_COMPLETION_CANARY: all requested edits are complete."
+    envelope = withheld_reply_envelope("advisor_publication_withheld", candidate)
+    row = await service.add_message(
+        session.id, "audit", candidate, writer_principal="compose_loop", tool_calls=[envelope], session_operation_context=context
+    )
+    rows = await service.get_messages(session.id, limit=None)
+    assert [record.id for record in rows] == [row.id]
+    assert rows[0].content == candidate
+    assert deep_thaw(rows[0].tool_calls) == [
+        {
+            "_kind": COMPOSER_WITHHELD_REPLY_KIND,
+            "schema": COMPOSER_WITHHELD_REPLY_SCHEMA,
+            "origin": "advisor_publication_withheld",
+            "content_hash": hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
+        }
+    ]
+    assert _helpers._composer_chat_history(rows) == []
 
 
 @pytest.mark.asyncio
@@ -828,8 +909,13 @@ async def test_rejected_receipt_then_fatal_assertion_drains_private_audit_before
 
 @pytest.mark.asyncio
 async def test_normal_tool_turn_retains_private_authored_content(
-    composer_service_with_real_sessions, fake_llm_with_sensitive_tool_call, result_session_id
+    composer_service_with_real_sessions, fake_llm_with_sensitive_tool_call, result_session_id, monkeypatch
 ):
+    from tests.unit.web.composer._helpers import _clean_advisor_checkpoint
+
+    # This control owns P4 authoring privacy, not provider/END policy. Its
+    # explicit stub still requires the actual candidate/evidence binding.
+    monkeypatch.setattr(composer_service_with_real_sessions._advisor_checkpoint, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
     await _run_one_turn(
         composer_service_with_real_sessions,
         llm=fake_llm_with_sensitive_tool_call,

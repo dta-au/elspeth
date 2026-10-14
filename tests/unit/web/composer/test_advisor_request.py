@@ -18,6 +18,7 @@ def test_checkpoint_options_disable_inner_provider_retries(structured_output: bo
         api_base="https://gateway.example.test/v1",
         api_key="test-token",
         structured_output=structured_output,
+        checkpoint_phase="early" if structured_output else None,
     )
     assert options["num_retries"] == 0
     assert options["max_retries"] == 0
@@ -45,6 +46,7 @@ def test_checkpoint_options_require_schema_and_route_support(model: str, api_bas
         api_base=api_base,
         api_key="test-token",
         structured_output=True,
+        checkpoint_phase="early",
     )
     assert options["model"] == model
     assert options["temperature"] == 0.25
@@ -76,6 +78,7 @@ def test_hint_options_preserve_prose_request() -> None:
         api_base=None,
         api_key=None,
         structured_output=False,
+        checkpoint_phase=None,
     )
     assert options == {
         "model": "openrouter/anthropic/claude-sonnet-5",
@@ -99,6 +102,7 @@ def test_installed_litellm_preserves_schema_routing_and_reasoning(provider: str)
         api_base=None,
         api_key=None,
         structured_output=True,
+        checkpoint_phase="end",
     )
     parameters = litellm.utils.get_optional_params(
         model="anthropic/claude-sonnet-5" if provider == "openrouter" else "gpt-4o",

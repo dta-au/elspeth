@@ -189,6 +189,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
     from elspeth.web.composer.session_tool import SessionToolOwner
+    from elspeth.web.composer.turn_effects import TurnEvidence
     from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
     from elspeth.web.sessions.protocol import (
         ComposerSessionPreferencesRecord,
@@ -844,6 +845,7 @@ class ToolBatchContext:
     # service resolves it once and builds both the sent list and this context
     # from the same value, so decode always reads the W that was sent.
     tool_contract_dialect: ToolContractDialect
+    turn_evidence: TurnEvidence | None = None
     session_operation_authority: SessionOperationAuthority | None = None
     provider_owner: ProviderInvocationOwner | None = None
     # Driver turn counters and last persisted tool-call turn, read only when
@@ -3062,6 +3064,13 @@ async def run_tool_batch(
         result_json = (
             serialize_admitted_discovery_result(admitted_result) if admitted_result is not None else _serialize_tool_result(result)
         )
+        if tool_name == "get_blob_content" and admitted_result is not None and ctx.turn_evidence is not None:
+            ctx.turn_evidence.register_blob_page(
+                tool_call_id=tool_call.id,
+                admitted=admitted_result,
+                selected_content=result_json,
+                producer_call_id=ctx.turn_evidence.current_call_id("primary"),
+            )
         await emit_progress(progress, tool_completed_progress_event(tool_name, result.success))
         _append_tool_outcome(
             response=admitted_result.to_tool_result() if admitted_result is not None else result,

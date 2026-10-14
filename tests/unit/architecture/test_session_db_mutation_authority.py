@@ -4567,7 +4567,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="53042278a36c4c3d",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=1568,
+        line=1576,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4578,7 +4578,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="cead0bcc3bfd62ba",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=1766,
+        line=1774,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4589,7 +4589,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="7bca5022ef616220",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=1605,
+        line=1613,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4600,7 +4600,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="dd57e4a23cc02bec",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=7665,
+        line=7705,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4611,7 +4611,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="dd57e4a23cc02bec",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=7654,
+        line=7694,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4622,7 +4622,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=1,
         authority="SessionForkAuthority",
-        line=8365,
+        line=8405,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4633,7 +4633,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=2,
         authority="SessionForkAuthority",
-        line=8396,
+        line=8436,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4644,7 +4644,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=1,
         authority="SessionForkAuthority",
-        line=8376,
+        line=8416,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4655,7 +4655,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=1,
         authority="SessionForkAuthority",
-        line=8408,
+        line=8448,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4666,7 +4666,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="473d58f284d34114",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=2937,
+        line=2977,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4677,7 +4677,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="473d58f284d34114",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=2952,
+        line=2992,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -6444,7 +6444,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "5684c68046118475",
         1,
         None,
-        line=527,
+        line=484,
         connection_escape=True,
     ),
 )

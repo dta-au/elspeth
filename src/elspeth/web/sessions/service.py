@@ -152,7 +152,14 @@ from elspeth.web.required_work import (
     RequiredWorkTicket,
 )
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
-from elspeth.web.sessions._persist_payload import AuditMessageDraft, AuditOutcome, RedactedToolRow, RejectionRecord, StatePayload
+from elspeth.web.sessions._persist_payload import (
+    AuditMessageDraft,
+    AuditOutcome,
+    CommittedCheckpointWitness,
+    RedactedToolRow,
+    RejectionRecord,
+    StatePayload,
+)
 from elspeth.web.sessions.archive_quarantine import (
     ArchiveQuarantineIdentity,
     archive_quarantine_operation_ids,
@@ -401,6 +408,7 @@ from elspeth.web.validation import _validate_accepted_value_content
 
 if TYPE_CHECKING:
     from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.execution.envelope import RunExecutionInput
@@ -2049,6 +2057,7 @@ class SessionServiceImpl:
                         session_operation_context=session_operation_context,
                     )
 
+                    inserted_state_ids: list[UUID] = []
                     for offset, tool_row in enumerate(redacted_tool_rows, start=1):
                         state_id: str | None = None
                         if tool_row.composition_state_payload is not None:
@@ -2074,6 +2083,7 @@ class SessionServiceImpl:
                                 session_operation_context=session_operation_context,
                             )
                             current_state_id = state_id
+                            inserted_state_ids.append(UUID(state_id))
                         self._insert_chat_message(
                             conn,
                             session_id=session_id,
@@ -2143,10 +2153,36 @@ class SessionServiceImpl:
                             created_at=now,
                             session_operation_context=session_operation_context,
                         )
+                    checkpoint = None
+                    if inserted_state_ids:
+                        row = conn.execute(
+                            select(composition_states_table).where(
+                                composition_states_table.c.id == str(inserted_state_ids[-1]),
+                                composition_states_table.c.session_id == session_id,
+                            )
+                        ).one_or_none()
+                        if row is None or row.creator_operation_id != session_operation_context.fence.operation_id:
+                            raise AuditIntegrityError("Inserted compose checkpoint does not match its exact session and creator fence")
+                        checkpoint_state = self._row_to_state_record(row)
+                        if str(checkpoint_state.id) != current_state_id or str(checkpoint_state.session_id) != session_id:
+                            raise AuditIntegrityError("Decoded compose checkpoint differs from its exact saved row identity")
+                        checkpoint = CommittedCheckpointWitness(
+                            state=checkpoint_state,
+                            creator_operation_id=row.creator_operation_id,
+                            inserted_state_ids=tuple(inserted_state_ids),
+                        )
+                # The transaction context commits during return unwinding. A
+                # failed commit never exposes this exact-row witness to P4.
                 return AuditOutcome(
                     assistant_id=assistant_id,
                     unwind_audit_failed=False,
                     current_state_id=current_state_id,
+                    checkpoint_disposition="committed"
+                    if checkpoint is not None
+                    else "no_new_checkpoint"
+                    if current_state_id is not None
+                    else "empty",
+                    checkpoint=checkpoint,
                 )
         except StaleComposeStateError as stale_exc:
             # StaleComposeStateError disposition (elspeth-45f72a949c):
@@ -2182,6 +2218,8 @@ class SessionServiceImpl:
                 return AuditOutcome(
                     assistant_id=None,
                     unwind_audit_failed=True,
+                    checkpoint_disposition="unavailable",
+                    checkpoint=None,
                 )
             raise
         except IntegrityError:
@@ -2238,6 +2276,8 @@ class SessionServiceImpl:
                 return AuditOutcome(
                     assistant_id=None,
                     unwind_audit_failed=True,
+                    checkpoint_disposition="unavailable",
+                    checkpoint=None,
                 )
             self._telemetry.tool_row_tier1_violation_total.add(1)
             raise AuditIntegrityError(
@@ -9113,8 +9153,13 @@ class SessionServiceImpl:
         authoritative_failure: bool = False,
         required_work: RequiredWorkCoordinator | None = None,
         failure_projection_work: RequiredWorkTicket | None = None,
+        operation_failure_facts: ComposerOperationFailureFacts | None = None,
     ) -> ComposerOperationRecord:
         """One sealed failure bundle with at most one exact immutable retry."""
+        from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts, private_operation_failure_draft
+
+        if operation_failure_facts is not None and type(operation_failure_facts) is not ComposerOperationFailureFacts:
+            raise AuditIntegrityError("Failed terminal facts are not nominal")
         if required_work is None:
             if failure_projection_work is not None:
                 raise AuditIntegrityError("Failure projection requires its exact coordinator")
@@ -9135,6 +9180,8 @@ class SessionServiceImpl:
         attempted_cancel: datetime | None = None
         attempted_deadline_expired: bool | None = None
         frozen_settled_at: datetime | None = None
+        frozen_failure_draft: AuditMessageDraft | None = None
+        frozen_failure_message_id: str | None = None
 
         def _can_retry(current: ComposerOperationRecord, now: datetime) -> bool:
             return (
@@ -9147,6 +9194,8 @@ class SessionServiceImpl:
 
         def _sync() -> ComposerOperationRecord:
             nonlocal attempted_failure, attempted_cancel, attempted_deadline_expired, frozen_settled_at
+            nonlocal frozen_failure_draft, frozen_failure_message_id
+            active_drafts: tuple[AuditMessageDraft, ...] = ()
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
                 now = database_now(conn)
                 self._require_session_operation_context_on_connection(
@@ -9161,6 +9210,12 @@ class SessionServiceImpl:
                 if row is None:
                     raise AuditIntegrityError("failed terminal operation missing")
                 current = _record_from_row(row)
+                if operation_failure_facts is not None:
+                    operation_failure_facts.validate_for(
+                        durable_operation_id=current.operation_id,
+                        request_id=current.request_id,
+                        context=running.session_operation_context,
+                    )
                 if attempted_failure is not None and not _can_retry(current, now):
                     raise _ComposerTerminalRetryStateChanged("immutable failed terminal driving state changed")
                 selected = _select_failure_on_connection(row, failure, now=now, authoritative_failure=authoritative_failure)
@@ -9171,9 +9226,30 @@ class SessionServiceImpl:
                 attempted_deadline_expired = current.deadline_at <= now
                 if frozen_settled_at is None:
                     frozen_settled_at = now
-                return settle_composer_operation_on_connection(
+                if operation_failure_facts is not None:
+                    if frozen_failure_draft is None:
+                        frozen_failure_draft = private_operation_failure_draft(operation_failure_facts, failure=attempted_failure)
+                        frozen_failure_message_id = str(uuid.uuid4())
+                    if frozen_failure_message_id is None:
+                        raise AuditIntegrityError("Frozen failed terminal diagnostics lack their message identity")
+                    active_drafts = self._write_audit_cohort_on_connection(
+                        conn,
+                        session_id=running.claim.session_id,
+                        drafts=(frozen_failure_draft,),
+                        writer_principal="compose_loop",
+                        composition_state_id=None,
+                        session_operation_context=running.session_operation_context,
+                        audit_only=True,
+                        message_ids=(frozen_failure_message_id,),
+                        created_at=frozen_settled_at,
+                        recorded_at=frozen_settled_at,
+                    )
+                result = settle_composer_operation_on_connection(
                     conn, running, outcome=attempted_failure, authoritative_failure=True, settled_at=frozen_settled_at
                 )
+            for draft in active_drafts:
+                record_settled_composer_audit_message(role=draft.role, writer_principal="compose_loop", tool_calls=draft.tool_calls)
+            return result
 
         try:
             return await self._run_composer_terminal_sql(
@@ -9226,7 +9302,12 @@ class SessionServiceImpl:
             )
             if evidence.operation_epoch != session_operation_context.fence.operation_epoch:
                 raise AuditIntegrityError("private diagnostic draft has another operation epoch")
-            if not draft.inherit_composition_state and evidence.status not in {"received_response", "provider_failure", "provider_request"}:
+            if not draft.inherit_composition_state and evidence.status not in {
+                "received_response",
+                "provider_failure",
+                "provider_request",
+                "operation_failure",
+            }:
                 raise AuditIntegrityError("unbound private state belongs only to physical diagnostics")
             key = (evidence.operation_id, evidence.operation_epoch, evidence.evidence_id)
             if key in incoming:

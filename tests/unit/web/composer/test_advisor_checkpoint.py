@@ -71,6 +71,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.execution.completion_gates import (
@@ -98,9 +99,13 @@ def _checkpoint_reply(
     note: str | None = None,
     category: str = "other",
     steps: tuple[str, ...] = (),
+    publication_verdict: str | None = None,
 ) -> str:
     """Construct explicit provider JSON, with every required field present."""
-    return json.dumps({"verdict": verdict, "category": category, "steps": list(steps), "findings": findings, "note": note})
+    payload = {"verdict": verdict, "category": category, "steps": list(steps), "findings": findings, "note": note}
+    if publication_verdict is not None:
+        payload["publication_verdict"] = publication_verdict
+    return json.dumps(payload)
 
 
 def _malformed_provider_error(message: str) -> _MalformedLLMResponseError:
@@ -233,7 +238,7 @@ def test_terminal_gate_docstring_scopes_user_constraint_comparison_to_supplied_e
     assert "signed off" not in normalized
 
 
-def _fenced_session(service: Any) -> dict[str, Any]:
+def _fenced_session(service: Any, *, review_state: CompositionState | None = None, request: str = "") -> dict[str, Any]:
     """A session id plus the COMPOSE operation held over it, for driving a
     checkpoint WITH a session.
 
@@ -248,7 +253,21 @@ def _fenced_session(service: Any) -> dict[str, Any]:
         service._advisor_checkpoint._sessions_service = service._sessions_service
         service._completion._sessions_service = service._sessions_service
     session_id = str(uuid.uuid4())
-    return {"session_id": session_id, "session_operation_context": _compose_context(session_id)}
+    context = _compose_context(session_id)
+    result = {"session_id": session_id, "session_operation_context": context}
+    if review_state is not None:
+        from elspeth.web.composer.turn_effects import TurnEvidence
+
+        evidence = TurnEvidence(
+            session_id=session_id,
+            session_operation_context=context,
+            request_id="checkpoint-unit-request",
+            request=request,
+            initial_state_id=None,
+            initial_state=review_state,
+        )
+        result["publication_review"] = evidence.review_candidate(candidate=_ASSISTANT_CONTENT, request=request, current_state=review_state)
+    return result
 
 
 def _compose_context(session_id: str) -> SessionOperationContext:
@@ -408,8 +427,14 @@ class _AsyncRecorder:
 
 
 @pytest.fixture
-def make_service() -> object:
+def make_service(monkeypatch: pytest.MonkeyPatch) -> object:
     """Return a zero-arg factory producing a wired ``ComposerServiceImpl``."""
+    import litellm
+
+    async def unexpected_sdk_call(**_kwargs):
+        raise AssertionError("Focused advisor controls must explicitly mock their SDK transport")
+
+    monkeypatch.setattr(litellm, "acompletion", unexpected_sdk_call)
 
     def _factory() -> ComposerServiceImpl:
         return ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
@@ -595,12 +620,12 @@ async def test_early_checkpoint_degrades_on_failure(make_service, empty_state, n
 async def test_run_advisor_checkpoint_end_returns_verdict(make_service, simple_state):
     service = make_service()
     service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(
-        return_value=(_checkpoint_reply("FLAGGED", findings="the sink drops the rating field"), {})
+        return_value=(_checkpoint_reply("FLAGGED", findings="the sink drops the rating field", publication_verdict="WITHHOLD"), {})
     )
     verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
         phase="end",
         state=simple_state,
-        **_fenced_session(service),
+        **_fenced_session(service, review_state=simple_state),
         recorder=make_recorder(),
     )
     assert isinstance(verdict, AdvisorCheckpointVerdict)
@@ -624,10 +649,10 @@ async def test_run_advisor_checkpoint_emits_one_bounded_pass_event(make_service,
     service = make_service()
     findings = "FLAGGED: TELEMETRY_FINDINGS_CANARY"
     service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(
-        return_value=(_checkpoint_reply("FLAGGED", findings=findings, note="USER_NOTE_CANARY"), {})
+        return_value=(_checkpoint_reply("FLAGGED", findings=findings, note="USER_NOTE_CANARY", publication_verdict="WITHHOLD"), {})
     )
 
-    fenced = _fenced_session(service)
+    fenced = _fenced_session(service, review_state=simple_state)
     with structlog.testing.capture_logs() as events:
         await service._advisor_checkpoint._run_advisor_checkpoint(
             phase="end",
@@ -677,7 +702,7 @@ async def test_run_advisor_checkpoint_telemetry_failure_does_not_replace_complet
     service = make_service()
     findings = "FLAGGED: TELEMETRY_FAILURE_FINDINGS_CANARY"
     service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(
-        return_value=(_checkpoint_reply("FLAGGED", findings=findings, note="USER_NOTE_CANARY"), {})
+        return_value=(_checkpoint_reply("FLAGGED", findings=findings, note="USER_NOTE_CANARY", publication_verdict="WITHHOLD"), {})
     )
     logger = MagicMock(spec_set=FilteringBoundLogger)
     counter = MagicMock(spec_set=Counter)
@@ -688,11 +713,12 @@ async def test_run_advisor_checkpoint_telemetry_failure_does_not_replace_complet
     else:
         counter.add.side_effect = RuntimeError("counter unavailable")
 
+    fenced = _fenced_session(service, review_state=simple_state)
     verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
         phase="end",
         state=simple_state,
         recorder=make_recorder(),
-        **_fenced_session(service),
+        **fenced,
     )
 
     # The parsed verdict is the model's, untouched by the telemetry failure;
@@ -707,6 +733,8 @@ async def test_run_advisor_checkpoint_telemetry_failure_does_not_replace_complet
         response_note_present=True,
         url_redactions=0,
         email_redactions=0,
+        publication_verdict="WITHHOLD",
+        publication_binding=fenced["publication_review"].binding,
     )
     logger.info.assert_called_once()
     counter.add.assert_called_once_with(1, {"phase": "end", "verdict": "flagged", "source": "model"})
@@ -979,7 +1007,14 @@ async def test_end_gate_flags_user_stated_schema_mode_mismatch(make_service, cle
         assert "user_message" in arguments
         assert "fixed schema" in arguments["user_message"]
         assert "quote each explicit configuration constraint visible" in arguments["problem_summary"]
-        return (_checkpoint_reply("FLAGGED", findings="FLAGGED: the user asked for a fixed schema mode but the source is flexible"), {})
+        return (
+            _checkpoint_reply(
+                "FLAGGED",
+                findings="FLAGGED: the user asked for a fixed schema mode but the source is flexible",
+                publication_verdict="WITHHOLD",
+            ),
+            {},
+        )
 
     service = make_service()
     service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(side_effect=_advisor_side_effect)
@@ -1897,11 +1932,11 @@ def _blocked_after_injection(service, state, assistant_message):
     )
 
 
-def test_blocked_turn_publishes_the_composers_reply(make_service, simple_state) -> None:
-    """Ruling 2026-09-22 (elspeth-032ec69c41): a block no longer deletes what the composer said."""
+def test_blocked_turn_withholds_the_unreviewed_composers_reply(make_service, simple_state) -> None:
+    """Graph findings alone cannot authorize publication of candidate prose."""
     result = _blocked_after_injection(make_service(), simple_state, _ExplainingAssistantMessage())
-    assert result.message.startswith(_ExplainingAssistantMessage.content)
-    assert result.raw_assistant_content == _ExplainingAssistantMessage.content
+    assert _ExplainingAssistantMessage.content not in result.message
+    assert result.raw_assistant_content == ""
     assert "Completion advisory review did not clear" in result.message
     assert result.runtime_preflight is not None
     assert result.runtime_preflight.readiness.completion_ready is False
@@ -1977,9 +2012,9 @@ def test_advisor_prompt_explains_withheld_values_are_present_and_not_defects(mak
 @pytest.mark.asyncio
 async def test_run_advisor_checkpoint_clean_verdict(make_service, simple_state):
     service = make_service()
-    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(), {}))
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(publication_verdict="ADMIT"), {}))
     verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-        phase="end", state=simple_state, **_fenced_session(service), recorder=make_recorder()
+        phase="end", state=simple_state, **_fenced_session(service, review_state=simple_state), recorder=make_recorder()
     )
     assert verdict.ok is True and verdict.blocking is False
 
@@ -1994,7 +2029,8 @@ def test_flagged_verdict_parses_category_steps_and_note() -> None:
             note="The request asked for error capture at the merge; both branches now discard.",
             category="request_not_met",
             steps=("merge_ab", "eval_a"),
-        )
+        ),
+        phase="early",
     )
     assert verdict.blocking is True
     assert verdict.category == "request_not_met"
@@ -2008,7 +2044,7 @@ def test_missing_required_category_is_malformed() -> None:
 
     reply = json.loads(_checkpoint_reply("FLAGGED", findings="sink omits rating"))
     del reply["category"]
-    verdict = _parse_advisor_checkpoint_guidance(json.dumps(reply))
+    verdict = _parse_advisor_checkpoint_guidance(json.dumps(reply), phase="early")
     assert verdict.ok is False
     assert verdict.failure_class == "malformed"
 
@@ -2016,7 +2052,7 @@ def test_missing_required_category_is_malformed() -> None:
 def test_unknown_category_is_malformed() -> None:
     from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance
 
-    verdict = _parse_advisor_checkpoint_guidance(_checkpoint_reply("FLAGGED", findings="x", category="vibes"))
+    verdict = _parse_advisor_checkpoint_guidance(_checkpoint_reply("FLAGGED", findings="x", category="vibes"), phase="early")
     assert verdict.ok is False
     assert verdict.failure_class == "malformed"
 
@@ -2024,7 +2060,9 @@ def test_unknown_category_is_malformed() -> None:
 def _parsed_note(note: str) -> str | None:
     from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance
 
-    verdict = _parse_advisor_checkpoint_guidance(_checkpoint_reply("FLAGGED", findings="TECHNICAL_FINDINGS_CANARY", note=note))
+    verdict = _parse_advisor_checkpoint_guidance(
+        _checkpoint_reply("FLAGGED", findings="TECHNICAL_FINDINGS_CANARY", note=note), phase="early"
+    )
     assert verdict.ok is True and verdict.blocking is True
     assert verdict.findings_text == "TECHNICAL_FINDINGS_CANARY"
     return verdict.note
@@ -2142,8 +2180,8 @@ def test_a_rejected_chat_message_is_not_told_to_change_the_pipeline(make_service
 def test_clean_and_unrendered_verdicts_carry_no_note() -> None:
     from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance
 
-    assert _parse_advisor_checkpoint_guidance(_checkpoint_reply()).note is None
-    malformed = _parse_advisor_checkpoint_guidance("I am not sure")
+    assert _parse_advisor_checkpoint_guidance(_checkpoint_reply(), phase="early").note is None
+    malformed = _parse_advisor_checkpoint_guidance("I am not sure", phase="early")
     assert malformed.ok is False or malformed.blocking is False
     assert malformed.note is None
 
@@ -2163,11 +2201,11 @@ async def test_malformed_response_consumes_retry_with_format_reprompt(make_servi
     from elspeth.web.composer.advisor_policy import _ADVISOR_VERDICT_FORMAT_REPROMPT
 
     service = make_service()
-    replies = iter([("I have no opinion.", {}), (_checkpoint_reply(), {})])
+    replies = iter([("I have no opinion.", {}), (_checkpoint_reply(publication_verdict="ADMIT"), {})])
     service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(side_effect=lambda *a, **k: next(replies))
 
     verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-        phase="end", state=simple_state, **_fenced_session(service), recorder=make_recorder()
+        phase="end", state=simple_state, **_fenced_session(service, review_state=simple_state), recorder=make_recorder()
     )
 
     assert verdict.ok is True and verdict.blocking is False
@@ -2588,6 +2626,7 @@ async def drive_try_terminate(
     runtime_preflight_absent: bool = False,
     tolerant_preflight_result: ValidationResult | None = None,
     message: str = "rate how cool the pages are",
+    candidate: str = _ASSISTANT_CONTENT,
     deadline: float | None = None,
     recorder: BufferingRecorder | None = None,
     initial_version: int = 1,
@@ -2603,7 +2642,7 @@ async def drive_try_terminate(
     """
     service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._completion._surface_and_finalize_no_tools = _AsyncRecorder(
-        return_value=finalize_result or ComposerResult(message="Done — the pipeline is ready.", state=state)
+        return_value=finalize_result or ComposerResult(message=candidate, state=state)
     )
     # The advisor-blocked terminal returns now run the surface+orphan-gate pair
     # (``_surface_pt_and_gate_orphans_or_none``) before building the blocked
@@ -2688,13 +2727,24 @@ async def drive_try_terminate(
     if deadline is not None:
         kwargs["deadline"] = deadline
     session_id = str(uuid.uuid4())
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    context = _compose_context(session_id)
     return await service._completion._try_terminate_no_tools(
-        assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
+        assistant_message=_AdmittedAssistantMessage(content=candidate),
+        turn_evidence=TurnEvidence(
+            session_id=session_id,
+            session_operation_context=context,
+            request_id="advisor-unit-request",
+            request=message,
+            initial_state_id="cs1",
+            initial_state=state,
+        ),
         message=message,
         llm_messages=[] if llm_messages is None else llm_messages,
         state=state,
         session_id=session_id,
-        session_operation_context=_compose_context(session_id),
+        session_operation_context=context,
         current_state_id="cs1",
         initial_version=initial_version,
         user_id="alice",
@@ -2728,14 +2778,8 @@ def _audit_row_origins(service) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_end_gate_block_publishes_the_models_reply(make_service, clean_runnable_state):
-    """Ruling 2026-09-22 (elspeth-032ec69c41): a blocked turn publishes the
-    composer's reply beside the block, not the block in place of it — whether
-    or not advisor findings entered the model's context earlier in the turn.
-    Before the ruling only the uninjected cohort (an outage on the first pass)
-    was published; the injected cohort was withheld and compensated with two
-    audit rows (elspeth-2306940c70). The withheld-words row is gone; the
-    user-role disclosure is now written for BOTH cohorts."""
+async def test_end_gate_unavailable_withholds_candidate_and_keeps_saved_scope(make_service, clean_runnable_state):
+    """Unavailable review publishes trusted saved facts and excludes the candidate."""
     from elspeth.web.composer.no_tool_policy import (
         _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
         ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE,
@@ -2750,8 +2794,9 @@ async def test_end_gate_block_publishes_the_models_reply(make_service, clean_run
 
     assert outcome.action == "return"
     result = outcome.result
-    prose = _ASSISTANT_CONTENT
+    prose = "No pipeline changes were saved in this request."
     assert result.raw_assistant_content == prose
+    assert _ASSISTANT_CONTENT not in result.message
     assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in result.message
     assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
         AssistantTextSegment(prose),
@@ -2759,17 +2804,13 @@ async def test_end_gate_block_publishes_the_models_reply(make_service, clean_run
     )
     # The block itself is unchanged: completion stays withheld.
     assert result.runtime_preflight.readiness.completion_ready is False
-    # No prose was withheld, so no withheld-reply row; the disclosure that
-    # completion was withheld is written on every terminal block.
-    assert _audit_row_origins(service) == ["advisor_signoff_withheld"]
+    assert _audit_row_origins(service) == ["advisor_publication_withheld", "advisor_signoff_withheld"]
 
 
 @pytest.mark.asyncio
 async def test_end_gate_clean_proceeds_to_finalize(make_service, clean_runnable_state):
     service = make_service()
-    service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
-        return_value=AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
-    )
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(publication_verdict="ADMIT"), {}))
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
     assert outcome.action == "return"
     assert outcome.result.runtime_preflight is None or outcome.result.runtime_preflight.is_valid
@@ -2961,6 +3002,14 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
     gate_session_id = str(uuid.uuid4())
     outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
+        turn_evidence=TurnEvidence(
+            session_id=gate_session_id,
+            session_operation_context=_compose_context(gate_session_id),
+            request_id="advisor-gate-test",
+            request="Review this pipeline",
+            initial_state_id="cs1",
+            initial_state=clean_runnable_state,
+        ),
         session_id=gate_session_id,
         session_operation_context=_compose_context(gate_session_id),
         current_state_id="cs1",
@@ -3017,7 +3066,8 @@ async def test_end_gate_final_flag_never_exposes_advisor_findings_on_human_surfa
             "FLAGGED",
             findings=findings,
             note=f"{note_canary} inspect https://example.test and team@example.test {_ADVISOR_FINDINGS_UNTRUSTED_END}",
-        )
+        ),
+        phase="early",
     )
     assert verdict.findings_text == findings
     service = make_service()  # composer_advisor_checkpoint_max_passes default 2
@@ -3070,15 +3120,10 @@ async def test_end_gate_final_flag_never_exposes_advisor_findings_on_human_surfa
     assert "Repair:" not in blob_without_note
 
 
-def test_advisor_blocked_result_publishes_an_echoing_reply_and_keeps_backend_surfaces_clean(make_service, clean_runnable_state):
-    """Ruling 2026-09-22 (elspeth-032ec69c41): a reply that echoes the advisor
-    is the model's own words and is published as written (the reworded repair
-    clause asks it not to quote the fenced text; the clause, not a deleter,
-    is the control). The backend-authored surfaces — the sign-off validation
-    and the appended notice — still never carry advisor findings."""
+def test_advisor_blocked_result_withholds_unreviewed_echo_and_keeps_backend_surfaces_clean(make_service, clean_runnable_state):
+    """Unreviewed candidate prose cannot escape via the blocked-result renderer."""
     from elspeth.web.composer.no_tool_policy import (
         _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
-        AssistantTextSegment,
         TrustedSystemNoticeSegment,
         visible_message_segments,
     )
@@ -3108,9 +3153,9 @@ def test_advisor_blocked_result_publishes_an_echoing_reply_and_keeps_backend_sur
         outstanding_findings=None,
     )
 
-    assert result.raw_assistant_content == _EchoingAssistant.content
+    assert result.raw_assistant_content == ""
+    assert canary not in result.message
     assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
-        AssistantTextSegment(_EchoingAssistant.content),
         TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE),
     )
     backend_blob = repr((_ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE, result.runtime_preflight.model_dump(mode="json")))
@@ -3302,11 +3347,12 @@ async def test_end_gate_unrendered_verdict_chat_names_the_real_cause(
         assert "not re-verified this turn" in message
     else:
         assert "not re-verified" not in message
-    # The model's reply, then fixed backend copy: the whole suffix is one
-    # trusted notice (ruling 2026-09-22: the reply is published on a block).
+    # The trusted saved scope replaces the unreviewed model reply; the
+    # independent review failure remains a trusted suffix.
     raw = outcome.result.raw_assistant_content or ""
     segments = visible_message_segments(content=message, raw_content=raw)
-    assert segments[0] == AssistantTextSegment(_ASSISTANT_CONTENT)
+    assert segments[0] == AssistantTextSegment("No pipeline changes were saved in this request.")
+    assert _ASSISTANT_CONTENT not in message
     assert len(segments) == 2
     assert type(segments[1]) is TrustedSystemNoticeSegment
     # The fail-closed structure is unchanged: completion stays withheld.
@@ -3337,7 +3383,8 @@ async def test_end_gate_flagged_verdict_keeps_did_not_clear_chat(make_service, c
     assert outcome.action == "return"
     expected = _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE if preflight_shape == "absent" else _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE
     assert outcome.result.message.endswith(expected)
-    assert outcome.result.message.startswith(_ASSISTANT_CONTENT)
+    assert outcome.result.message.startswith("No pipeline changes were saved in this request.")
+    assert _ASSISTANT_CONTENT not in outcome.result.message
     assert "MODEL_FINDING_CANARY" not in outcome.result.message
 
 
@@ -3484,7 +3531,7 @@ async def test_advisor_recovery_real_prescan_accepts_reworded_message(make_servi
     from elspeth.web.execution.completion_gates import resolve_completion_gate_facts
 
     service = make_service()
-    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(), {}))
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(publication_verdict="ADMIT"), {}))
     first = await drive_try_terminate(
         service,
         simple_state,
@@ -3644,7 +3691,7 @@ async def test_checkpoint_pass_telemetry_discriminates_prescan_from_model(make_s
     calls: list[dict[str, object]] = []
     monkeypatch.setattr("elspeth.web.composer.advisor_audit.record_advisor_checkpoint_pass", lambda **kw: calls.append(kw))
     service = make_service()
-    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(), {}))
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(publication_verdict="ADMIT"), {}))
 
     await service._advisor_checkpoint._run_advisor_checkpoint(
         phase="end",
@@ -3656,7 +3703,7 @@ async def test_checkpoint_pass_telemetry_discriminates_prescan_from_model(make_s
     await service._advisor_checkpoint._run_advisor_checkpoint(
         phase="end",
         state=simple_state,
-        **_fenced_session(service),
+        **_fenced_session(service, review_state=simple_state, request="rate how cool the pages are"),
         recorder=make_recorder(),
         user_message="rate how cool the pages are",
     )
@@ -3733,7 +3780,7 @@ async def test_published_notice_never_contradicts_the_preflight_shape(make_servi
     assert outcome.action == "return"
     message = outcome.result.message
     if shape != "green":
-        assert "no pipeline change" not in message.lower()
+        assert "no pipeline change is needed" not in message.lower()
         assert "pipeline is configured and ready" not in message.lower()
     if shape == "absent":
         assert _PREFLIGHT_NOTICE_HEADER not in message
@@ -4002,9 +4049,7 @@ async def test_preflight_repair_gate_passes_verified_handoff_to_end_gate(make_se
     resolve would burn repair budget for nothing.
     """
     service = make_service()
-    service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
-        return_value=AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
-    )
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(publication_verdict="ADMIT"), {}))
     llm_messages: list[dict[str, object]] = []
     outcome = await drive_try_terminate(
         service,
@@ -4016,7 +4061,7 @@ async def test_preflight_repair_gate_passes_verified_handoff_to_end_gate(make_se
     )
 
     assert outcome.action == "return"
-    assert service._advisor_checkpoint._run_advisor_checkpoint.await_count == 1
+    assert service._advisor_checkpoint._call_advisor_with_audit.await_count == 1
     assert llm_messages == []
     assert outcome.result.message == "Done — the pipeline is ready."
 
@@ -4071,7 +4116,7 @@ async def test_end_gate_masked_graph_failure_blocks_handoff_and_names_outstandin
     )
     # Only fixed backend chrome is trusted. The actual validator detail is
     # preserved as diagnostic text rather than replaced by advisor wording.
-    assert segments[0] == AssistantTextSegment(_ASSISTANT_CONTENT)
+    assert segments[0] == AssistantTextSegment("No pipeline changes were saved in this request.")
     assert segments[1] == TrustedSystemNoticeSegment(_PREFLIGHT_NOTICE_HEADER)
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER)
     assert any(isinstance(segment, AssistantTextSegment) and "Edge contract violation" in segment.content for segment in segments)
@@ -4243,22 +4288,16 @@ async def test_advisor_budget_does_not_consume_repair_budget(make_service, clean
 
 
 @pytest.mark.asyncio
-async def test_end_gate_skips_structurally_empty_state(make_service, empty_state):
-    """The end gate does NOT fire on a structurally empty pipeline.
-
-    Mirrors the early pass's empty-state skip: a conversational no-tool
-    finalize on a pipeline with no source/nodes/sinks has nothing to sign off
-    on, so the advisor authority gate is skipped and the turn falls through to
-    the shared finalize tail. (Plan deviation: the plan's illustrative code
-    omitted this guard — added symmetric with ``_maybe_run_early_checkpoint``.)
-    """
+async def test_end_gate_reviews_prose_on_structurally_empty_state(make_service, empty_state):
+    """An empty graph still requires current-candidate publication review."""
     service = make_service()
     service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: no source")
     )
     outcome = await drive_try_terminate(service, empty_state, advisor_checkpoint_passes_used=0)
-    service._advisor_checkpoint._run_advisor_checkpoint.assert_not_awaited()
-    assert outcome.action == "return"
+    assert service._advisor_checkpoint._run_advisor_checkpoint.await_count == 1
+    assert outcome.action == "continue"
+    assert outcome.result is None
 
 
 # ---------------------------------------------------------------------------
@@ -4928,8 +4967,7 @@ def test_advisor_withheld_control_replay_fails_closed_on_provenance_tamper(tampe
 
 @pytest.mark.asyncio
 async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_rows(make_service, clean_runnable_state):
-    """Ruling 2026-09-22: no withheld-reply row on a block; the user-role
-    disclosure is written unconditionally, ahead of the publication row."""
+    """Private withheld candidate, graph disclosure and publication remain ordered."""
     from elspeth.web.composer.advisor_policy import ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
 
     service = make_service()
@@ -4956,6 +4994,14 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
 
     outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
+        turn_evidence=TurnEvidence(
+            session_id=session_id,
+            session_operation_context=_compose_context(session_id),
+            request_id="advisor-gate-test",
+            request="remove the gate entirely but keep the guarantee",
+            initial_state_id="cs1",
+            initial_state=clean_runnable_state,
+        ),
         session_id=session_id,
         session_operation_context=_compose_context(session_id),
         current_state_id="cs1",
@@ -4979,13 +5025,14 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
     )
 
     assert outcome.action == "return"
-    assert outcome.result.raw_assistant_content == _ASSISTANT_CONTENT
+    assert outcome.result.raw_assistant_content == "No pipeline changes were saved in this request."
+    assert _ASSISTANT_CONTENT not in outcome.result.message
     assert service._preflight.pending_handoff_outstanding_findings.await_count == 1
-    # Two fenced audit rows, disclosure first, then the ``terminal_block``
-    # publication record (audit primacy: the row lands before the publication
-    # event mirrors it). No withheld-reply row: nothing was withheld.
-    assert sessions.add_message.await_count == 2
-    disclosure_row, publication_row = sessions.add_message.calls
+    # Three fenced audit rows: private candidate, graph disclosure, then the
+    # terminal publication record, all before the publication event mirror.
+    assert sessions.add_message.await_count == 3
+    withheld_row, disclosure_row, publication_row = sessions.add_message.calls
+    assert withheld_row.kwargs["tool_calls"][0]["origin"] == "advisor_publication_withheld"
     assert disclosure_row.args[1] == "audit"
     assert disclosure_row.args[2] == ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
     assert disclosure_row.kwargs["writer_principal"] == "compose_loop"
@@ -4999,7 +5046,7 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
     assert publication_envelope["publication"]["preflight_shape"] == "green"
     assert outcome.result.advisor_terminal_publication is not None
     assert publication_envelope["publication"] == outcome.result.advisor_terminal_publication.to_dict()
-    assert _audit_row_origins(service) == ["advisor_signoff_withheld"]
+    assert _audit_row_origins(service) == ["advisor_publication_withheld", "advisor_signoff_withheld"]
 
 
 @pytest.mark.asyncio
@@ -5020,6 +5067,14 @@ async def test_end_gate_terminal_block_blocks_cleanly_without_session(make_servi
 
     outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
+        turn_evidence=TurnEvidence(
+            session_id=None,
+            session_operation_context=None,
+            request_id="advisor-gate-test",
+            request="remove the gate entirely but keep the guarantee",
+            initial_state_id=None,
+            initial_state=clean_runnable_state,
+        ),
         session_id=None,
         current_state_id=None,
         assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
@@ -5046,15 +5101,8 @@ async def test_end_gate_terminal_block_blocks_cleanly_without_session(make_servi
 
 
 @pytest.mark.asyncio
-async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(tmp_path: Path, make_service, clean_runnable_state):
-    """Battery-round-2 repro (session b2ad4da8), re-seated on the 2026-09-22
-    ruling (elspeth-032ec69c41): the model-facing history for the turn AFTER
-    an advisor block carries the model's own reply — the words that explain
-    what blocked it — not an empty assistant message. The backend's user-role
-    disclosure that completion was withheld sits between the instruction and
-    that reply, so a reply claiming the change landed cannot be read as the
-    record.
-    """
+async def test_blocked_turn_excludes_unreviewed_reply_from_next_turn_model_history(tmp_path: Path, make_service, clean_runnable_state):
+    """The original unreviewed completion cannot replay as saved assistant prose."""
     from elspeth.web.composer.advisor_policy import ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
     from elspeth.web.sessions.routes._helpers import _composer_chat_history
 
@@ -5097,6 +5145,14 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
     async with sessions._call_context(session.id, SessionOperationKind.COMPOSE) as compose_context:
         outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
             state=clean_runnable_state,
+            turn_evidence=TurnEvidence(
+                session_id=str(session.id),
+                session_operation_context=compose_context,
+                request_id="advisor-history-test",
+                request=contradiction,
+                initial_state_id=None,
+                initial_state=clean_runnable_state,
+            ),
             session_id=str(session.id),
             session_operation_context=compose_context,
             current_state_id=None,
@@ -5120,7 +5176,7 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
         )
     assert outcome.action == "return"
     result = outcome.result
-    assert result.raw_assistant_content == _ASSISTANT_CONTENT
+    assert result.raw_assistant_content == "No pipeline changes were saved in this request."
     # Persist the terminal assistant row exactly as the route does
     # (sessions/routes/composer/compose.py): content=message, raw_content=prose.
     await sessions.add_message(
@@ -5133,9 +5189,8 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
 
     history = _composer_chat_history(await sessions.get_messages(session.id, limit=None))
 
-    # The blocked turn replays the model's own prose, not the appended notice
-    # and not an empty message.
-    assert history[-1] == {"role": "assistant", "content": _ASSISTANT_CONTENT}
+    assert history[-1] == {"role": "assistant", "content": "No pipeline changes were saved in this request."}
+    assert _ASSISTANT_CONTENT not in json.dumps(history)
     # The backend's disclosure replays as a user-role message between the
     # instruction and the reply.
     assert [message["content"] for message in history if message["role"] == "user"] == [
@@ -5444,9 +5499,15 @@ async def test_early_checkpoint_does_not_carry_mutation_expectation(make_service
 
 
 def _advisor_evidence_hash(state: CompositionState) -> str:
-    from elspeth.web.composer.advisor_context import summarize_pipeline_for_advisor
-
-    return stable_hash({"advisor_evidence": summarize_pipeline_for_advisor(state)})
+    evidence = TurnEvidence(
+        session_id=None,
+        session_operation_context=None,
+        request_id="stalled-gate-request",
+        request="build the thing",
+        initial_state_id=None,
+        initial_state=state,
+    )
+    return evidence.review_candidate(candidate=_ASSISTANT_CONTENT, request="build the thing", current_state=state).semantic_repair_key
 
 
 def _make_stalled_gate_service():
@@ -5473,6 +5534,14 @@ async def _drive_gate_with_review_state(service, state, review_state):
     )
     return await service._completion._evaluate_terminal_no_tool_advisor_gate(
         state=state,
+        turn_evidence=TurnEvidence(
+            session_id=None,
+            session_operation_context=None,
+            request_id="stalled-gate-request",
+            request="build the thing",
+            initial_state_id=None,
+            initial_state=state,
+        ),
         session_id=None,
         current_state_id=None,
         assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
@@ -5558,9 +5627,7 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
     service = _make_stalled_gate_service()
     service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._completion._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
-    service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
-        return_value=AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
-    )
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(publication_verdict="ADMIT"), {}))
     review_state = _AdvisorReviewState(
         completed_passes=1,
         previous_findings=("FLAGGED: still unresolved",),
@@ -5575,6 +5642,14 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
     )
     outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
+        turn_evidence=TurnEvidence(
+            session_id=None,
+            session_operation_context=None,
+            request_id="stalled-gate-request",
+            request="build the thing",
+            initial_state_id=None,
+            initial_state=clean_runnable_state,
+        ),
         session_id=None,
         current_state_id=None,
         assistant_message=_AdmittedAssistantMessage(content=_ASSISTANT_CONTENT),
@@ -5596,7 +5671,7 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
         plugin_snapshot=None,
         advisor_review_state=review_state,
     )
-    assert service._advisor_checkpoint._run_advisor_checkpoint.await_count == 1
+    assert service._advisor_checkpoint._call_advisor_with_audit.await_count == 1
     assert outcome.action == "fall_through"
 
 
@@ -6142,8 +6217,8 @@ def test_bound_advisor_pipeline_summary_publishes_marker_alone_when_no_line_fits
     assert len(bounded) <= 200
 
 
-def test_both_end_gate_call_sites_pass_the_durable_gate_fact():
-    """P2 and P5 share one gate; a site that omits the fact reviews where the other skips."""
+def test_all_end_gate_call_sites_pass_the_durable_gate_fact_and_owned_evidence():
+    """Ordinary, staged-reply and budget terminal paths share current review custody."""
     from elspeth.web.composer import composition_completion
     from elspeth.web.composer import service as service_module
 
@@ -6156,9 +6231,9 @@ def test_both_end_gate_call_sites_pass_the_durable_gate_fact():
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "_evaluate_terminal_no_tool_advisor_gate"
     ]
-    assert len(calls) == 2
+    assert len(calls) == 3
     for call in calls:
-        assert "completion_gates" in {kw.arg for kw in call.keywords}
+        assert {"completion_gates", "turn_evidence"} <= {kw.arg for kw in call.keywords}
 
 
 def _blocked_facts_for(state: CompositionState) -> CompletionGateFacts:
@@ -6221,8 +6296,8 @@ async def test_advisor_recovery_reviews_unchanged_graph_after_transient_block(ma
         }
     )
     recovered = make_service()
-    recovered._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
-        return_value=AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
+    recovered._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(
+        return_value=(_checkpoint_reply(publication_verdict="ADMIT"), {})
     )
     green = ValidationResult(
         is_valid=True,
@@ -6239,7 +6314,7 @@ async def test_advisor_recovery_reviews_unchanged_graph_after_transient_block(ma
         message="Please review this pipeline",
         finalize_result=ComposerResult(message="Reviewed", state=state, runtime_preflight=green),
     )
-    assert len(recovered._advisor_checkpoint._run_advisor_checkpoint.calls) == 1
+    assert len(recovered._advisor_checkpoint._call_advisor_with_audit.calls) == 1
     assert retry.result.runtime_preflight.readiness.completion_ready is True
     assert retry.result.advisor_gate_decision == AdvisorGatePassed(for_graph=completion_gate_fingerprint(state))
 
@@ -6275,10 +6350,12 @@ async def test_advisor_recovery_orphan_return_preserves_prior_block(make_service
 
 
 @pytest.mark.asyncio
-async def test_question_on_an_already_blocked_graph_skips_the_review(make_service, clean_runnable_state):
-    """Ruling 2026-09-22 (session 6990d39f): asking what a block means must not re-enter the repair loop."""
+async def test_question_on_an_already_blocked_graph_reviews_explanation_without_clearing_graph(make_service, clean_runnable_state):
+    """A fresh prose admission can publish an explanation while the invalid graph remains blocked."""
     service = make_service()
-    service._advisor_checkpoint._run_advisor_checkpoint = _flagging_advisor()
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(
+        return_value=(_checkpoint_reply("FLAGGED", findings="FLAGGED: unchanged graph defect", publication_verdict="ADMIT"), {})
+    )
     outcome = await drive_try_terminate(
         service,
         clean_runnable_state,
@@ -6286,9 +6363,12 @@ async def test_question_on_an_already_blocked_graph_skips_the_review(make_servic
         initial_version=clean_runnable_state.version,
         completion_gates=_blocked_facts_for(clean_runnable_state),
         message="What does this mean, and what are my options?",
+        candidate="Here are your options.",
     )
-    assert service._advisor_checkpoint._run_advisor_checkpoint.calls == []
+    assert service._advisor_checkpoint._call_advisor_with_audit.await_count == 1
     assert outcome.action == "return"
+    assert outcome.result.raw_assistant_content == "Here are your options."
+    assert outcome.result.runtime_preflight.readiness.completion_ready is False
 
 
 @pytest.mark.asyncio
@@ -6308,8 +6388,8 @@ async def test_unchanged_turn_without_a_block_still_reviews(make_service, clean_
 
 
 @pytest.mark.asyncio
-async def test_skipped_turn_result_keeps_completion_withheld(make_service, clean_runnable_state):
-    """Review Focus 3: a green preview on a question turn must not publish completion over the durable block."""
+async def test_reviewed_explanation_keeps_prior_graph_completion_withheld(make_service, clean_runnable_state):
+    """CLEAN explanatory prose cannot clear a prior graph rejection on an unchanged draft."""
     green = ValidationResult(
         is_valid=True,
         checks=[],
@@ -6317,13 +6397,14 @@ async def test_skipped_turn_result_keeps_completion_withheld(make_service, clean
         readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
     )
     service = make_service()
-    service._advisor_checkpoint._run_advisor_checkpoint = _flagging_advisor()
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(publication_verdict="ADMIT"), {}))
     outcome = await drive_try_terminate(
         service,
         clean_runnable_state,
         advisor_checkpoint_passes_used=0,
         initial_version=clean_runnable_state.version,
         completion_gates=_blocked_facts_for(clean_runnable_state),
+        candidate="Here are your options.",
         finalize_result=ComposerResult(message="Here are your options.", state=clean_runnable_state, runtime_preflight=green),
     )
     assert outcome.result.message == "Here are your options."

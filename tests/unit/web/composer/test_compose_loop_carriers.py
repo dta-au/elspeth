@@ -172,6 +172,7 @@ def test_persist_outcome_rejects_current_dispatch_identity_without_committed_row
             redacted_assistant_tool_calls=(),
             redacted_tool_rows=(),
             audit_outcome=None,
+            effect_verification_failure=None,
         )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
+from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase
 from elspeth.web.composer.advisor_output import advisor_response_format
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 
@@ -18,6 +19,7 @@ def build_advisor_request_options(
     api_base: str | None,
     api_key: str | None,
     structured_output: bool,
+    checkpoint_phase: AdvisorCheckpointPhase | None,
 ) -> dict[str, object]:
     """Keep checkpoint capabilities identical at boot and during a turn.
 
@@ -39,9 +41,13 @@ def build_advisor_request_options(
     if api_key is not None:
         kwargs["api_key"] = api_key
     if structured_output:
-        kwargs["response_format"] = advisor_response_format()
+        if checkpoint_phase is None:
+            raise ValueError("Structured advisor requests require their owned checkpoint phase")
+        kwargs["response_format"] = advisor_response_format(phase=checkpoint_phase)
         if model.startswith("openrouter/") or (api_base is not None and urlsplit(api_base).hostname == "openrouter.ai"):
             # Top-level provider survives LiteLLM's OpenRouter transformation;
             # caller-supplied extra_body is rebuilt by that adapter.
             kwargs["provider"] = {"require_parameters": True}
+    elif checkpoint_phase is not None:
+        raise ValueError("Manual prose hints have no checkpoint phase")
     return kwargs

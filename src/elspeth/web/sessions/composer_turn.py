@@ -62,7 +62,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
-from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_required_sql_finish_once
 from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord, compartment_ingress_record
 from elspeth.web.composer.audit import ComposerToolCancellation, ComposerToolFailure
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
@@ -79,15 +79,18 @@ from elspeth.web.composer.protocol import (
     ComposerRuntimePreflightError,
     ComposerServiceError,
     GraphRecoveryResponse,
+    RetainedOperationContext,
 )
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.state import ValidationSummary
+from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.completion_gates import completion_gate_decision_changes, parse_completion_gates
+from elspeth.web.required_sql_outcomes import RequiredSQLRaised
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
     RequiredWorkAuthority,
@@ -585,6 +588,81 @@ async def _required_audit[T](observation: ComposerTurnObservation, work: Corouti
     if deferred is not None and observation.deferred_cancellation is None:
         observation.deferred_cancellation = deferred
     return result
+
+
+async def _read_retained_operation_context(
+    *,
+    authority: ComposerAsyncOperationAuthority,
+    binding: RequiredWorkBinding,
+    session_id: UUID,
+    actor_user_id: str,
+) -> RetainedOperationContext:
+    """Hand actual required history SQL/projection outcomes to the owning turn."""
+    sql, projection = binding.reserve_pair(
+        RequiredWorkSource.RETAINED_OPERATION_READ_SQL, RequiredWorkSource.RETAINED_OPERATION_READ_PROJECTION
+    )
+    try:
+        outcome = await run_required_sql_finish_once(
+            sql, authority.list_failure_outcomes, session_id=session_id, actor_user_id=actor_user_id, limit=3
+        )
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    errors: list[BaseException] = []
+    context: RetainedOperationContext | None = None
+    if isinstance(outcome, RequiredSQLRaised):
+        projection.complete_without_submission()
+        errors.append(outcome.error)
+    else:
+        projection.begin_projection()
+        try:
+            outcomes, cursor = outcome.value
+            context = RetainedOperationContext(
+                session_id=session_id,
+                actor_user_id=actor_user_id,
+                availability="available",
+                outcomes=outcomes,
+                has_more=cursor is not None,
+            )
+        except BaseException as error:
+            projection.complete_owned(error)
+            errors.append(error)
+        else:
+            projection.complete_owned()
+    errors.extend(outcome.deferred_cancellations)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("Retained operation history original outcomes", errors)
+    if context is None:
+        raise AuditIntegrityError("Retained operation history lost its projected outcome")
+    return context
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _RetainedOperationReadOutcome:
+    context: RetainedOperationContext | None
+    original_error: BaseException | None
+
+    def __post_init__(self) -> None:
+        if (self.context is None) == (self.original_error is None):
+            raise AuditIntegrityError("Retained history must hand off exactly one actual outcome")
+        if self.context is not None and type(self.context) is not RetainedOperationContext:
+            raise AuditIntegrityError("Retained history handoff contains an unowned context")
+
+
+async def _capture_retained_operation_read(
+    read: Coroutine[object, object, RetainedOperationContext],
+) -> _RetainedOperationReadOutcome:
+    try:
+        context = await read
+    except (Exception, asyncio.CancelledError, BaseExceptionGroup) as original_error:
+        # The required helper has already joined actual SQL and projection.
+        # Return normally so the registered child cannot replay this outcome
+        # or convert an observed child cancellation during lease close.
+        return _RetainedOperationReadOutcome(context=None, original_error=original_error)
+    return _RetainedOperationReadOutcome(context=context, original_error=None)
 
 
 def _turn_audit_cohort_drafts(
@@ -1263,6 +1341,38 @@ async def _run_composer_turn(
             )
             return record
 
+        # History reads consume the unchanged request budget. A required SQL
+        # failure aborts; it is never downgraded to an unavailable empty history.
+        history_task = lease.create_task(
+            _capture_retained_operation_read(
+                _read_retained_operation_context(
+                    authority=services.composer_operation_authority,
+                    binding=provider_binding,
+                    session_id=turn.session_id,
+                    actor_user_id=turn.actor_user_id,
+                )
+            ),
+            name="composer-retained-operation-history",
+        )
+        history_cancellations: list[asyncio.CancelledError] = []
+        history_outcome, _ = await _join_freeform_owned_task(history_task, cancellation_observations=history_cancellations)
+        if type(history_outcome) is not _RetainedOperationReadOutcome:
+            raise AuditIntegrityError("Retained history child lost its actual outcome")
+        if history_outcome.original_error is not None:
+            history_failure = history_outcome.original_error
+            if history_cancellations:
+                raise BaseExceptionGroup(
+                    "Retained history failure and caller cancellation", [history_failure, *history_cancellations]
+                ) from history_failure
+            raise history_failure
+        if len(history_cancellations) == 1:
+            raise history_cancellations[0]
+        if history_cancellations:
+            raise BaseExceptionGroup("Retained history caller cancellations", history_cancellations)
+        retained_operation_context = history_outcome.context
+        if retained_operation_context is None:
+            raise AuditIntegrityError("Retained history success lacks its actual projected context")
+
         post_provider_error: BaseException | None = None
         settled_record: ComposerOperationRecord | None = None
         # E14/F-C5: what is left of the admitted deadline NOW, with no await between
@@ -1309,6 +1419,7 @@ async def _run_composer_turn(
                     required_work=provider_binding,
                     provider_owner=provider_owner,
                     recovery_context=recovery_context,
+                    retained_operation_context=retained_operation_context,
                 )
             # F-B2/C2: first statement after compose() returns.
             observation.compose_result = result
@@ -1691,6 +1802,21 @@ async def _run_composer_turn(
                 )
                 observation.audit_cohort_durable = True
         if post_provider_error is not None:
+            if type(post_provider_error) is ComposerOwnedSettlementFailure and continuation_cancellations:
+                original_cause = post_provider_error.__cause__
+                secondary: list[BaseException] = []
+                if original_cause is not None and original_cause is not post_provider_error:
+                    secondary.append(original_cause)
+                for cancellation in continuation_cancellations:
+                    if all(cancellation is not prior for prior in secondary):
+                        secondary.append(cancellation)
+                if secondary:
+                    # The exact owned wrapper retains its priority. These
+                    # observations preceded wrapper construction, so grouping
+                    # them cannot introduce a reference back to that wrapper.
+                    raise post_provider_error from BaseExceptionGroup(
+                        "Composer settlement retained original cause and joined caller cancellations", secondary
+                    )
             raise post_provider_error
         if settled_record is None:
             raise InvariantError("Provider returned without a freeform continuation receipt")

@@ -411,7 +411,7 @@ def _canonical_payload(
 
 def diagnostic_evidence_identity(domain: str, correlation: str) -> str:
     """Keep owned evidence domains disjoint from arbitrary provider call IDs."""
-    if domain not in {"tool-authoring", "tool-failure", "provider-failure", "provider-request", "planner-candidate"}:
+    if domain not in {"tool-authoring", "tool-failure", "provider-failure", "provider-request", "planner-candidate", "operation-failure"}:
         raise AuditIntegrityError("Unknown private evidence identity domain")
     return f"{domain}:{hashlib.sha256(correlation.encode('utf-8')).hexdigest()}"
 

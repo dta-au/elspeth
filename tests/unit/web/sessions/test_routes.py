@@ -63,7 +63,13 @@ from elspeth.web.composer.diagnostic_evidence import (
 )
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.progress import ComposerProgressRegistry
-from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult, ComposerService, PipelineCommitIntent
+from elspeth.web.composer.protocol import (
+    ComposerPluginCrashError,
+    ComposerResult,
+    ComposerService,
+    PipelineCommitIntent,
+    RetainedOperationContext,
+)
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationSummary
@@ -679,9 +685,10 @@ class _ProgressAwareComposer:
         required_work=None,
         provider_owner=None,
         recovery_context=None,
+        retained_operation_context: RetainedOperationContext | None = None,
     ) -> ComposerResult:
         del message, chat_messages, session_id, current_state_id, user_id, user_message_id, completion_gates, budget_seconds
-        del required_work, provider_owner, recovery_context
+        del required_work, provider_owner, recovery_context, retained_operation_context
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True

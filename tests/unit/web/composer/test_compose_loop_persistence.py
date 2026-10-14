@@ -182,6 +182,275 @@ def _record_real_tool_handlers(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return handler_calls
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plugin_failure", (False, True))
+async def test_committed_effect_comparison_failure_preserves_saved_rows_and_original_failure(
+    composer_service_with_real_sessions,
+    result_session_id,
+    monkeypatch,
+    plugin_failure,
+):
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    composer = composer_service_with_real_sessions
+    sessions = composer._sessions_service
+    persisted = []
+    evidence_owners = []
+    actual_persist = sessions.persist_compose_turn_async
+    actual_accept = TurnEvidence.accept_checkpoint
+    actual_execute = tool_batch_module.execute_tool
+    original_failure = ValueError("Synthetic original tool failure")
+    comparison_failure = RuntimeError("Synthetic private comparison failure")
+    provider_calls = 0
+
+    async def persist(**kwargs):
+        outcome = await actual_persist(**kwargs)
+        persisted.append(outcome)
+        return outcome
+
+    def accept(owner, *args, **kwargs):
+        actual_accept(owner, *args, **kwargs)
+        evidence_owners.append(owner)
+        raise comparison_failure
+
+    def execute(name, *args, **kwargs):
+        if plugin_failure and name == "get_pipeline_state":
+            raise original_failure
+        return actual_execute(name, *args, **kwargs)
+
+    async def completion(*args, **kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        calls = [("saved-metadata", "set_metadata", {"patch": {"name": "Saved name"}})]
+        if plugin_failure:
+            calls.append(("failed-discovery", "get_pipeline_state", {}))
+        return _admit_composer_llm_completion(_tool_batch_response(*calls))
+
+    monkeypatch.setattr(sessions, "persist_compose_turn_async", persist)
+    monkeypatch.setattr(TurnEvidence, "accept_checkpoint", accept)
+    monkeypatch.setattr(tool_batch_module, "execute_tool", execute)
+    expected_error = ComposerPluginCrashError if plugin_failure else AuditIntegrityError
+    with pytest.raises(expected_error) as caught:
+        await _run_one_turn(composer, llm=completion, session_id=result_session_id)
+    assert provider_calls == 1
+    assert len(persisted) == 1
+    assert persisted[0].checkpoint_disposition == "committed"
+    assert persisted[0].checkpoint is not None
+    assert evidence_owners[0].effects.saved_revision_count == 1
+    assert evidence_owners[0].effects.verification == "unavailable"
+    assert caught.value.failed_turn.tool_responses_persisted == (2 if plugin_failure else 1)
+    if plugin_failure:
+        assert caught.value.original_exc is original_failure
+        assert isinstance(caught.value.__cause__, BaseExceptionGroup)
+        assert caught.value.__cause__.exceptions[0] is original_failure
+        verification_failure = caught.value.__cause__.exceptions[1]
+        assert isinstance(verification_failure, AuditIntegrityError)
+        assert verification_failure.__cause__ is comparison_failure
+    else:
+        assert caught.value.__cause__ is comparison_failure
+    messages = await sessions.get_messages(UUID(result_session_id), limit=None)
+    assert len([row for row in messages if row.role == "assistant"]) == 1
+    assert len([row for row in messages if row.role == "tool"]) == (2 if plugin_failure else 1)
+    states = await sessions.get_state_versions(UUID(result_session_id))
+    assert len(states) == 1
+    assert str(states[0].id) == persisted[0].current_state_id
+    assert "Synthetic private comparison failure" not in json.dumps([row.content for row in messages if row.role != "audit"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verification_fails", (False, True))
+@pytest.mark.parametrize("failure_kind", ("early", "early_group", "early_deadline", "dispatch_deadline", "dispatch_deadline_inflight"))
+async def test_pending_advisor_failure_retains_committed_effect_outcome(
+    composer_service_with_real_sessions,
+    result_session_id,
+    monkeypatch,
+    verification_fails,
+    failure_kind,
+):
+    from elspeth.web.composer.advisor_checkpoint import _AdvisorCheckpointComposeDeadlineExpired
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    composer = composer_service_with_real_sessions
+    sessions = composer._sessions_service
+    actual_persist = sessions.persist_compose_turn_async
+    actual_accept = TurnEvidence.accept_checkpoint
+    persisted = []
+    owners = []
+    original_leaves = (asyncio.CancelledError("Synthetic owned cancellation"), AuditIntegrityError("Synthetic owned integrity failure"))
+    original_failure = (
+        BaseExceptionGroup("Synthetic owned EARLY mixed failure", original_leaves)
+        if failure_kind == "early_group"
+        else ValueError("Synthetic EARLY controlled failure")
+    )
+    comparison_failure = RuntimeError("Synthetic secondary comparison failure")
+
+    async def persist(**kwargs):
+        outcome = await actual_persist(**kwargs)
+        persisted.append(outcome)
+        return outcome
+
+    def accept(owner, *args, **kwargs):
+        actual_accept(owner, *args, **kwargs)
+        owners.append(owner)
+        if verification_fails:
+            raise comparison_failure
+
+    async def early(**kwargs):
+        if failure_kind == "early_deadline":
+            raise _AdvisorCheckpointComposeDeadlineExpired
+        raise original_failure
+
+    async def completion(*args, **kwargs):
+        calls = [("saved-metadata", "set_metadata", {"patch": {"name": "Saved before failure"}})]
+        if failure_kind.startswith("dispatch_deadline"):
+            calls.append(
+                (
+                    "deadline-hint",
+                    "request_advisor_hint",
+                    {
+                        "trigger": "proactive_security_safety",
+                        "problem_summary": "Inspect the configuration",
+                        "recent_errors": [],
+                        "attempted_actions": [],
+                    },
+                )
+            )
+        return _admit_composer_llm_completion(_tool_batch_response(*calls))
+
+    monkeypatch.setattr(sessions, "persist_compose_turn_async", persist)
+    monkeypatch.setattr(TurnEvidence, "accept_checkpoint", accept)
+    monkeypatch.setattr(composer._advisor_checkpoint, "_maybe_run_early_checkpoint", early)
+    if failure_kind.startswith("dispatch_deadline"):
+        remaining = 5.0 if failure_kind == "dispatch_deadline_inflight" else 0.0
+        monkeypatch.setattr(tool_batch_module, "_remaining_compose_seconds", lambda deadline: remaining)
+        composer._settings = composer._settings.model_copy(update={"composer_advisor_timeout_seconds": 60.0})
+
+        async def timeout_advisor(**kwargs):
+            raise TimeoutError
+
+        monkeypatch.setattr("elspeth.web.composer.provider_gateway._litellm_acompletion", timeout_advisor)
+    expected_error = (
+        BaseExceptionGroup if failure_kind == "early_group" else ValueError if failure_kind == "early" else ComposerConvergenceError
+    )
+    with pytest.raises(expected_error) as caught:
+        await _run_one_turn(composer, llm=completion, session_id=result_session_id)
+    if failure_kind in ("early", "early_group"):
+        assert caught.value is original_failure
+        if failure_kind == "early_group":
+            assert caught.value.exceptions == original_leaves
+    else:
+        assert caught.value.budget_exhausted == "timeout"
+        assert caught.value.partial_state.metadata.name == "Saved before failure"
+        assert caught.value.tool_invocations == ()
+        assert caught.value.failed_turn.assistant_message_id == persisted[0].assistant_id
+        assert caught.value.failed_turn.tool_responses_persisted == (2 if failure_kind.startswith("dispatch_deadline") else 1)
+    assert len(persisted) == 1
+    assert persisted[0].checkpoint_disposition == "committed"
+    assert owners[0].effects.saved_revision_count == 1
+    assert owners[0].effects.verification == ("unavailable" if verification_fails else "verified")
+    if verification_fails:
+        cause = caught.value.__cause__
+        secondary = cause.exceptions[-1] if isinstance(cause, BaseExceptionGroup) else cause
+        assert isinstance(secondary, AuditIntegrityError)
+        assert secondary.__cause__ is comparison_failure
+        assert secondary.failed_turn.assistant_message_id == persisted[0].assistant_id
+        assert secondary.failed_turn.tool_responses_persisted == (2 if failure_kind.startswith("dispatch_deadline") else 1)
+    rows = await sessions.get_messages(UUID(result_session_id), limit=None)
+    assert len([row for row in rows if row.role == "assistant"]) == 1
+    assert len([row for row in rows if row.role == "tool"]) == (2 if failure_kind.startswith("dispatch_deadline") else 1)
+    states = await sessions.get_state_versions(UUID(result_session_id))
+    assert len(states) == 1
+    assert str(states[0].id) == persisted[0].current_state_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plugin_fails", (False, True))
+@pytest.mark.parametrize("verification_fails", (False, True))
+async def test_pending_cancel_and_plugin_retain_early_and_committed_effect_failures(
+    composer_service_with_real_sessions,
+    result_session_id,
+    monkeypatch,
+    plugin_fails,
+    verification_fails,
+):
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    composer = composer_service_with_real_sessions
+    sessions = composer._sessions_service
+    actual_accept = TurnEvidence.accept_checkpoint
+    actual_execute = tool_batch_module.execute_tool
+    actual_persist = sessions.persist_compose_turn_async
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    early_failure = ValueError("Synthetic EARLY failure during pending cancellation")
+    plugin_failure = RuntimeError("Synthetic primary plugin failure")
+    comparison_failure = RuntimeError("Synthetic secondary comparison failure")
+    persisted = []
+
+    async def persist(**kwargs):
+        result = await actual_persist(**kwargs)
+        persisted.append(result)
+        return result
+
+    def accept(owner, *args, **kwargs):
+        actual_accept(owner, *args, **kwargs)
+        if verification_fails:
+            raise comparison_failure
+
+    def execute(name, *args, **kwargs):
+        if plugin_fails and name == "get_pipeline_state":
+            raise plugin_failure
+        return actual_execute(name, *args, **kwargs)
+
+    async def early(**kwargs):
+        entered.set()
+        await release.wait()
+        raise early_failure
+
+    async def completion(*args, **kwargs):
+        calls = [("saved-metadata", "set_metadata", {"patch": {"name": "Saved before cancellation"}})]
+        if plugin_fails:
+            calls.append(("failed-discovery", "get_pipeline_state", {}))
+        return _admit_composer_llm_completion(_tool_batch_response(*calls))
+
+    monkeypatch.setattr(sessions, "persist_compose_turn_async", persist)
+    monkeypatch.setattr(TurnEvidence, "accept_checkpoint", accept)
+    monkeypatch.setattr(tool_batch_module, "execute_tool", execute)
+    monkeypatch.setattr(composer._advisor_checkpoint, "_maybe_run_early_checkpoint", early)
+    task = asyncio.create_task(_run_one_turn(composer, llm=completion, session_id=result_session_id))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    task.cancel("Synthetic caller cancellation")
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(ComposerPluginCrashError if plugin_fails else asyncio.CancelledError) as caught:
+        await task
+    assert len(persisted) == 1
+    assert persisted[0].checkpoint_disposition == "committed"
+    cause = caught.value.__cause__
+    assert isinstance(cause, BaseExceptionGroup)
+    expected_originals = (plugin_failure, early_failure) if plugin_fails else (early_failure,)
+    assert cause.exceptions[: len(expected_originals)] == expected_originals
+    if plugin_fails:
+        assert caught.value.original_exc is plugin_failure
+        assert caught.value.tool_invocations == ()
+        assert caught.value.failed_turn.assistant_message_id == persisted[0].assistant_id
+    else:
+        assert caught.value.args == ("Synthetic caller cancellation",)
+    if verification_fails:
+        secondary = cause.exceptions[-1]
+        assert isinstance(secondary, AuditIntegrityError)
+        assert secondary.__cause__ is comparison_failure
+        assert secondary.failed_turn.assistant_message_id == persisted[0].assistant_id
+    else:
+        assert len(cause.exceptions) == len(expected_originals)
+    rows = await sessions.get_messages(UUID(result_session_id), limit=None)
+    assert len([row for row in rows if row.role == "assistant"]) == 1
+    assert len([row for row in rows if row.role == "tool"]) == (2 if plugin_fails else 1)
+    states = await sessions.get_state_versions(UUID(result_session_id))
+    assert len(states) == 1
+    assert str(states[0].id) == persisted[0].current_state_id
+
+
 async def _capture_tool_batch_rejection(
     service: ComposerServiceImpl,
     *,
@@ -711,7 +980,7 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
     result_session_id: str,
 ) -> None:
     arguments = {
-        "source": {"plugin": "null", "on_success": "rows"},
+        "source": {"plugin": "null", "on_success": "rows", "on_validation_failure": "discard"},
         "nodes": [],
         "edges": [],
         "outputs": [],

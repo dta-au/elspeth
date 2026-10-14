@@ -10,10 +10,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, final
+from uuid import UUID
 
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.web.sessions.protocol import ChatMessageRole, CompositionStateData
+from elspeth.web.sessions.protocol import ChatMessageRole, CompositionStateData, CompositionStateRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +210,8 @@ class AuditOutcome:
 
     assistant_id: str | None
     unwind_audit_failed: bool
+    checkpoint_disposition: Literal["committed", "no_new_checkpoint", "empty", "unavailable"]
+    checkpoint: CommittedCheckpointWitness | None
     current_state_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -220,3 +223,47 @@ class AuditOutcome:
                 "assistant_id being set; the unwind path cannot have produced "
                 "an assistant id"
             )
+        if self.unwind_audit_failed:
+            if self.checkpoint_disposition != "unavailable" or self.checkpoint is not None:
+                raise ValueError("Failed audit unwind cannot carry a committed checkpoint witness")
+        elif self.checkpoint_disposition == "committed":
+            if type(self.checkpoint) is not CommittedCheckpointWitness or str(self.checkpoint.state.id) != self.current_state_id:
+                raise ValueError("Committed audit outcome requires its exact checkpoint witness")
+        elif self.checkpoint_disposition == "no_new_checkpoint":
+            if self.current_state_id is None or self.checkpoint is not None:
+                raise ValueError("Inherited state cannot be claimed as a new checkpoint")
+        elif self.checkpoint_disposition == "empty":
+            if self.current_state_id is not None or self.checkpoint is not None:
+                raise ValueError("Empty checkpoint disposition cannot carry a saved state")
+        else:
+            raise ValueError("Successful audit outcome requires an explicit checkpoint disposition")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CommittedCheckpointWitness:
+    """Exact inserted row selected in its transaction, returned only after commit.
+
+    This is internal saved-revision evidence, not a later observation of the
+    current head. All inserted IDs belong to this batch; the decoded row names
+    the last one. Provider tool calls need not map one-to-one to revisions.
+    """
+
+    state: CompositionStateRecord
+    creator_operation_id: str
+    inserted_state_ids: tuple[UUID, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.state) is not CompositionStateRecord:
+            raise TypeError("Checkpoint witness requires an owned decoded state record")
+        if type(self.creator_operation_id) is not str or not self.creator_operation_id:
+            raise ValueError("Checkpoint witness requires its actual creator fence identity")
+        if (
+            type(self.inserted_state_ids) is not tuple
+            or not self.inserted_state_ids
+            or any(type(item) is not UUID for item in self.inserted_state_ids)
+        ):
+            raise ValueError("Checkpoint witness requires actual inserted revision identities")
+        if self.inserted_state_ids[-1] != self.state.id or len(set(self.inserted_state_ids)) != len(self.inserted_state_ids):
+            raise ValueError("Checkpoint witness must identify the final distinct inserted revision")
+        freeze_fields(self, "inserted_state_ids")

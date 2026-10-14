@@ -28,6 +28,7 @@ WithheldReplyOrigin = Literal[
     "repair_gate_superseded",
     "advisor_repair_tool_turn",
     "advisor_repair_terminal",
+    "advisor_publication_withheld",
     "compose_deadline_expired",
     "planner_prose_unadmitted",
 ]

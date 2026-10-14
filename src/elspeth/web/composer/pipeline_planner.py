@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from functools import partial
-from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast, final
 from uuid import UUID, uuid4
 
 import structlog
@@ -108,7 +108,7 @@ from elspeth.web.composer.progress import (
 # identity closes a gap. (Runtime-safe: prompts reaches this module only
 # through protocol's TYPE_CHECKING block.)
 from elspeth.web.composer.prompts import _state_referenced_plugins
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import RetainedOperationContext, ToolArgumentError, retained_operation_context_message
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_discovery_response import (
     argument_error_response,
@@ -129,7 +129,7 @@ from elspeth.web.composer.provider_quota import (
 )
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.recovery_controls import parse_recovery_tool_call, recovery_context_message, recovery_tool_definitions
-from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.redaction import GetBlobContentArgumentsModel, SetPipelineArgumentsModel
 from elspeth.web.composer.response_contracts import AdmittedResponse
 from elspeth.web.composer.state import (
     COMPOSER_NODE_TYPES,
@@ -165,6 +165,7 @@ from elspeth.web.composer.tools.wire_projection import (
     stamp_planner_terminal,
     wire_tool_definitions,
 )
+from elspeth.web.composer.turn_effects import AdvisorPublicationReview, BlobDeliveryAttempt, TurnEvidence
 from elspeth.web.credential_guard import (
     CredentialMaterialRefused,
     require_no_credential_material,
@@ -434,8 +435,11 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
         blob_id = arguments["blob_id"] if "blob_id" in arguments else None
         return (f"blob.inspection:{blob_id}",)
     if name == "get_blob_content":
-        blob_id = arguments["blob_id"] if "blob_id" in arguments else None
-        return (f"blob.content:{blob_id}",)
+        try:
+            page = GetBlobContentArgumentsModel.model_validate(deep_thaw(arguments))
+        except PydanticValidationError:
+            return ()
+        return ("blob.content:" + canonical_json((page.blob_id, page.offset_chars, page.expected_content_hash)),)
     if name == "list_secret_refs":
         return ("secret.index",)
     if name == "validate_secret_ref":
@@ -645,9 +649,10 @@ class PlannerDeclined(PipelinePlannerError):
     failure.
     """
 
-    def __init__(self, message: str, *, decline_text: str) -> None:
+    def __init__(self, message: str, *, decline_text: str, continuation_budget: PlannerContinuationBudget | None = None) -> None:
         super().__init__(message, code="DECLINED")
         self.decline_text = decline_text
+        self.continuation_budget = continuation_budget
 
 
 class PlannerHandoff(PipelinePlannerError):
@@ -662,6 +667,103 @@ class _PipelineCandidateRejected(RuntimeError):
     def __init__(self, result: ToolResult) -> None:
         super().__init__("pipeline candidate was not acceptable")
         self.result = result
+
+
+class PlannerContinuationUnavailable(Exception):
+    """Internal admission signal, never a provider outage or model verdict."""
+
+
+@final
+@dataclass(slots=True)
+class PlannerContinuationBudget:
+    """Continue this exact declined request's existing reservations and cost cap."""
+
+    policy: PlannerBudgetPolicy
+    session_id: str
+    request_id: str | None
+    request_hash: str
+    provider_owner: ProviderInvocationOwner | None
+    evidence_owner: TurnEvidence | None
+    deadline: float
+    reserved_calls: int
+    validated_cost: Decimal
+    cost_known: bool
+    _charged_call_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _publication_binding: str | None = field(default=None, init=False, repr=False)
+
+    def validate_for(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        request: str,
+        provider_owner: ProviderInvocationOwner | None,
+        evidence_owner: TurnEvidence,
+    ) -> None:
+        if (
+            type(self.policy) is not PlannerBudgetPolicy
+            or type(self.request_id) is not str
+            or not self.request_id
+            or self.session_id != session_id
+            or self.request_id != request_id
+            or self.request_hash != stable_hash(request)
+            or self.provider_owner is not provider_owner
+            or self.evidence_owner is not evidence_owner
+            or type(evidence_owner) is not TurnEvidence
+            or type(self.reserved_calls) is not int
+            or not 0 <= self.reserved_calls <= self.policy.max_total_provider_calls
+            or type(self.validated_cost) is not Decimal
+            or not self.validated_cost.is_finite()
+            or self.validated_cost < 0
+            or type(self.cost_known) is not bool
+            or type(self.deadline) is not float
+            or not math.isfinite(self.deadline)
+        ):
+            raise AuditIntegrityError("Planner continuation belongs to another request or has invalid accounting")
+
+    def has_cost_headroom(self) -> bool:
+        return self.cost_known and self.validated_cost < self.policy.max_cumulative_provider_cost
+
+    def within_cost_cap(self) -> bool:
+        return self.cost_known and self.validated_cost <= self.policy.max_cumulative_provider_cost
+
+    def bind_publication(self, review: AdvisorPublicationReview) -> None:
+        if type(review) is not AdvisorPublicationReview or (
+            self._publication_binding is not None and self._publication_binding != review.binding
+        ):
+            raise AuditIntegrityError("Planner continuation changed its exact candidate review")
+        self._publication_binding = review.binding
+
+    def require_publication(self, review: AdvisorPublicationReview | None) -> None:
+        if type(review) is not AdvisorPublicationReview or self._publication_binding is None or review.binding != self._publication_binding:
+            raise AuditIntegrityError("Planner continuation lacks its exact bound candidate review")
+
+    def reserve_attempt(self, *, now: float) -> bool:
+        if now >= self.deadline or self.reserved_calls >= self.policy.max_total_provider_calls or not self.has_cost_headroom():
+            return False
+        # Matches original planner semantics: reserved before quota, distinct
+        # from the number of actual physical SDK dispatches.
+        self.reserved_calls += 1
+        return True
+
+    def check_dispatch(self, *, now: float) -> None:
+        if now >= self.deadline or self.reserved_calls > self.policy.max_total_provider_calls or not self.has_cost_headroom():
+            raise PlannerContinuationUnavailable("Planner continuation has no existing admission headroom")
+
+    def consume_call(self, call: ComposerLLMCall, *, retained: bool) -> None:
+        if type(call) is not ComposerLLMCall or call.call_id is None or not retained:
+            raise AuditIntegrityError("Planner continuation lacks its actual retained advisor audit")
+        if call.call_id in self._charged_call_ids:
+            raise AuditIntegrityError("Planner continuation attempted to charge the same advisor call twice")
+        self._charged_call_ids.add(call.call_id)
+        if call.provider_cost is None:
+            self.cost_known = False
+            return
+        cost = Decimal(str(call.provider_cost))
+        if not cost.is_finite() or cost < 0:
+            self.cost_known = False
+            return
+        self.validated_cost += cost
 
 
 @dataclass(frozen=True, slots=True)
@@ -1394,17 +1496,15 @@ class _ParsedToolCall:
 
 @dataclass(frozen=True, slots=True)
 class _AuditedDiscoveryResult:
-    """Carry the real result while exposing only a closed audit projection."""
+    """Buffer the admitted envelope for strict manifest redaction at persistence."""
 
     result: ToolResult
     admitted: AdmittedDiscoveryResult
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "success": self.result.success,
-            "validation": {"is_valid": self.result.validation.is_valid},
-            "version": self.result.updated_state.version,
-        }
+        # Preserve required successful data and framing through the nominal
+        # selected encoder. Original unadmitted discovery data is not traversed.
+        return self.admitted.to_dict()
 
 
 class _PlannerTerminalPayload(BaseModel):
@@ -3098,6 +3198,9 @@ async def plan_pipeline(
     mark_schema_loaded: Callable[[str, str], None] | None,
     conversation_context: PlannerConversationContext | None = None,
     recovery_context: GraphRecoveryContext | None = None,
+    retained_operation_context: RetainedOperationContext | None = None,
+    turn_evidence: TurnEvidence | None = None,
+    request_deadline: float | None = None,
     policy_catalog: PolicyCatalogView,
     plugin_snapshot: PluginAvailabilitySnapshot,
     originating_message: PlannerOriginatingMessage,
@@ -3128,8 +3231,19 @@ async def plan_pipeline(
         raise ValueError("repair_budget must be a non-negative exact integer")
     if conversation_context is not None and type(conversation_context) is not PlannerConversationContext:
         raise TypeError("conversation_context must be an exact PlannerConversationContext or None")
+    if retained_operation_context is not None:
+        retained_operation_context.validate_for(session_id=originating_message.session_id, actor_user_id=originating_message.user_id)
     if policy_catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
+    if request_deadline is not None and (type(request_deadline) is not float or not math.isfinite(request_deadline)):
+        raise TypeError("Planner request deadline must be a finite exact float")
+    if turn_evidence is not None and (
+        type(turn_evidence) is not TurnEvidence
+        or turn_evidence.session_id != originating_message.session_id
+        or turn_evidence.operation_id
+        != (custody_config.session_operation_context.fence.operation_id if custody_config.session_operation_context is not None else None)
+    ):
+        raise AuditIntegrityError("Planner evidence belongs to another request's session operation")
     canonical_json(provider_current_state)
     if not callable(candidate_finalizer):
         raise TypeError("candidate_finalizer must be callable")
@@ -3162,6 +3276,9 @@ async def plan_pipeline(
                 mark_schema_loaded=mark_schema_loaded,
                 conversation_context=conversation_context,
                 recovery_context=recovery_context,
+                retained_operation_context=retained_operation_context,
+                turn_evidence=turn_evidence,
+                request_deadline=request_deadline,
                 policy_catalog=policy_catalog,
                 plugin_snapshot=plugin_snapshot,
                 originating_message=originating_message,
@@ -3233,6 +3350,9 @@ async def _plan_pipeline_inner(
     mark_schema_loaded: Callable[[str, str], None] | None,
     conversation_context: PlannerConversationContext | None,
     recovery_context: GraphRecoveryContext | None,
+    retained_operation_context: RetainedOperationContext | None,
+    turn_evidence: TurnEvidence | None,
+    request_deadline: float | None,
     policy_catalog: PolicyCatalogView,
     plugin_snapshot: PluginAvailabilitySnapshot,
     originating_message: PlannerOriginatingMessage,
@@ -3250,6 +3370,8 @@ async def _plan_pipeline_inner(
 ) -> PipelinePlanResult:
     skill_hash = hashlib.sha256(rendered_skill.encode("utf-8")).hexdigest()
     deadline = _planner_deadline_time() + model_config.timeout_seconds
+    if request_deadline is not None:
+        deadline = min(deadline, request_deadline)
 
     async def run_planner_sync(func: Callable[..., Any], *args: Any) -> Any:
         remaining = deadline - _planner_deadline_time()
@@ -3332,6 +3454,7 @@ async def _plan_pipeline_inner(
         provider_request["conversation_context"] = conversation_context.to_dict()
     if recovery_context is not None:
         provider_request["graph_recovery_context"] = json.loads(recovery_context_message(recovery_context))
+    provider_request.update(json.loads(retained_operation_context_message(retained_operation_context)))
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": rendered_skill},
@@ -3343,6 +3466,7 @@ async def _plan_pipeline_inner(
     total_calls = 0
     private_response_namespace = str(uuid4())
     total_cost = Decimal("0")
+    continuation_cost_known = True
     discovery_turns = 0
     composition_turns = 0
     repair_count = 0
@@ -3398,6 +3522,8 @@ async def _plan_pipeline_inner(
         selected_schema_contracts.append(contract_payload)
         return contract_payload
 
+    pending_delivery: BlobDeliveryAttempt | None = None
+
     async def call_model_body(
         *,
         model_override: str | None = None,
@@ -3408,7 +3534,8 @@ async def _plan_pipeline_inner(
         attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
         provider_custody: ProviderCallCustody | None = None,
     ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
-        nonlocal total_calls, total_cost
+        nonlocal total_calls, total_cost, pending_delivery
+        pending_delivery = None
         effective_model = model_override or model_config.model_identifier
         effective_pricing_model = model_config.escape_hatch_pricing_model if model_override is not None else model_config.pricing_model
         # Endpoint affordance: select by the SAME condition that selects
@@ -3466,6 +3593,10 @@ async def _plan_pipeline_inner(
             ordinal: int,
             received: tuple[PrivateReceivedDiagnostic, ...] = (),
         ) -> ComposerLLMCall:
+            nonlocal continuation_cost_known
+            # Preserve the historical validated-success accumulator. Unknown
+            # earlier transport cost cannot become free END allowance.
+            continuation_cost_known = False
             failed_call = build_llm_call_record(
                 model_requested=effective_model,
                 pricing_model=effective_pricing_model,
@@ -3574,6 +3705,13 @@ async def _plan_pipeline_inner(
                 api_key=api_key,
             )
             private_request = capture_provider_context(messages=marked_messages, tools=marked_tools)
+            delivery = (
+                turn_evidence.prepare_delivery(
+                    scope="planner", messages=marked_messages, tools=marked_tools, previous_calls=recorder.llm_calls
+                )
+                if turn_evidence is not None
+                else None
+            )
 
             try:
                 response = await asyncio.wait_for(
@@ -3874,6 +4012,7 @@ async def _plan_pipeline_inner(
             record_response_call(call, None)
             message, calls = parsed_response
             begin_response_attempt(call, calls)
+            pending_delivery = delivery
             return message, calls, call
         raise AssertionError("provider attempt loop exited without return or exception")
 
@@ -3906,7 +4045,7 @@ async def _plan_pipeline_inner(
         attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
     ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
         if provider_owner is None:
-            return await call_model_legacy(
+            result = await call_model_legacy(
                 model_override=model_override,
                 tools_override=tools_override,
                 allow_text_reply=allow_text_reply,
@@ -3914,18 +4053,23 @@ async def _plan_pipeline_inner(
                 reasoning_effort=reasoning_effort,
                 attempt_phase_hint=attempt_phase_hint,
             )
-        provider_custody = _new_planner_custody(provider_owner)
-        async with provider_call_scope(provider_custody):
-            with required_provider_audit_scope(provider_custody):
-                return await call_model_body(
-                    model_override=model_override,
-                    tools_override=tools_override,
-                    allow_text_reply=allow_text_reply,
-                    text_reply_marker=text_reply_marker,
-                    reasoning_effort=reasoning_effort,
-                    attempt_phase_hint=attempt_phase_hint,
-                    provider_custody=provider_custody,
-                )
+        else:
+            provider_custody = _new_planner_custody(provider_owner)
+            async with provider_call_scope(provider_custody):
+                with required_provider_audit_scope(provider_custody):
+                    result = await call_model_body(
+                        model_override=model_override,
+                        tools_override=tools_override,
+                        allow_text_reply=allow_text_reply,
+                        text_reply_marker=text_reply_marker,
+                        reasoning_effort=reasoning_effort,
+                        attempt_phase_hint=attempt_phase_hint,
+                        provider_custody=provider_custody,
+                    )
+        # Body success is insufficient: owned settlement must have unwound.
+        if turn_evidence is not None and pending_delivery is not None:
+            turn_evidence.confirm_delivery(pending_delivery, recorder.llm_calls)
+        return result
 
     # ── Escape-hatch state ────────────────────────────────────────────────
     # On budget exhaustion, instead of failing immediately, one overtime turn
@@ -4135,6 +4279,18 @@ async def _plan_pipeline_inner(
             raise PlannerDeclined(
                 "planner escape-hatch advisor declined the request" if is_hatch_turn else "planner declined the request",
                 decline_text=raw_text if is_hatch_turn else (marker_body if marker_body is not None else ""),
+                continuation_budget=PlannerContinuationBudget(
+                    policy=budget_policy,
+                    session_id=originating_message.session_id,
+                    request_id=originating_message.message_id,
+                    request_hash=stable_hash(intent),
+                    provider_owner=provider_owner,
+                    evidence_owner=turn_evidence,
+                    deadline=deadline,
+                    reserved_calls=total_calls,
+                    validated_cost=total_cost,
+                    cost_known=continuation_cost_known,
+                ),
             )
         if terminal_calls and len(calls) > 1:
             # emit_pipeline_proposal batched with other calls. Nothing in the
@@ -4811,6 +4967,13 @@ async def _plan_pipeline_inner(
                 result=discovery_result,
                 schema_contract_budget_remaining=budget_remaining,
             )
+            if call.name == "get_blob_content" and turn_evidence is not None and type(discovery_result) is AdmittedDiscoveryResult:
+                turn_evidence.register_blob_page(
+                    tool_call_id=call.call_id,
+                    admitted=discovery_result,
+                    selected_content=serialized_result,
+                    producer_call_id=turn_evidence.current_call_id("planner"),
+                )
             messages.append(
                 {
                     "role": "tool",

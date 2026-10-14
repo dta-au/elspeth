@@ -357,7 +357,7 @@ async def test_compose_loop_rejects_unwind_audit_failure_without_plugin_crash(
             return []
 
         async def persist_compose_turn_async(self, **_kwargs: Any) -> AuditOutcome:
-            return AuditOutcome(assistant_id=None, unwind_audit_failed=True)
+            return AuditOutcome(assistant_id=None, unwind_audit_failed=True, checkpoint_disposition="unavailable", checkpoint=None)
 
         async def upsert_skill_markdown_history(self, **_kwargs: Any) -> bool:
             # Phase 5b Task 5 follow-on (F-5c). Mock satisfies the protocol
