@@ -24,6 +24,176 @@ def _source_units(paths: tuple[str, ...]) -> tuple[fencing.SourceUnit, ...]:
     return tuple(fencing._parse_source(path, (ROOT / path).read_text()) for path in paths)
 
 
+def _retained_transfer_units() -> tuple[fencing.SourceUnit, ...]:
+    return _source_units(
+        tuple(
+            sorted(
+                {
+                    *compose._METHOD_PATHS,
+                    terminal.SERVICE,
+                    terminal.REQUIRED,
+                    terminal.WORKERS,
+                    terminal.AUTHORITY,
+                    "src/elspeth/web/composer/audit_storage.py",
+                }
+            )
+        )
+    )
+
+
+def test_retained_failure_transfer_receipts_identify_exact_actual_four_calls() -> None:
+    units = _retained_transfer_units()
+    failures, calls = fencing._reserve_retained_failure_transfer_receipts(units)
+    assert failures == []
+    actual = {
+        (unit.path, ast.unparse(node.func))
+        for unit in units
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Call) and (unit.path, id(node)) in calls
+    }
+    assert len(calls) == 4
+    assert actual == {
+        (TURN, "lease.create_task"),
+        (TURN, "_capture_retained_operation_read"),
+        (TURN, "_read_retained_operation_context"),
+        (SERVICE, "private_operation_failure_draft"),
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "def corrupt():\n global private_operation_failure_draft\n private_operation_failure_draft = foreign\n",
+        "def corrupt():\n private_operation_failure_draft.__code__ = foreign.__code__\n",
+        "def corrupt():\n ComposerOperationFailureFacts.__getattribute__ = foreign\n",
+    ),
+)
+def test_retained_failure_supplier_refuses_deferred_replacement(mutation: str) -> None:
+    units = _retained_transfer_units()
+    assert fencing._reserve_retained_failure_transfer_receipts(units)[0] == []
+    audit = next(unit for unit in units if unit.path == "src/elspeth/web/composer/audit_storage.py")
+    audit.tree.body.extend(ast.parse(mutation).body)
+    failures, calls = fencing._reserve_retained_failure_transfer_receipts(units)
+    assert failures == ["retained/private transfer owned supplier mutated " + audit.path]
+    assert calls == frozenset()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "from elspeth.web.composer import audit_storage as storage\ndef corrupt():\n storage.private_operation_failure_draft = foreign\n",
+        "from elspeth.web.composer.audit_storage import private_operation_failure_draft as project\ndef corrupt():\n project.__code__ = foreign.__code__\n",
+        "from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts as Facts\ndef corrupt():\n Facts.validate_for = foreign\n",
+        "import elspeth.web.composer.audit_storage as storage\ndef corrupt():\n setattr(storage, 'private_operation_failure_draft', foreign)\n",
+    ),
+)
+def test_retained_failure_supplier_roots_refuse_sibling_mutation(mutation: str) -> None:
+    units = _retained_transfer_units()
+    sibling = fencing._parse_source("src/elspeth/retained_transfer_adversary.py", mutation)
+    failures = fencing._reserve_selected_origin_effect_failures((*units, sibling), fencing._reserve_RETAINED_FAILURE_ORIGINS)
+    assert any(sibling.path in failure for failure in failures), failures
+
+
+def test_retained_failure_supplier_roots_allow_unchanged_sibling_imports() -> None:
+    sibling = fencing._parse_source(
+        "src/elspeth/retained_transfer_adversary.py",
+        "from elspeth.web.composer import audit_storage as storage\n"
+        "from elspeth.web.composer.audit_storage import private_operation_failure_draft as project\n"
+        "from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts as Facts\n"
+        "def harmless():\n return 'ordinary unrelated value'\n",
+    )
+    failures = fencing._reserve_selected_origin_effect_failures(
+        (*_retained_transfer_units(), sibling), fencing._reserve_RETAINED_FAILURE_ORIGINS
+    )
+    assert not any(sibling.path in failure for failure in failures), failures
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "authority",
+        "binding",
+        "callee",
+        "task_supplier",
+        "join",
+        "cancellation",
+        "reader_forwarding",
+        "capture_failure",
+        "outcome_guard",
+        "import",
+        "dependency_rebound",
+        "private_callee",
+        "private_argument",
+        "private_forwarding",
+        "private_nominal_guard",
+    ),
+)
+def test_retained_failure_transfers_refuse_changed_source(fault: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    units = _retained_transfer_units()
+    assert fencing._reserve_retained_failure_transfer_receipts(units)[0] == []
+    index = {unit.path: unit for unit in units}
+    turn = fencing._reserve_node_at(index[TURN], "_run_composer_turn")
+    history = turn.body[37].body[6]
+    reader = next(
+        node for node in ast.walk(history) if isinstance(node, ast.Call) and ast.unparse(node.func) == "_read_retained_operation_context"
+    )
+    audit = index["src/elspeth/web/composer/audit_storage.py"]
+    if fault in {"authority", "binding"}:
+        next(keyword for keyword in reader.keywords if keyword.arg == fault).value = ast.Name(id="foreign", ctx=ast.Load())
+    elif fault == "callee":
+        reader.func = ast.Name(id="foreign_reader", ctx=ast.Load())
+    elif fault == "task_supplier":
+        history.value.func.value = ast.Name(id="foreign_lease", ctx=ast.Load())
+    elif fault == "join":
+        turn.body[37].body[8].value.value.args[0] = ast.Name(id="foreign_task", ctx=ast.Load())
+    elif fault == "cancellation":
+        turn.body[37].body[11].body[0] = ast.Pass()
+    elif fault == "reader_forwarding":
+        declaration = fencing._reserve_node_at(index[TURN], "_read_retained_operation_context")
+        declaration.body.insert(1, ast.parse("foreign(authority)").body[0])
+    elif fault == "capture_failure":
+        declaration = fencing._reserve_node_at(index[TURN], "_capture_retained_operation_read")
+        declaration.body[0].handlers[0].body = [ast.parse("return foreign(read)").body[0]]
+    elif fault == "outcome_guard":
+        declaration = fencing._reserve_node_at(index[TURN], "_RetainedOperationReadOutcome.__post_init__")
+        declaration.body[0].test = ast.Constant(value=False)
+    elif fault == "import":
+        imported = next(
+            node for node in index[TURN].tree.body if isinstance(node, ast.ImportFrom) and node.module == "elspeth.web.async_workers"
+        )
+        imported.module = "foreign.async_workers"
+    elif fault == "dependency_rebound":
+        audit.tree.body.append(
+            ast.parse("def mutate():\n global build_private_tool_evidence\n build_private_tool_evidence = foreign\n").body[0]
+        )
+    elif fault in {"private_callee", "private_argument"}:
+        method = fencing._reserve_node_at(index[SERVICE], "SessionServiceImpl.fail_composer_async_operation")
+        call = next(
+            node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == "private_operation_failure_draft"
+        )
+        if fault == "private_callee":
+            call.func = ast.Name(id="foreign_projection", ctx=ast.Load())
+        else:
+            call.keywords[0].value = ast.Name(id="foreign_failure", ctx=ast.Load())
+    else:
+        declaration = fencing._reserve_node_at(audit, "private_operation_failure_draft")
+        if fault == "private_forwarding":
+            declaration.body.insert(2, ast.parse("foreign(failure)").body[0])
+        else:
+            declaration.body[1].test = ast.Constant(value=False)
+    for unit in units:
+        ast.fix_missing_locations(unit.tree)
+    # Re-admit the changed caller grammar: structural history/call checks must
+    # still refuse, rather than succeeding only because an old digest differs.
+    if fault in {"authority", "binding", "callee", "task_supplier", "join", "cancellation"}:
+        monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, TURN, compose._method_shape(compose._strip_inert_annotations(turn, TURN)))
+    elif fault in {"private_callee", "private_argument"}:
+        monkeypatch.setitem(terminal.GRAMMARS, terminal.FAIL, terminal.grammar(method))
+    failures, calls = fencing._reserve_retained_failure_transfer_receipts(units)
+    assert failures
+    assert calls == frozenset()
+
+
 @pytest.mark.parametrize("fault", ("omit_admission", "foreign_worker_app", "foreign_return"))
 def test_reviewed_app_whole_scope_matches_live_source_and_refuses_drift(fault: str) -> None:
     units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_origin.TURN))

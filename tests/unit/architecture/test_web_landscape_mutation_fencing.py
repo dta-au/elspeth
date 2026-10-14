@@ -6605,6 +6605,7 @@ def _reserve_selected_origin_effect_failures(
     protected_reflection_candidate_sites=None,
     protected_constructed_classes=frozenset(),
     validated_worker_error_carrier_calls=frozenset(),
+    validated_retained_failure_calls=frozenset(),
 ):
     """Find source-visible effects on the finite coordinator/dispatch roots.
 
@@ -8236,31 +8237,41 @@ def _reserve_selected_origin_effect_failures(
                     and isinstance(node.args[0], ast.Call)
                     and scoped_expression(node.args[0].func, node) == ("object", "elspeth.web.required_work.RequiredWorkAuthority")
                 )
-                if target not in {
-                    ("object", "builtins.vars"),
-                    ("object", "builtins.globals"),
-                    ("object", "builtins.getattr"),
-                    ("object", "builtins.setattr"),
-                    ("object", "builtins.delattr"),
-                    ("object", "builtins.isinstance"),
-                    ("object", "builtins.issubclass"),
-                    *({("pure", "typing.cast")} if reviewed_noop_cast(node) else set()),
-                    *({("object", "builtins.enumerate")} if reviewed_public_error_iteration(node) else set()),
-                } and any(
-                    (origin := scoped_expression(argument, node)) is not None
-                    and (
-                        (origin[0] == "module" and origin[1] in selected_modules)
-                        or (origin[0] == "namespace" and origin[1] in selected_modules | selected)
-                        or origin == ("unknown", "protected-carrier")
-                        or origin[0] == "config-entry"
-                        or (origin[0] == "member" and protected_receiver_method(origin[1]) and not reviewed_telemetry_method_witness(node))
+                if (
+                    target
+                    not in {
+                        ("object", "builtins.vars"),
+                        ("object", "builtins.globals"),
+                        ("object", "builtins.getattr"),
+                        ("object", "builtins.setattr"),
+                        ("object", "builtins.delattr"),
+                        ("object", "builtins.isinstance"),
+                        ("object", "builtins.issubclass"),
+                        *({("pure", "typing.cast")} if reviewed_noop_cast(node) else set()),
+                        *({("object", "builtins.enumerate")} if reviewed_public_error_iteration(node) else set()),
+                    }
+                    and (unit.path, id(node)) not in validated_retained_failure_calls
+                    and any(
+                        (origin := scoped_expression(argument, node)) is not None
+                        and (
+                            (origin[0] == "module" and origin[1] in selected_modules)
+                            or (origin[0] == "namespace" and origin[1] in selected_modules | selected)
+                            or origin == ("unknown", "protected-carrier")
+                            or origin[0] == "config-entry"
+                            or (
+                                origin[0] == "member"
+                                and protected_receiver_method(origin[1])
+                                and not reviewed_telemetry_method_witness(node)
+                            )
+                        )
+                        for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
                     )
-                    for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
                 ):
                     unresolved.append("selected module capability passed to unreviewed caller " + unit.path + ":" + str(node.lineno))
                 if (
                     not reviewed_authority_construction
                     and (unit.path, id(node)) not in validated_transfer_nodes
+                    and (unit.path, id(node)) not in validated_retained_failure_calls
                     and target
                     not in {
                         ("object", "builtins.isinstance"),
@@ -10655,6 +10666,120 @@ def _reserve_turn_title_call_receipt(units):
     return [], (path, id(title_calls[0]))
 
 
+_reserve_RETAINED_FAILURE_SUPPLIERS = {
+    "src/elspeth/web/sessions/composer_turn.py": (
+        "_read_retained_operation_context",
+        "_capture_retained_operation_read",
+        "_RetainedOperationReadOutcome",
+    ),
+    "src/elspeth/web/composer/audit_storage.py": ("ComposerOperationFailureFacts", "private_operation_failure_draft"),
+}
+_reserve_RETAINED_FAILURE_ORIGINS = frozenset(
+    path.removeprefix("src/").removesuffix(".py").replace("/", ".") + "." + name
+    for path, names in _reserve_RETAINED_FAILURE_SUPPLIERS.items()
+    for name in names
+)
+
+
+def _reserve_retained_failure_transfer_receipts(units):
+    """Close four current transfers, never infer capability-free call results.
+
+    The complete existing caller grammars retain task ownership, cancellation,
+    correlation, and retry ordering. Exact supplier bodies/namespaces below
+    prove that history transfers only its joined outcome and the private audit
+    projection consumes nominal failure fields rather than forwarding authority.
+    Receipts identify calls in these supplied ASTs, not spelling-based exemptions.
+    """
+    turn_path = "src/elspeth/web/sessions/composer_turn.py"
+    service_path = "src/elspeth/web/sessions/service.py"
+    selected = _reserve_RETAINED_FAILURE_SUPPLIERS
+    index = {unit.path: unit for unit in units}
+    if len(index) != len(units) or any(path not in index for path in (*selected, service_path)):
+        return ["retained/private transfer source missing or duplicated"], frozenset()
+    recipes = _reserve_json.loads((_reserve_BASE / "reviewed-writer-recipes.json").read_text())
+    for path, names in selected.items():
+        unit = index[path]
+        bindings = ast.Module(
+            body=[node for node in unit.tree.body if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))],
+            type_ignores=[],
+        )
+        if stable_ast_dump(bindings) != recipes.get(path + ":module-bindings"):
+            return ["retained/private transfer namespace changed " + path], frozenset()
+        for name in names:
+            declaration = _reserve_node_at(unit, name)
+            if declaration is None or stable_ast_dump(declaration) != recipes.get(path + ":" + name):
+                return ["retained/private transfer supplier changed " + path + ":" + name], frozenset()
+            if not _reserve_terminal_sql_transfers.owned_origin(unit.tree, name, declaration):
+                return ["retained/private transfer supplier binding changed " + path + ":" + name], frozenset()
+        imported = {
+            alias.asname or alias.name.split(".", 1)[0]
+            for statement in unit.tree.body
+            if isinstance(statement, (ast.Import, ast.ImportFrom))
+            for alias in statement.names
+        }
+        dependencies = {
+            node.id
+            for name in names
+            for node in ast.walk(_reserve_node_at(unit, name))
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        } & (imported | {"type", "isinstance", "BaseException", "BaseExceptionGroup", "Exception"})
+        # owned_origin deliberately covers evaluated module/class bindings.
+        # Retained suppliers additionally forbid deferred global replacement
+        # and direct member/code mutation; the enriched scanner protects their
+        # origins against aliases and sibling-module namespace writes too.
+        if any(
+            (isinstance(node, ast.Name) and node.id in names and isinstance(node.ctx, (ast.Store, ast.Del)))
+            or (isinstance(node, (ast.Global, ast.Nonlocal)) and bool(set(node.names) & set(names)))
+            or (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and isinstance(node.value, ast.Name)
+                and node.value.id in names
+            )
+            for node in ast.walk(unit.tree)
+        ):
+            return ["retained/private transfer owned supplier mutated " + path], frozenset()
+        if any(
+            (isinstance(node, ast.Name) and node.id in dependencies and isinstance(node.ctx, (ast.Store, ast.Del)))
+            or (isinstance(node, ast.arg) and node.arg in dependencies)
+            or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in dependencies)
+            or (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and isinstance(node.value, ast.Name)
+                and node.value.id in dependencies
+            )
+            for node in ast.walk(unit.tree)
+        ):
+            return ["retained/private transfer dependency rebound " + path], frozenset()
+    compose_failures, _ = _reserve_compose_proposal_transfers.compose_proposal_local_transfers(units)
+    terminal_failures, _ = _reserve_terminal_sql_transfers.terminal_sql_local_contracts(units)
+    if compose_failures or terminal_failures:
+        return [*compose_failures, *terminal_failures], frozenset()
+    turn = _reserve_node_at(index[turn_path], "_run_composer_turn")
+    failure = _reserve_node_at(index[service_path], "SessionServiceImpl.fail_composer_async_operation")
+    # Keep the independently checked history/cancellation structure even when a
+    # caller grammar is deliberately rebound by an adversarial control.
+    prefix = turn.body[37].body[4:15] + turn.body[37].body[16:21]
+    if not _reserve_composer_receiver.receiver_transfer_prefix(prefix):
+        return ["retained/private transfer history ownership or cancellation changed"], frozenset()
+    expected = {
+        "lease.create_task(_capture_retained_operation_read(_read_retained_operation_context(authority=services.composer_operation_authority, binding=provider_binding, session_id=turn.session_id, actor_user_id=turn.actor_user_id)), name='composer-retained-operation-history')",
+        "_capture_retained_operation_read(_read_retained_operation_context(authority=services.composer_operation_authority, binding=provider_binding, session_id=turn.session_id, actor_user_id=turn.actor_user_id))",
+        "_read_retained_operation_context(authority=services.composer_operation_authority, binding=provider_binding, session_id=turn.session_id, actor_user_id=turn.actor_user_id)",
+    }
+    history = [node for node in ast.walk(turn) if isinstance(node, ast.Call) and ast.unparse(node) in expected]
+    private = [
+        node
+        for node in ast.walk(failure)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node) == "private_operation_failure_draft(operation_failure_facts, failure=attempted_failure)"
+    ]
+    if len(history) != 3 or {ast.unparse(node) for node in history} != expected or len(private) != 1:
+        return ["retained/private transfer exact argument or caller set changed"], frozenset()
+    return [], frozenset({*((turn_path, id(node)) for node in history), (service_path, id(private[0]))})
+
+
 def _reserve_supported_boundary(units):
     """Join finite source receipts on these AST nodes; refuse unclosed effects."""
     family = _reserve_family_contracts.__dict__
@@ -11019,6 +11144,10 @@ def _reserve_supported_boundary(units):
     normal_carrier_calls.add((service_path, id(settlement_calls[0])))
     if len(normal_carrier_calls) != 12 or not normal_carrier_calls <= actual_nodes:
         return _reserve_ProtectedBoundary(("normal protected carrier source set is incomplete",), (), (), (), ())
+    retained_failures, retained_calls = _reserve_retained_failure_transfer_receipts(units)
+    if retained_failures:
+        return _reserve_ProtectedBoundary(retained_failures, (), (), (), ())
+    normal_carrier_calls.update(retained_calls)
     whole_worker_nodes = tuple(
         whole_worker[key]
         for key in (
@@ -11185,6 +11314,9 @@ def _reserve_supported_boundary(units):
         "elspeth.web.required_work.RequiredWorkSource",
         "elspeth.web.required_work.make_required_work_key",
     }
+    # New transfer receipts require the same cross-module rebinding/reflection
+    # protection as every other selected supplier, not only local body pins.
+    origins.update(_reserve_RETAINED_FAILURE_ORIGINS)
     guarded_classes = set()
     guarded_functions = set()
     for path, guard in _reserve_full_source_guards().items():
@@ -11262,6 +11394,7 @@ def _reserve_supported_boundary(units):
         protected_reflection_candidate_sites=reflection_candidates,
         protected_constructed_classes=frozenset(guarded_classes),
         validated_worker_error_carrier_calls=frozenset(error_carrier_calls | normal_carrier_calls),
+        validated_retained_failure_calls=retained_calls,
     )
     if origin_failures:
         return _reserve_ProtectedBoundary(origin_failures, (), (), (), (), qualified_owner_stores)
