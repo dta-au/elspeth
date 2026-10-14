@@ -188,6 +188,10 @@ _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS = frozenset(
         "completion_tokens",
         "cached_prompt_tokens",
         "advisor_latency_ms",
+        "total_chars",
+        "start_char",
+        "end_char",
+        "next_offset_chars",
     }
 )
 # Exactly the classes the web ARG_ERROR producers raise, pinned by the
@@ -3315,13 +3319,16 @@ class _RequestInterpretationReviewResponseModel(BaseModel):
 class GetBlobContentArgumentsModel(BaseModel):
     """Redaction-bearing argument model for the ``get_blob_content`` tool.
 
-    Mirrors the JSON schema declared at ``tools.py:1444-1455`` and its
-    required-paths (``blob_id``).  The argument surface carries no sensitive
-    material — ``blob_id`` is a UUID identity — so no fields are Sensitive.
+    Mirrors the declaration in ``tools/blobs.py``. ``blob_id`` and the
+    character offset are read selectors. The caller's expected hash is
+    Sensitive and masked in argument persistence; only the verified server
+    response may supply publicly retained content identity. At offset zero,
+    omission/null means no expected identity constraint; subsequent offsets
+    require a canonical non-null hash. Every non-null supplied hash is checked.
 
     ``get_blob_content`` is type-driven (not declarative) because the
     response surface IS sensitive: ``content`` carries the operator's
-    uploaded blob payload and must be summarized to a length-only scalar
+    uploaded blob payload and must be replaced by the fixed content sentinel
     before reaching ``chat_messages.tool_calls``.  Declarative entries have
     no ``response_summarizers`` field; the only way
     to attach a per-key summarizer is via a ``Annotated[T, Sensitive(...)]``
@@ -3334,8 +3341,16 @@ class GetBlobContentArgumentsModel(BaseModel):
     """
 
     blob_id: str
+    offset_chars: int = Field(default=0, ge=0)
+    expected_content_hash: Annotated[str | None, Sensitive()] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def require_continuation_identity(self) -> GetBlobContentArgumentsModel:
+        if self.offset_chars > 0 and self.expected_content_hash is None:
+            raise ValueError("Continuation requires expected_content_hash")
+        return self
 
 
 class GetBlobContentDataModel(BaseModel):
@@ -3347,6 +3362,11 @@ class GetBlobContentDataModel(BaseModel):
     content: Annotated[str, Sensitive(summarizer=_summarize_blob_content)]
     truncated: bool
     size_bytes: int
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    total_chars: int = Field(ge=0)
+    start_char: int = Field(ge=0)
+    end_char: int = Field(ge=0)
+    next_offset_chars: int | None = Field(ge=0)
     # Blob origin (elspeth-47eba5cced). Not Sensitive: both are closed
     # server-recorded vocabularies, and _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD
     # admits only their declared members, so the persisted audit row keeps
@@ -3356,7 +3376,19 @@ class GetBlobContentDataModel(BaseModel):
     created_by: str
     creation_modality: str
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def require_consistent_range(self) -> GetBlobContentDataModel:
+        if not self.start_char <= self.end_char <= self.total_chars or self.end_char - self.start_char > 50_000:
+            raise ValueError("Blob content range is invalid")
+        if self.end_char == self.start_char and self.end_char < self.total_chars:
+            raise ValueError("A nonterminal blob page must advance")
+        if self.truncated != (self.end_char < self.total_chars):
+            raise ValueError("Blob truncation must describe the returned range")
+        if self.next_offset_chars != (self.end_char if self.truncated else None):
+            raise ValueError("Blob continuation offset must match the returned range")
+        return self
 
 
 class GetBlobContentResponseModel(BaseModel):
@@ -4185,6 +4217,14 @@ def redact_tool_call_response(
             entry.response_model,
             telemetry=telemetry,
         )
+        if tool_name == "get_blob_content":
+            if not isinstance(validated, GetBlobContentResponseModel):
+                raise AuditIntegrityError("Blob content redaction requires its declared response model")
+            if validated.data is not None and "data" not in over_budget:
+                # Only this closed model's canonical SHA256 is public identity
+                # metadata. Preserve it without admitting arbitrary strings or
+                # hashes from any other tool's response projection.
+                schema_redacted["data"]["content_hash"] = _TrustedRedactionSummary(validated.data.content_hash)
         projected = _project_validated_response_scalars(schema_redacted)
         assert type(projected) is dict
         for key in response:

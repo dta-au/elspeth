@@ -17,7 +17,7 @@ import json
 from typing import Annotated, Any
 
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.errors import AuditIntegrityError
@@ -695,6 +695,11 @@ def test_get_blob_content_redacts_tool_result_envelope_content() -> None:
             "size_bytes": 15,
             "created_by": "assistant",
             "creation_modality": "llm_generated",
+            "content_hash": "a" * 64,
+            "total_chars": 15,
+            "start_char": 0,
+            "end_char": 15,
+            "next_offset_chars": None,
         },
     }
 
@@ -707,6 +712,18 @@ def test_get_blob_content_redacts_tool_result_envelope_content() -> None:
     # authored the bytes the planner then narrated (elspeth-47eba5cced).
     assert result["data"]["created_by"] == "assistant"
     assert result["data"]["creation_modality"] == "llm_generated"
+    assert result["data"]["total_chars"] == 15
+    assert result["data"]["start_char"] == 0
+    assert result["data"]["end_char"] == 15
+    assert result["data"]["next_offset_chars"] is None
+    assert redact_tool_call_response("get_blob_content", result, telemetry=NoopRedactionTelemetry()) == result
+    assert result["data"]["content_hash"] == "a" * 64
+    for field, value in (("content_hash", "A" * 64), ("unrecognized_range", 5)):
+        malformed = {**response, "data": {**response["data"], field: value}}
+        with pytest.raises(ValidationError):
+            redact_tool_call_response("get_blob_content", malformed, telemetry=NoopRedactionTelemetry())
+    other_tool = redact_tool_call_response("get_blob_metadata", response, telemetry=NoopRedactionTelemetry())
+    assert "a" * 64 not in json.dumps(other_tool)
 
 
 def test_get_blob_content_redacts_tool_result_failure_envelope() -> None:
@@ -812,6 +829,11 @@ def test_get_blob_content_populated_validation_envelope_redacts_external_scalars
             "size_bytes": 15,
             "created_by": "user",
             "creation_modality": "verbatim",
+            "content_hash": "a" * 64,
+            "total_chars": 15,
+            "start_char": 0,
+            "end_char": 15,
+            "next_offset_chars": None,
         },
     }
 

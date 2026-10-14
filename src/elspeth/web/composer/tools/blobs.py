@@ -72,6 +72,7 @@ from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     CreateBlobArgumentsModel,
     GetBlobContentArgumentsModel,
+    GetBlobContentDataModel,
     UpdateBlobArgumentsModel,
 )
 from elspeth.web.composer.response_contracts import SelectedResponseContract
@@ -239,14 +240,9 @@ class _ComposerBlobsResponse:
     blobs: tuple[_BlobInlineResponse, ...]
 
 
-class _BlobContentResponse(BaseModel):
+class _BlobContentResponse(GetBlobContentDataModel):
     """Immutable counterpart to the producer's BlobContentPayload."""
 
-    blob_id: str
-    filename: str
-    mime_type: str
-    content: str
-    truncated: bool
     size_bytes: int = Field(ge=0)
     created_by: BlobCreator
     creation_modality: str
@@ -274,6 +270,8 @@ def _parse_blob_content_response(value: object) -> _BlobContentResponse:
     except (PydanticValidationError, AttributeError, TypeError):
         raise FrameworkBugError(_BLOB_RESPONSE_ERROR) from None
     if admitted.creation_modality not in CreationModality:
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+    if len(admitted.content) != admitted.end_char - admitted.start_char:
         raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
     return admitted
 
@@ -343,6 +341,11 @@ def _encode_blob_content_response(value: _BlobContentResponse) -> JsonValue:
         "size_bytes": value.size_bytes,
         "created_by": value.created_by,
         "creation_modality": value.creation_modality,
+        "content_hash": value.content_hash,
+        "total_chars": value.total_chars,
+        "start_char": value.start_char,
+        "end_char": value.end_char,
+        "next_offset_chars": value.next_offset_chars,
     }
 
 
@@ -446,6 +449,11 @@ class BlobContentPayload(TypedDict):
     size_bytes: int
     created_by: str
     creation_modality: str
+    content_hash: str
+    total_chars: int
+    start_char: int
+    end_char: int
+    next_offset_chars: int | None
 
 
 def _blob_row_to_tool_dict(row: Any) -> BlobToolRecord:
@@ -2027,29 +2035,76 @@ def _execute_get_blob_content(
             f"Blob '{blob_id}' is not valid UTF-8 text ({exc.reason} at byte offset {exc.start}).",
         )
 
-    # Truncate very large content to avoid overwhelming the LLM context
-    max_chars = 50_000
-    truncated = len(content) > max_chars
-    if truncated:
-        content = content[:max_chars]
+    verified_hash = blob["content_hash"]
+    if verified_hash is None:
+        raise AuditIntegrityError("Ready blob content has no verified hash")
+    if validated.expected_content_hash is not None and not hmac.compare_digest(validated.expected_content_hash, verified_hash):
+        return _failure_result(state, "Blob content changed; restart inspection with its current content hash.")
+    total_chars = len(content)
+    start_char = validated.offset_chars
+    if start_char > total_chars:
+        return _failure_result(state, "Blob content offset exceeds its decoded character length.")
 
     payload: BlobContentPayload = {
         "blob_id": blob_id,
         "filename": blob["filename"],
         "mime_type": blob["mime_type"],
         "content": content,
-        "truncated": truncated,
+        "truncated": False,
         "size_bytes": blob["size_bytes"],
         # Origin facts, read straight off the row. See BlobContentPayload:
         # they are the only within-result signal that distinguishes reading
         # back self-authored content from discovering an operator's file.
         "created_by": blob["created_by"],
         "creation_modality": blob["creation_modality"],
+        "content_hash": verified_hash,
+        "total_chars": total_chars,
+        "start_char": start_char,
+        "end_char": total_chars,
+        "next_offset_chars": None,
     }
+    # Inspect the FULL decoded content before slicing. Otherwise credentials
+    # beyond or across a page seam could leak through a successful prefix.
     refusal = _credential_safe_blob_discovery_result(state, payload, surface="composer_blob_content")
     if refusal is not None:
         return refusal
-    return _discovery_result(state, payload)
+
+    from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+
+    result = _discovery_result(state, payload)
+
+    def page(end_char: int) -> tuple[ToolResult, int]:
+        page_payload: BlobContentPayload = {
+            **payload,
+            "content": content[start_char:end_char],
+            "end_char": end_char,
+            "truncated": end_char < total_chars,
+            "next_offset_chars": end_char if end_char < total_chars else None,
+        }
+        candidate = replace(result, data=page_payload)
+        # Use the actual selected provider serializer, including validation,
+        # metadata and JSON escaping. This is a new conservative page bound;
+        # it does not expand or replace the aggregate provider request budget.
+        encoded = serialize_admitted_discovery_result(admit_discovery_result("get_blob_content", candidate))
+        return candidate, len(encoded.encode("utf-8"))
+
+    end_char = min(start_char + 50_000, total_chars)
+    candidate, size = page(end_char)
+    if size <= 65_536:
+        return candidate
+    low, high = start_char + 1, end_char - 1
+    best: ToolResult | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        candidate, size = page(middle)
+        if size <= 65_536:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    if best is None:
+        return _failure_result(state, "Blob page cannot fit the bounded tool response; no content was returned.")
+    return best
 
 
 _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
@@ -2059,8 +2114,10 @@ _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
     response_contract=_BLOB_CONTENT_RESPONSE,
     description=(
         "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
-        "Large files are truncated to 50,000 characters "
-        "(`truncated` is true when so; `size_bytes` is the full size). "
+        "Pages contain at most 50,000 original Unicode code points and the complete JSON tool response is bounded to 65,536 bytes. "
+        "Read `next_offset_chars` with `expected_content_hash` to continue; ranges are [start_char,end_char), "
+        "`total_chars` counts the full decoded text and `content_hash` identifies the verified original bytes. "
+        "`truncated` means end_char < total_chars, not whole-file inspection; `size_bytes` is the full byte size. "
         "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
         "`creation_modality` — so content the assistant generated earlier is not mistaken for a discovered file."
     ),
@@ -2070,6 +2127,15 @@ _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
             "blob_id": {
                 "type": "string",
                 "description": "ID of the blob to read.",
+            },
+            "offset_chars": {"type": "integer", "minimum": 0, "default": 0, "description": "Start offset in original Unicode code points."},
+            "expected_content_hash": {
+                "type": ["string", "null"],
+                "pattern": "^[0-9a-f]{64}$",
+                "description": (
+                    "Verified original-byte SHA256. Use null at offset 0 for no expected identity constraint; "
+                    "a canonical non-null hash is required after offset 0. Every non-null hash is checked, even at offset 0."
+                ),
             },
         },
         "required": ["blob_id"],

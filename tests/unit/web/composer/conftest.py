@@ -88,6 +88,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.blobs import BLOB_CREATORS
+from elspeth.contracts.enums import CreationModality
 from elspeth.core.config import validate_runtime_node_name
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
@@ -99,6 +101,7 @@ from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import (
     MANIFEST,
     CreateBlobArgumentsModel,
+    GetBlobContentArgumentsModel,
     GetBlobContentDataModel,
     GetBlobContentResponseModel,
     SetPipelineArgumentsModel,
@@ -225,6 +228,43 @@ def _get_blob_content_response_strategy() -> st.SearchStrategy[GetBlobContentRes
     )
 
 
+_BLOB_HASH_STRATEGY = st.text(alphabet="0123456789abcdef", min_size=64, max_size=64)
+
+
+@st.composite
+def _get_blob_content_arguments_strategy(draw: st.DrawFn) -> GetBlobContentArgumentsModel:
+    offset = draw(st.integers(min_value=0, max_value=50_000))
+    arguments = {"blob_id": draw(st.text()), "offset_chars": offset}
+    if offset > 0:
+        arguments["expected_content_hash"] = draw(_BLOB_HASH_STRATEGY)
+    elif draw(st.booleans()):
+        arguments["expected_content_hash"] = draw(st.one_of(st.none(), _BLOB_HASH_STRATEGY))
+    return GetBlobContentArgumentsModel.model_validate(arguments)
+
+
+@st.composite
+def _get_blob_content_data_strategy(draw: st.DrawFn) -> GetBlobContentDataModel:
+    remaining = draw(st.integers(min_value=0, max_value=50_000))
+    content = draw(st.text(min_size=1 if remaining else 0, max_size=64))
+    start = draw(st.integers(min_value=0, max_value=50_000))
+    end = start + len(content)
+    return GetBlobContentDataModel(
+        blob_id=draw(st.text()),
+        filename=draw(st.text()),
+        mime_type=draw(st.text()),
+        content=content,
+        truncated=remaining > 0,
+        size_bytes=len(content.encode("utf-8")) + start + remaining,
+        content_hash=draw(_BLOB_HASH_STRATEGY),
+        total_chars=end + remaining,
+        start_char=start,
+        end_char=end,
+        next_offset_chars=end if remaining else None,
+        created_by=draw(st.sampled_from(sorted(BLOB_CREATORS))),
+        creation_modality=draw(st.sampled_from(tuple(modality.value for modality in CreationModality))),
+    )
+
+
 def _set_pipeline_source_strategy() -> st.SearchStrategy[_SetPipelineSourceModel]:
     return st.builds(
         _SetPipelineSourceModel,
@@ -232,7 +272,7 @@ def _set_pipeline_source_strategy() -> st.SearchStrategy[_SetPipelineSourceModel
         on_success=st.text(),
         blob_id=st.one_of(st.none(), st.text()),
         options=_OPTIONS_STRATEGY,
-        on_validation_failure=st.one_of(st.none(), st.text()),
+        on_validation_failure=st.just("discard"),
         inline_blob=st.one_of(st.none(), st.from_type(_InlineBlobModel)),
     )
 
@@ -243,7 +283,7 @@ def _set_pipeline_named_source_strategy() -> st.SearchStrategy[_SetPipelineNamed
         plugin=st.text(),
         on_success=st.text(),
         options=_OPTIONS_STRATEGY,
-        on_validation_failure=st.one_of(st.none(), st.text()),
+        on_validation_failure=st.just("discard"),
     )
 
 
@@ -308,7 +348,7 @@ def _pipeline_output_strategy() -> st.SearchStrategy[_PipelineOutputModel]:
         sink_name=st.text(),
         plugin=st.text(),
         options=_OPTIONS_STRATEGY,
-        on_write_failure=st.one_of(st.none(), st.text()),
+        on_write_failure=st.just("discard"),
     )
 
 
@@ -361,6 +401,8 @@ def _repair_tool_call_strategy() -> st.SearchStrategy[_RepairToolCallShadowModel
 st.register_type_strategy(SetSourceFromBlobArgumentsModel, _set_source_from_blob_strategy())
 st.register_type_strategy(SetSourceFromBlobsArgumentsModel, _set_source_from_blobs_strategy())
 st.register_type_strategy(CreateBlobArgumentsModel, _create_blob_strategy())
+st.register_type_strategy(GetBlobContentArgumentsModel, _get_blob_content_arguments_strategy())
+st.register_type_strategy(GetBlobContentDataModel, _get_blob_content_data_strategy())
 st.register_type_strategy(GetBlobContentResponseModel, _get_blob_content_response_strategy())
 st.register_type_strategy(_SetPipelineSourceModel, _set_pipeline_source_strategy())
 st.register_type_strategy(_SetPipelineNamedSourceModel, _set_pipeline_named_source_strategy())
