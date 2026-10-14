@@ -24,7 +24,8 @@
           "plugin": "csv",
           "on_success": "rows",
           "options": {},
-          "inline_blob": null
+          "inline_blob": null,
+          "on_validation_failure": "discard"
         },
         "nodes": [],
         "edges": [],
@@ -35,6 +36,7 @@
           "plugin": "csv",
           "on_success": "rows",
           "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard",
           "inline_blob": null
         },
         "nodes": [],
@@ -67,6 +69,7 @@
         "source": {
           "plugin": "csv",
           "on_success": "csv_rows",
+          "on_validation_failure": "discard",
           "description": null,
           "options": {},
           "inline_blob": {
@@ -84,6 +87,7 @@
           "plugin": "csv",
           "on_success": "csv_rows",
           "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard",
           "description": null,
           "inline_blob": {
             "filename": "chat.csv",
@@ -103,6 +107,7 @@
         "source": {
           "plugin": "csv",
           "on_success": "csv_rows",
+          "on_validation_failure": "discard",
           "options": {},
           "inline_blob": {
             "filename": "chat.csv",
@@ -120,6 +125,7 @@
           "plugin": "csv",
           "on_success": "csv_rows",
           "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard",
           "inline_blob": {
             "filename": "chat.csv",
             "mime_type": "text/csv",
@@ -139,6 +145,7 @@
         "source": {
           "plugin": "csv",
           "on_success": "csv_rows",
+          "on_validation_failure": "discard",
           "options": {
             "delimiter": ","
           },
@@ -158,6 +165,7 @@
           "plugin": "csv",
           "on_success": "csv_rows",
           "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard",
           "inline_blob": {
             "filename": "chat.csv",
             "mime_type": "text/csv",
@@ -413,7 +421,7 @@
             "plugin": "field_mapper",
             "input": "rows",
             "on_success": "mapped",
-            "on_error": null,
+            "on_error": "discard",
             "options": {
               "mappings": {
                 "a": "b"
@@ -436,7 +444,8 @@
             "plugin": "json",
             "options": {
               "path": "out.json"
-            }
+            },
+            "on_write_failure": "discard"
           }
         ]
       },
@@ -451,7 +460,7 @@
           {
             "id": "extract",
             "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}",
-            "on_error": null,
+            "on_error": "discard",
             "node_type": "transform",
             "input": "rows",
             "plugin": "field_mapper",
@@ -471,7 +480,8 @@
           {
             "sink_name": "results",
             "plugin": "json",
-            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+            "on_write_failure": "discard"
           }
         ]
       },
@@ -496,7 +506,8 @@
             "plugin": "csv",
             "options": {
               "path": "out.json"
-            }
+            },
+            "on_write_failure": "discard"
           }
         ]
       },
@@ -513,7 +524,8 @@
           {
             "sink_name": "results",
             "plugin": "csv",
-            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+            "on_write_failure": "discard"
           }
         ]
       },
@@ -537,7 +549,7 @@
             "plugin": "field_mapper",
             "input": "rows",
             "on_success": "mapped",
-            "on_error": null,
+            "on_error": "discard",
             "options": {
               "mappings": {
                 "a": "b"
@@ -560,7 +572,8 @@
             "plugin": "json",
             "options": {
               "path": "out.json"
-            }
+            },
+            "on_write_failure": "discard"
           }
         ]
       },
@@ -575,7 +588,7 @@
           {
             "id": "extract",
             "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}",
-            "on_error": null,
+            "on_error": "discard",
             "node_type": "transform",
             "input": "rows",
             "plugin": "field_mapper",
@@ -595,7 +608,8 @@
           {
             "sink_name": "results",
             "plugin": "json",
-            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+            "on_write_failure": "discard"
           }
         ]
       },
@@ -620,7 +634,7 @@
             "plugin": "field_mapper",
             "input": "rows",
             "on_success": "mapped",
-            "on_error": null,
+            "on_error": "discard",
             "options": {
               "mappings": {
                 "a": "b"
@@ -645,7 +659,8 @@
             "options": {
               "path": "out.json"
             },
-            "on_write_failure": null
+            "on_write_failure": "discard",
+            "description": null
           }
         ]
       },
@@ -661,7 +676,7 @@
           {
             "id": "extract",
             "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}",
-            "on_error": null,
+            "on_error": "discard",
             "node_type": "transform",
             "input": "rows",
             "plugin": "field_mapper",
@@ -683,7 +698,8 @@
             "sink_name": "results",
             "plugin": "json",
             "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
-            "on_write_failure": null
+            "on_write_failure": "discard",
+            "description": null
           }
         ]
       },
@@ -705,7 +721,7 @@
             "plugin": "field_mapper",
             "input": "rows",
             "on_success": "mapped",
-            "on_error": null,
+            "on_error": "discard",
             "options": {}
           }
         ],
@@ -722,7 +738,8 @@
           {
             "sink_name": "results",
             "plugin": "json",
-            "options": {}
+            "options": {},
+            "on_write_failure": "discard"
           }
         ]
       },
@@ -737,7 +754,7 @@
           {
             "id": "extract",
             "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
-            "on_error": null,
+            "on_error": "discard",
             "node_type": "transform",
             "input": "rows",
             "plugin": "field_mapper",
@@ -757,7 +774,8 @@
           {
             "sink_name": "results",
             "plugin": "json",
-            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}"
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+            "on_write_failure": "discard"
           }
         ]
       },

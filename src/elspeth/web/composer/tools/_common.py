@@ -1794,6 +1794,7 @@ _DEFAULT_SOURCE_VALIDATION_FAILURE: Final[str] = "discard"
 
 _SOURCE_VALIDATION_FAILURE_DESCRIPTION: Final[str] = (
     "Explicit non-empty failure choice required for new sources. 'discard' records the drop; "
+    "Any other value, including 'quarantine', must match a configured output/sink name. "
     "a named route must satisfy sink and required-control policy. Omit only to preserve the same existing source's choice. "
     "Null/empty is invalid; no server default is supplied."
 )

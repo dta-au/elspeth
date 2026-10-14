@@ -2074,7 +2074,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     },
                     "on_validation_failure": {
                         "type": "string",
-                        "description": "Required explicit non-empty source-validation failure choice: 'discard' or an eligible named sink. Full replacement does not reuse prior choices; null/empty is invalid.",
+                        "description": "Required explicit non-empty source-validation failure choice: 'discard' or an eligible named sink. Any other value, including 'quarantine', must match a configured output/sink name. Full replacement does not reuse prior choices; null/empty is invalid.",
                     },
                     "description": {
                         "type": ["string", "null"],
@@ -2119,7 +2119,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "on_success": {"type": "string"},
                         "on_validation_failure": {
                             "type": "string",
-                            "description": "Required explicit non-empty source-validation failure choice: 'discard' or an eligible named sink. Full replacement does not reuse prior choices; null/empty is invalid.",
+                            "description": "Required explicit non-empty source-validation failure choice: 'discard' or an eligible named sink. Any other value, including 'quarantine', must match a configured output/sink name. Full replacement does not reuse prior choices; null/empty is invalid.",
                         },
                         "description": {
                             "type": ["string", "null"],

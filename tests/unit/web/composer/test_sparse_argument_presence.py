@@ -22,12 +22,12 @@ def _redact(arguments):
 
 
 def test_sparse_pipeline_retains_explicit_null_and_sensitive_presence() -> None:
-    arguments = {"source": {"plugin": "csv", "on_success": "rows", "options": {"path": "PRIVATE_PATH"}}}
+    arguments = {"source": {"plugin": "csv", "on_success": "rows", "options": {"path": "PRIVATE_PATH"}, "on_validation_failure": "discard"}}
     original = deepcopy(arguments)
     omitted = _redact(arguments)
     explicit = _redact({"source": {**arguments["source"], "inline_blob": None}})
     assert set(omitted) == {"source", "nodes", "edges", "outputs"}
-    assert set(omitted["source"]) == {"plugin", "on_success", "options"}
+    assert set(omitted["source"]) == {"plugin", "on_success", "options", "on_validation_failure"}
     assert explicit["source"]["inline_blob"] is None
     assert "PRIVATE_PATH" not in str(omitted)
     assert arguments == original
@@ -52,7 +52,7 @@ def test_semantic_hash_keeps_named_source_null_and_preserves_frozen_input() -> N
 
 
 def test_sparse_sensitive_metadata_summaries_reflect_authored_keys() -> None:
-    source = {"source": {"plugin": "csv", "on_success": "rows", "options": {}}}
+    source = {"source": {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"}}
     assert "metadata" not in _redact(source)
     empty = _redact({**source, "metadata": {}})
     named = _redact({**source, "metadata": {"name": "PRIVATE_NAME"}})
@@ -61,7 +61,12 @@ def test_sparse_sensitive_metadata_summaries_reflect_authored_keys() -> None:
 
 
 def test_actual_audit_projection_preserves_null_while_dispatch_binding_agrees() -> None:
-    omitted = {"source": {"plugin": "csv", "on_success": "rows", "options": {}}, "nodes": [], "edges": [], "outputs": []}
+    omitted = {
+        "source": {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"},
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
     explicit = deepcopy(omitted)
     explicit["source"]["inline_blob"] = None
     bindings = []

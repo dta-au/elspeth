@@ -244,6 +244,8 @@ class TestToolDefinitions:
             lowered = description.lower()
             assert "built-in quarantine" not in lowered, tool_name
             assert "discard" in description, tool_name
+            assert "explicit non-empty" in lowered, tool_name
+            assert "null/empty is invalid" in lowered, tool_name
             assert "Any other value, including 'quarantine', must match a configured output/sink name." in description, tool_name
 
     @pytest.mark.parametrize(

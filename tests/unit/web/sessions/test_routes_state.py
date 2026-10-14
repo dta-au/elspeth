@@ -323,6 +323,7 @@ sources:
     plugin: csv
     on_success: score
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
 transforms:
@@ -776,6 +777,7 @@ sources:
     plugin: csv
     on_success: score
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
 transforms:
@@ -1325,6 +1327,7 @@ sources:
   source:
     plugin: csv
     on_success: score
+    on_validation_failure: discard
     options:
       schema:
         mode: observed
@@ -1395,6 +1398,7 @@ sources:
     plugin: csv
     on_success: score
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
 transforms:
@@ -1456,6 +1460,7 @@ sources:
     plugin: csv
     on_success: source
     options:
+      on_validation_failure: discard
       path: /old/blob.csv
       schema:
         mode: observed
@@ -1539,6 +1544,7 @@ sources:
     plugin: csv
     on_success: source
     options:
+      on_validation_failure: discard
       path: /old/blob.csv
       schema:
         mode: observed
@@ -1792,6 +1798,7 @@ sources:
     plugin: csv
     on_success: main
     options:
+      on_validation_failure: discard
       source_authoring:
         content_hash: abc123
 """,
@@ -1863,6 +1870,7 @@ sources:
     plugin: csv
     on_success: score
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
 transforms:
@@ -1925,6 +1933,7 @@ sources:
     plugin: csv
     on_success: score
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
 transforms:
@@ -3201,12 +3210,14 @@ sources:
     plugin: csv
     on_success: inbound
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
   refunds:
     plugin: csv
     on_success: inbound
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
 queues:
@@ -3256,12 +3267,14 @@ sources:
   orders:
     plugin: csv
     on_success: inbound
+    on_validation_failure: discard
     options:
       schema:
         mode: observed
   refunds:
     plugin: csv
     on_success: inbound
+    on_validation_failure: discard
     options:
       schema:
         mode: observed

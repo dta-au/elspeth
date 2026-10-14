@@ -35,7 +35,7 @@ function makeState(overrides: Partial<CompositionState> = {}): CompositionState 
         plugin: "field_mapper",
         input: "rows",
         on_success: "mapped",
-        on_error: null,
+        on_error: "discard",
         options: { mappings: { a: "b" } },
       },
     ],
@@ -48,7 +48,7 @@ function makeState(overrides: Partial<CompositionState> = {}): CompositionState 
         label: null,
       },
     ],
-    outputs: [{ name: "results", plugin: "json", options: { path: "out.json" } }],
+    outputs: [{ name: "results", plugin: "json", options: { path: "out.json" }, on_write_failure: "discard" }],
     metadata: { name: "My pipeline", description: null },
     ...overrides,
   };
@@ -94,7 +94,7 @@ describe("buildProposalDiff", () => {
     const current = makeState({
       sources: { source: { ...base.sources.source, description: "Current source" } },
       nodes: base.nodes.map((node) => ({ ...node, timeout_seconds: 45 })),
-      outputs: base.outputs.map((output) => ({ ...output, on_write_failure: "errors" })),
+      outputs: base.outputs.map((output) => ({ ...output, description: "Current output" })),
     });
     const diff = buildProposalDiff(
       "set_pipeline",

@@ -278,7 +278,7 @@ def _set_pipeline_without_interpretation_sites() -> dict[str, Any]:
     recompute the preflight rather than pass ``None`` through.
     """
     return {
-        "source": {"plugin": "null", "on_success": "rows", "options": {}},
+        "source": {"plugin": "null", "on_success": "rows", "options": {}, "on_validation_failure": "discard"},
         "nodes": [
             {
                 "id": "map_node",

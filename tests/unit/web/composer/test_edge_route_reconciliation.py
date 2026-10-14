@@ -42,6 +42,7 @@ def _transform_args(node_id: str, *, input_: str = "in", on_success: str = "out"
         "plugin": "passthrough",
         "input": input_,
         "on_success": on_success,
+        "on_error": "discard",
         "options": {"schema": {"mode": "observed"}},
     }
 
