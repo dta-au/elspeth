@@ -162,13 +162,18 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
 ) -> None:
     import litellm
 
+    from elspeth.web.composer.invariants import InvariantError
+    from elspeth.web.composer.tools import ADVISOR_TRIGGER_DETERMINISTIC_END
+
     _clear_static_provider_keys(monkeypatch)
     captured: list[dict[str, Any]] = []
     dispatches: list[bool] = []
-    reply = json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None})
+    reply = json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"})
 
     async def fake_acompletion(**kwargs: Any) -> Any:
         assert dispatches == [True]
+        assert captured == [], "Only one Bedrock advisor SDK response is supplied"
+        assert kwargs["model"] == _BEDROCK_ADVISOR
         captured.append(kwargs)
         return SimpleNamespace(
             model=_BEDROCK_ADVISOR,
@@ -181,13 +186,25 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
     service = _bedrock_service()
     recorder = BufferingRecorder()
 
+    arguments = {
+        "trigger": "end",
+        "problem_summary": "Review the complete pipeline.",
+        "recent_errors": [],
+        "attempted_actions": [],
+    }
+    # A free-form phase label is not an owned checkpoint trigger. The
+    # original fixture must remain rejected before any provider dispatch.
+    with pytest.raises(InvariantError, match=r"^Structured advisor request requires an owned checkpoint trigger$"):
+        await service._advisor_checkpoint._call_advisor_with_audit(
+            arguments,
+            recorder=recorder,
+            structured_output=True,
+            on_provider_dispatch=lambda: dispatches.append(True),
+        )
+    assert dispatches == [] and captured == [] and recorder.llm_calls == ()
+    arguments["trigger"] = ADVISOR_TRIGGER_DETERMINISTIC_END
     guidance, metadata = await service._advisor_checkpoint._call_advisor_with_audit(
-        {
-            "trigger": "end",
-            "problem_summary": "Review the complete pipeline.",
-            "recent_errors": [],
-            "attempted_actions": [],
-        },
+        arguments,
         recorder=recorder,
         structured_output=True,
         on_provider_dispatch=lambda: dispatches.append(True),
@@ -204,9 +221,19 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
     assert request["num_retries"] == request["max_retries"] == 0
     assert request["response_format"]["type"] == "json_schema"
     assert request["response_format"]["json_schema"]["strict"] is True
+    assert request["response_format"]["json_schema"]["name"] == "advisor_end_response"
+    assert set(request["response_format"]["json_schema"]["schema"]["required"]) == {
+        "verdict",
+        "category",
+        "steps",
+        "findings",
+        "note",
+        "publication_verdict",
+    }
     assert request["reasoning_effort"] == "medium"
     assert "tools" not in request
     assert not (_FORBIDDEN_BEDROCK_KWARGS & set(request))
+    assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[-1].model_requested == _BEDROCK_ADVISOR
 
 

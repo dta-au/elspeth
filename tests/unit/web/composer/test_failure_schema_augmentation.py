@@ -1146,7 +1146,11 @@ class TestFailureSchemaAugmentationPerToolCoverage:
 
         result = execute_tool(
             "splice_transform",
-            {"predecessor_id": "source", "successor_id": "t1", "node": {"id": "t2", "plugin": "passthrough", "options": {}}},
+            {
+                "predecessor_id": "source",
+                "successor_id": "t1",
+                "node": {"id": "t2", "plugin": "passthrough", "on_error": "discard", "options": {}},
+            },
             state,
             catalog,
         )
