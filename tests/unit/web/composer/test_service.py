@@ -1651,6 +1651,7 @@ class TestComposerMultiTurnToolCalls:
         still land, but no human/transcript field may retain model-authored
         prose produced from the advisor repair context.
         """
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
         from elspeth.web.composer.advisor_context import (
             _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN,
             _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END,
@@ -1661,6 +1662,8 @@ class TestComposerMultiTurnToolCalls:
             _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
             _ADVISOR_FINDINGS_UNTRUSTED_END,
         )
+        from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
+        from elspeth.web.sessions.routes._helpers import _composer_conversation_or_tool_messages
 
         service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
         service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
@@ -1700,19 +1703,43 @@ class TestComposerMultiTurnToolCalls:
             _make_llm_response(content=echoed_primary_prose),
         ]
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        reviews: list[dict[str, Any]] = []
+
+        async def review_echo(
+            arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
+        ) -> tuple[str, dict[str, object]]:
+            review = json.loads(arguments["publication_review"])
+            reviews.append(review)
+            assert len(reviews) <= 2, "Only two END responses are supplied"
+            assert review["current_request"] == "Review this pipeline"
+            assert review["candidate_reply"] == ("The pipeline is ready.", echoed_primary_prose)[len(reviews) - 1]
+            assert review["saved_effects"]["saved_revision_count"] == len(reviews) - 1
+            assert review["saved_effects"]["net_changed"] is (len(reviews) == 2)
+            if on_provider_dispatch is not None:
+                on_provider_dispatch()
+            flagged = len(reviews) == 1
+            return json.dumps(
+                {
+                    "verdict": "FLAGGED" if flagged else "CLEAN",
+                    "category": "other",
+                    "steps": [],
+                    "findings": findings if flagged else "Candidate repeats unsupported advisor findings and internal sentinel markers.",
+                    "note": "Review the configured source options." if flagged else None,
+                    # A CLEAN graph judgment cannot authorize false quoted
+                    # findings and internal sentinels in the candidate reply.
+                    "publication_verdict": "WITHHOLD",
+                }
+            ), {}
 
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as primary_call,
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=_advisor_checkpoint_responses(
-                    _advisor_checkpoint_reply(verdict="FLAGGED", findings=findings, note="Review the configured source options."),
-                    _advisor_checkpoint_reply(verdict="CLEAN", findings="", note=None),
-                ),
-            ),
+                side_effect=review_echo,
+            ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
@@ -1731,13 +1758,46 @@ class TestComposerMultiTurnToolCalls:
                 .all()
             )
 
-        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
-        assert result.raw_assistant_content is None
+        assert primary_call.await_count == 3 and advisor_call.await_count == len(reviews) == 2
+        assert reviews[0]["current_graph_hash"] != reviews[1]["current_graph_hash"]
+        saved_scope = (
+            "This request saved 1 draft revisions with verified changes. "
+            "Saved changes do not establish that the requested task is complete."
+        )
+        assert result.message.startswith(saved_scope)
+        assert result.raw_assistant_content == saved_scope
         assert result.state.metadata.name == "Repaired"
         assert len(persisted_assistant_rows) == 1
         assert persisted_assistant_rows[0]["content"] == "ELSPETH is applying a pipeline correction."
         assert persisted_assistant_rows[0]["raw_content"] is None
         assert persisted_assistant_rows[0]["tool_calls"] is not None
+        sessions = service._require_sessions_service()
+        stored = await sessions.get_messages(UUID(session_id), limit=None)
+        withheld = [
+            (row.tool_calls[0]["origin"], row.content)
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == COMPOSER_WITHHELD_REPLY_KIND
+        ]
+        assert withheld == [
+            ("repair_gate_superseded", "The pipeline is ready."),
+            ("advisor_repair_tool_turn", echoed_primary_prose),
+            ("advisor_publication_withheld", echoed_primary_prose),
+        ]
+        passes = [
+            row.tool_calls[0]["pass"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert [(item["verdict"], item["publication_verdict"], item["provider_attempts"]) for item in passes] == [
+            ("flagged", "WITHHOLD", 1),
+            ("clean", "WITHHOLD", 1),
+        ]
+        assert all(item["first_attempt_accepted"] is True for item in passes)
+        assert all(type(item["publication_binding"]) is str and len(item["publication_binding"]) == 64 for item in passes)
+        assert passes[0]["publication_binding"] != passes[1]["publication_binding"]
+        public_rows = _composer_conversation_or_tool_messages(
+            await sessions.get_messages(UUID(session_id), limit=None, include_private_evidence=False)
+        )
 
         runtime_preflight = result.runtime_preflight
         assert runtime_preflight is not None
@@ -1746,6 +1806,8 @@ class TestComposerMultiTurnToolCalls:
             result.raw_assistant_content or "",
             *(row["content"] for row in persisted_assistant_rows),
             *((row["raw_content"] or "") for row in persisted_assistant_rows),
+            *(row.content or "" for row in public_rows),
+            *(row.raw_content or "" for row in public_rows),
             *(check.detail for check in runtime_preflight.checks),
             *(error.message for error in runtime_preflight.errors),
             *((error.suggestion or "") for error in runtime_preflight.errors),
@@ -2776,6 +2838,7 @@ class TestComposerErrorHandling:
                             "primary": {
                                 "plugin": "csv",
                                 "on_success": "t1",
+                                "on_validation_failure": "discard",
                                 "options": {"path": "/data/blobs/in.csv", "schema": {"mode": "observed"}},
                             }
                         },
@@ -2786,6 +2849,7 @@ class TestComposerErrorHandling:
                                 "plugin": "passthrough",
                                 "input": "main",
                                 "on_success": "main",
+                                "on_error": "discard",
                                 "options": {},
                             }
                         ],
@@ -2801,6 +2865,7 @@ class TestComposerErrorHandling:
                             {
                                 "sink_name": "main",
                                 "plugin": "csv",
+                                "on_write_failure": "discard",
                                 "options": {"path": "/data/out.csv", "schema": {"mode": "observed"}},
                             }
                         ],
@@ -2808,7 +2873,7 @@ class TestComposerErrorHandling:
                 }
             ],
         )
-        text = _make_llm_response(content="Pipeline ready.")
+        text = _make_llm_response(content="No pipeline changes were saved.")
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
 
         with (
@@ -2817,7 +2882,7 @@ class TestComposerErrorHandling:
         ):
             script = _ReconciliationLLMScript(good_call, text, text)
             mock_llm.side_effect = script.respond
-            await service.compose("Setup", [], state, session_id=session_id)
+            result = await service.compose("Setup", [], state, session_id=session_id)
 
         _assert_reconciliation_turn(mock_llm, script)
 
@@ -2829,13 +2894,15 @@ class TestComposerErrorHandling:
         # regardless of what the tool handler returns afterwards.
         tool_msg = script.prompts[1][-1]
         assert tool_msg["role"] == "tool"
-        try:
-            error_content = json.loads(tool_msg["content"])
-            error_text = error_content.get("error", "") if isinstance(error_content, dict) else ""
-        except json.JSONDecodeError:
-            error_text = ""
+        error_content = json.loads(tool_msg["content"])
+        assert type(error_content) is dict
+        error_text = error_content.get("error", "")
+        assert type(error_text) is str
         assert "missing required argument" not in error_text.lower()
         assert "inline_blob" not in error_text
+        assert len(result.tool_invocations) == 1
+        assert result.tool_invocations[0].tool_call_id == "call_ok"
+        assert result.tool_invocations[0].error_category is not ToolArgumentErrorCategory.MISSING_REQUIRED_PATH
 
     @pytest.mark.asyncio
     async def test_set_pipeline_with_partial_inline_blob_returns_tier3_arg_error(self) -> None:

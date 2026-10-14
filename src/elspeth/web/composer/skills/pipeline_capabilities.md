@@ -334,8 +334,10 @@ keeps its existing whole-original-row visibility.
 `query_input_mode: upstream` is the default: every query reads the original row.
 `query_input_mode: ordered` requires list-form named queries and `pool_size: 1`.
 Its `input_fields` may bind an exact generated name from an earlier successful,
-validated query, including `<query>_<suffix>` structured outputs and
-`<query>_<response_field>` raw/usage/model fields. Self/forward bindings and
+validated query. Before authoring each binding, obtain the selected plugin's
+exact configuration and generated structured/raw/usage/model output names from
+`get_plugin_schema` and `get_plugin_assistance`; never infer them from query names
+or prompt prose. Self/forward bindings and
 collisions are refused. Those internal dependencies are not upstream requirements.
 `source_row` and images always remain original-only. A constant first ordered
 query may use `input_fields: {}`; do not invent an external input for it.

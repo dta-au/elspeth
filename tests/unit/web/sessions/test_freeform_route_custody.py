@@ -20,6 +20,7 @@ from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions import composer_turn
+from elspeth.web.sessions.composer_operations import ComposerOperationError
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, composition_states_table, session_operation_fences_table
 from elspeth.web.sessions.routes._helpers import _join_freeform_owned_task
@@ -621,7 +622,32 @@ async def _actual_join_control(tmp_path, monkeypatch, *, site, route):
                 replay_record = app.state.composer_async_operation_authority.get(session_id=UUID(session_id), operation_id=key)
                 assert replay_record is not None and replay_record.user_message_id == messages[0].id
                 assert composer.calls == 0
-                assert [message.role for message in await service.get_messages(UUID(session_id), limit=None)] == ["user"]
+                assert roles == ["user", "audit"]
+                assert await service.get_messages(UUID(session_id), limit=None) == messages
+                assert messages[1].tool_calls is not None and len(messages[1].tool_calls) == 1
+                context = gate.leases[0].context
+                evidence = ComposerDiagnosticEvidence.from_envelope(
+                    messages[1].tool_calls[0],
+                    expected_session_id=session_id,
+                    expected_operation_id=context.fence.operation_id,
+                    expected_tool_call_id="operation:" + key,
+                )
+                assert evidence.operation_epoch == context.fence.operation_epoch
+                assert evidence.tool_name == "composer_failure" and evidence.status == "operation_failure"
+                selected = ComposerOperationError.model_validate_json(replay_record.result_json)
+                assert evidence.arguments.content is not None and evidence.result.content is not None
+                assert json.loads(evidence.arguments.content) == {
+                    "correlation_kind": "internal_operation",
+                    "durable_operation_id": key,
+                    "request_id": replay_record.request_id,
+                    "diagnostic_id": selected.diagnostic_id,
+                    "failure_code": selected.failure_code,
+                }
+                facts = json.loads(evidence.result.content)
+                assert facts["record_type"] == "failure_facts"
+                assert facts["nodes"][0]["class"] == "CancelledError"
+                assert facts["nodes"][0]["arguments"] == [{"disposition": "retained", "text": "first cancellation"}]
+                assert "first cancellation" not in final.text
                 status, error = observed.error()
                 assert status == 503, error
                 assert final.json()["cancel_requested"] is False

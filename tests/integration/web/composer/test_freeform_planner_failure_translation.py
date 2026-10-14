@@ -1252,18 +1252,68 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
     """An escape-hatch decline is a successful conversational outcome, not a
     provider failure: 200 with the advisor's own words, no failure disposition,
     no 'unusable pipeline plan' misattribution."""
-    client, engine, _sessions = _build_app(tmp_path, monkeypatch, _decline_after_exhaustion_completion())
+    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+
+    request = "Build a pipeline that joins two unbounded streams by matching keys."
+    planner_completion = _decline_after_exhaustion_completion()
+    planner_requests: list[dict[str, Any]] = []
+    end_requests: list[dict[str, Any]] = []
+
+    async def completion(**kwargs: Any) -> _Response:
+        model = kwargs["model"]
+        if "response_format" in kwargs:
+            assert model == composer._settings.composer_advisor_model
+            end_requests.append(deepcopy(kwargs))
+            assert len(end_requests) == 1, "Only one END SDK response is supplied"
+            assert [item["model"] for item in planner_requests] == ["test/planner", "test/planner", model]
+            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            assert review["current_request"] == request
+            assert review["candidate_reply"] == _DECLINE_TEXT
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
+            return _Response(
+                choices=[
+                    _Choice(
+                        message=_Message(
+                            content=json.dumps(
+                                {
+                                    "verdict": "CLEAN",
+                                    "category": "other",
+                                    "steps": [],
+                                    "findings": "",
+                                    "note": None,
+                                    "publication_verdict": "ADMIT",
+                                }
+                            )
+                        )
+                    )
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                model=model,
+                id="decline-end-review",
+            )
+        planner_requests.append(deepcopy(kwargs))
+        assert len(planner_requests) <= 3, "Only the original two discovery turns and hatch are supplied"
+        assert model == ("test/planner" if len(planner_requests) <= 2 else composer._settings.composer_advisor_model)
+        return await planner_completion(**kwargs)
+
+    client, engine, _sessions = _build_app(tmp_path, monkeypatch, completion)
+    composer = client.app.state.composer_service
     session_id = client.post("/api/sessions", json={"title": "freeform planner decline"}).json()["id"]
 
     settled = settle_sync(
         client,
         client.app,
         path=f"/api/sessions/{session_id}/messages",
-        body={"content": _EMPTY_INTENT, "operation_id": str(uuid4()), "state_id": None},
+        body={"content": request, "operation_id": str(uuid4()), "state_id": None},
     )
 
     assert settled.final.status_code == 200, settled.final.text
-    settled.result()
+    body = settled.result()
+    assert len(planner_requests) == 3 and len(end_requests) == 1
+    assert body["message"]["content"] == _DECLINE_TEXT
     assert _DECLINE_TEXT in settled.final.text
     assert "unusable pipeline plan" not in settled.final.text
 
@@ -1272,16 +1322,25 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
     progress = client.get(f"/api/sessions/{session_id}/composer-progress").json()
     assert progress.get("phase") != "failed"
 
-    # The planner's LLM audit evidence is durable: the first no-gain discovery
-    # response earns one bounded retry, the second opens the escape hatch, and
-    # the advisor then records the honest decline.
-    assert len(_llm_audit_rows(engine)) == 3
+    # Original discovery retry/hatch semantics remain; publication adds one
+    # separately accounted physical END call with an actual accepted audit.
+    assert len(_llm_audit_rows(engine)) == 4
 
     # The decline lands in the visible conversation as an assistant message.
     with engine.connect() as conn:
-        rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.content)).all()
+        rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.content, chat_messages_table.c.tool_calls)).all()
     assistant_rows = [row for row in rows if row.role == "assistant" and _DECLINE_TEXT in (row.content or "")]
     assert len(assistant_rows) == 1
+    passes = [
+        row.tool_calls[0]["pass"]
+        for row in rows
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    ]
+    assert len(passes) == 1
+    assert passes[0]["phase"] == "end" and passes[0]["source"] == "model"
+    assert passes[0]["verdict"] == "clean" and passes[0]["publication_verdict"] == "ADMIT"
+    assert passes[0]["provider_attempts"] == 1 and passes[0]["first_attempt_accepted"] is True
+    assert type(passes[0]["publication_binding"]) is str and len(passes[0]["publication_binding"]) == 64
 
 
 def _marker_decline_completion() -> Any:

@@ -346,6 +346,14 @@ lists the component ids the call touched; `data` is the tool-specific
 payload each tool's own description names. `validation` is always present.
 <!-- taught:end -->
 
+<!-- taught:begin tool-data get_blob_content data.start_char; tool-data get_blob_content data.end_char -->
+For a successful `get_blob_content` page, `start_char` is the inclusive
+decoded-character offset and `end_char` is the exclusive offset of the
+returned content. These are character positions, not byte offsets. A page
+does not establish inspection of content outside that range; continue using
+the returned continuation offset and the same content hash when more remains.
+<!-- taught:end -->
+
 <!-- taught:begin plugin-schema * plugin_schemas.<kind/plugin>.aggregation_output_modes; tool-data get_plugin_schema data.aggregation_output_modes -->
 In a selected plugin schema or `get_plugin_schema` result, `aggregation_output_modes`
 reports the class-declared batch modes. `transform` is the standard aggregation

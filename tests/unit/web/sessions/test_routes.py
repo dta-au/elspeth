@@ -97,6 +97,7 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
+from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationRecord
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identity_roles_table
 from elspeth.web.sessions.protocol import (
@@ -142,6 +143,37 @@ _EMPTY_STATE = CompositionState(
 
 
 _APP_SESSION_ENGINES: list[Engine] = []
+
+
+def _assert_terminal_private_failure(
+    messages: Sequence[ChatMessageRecord], operation: ComposerOperationRecord
+) -> ComposerDiagnosticEvidence:
+    assert [message.role for message in messages] == ["user", "audit"]
+    assert operation.status == "failed" and operation.result_json is not None
+    assert operation.session_operation_id is not None
+    assert operation.session_operation_epoch is not None
+    failure = ComposerOperationError.model_validate_json(operation.result_json, strict=True)
+    private = messages[1]
+    assert private.tool_calls is not None and len(private.tool_calls) == 1
+    evidence = ComposerDiagnosticEvidence.from_envelope(
+        private.tool_calls[0],
+        expected_session_id=str(operation.session_id),
+        expected_operation_id=operation.session_operation_id,
+        expected_tool_call_id="operation:" + operation.operation_id,
+    )
+    assert evidence.operation_epoch == operation.session_operation_epoch
+    assert evidence.tool_name == "composer_failure" and evidence.status == "operation_failure"
+    assert evidence.arguments.content is not None
+    assert json.loads(evidence.arguments.content) == {
+        "durable_operation_id": operation.operation_id,
+        "request_id": operation.request_id,
+        "diagnostic_id": failure.diagnostic_id,
+        "failure_code": failure.failure_code,
+        "correlation_kind": "internal_operation",
+    }
+    assert evidence.result.content is not None
+    assert json.loads(evidence.result.content)["record_type"] == "failure_facts"
+    return evidence
 
 
 @pytest.fixture(autouse=True)
@@ -639,9 +671,11 @@ class _BlockingRecordingComposer:
         required_work=None,
         provider_owner=None,
         recovery_context=None,
+        retained_operation_context: RetainedOperationContext | None = None,
     ) -> ComposerResult:
         del state, session_id, current_state_id, user_id, progress, user_message_id
         del session_operation_context, completion_gates, budget_seconds, required_work, provider_owner, recovery_context
+        del retained_operation_context
 
         self.calls.append(
             {
@@ -3148,6 +3182,7 @@ def test_accept_proposal_threads_originating_message_id_to_inline_blob(tmp_path,
         "source": {
             "plugin": "csv",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": {"schema": {"mode": "observed"}},
             "inline_blob": {
                 "filename": "ada.csv",
@@ -5453,7 +5488,11 @@ class TestMessageRoutes:
                 assert terminal.json()["error"]["failure_code"] == "request_cancelled"
                 assert composer.cancelled is True
                 messages = await service.get_messages(uuid.UUID(session_id), limit=None)
-                assert [message.role for message in messages] == ["user"]
+                operation, _ = app.state.composer_async_operation_authority.get_with_database_now(
+                    session_id=uuid.UUID(session_id), operation_id=body["operation_id"]
+                )
+                evidence = _assert_terminal_private_failure(messages, operation)
+                assert any(node["class"] == "CancelledError" for node in json.loads(evidence.result.content)["nodes"])
                 app.state.composer_service = _make_composer_mock(response_text="Still alive")
                 follow_up = await submit_and_settle(http, app, path=path, body=message_body("try again"))
                 assert follow_up.result()["message"]["content"] == "Still alive"
@@ -5811,6 +5850,9 @@ class TestMessageRoutes:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+
         prompt_canary = "PROMPT_CANARY_9c0b3d"
         option_canary = "OPTION_CANARY_314a7e"
         path_canary = "PATH_CANARY_820f65"
@@ -5927,6 +5969,29 @@ class TestMessageRoutes:
                     model="anthropic/claude-sonnet-4-6",
                     id="redaction-advisor",
                 ),
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=json.dumps(
+                                    {
+                                        "verdict": "CLEAN",
+                                        "category": "other",
+                                        "steps": [],
+                                        "findings": "",
+                                        "note": None,
+                                        "publication_verdict": "ADMIT",
+                                    }
+                                ),
+                                tool_calls=[],
+                            ),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                    model="anthropic/claude-sonnet-4-6",
+                    id="redaction-end",
+                ),
             )
         )
         provider_requests: list[dict[str, Any]] = []
@@ -5948,7 +6013,15 @@ class TestMessageRoutes:
         )
 
         assert sent.status_code == 200, sent.json()
-        assert len(provider_requests) == 2
+        assert len(provider_requests) == 3
+        end_messages = provider_requests[2]["messages"]
+        assert [message["role"] for message in end_messages] == ["system", "user"]
+        review_json = end_messages[1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+        review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+        assert review["current_request"] == f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
+        assert review["candidate_reply"] == "I cannot safely complete that pipeline."
+        assert review["saved_effects"]["saved_revision_count"] == 0
+        assert review["saved_effects"]["net_changed"] is False
         advisor_context = json.dumps(provider_requests[1]["messages"])
         assert all(canary in advisor_context for canary in canaries.values())
         validator_feedback = next(message["content"] for message in reversed(provider_requests[1]["messages"]) if message["role"] == "tool")
@@ -5965,7 +6038,7 @@ class TestMessageRoutes:
         assert any(evidence.status == "received_response" for evidence in private_evidence)
         assert any(evidence.status == "rejected" for evidence in private_evidence)
         private_requests = [evidence for evidence in private_evidence if evidence.status == "provider_request"]
-        assert len(private_requests) == 2
+        assert len(private_requests) == 3
         assert len({evidence.evidence_id for evidence in private_evidence}) == len(private_evidence)
         for evidence in private_requests:
             assert evidence.tool_name == "composer_provider_context"
@@ -5999,15 +6072,30 @@ class TestMessageRoutes:
         }
         # Physical calls checkpoint before the planner returns its semantic cohort.
         envelopes = [message.tool_calls[0] for message in persisted_audit if message.tool_calls]
-        assert [envelope["_kind"] for envelope in envelopes] == [
+        physical = [envelope for envelope in envelopes if envelope["_kind"] == "llm_call_audit"]
+        attempts = [envelope for envelope in envelopes if envelope["_kind"] == "planner_attempt_audit"]
+        passes = [envelope for envelope in envelopes if envelope["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND]
+        assert len(envelopes) == 6
+        assert len(physical) == 3 and len(attempts) == 2 and len(passes) == 1
+        planner_cohort = [
+            envelope
+            for envelope in envelopes
+            if envelope["_kind"] == "planner_attempt_audit"
+            or (envelope["_kind"] == "llm_call_audit" and envelope["call"]["planner_call_ordinal"] is not None)
+        ]
+        assert [envelope["_kind"] for envelope in planner_cohort] == [
             "llm_call_audit",
             "llm_call_audit",
             "planner_attempt_audit",
             "planner_attempt_audit",
         ]
-        assert [envelope["call"]["planner_call_ordinal"] for envelope in envelopes[:2]] == [1, 2]
-        assert [envelope["attempt"]["planner_call_ordinal"] for envelope in envelopes[2:]] == [1, 2]
-        assert {evidence.tool_call_id for evidence in private_requests} == {envelope["call"]["call_id"] for envelope in envelopes[:2]}
+        assert [envelope["call"]["planner_call_ordinal"] for envelope in physical[:2]] == [1, 2]
+        assert physical[2]["call"]["planner_call_ordinal"] is None
+        assert [envelope["attempt"]["planner_call_ordinal"] for envelope in attempts] == [1, 2]
+        assert passes[0]["pass"]["phase"] == "end"
+        assert passes[0]["pass"]["publication_verdict"] == "ADMIT"
+        assert passes[0]["pass"]["provider_attempts"] == 1
+        assert {evidence.tool_call_id for evidence in private_requests} == {envelope["call"]["call_id"] for envelope in physical}
         for surface_name, surface_payload in audit_surfaces.items():
             for canary_name, canary in canaries.items():
                 assert canary not in surface_payload, f"{canary_name} canary leaked through {surface_name} planner audit"
@@ -12223,15 +12311,26 @@ def test_durable_worker_preserves_integrity_and_ordinary_sql_categories(
     app.state.composer_service = composer
     client = TestClient(app)
     session_id = client.post("/api/sessions", json={"title": "Error categories"}).json()["id"]
+    body = message_body("Hello")
     response = _settled_composer_response(
         client,
         app,
         path=f"/api/sessions/{session_id}/messages",
-        body=message_body("Hello"),
+        body=body,
     )
     assert response.status_code == http_status
     assert response.json()["error_type"] == error_type
     assert diagnostic not in response.text
     composer.compose.assert_awaited_once()
     messages = asyncio.run(service.get_messages(uuid.UUID(session_id), limit=None))
-    assert [message.role for message in messages] == ["user"]
+    operation, _ = app.state.composer_async_operation_authority.get_with_database_now(
+        session_id=uuid.UUID(session_id), operation_id=body["operation_id"]
+    )
+    evidence = _assert_terminal_private_failure(messages, operation)
+    assert diagnostic in evidence.result.content
+    expected_class = "AuditIntegrityError" if failure_kind == "integrity" else "OperationalError"
+    assert any(node["class"] == expected_class for node in json.loads(evidence.result.content)["nodes"])
+    public = client.get(f"/api/sessions/{session_id}/messages?include_llm_audit=true&include_raw_content=true")
+    assert public.status_code == 200
+    assert diagnostic not in public.text
+    assert str(messages[1].id) not in {message["id"] for message in public.json()}

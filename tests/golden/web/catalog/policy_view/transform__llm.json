@@ -19,7 +19,9 @@
     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model \u2014 don't hand-add them.",
     "required_input_fields names upstream columns and bounds template visibility (ADR-051). Never require this node's generated fields as upstream inputs. options.schema.fields may declare output types (ADR-050); it does not extract fields from the reply.",
     "The plugin derives generated outputs from response_field and output_fields; pass-through guarantees come from upstream.",
-    "In multi-query mode, input_fields maps template variables to upstream columns. Per-query output_fields generates <queryname>_<suffix>; downstream consumers use those exact names.",
+    "In multi-query mode, input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered requires list-form named queries and pool_size=1, and allows exact bindings to earlier validated generated fields; self/forward references are refused. Per-query output_fields generates <queryname>_<suffix>.",
+    "Ordered mode preserves original-only source_row/images and atomic final output. Later failure routes the original entry row; prior calls/charges remain. Node-level restart may repeat calls; no durable mid-node resume or exactly-once guarantee.",
+    "Optional chain compaction is an operator choice: inspect all consumers, exact output names/types, rendered prompts, effective provider/profile/settings, intermediate shields/gates/mappers/branches and failure policies. Independent entry-row queries can qualify today; dependent ones require ordered mode. Never promise fewer calls/tokens. Disclose changed quarantine/audit/checkpoint boundaries and obtain a choice before ordinary provider-authored node/edge mutations; decline changes nothing. Preserve interpretation tokens and prompt/semantics review.",
     "For the colour example, require colour on the LLM and good_colour_pair_answer / approximate_hex_answer downstream.",
     "Single-query LLM output is written to response_field as raw text. Prompt wording alone does not create separate JSON fields; preserve response_field through cleanup when no output_fields are configured.",
     "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. The raw response_field and automatic usage/model fields remain available.",
@@ -268,6 +270,15 @@
         "title": "QueryDefinition",
         "type": "object"
       },
+      "QueryInputMode": {
+        "description": "Whether explicit bindings can consume previously validated query outputs.",
+        "enum": [
+          "upstream",
+          "ordered"
+        ],
+        "title": "QueryInputMode",
+        "type": "string"
+      },
       "ResponseFormat": {
         "description": "LLM response format modes.\n\n- STANDARD: Uses {\"type\": \"json_object\"} - model outputs JSON but no schema enforcement\n- STRUCTURED: Uses {\"type\": \"json_schema\", ...} - API enforces exact schema compliance",
         "enum": [
@@ -478,6 +489,12 @@
         "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "title": "Queries"
       },
+      "query_input_mode": {
+        "$ref": "#/$defs/QueryInputMode",
+        "default": "upstream",
+        "description": "upstream reads the original row; ordered requires list-form queries and pool_size=1, and allows explicit bindings to earlier validated outputs. source_row and images always read the original row.",
+        "title": "Query Input Mode"
+      },
       "required_input_fields": {
         "anyOf": [
           {
@@ -563,6 +580,13 @@
       {
         "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "name": "queries",
+        "required": false,
+        "tier": "common",
+        "type": "object"
+      },
+      {
+        "description": "upstream reads the original row; ordered requires list-form queries and pool_size=1, and allows explicit bindings to earlier validated outputs. source_row and images always read the original row.",
+        "name": "query_input_mode",
         "required": false,
         "tier": "common",
         "type": "object"

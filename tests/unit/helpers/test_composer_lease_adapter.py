@@ -13,7 +13,7 @@ from tests.integration.web.composer.test_freeform_proposal_prevalidation import 
 
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
-from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult
+from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult, RetainedOperationContext
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -51,9 +51,11 @@ async def test_adapter_forwards_exact_remaining_budget_and_owned_provider_pair(t
         required_work=None,
         provider_owner=None,
         recovery_context=None,
+        retained_operation_context: RetainedOperationContext | None = None,
     ):
         calls.append((self, message, messages, state, session_operation_context, budget_seconds, required_work, provider_owner))
         assert recovery_context is recovery
+        assert retained_operation_context is None
         return ComposerResult(message="Captured adapter forwarding.", state=state)
 
     monkeypatch.setattr(ComposerServiceImpl, "compose", capture)
@@ -120,10 +122,12 @@ async def test_adapter_legacy_call_preserves_budget_and_closes_actual_owned_leas
         required_work=None,
         provider_owner=None,
         recovery_context=None,
+        retained_operation_context: RetainedOperationContext | None = None,
     ):
         contexts.append(session_operation_context)
         budgets.append(budget_seconds)
         assert required_work is provider_owner is recovery_context is None
+        assert retained_operation_context is None
         self._sessions_service.session_operation_authority.compare_and_swap(session_operation_context)
         return ComposerResult(message="Captured legacy forwarding.", state=state)
 

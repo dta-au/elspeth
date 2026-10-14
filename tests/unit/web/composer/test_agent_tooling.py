@@ -1201,7 +1201,12 @@ class TestCreateBlobToSetSourceEndToEnd:
         # Step 2: Wire the blob as the pipeline source
         source_result = execute_tool(
             "set_source_from_blob",
-            {"blob_id": blob_id, "on_success": "transform1", "options": {"schema": {"mode": "observed"}}},
+            {
+                "blob_id": blob_id,
+                "on_success": "transform1",
+                "on_validation_failure": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
             state,
             catalog,
             data_dir=blob_env["data_dir"],

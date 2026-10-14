@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
-from elspeth.web.composer import provider_gateway
-from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.config import WebSettings
 from tests.helpers.session_fences import fenced_operation_context
-from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_llm_response, _make_settings, _mock_catalog
+from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_settings, _mock_catalog
 
 _BEDROCK_PRIMARY = "bedrock/global.anthropic.claude-sonnet-4-6"
 _BEDROCK_ADVISOR = "bedrock/global.anthropic.claude-opus-4-6-v1"
@@ -63,19 +63,49 @@ def _bedrock_service() -> ComposerServiceImpl:
 async def test_bedrock_primary_uses_real_service_path_without_static_provider_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import litellm
+
+    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+
     _clear_static_provider_keys(monkeypatch)
     captured: list[dict[str, Any]] = []
+    reviews: list[dict[str, Any]] = []
+    unexpected_models: list[str] = []
+    candidate = "No pipeline changes were saved in this request."
 
     async def fake_acompletion(**kwargs: Any) -> Any:
-        captured.append(kwargs)
-        return _make_llm_response(content="No pipeline changes are needed.")
+        captured.append(deepcopy(kwargs))
+        model = kwargs["model"]
+        assert not (_FORBIDDEN_BEDROCK_KWARGS & set(kwargs))
+        if model == _BEDROCK_PRIMARY:
+            assert [item["model"] for item in captured] == [_BEDROCK_PRIMARY], "Only one native primary response is supplied"
+            content = candidate
+        elif model == _BEDROCK_ADVISOR:
+            assert [item["model"] for item in captured] == [_BEDROCK_PRIMARY, _BEDROCK_ADVISOR], "Only one independent END is supplied"
+            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            reviews.append(review)
+            assert review["candidate_reply"] == candidate
+            assert review["current_request"] == "No pipeline changes are needed."
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
+            content = json.dumps(
+                {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+            )
+        else:
+            unexpected_models.append(model)
+            raise AssertionError(f"No SDK response is supplied for {model!r}")
+        return litellm.ModelResponse(
+            model=model,
+            choices=[{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+        )
 
-    async def clean_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
-        return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
+    # Fake only the native SDK seam, after custody/callback handling. END
+    # request construction, strict parser, binding and durable audit run.
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
     service, session_id = _composer_service_with_session(_mock_catalog(), _bedrock_settings())
-    monkeypatch.setattr(service._advisor_checkpoint, "_run_advisor_checkpoint", clean_checkpoint)
 
     availability = service.get_availability()
     assert availability.available is True
@@ -85,13 +115,16 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     engine = service._require_sessions_service()._engine
     try:
         with fenced_operation_context(engine, session_id) as context:
-            await service.compose(
+            result = await service.compose(
                 "No pipeline changes are needed.", [], _empty_state(), session_id=session_id, session_operation_context=context
             )
+        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
     finally:
         engine.dispose()
 
-    assert len(captured) == 1
+    assert unexpected_models == []
+    assert len(captured) == len(result.llm_calls) == 2 and len(reviews) == 1
+    assert result.message == candidate
     request = captured[0]
     assert request["model"] == _BEDROCK_PRIMARY
     assert {tool["function"]["name"] for tool in request["tools"]} == expected_tool_names
@@ -102,6 +135,25 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     assert request["num_retries"] == request["max_retries"] == 0
     assert request["reasoning_effort"] == "low"
     assert not (_FORBIDDEN_BEDROCK_KWARGS & set(request))
+    end_request = captured[1]
+    assert end_request["model"] == _BEDROCK_ADVISOR
+    assert set(end_request) == {"model", "messages", "max_tokens", "reasoning_effort", "response_format", "num_retries", "max_retries"}
+    assert end_request["reasoning_effort"] == "medium"
+    assert end_request["num_retries"] == end_request["max_retries"] == 0
+    assert end_request["response_format"]["type"] == "json_schema"
+    assert end_request["response_format"]["json_schema"]["strict"] is True
+    assert "tools" not in end_request
+    assert [call.model_requested for call in result.llm_calls] == [_BEDROCK_PRIMARY, _BEDROCK_ADVISOR]
+    passes = [
+        row.tool_calls[0]["pass"]
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    ]
+    assert len(passes) == 1
+    assert passes[0]["phase"] == "end" and passes[0]["source"] == "model"
+    assert passes[0]["verdict"] == "clean" and passes[0]["publication_verdict"] == "ADMIT"
+    assert passes[0]["provider_attempts"] == 1 and passes[0]["first_attempt_accepted"] is True
+    assert type(passes[0]["publication_binding"]) is str and len(passes[0]["publication_binding"]) == 64
 
 
 @pytest.mark.asyncio
