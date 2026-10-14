@@ -2123,24 +2123,51 @@ class TestComposerMultiTurnToolCalls:
 
     @pytest.mark.asyncio
     async def test_advisor_outage_on_the_first_pass_does_not_delete_the_models_reply(self) -> None:
-        """Whole loop, real driver wiring: the advisor never rendered a verdict,
-        so nothing hidden entered the model's context and the reply is the
-        model's own. The block is reported beside it."""
+        """An unreviewed reply survives privately while public copy states saved facts."""
+        from hashlib import sha256
+
+        from elspeth.web.composer.advisor_audit import ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
+        from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
+        from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND, COMPOSER_WITHHELD_REPLY_SCHEMA
+        from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_or_tool_messages
+
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         outage = AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="advisor unavailable", failure_class="unavailable")
+        state = self._wired_source_only_state()
 
         with (
             patch.object(
                 service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=[_make_llm_response(content="Looks ready.")]
-            ),
-            patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
-            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", new_callable=AsyncMock, return_value=outage),
+            ) as primary_call,
+            patch.object(
+                service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])
+            ) as preflight,
+            patch.object(
+                service._advisor_checkpoint, "_run_advisor_checkpoint", new_callable=AsyncMock, return_value=outage
+            ) as advisor_call,
         ):
-            result = await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
+            result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
-        assert result.raw_assistant_content == "Looks ready."
+        assert primary_call.await_count == 1
+        assert advisor_call.await_count == service._settings.composer_advisor_checkpoint_max_passes == 2
+        assert [call.kwargs["pass_index"] for call in advisor_call.await_args_list] == [1, 2]
+        reviews = [call.kwargs["publication_review"] for call in advisor_call.await_args_list]
+        assert type(reviews[0]) is AdvisorPublicationReview and reviews[1] is reviews[0]
+        evidence = json.loads(reviews[0].payload_json)
+        assert evidence["candidate_reply"] == "Looks ready."
+        assert evidence["current_request"] == "Review this pipeline"
+        assert evidence["saved_effects"]["saved_revision_count"] == 0
+        assert evidence["saved_effects"]["net_changed"] is False
+        preflight.assert_not_called()
+        assert result.state == state
+        assert result.tool_invocations == ()
+        saved_scope = "No pipeline changes were saved in this request."
+        assert result.raw_assistant_content == saved_scope
+        assert result.message == saved_scope + _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+        assert "Looks ready." not in result.message
         assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
-            _no_tool_policy_module.AssistantTextSegment("Looks ready."),
+            _no_tool_policy_module.AssistantTextSegment(saved_scope),
             # No mutation this turn, so no preflight ran: the absent-shape twin.
             _no_tool_policy_module.TrustedSystemNoticeSegment(
                 _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE
@@ -2148,6 +2175,42 @@ class TestComposerMultiTurnToolCalls:
         )
         assert result.runtime_preflight is not None
         assert result.runtime_preflight.readiness.completion_ready is False
+        assert isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
+        assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.UNAVAILABLE
+        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
+        withheld = [
+            row for row in stored if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == COMPOSER_WITHHELD_REPLY_KIND
+        ]
+        assert len(withheld) == 1
+        assert withheld[0].session_id == UUID(session_id) and withheld[0].writer_principal == "compose_loop"
+        assert withheld[0].content == "Looks ready."
+        assert len(withheld[0].tool_calls) == 1
+        assert withheld[0].tool_calls[0] == {
+            "_kind": COMPOSER_WITHHELD_REPLY_KIND,
+            "schema": COMPOSER_WITHHELD_REPLY_SCHEMA,
+            "origin": "advisor_publication_withheld",
+            "content_hash": sha256(b"Looks ready.").hexdigest(),
+        }
+        public_rows = _composer_conversation_or_tool_messages(stored)
+        assert withheld[0] not in public_rows
+        assert all(row.content != "Looks ready." and row.raw_content != "Looks ready." for row in public_rows)
+        assert all(item["content"] != "Looks ready." for item in _composer_chat_history(stored))
+        terminal = [
+            row
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
+        ]
+        assert len(terminal) == 1
+        assert terminal[0].tool_calls[0] == {
+            "_kind": ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND,
+            "publication": {
+                "branch": "terminal_block",
+                "reason": "unavailable",
+                "preflight_shape": "absent",
+                "findings_backend_authored": False,
+            },
+        }
+        assert json.loads(terminal[0].content) == terminal[0].tool_calls[0]
 
     @pytest.mark.asyncio
     async def test_advisor_cohort_keeps_every_replaced_reply_recoverable(self) -> None:
