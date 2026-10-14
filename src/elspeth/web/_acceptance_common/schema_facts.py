@@ -11,7 +11,7 @@ from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 from .errors import AcceptanceCheckError
 
-_CANDIDATE_PACKAGE_VERSION = "0.8.5"
+_CANDIDATE_PACKAGE_VERSION = "0.8.6"
 
 _ROLLBACK_PACKAGE_VERSION = "0.7.1"
 

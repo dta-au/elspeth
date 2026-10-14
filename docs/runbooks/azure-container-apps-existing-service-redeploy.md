@@ -15,7 +15,7 @@ Every platform literal below is measured in the
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This is an executable operator procedure; steps marked
 > **LIVE** require measurements during execution. A future acceptance receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.5.json` is no longer a tracker
+> `docs/operator/evidence/azure-container-apps/0.8.6.json` is no longer a tracker
 > closure or documentation-promotion condition.
 
 > **Temporary deployment hold:** the current candidate supports only fresh/new
@@ -305,7 +305,7 @@ status; health alone does not prove LLM or login setup.
 > **LIVE:** the console-log query by revision name that shows no new
 > unhandled startup or runtime failure.
 
-The 0.8.5 candidate expects session epoch 75 and Landscape epoch 49. An
+The 0.8.6 candidate expects session epoch 75 and Landscape epoch 49. An
 epoch-crossing candidate is unsupported under the temporary fresh-store-only
 policy. Stop without applying the candidate or altering either existing store.
 The [identity workflow cutover handoff](identity-workflow-cutover.md) is

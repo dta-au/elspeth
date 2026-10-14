@@ -2,7 +2,7 @@
 
 Index of the documentation shipped in this repository.
 
-**Framework status:** `0.8.5`
+**Framework status:** `0.8.6`
 **Archive note:** current release, architecture, contract, guide, reference, and
 runbook docs remain visible here. Implemented plans, superseded specs, generated
 review sidecars, and other internal work product are removed from active public

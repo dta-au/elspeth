@@ -4,6 +4,50 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.6 - Candidate (Composer correctness and recovery)
+
+- **Dependent queries can run in one LLM node.** `query_input_mode: ordered`
+  lets explicitly bound later queries read earlier validated outputs. It
+  requires uniquely named list-form queries and `pool_size: 1`; each query
+  still makes a provider call. Recovery remains at the node boundary and can
+  repeat earlier calls. See [ordered LLM queries](docs/guides/ordered-llm-queries.md).
+- **Failure-route visibility is local presentation.** The graph's quarantine
+  and discard toggle filters the displayed routes after layout without changing
+  the authored graph, execution behavior or persisted pipeline.
+- **Final replies use the existing bounded review.** Ordinary explanations,
+  edit-completion replies, planner declines and proof-exhausted replies require
+  current candidate/evidence-bound publication admission. Unadmitted prose is
+  retained privately while trusted saved-progress and blocker text is shown.
+  Reply admission does not clear graph, pending-review or execution blockers.
+- **Saved changes and inspection evidence remain distinct.** Final review uses
+  committed-row witnesses and net authored changes, separately from the content
+  actually delivered to the reviewing provider. A saved revision count does not
+  establish that requested edits were completed; complete inspection does not
+  establish semantic equivalence.
+- **Operation outcomes survive refreshes.** Authenticated retained outcomes
+  expose bounded saved progress and safe diagnostics. Known terminal outcomes
+  appear before optional refreshes finish, including attachment to another
+  active operation, without replaying the losing submission.
+- **Blob inspection supports bounded continuation.** Pages bind to the original
+  content hash and actual returned character ranges. Response byte limits can
+  produce smaller pages; stale content identities cannot be combined into one
+  inspection. Stream completion remains bounded when the transport is writable.
+- **Diagnostics and guidance follow existing contracts.** Invalid schema-name
+  examples are checked against the actual field grammar without renaming input.
+  Fork guidance describes ordinary downstream consumers without requiring
+  coalescing. Failed-operation diagnostics retain bounded private original
+  causes atomically with the failed terminal under the existing live fence.
+
+Session epoch 75 and Landscape epoch 49 are unchanged. Existing unsupported
+stores remain preserved and refused; this candidate authorizes no migration,
+reset or downgrade. Backwards compatibility is considered within explicitly
+supported boundaries.
+
+These notes describe source changes. Focused checks and source review do not
+establish final exact-head or PostgreSQL qualification, live provider acceptance,
+operator signature clearance, release tagging or deployment. Automatic image
+publication from main remains held; 0.8.6 container publication is not authorized.
+
 ## 0.8.5 - LLM compatibility and Composer recovery
 
 - **Omitted LLM temperature uses the provider default.** Common source and
