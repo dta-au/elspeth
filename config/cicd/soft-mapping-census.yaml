@@ -936,7 +936,7 @@ files:
     dict[str, Any]: 28
   src/elspeth/web/composer/yaml_importer.py:
     Mapping[str, Any]: 3
-    boundary: 4
+    boundary: 5
   src/elspeth/web/config.py:
     dict[str, object]: 1
   src/elspeth/web/coordination/membership_authority.py:
@@ -1063,7 +1063,7 @@ totals:
   Mapping[str, Any]: 755
   Mapping[str, object]: 315
   MutableMapping[str, Any]: 8
-  boundary: 59
+  boundary: 60
   dict[str, Any]: 1073
   dict[str, object]: 395
   soft: 2546

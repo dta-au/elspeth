@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from math import isfinite
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import yaml
 
@@ -404,6 +404,32 @@ def _require_str(entry: Mapping[str, Any], key: str, path: str) -> str:
 
 @trust_boundary(
     tier=3,
+    source="web-authored pipeline YAML ordinary failure-choice entry (untrusted import payload)",
+    source_param="entry",
+    suppresses=("R1", "R5"),
+    invariant="raises RuntimeYamlImportError on missing/null/non-string/blank failure choices and returns a trimmed explicit route without echoing values",
+    test_ref="tests/unit/web/composer/test_explicit_failure_choices.py::test_ordinary_yaml_failure_choice_is_nonblank_private_safe",
+    test_fingerprint="787e09bff5cdaa3379adaa36f0c4fbddcd6733dd008492835a98cf3841648298",
+)
+def _require_ordinary_failure_choice(
+    entry: Mapping[str, Any],
+    *,
+    field: Literal["on_error", "on_write_failure"],
+    location: Literal["transforms.item", "aggregations.item", "sinks.item"],
+) -> str:
+    """Admit an explicit ordinary route without echoing authored identifiers."""
+    message = f"{location}.{field} requires an explicit non-empty failure choice: 'discard' or an eligible named route"
+    value = entry.get(field)
+    if type(value) is not str:
+        raise RuntimeYamlImportError(message)
+    try:
+        return resolve_failure_route_choice(value, supplied=field in entry, field=field)
+    except FailureRouteChoiceError as exc:
+        raise RuntimeYamlImportError(message) from exc
+
+
+@trust_boundary(
+    tier=3,
     source="web-authored pipeline YAML entry mapping (untrusted import payload)",
     source_param="entry",
     suppresses=("R1", "R5"),
@@ -754,7 +780,9 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                 plugin=_require_str(entry, "plugin", path),
                 input=_require_str(entry, "input", path),
                 on_success=_optional_str(entry, "on_success") if node_type == "aggregation" else _require_str(entry, "on_success", path),
-                on_error=_require_str(entry, "on_error", path),
+                on_error=_require_ordinary_failure_choice(
+                    entry, field="on_error", location="aggregations.item" if node_type == "aggregation" else "transforms.item"
+                ),
                 options=options,
                 condition=None,
                 routes=None,
@@ -878,7 +906,7 @@ def _outputs_from_runtime_sinks(sinks: Any) -> tuple[OutputSpec, ...]:
                 name=sink_name,
                 plugin=_require_str(entry, "plugin", path),
                 options=_json_mapping(entry.get("options"), f"{path}.options"),
-                on_write_failure=_require_str(entry, "on_write_failure", path),
+                on_write_failure=_require_ordinary_failure_choice(entry, field="on_write_failure", location="sinks.item"),
             )
         )
     return tuple(outputs)

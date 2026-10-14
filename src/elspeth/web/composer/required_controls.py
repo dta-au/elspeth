@@ -69,10 +69,8 @@ from elspeth.web.composer.state import (
     validate_composer_source_name,
 )
 
-# The shared on_validation_failure canonicalizer is the single owner of the
-# "" -> 'discard' fold (elspeth-bcd7051143); deep-importing tools._common is
-# the established cross-package pattern (pipeline_planner and pipeline_commit
-# do the same).
+# Use the same explicit-choice admission as the mutation tools; projection
+# must not invent discard for an absent or invalid ordinary route.
 from elspeth.web.composer.tools._common import (
     _canonicalize_authored_interpretation_requirements,
     resolve_failure_route_choice,

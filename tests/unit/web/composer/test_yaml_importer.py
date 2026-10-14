@@ -856,7 +856,7 @@ sinks:
 
 
 def test_composition_state_from_runtime_yaml_rejects_missing_transform_error_route() -> None:
-    with pytest.raises(RuntimeYamlImportError, match=r"transforms\[0\]\.on_error"):
+    with pytest.raises(RuntimeYamlImportError, match=r"transforms\.item\.on_error"):
         composition_state_from_runtime_yaml(
             """
 sources:
@@ -883,7 +883,7 @@ sinks:
 
 
 def test_composition_state_from_runtime_yaml_rejects_missing_aggregation_error_route() -> None:
-    with pytest.raises(RuntimeYamlImportError, match=r"aggregations\[0\]\.on_error"):
+    with pytest.raises(RuntimeYamlImportError, match=r"aggregations\.item\.on_error"):
         composition_state_from_runtime_yaml(
             """
 sources:
@@ -909,7 +909,7 @@ sinks:
 
 
 def test_composition_state_from_runtime_yaml_rejects_missing_sink_write_failure_route() -> None:
-    with pytest.raises(RuntimeYamlImportError, match=r"sinks\.out\.on_write_failure"):
+    with pytest.raises(RuntimeYamlImportError, match=r"sinks\.item\.on_write_failure"):
         composition_state_from_runtime_yaml(
             """
 sources:

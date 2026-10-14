@@ -25,6 +25,7 @@ from elspeth.web.sessions.routes.workflow.library import create_library_router
 from tests.fixtures.identities import ensure_test_identity
 from tests.integration.web.conftest import _seed_session_with_state
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
+from tests.unit.web.composer.test_explicit_failure_choices import _ordinary_failure_yaml
 
 
 @dataclass
@@ -227,6 +228,7 @@ def test_publish_without_compartment_returns_named_refusal(
         "sources:\n  PRIVATE_SOURCE_MARKER:\n    plugin: csv\n    on_success: out\n    options: {}\n",
         'sources:\n  PRIVATE_SOURCE_MARKER:\n    plugin: "null"\n    on_success: out\n    options: {}\n',
         "sources: [PRIVATE_YAML_MARKER]\n",
+        *[_ordinary_failure_yaml(kind, route) for kind in ("transforms", "aggregations", "sinks") for route in (None, "", "   ")],
     ],
 )
 def test_fork_invalid_yaml_refuses_before_session_creation_without_private_echo(library_client, monkeypatch, document):
@@ -290,6 +292,39 @@ def test_fork_passes_exact_frozen_yaml_and_provenance_to_seed_seam(
             "version": 1,
         }
     }
+
+
+@pytest.mark.parametrize("kind", ["transforms", "aggregations", "sinks"])
+@pytest.mark.parametrize("route", ["discard", " discard "])
+def test_fork_accepts_explicit_trimmed_ordinary_failure_choices(library_client, monkeypatch, kind, route):
+    client, actor, _events = library_client
+    _, published = _publish(client)
+    actor.identity_id = "carol"
+    assert client.post(f"/api/library/{published['entry_id']}/accept", json={}).status_code == 200
+    actor.identity_id = "bob"
+    authorize = client.app.state.library_authority.authorize_fork_source
+    document = _ordinary_failure_yaml(kind, route)
+
+    def historical_source(self, **kwargs):
+        return replace(authorize(**kwargs), payload_yaml=document)
+
+    monkeypatch.setattr(RepositoryLibraryAuthority, "authorize_fork_source", historical_source)
+    received = []
+
+    async def seed(**kwargs):
+        received.append(kwargs)
+        return SimpleNamespace(id="seeded-state-id")
+
+    client.app.state.library_state_seeder = seed
+    engine = client.app.state.session_engine
+    with engine.connect() as conn:
+        before = conn.execute(select(func.count()).select_from(sessions_table)).scalar_one()
+    response = client.post(f"/api/library/{published['entry_id']}/fork")
+    assert response.status_code == 201, response.text
+    assert len(received) == 1
+    assert received[0]["body"].yaml == document
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(sessions_table)).scalar_one() == before + 1
 
 
 def test_fork_archives_new_session_if_seed_raises_internal_error(

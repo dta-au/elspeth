@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 
 import pytest
+import yaml
 
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
@@ -20,10 +21,87 @@ from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.schema_contract import assert_set_pipeline_schema_compatible
 from elspeth.web.composer.tools.wire_projection import decode_wire_arguments, project_tool
 from elspeth.web.composer.yaml_generator import generate_yaml
-from elspeth.web.composer.yaml_importer import RuntimeYamlImportError, _source_from_runtime_entry, composition_state_from_runtime_yaml
+from elspeth.web.composer.yaml_importer import (
+    RuntimeYamlImportError,
+    _require_ordinary_failure_choice,
+    _source_from_runtime_entry,
+    composition_state_from_runtime_yaml,
+)
 from tests.unit.web.composer.test_splice_transform_tool import _arguments as splice_arguments
 from tests.unit.web.composer.test_splice_transform_tool import _state as splice_state
 from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog, execute_tool
+
+
+def _ordinary_failure_yaml(kind: str, route: object) -> str:
+    document = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            }
+        },
+        "sinks": {
+            "PRIVATE_SINK_MARKER": {
+                "plugin": "json",
+                "on_write_failure": route if kind == "sinks" else "discard",
+                "options": {"path": "outputs/out.json", "schema": {"mode": "observed"}},
+            }
+        },
+    }
+    if kind != "sinks":
+        document[kind] = [
+            {
+                "name": "PRIVATE_NODE_MARKER",
+                "plugin": "passthrough",
+                "input": "rows",
+                "on_success": "PRIVATE_SINK_MARKER",
+                "on_error": route,
+                "options": {"schema": {"mode": "observed"}},
+            }
+        ]
+    return yaml.safe_dump(document)
+
+
+@pytest.mark.parametrize("kind", ["transforms", "aggregations", "sinks"])
+@pytest.mark.parametrize("route", [None, "", "   ", 42, "OMITTED"])
+def test_ordinary_yaml_failure_choice_is_nonblank_private_safe(kind, route):
+    document = yaml.safe_load(_ordinary_failure_yaml(kind, route))
+    entry = document["sinks"]["PRIVATE_SINK_MARKER"] if kind == "sinks" else document[kind][0]
+    field = "on_write_failure" if kind == "sinks" else "on_error"
+    if route == "OMITTED":
+        entry.pop(field)
+    with pytest.raises(RuntimeYamlImportError):
+        _require_ordinary_failure_choice(entry, field=field, location=f"{kind}.item")
+    with pytest.raises(RuntimeYamlImportError) as caught:
+        composition_state_from_runtime_yaml(yaml.safe_dump(document))
+    assert f"{kind}.item." in str(caught.value)
+    assert "explicit non-empty" in str(caught.value)
+    assert "PRIVATE_" not in str(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["transforms", "aggregations", "sinks"])
+@pytest.mark.parametrize("route", ["discard", " discard ", " quarantine "])
+def test_ordinary_yaml_failure_choice_is_canonical_without_gate_policy_change(kind, route):
+    document = yaml.safe_load(_ordinary_failure_yaml(kind, route))
+    document["gates"] = [{"name": "gate", "input": "rows", "condition": "True", "routes": {"true": "PRIVATE_SINK_MARKER"}}]
+    imported = composition_state_from_runtime_yaml(yaml.safe_dump(document))
+    assert next(node for node in imported.nodes if node.node_type == "gate").on_error is None
+    if kind == "sinks":
+        assert imported.outputs[0].on_write_failure == route.strip()
+    else:
+        assert next(node for node in imported.nodes if node.node_type != "gate").on_error == route.strip()
+
+
+@pytest.mark.parametrize("choice", [None, "discard", "quarantine"])
+def test_yaml_optional_gate_failure_choice_is_preserved(choice):
+    document = yaml.safe_load(_ordinary_failure_yaml("sinks", "discard"))
+    document["gates"] = [
+        {"name": "gate", "input": "rows", "condition": "True", "routes": {"true": "PRIVATE_SINK_MARKER"}, "on_error": choice}
+    ]
+    imported = composition_state_from_runtime_yaml(yaml.safe_dump(document))
+    assert imported.nodes[0].on_error == choice
 
 
 @pytest.mark.parametrize(
