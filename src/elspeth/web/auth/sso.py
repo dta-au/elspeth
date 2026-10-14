@@ -56,7 +56,7 @@ from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_sync
 from elspeth.web.auth.claims import IdTokenClaims, UserinfoClaims, optional_string_claim
 from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, IdentityClaims, UserIdentity, UserProfile
-from elspeth.web.auth.session_token import SessionTokenIssuer
+from elspeth.web.auth.session_token import SessionBinding, SessionTokenIssuer
 from elspeth.web.auth.urls import DiscoveredEndpoints, validate_discovered_endpoints
 
 # ── failure taxonomy ─────────────────────────────────────────────────────
@@ -1410,6 +1410,12 @@ class SsoAuthProvider:
 
     async def authenticate(self, token: str) -> UserIdentity:
         return await run_sync_in_worker(self._authenticate_sync, token)
+
+    async def logout(self, token: str) -> None:
+        await run_sync_in_worker(self._issuer.revoke, token)
+
+    def authorize_binding(self, user: UserIdentity, binding: SessionBinding) -> None:
+        self._issuer.authorize_binding(identity_id=user.user_id, binding=binding)
 
     def _authenticate_sync(self, token: str) -> UserIdentity:
         claims = self._issuer.authenticate(token)

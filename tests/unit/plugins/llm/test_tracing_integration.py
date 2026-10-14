@@ -117,7 +117,7 @@ class _ErroringProvider:
         messages: list[dict[str, str]],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
@@ -125,7 +125,7 @@ class _ErroringProvider:
         del messages, model, temperature, max_tokens, audit_parent, response_format
         raise self.error
 
-    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str, temperature: float | None) -> None:
         del operation_id, model
 
     def close(self) -> None:

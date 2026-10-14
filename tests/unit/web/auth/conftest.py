@@ -32,6 +32,7 @@ from elspeth.web.auth.session_token import (
     SessionTokenIssuer,
 )
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.auth_session_authority import RepositoryAuthSessionAuthority
 from elspeth.web.coordination.identity_authority import (
     IdentityDormant,
     IdentityRebound,
@@ -268,6 +269,7 @@ def build_local_auth_provider(
                 token_expiry_hours=token_expiry_hours,
                 max_refresh_chain_hours=max_refresh_chain_hours,
                 principal_is_active=_principal_is_active,
+                sessions=RepositoryAuthSessionAuthority(engine),
             ),
             admit_identity=_admit_identity,
             retire_identity=local_identity_retirer(authority, _record_no_retirement),

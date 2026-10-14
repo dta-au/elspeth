@@ -369,7 +369,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 72 persists durable composer operations and exact operation ingress binding.
     # Epoch 73 is retired: independent recovery and auth branches used it for
     # different shapes. Epoch 74 adds recovery bookmarks and checkpoint owners.
-    assert SESSION_SCHEMA_EPOCH == 74
+    # Epoch 75 adds auth families and ticket bindings without removing recovery.
+    assert SESSION_SCHEMA_EPOCH == 75
     assert "composition_graph_parks" in inspector.get_table_names()
     assert "creator_operation_id" in {column["name"] for column in inspector.get_columns("composition_states")}
     expected_tables = frozenset(
@@ -380,6 +381,7 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
             "run_start_permits",
             "run_execution_inputs",
             "websocket_tickets",
+            "auth_session_families",
             "composer_inflight_requests",
             "composer_progress_snapshots",
             "rate_limit_buckets",
@@ -398,6 +400,7 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
         "run_start_permits": {"ix_run_start_permits_retention_expires_at"},
         "run_execution_inputs": set(),
         "websocket_tickets": {"ix_websocket_tickets_expires_at", "ix_websocket_tickets_run_id"},
+        "auth_session_families": {"ix_auth_session_families_expires_at", "ix_auth_session_families_identity_id"},
         "composer_inflight_requests": {"ix_composer_inflight_requests_expires_at", "ix_composer_inflight_session_expiry"},
         "composer_progress_snapshots": {"ix_composer_progress_snapshots_expires_at"},
         "rate_limit_buckets": {"ix_rate_limit_buckets_expires_at"},
@@ -436,6 +439,10 @@ def test_coordination_hard_cut_check_constraints_are_exact() -> None:
     inspector = inspect(eng)
 
     expected_checks = {
+        "auth_session_families": {
+            "ck_auth_session_families_id_nonblank",
+            "ck_auth_session_families_provider",
+        },
         "web_instances": {
             "ck_web_instances_generation_nonblank",
             "ck_web_instances_image_digest_nonblank",
@@ -486,6 +493,8 @@ def test_coordination_hard_cut_check_constraints_are_exact() -> None:
             "ck_websocket_tickets_digest_sha256",
             "ck_websocket_tickets_run_id_nonblank",
             "ck_websocket_tickets_user_id_nonblank",
+            "ck_websocket_tickets_token_binding",
+            "ck_websocket_tickets_family_nonblank",
         },
         "composer_inflight_requests": {
             "ck_composer_inflight_token_nonblank",
@@ -836,6 +845,9 @@ def test_websocket_ticket_run_id_rejects_ascii_whitespace(engine) -> None:
                 run_id="\n",
                 user_id="alice",
                 auth_provider_type="local",
+                session_family_id="family",
+                credential_generation=0,
+                token_expires_at=int(now.timestamp()),
                 issued_at=now,
                 expires_at=now,
             )

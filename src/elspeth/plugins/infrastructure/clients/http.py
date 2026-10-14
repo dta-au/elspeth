@@ -134,6 +134,24 @@ class HTTPResponseEncodingLimitError(httpx.HTTPError):
         self.response_data = response_payload.to_dict()
 
 
+class HTTPResponseAuditRejectedError(httpx.HTTPError):
+    """Response refused before any raw body/header enters audit or telemetry."""
+
+    def __init__(self, response: HTTPCallResponse | None = None) -> None:
+        super().__init__("HTTP response rejected by audit policy")
+        self.response_payload = (
+            None
+            if response is None
+            else HTTPCallResponse(
+                status_code=response.status_code,
+                headers={},
+                body_size=response.body_size,
+                body={"_redacted": True, "_reason": "audit_response_rejected"} if response.body_size is not None else None,
+            )
+        )
+        self.response_data = None if self.response_payload is None else self.response_payload.to_dict()
+
+
 class HTTPPolicyError(httpx.HTTPError):
     """A value-free external failure with separately retained body evidence."""
 
@@ -565,6 +583,7 @@ class AuditedHTTPClient(AuditedClientBase):
         params: dict[str, str | int | float] | None,
         call_index: int,
         token_id: str | None,
+        response_admission: Callable[[CallPayload, bytes], bool] | None = None,
     ) -> httpx.Response:
         session = self._call_mode_session
         if session is None or session.mode is not RunMode.REPLAY:
@@ -581,6 +600,20 @@ class AuditedHTTPClient(AuditedClientBase):
         )
         expected_url = str(httpx.Request(method, full_url, params=params).url)
         response = self._restore_replay_response(evidence, method=method, expected_url=expected_url, request_headers=request_headers)
+        if response_admission is not None:
+            candidate, _ = self._build_response_payload(response, full_url)
+            archived = HTTPCallResponse(
+                status_code=response.status_code,
+                headers={},
+                body_size=len(response.content),
+                body=evidence.response_data,
+            )
+            if (
+                not response_admission(candidate, response.content)
+                or not response_admission(archived, b"")
+                or (evidence.error_data is not None and not response_admission(RawCallPayload(evidence.error_data), b""))
+            ):
+                raise AuditIntegrityError("HTTP replay response violates the current audit admission policy")
         response_payload = RawCallPayload(evidence.response_data or {})
         error_payload = RawCallPayload(evidence.error_data) if evidence.error_data is not None else None
         self._record_and_emit(
@@ -1394,6 +1427,8 @@ class AuditedHTTPClient(AuditedClientBase):
         json: Mapping[str, Any] | None = None,
         params: dict[str, str | int | float] | None = None,
         audit_request_metadata: Mapping[str, Any] | None = None,
+        audit_json: Mapping[str, Any] | None = None,
+        response_admission: Callable[[CallPayload, bytes], bool] | None = None,
         token_id: str | None = None,
     ) -> httpx.Response:
         """Execute an HTTP request with audit recording and telemetry.
@@ -1411,6 +1446,11 @@ class AuditedHTTPClient(AuditedClientBase):
             audit_request_metadata: Audit-only metadata to include in the
                 recorded request payload without sending it to the remote
                 service.
+            audit_json: Explicit audit projection of the JSON body. When
+                supplied, all recording, telemetry and replay/verify matching
+                use this projection; only the original json is sent remotely.
+            response_admission: Optional policy checked against complete
+                response and error candidates before audit, telemetry or replay recording.
             token_id: Per-call token_id for telemetry (overrides client default).
                 Used by batch transforms where one client serves multiple tokens.
 
@@ -1439,7 +1479,7 @@ class AuditedHTTPClient(AuditedClientBase):
             method=method,
             url=_fingerprint_url(full_url),
             headers=self._filter_request_headers(merged_headers),
-            json=json,
+            json=json if audit_json is None else audit_json,
             params=_fingerprint_params(params),
             audit_metadata=audit_request_metadata,
         )
@@ -1454,6 +1494,7 @@ class AuditedHTTPClient(AuditedClientBase):
                 params=params,
                 call_index=call_index,
                 token_id=token_id,
+                response_admission=response_admission,
             )
 
         self._admit_verify_call(call_type=CallType.HTTP, request_data=request_data, call_index=call_index)
@@ -1485,9 +1526,19 @@ class AuditedHTTPClient(AuditedClientBase):
             latency_ms = (time.perf_counter() - start) * 1000
             response_payload: HTTPCallResponse | None = None
             response_data: Mapping[str, Any] | None = None
+            error_payload = HTTPCallError(type=type(e).__name__, message=str(e))
+            error_refusal: HTTPResponseAuditRejectedError | None = None
             if isinstance(e, (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError)):
                 response_payload = e.response_payload
                 response_data = e.response_data
+                if response_admission is not None and not response_admission(response_payload, b""):
+                    bounded_refusal = HTTPResponseAuditRejectedError(response_payload)
+                    response_payload = bounded_refusal.response_payload
+                    response_data = bounded_refusal.response_data
+
+            if response_admission is not None and not response_admission(error_payload, b""):
+                error_refusal = HTTPResponseAuditRejectedError()
+                error_payload = HTTPCallError(type=type(error_refusal).__name__, message=str(error_refusal))
 
             self._record_and_emit(
                 call_index=call_index,
@@ -1495,10 +1546,7 @@ class AuditedHTTPClient(AuditedClientBase):
                 request_data=request_data,
                 response=None,
                 response_data=response_data,
-                error_data=HTTPCallError(
-                    type=type(e).__name__,
-                    message=str(e),
-                ),
+                error_data=error_payload,
                 latency_ms=latency_ms,
                 call_status=CallStatus.ERROR,
                 request_payload=request_dto,
@@ -1506,17 +1554,28 @@ class AuditedHTTPClient(AuditedClientBase):
                 token_id_override=token_id,
             )
 
+            if error_refusal is not None:
+                raise error_refusal from e
             raise
+
+        response_dto, _ = self._build_response_payload(response, full_url)
+        refusal: HTTPResponseAuditRejectedError | None = None
+        if response_admission is not None and not response_admission(response_dto, response.content):
+            refusal = HTTPResponseAuditRejectedError(response_dto)
+            assert refusal.response_payload is not None
+            response_dto = refusal.response_payload
 
         latency_ms = (time.perf_counter() - start) * 1000
 
         # 2xx = SUCCESS, 4xx/5xx = ERROR
-        is_success = 200 <= response.status_code < 300
+        is_success = refusal is None and 200 <= response.status_code < 300
         call_status = CallStatus.SUCCESS if is_success else CallStatus.ERROR
-        response_dto, response_data = self._build_response_payload(response, full_url)
+        response_data = response_dto.to_dict()
 
         error_data: CallPayload | None = None
-        if not is_success:
+        if refusal is not None:
+            error_data = HTTPCallError(type=type(refusal).__name__, message=str(refusal))
+        elif not is_success:
             error_data = HTTPCallError(
                 type="HTTPError",
                 message=f"HTTP {response.status_code}",
@@ -1527,7 +1586,7 @@ class AuditedHTTPClient(AuditedClientBase):
             call_index=call_index,
             full_url=full_url,
             request_data=request_data,
-            response=response,
+            response=response if refusal is None else None,
             response_data=response_data,
             error_data=error_data,
             latency_ms=latency_ms,
@@ -1537,6 +1596,8 @@ class AuditedHTTPClient(AuditedClientBase):
             token_id_override=token_id,
         )
 
+        if refusal is not None:
+            raise refusal
         return response
 
     def post(
@@ -1547,6 +1608,8 @@ class AuditedHTTPClient(AuditedClientBase):
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
         audit_request_metadata: Mapping[str, Any] | None = None,
+        audit_json: Mapping[str, Any] | None = None,
+        response_admission: Callable[[CallPayload, bytes], bool] | None = None,
         token_id: str | None = None,
     ) -> httpx.Response:
         """Make POST request with automatic audit recording.
@@ -1559,6 +1622,10 @@ class AuditedHTTPClient(AuditedClientBase):
             audit_request_metadata: Audit-only metadata to include in the
                 recorded request payload without sending it to the remote
                 service.
+            audit_json: Explicit JSON audit projection, separate from the wire
+                body. Used for recording, telemetry and replay/verify matching.
+            response_admission: Refuse unsafe response and error payloads before recording
+                them, while preserving admitted responses exactly.
             token_id: Per-call token_id for telemetry (overrides client default).
                 Used by batch transforms where one client serves multiple tokens.
 
@@ -1575,6 +1642,8 @@ class AuditedHTTPClient(AuditedClientBase):
             timeout=timeout,
             json=json,
             audit_request_metadata=audit_request_metadata,
+            audit_json=audit_json,
+            response_admission=response_admission,
             token_id=token_id,
         )
 

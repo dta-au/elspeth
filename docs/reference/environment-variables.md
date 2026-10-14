@@ -205,6 +205,16 @@ unavailable with a provider-inference error.
 The defaults (`gpt-5.5` primary, `anthropic/claude-sonnet-4-6` advisor) are
 development conveniences. Production deployments should set both explicitly.
 
+Composer sampling is configured separately from pipeline profiles.
+`ELSPETH_WEB__COMPOSER_TEMPERATURE` and `ELSPETH_WEB__COMPOSER_SEED` default
+to unset: Composer omits them from provider requests. An explicit temperature
+from `0.0` to `2.0` or integer seed is forwarded unchanged. These settings are
+shared by the primary model, advisor and auto-title; choose values supported
+by every configured route, or leave them unset. Reasoning models do not
+universally require zero; see [sampling compatibility](configuration.md#environment-configuration).
+Composer reasoning-effort setting `none` omits the effort hint; it does not
+send an explicit provider instruction to disable reasoning.
+
 Custom endpoints may route on an operator-defined deployment alias that is
 absent from the pricing catalogue. Set `ELSPETH_WEB__COMPOSER_PRICING_MODEL`
 and `ELSPETH_WEB__COMPOSER_ADVISOR_PRICING_MODEL` independently to the matching
@@ -425,6 +435,7 @@ with `-` or `_`).
 | `endpoint`, `deployment_name`, `api_version` | azure | `endpoint` (HTTPS, credential-free) and `deployment_name` are required for Azure; all three are forbidden for other providers. |
 | `timeout_seconds` | openrouter | Only OpenRouter profiles accept an explicit timeout (default 60, max 300 seconds). |
 | `max_tokens` | all | Optional completion-token cap. |
+| `temperature` | all | Optional `0.0`–`2.0` number or `null`. An absent key preserves the ELSPETH provider default (Azure: omitted; others: `0.0`); explicit `null` omits temperature in completion and runtime-preflight requests. Numbers are sent unchanged. Check [model and reasoning-mode compatibility](configuration.md#environment-configuration) before setting a value. |
 
 Credential rules:
 

@@ -38,11 +38,13 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import require_pipeline_user
-from elspeth.web.auth.models import UserIdentity
+from elspeth.web.auth.models import AuthenticationError, UserIdentity
+from elspeth.web.auth.session_token import SessionBinding
 from elspeth.web.blobs.protocol import BlobNotFoundError
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
+from elspeth.web.composer_stream_auth import ComposerStreamAuthServices
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
@@ -1631,9 +1633,14 @@ def create_execution_router() -> APIRouter:
             await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Missing WebSocket ticket")
             return
         store = _get_websocket_ticket_store(websocket.app)
-        user = await run_sync_in_worker(store.consume, ticket=ticket, run_id=run_id)
-        if user is None:
+        credential = await run_sync_in_worker(store.consume, ticket=ticket, run_id=run_id)
+        if credential is None:
             await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Invalid or expired WebSocket ticket")
+            return
+        user = credential.user
+        binding = credential.binding
+        if not await _run_stream_authorized(websocket, user, binding):
+            await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Session is no longer active")
             return
         identity_authority = cast(RepositoryIdentityAuthority, websocket.app.state.identity_authority)
         settings: WebSettings = websocket.app.state.settings
@@ -1656,7 +1663,7 @@ def create_execution_router() -> APIRouter:
         if reader is not None:
             if not isinstance(reader, RepositoryRunProgressReader):
                 raise TypeError("Run progress reader is not configured")
-            await _stream_durable_run_progress(websocket, run_id, user, service, reader, after_sequence)
+            await _stream_durable_run_progress(websocket, run_id, user, service, reader, after_sequence, binding)
             return
 
         # IDOR protection: verify authenticated user owns this run's session
@@ -1732,6 +1739,9 @@ def create_execution_router() -> APIRouter:
             max_replayed_sequence = after_sequence
             replayed_terminal = False
             for persisted in await websocket.app.state.session_service.list_run_events(UUID(run_id)):
+                if not await _run_stream_authorized(websocket, user, binding):
+                    await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Session is no longer active")
+                    return
                 if persisted.sequence <= max_replayed_sequence:
                     continue
                 replay_event = _run_event_from_record(persisted)
@@ -1744,12 +1754,18 @@ def create_execution_router() -> APIRouter:
                 return
             if current.status in RUN_STATUS_TERMINAL_VALUES:
                 event = _build_terminal_run_event(current, cancelled_run_record=current_snapshot.record)
+                if not await _run_stream_authorized(websocket, user, binding):
+                    await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Session is no longer active")
+                    return
                 await websocket.send_json(event.model_dump(mode="json"))
                 await websocket.close(code=RunStreamCloseCode.NORMAL)
                 return
             while True:
+                if not await _run_stream_authorized(websocket, user, binding):
+                    await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Session is no longer active")
+                    return
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=60.0)
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
                 except TimeoutError:
                     # Idle timeout — a terminal broadcast may have been missed.
                     # Re-check authoritative run status instead of sending an
@@ -1798,12 +1814,18 @@ def create_execution_router() -> APIRouter:
                     current = current_snapshot.response
                     if current.status in RUN_STATUS_TERMINAL_VALUES:
                         terminal_event = _build_terminal_run_event(current, cancelled_run_record=current_snapshot.record)
+                        if not await _run_stream_authorized(websocket, user, binding):
+                            await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Session is no longer active")
+                            return
                         await websocket.send_json(terminal_event.model_dump(mode="json"))
                         await websocket.close(code=RunStreamCloseCode.NORMAL)
                         break
                     continue
                 if event.event_sequence is not None and event.event_sequence <= max_replayed_sequence:
                     continue
+                if not await _run_stream_authorized(websocket, user, binding):
+                    await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Session is no longer active")
+                    return
                 await websocket.send_json(event.model_dump(mode="json"))
                 if event.event_sequence is not None:
                     max_replayed_sequence = event.event_sequence
@@ -2077,10 +2099,28 @@ def create_execution_router() -> APIRouter:
     ) -> WebSocketTicketResponse:
         """Issue a short-lived one-use credential for the progress WebSocket."""
         await _verify_run_ownership(run_id, user, request)
-        ticket = await run_sync_in_worker(_get_websocket_ticket_store(request.app).issue, run_id=run_id, user=user)
+        auth = cast(ComposerStreamAuthServices, request.app.state.composer_stream_auth)
+        binding = auth.decode(request.state.auth_token).binding
+        ticket = await run_sync_in_worker(_get_websocket_ticket_store(request.app).issue, run_id=run_id, user=user, binding=binding)
         return WebSocketTicketResponse(ticket=ticket.ticket, expires_at=ticket.expires_at)
 
     return router
+
+
+async def _run_stream_authorized(websocket: WebSocket, user: UserIdentity, binding: SessionBinding) -> bool:
+    auth = cast(ComposerStreamAuthServices, websocket.app.state.composer_stream_auth)
+    try:
+        await run_sync_in_worker(auth.provider.authorize_binding, user, binding)
+        authority = cast(RepositoryIdentityAuthority, websocket.app.state.identity_authority)
+        settings: WebSettings = websocket.app.state.settings
+        return await run_sync_in_worker(
+            authority.holds_active_human_role,
+            identity_id=user.user_id,
+            provider=settings.auth_provider,
+            role="user",
+        )
+    except AuthenticationError:
+        return False
 
 
 async def _stream_durable_run_progress(
@@ -2090,6 +2130,7 @@ async def _stream_durable_run_progress(
     service: ExecutionService,
     reader: RepositoryRunProgressReader,
     after_sequence: int,
+    binding: SessionBinding,
 ) -> None:
     """Join the database poller when either peer or producer closes."""
 
@@ -2101,7 +2142,7 @@ async def _stream_durable_run_progress(
 
     disconnect = asyncio.create_task(watch_disconnect(), name="run-progress-disconnect")
     poller = asyncio.create_task(
-        _poll_durable_run_progress(websocket, run_id, user, service, reader, after_sequence), name="run-progress-poll"
+        _poll_durable_run_progress(websocket, run_id, user, service, reader, after_sequence, binding), name="run-progress-poll"
     )
     try:
         done, _ = await asyncio.wait((disconnect, poller), return_when=asyncio.FIRST_COMPLETED)
@@ -2120,11 +2161,15 @@ async def _poll_durable_run_progress(
     service: ExecutionService,
     reader: RepositoryRunProgressReader,
     after_sequence: int,
+    binding: SessionBinding,
 ) -> None:
     """Poll bounded committed pages; local queues cannot supply peer events."""
     try:
         parsed_run_id = UUID(run_id)
         while True:
+            if not await _run_stream_authorized(websocket, user, binding):
+                await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Session is no longer active")
+                return
             records = await run_sync_in_worker(
                 reader.read_after, identity_id=user.user_id, run_id=parsed_run_id, after_sequence=after_sequence
             )
@@ -2132,6 +2177,9 @@ async def _poll_durable_run_progress(
                 await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
                 return
             for record in records:
+                if not await _run_stream_authorized(websocket, user, binding):
+                    await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Session is no longer active")
+                    return
                 event = _run_event_from_record(record)
                 await websocket.send_json(event.model_dump(mode="json"))
                 after_sequence = record.sequence
@@ -2157,6 +2205,9 @@ async def _poll_durable_run_progress(
                 if final_records:
                     continue
                 terminal = _build_terminal_run_event(snapshot.response, cancelled_run_record=snapshot.record)
+                if not await _run_stream_authorized(websocket, user, binding):
+                    await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Session is no longer active")
+                    return
                 await websocket.send_json(terminal.model_dump(mode="json"))
                 await websocket.close(code=RunStreamCloseCode.NORMAL)
                 return

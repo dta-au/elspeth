@@ -1,7 +1,7 @@
 # ELSPETH Platform Architecture
 
 **Document date:** 5 October 2026
-**Release covered:** 0.8.3 candidate
+**Release covered:** 0.8.4 candidate
 **Audience:** Evaluators, technical leaders, architects, and assurance reviewers
 **Register:** Public-facing / technical
 **Status:** Current architecture overview
@@ -162,14 +162,16 @@ The platform still requires deployment choices by the adopting team:
 - data classification and provider suitability;
 - audit-database retention;
 - backup and recovery process;
-- schema migration procedure;
+- store compatibility and admission procedure;
 - incident response ownership.
 
 The supported AWS profile runs one web task on Fargate with Aurora PostgreSQL,
 EFS, task-role S3 access, Cognito, Bedrock, CloudWatch, and X-Ray. ELSPETH is
-still pre-1.0: crossing the 0.8.0 session or Landscape schema boundary requires
-an archive/export decision and database recreation, not a mixed-version rollout
-or code rollback over the newer stores.
+still pre-1.0. The current candidate qualifies explicitly new compatible stores;
+unsupported existing stores are preserved and refused before incompatible
+writes. Historical recreation procedures for the 0.8.0 boundary do not authorize
+a reset, migration or restamp for this candidate. See the current deployment
+runbooks for exact admission requirements.
 
 ELSPETH provides the engine and evidence model. It does not decide the agency's
 risk appetite or authority-to-operate boundary.

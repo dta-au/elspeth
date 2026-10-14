@@ -44,7 +44,7 @@ class FakeProvider:
         messages: Sequence[ChatMessage],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
@@ -58,8 +58,8 @@ class FakeProvider:
             raise self.result
         return self.result
 
-    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str) -> None:
-        del operation_id, model
+    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str, temperature: float | None) -> None:
+        del operation_id, model, temperature
         self.runtime_preflight_calls += 1
 
     def close(self) -> None:

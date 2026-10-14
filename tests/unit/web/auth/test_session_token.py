@@ -13,8 +13,10 @@ import time
 import jwt
 import pytest
 
+from elspeth.contracts.auth import AuthProviderType
 from elspeth.web.auth.models import AuthenticationError
 from elspeth.web.auth.session_token import LOCAL_AUDIENCE, SessionTokenIssuer
+from tests.fixtures.auth_sessions import TestSessionFamilies
 
 _KEY = b"a" * 32
 _OTHER_KEY = b"b" * 32
@@ -24,19 +26,21 @@ _IDENTITY = "3f2a6c1e-0000-4000-8000-000000000001"
 def _issuer(
     *,
     key: bytes = _KEY,
-    provider: str = "local",
+    provider: AuthProviderType = "local",
     audience: str = LOCAL_AUDIENCE,
     expiry_hours: int = 24,
     chain_hours: int = 168,
     active: bool = True,
+    sessions: TestSessionFamilies | None = None,
 ) -> SessionTokenIssuer:
     return SessionTokenIssuer(
         signing_key=key,
-        provider=provider,  # type: ignore[arg-type]
+        provider=provider,
         audience=audience,
         token_expiry_hours=expiry_hours,
         max_refresh_chain_hours=chain_hours,
         principal_is_active=lambda _identity_id: active,
+        sessions=TestSessionFamilies() if sessions is None else sessions,
     )
 
 
@@ -82,9 +86,10 @@ def test_each_token_gets_a_distinct_jti() -> None:
 
 
 def test_a_token_signed_with_another_key_is_refused() -> None:
-    forged = _issuer(key=_OTHER_KEY).mint(identity_id=_IDENTITY, username="ada")
+    sessions = TestSessionFamilies()
+    forged = _issuer(key=_OTHER_KEY, sessions=sessions).mint(identity_id=_IDENTITY, username="ada")
     with pytest.raises(AuthenticationError):
-        _issuer().authenticate(forged)
+        _issuer(sessions=sessions).authenticate(forged)
 
 
 def test_an_unsigned_none_algorithm_token_is_refused() -> None:
@@ -109,10 +114,11 @@ def test_an_unsigned_none_algorithm_token_is_refused() -> None:
 
 def test_a_token_for_another_deployment_is_refused() -> None:
     """Two deployments sharing a secret must not accept each other's tokens."""
-    other_deployment = _issuer(audience="https://elsewhere.example.com")
+    sessions = TestSessionFamilies()
+    other_deployment = _issuer(audience="https://elsewhere.example.com", sessions=sessions)
     token = other_deployment.mint(identity_id=_IDENTITY, username="ada")
     with pytest.raises(AuthenticationError):
-        _issuer(audience="https://here.example.com").authenticate(token)
+        _issuer(audience="https://here.example.com", sessions=sessions).authenticate(token)
 
 
 def test_a_token_from_a_different_provider_is_refused() -> None:
@@ -127,103 +133,81 @@ def test_a_token_from_a_different_provider_is_refused() -> None:
 
 
 def test_a_token_with_a_foreign_issuer_is_refused() -> None:
-    forged = jwt.encode(
-        {
-            "sub": _IDENTITY,
-            "username": "ada",
-            "provider": "local",
-            "iss": "not-elspeth",
-            "aud": LOCAL_AUDIENCE,
-            "jti": "forged",
-            "iat": int(time.time()),
-            "exp": int(time.time()) + 3600,
-        },
-        _KEY,
-        algorithm="HS256",
-    )
+    issuer = _issuer()
+    valid = issuer.mint(identity_id=_IDENTITY, username="ada")
+    assert issuer.authenticate(valid).identity_id == _IDENTITY
+    payload = jwt.decode(valid, _KEY, algorithms=["HS256"], audience=LOCAL_AUDIENCE)
+    payload["iss"] = "not-elspeth"
+    forged = jwt.encode(payload, _KEY, algorithm="HS256")
     with pytest.raises(AuthenticationError):
-        _issuer().authenticate(forged)
+        issuer.authenticate(forged)
 
 
-@pytest.mark.parametrize("missing", ["sub", "jti", "iat", "exp"])
+@pytest.mark.parametrize("missing", ["sub", "jti", "iat", "exp", "sid", "credential_generation"])
 def test_a_token_missing_a_required_claim_is_refused(missing: str) -> None:
-    payload = {
-        "sub": _IDENTITY,
-        "username": "ada",
-        "provider": "local",
-        "iss": "elspeth",
-        "aud": LOCAL_AUDIENCE,
-        "jti": "present",
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 3600,
-    }
+    issuer = _issuer()
+    valid = issuer.mint(identity_id=_IDENTITY, username="ada")
+    assert issuer.authenticate(valid).identity_id == _IDENTITY
+    payload = jwt.decode(valid, _KEY, algorithms=["HS256"], audience=LOCAL_AUDIENCE)
     del payload[missing]
     with pytest.raises(AuthenticationError):
-        _issuer().authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
+        issuer.authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
+
+
+@pytest.mark.parametrize("generation", [True, -1, "0", None])
+def test_invalid_credential_generation_is_refused(generation: object) -> None:
+    issuer = _issuer()
+    valid = issuer.mint(identity_id=_IDENTITY, username="ada")
+    assert issuer.authenticate(valid).identity_id == _IDENTITY
+    payload = jwt.decode(valid, _KEY, algorithms=["HS256"], audience=LOCAL_AUDIENCE)
+    payload["credential_generation"] = generation
+    with pytest.raises(AuthenticationError):
+        issuer.authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
 
 
 def test_a_token_with_no_provider_claim_is_refused() -> None:
     """A pre-extraction token has no ``provider``; it must not authenticate."""
-    payload = {
-        "sub": _IDENTITY,
-        "username": "ada",
-        "iss": "elspeth",
-        "aud": LOCAL_AUDIENCE,
-        "jti": "legacy",
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 3600,
-    }
+    issuer = _issuer()
+    valid = issuer.mint(identity_id=_IDENTITY, username="ada")
+    assert issuer.authenticate(valid).identity_id == _IDENTITY
+    payload = jwt.decode(valid, _KEY, algorithms=["HS256"], audience=LOCAL_AUDIENCE)
+    del payload["provider"]
     with pytest.raises(AuthenticationError):
-        _issuer().authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
+        issuer.authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
 
 
 def test_an_expired_token_is_refused() -> None:
+    issuer = _issuer()
+    valid = issuer.mint(identity_id=_IDENTITY, username="ada")
+    assert issuer.authenticate(valid).identity_id == _IDENTITY
+    payload = jwt.decode(valid, _KEY, algorithms=["HS256"], audience=LOCAL_AUDIENCE)
     past = int(time.time()) - 7200
-    payload = {
-        "sub": _IDENTITY,
-        "username": "ada",
-        "provider": "local",
-        "iss": "elspeth",
-        "aud": LOCAL_AUDIENCE,
-        "jti": "stale",
-        "iat": past,
-        "exp": past + 60,
-    }
+    payload.update(iat=past, exp=past + 60)
     with pytest.raises(AuthenticationError):
-        _issuer().authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
+        issuer.authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
 
 
 @pytest.mark.parametrize("blank", ["", "   ", "​"])
 def test_a_blank_subject_is_refused(blank: str) -> None:
     """A blank ``sub`` would authenticate as no identity at all."""
-    payload = {
-        "sub": blank,
-        "username": "ada",
-        "provider": "local",
-        "iss": "elspeth",
-        "aud": LOCAL_AUDIENCE,
-        "jti": "blank-sub",
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 3600,
-    }
+    issuer = _issuer()
+    valid = issuer.mint(identity_id=_IDENTITY, username="ada")
+    assert issuer.authenticate(valid).identity_id == _IDENTITY
+    payload = jwt.decode(valid, _KEY, algorithms=["HS256"], audience=LOCAL_AUDIENCE)
+    payload["sub"] = blank
     with pytest.raises(AuthenticationError):
-        _issuer().authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
+        issuer.authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
 
 
 def test_a_boolean_iat_is_refused() -> None:
     """``bool`` is an ``int`` subclass; ``True`` must not read as epoch 1."""
-    payload = {
-        "sub": _IDENTITY,
-        "username": "ada",
-        "provider": "local",
-        "iss": "elspeth",
-        "aud": LOCAL_AUDIENCE,
-        "jti": "bool-iat",
-        "iat": True,
-        "exp": int(time.time()) + 3600,
-    }
+    issuer = _issuer()
+    valid = issuer.mint(identity_id=_IDENTITY, username="ada")
+    assert issuer.authenticate(valid).identity_id == _IDENTITY
+    payload = jwt.decode(valid, _KEY, algorithms=["HS256"], audience=LOCAL_AUDIENCE)
+    payload["iat"] = True
     with pytest.raises(AuthenticationError):
-        _issuer().authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
+        issuer.authenticate(jwt.encode(payload, _KEY, algorithm="HS256"))
 
 
 # --------------------------------------------------------------------------
@@ -232,9 +216,10 @@ def test_a_boolean_iat_is_refused() -> None:
 
 
 def test_a_disabled_identity_cannot_authenticate() -> None:
-    minted = _issuer(active=True).mint(identity_id=_IDENTITY, username="ada")
+    sessions = TestSessionFamilies()
+    minted = _issuer(active=True, sessions=sessions).mint(identity_id=_IDENTITY, username="ada")
     with pytest.raises(AuthenticationError):
-        _issuer(active=False).authenticate(minted)
+        _issuer(active=False, sessions=sessions).authenticate(minted)
 
 
 def test_a_disabled_identity_cannot_refresh() -> None:
@@ -243,9 +228,10 @@ def test_a_disabled_identity_cannot_refresh() -> None:
     Refresh carries the original ``iat`` forward, so without this check a
     token issued before a disable stays renewable for the whole chain window.
     """
-    minted = _issuer(active=True).mint(identity_id=_IDENTITY, username="ada")
+    sessions = TestSessionFamilies()
+    minted = _issuer(active=True, sessions=sessions).mint(identity_id=_IDENTITY, username="ada")
     with pytest.raises(AuthenticationError):
-        _issuer(active=False).refresh(minted)
+        _issuer(active=False, sessions=sessions).refresh(minted)
 
 
 def test_decode_does_not_consult_the_identity_store() -> None:
@@ -261,6 +247,7 @@ def test_decode_does_not_consult_the_identity_store() -> None:
         token_expiry_hours=24,
         max_refresh_chain_hours=168,
         principal_is_active=_explode,
+        sessions=TestSessionFamilies(),
     )
     token = issuer.mint(identity_id=_IDENTITY, username="ada")
     assert issuer.decode(token).identity_id == _IDENTITY

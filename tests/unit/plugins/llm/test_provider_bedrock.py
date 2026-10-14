@@ -88,7 +88,7 @@ def test_verify_source_request_refusal_precedes_bedrock_sdk_construction(
 
     with pytest.raises(AuditIntegrityError, match=source_problem):
         if preflight:
-            provider.runtime_preflight(operation_id="op-1", model=MODEL, coordination_token=_LEADER_TOKEN)
+            provider.runtime_preflight(operation_id="op-1", temperature=0.0, model=MODEL, coordination_token=_LEADER_TOKEN)
         else:
             provider.execute_query(
                 [ChatMessage(role="user", content="hello")],
@@ -173,11 +173,11 @@ def test_governance_guards_bedrock_and_settles_once(preflight: bool, refused: bo
         if refused:
             with pytest.raises(RuntimeError, match="quota refused"):
                 if preflight:
-                    provider.runtime_preflight(operation_id="op-1", model=MODEL, coordination_token=_LEADER_TOKEN)
+                    provider.runtime_preflight(operation_id="op-1", temperature=0.0, model=MODEL, coordination_token=_LEADER_TOKEN)
                 else:
                     _execute_for_operation(provider)
         elif preflight:
-            provider.runtime_preflight(operation_id="op-1", model=MODEL, coordination_token=_LEADER_TOKEN)
+            provider.runtime_preflight(operation_id="op-1", temperature=0.0, model=MODEL, coordination_token=_LEADER_TOKEN)
         else:
             _execute_for_operation(provider)
         assert completion.call_count == (0 if refused else 1)
@@ -629,7 +629,7 @@ class TestBedrockProvider:
         )
 
         with patch("litellm.completion", side_effect=provider_error), pytest.raises(RateLimitError) as exc_info:
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="operation-1", model=MODEL)
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="operation-1", temperature=0.0, model=MODEL)
 
         escaping = exc_info.value
         assert str(escaping) == "Bedrock LLM request failed"

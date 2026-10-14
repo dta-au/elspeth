@@ -260,8 +260,8 @@ class LLMConfig(TransformDataConfig):
         ge=0.0,
         le=2.0,
         description=(
-            "Sampling temperature. Set to null to omit it from the request so the provider default applies — "
-            "required for reasoning deployments, which reject any explicit temperature"
+            "Sampling temperature. Set to null to omit it from the request. Support and valid values depend on "
+            "the provider, model and reasoning mode; check the provider's documentation before setting an explicit value."
         ),
         json_schema_extra={"composer_tier": "advanced"},
     )

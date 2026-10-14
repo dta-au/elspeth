@@ -1679,6 +1679,12 @@ def _raw_sql_is_connection_configuration(value: str) -> bool:
     normalized = _normalized_raw_sql(value).rstrip(";").strip().lower()
     if normalized.startswith(("set transaction", "set session characteristics")):
         return True
+    if normalized in {
+        "set local search_path = pg_catalog, public, pg_temp",
+        "set local standard_conforming_strings = on",
+        "set local row_security = on",
+    }:
+        return True
     if re.fullmatch(r"set local (?:lock_timeout|statement_timeout) = '[0-9]+ms'", normalized):
         return True
     match = _RAW_PRAGMA_ASSIGNMENT_RE.match(normalized)
@@ -14288,7 +14294,9 @@ def _raw_write_surface_violations(units: Iterable[SourceUnit]) -> tuple[str, ...
             if execution_name == "exec_driver_sql" and raw_sql is None:
                 # A text carried by a name, a subscript of a literal container,
                 # or the method's own instance attribute is admitted only when
-                # EVERY candidate resolves and every one is a proven read.
+                # EVERY candidate resolves and every one is a proven read or
+                # one of the closed, single-statement local settings. Other
+                # connection configuration does not gain outside admission.
                 exact = _raw_sql_exact_texts(node.args[0], resolver, use=node)
                 if exact is None and isinstance(node.args[0], ast.Attribute):
                     texts = _raw_attribute_collector(unit, units)._self_attribute_module_constant_texts(node.args[0], use=node)
@@ -14298,7 +14306,11 @@ def _raw_write_surface_violations(units: Iterable[SourceUnit]) -> tuple[str, ...
                         )
                 if any(_raw_sql_is_write(text) for text in (exact or ())):
                     violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} outside raw SQL write/DDL")
-                elif exact is None or not all(_raw_sql_is_proven_read(text) for text in exact):
+                elif exact is None or not all(
+                    _raw_sql_is_proven_read(text)
+                    or (_normalized_raw_sql(text).lower().startswith("set local ") and _raw_sql_is_single_configuration_statement(text))
+                    for text in exact
+                ):
                     violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} outside unknown raw SQL effect")
                 continue
             if shape is None and raw_sql is not None and _raw_sql_is_write(raw_sql):
@@ -27667,6 +27679,56 @@ def test_actual_ticket_runtime_clock_override_withdraws_read_proof():
     violations = _raw_write_surface_violations((changed, *units[1:]))
     assert sum("RepositorySessionWebsocketTicketAuthority.issue" in item and "raw SQL" in item for item in violations) == 1
     assert sum("RepositorySessionWebsocketTicketAuthority.consume" in item and "raw SQL" in item for item in violations) == 1
+
+
+def test_actual_postgres_profile_fixed_configuration_is_not_a_raw_write() -> None:
+    root = _repo_root()
+    unit = _read_source(root / "src/elspeth/mcp/postgres_profile.py", anchor=root)
+    assert _raw_write_surface_violations((unit,)) == ()
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "SET LOCAL search_path = public, pg_catalog, pg_temp",
+        "SET LOCAL search_path = pg_catalog, attacker, public, pg_temp",
+        "SET LOCAL row_security = off",
+        "SET LOCAL standard_conforming_strings = off",
+        "SET LOCAL lock_timeout = 'invalidms'",
+        "SET LOCAL statement_timeout = '0.5ms'",
+        "SET LOCAL row_security = on;",
+        "SET LOCAL row_security = on; DELETE FROM runs",
+        "SET LOCAL row_security = on; SELECT 1",
+        "SET TRANSACTION READ WRITE",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+        "PRAGMA journal_mode = WAL",
+    ),
+)
+def test_postgres_profile_one_unsupported_configuration_withdraws_proof(replacement: str) -> None:
+    root = _repo_root()
+    unit = _read_source(root / "src/elspeth/mcp/postgres_profile.py", anchor=root)
+    original = '"SET LOCAL row_security = on"'
+    assert unit.source.count(original) == 1
+    changed = _parse_source(unit.path, unit.source.replace(original, repr(replacement)))
+    violations = _raw_write_surface_violations((changed,))
+    assert len(violations) == 1, violations
+    assert "admit_postgres_profile outside" in violations[0]
+    assert "raw SQL" in violations[0]
+
+
+@pytest.mark.parametrize("iterable", ("caller_sql", "(*_SETTINGS, caller_sql)"))
+def test_postgres_profile_caller_configuration_stays_opaque(iterable: str) -> None:
+    root = _repo_root()
+    unit = _read_source(root / "src/elspeth/mcp/postgres_profile.py", anchor=root)
+    signature = "def admit_postgres_profile(conn: Connection, tables: frozenset[str]) -> None:"
+    loop = "for setting in _SETTINGS:"
+    assert unit.source.count(signature) == 1 and unit.source.count(loop) == 1
+    changed_source = unit.source.replace(signature, signature.replace(") -> None:", ", caller_sql: tuple[str, ...]) -> None:"))
+    changed_source = changed_source.replace(loop, f"for setting in {iterable}:")
+    changed = _parse_source(unit.path, changed_source)
+    violations = _raw_write_surface_violations((changed,))
+    assert len(violations) == 1, violations
+    assert "admit_postgres_profile outside unknown raw SQL effect" in violations[0]
 
 
 def test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metadata() -> None:

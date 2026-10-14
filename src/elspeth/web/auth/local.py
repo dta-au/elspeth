@@ -36,7 +36,7 @@ from elspeth.web.auth.models import (
     UserIdentity,
     UserProfile,
 )
-from elspeth.web.auth.session_token import SessionTokenIssuer
+from elspeth.web.auth.session_token import SessionBinding, SessionTokenIssuer
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
@@ -504,7 +504,7 @@ class LocalAuthProvider:
         # login. Reachable with consequence: an identity already disabled (or
         # pre-provisioned pending) whose credential row was deleted can be
         # re-registered, and without this it would be handed a token.
-        access_token = self._issue_token(self._admitted_identity_id(user_id), user_id)
+        access_token = self._issue_token(self._admitted_identity_id(user_id), user_id, credential_generation=0)
         try:
             record_token_issued(access_token)
         except BaseException as audit_error:
@@ -704,15 +704,13 @@ class LocalAuthProvider:
     def set_password(self, user_id: str, password: str) -> None:
         """Replace a user's password hash (dev-admin reset path).
 
-        Raises ValueError if the user does not exist or the password
-        exceeds bcrypt's byte limit. Outstanding JWTs are NOT revoked --
-        there is no session store to revoke against; they expire on their
-        own schedule.
+        Hash replacement and generation advancement commit together. Every
+        old bearer and derived credential is refused by the next auth check.
         """
         password_hash = bcrypt.hashpw(bcrypt_password_bytes(password), bcrypt.gensalt()).decode()
         with self._connect() as conn:
             updated = conn.execute(
-                "UPDATE users SET password_hash = ? WHERE user_id = ?",
+                "UPDATE users SET password_hash = ?, credential_generation = credential_generation + 1 WHERE user_id = ?",
                 (password_hash, user_id),
             )
             if updated.rowcount != 1:
@@ -1034,7 +1032,7 @@ class LocalAuthProvider:
             self._reclaim_stale_token_audit_intents(conn, now=now)
             row = conn.execute(
                 """
-                SELECT tokens.user_id, tokens.expires_at, tokens.used_at, users.email_verified
+                SELECT tokens.user_id, tokens.expires_at, tokens.used_at, users.email_verified, users.credential_generation
                 FROM email_verification_tokens AS tokens
                 JOIN users ON users.user_id = tokens.user_id
                 WHERE tokens.token_hash = ?
@@ -1043,7 +1041,7 @@ class LocalAuthProvider:
             ).fetchone()
             if row is None:
                 raise AuthenticationError("Invalid email verification token")
-            user_id, expires_at, used_at, email_verified = row
+            user_id, expires_at, used_at, email_verified, credential_generation = row
             if used_at is not None:
                 raise AuthenticationError("Email verification token already used")
             if expires_at <= now:
@@ -1084,7 +1082,7 @@ class LocalAuthProvider:
         # expired session.
         identity_id = self._admitted_identity_id(user_id)
         identity = UserIdentity(user_id=identity_id, username=user_id)
-        access_token = self._issue_token(identity_id, user_id)
+        access_token = self._issue_token(identity_id, user_id, credential_generation=credential_generation)
 
         try:
             record_token_issued(identity, access_token)
@@ -1148,7 +1146,7 @@ class LocalAuthProvider:
 
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT password_hash, email_verified FROM users WHERE user_id = ?",
+                "SELECT password_hash, email_verified, credential_generation FROM users WHERE user_id = ?",
                 (username,),
             ).fetchone()
 
@@ -1164,7 +1162,9 @@ class LocalAuthProvider:
             raise AuthenticationError("Email verification required")
 
         # The credential was CORRECT; admission is a separate decision.
-        return self._issue_token(self._admitted_identity_id(username), username)
+        # Carry the generation of the hash we actually checked. A reset racing
+        # with bcrypt/admission cannot upgrade the old password's generation.
+        return self._issue_token(self._admitted_identity_id(username), username, credential_generation=row[2])
 
     @property
     def _issuer(self) -> SessionTokenIssuer:
@@ -1223,8 +1223,28 @@ class LocalAuthProvider:
             raise AccessPending
         return record.identity_id
 
-    def _issue_token(self, identity_id: str, username: str, *, issued_at: int | None = None) -> str:
-        return self._issuer.mint(identity_id=identity_id, username=username, issued_at=issued_at)
+    def _issue_token(
+        self,
+        identity_id: str,
+        username: str,
+        *,
+        issued_at: int | None = None,
+        credential_generation: int | None = None,
+    ) -> str:
+        if credential_generation is None:
+            with self._connect() as conn:
+                row = conn.execute("SELECT credential_generation FROM users WHERE user_id = ?", (username,)).fetchone()
+            if row is None:
+                raise AuthenticationError("Invalid token")
+            credential_generation = row[0]
+        if not self._credential_is_current(username, credential_generation):
+            raise AuthenticationError("Invalid token")
+        return self._issuer.mint(
+            identity_id=identity_id,
+            username=username,
+            issued_at=issued_at,
+            credential_generation=credential_generation,
+        )
 
     async def refresh(self, token: str) -> str:
         """Issue a successor token for an already-authenticated caller.
@@ -1247,11 +1267,11 @@ class LocalAuthProvider:
         renewable. Both halves must hold, and neither implies the other.
         """
         claims = self._issuer.decode(token)
-        if not self._credential_is_current(claims.username):
+        if not self._credential_is_current(claims.username, claims.binding.credential_generation):
             raise AuthenticationError("Invalid token")
         return self._issuer.refresh(token)
 
-    def _credential_is_current(self, username: str) -> bool:
+    def _credential_is_current(self, username: str, credential_generation: int) -> bool:
         """Does a verified credential row still back this login?
 
         Keyed by username, which for local auth IS the identity's ``subject``:
@@ -1260,10 +1280,10 @@ class LocalAuthProvider:
         """
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT email_verified FROM users WHERE user_id = ?",
+                "SELECT email_verified, credential_generation FROM users WHERE user_id = ?",
                 (username,),
             ).fetchone()
-        return row is not None and bool(row[0])
+        return row is not None and bool(row[0]) and row[1] == credential_generation
 
     async def authenticate(self, token: str) -> UserIdentity:
         """Verify a session token and return the identity it authorises.
@@ -1292,12 +1312,21 @@ class LocalAuthProvider:
     def _authenticate_sync(self, token: str) -> UserIdentity:
         """Verify token, admission, and credential together off the loop."""
         claims = self._issuer.authenticate(token)
-        if not self._credential_is_current(claims.username):
+        if not self._credential_is_current(claims.username, claims.binding.credential_generation):
             raise AuthenticationError("Invalid token")
         return UserIdentity(
             user_id=claims.identity_id,
             username=claims.username,
         )
+
+    def authorize_binding(self, user: UserIdentity, binding: SessionBinding) -> None:
+        """Validate a trusted ticket/stream's original session authorization."""
+        self._issuer.authorize_binding(identity_id=user.user_id, binding=binding)
+        if not self._credential_is_current(user.username, binding.credential_generation):
+            raise AuthenticationError("Invalid token")
+
+    async def logout(self, token: str) -> None:
+        await run_sync_in_worker(self._issuer.revoke, token)
 
     def _query_user(self, username: str) -> tuple[str, str | None] | None:
         """Synchronous profile lookup by username — via run_sync_in_worker."""

@@ -318,14 +318,14 @@ class BedrockLLMProvider:
             finish_reason=finish_reason,
         )
 
-    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, temperature: float | None, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited Bedrock call under an operation parent."""
         smoke_messages = [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]
         if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
             request = build_llm_call_request(
                 model=model,
                 messages=smoke_messages,
-                temperature=0.0,
+                temperature=temperature,
                 provider="bedrock",
                 max_tokens=32,
             )
@@ -357,7 +357,7 @@ class BedrockLLMProvider:
                 client.chat_completion(
                     model=model,
                     messages=smoke_messages,
-                    temperature=0.0,
+                    temperature=temperature,
                     max_tokens=32,
                 )
             except LLMClientError as error:

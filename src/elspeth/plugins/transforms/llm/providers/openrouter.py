@@ -30,14 +30,19 @@ from elspeth.contracts import CallStatus, CallType, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.call_governance import LLMCallGovernance
-from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.chat_parts import ChatMessage, audit_messages, image_response_is_audit_safe, wire_messages
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import ValueSource
 from elspeth.core.llm_pricing import provider_cost_from_response
-from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
+from elspeth.plugins.infrastructure.clients.http import (
+    AuditedHTTPClient,
+    HTTPResponseAuditRejectedError,
+    HTTPResponseBodyTooLargeError,
+    HTTPResponseEncodingLimitError,
+)
 from elspeth.plugins.infrastructure.clients.llm import (
     CONTEXT_LENGTH_PATTERNS,
     ContentPolicyError,
@@ -91,6 +96,12 @@ OPENROUTER_APP_TITLE = "Elspeth"
 """Canonical OpenRouter app display title."""
 
 logger = structlog.get_logger(__name__)
+
+# Bound the complete completion envelope independently of provider token limits.
+# 16 MiB leaves room for large completions and JSON metadata while the streamed
+# decoded and encoded ceilings also bound compressed responses and audit copies.
+_MAX_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
+_MAX_ENCODED_RESPONSE_BYTES = 16 * 1024 * 1024
 
 
 def _http_error_body_text(error: httpx.HTTPStatusError) -> str:
@@ -417,6 +428,8 @@ class OpenRouterLLMProvider:
                 response = http_client.post(
                     "/chat/completions",
                     json=request_body,
+                    audit_json={**request_body, "messages": audit_messages(messages)},
+                    response_admission=lambda response, body: image_response_is_audit_safe(messages, response, body=body),
                     headers={"Content-Type": "application/json"},
                 )
                 observed_usage = observe_http_token_usage(response.content)
@@ -443,6 +456,10 @@ class OpenRouterLLMProvider:
                         f"HTTP {status_code}{detail}",
                         retryable=False,
                     ) from e
+            except HTTPResponseAuditRejectedError as e:
+                raise LLMClientError("Provider response violated image audit policy", retryable=False) from e
+            except (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError) as e:
+                raise LLMClientError("Provider response exceeded HTTP transport limits", retryable=False) from e
             except httpx.RequestError as e:
                 raise NetworkError(f"Network error: {e}") from e
 
@@ -609,12 +626,12 @@ class OpenRouterLLMProvider:
                 raise RuntimeError("Governed LLM call has no admission attempt")
             self._llm_call_governance.after_call(attempt_id, call.call_id)
 
-    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, temperature: float | None, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited OpenRouter call under an operation parent."""
         self.execute_query(
             [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
             model=model,
-            temperature=0.0,
+            temperature=temperature,
             # The allowance includes reasoning tokens as well as reply text.
             max_tokens=256,
             audit_parent=LLMAuditParent.for_operation(operation_id=operation_id, coordination_token=coordination_token),
@@ -636,6 +653,8 @@ class OpenRouterLLMProvider:
                     timeout=self._timeout,
                     base_url=self._base_url,
                     headers=self._request_headers,
+                    max_response_body_bytes=_MAX_RESPONSE_BODY_BYTES,
+                    max_encoded_response_bytes=_MAX_ENCODED_RESPONSE_BYTES,
                     limiter=self._limiter,
                     call_mode_session=self._call_mode_session,
                     **audit_parent.client_kwargs(),

@@ -46,10 +46,10 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 
 # ``SESSION_SCHEMA_EPOCH`` — schema version sentinel. Bump this constant
 # whenever a table is added, removed, or otherwise altered in a way that
-# requires the operator to delete the existing session DB. The startup
+# makes existing session stores incompatible. The startup
 # validator (``schema._assert_schema_sentinels``) reads ``PRAGMA user_version``
 # and crashes if it does not match, producing an actionable
-# "Delete the session DB file and restart" message rather than a cryptic
+# "Preserve this store unchanged" message rather than a cryptic
 # SQLAlchemy error the first time a new code path touches the stale DB.
 #
 # Pattern mirrors ``SQLITE_SCHEMA_EPOCH`` in ``core/landscape/schema.py``
@@ -57,8 +57,9 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # with separate lifecycles and separate epochs.
 #
 # Epoch 74 adds graph recovery parks and checkpoint operation ownership.
+# Epoch 75 adds durable auth families and derived-token revocation bindings.
 # There is no migration path; preserve incompatible stores and prior access.
-SESSION_SCHEMA_EPOCH = 74
+SESSION_SCHEMA_EPOCH = 75
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -2175,6 +2176,18 @@ run_execution_inputs_table = Table(
     ),
 )
 
+auth_session_families_table = Table(
+    "auth_session_families",
+    metadata,
+    Column("family_id", String, primary_key=True),
+    Column("identity_id", String, ForeignKey("identities.identity_id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("provider", String, nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+    *_non_blank_text_constraints("family_id", name="ck_auth_session_families_id_nonblank"),
+    CheckConstraint(_AUTH_PROVIDER_TYPE_CHECK.replace("auth_provider_type", "provider"), name="ck_auth_session_families_provider"),
+)
+
 websocket_tickets_table = Table(
     "websocket_tickets",
     metadata,
@@ -2182,6 +2195,9 @@ websocket_tickets_table = Table(
     Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True),
     Column("user_id", String, nullable=False),
     Column("auth_provider_type", String, nullable=False),
+    Column("session_family_id", String, nullable=False),
+    Column("credential_generation", Integer, nullable=False),
+    Column("token_expires_at", Integer, nullable=False),
     Column("issued_at", DateTime(timezone=True), nullable=False),
     Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
     Column("consumed_at", DateTime(timezone=True), nullable=True),
@@ -2189,6 +2205,8 @@ websocket_tickets_table = Table(
     *_non_blank_text_constraints("run_id", name="ck_websocket_tickets_run_id_nonblank"),
     *_non_blank_text_constraints("user_id", name="ck_websocket_tickets_user_id_nonblank"),
     CheckConstraint(_AUTH_PROVIDER_TYPE_CHECK, name="ck_websocket_tickets_auth_provider_type"),
+    CheckConstraint("credential_generation >= 0 AND token_expires_at > 0", name="ck_websocket_tickets_token_binding"),
+    *_non_blank_text_constraints("session_family_id", name="ck_websocket_tickets_family_nonblank"),
 )
 
 composer_inflight_requests_table = Table(

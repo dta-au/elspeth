@@ -77,6 +77,7 @@ from elspeth.web.auth.routes import create_auth_router
 from elspeth.web.auth.session_token import (
     DEFAULT_MAX_REFRESH_CHAIN_HOURS,
     DEFAULT_TOKEN_EXPIRY_HOURS,
+    SessionFamilyAuthority,
     SessionTokenIssuer,
     session_token_audience,
 )
@@ -96,6 +97,7 @@ from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_
 from elspeth.web.coordination.approval_authority import ApprovalTransactionAuthority
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
+from elspeth.web.coordination.auth_session_authority import RepositoryAuthSessionAuthority
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry, SessionComposerProgressAuthority
 from elspeth.web.coordination.identity_authority import (
@@ -1185,31 +1187,16 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 class _BodySizeLimitMiddleware:
-    """Reject request bodies declaring Content-Length > 10 MB with HTTP 413.
+    """Bound HTTP bodies before routing, authentication, or JSON parsing.
 
-    Phase 5b.0.5 (F-3): defense-in-depth body-size guard.  The Pydantic
-    per-field caps (``SendMessageRequest.content`` at 64 KiB,
-    ``_InlineBlobModel.content`` at 256 KiB) are the actual guarantees;
-    this middleware short-circuits requests that declare an oversized
-    body before the framework parses anything.  Mirrors the
-    ``settings.max_upload_bytes`` post-decode guard at
-    ``web/blobs/routes.py:171,208``, but at the ASGI layer so it covers
-    every route uniformly.
-
-    Threat model: an attacker submitting a multi-gigabyte JSON body
-    forces FastAPI to buffer the entire payload before the per-field
-    validator can reject it — even though the validator would ultimately
-    reject it.  10 MB is the global ceiling chosen to comfortably exceed
-    the 256 KiB inline-blob cap while remaining well below any
-    pathological memory pressure threshold.
-
-    The check is Content-Length-only by design: clients may omit or
-    falsify the header.  Malformed ``Content-Length`` is rejected here as a
-    deterministic client error before the body is read.  The Pydantic caps
-    remain the contract.
+    Content-Length permits early rejection, but the received bytes enforce
+    the ceiling even when that header is absent or understates the body.
+    Buffer at most 10 MiB within 30 seconds, then replay through the normal ASGI path.
+    No downstream response has begun when an oversized stream is refused.
     """
 
     _MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
+    _MAX_BODY_READ_SECONDS = 30.0
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -1221,10 +1208,10 @@ class _BodySizeLimitMiddleware:
         "before use",
         source_param="scope",
         suppresses=("R1",),
-        invariant="never raises on the header value: absence passes the request through to the "
-        "per-field Pydantic caps, a non-ASCII-decimal or negative value returns a 400 response, "
-        "and a declared size over _MAX_BODY_BYTES returns a 413 response; the header is never "
-        "coerced into a fabricated length",
+        invariant="a malformed Content-Length returns 400 before reading; declared or received "
+        "bytes over _MAX_BODY_BYTES return 413 before downstream dispatch; absent headers do not "
+        "bypass received-byte accounting; an incomplete body returns 408 within the "
+        "overall read deadline before downstream dispatch",
         non_raising=True,
     )
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -1232,26 +1219,71 @@ class _BodySizeLimitMiddleware:
             await self.app(scope, receive, send)
             return
         content_length = Headers(scope=scope).get("content-length")
-        if content_length is None:
-            await self.app(scope, receive, send)
-            return
-        if not content_length.isascii() or not content_length.isdecimal():
-            response = StarletteResponse(content='{"error": "Invalid Content-Length"}', status_code=400, media_type="application/json")
-            await response(scope, receive, send)
-            return
-        try:
-            content_length_bytes = int(content_length)
-        except ValueError:
-            response = StarletteResponse(content='{"error": "Invalid Content-Length"}', status_code=400, media_type="application/json")
-            await response(scope, receive, send)
-            return
-        if content_length_bytes > self._MAX_BODY_BYTES:
-            response = StarletteResponse(
-                content='{"error": "Request body too large (max 10 MB)"}', status_code=413, media_type="application/json"
-            )
-            await response(scope, receive, send)
-            return
-        await self.app(scope, receive, send)
+        if content_length is not None:
+            if not content_length.isascii() or not content_length.isdecimal():
+                response = StarletteResponse(content='{"error": "Invalid Content-Length"}', status_code=400, media_type="application/json")
+                await response(scope, receive, send)
+                return
+            try:
+                content_length_bytes = int(content_length)
+            except ValueError:
+                response = StarletteResponse(content='{"error": "Invalid Content-Length"}', status_code=400, media_type="application/json")
+                await response(scope, receive, send)
+                return
+            if content_length_bytes > self._MAX_BODY_BYTES:
+                response = StarletteResponse(
+                    content='{"error": "Request body too large (max 10 MB)"}', status_code=413, media_type="application/json"
+                )
+                await response(scope, receive, send)
+                return
+
+        body = bytearray()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._MAX_BODY_READ_SECONDS
+        while True:
+            # Empty immediately-ready chunks still yield to cancellation
+            # and other requests; awaiting receive alone need not yield.
+            await asyncio.sleep(0)
+            remaining = deadline - loop.time()
+            try:
+                if remaining <= 0:
+                    raise TimeoutError
+                # Join receive cancellation before sending a timeout refusal.
+                message = await asyncio.wait_for(receive(), timeout=remaining)
+            except TimeoutError:
+                response = StarletteResponse(
+                    content='{"error": "Request body read timed out"}',
+                    status_code=408,
+                    media_type="application/json",
+                    headers={"Connection": "close"},
+                )
+                await response(scope, receive, send)
+                return
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            if len(chunk) > self._MAX_BODY_BYTES - len(body):
+                response = StarletteResponse(
+                    content='{"error": "Request body too large (max 10 MB)"}', status_code=413, media_type="application/json"
+                )
+                await response(scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        pending_body: bytes | None = bytes(body)
+        del body
+
+        async def receive_bounded_body() -> Message:
+            nonlocal pending_body
+            if pending_body is not None:
+                payload = pending_body
+                pending_body = None
+                return {"type": "http.request", "body": payload, "more_body": False}
+            return await receive()
+
+        await self.app(scope, receive_bounded_body, send)
 
 
 # The browser only ever talks to ELSPETH itself: the SSO code exchange is the
@@ -1359,6 +1391,7 @@ def _build_local_auth_provider(
     identity_authority: RepositoryIdentityAuthority,
     *,
     audit_recorder: AuthAuditRecorder,
+    sessions: SessionFamilyAuthority,
 ) -> LocalAuthProvider:
     """Assemble the local provider from its three separate concerns.
 
@@ -1474,6 +1507,7 @@ def _build_local_auth_provider(
         token_expiry_hours=DEFAULT_TOKEN_EXPIRY_HOURS,
         max_refresh_chain_hours=DEFAULT_MAX_REFRESH_CHAIN_HOURS,
         principal_is_active=_principal_is_active,
+        sessions=sessions,
     )
 
     return LocalAuthProvider(
@@ -1645,7 +1679,7 @@ def _create_app(
         unit="ms",
     )
 
-    app = FastAPI(title="ELSPETH Web", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="ELSPETH Web", version=__version__, lifespan=lifespan)
     app.state.operator_telemetry = operator_runtime
     app.state.process_recovery = process_recovery
     app.state.process_watchdog = watchdog
@@ -2010,7 +2044,12 @@ def _create_app(
     )
     app.state.sso_wiring = sso_wiring
     if settings.auth_provider == "local":
-        local_provider = _build_local_auth_provider(settings, identity_authority, audit_recorder=audit_recorder)
+        local_provider = _build_local_auth_provider(
+            settings,
+            identity_authority,
+            audit_recorder=audit_recorder,
+            sessions=RepositoryAuthSessionAuthority(session_engine),
+        )
         local_provider.publish_pending_email_verifications(settings.data_dir / "email-verifications.jsonl")
         auth_provider = local_provider
         stream_provider: LocalAuthProvider | SsoAuthProvider = local_provider

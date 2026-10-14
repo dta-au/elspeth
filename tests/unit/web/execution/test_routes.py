@@ -226,6 +226,11 @@ def _create_test_app(
     app.state.execution_service = execution_service if execution_service is not None else _execution_service()
     app.state.broadcaster = broadcaster if broadcaster is not None else _progress_broadcaster()
     app.state.auth_provider = object()
+    from types import SimpleNamespace
+
+    from tests.fixtures.auth_sessions import make_session_claims
+
+    app.state.composer_stream_auth = SimpleNamespace(decode=make_session_claims)
     app.state.websocket_ticket_store = WebSocketTicketStore()
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
 
@@ -271,7 +276,8 @@ def _create_test_app(
 
     fake_user = UserIdentity(user_id=_TEST_USER_ID, username="testuser")
 
-    async def _fake_current_user() -> UserIdentity:
+    async def _fake_current_user(request: Request) -> UserIdentity:
+        request.state.auth_token = "authenticated-test-token"
         return fake_user
 
     app.dependency_overrides[get_current_user] = _fake_current_user
@@ -367,7 +373,7 @@ class TestWebSocketTicketEndpoint:
         assert body["ticket"] != "auth-token"
 
         consumed = app.state.websocket_ticket_store.consume(ticket=body["ticket"], run_id=str(run_id))
-        assert consumed == UserIdentity(user_id=_TEST_USER_ID, username="testuser")
+        assert consumed is not None and consumed.user == UserIdentity(user_id=_TEST_USER_ID, username="testuser")
         assert app.state.websocket_ticket_store.consume(ticket=body["ticket"], run_id=str(run_id)) is None
 
     @pytest.mark.asyncio

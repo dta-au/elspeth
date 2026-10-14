@@ -273,14 +273,14 @@ class AzureLLMProvider:
             with self._llm_clients_lock:
                 self._llm_clients.pop(cache_key, None)
 
-    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, temperature: float | None, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited Azure OpenAI call under an operation parent."""
         smoke_messages = [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]
         if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
             request = build_llm_call_request(
                 model=model,
                 messages=smoke_messages,
-                temperature=None,
+                temperature=temperature,
                 provider="azure",
                 max_tokens=_PREFLIGHT_MAX_COMPLETION_TOKENS,
                 max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
@@ -312,10 +312,9 @@ class AzureLLMProvider:
             response = client.chat_completion(
                 model=model,
                 messages=smoke_messages,
-                # No temperature: reasoning deployments reject any explicit
-                # value with HTTP 400, and a smoke test has no determinism
-                # requirement.
-                temperature=None,
+                # Readiness must exercise the operator's resolved sampling
+                # value, including omission, just like normal completions.
+                temperature=temperature,
                 max_tokens=_PREFLIGHT_MAX_COMPLETION_TOKENS,
             )
             if not response.content.strip():

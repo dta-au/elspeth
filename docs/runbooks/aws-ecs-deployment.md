@@ -1633,14 +1633,14 @@ approvals, not invented evidence:
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_task_definition": "exact-candidate-task-definition-arn",
   "candidate_doctor_task_definition": "exact-candidate-doctor-task-definition-arn",
-  "candidate_package_version": "0.8.3",
+  "candidate_package_version": "0.8.4",
   "previous_source_sha": "",
   "previous_image_digest": "",
   "previous_task_definition": "",
   "rollback_doctor_task_definition": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 74, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 75, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",
@@ -1670,7 +1670,7 @@ v2 records/receipts do not satisfy the current v3 contract.
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 74, Landscape epoch 49 and `run_web_plugin_policy` presence,
+session epoch 75, Landscape epoch 49 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and

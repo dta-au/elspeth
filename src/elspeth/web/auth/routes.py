@@ -518,15 +518,15 @@ def create_auth_router() -> APIRouter:
 
     @router.post("/logout", status_code=204, response_class=Response)
     async def logout(request: Request) -> Response:
-        """Record that a session ended on purpose; the client discards the token.
+        """Revoke the bearer family for every provider, then record logout.
 
-        Mounted for every provider. Server-side revocation is a future
-        ``jti`` denylist (spec rev2), so the row is the whole effect: the
-        audit trail reads it alongside the ``login`` and ``token_issued``
-        rows it closes, and it is written before the response.
+        An audit failure cannot undo a committed revocation. A concurrent
+        refresh retains the same family and cannot escape it.
         """
         settings: WebSettings = request.app.state.settings
         user = await get_current_user(request)
+        provider: AuthProvider = request.app.state.auth_provider
+        await provider.logout(request.state.auth_token)
         _auth_audit_recorder(request).record_logout(
             request,
             provider=settings.auth_provider,

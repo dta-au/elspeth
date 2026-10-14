@@ -323,6 +323,9 @@ files:
   src/elspeth/mcp/server.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 8
+  src/elspeth/mcp/sql_policy.py:
+    Mapping[str, object]: 2
+    dict[str, object]: 1
   src/elspeth/mcp/types.py:
     dict[str, Any]: 21
   src/elspeth/plugins/infrastructure/base.py:
@@ -336,7 +339,7 @@ files:
   src/elspeth/plugins/infrastructure/clients/dataverse.py:
     dict[str, Any]: 4
   src/elspeth/plugins/infrastructure/clients/http.py:
-    Mapping[str, Any]: 16
+    Mapping[str, Any]: 18
     dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/clients/llm.py:
     Mapping[str, Any]: 3
@@ -1057,10 +1060,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 753
-  Mapping[str, object]: 313
+  Mapping[str, Any]: 755
+  Mapping[str, object]: 315
   MutableMapping[str, Any]: 8
   boundary: 59
   dict[str, Any]: 1073
-  dict[str, object]: 394
-  soft: 2541
+  dict[str, object]: 395
+  soft: 2546

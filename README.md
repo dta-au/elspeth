@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.3](https://img.shields.io/badge/status-0.8.3-green.svg)
+![Status: 0.8.4](https://img.shields.io/badge/status-0.8.4-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -98,19 +98,20 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.3
+## What changed in 0.8.4
 
-This unreleased candidate includes the merged EFS session archive recovery
-repair and container/dependency maintenance. The Web Composer HTTPS progress
-transport is under final integration and acceptance review. It delivers
-operation progress followed by the completed answer; it does not stream
-generated answer tokens. See the [release notes](CHANGELOG.md).
+This unreleased candidate adds restricted PostgreSQL analysis, durable logout
+and password-change revocation, bounded request/provider handling, and image
+evidence refusal. It retains the preceding archive recovery and Composer
+progress work. Composer delivers operation progress followed by the completed
+answer; it does not stream generated answer tokens. Final qualification is
+pending. See the [release notes](CHANGELOG.md).
 
-This candidate requires session epoch 74 and Landscape epoch 49. Existing
+This candidate requires session epoch 75 and Landscape epoch 49. Existing
 unsupported stores are refused before writes: preserve them unchanged and
 configure explicitly new compatible databases. ELSPETH does not migrate either
 store in place or authorize downgrading these stores. This pre-release
-compatibility policy has no fixed expiry. Package metadata remains 0.8.3;
+compatibility policy has no fixed expiry. Package metadata remains 0.8.4;
 automatic image publication is held. See the
 [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.

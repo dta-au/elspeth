@@ -814,15 +814,21 @@ let admissionAbort = null;
 let heldTerminal = null;
 let releaseTerminal = null;
 let holdNextTerminal = false;
+let expectedLogoutToken = null;
 const originalFetch = window.fetch.bind(window);
 window.fetch = async (input, init = {}) => {
   const url = new URL(String(input), location.href);
   if (url.origin !== location.origin) throw new Error('Browser acceptance egress refused');
   const headers = new Headers(init.headers);
   const token = localStorage.getItem('auth_token');
+  const method = init.method ?? 'GET';
+  const logoutRequest = method === 'POST' && url.pathname === '/api/auth/logout';
+  const expectedToken = logoutRequest ? expectedLogoutToken : token;
   const item = { method: init.method ?? 'GET', path: url.pathname,
     publicConfiguration: url.pathname === '/api/auth/config',
-    authorized: headers.get('Authorization') === (url.pathname === '/api/auth/config' || token === null ? null : `Bearer ${token}`) };
+    authorized: logoutRequest
+      ? expectedToken !== null && headers.get('Authorization') === `Bearer ${expectedToken}`
+      : headers.get('Authorization') === (url.pathname === '/api/auth/config' || token === null ? null : `Bearer ${token}`) };
   if (item.method === 'POST' && url.pathname.endsWith('/messages')) item.operationId = JSON.parse(init.body).operation_id;
   requests.push(item);
   const response = await originalFetch(input, { ...init, signal: item.method === 'POST' && url.pathname.endsWith('/messages') && admissionAbort !== null ? admissionAbort.signal : init.signal });
@@ -885,7 +891,11 @@ window.custodyAcceptance = {
     await useAuthStore.getState().loginWithToken(access_token);
     return localStorage.getItem('auth_token') === access_token;
   },
-  async logout() { await useAuthStore.getState().logout(); },
+  async logout() {
+    expectedLogoutToken = localStorage.getItem('auth_token');
+    if (expectedLogoutToken === null) throw new Error('Missing test-owned logout bearer');
+    await useAuthStore.getState().logout();
+  },
   async loggedOutRefusal() { return (await fetch('/api/auth/me')).status; },
   async preStopped(id) {
     const controller = new AbortController(); controller.abort('user_cancel');
@@ -965,10 +975,20 @@ async function waitFor(read, predicate, label) {
 try {
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
   await context.route('**/*', route => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort('blockedbyclient'));
-  async function load(page) { await page.goto(baseUrl + '/docs'); await page.addScriptTag({ url: baseUrl + '/__acceptance/custody.js' }); await page.evaluate(({token, sessionId}) => window.custodyAcceptance.boot(token, sessionId), { token, sessionId }); }
+  async function load(page, bootToken = token) { await page.goto(baseUrl + '/docs'); await page.addScriptTag({ url: baseUrl + '/__acceptance/custody.js' }); await page.evaluate(({token, sessionId}) => window.custodyAcceptance.boot(token, sessionId), { token: bootToken, sessionId }); }
   const a = await context.newPage(); await load(a);
   const read = page => page.evaluate(() => window.custodyAcceptance.state());
   const backend = () => a.evaluate(() => window.custodyAcceptance.control());
+  const ownedTokens = [token];
+  async function assertRevokedFamily(page) {
+    const requests = (await read(page)).requests.filter(r => r.method === 'POST' && r.path === '/api/auth/logout');
+    assert.equal(requests.length, 1); assert.equal(requests[0].authorized, true); assert.equal(requests[0].status, 204);
+    const headers = { Authorization: `Bearer ${token}` };
+    const access = await context.request.get(baseUrl + '/api/auth/me', { headers });
+    const refresh = await context.request.post(baseUrl + '/api/auth/token', { headers });
+    assert.equal(access.status(), 401); assert.equal(refresh.status(), 401);
+    evidence.witnesses.revokedFamily = { accessStatus: access.status(), refreshStatus: refresh.status(), revocationPosts: requests.length };
+  }
   if (scenario === 'late-sql-stop') {
     await a.evaluate(id => { window.custodyAcceptance.holdAdmission(); window.custodyAcceptance.start(id); }, operationId);
     evidence.witnesses.beforeAbort = await waitFor(backend, x => x.admissionHeld && x.jobMissing, 'real admission worker held before SQL');
@@ -1026,6 +1046,7 @@ try {
     await waitFor(() => read(a), x => x.foreground === null, 'new authenticated generation reconciles exact terminal');
     evidence.backend = await backend();
     await a.evaluate(() => window.custodyAcceptance.logout());
+    await assertRevokedFamily(a);
     evidence.witnesses.loggedOutRefusal = await a.evaluate(() => window.custodyAcceptance.loggedOutRefusal());
     assert.equal(evidence.witnesses.loggedOutRefusal, 401);
     evidence.afterLogout = await read(a); assert.equal(evidence.afterLogout.raw, null); assert.equal(evidence.afterLogout.foreground, null);
@@ -1052,15 +1073,22 @@ try {
     evidence.witnesses.refusedNewSubmission = refused;
     await load(a); assert.equal((await read(a)).raw, raw); assert.ok((await read(a)).notice.includes('read-only recovery'));
     await a.evaluate(() => window.custodyAcceptance.logout()); const cleared = await read(a); assert.equal(cleared.raw, null); assert.equal(cleared.notice, null);
-    await a.evaluate(token => window.custodyAcceptance.refresh(token), token);
-    await load(a);
+    await assertRevokedFamily(a); evidence.afterLogout = cleared;
+    const login = await context.request.post(baseUrl + '/api/auth/login', { data: { username: 'transport-user', password: 'test transport password' } });
+    assert.equal(login.status(), 200);
+    const freshToken = (await login.json()).access_token; ownedTokens.push(freshToken);
+    const claims = bearer => JSON.parse(Buffer.from(bearer.split('.')[1], 'base64url').toString());
+    assert.notEqual(claims(freshToken).sid, claims(token).sid); assert.equal(claims(freshToken).sub, claims(token).sub);
+    evidence.witnesses.freshLoginChangedFamily = true;
+    await a.evaluate(token => window.custodyAcceptance.refresh(token), freshToken);
+    await load(a, freshToken);
     await a.evaluate(id => window.custodyAcceptance.start(id), otherId);
     const fresh = await waitFor(() => read(a), x => x.outcome !== null, 'logout clears quarantine and real fresh admission succeeds');
     assert.equal(fresh.outcome.status, 'completed'); evidence.afterLogoutFreshAction = fresh;
     evidence.witnesses.validRecovery = recovered;
   }
   if (scenario !== 'auth-refresh-stale-terminal') evidence.backend = await backend();
-  for (const value of Object.values(evidence)) if (value && Array.isArray(value.requests)) assert.ok(value.requests.every(r => r.authorized && !r.path.includes(token)));
+  for (const value of Object.values(evidence)) if (value && Array.isArray(value.requests)) assert.ok(value.requests.every(r => r.authorized && ownedTokens.every(bearer => !r.path.includes(bearer))));
   console.log(JSON.stringify(evidence)); await context.close();
 } catch (error) { console.error(JSON.stringify(evidence)); throw error; }
 finally { clearTimeout(browserDeadline); await browser.close(); }

@@ -51,6 +51,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.sso_handoff_repository import SsoHandoffRepository
+from tests.fixtures.auth_sessions import TestSessionFamilies
 from tests.helpers.fake_idp import FakeIdP
 from tests.unit.web.auth.conftest import saturated_worker_pool
 
@@ -212,6 +213,7 @@ def _runtime(idp: FakeIdP, substrate: _Substrate, *, jwks_transport: httpx.Async
             token_expiry_hours=1,
             max_refresh_chain_hours=2,
             principal_is_active=lambda _identity_id: True,
+            sessions=TestSessionFamilies(),
         ),
         transport=idp.transport(),
     )

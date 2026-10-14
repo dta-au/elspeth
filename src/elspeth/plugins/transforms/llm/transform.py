@@ -1213,7 +1213,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:472746765fba66e5"
+    source_file_hash: str | None = "sha256:21f9061bf39be4d9"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1398,8 +1398,10 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     finish_reason=FinishReason.STOP,
                 )
 
-            def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
-                del operation_id, model, coordination_token
+            def runtime_preflight(
+                self, *, operation_id: str, model: str, temperature: float | None, coordination_token: CoordinationToken
+            ) -> None:
+                del operation_id, model, temperature, coordination_token
 
             def close(self) -> None:
                 return None
@@ -1835,7 +1837,10 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
         try:
             self._provider.runtime_preflight(
-                operation_id=ctx.operation_id, model=self._model, coordination_token=ctx.require_coordination_token()
+                operation_id=ctx.operation_id,
+                model=self._model,
+                temperature=self._temperature,
+                coordination_token=ctx.require_coordination_token(),
             )
         except LLMClientError as exc:
             raise RuntimePreflightFailedError(

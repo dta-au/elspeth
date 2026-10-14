@@ -433,8 +433,8 @@ class LLMProvider(Protocol):
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult: ...
 
-    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
-        """Validate provider/model reachability before row processing."""
+    def runtime_preflight(self, *, operation_id: str, model: str, temperature: float | None, coordination_token: CoordinationToken) -> None:
+        """Validate reachability with the resolved sampling value used for row processing."""
         ...
 
     def close(self) -> None: ...

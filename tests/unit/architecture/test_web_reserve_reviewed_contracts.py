@@ -9,6 +9,7 @@ from tests.helpers import web_reserve_composer_receiver as receiver
 from tests.helpers import web_reserve_provider_mint_contract as provider
 from tests.helpers import web_reserve_route_helper as route
 from tests.helpers import web_reserve_terminal_sql_transfers as terminal
+from tests.helpers import web_reserve_worker_caller as worker_caller
 from tests.helpers import web_worker_whole_scope_origin as worker_origin
 from tests.unit.architecture import test_web_landscape_mutation_fencing as fencing
 
@@ -27,6 +28,7 @@ def _source_units(paths: tuple[str, ...]) -> tuple[fencing.SourceUnit, ...]:
 def test_reviewed_app_whole_scope_matches_live_source_and_refuses_drift(fault: str) -> None:
     units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_origin.TURN))
     assert worker_origin.worker_whole_scope_origin_local_contracts(units)[0] == []
+    assert worker_caller.worker_caller_local_contracts(units)[0] == []
     factory = fencing._reserve_node_at(units[0], "_create_app")
     if fault == "omit_admission":
         admission = next(
@@ -50,6 +52,8 @@ def test_reviewed_app_whole_scope_matches_live_source_and_refuses_drift(fault: s
     assert worker_origin.worker_whole_scope_origin_local_contracts(units)[0] == [
         "worker whole scope: complete finite whole-body grammar changed _create_app"
     ]
+    expected_caller_failures = [] if fault == "foreign_return" else ["worker caller: complete finite executed grammar changed _create_app"]
+    assert worker_caller.worker_caller_local_contracts(units)[0] == expected_caller_failures
 
 
 @pytest.mark.parametrize("fault", ("recovery_guard", "recovery_default", "recovery_import"))

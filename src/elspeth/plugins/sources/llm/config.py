@@ -73,8 +73,8 @@ class LLMSourceConfig(DataPluginConfig):
         ge=0.0,
         le=2.0,
         description=(
-            "Sampling temperature. Set to null to omit it from the request so the provider default applies — "
-            "required for reasoning deployments, which reject any explicit temperature"
+            "Sampling temperature. Set to null to omit it from the request. Support and valid values depend on "
+            "the provider, model and reasoning mode; check the provider's documentation before setting an explicit value."
         ),
     )
     max_tokens: int | None = Field(default=None, gt=0, description="Maximum tokens in response")

@@ -35,6 +35,7 @@ import elspeth.web.aws_ecs_startup as aws_ecs_startup_module
 import elspeth.web.deployment_contract as deployment_contract_module
 import elspeth.web.external_state_startup as external_state_startup_module
 import elspeth.web.operator_telemetry as operator_telemetry_module
+from elspeth import __version__
 from elspeth.contracts import RunStatus
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -389,7 +390,8 @@ class TestCreateApp:
 
     def test_returns_fastapi_instance_with_correct_version(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))
-        assert app.version == "0.1.0"
+        assert app.version == __version__
+        assert app.openapi()["info"]["version"] == __version__
 
     def test_default_settings_when_none_passed(self, tmp_path) -> None:
         # create_app(None) uses WebSettings() which defaults data_dir to "data".
@@ -1147,14 +1149,7 @@ class TestBrowserDocumentHeaders:
 
 
 class TestBodySizeLimitMiddleware:
-    """Tests that the 10 MB body-size guard rejects oversized requests.
-
-    Phase 5b.0.5 (F-3): the ASGI body-size middleware is defense-in-depth
-    against unbounded payload allocation.  The Pydantic per-field caps
-    (``SendMessageRequest.content``, ``_InlineBlobModel.content``) are
-    the actual guarantees; the middleware short-circuits Content-Length
-    declarations that would otherwise reach the parser at all.
-    """
+    """Header rejection and ordinary request controls for the body ceiling."""
 
     @pytest.mark.asyncio
     async def test_rejects_oversized_content_length(self) -> None:
@@ -1192,7 +1187,7 @@ class TestBodySizeLimitMiddleware:
         assert response.body == b'{"error": "Invalid Content-Length"}'
 
     @pytest.mark.asyncio
-    async def test_missing_content_length_stream_passes_through_without_body_read(self) -> None:
+    async def test_missing_content_length_allows_bounded_body(self) -> None:
         response = await self._dispatch_with_content_length(None)
         assert response.status_code == 204
 
@@ -1207,7 +1202,13 @@ class TestBodySizeLimitMiddleware:
             scope["headers"] = [(b"content-length", str(content_length).encode("ascii"))]
 
         async def receive():
-            raise AssertionError("Content-Length-only guard must not read request bodies")
+            if content_length is not None and (
+                not str(content_length).isascii()
+                or not str(content_length).isdecimal()
+                or int(content_length) > _BodySizeLimitMiddleware._MAX_BODY_BYTES
+            ):
+                raise AssertionError("Rejected Content-Length must not read request bodies")
+            return {"type": "http.request", "body": b"", "more_body": False}
 
         async def send(message):
             messages.append(message)

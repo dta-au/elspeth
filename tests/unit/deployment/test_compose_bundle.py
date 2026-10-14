@@ -43,8 +43,22 @@ POSTGRES_PASSWORD_REF = "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}"
 COMPOSE_TEST_ENVIRONMENT = os.environ | {
     "IMAGE_TAG": "sha-test",
     "POSTGRES_PASSWORD": "0123456789abcdef0123456789abcdef0123456789abcdef",
+    "POSTGRES_SESSION_SCHEMA_PASSWORD": "1" * 48,
+    "POSTGRES_LANDSCAPE_SCHEMA_PASSWORD": "2" * 48,
+    "POSTGRES_SESSION_RUNTIME_PASSWORD": "3" * 48,
+    "POSTGRES_LANDSCAPE_RUNTIME_PASSWORD": "4" * 48,
     "ELSPETH_WEB_SECRET_KEY": "test-only-secret-key-with-more-than-32-bytes",
     "ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    # pytest loads the developer's .env. Rendering a synthetic bundle must not
+    # carry real provider credentials into test object representations/logs.
+    "OPENROUTER_API_KEY": "",
+    "OPENAI_API_KEY": "",
+    "ANTHROPIC_API_KEY": "",
+    "AZURE_API_KEY": "",
+    "AZURE_CONTENT_SAFETY_KEY": "",
+    "AZURE_OPENAI_API_KEY": "",
+    "AZURE_OPENAI_ENDPOINT": "",
+    "ELSPETH_FINGERPRINT_KEY": "",
 }
 
 
@@ -150,7 +164,10 @@ def test_postgresql_overlay_wires_a_healthy_persistent_server_and_cli_database()
     assert postgres["restart"] == "unless-stopped"
 
     database_url = _environment(cli)["DATABASE_URL"]
-    assert database_url == ("postgresql+psycopg://elspeth:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/elspeth_landscape")
+    assert database_url == (
+        "postgresql+psycopg://elspeth_landscape_schema:"
+        "${POSTGRES_LANDSCAPE_SCHEMA_PASSWORD:?POSTGRES_LANDSCAPE_SCHEMA_PASSWORD required}@postgres:5432/elspeth_landscape"
+    )
     assert cli["depends_on"]["postgres"]["condition"] == "service_healthy"
 
 
@@ -167,8 +184,8 @@ def test_postgresql_initializer_creates_exactly_the_two_application_databases() 
     created = re.findall(r"CREATE\s+DATABASE\s+([a-z_][a-z0-9_]*)\b", sql, re.IGNORECASE)
 
     assert created == ["elspeth_sessions", "elspeth_landscape"]
-    assert sql.upper().count("WHERE NOT EXISTS") == 2
-    assert sql.count("\\gexec") == 2
+    assert "OWNER elspeth_session_schema" in sql
+    assert "OWNER elspeth_landscape_schema" in sql
 
 
 def test_postgresql_bootstrap_reconciles_reused_data_volumes_before_web_init() -> None:
@@ -239,10 +256,12 @@ def test_web_service_uses_distinct_external_postgresql_state_and_one_persistent_
     assert environment["ELSPETH_WEB__DEPLOYMENT_TARGET"] == "docker-compose"
     assert environment["ELSPETH_WEB__DEPLOYMENT_STATE_MODE"] == "external-postgresql"
     assert environment["ELSPETH_WEB__SESSION_DB_URL"] == (
-        "postgresql+psycopg://elspeth:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/elspeth_sessions"
+        "postgresql+psycopg://elspeth_session_runtime:"
+        "${POSTGRES_SESSION_RUNTIME_PASSWORD:?POSTGRES_SESSION_RUNTIME_PASSWORD required}@postgres:5432/elspeth_sessions"
     )
     assert environment["ELSPETH_WEB__LANDSCAPE_URL"] == (
-        "postgresql+psycopg://elspeth:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/elspeth_landscape"
+        "postgresql+psycopg://elspeth_landscape_runtime:"
+        "${POSTGRES_LANDSCAPE_RUNTIME_PASSWORD:?POSTGRES_LANDSCAPE_RUNTIME_PASSWORD required}@postgres:5432/elspeth_landscape"
     )
     assert environment["ELSPETH_WEB__SESSION_DB_URL"] != environment["ELSPETH_WEB__LANDSCAPE_URL"]
     assert environment["ELSPETH_WEB__DATA_DIR"] == "/app/state/data"
@@ -261,6 +280,21 @@ def test_web_and_initializer_share_the_container_serving_bind_address() -> None:
     for document in (static, rendered):
         assert _environment(_service(document, "web"))["ELSPETH_WEB__HOST"] == "0.0.0.0"
         assert _environment(_service(document, "web-init"))["ELSPETH_WEB__HOST"] == "0.0.0.0"
+
+
+def test_rendered_web_receives_only_runtime_database_credentials() -> None:
+    rendered = _rendered_bundle()
+    web_environment = _environment(_service(rendered, "web"))
+    init_environment = _environment(_service(rendered, "web-init"))
+    web_values = "\n".join(web_environment.values())
+    for name in ("POSTGRES_PASSWORD", "POSTGRES_SESSION_SCHEMA_PASSWORD", "POSTGRES_LANDSCAPE_SCHEMA_PASSWORD"):
+        assert COMPOSE_TEST_ENVIRONMENT[name] not in web_values
+    assert not any(name.startswith("POSTGRES_") for name in web_environment)
+    assert "elspeth_session_runtime:" in web_environment["ELSPETH_WEB__SESSION_DB_URL"]
+    assert "elspeth_landscape_runtime:" in web_environment["ELSPETH_WEB__LANDSCAPE_URL"]
+    assert "elspeth_session_schema:" in init_environment["ELSPETH_WEB__SESSION_DB_URL"]
+    assert "elspeth_landscape_schema:" in init_environment["ELSPETH_WEB__LANDSCAPE_URL"]
+    assert COMPOSE_TEST_ENVIRONMENT["POSTGRES_PASSWORD"] not in "\n".join(init_environment.values())
 
 
 def test_web_readiness_probe_uses_only_python_standard_library() -> None:

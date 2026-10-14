@@ -20,6 +20,7 @@ from elspeth.web.sessions.models import (
     websocket_tickets_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.auth_sessions import make_session_binding
 from tests.fixtures.identities import ensure_test_identity
 
 
@@ -74,12 +75,13 @@ def test_digest_only_single_use_and_current_identity(ticket_engine):
     _, run_id, user = seed_ticket_run(ticket_engine)
     first = RepositorySessionWebsocketTicketAuthority(ticket_engine)
     second = RepositorySessionWebsocketTicketAuthority(ticket_engine)
-    issued = first.issue(run_id=run_id, user=user)
+    issued = first.issue(run_id=run_id, user=user, binding=make_session_binding())
     with ticket_engine.connect() as conn:
         row = conn.execute(select(websocket_tickets_table)).one()
     assert row.ticket_digest == sha256(issued.ticket.encode()).hexdigest()
     assert issued.ticket not in str(row)
-    assert second.consume(ticket=issued.ticket, run_id=run_id) == UserIdentity(user.user_id, "current-name")
+    consumed = second.consume(ticket=issued.ticket, run_id=run_id)
+    assert consumed is not None and consumed.user == UserIdentity(user.user_id, "current-name") and consumed.binding == issued.binding
     assert first.consume(ticket=issued.ticket, run_id=run_id) is None
 
 
@@ -87,7 +89,7 @@ def test_digest_only_single_use_and_current_identity(ticket_engine):
 def test_consumption_rechecks_live_authorization(ticket_engine, refusal):
     session_id, run_id, user = seed_ticket_run(ticket_engine)
     authority = RepositorySessionWebsocketTicketAuthority(ticket_engine)
-    issued = authority.issue(run_id=run_id, user=user)
+    issued = authority.issue(run_id=run_id, user=user, binding=make_session_binding())
     with ticket_engine.begin() as conn:
         if refusal == "expired":
             conn.execute(update(websocket_tickets_table).values(expires_at=datetime.now(UTC) - timedelta(seconds=1)))
@@ -112,7 +114,7 @@ def test_issue_rejects_identity_that_does_not_own_run(ticket_engine):
     _, _, other = seed_ticket_run(ticket_engine)
     authority = RepositorySessionWebsocketTicketAuthority(ticket_engine)
     with pytest.raises(AuthenticationError):
-        authority.issue(run_id=run_id, user=other)
+        authority.issue(run_id=run_id, user=other, binding=make_session_binding())
     with ticket_engine.connect() as conn:
         assert conn.execute(select(websocket_tickets_table)).all() == []
 
@@ -120,21 +122,21 @@ def test_issue_rejects_identity_that_does_not_own_run(ticket_engine):
 def test_database_failure_is_not_local_admission(ticket_engine):
     _, run_id, user = seed_ticket_run(ticket_engine)
     authority = RepositorySessionWebsocketTicketAuthority(ticket_engine)
-    issued = authority.issue(run_id=run_id, user=user)
+    issued = authority.issue(run_id=run_id, user=user, binding=make_session_binding())
     websocket_tickets_table.drop(ticket_engine)
     with pytest.raises(OperationalError):
         authority.consume(ticket=issued.ticket, run_id=run_id)
     with pytest.raises(OperationalError):
-        authority.issue(run_id=run_id, user=user)
+        authority.issue(run_id=run_id, user=user, binding=make_session_binding())
 
 
 def test_issue_reclaims_expired_tickets_in_bounded_batches_across_retained_runs(ticket_engine):
     _, old_run_id, old_user = seed_ticket_run(ticket_engine)
     _, run_id, user = seed_ticket_run(ticket_engine)
     authority = RepositorySessionWebsocketTicketAuthority(ticket_engine)
-    consumed = authority.issue(run_id=old_run_id, user=old_user)
+    consumed = authority.issue(run_id=old_run_id, user=old_user, binding=make_session_binding())
     assert authority.consume(ticket=consumed.ticket, run_id=old_run_id) is not None
-    live = authority.issue(run_id=old_run_id, user=old_user)
+    live = authority.issue(run_id=old_run_id, user=old_user, binding=make_session_binding())
     now = datetime.now(UTC)
     expired_digests = {sha256(f"expired-{number}".encode()).hexdigest() for number in range(105)}
     with ticket_engine.begin() as conn:
@@ -147,6 +149,9 @@ def test_issue_reclaims_expired_tickets_in_bounded_batches_across_retained_runs(
                     "run_id": old_run_id,
                     "user_id": old_user.user_id,
                     "auth_provider_type": "local",
+                    "session_family_id": "expired-family",
+                    "credential_generation": 0,
+                    "token_expires_at": int(now.timestamp()),
                     "issued_at": now - timedelta(minutes=2),
                     "expires_at": now - timedelta(minutes=1),
                     "consumed_at": now - timedelta(seconds=90) if number % 2 else None,
@@ -154,14 +159,14 @@ def test_issue_reclaims_expired_tickets_in_bounded_batches_across_retained_runs(
                 for number, digest in enumerate(sorted(expired_digests))
             ],
         )
-    first = authority.issue(run_id=run_id, user=user)
+    first = authority.issue(run_id=run_id, user=user, binding=make_session_binding())
     with ticket_engine.connect() as conn:
         remaining = set(conn.execute(select(websocket_tickets_table.c.ticket_digest)).scalars())
         assert conn.execute(select(runs_table.c.status).where(runs_table.c.id == old_run_id)).scalar_one() == "completed"
     assert len(remaining & expired_digests) == 5
     assert sha256(live.ticket.encode()).hexdigest() in remaining
     assert sha256(consumed.ticket.encode()).hexdigest() in remaining
-    authority.issue(run_id=run_id, user=user)
+    authority.issue(run_id=run_id, user=user, binding=make_session_binding())
     with ticket_engine.connect() as conn:
         assert not expired_digests.intersection(conn.execute(select(websocket_tickets_table.c.ticket_digest)).scalars())
     assert authority.consume(ticket=live.ticket, run_id=old_run_id) is not None

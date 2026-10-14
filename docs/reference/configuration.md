@@ -240,6 +240,27 @@ override it, including with `null`. Unprofiled YAML nodes can still configure
 temperature directly. Use explicit sampling only for a deployment that
 supports it; deployment aliases do not identify model capabilities.
 
+**Omission and zero are different.** Leaving temperature out of a profile
+preserves ELSPETH's provider default: omitted for Azure, `0.0` for Bedrock,
+OpenRouter and gateway. To omit it from completion and runtime-preflight
+requests on any provider, set `temperature: null` explicitly (JSON profiles
+use `"temperature": null`). An explicit number, including zero, is sent
+unchanged in both paths; a provider rejection is a configuration error, not
+a reason to retry with a different sampling setting.
+
+**Check the exact provider, model and reasoning mode.** Zero is not a
+universal reasoning-model setting and does not guarantee identical outputs.
+Some deployments require omission; [Claude thinking](https://platform.claude.com/docs/en/claude_api_primer)
+requires temperature 1 or unset, and [Bedrock Claude Opus 4.7](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html)
+recommends omitting sampling parameters. [OpenAI GPT-5.1/5.2](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.2)
+supports temperature only with provider reasoning effort `none`.
+[Azure's reasoning-model guide](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning)
+lists deployment-specific restrictions. For OpenRouter, check the underlying
+model/provider: its [generic parameter range](https://openrouter.ai/docs/api_reference/parameters)
+does not guarantee support on every route. Normal completion and preflight
+preserve your configured intent; successful readiness alone does not prove
+that an intermediary applied every sampling parameter.
+
 `ELSPETH_WEB__DEFAULT_LLM_PROFILE` must name a configured profile or the
 service refuses to start — so renaming or removing a profile this still points
 at will break a previously healthy deployment on its next restart; change both

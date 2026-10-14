@@ -1110,12 +1110,12 @@ def test_governance_covers_preflight_completion_without_charging_readiness(
     completion = respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(body))
     if mode == "refused":
         with pytest.raises(RuntimeError, match="quota refused"):
-            provider.runtime_preflight(operation_id="op-1", model="standard", coordination_token=_LEADER_TOKEN)
+            provider.runtime_preflight(operation_id="op-1", temperature=0.0, model="standard", coordination_token=_LEADER_TOKEN)
     elif mode == "malformed":
         with pytest.raises(LLMClientError):
-            provider.runtime_preflight(operation_id="op-1", model="standard", coordination_token=_LEADER_TOKEN)
+            provider.runtime_preflight(operation_id="op-1", temperature=0.0, model="standard", coordination_token=_LEADER_TOKEN)
     else:
-        provider.runtime_preflight(operation_id="op-1", model="standard", coordination_token=_LEADER_TOKEN)
+        provider.runtime_preflight(operation_id="op-1", temperature=0.0, model="standard", coordination_token=_LEADER_TOKEN)
     assert ready.call_count == 1
     assert completion.call_count == (0 if mode == "refused" else 1)
     assert events == (["before"] if mode == "refused" else ["before", "after"])
@@ -1130,7 +1130,7 @@ class TestRuntimePreflight:
     def test_preflight_succeeds_when_ready_and_completion_works(self, provider: GatewayLLMProvider) -> None:
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "1"}))
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(content="ok")))
-        provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+        provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
 
     @respx.mock
     def test_preflight_fails_when_readyz_reports_not_ready(self, provider: GatewayLLMProvider) -> None:
@@ -1138,7 +1138,7 @@ class TestRuntimePreflight:
             return_value=httpx.Response(503, json=_readyz_body(ready=False), headers={_CONTRACT_HEADER: "1"})
         )
         with pytest.raises(LLMClientError):
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
 
     @respx.mock
     def test_preflight_fails_when_contract_major_mismatched(self, provider: GatewayLLMProvider) -> None:
@@ -1146,7 +1146,7 @@ class TestRuntimePreflight:
             return_value=httpx.Response(200, json=_readyz_body(contract_major=2), headers={_CONTRACT_HEADER: "1"})
         )
         with pytest.raises(LLMClientError):
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
 
     @respx.mock
     def test_preflight_fails_when_model_alias_absent(self, provider: GatewayLLMProvider) -> None:
@@ -1154,7 +1154,7 @@ class TestRuntimePreflight:
             return_value=httpx.Response(200, json=_readyz_body(model_aliases=["other-model"]), headers={_CONTRACT_HEADER: "1"})
         )
         with pytest.raises(LLMClientError):
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
 
     @respx.mock
     def test_preflight_fails_when_required_capability_missing(
@@ -1173,7 +1173,7 @@ class TestRuntimePreflight:
             return_value=httpx.Response(200, json=_readyz_body(capabilities=["text", "usage"]), headers={_CONTRACT_HEADER: "1"})
         )
         with pytest.raises(LLMClientError):
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
 
     @respx.mock
     def test_preflight_fails_when_readyz_ok_but_completion_fails(self, provider: GatewayLLMProvider) -> None:
@@ -1184,19 +1184,19 @@ class TestRuntimePreflight:
             return_value=_gateway_response(_error_body("upstream_unavailable"), status_code=503)
         )
         with pytest.raises(ServerError):
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
 
     @respx.mock
     def test_preflight_readyz_transport_error_raises_network_error(self, provider: GatewayLLMProvider) -> None:
         respx.get(f"{_READYZ_ROOT}/readyz").mock(side_effect=httpx.ConnectError("refused"))
         with pytest.raises(NetworkError):
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
 
     @respx.mock
     def test_preflight_smoke_test_request_shape(self, provider: GatewayLLMProvider) -> None:
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "1"}))
         route = respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(content="ok")))
-        provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+        provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
         sent_body = json.loads(route.calls.last.request.content)
         assert sent_body["model"] == "standard"
         assert sent_body["max_tokens"] == 32
@@ -1207,14 +1207,14 @@ class TestRuntimePreflight:
         the completions path (fix-round-1 minor)."""
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body()))
         with pytest.raises(LLMClientError) as exc_info:
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
         assert exc_info.value.retryable is False
 
     @respx.mock
     def test_preflight_fails_when_readyz_contract_header_mismatched(self, provider: GatewayLLMProvider) -> None:
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "2"}))
         with pytest.raises(LLMClientError) as exc_info:
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
         assert exc_info.value.retryable is False
 
     @respx.mock
@@ -1227,7 +1227,7 @@ class TestRuntimePreflight:
         del body["capabilities"]
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=body, headers={_CONTRACT_HEADER: "1"}))
         with pytest.raises(LLMClientError) as exc_info:
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
         assert exc_info.value.retryable is False
 
     @respx.mock
@@ -1240,7 +1240,7 @@ class TestRuntimePreflight:
         del body["adapter"]
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=body, headers={_CONTRACT_HEADER: "1"}))
         with pytest.raises(LLMClientError) as exc_info:
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
         assert exc_info.value.retryable is False
 
     @respx.mock
@@ -1258,14 +1258,14 @@ class TestRuntimePreflight:
         body["adapter"] = malformed_adapter
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=body, headers={_CONTRACT_HEADER: "1"}))
         with pytest.raises(LLMClientError) as exc_info:
-            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
         assert exc_info.value.retryable is False
 
     @respx.mock
     def test_preflight_captures_adapter_identity_as_forensic_metadata(self, provider: GatewayLLMProvider) -> None:
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "1"}))
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(content="ok")))
-        provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
+        provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", temperature=0.0, model="standard")
         assert provider._last_readyz_adapter_identity == {
             "name": "reference_v1_invoke",
             "version": "1.0.0",

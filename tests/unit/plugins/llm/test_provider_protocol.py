@@ -334,7 +334,7 @@ class TestLLMProviderProtocol:
                 messages: list[dict[str, str]],
                 *,
                 model: str,
-                temperature: float,
+                temperature: float | None,
                 max_tokens: int | None,
                 audit_parent: LLMAuditParent,
             ) -> LLMQueryResult:
@@ -345,7 +345,9 @@ class TestLLMProviderProtocol:
                     model=model,
                 )
 
-            def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
+            def runtime_preflight(
+                self, *, operation_id: str, model: str, temperature: float | None, coordination_token: CoordinationToken
+            ) -> None:
                 del operation_id, model
 
             def close(self) -> None:

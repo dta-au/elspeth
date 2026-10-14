@@ -66,6 +66,15 @@ class _OpenRouterHTTPClientDouble:
         self.post = _SyncCallRecorder(side_effect=post_response)
         self.close = _SyncCallRecorder()
 
+    @contextmanager
+    def stream(self, method: str, url: str, **kwargs: Any) -> Iterator[httpx.Response]:
+        assert method == "POST"
+        response = self.post(url, **kwargs)
+        try:
+            yield response
+        finally:
+            response.close()
+
     def __enter__(self) -> _OpenRouterHTTPClientDouble:
         return self
 

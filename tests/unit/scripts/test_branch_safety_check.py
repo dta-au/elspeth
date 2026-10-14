@@ -11,6 +11,15 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "branch-safety-check.sh"
 
 
+@pytest.fixture(autouse=True)
+def isolated_git_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Temporary repositories must not inherit operator pruning or other policy."""
+    for scope in ("GLOBAL", "SYSTEM"):
+        config = tmp_path / f"git-{scope.lower()}.config"
+        config.write_text("", encoding="utf-8")
+        monkeypatch.setenv(f"GIT_CONFIG_{scope}", str(config))
+
+
 def _git(repo: Path, *args: str, expected: int = 0) -> str:
     result = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=False)
     assert result.returncode == expected, result.stdout + result.stderr
@@ -271,6 +280,11 @@ def test_excluded_alias_never_falls_back_to_an_unrelated_branch(fetch_repo: tupl
         _git(repo, "config", "remote.mirror.fetch", mapping)
     result = _preflight(repo, "merge", "--base", base, "--fetch")
     assert result.returncode == (0 if has_mirror_owner else 1), result.stdout + result.stderr
+    if has_mirror_owner:
+        assert "refreshed from mirror:refs/heads/release/0.8.2" in result.stdout
+    else:
+        assert "[FAIL] fetch-base" in result.stdout
+        assert "excluded by all its configured mappings" in result.stdout
     assert _git(repo, "rev-parse", base).strip() == (new if has_mirror_owner else old)
     assert "refreshed from origin:refs/heads/rc-candidate" not in result.stdout
 

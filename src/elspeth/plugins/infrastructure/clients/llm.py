@@ -17,7 +17,7 @@ import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType, RunMode
 from elspeth.contracts.call_data import CallPayload, LLMCallError, LLMCallRequest, LLMCallResponse, LLMErrorCategory, RawCallPayload
 from elspeth.contracts.call_governance import LLMCallGovernance
-from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.chat_parts import ChatMessage, audit_messages, image_response_is_audit_safe, wire_messages
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import PluginRetryableError
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 _AUDIT_SAFE_PROVIDER_ERROR = "LLM provider request failed"
+_AUDIT_SAFE_IMAGE_ERROR = "LLM response refused by image audit policy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,6 +418,7 @@ class AuditedLLMClient(AuditedClientBase):
     def _replay_completion(
         self,
         *,
+        messages: Sequence[ChatMessage],
         request_dto: LLMCallRequest,
         call_index: int,
         approved_prompt_artifact_hash: str | None,
@@ -464,7 +466,8 @@ class AuditedLLMClient(AuditedClientBase):
                 provider_cost_source=cast(ComposerLLMProviderCostSource, raw_cost_source),
                 category=category,
             )
-            self._record_call(
+            self._record_image_call(
+                messages=messages,
                 call_index=call_index,
                 call_type=CallType.LLM,
                 status=CallStatus.ERROR,
@@ -530,7 +533,8 @@ class AuditedLLMClient(AuditedClientBase):
             latency_ms=0.0 if evidence.latency_ms is None else evidence.latency_ms,
             raw_response=response_dto.raw_response,
         )
-        self._record_call(
+        self._record_image_call(
+            messages=messages,
             call_index=call_index,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -552,9 +556,10 @@ class AuditedLLMClient(AuditedClientBase):
         )
         return response
 
-    def _record_call(
+    def _record_image_call(
         self,
         *,
+        messages: Sequence[ChatMessage],
         call_index: int,
         call_type: CallType,
         status: CallStatus,
@@ -567,6 +572,27 @@ class AuditedLLMClient(AuditedClientBase):
         llm_call_attempt: str | None = None,
         source_call_id: str | None = None,
     ) -> Call:
+        image_rejected = any(
+            payload is not None and not image_response_is_audit_safe(messages, payload) for payload in (response_data, error)
+        )
+        if image_rejected:
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY:
+                raise contract_errors.AuditIntegrityError("Recorded LLM evidence violates image audit policy")
+            pricing = next((payload for payload in (error, response_data) if isinstance(payload, (LLMCallError, LLMCallResponse))), None)
+            pricing_model = None if pricing is None else pricing.pricing_model
+            if not image_response_is_audit_safe(messages, RawCallPayload({"pricing_model": pricing_model})):
+                pricing_model = None
+            status = CallStatus.ERROR
+            response_data = None
+            error = LLMCallError(
+                type="ImageResponsePolicyError",
+                message=_AUDIT_SAFE_IMAGE_ERROR,
+                retryable=False,
+                category="response_processing",
+                pricing_model=pricing_model,
+                provider_cost=None if pricing is None else pricing.provider_cost,
+                provider_cost_source="not_available" if pricing is None else pricing.provider_cost_source,
+            )
         call = super()._record_call(
             call_index=call_index,
             call_type=call_type,
@@ -593,6 +619,17 @@ class AuditedLLMClient(AuditedClientBase):
                 live_response_data=None if response_data is None else response_data.to_dict(),
                 live_error_data=None if error is None else error.to_dict(),
             )
+        if image_rejected:
+            self._emit_telemetry_after_audit(
+                call_status=CallStatus.ERROR,
+                latency_ms=0.0 if latency_ms is None else latency_ms,
+                request_data=request_data.to_dict(),
+                request_payload=request_data,
+                response_data=None,
+                response_payload=None,
+                token_usage=token_usage if token_usage.has_data else None,
+            )
+            raise LLMClientError(_AUDIT_SAFE_IMAGE_ERROR, retryable=False)
         return call
 
     def _emit_telemetry_after_audit(
@@ -713,6 +750,7 @@ class AuditedLLMClient(AuditedClientBase):
 
         if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY:
             return self._replay_completion(
+                messages=messages,
                 request_dto=request_dto,
                 call_index=call_index,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
@@ -756,7 +794,8 @@ class AuditedLLMClient(AuditedClientBase):
             # Classify error for retry decision
             is_retryable = error_class in {"rate_limit", "server", "network"}
 
-            self._record_call(
+            self._record_image_call(
+                messages=messages,
                 llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
@@ -832,7 +871,8 @@ class AuditedLLMClient(AuditedClientBase):
             # The LLM call happened — record it before re-raising so the
             # audit trail reflects the consumed tokens even though we can't
             # fully read/serialize the response.
-            self._record_call(
+            self._record_image_call(
+                messages=messages,
                 llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
@@ -879,7 +919,8 @@ class AuditedLLMClient(AuditedClientBase):
         except (ValueError, AttributeError) as model_exc:
             error_msg = f"{model_exc}. Provider returned malformed data at Tier 3 boundary."
             response_payload = RawCallPayload(raw_response)
-            self._record_call(
+            self._record_image_call(
+                messages=messages,
                 llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
@@ -925,7 +966,8 @@ class AuditedLLMClient(AuditedClientBase):
                 usage=usage,
                 raw_response=raw_response,
             )
-            self._record_call(
+            self._record_image_call(
+                messages=messages,
                 llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
@@ -973,7 +1015,8 @@ class AuditedLLMClient(AuditedClientBase):
         except AttributeError as attr_exc:
             error_msg = f"LLM response missing expected attribute at Tier-3 boundary: {attr_exc}"
             response_payload = RawCallPayload(raw_response)
-            self._record_call(
+            self._record_image_call(
+                messages=messages,
                 llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
@@ -1022,7 +1065,8 @@ class AuditedLLMClient(AuditedClientBase):
                     usage=usage,
                     raw_response=raw_response,
                 )
-                self._record_call(
+                self._record_image_call(
+                    messages=messages,
                     llm_call_attempt=llm_call_attempt,
                     call_index=call_index,
                     call_type=CallType.LLM,
@@ -1070,7 +1114,8 @@ class AuditedLLMClient(AuditedClientBase):
                 usage=usage,
                 raw_response=raw_response,
             )
-            self._record_call(
+            self._record_image_call(
+                messages=messages,
                 llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
@@ -1115,7 +1160,8 @@ class AuditedLLMClient(AuditedClientBase):
                 f"LLM response content is {type(content).__name__}, expected str. Provider returned malformed data at Tier 3 boundary."
             )
             response_payload = RawCallPayload(raw_response)
-            self._record_call(
+            self._record_image_call(
+                messages=messages,
                 llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
@@ -1161,7 +1207,8 @@ class AuditedLLMClient(AuditedClientBase):
         )
         response_data = response_dto.to_dict()
 
-        self._record_call(
+        self._record_image_call(
+            messages=messages,
             llm_call_attempt=llm_call_attempt,
             call_index=call_index,
             call_type=CallType.LLM,
