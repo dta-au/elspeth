@@ -420,6 +420,35 @@ def _assert_no_sentinel_leak(
             assert len(calls) == 1
             assert fields["role"] == "audit"
             assert fields["writer_principal"] == "compose_loop"
+            if calls[0]["evidence"]["status"] == "operation_failure":
+                assert operation is not None
+                assert fields["content"] == "Private credential-filtered operation failure facts"
+                assert fields["session_id"] == operation["session_id"]
+                evidence = ComposerDiagnosticEvidence.from_envelope(
+                    calls[0], expected_session_id=operation["session_id"], expected_operation_id=operation["session_operation_id"]
+                )
+                correlation = "operation:" + operation["operation_id"]
+                assert evidence.tool_name == "composer_failure" and evidence.tool_call_id == correlation
+                assert evidence.evidence_id == diagnostic_evidence_identity("operation-failure", correlation)
+                assert evidence.operation_epoch == operation["session_operation_epoch"]
+                assert evidence.arguments.content is not None and evidence.result.content is not None
+                assert json.loads(evidence.arguments.content) == {
+                    "durable_operation_id": operation["operation_id"],
+                    "request_id": operation["request_id"],
+                    "diagnostic_id": json.loads(operation["result_json"])["diagnostic_id"],
+                    "failure_code": operation["failure_code"],
+                    "correlation_kind": "internal_operation",
+                }
+                facts = json.loads(evidence.result.content)
+                assert facts["record_type"] == "failure_facts"
+                assert len(evidence.result.content.encode("utf-8")) <= 8192
+                assert any(
+                    node["class"] == expected_failure_class and {"disposition": "retained", "text": failure_text} in node["arguments"]
+                    for node in facts["nodes"]
+                )
+                del calls[0]["evidence"]["result"]["content"]
+                assert _PROVIDER_LEAK_SENTINEL not in json.dumps(fields, default=str)
+                continue
             assert fields["content"] == "Private credential-filtered diagnostic facts"
             assert all(fields[key] is None for key in ("raw_content", "tool_call_id", "composition_state_id", "parent_assistant_id"))
             assert operation is not None
@@ -471,10 +500,16 @@ def _assert_no_sentinel_leak(
                 assert json.loads(evidence.result.content) == {
                     "record_type": "failure_facts",
                     "termination": "complete",
+                    "termination_reasons": [],
+                    "omitted_edges": 0,
+                    "trimmed_arguments": 0,
+                    "edges": [],
                     "nodes": [
                         {
+                            "id": 0,
                             "relation": "exception",
                             "class": expected_failure_class,
+                            "suppressed_context": False,
                             "arguments": [{"disposition": "retained", "text": failure_text}],
                             "omitted_arguments": 0,
                         }
@@ -658,16 +693,44 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
         "Read customers.csv and explain: write is a pipeline operation.",
         "Read customers.csv and summarize the data, then write a summary in this chat.",
     }
-    expected_calls = 1 if message in single_transition_requests else 2
+    expected_primary_calls = 1 if message in single_transition_requests else 2
     completion = AsyncMock(spec=litellm.acompletion, side_effect=_conversational_completion())
     reconciliation_completion = AsyncMock(spec=litellm.acompletion, side_effect=_conversational_completion())
     requests = []
+    primary_requests = []
+    advisor_requests = []
 
     async def physical_completion(**kwargs):
-        requests.append(deepcopy({key: kwargs[key] for key in ("model", "messages", "tools")}))
-        if len(requests) == 1:
+        request = deepcopy({"model": kwargs["model"], "messages": kwargs["messages"], "tools": kwargs.get("tools")})
+        requests.append(request)
+        if kwargs["model"] != "test/planner":
+            assert kwargs["model"] == composer._settings.composer_advisor_model
+            advisor_requests.append(request)
+            assert len(advisor_requests) == 1, "An unbudgeted additional END transition must not occur"
+            return _Response(
+                choices=[
+                    _Choice(
+                        message=_Message(
+                            content=json.dumps(
+                                {
+                                    "verdict": "CLEAN",
+                                    "category": "other",
+                                    "steps": [],
+                                    "findings": "The reply reports no pipeline changes and makes no completion claim.",
+                                    "note": None,
+                                    "publication_verdict": "ADMIT",
+                                }
+                            )
+                        )
+                    )
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+            )
+        primary_requests.append(request)
+        assert len(primary_requests) <= expected_primary_calls, "An unbudgeted primary transition must not occur"
+        if len(primary_requests) == 1:
             return await completion(**kwargs)
-        if len(requests) == 2:
+        if len(primary_requests) == 2:
             return await reconciliation_completion(**kwargs)
         raise AssertionError("An unbudgeted third provider transition must not occur")
 
@@ -692,9 +755,12 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
     settled.result()
     ordinary_loop.assert_awaited_once()
     completion.assert_awaited_once()
-    assert physical_sdk.await_count == expected_calls
-    assert len(requests) == expected_calls
-    assert requests[0]["messages"][-2:] == [
+    assert len(primary_requests) == expected_primary_calls
+    assert len(advisor_requests) == 1
+    assert physical_sdk.await_count == len(requests) == expected_primary_calls + 1
+    assert requests == [*primary_requests, *advisor_requests]
+    assert advisor_requests[0]["tools"] is None
+    assert requests[0]["messages"][-3:-1] == [
         {"role": "user", "content": message},
         {
             "role": "system",
@@ -711,7 +777,21 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
             ),
         },
     ]
-    if expected_calls == 2:
+    assert requests[0]["messages"][-1]["role"] == "system"
+    assert json.loads(requests[0]["messages"][-1]["content"]) == {
+        "retained_operation_history": {
+            "availability": "available",
+            "has_more": False,
+            "outcomes": [],
+            "scope": "Bounded retained failures for this authenticated session and actor; not complete lifetime history.",
+            "interpretation": (
+                "Saved revision counts describe operation-local persistence, not requested edits or request satisfaction. "
+                "Unknown attribution is not zero progress. No retained failure does not establish prior success. "
+                "These outcomes do not describe the current session head or this request's effects."
+            ),
+        }
+    }
+    if expected_primary_calls == 2:
         reconciliation_completion.assert_awaited_once()
         assert requests[1]["model"] == requests[0]["model"]
         assert requests[1]["tools"] == requests[0]["tools"]
@@ -735,14 +815,14 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
     else:
         reconciliation_completion.assert_not_awaited()
     audit_rows = _llm_audit_rows(engine)
-    assert len(audit_rows) == expected_calls
+    assert len(audit_rows) == expected_primary_calls + 1
     actual_calls = [row.tool_calls[0]["call"] for row in audit_rows]
-    assert len({call["call_id"] for call in actual_calls}) == expected_calls
+    assert len({call["call_id"] for call in actual_calls}) == expected_primary_calls + 1
     assert {call["messages_hash"] for call in actual_calls} == {stable_hash(request["messages"]) for request in requests}
     for request in requests:
         matching = [call for call in actual_calls if call["messages_hash"] == stable_hash(request["messages"])]
         assert len(matching) == 1
-        assert matching[0]["tools_spec_hash"] == stable_hash(request["tools"])
+        assert matching[0]["tools_spec_hash"] == (stable_hash(request["tools"]) if request["tools"] is not None else None)
         assert matching[0]["model_requested"] == request["model"]
         assert matching[0]["status"] == "success"
     assert asyncio.run(sessions.list_composition_proposals(UUID(session_id))) == []

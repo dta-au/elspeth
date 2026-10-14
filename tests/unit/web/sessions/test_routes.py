@@ -5485,7 +5485,30 @@ class TestMessageRoutes:
             assert isinstance(captured[0], asyncio.CancelledError)
             assert captured[0].args == (COMPOSER_SHUTDOWN,)
             messages = await service.get_messages(uuid.UUID(session_id), limit=None)
-            assert [message.role for message in messages] == ["user"]
+            assert [message.role for message in messages] == ["user", "audit"]
+            private = messages[1]
+            assert private.writer_principal == "compose_loop" and private.composition_state_id is None
+            assert private.tool_calls is not None and len(private.tool_calls) == 1
+            assert private.tool_calls[0]["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
+            operation_id = final.json()["operation_id"]
+            job = app.state.composer_async_operation_authority.get(session_id=uuid.UUID(session_id), operation_id=operation_id)
+            assert job is not None
+            evidence = ComposerDiagnosticEvidence.from_envelope(
+                private.tool_calls[0], expected_session_id=session_id, expected_operation_id=job.session_operation_id
+            )
+            correlation = "operation:" + operation_id
+            assert evidence.status == "operation_failure" and evidence.tool_name == "composer_failure"
+            assert evidence.tool_call_id == correlation
+            assert evidence.evidence_id == diagnostic_evidence_identity("operation-failure", correlation)
+            assert evidence.operation_epoch == job.session_operation_epoch
+            assert evidence.arguments.content is not None
+            assert json.loads(evidence.arguments.content) == {
+                "durable_operation_id": operation_id,
+                "request_id": job.request_id,
+                "diagnostic_id": final.json()["error"]["diagnostic_id"],
+                "failure_code": job.failure_code,
+                "correlation_kind": "internal_operation",
+            }
             snapshot = await app.state.composer_progress_registry.get_latest(session_id)
             assert snapshot.phase == "failed"
 

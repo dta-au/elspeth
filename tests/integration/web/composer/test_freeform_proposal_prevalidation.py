@@ -99,7 +99,14 @@ def _fake_llm_response(*, content: str | None = None, tool_calls: tuple[dict[str
 
 async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
     """Keep proposal-prevalidation tests independent of the real advisor."""
+    if _kwargs["phase"] == "end":
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 
+        review = _kwargs["publication_review"]
+        assert type(review) is AdvisorPublicationReview
+        return AdvisorCheckpointVerdict(
+            ok=True, blocking=False, findings_text="CLEAN", publication_verdict="ADMIT", publication_binding=review.binding
+        )
     return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
 
 

@@ -339,6 +339,7 @@ async def test_template_scaffold_cannot_satisfy_assessment_completion(tmp_path: 
                 content=json.dumps(
                     {
                         "verdict": "FLAGGED",
+                        "publication_verdict": "WITHHOLD",
                         "category": "other",
                         "steps": [],
                         "findings": "The report scaffold has no assessment transforms and reads the report template instead of case studies.",
@@ -359,4 +360,12 @@ async def test_template_scaffold_cannot_satisfy_assessment_completion(tmp_path: 
     assert result.advisor_gate_decision.fact.note is not None
     assert "case-study" in result.advisor_gate_decision.fact.note
     assert "completion advisory review did not clear" in result.message.lower()
-    assert "assessment" in result.message.lower()
+    assert "The assessment pipeline is complete." not in result.message
+    assert service._sessions_service is not None
+    stored = await service._sessions_service.get_messages(UUID(session_id), limit=None)
+    withheld = [
+        row
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0].get("origin") == "advisor_publication_withheld"
+    ]
+    assert len(withheld) == 1 and withheld[0].content == "The assessment pipeline is complete."

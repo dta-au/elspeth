@@ -1969,9 +1969,8 @@ class TestComposerMultiTurnToolCalls:
 
     @pytest.mark.asyncio
     async def test_advisor_cohort_keeps_every_replaced_reply_recoverable(self) -> None:
-        """The advisor-repair cohort publishes fixed copy in place of the
-        model's prose on the repair tool turn and on the terminal. What the
-        user sees is unchanged; the replaced words must still exist somewhere."""
+        """Verified request effects replace completion prose without losing any private reply."""
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
         from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
@@ -1981,8 +1980,24 @@ class TestComposerMultiTurnToolCalls:
                 content="Renaming it as the review asked.",
                 tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
             ),
-            _make_llm_response(content="Pipeline is ready."),
+            _make_llm_response(content="The pipeline name is now Repaired."),
         ]
+        reviews: list[AdvisorPublicationReview] = []
+
+        async def review_reply(*_args, **kwargs):
+            assert kwargs["phase"] == "end"
+            review = kwargs["publication_review"]
+            assert type(review) is AdvisorPublicationReview
+            reviews.append(review)
+            assert len(reviews) <= 2, "No additional review allowance is supplied by this fixture"
+            flagged = len(reviews) == 1
+            return AdvisorCheckpointVerdict(
+                ok=True,
+                blocking=flagged,
+                findings_text="FLAGGED: sink omits rating" if flagged else "CLEAN",
+                publication_verdict="WITHHOLD" if flagged else "ADMIT",
+                publication_binding=review.binding,
+            )
 
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
@@ -1990,17 +2005,14 @@ class TestComposerMultiTurnToolCalls:
             patch.object(
                 service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
-                new_callable=AsyncMock,
-                side_effect=[
-                    AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating"),
-                    AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
-                ],
+                autospec=True,
+                side_effect=review_reply,
             ),
         ):
             result = await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
 
-        # Published behaviour is untouched: fixed copy, prose withheld.
-        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
+        assert len(reviews) == 2 and reviews[0].binding != reviews[1].binding
+        assert result.message == "The pipeline name is now Repaired."
         assert result.raw_assistant_content is None
 
         assert service._sessions_service is not None
@@ -2013,7 +2025,6 @@ class TestComposerMultiTurnToolCalls:
         assert withheld == [
             ("repair_gate_superseded", "Looks ready to me."),
             ("advisor_repair_tool_turn", "Renaming it as the review asked."),
-            ("advisor_repair_terminal", "Pipeline is ready."),
         ]
         assert all(row.content != "Renaming it as the review asked." for row in stored if row.role == "assistant")
 

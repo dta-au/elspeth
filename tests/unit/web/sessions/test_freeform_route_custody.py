@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from dataclasses import replace
 from uuid import UUID, uuid4
@@ -14,6 +15,7 @@ from sqlalchemy import event, select
 from sqlalchemy.sql.dml import Insert
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence, diagnostic_evidence_identity
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -340,7 +342,32 @@ async def test_response_projection_fault_cannot_publish_false_complete(
             records = await service.get_messages(UUID(session_id), limit=None)
             # Source34 runs before the atomic terminal commit: no assistant escapes rollback.
             assert sum(message.role == "assistant" for message in records) == 0
-            assert sum(message.role == "audit" for message in records) == 1
+            audits = [message for message in records if message.role == "audit"]
+            assert all(message.tool_calls is not None and len(message.tool_calls) == 1 for message in audits)
+            by_kind = {message.tool_calls[0]["_kind"]: message for message in audits}
+            assert set(by_kind) == {DIAGNOSTIC_EVIDENCE_KIND, "llm_call_audit"}
+            assert by_kind["llm_call_audit"].tool_calls[0]["call"]["call_id"] == _llm_call().call_id
+            assert len(audits) == len(by_kind)
+            job = app.state.composer_async_operation_authority.get(session_id=UUID(session_id), operation_id=body["operation_id"])
+            assert job is not None
+            private = by_kind[DIAGNOSTIC_EVIDENCE_KIND]
+            assert private.writer_principal == "compose_loop" and private.composition_state_id is None
+            evidence = ComposerDiagnosticEvidence.from_envelope(
+                private.tool_calls[0], expected_session_id=session_id, expected_operation_id=job.session_operation_id
+            )
+            correlation = "operation:" + body["operation_id"]
+            assert evidence.status == "operation_failure" and evidence.tool_name == "composer_failure"
+            assert evidence.tool_call_id == correlation
+            assert evidence.evidence_id == diagnostic_evidence_identity("operation-failure", correlation)
+            assert evidence.operation_epoch == job.session_operation_epoch
+            assert evidence.arguments.content is not None
+            assert json.loads(evidence.arguments.content) == {
+                "durable_operation_id": body["operation_id"],
+                "request_id": job.request_id,
+                "diagnostic_id": settled.final.json()["error"]["diagnostic_id"],
+                "failure_code": job.failure_code,
+                "correlation_kind": "internal_operation",
+            }
     finally:
         engine.dispose()
 
