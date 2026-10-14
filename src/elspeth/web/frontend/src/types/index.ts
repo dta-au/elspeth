@@ -1182,8 +1182,8 @@ export interface ApiError {
   request_id?: string;
   /** Validated retained diagnostic support reference; never exception detail. */
   diagnostic_id?: string;
-  /** Identity of the authenticated durable terminal that produced this error. */
-  composer_operation?: { operation_id: string; kind: import("./composerOperations").OperationKind };
+  /** Authenticated terminal identity/category, separate from application refusal codes. */
+  composer_operation?: { operation_id: string; kind: import("./composerOperations").OperationKind; failure_code: import("./composerOperations").ComposerOperationError["failure_code"] };
   /** Exact accepted send receipt, distinct from the server request correlation id. */
   failure_code?: string;
   /** Static provider or accounting guidance supplied by the Composer route. */

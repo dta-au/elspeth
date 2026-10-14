@@ -1,7 +1,7 @@
 import { currentAuthGeneration, isCurrentAuthGeneration } from "@/api/authSession";
 import { observeComposerOperation, submitAndObserveComposerOperation, cancelObservedComposerOperation, detachComposerObservers, ComposerActiveAttachment, ComposerObservationDetached, ComposerSessionMissing } from "@/api/composerOperationObserver";
 import { composerCustodySessionIds, composerCustodyRecoveryNotice, composerStopPersistenceLimited, composerCustodyScope, findComposerOperationCustody, samePrincipal } from "./composerOperationCustody";
-import type { OperationCustody, SubmittedCustody, ComposerOperationFailureNotice, ComposerOperationFailureOutcome } from "@/types/composerOperations";
+import type { OperationCustody, SubmittedCustody, ComposerOperationFailureNotice } from "@/types/composerOperations";
 // src/stores/sessionStore.ts
 import { create } from "zustand";
 import type {
@@ -486,9 +486,9 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   const errorText = error === null ? null : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
   const terminalFailure = failure instanceof ComposerActiveAttachment ? failure.terminal.status === "failed" ? failure.terminal.error : null : error;
   const terminalIdentity = terminalFailure?.composer_operation;
-  const observedFailure: ComposerOperationFailureNotice | null = terminalIdentity === undefined || terminalFailure?.failure_code === undefined ? null : {
+  const observedFailure: ComposerOperationFailureNotice | null = terminalFailure === null || terminalIdentity === undefined ? null : {
     session_id: sessionId, operation_id: terminalIdentity.operation_id, kind: terminalIdentity.kind, user_message_id: null,
-    settled_at: null, failure_code: terminalFailure.failure_code as ComposerOperationFailureOutcome["failure_code"], error_type: null,
+    settled_at: null, failure_code: terminalIdentity.failure_code, error_type: null,
     diagnostic_id: terminalFailure.diagnostic_id ?? null,
     request_id: terminalFailure.request_id !== undefined && terminalFailure.request_id.length > 0 && terminalFailure.request_id.length <= 128 ? terminalFailure.request_id : null,
     saved_revisions: { attribution: "unavailable", count: null, latest_state_id: null, latest_version: null },

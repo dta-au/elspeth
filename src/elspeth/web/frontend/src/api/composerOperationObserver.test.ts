@@ -22,6 +22,32 @@ beforeEach(() => {
 });
 afterEach(() => { detachComposerObservers(); vi.useRealTimers(); purgeComposerCustody(); });
 describe("one durable operation observer", () => {
+  it.each([
+    ["http_error", "admission_refused", "admission_refused"],
+    ["http_error", undefined, undefined],
+    ["operation_failed", "admission_refused", "operation_failed"],
+    ["worker_lost", "admission_refused", "worker_lost"],
+    ["request_cancelled", "policy_blocked", "request_cancelled"],
+    ["deadline_expired", "policy_blocked", "deadline_expired"],
+  ] as const)("keeps durable %s separate from body code %s", async (category, semanticCode, expectedCode) => {
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 422, detail: "Synthetic refusal", failure_code: semanticCode });
+    const diagnosticId = category === "operation_failed" ? other : null;
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({
+      ...snapshot(), status: "failed", result: null,
+      error: { http_status: 422, body: { detail: "Synthetic refusal", ...(semanticCode === undefined ? {} : { failure_code: semanticCode }) }, error_type: null, failure_code: category, diagnostic_id: diagnosticId },
+    });
+    const failure = await submitAndObserveComposerOperation(descriptor()).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      failure_code: expectedCode,
+      composer_operation: { operation_id: id, kind: "compose_message", failure_code: category },
+      diagnostic_id: diagnosticId ?? undefined,
+    });
+    expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+    expect(api.fetchComposerOperation).toHaveBeenCalledTimes(1);
+    expect(api.cancelComposerOperation).not.toHaveBeenCalled();
+  });
+
   it("falls back after stream EOF and applies only the final authenticated GET", async () => {
     vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(new Response(new ReadableStream({ start(controller) { controller.close(); } }), { headers: { "Content-Type": "text/event-stream" } }));
     const result = await submitAndObserveComposerOperation(descriptor());

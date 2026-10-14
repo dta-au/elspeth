@@ -160,11 +160,12 @@ export async function observeComposerOperation(initial: OperationCustody, option
         backoff = 1000;
         if (snapshot.status === "completed" || snapshot.status === "failed") {
           if (snapshot.status === "failed") validateComposerRecoveryBody(snapshot.error!.body, initial.sessionId);
-          const terminalError = snapshot.status === "failed" ? {
-            ...await api.apiErrorFromBody(snapshot.error!.http_status, snapshot.error!.body),
-            failure_code: snapshot.error!.failure_code,
+          const bodyError = snapshot.status === "failed" ? await api.apiErrorFromBody(snapshot.error!.http_status, snapshot.error!.body) : null;
+          const terminalError = bodyError !== null ? {
+            ...bodyError,
+            failure_code: snapshot.error!.failure_code === "http_error" ? bodyError.failure_code : snapshot.error!.failure_code,
             diagnostic_id: snapshot.error!.diagnostic_id ?? undefined,
-            composer_operation: { operation_id: snapshot.operation_id, kind: snapshot.kind },
+            composer_operation: { operation_id: snapshot.operation_id, kind: snapshot.kind, failure_code: snapshot.error!.failure_code },
           } : null;
           check();
           durableTerminal = true;
