@@ -9,9 +9,10 @@ python3 -m http.server 8080 --bind 127.0.0.1 --directory website
 node website/check-contrast.mjs
 ```
 
-The Pages workflow uploads this directory directly on an authorized manual
-dispatch from the protected repository default branch, using a trusted Nyx
-runner. Automatic push publication is held by the deploy job guard.
+The Pages workflow uploads this directory directly on relevant website/workflow
+pushes to the protected repository default branch. Manual dispatch from that
+same branch is also supported. Pull requests and untrusted refs cannot deploy.
+Deployment uses a trusted Nyx runner and the existing `github-pages` environment.
 A local preview is not a deployment. Changes to the tutorial fixture under
 `tutorial-site/` are separate from the public site.
 
