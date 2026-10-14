@@ -310,6 +310,34 @@ describe("ChatPanel", () => {
     expect(useSessionStore.getState().messages).toHaveLength(1);
   });
 
+  it("groups retained-history loading, recovery and pagination with their actual actions", () => {
+    const loadOutcomes = vi.fn().mockResolvedValue(undefined);
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      composerFailureHistoryLoading: true,
+      composerFailureNextCursor: "earlier-page",
+      loadComposerFailureOutcomes: loadOutcomes,
+    });
+    const { container } = render(<ChatPanel />);
+    const controls = container.querySelector(".chat-panel-history-controls");
+    expect(controls).toContainElement(screen.getByText("Loading saved operation outcomes…"));
+    expect(controls).toContainElement(screen.getByRole("button", { name: "Load earlier outcomes" }));
+    expect(screen.getByRole("button", { name: "Load earlier outcomes" })).toBeDisabled();
+    act(() => useSessionStore.setState({
+      composerFailureHistoryLoading: false,
+      composerFailureHistoryError: "Could not load saved operation outcomes.",
+    }));
+    expect(controls).toContainElement(screen.getByText("Could not load saved operation outcomes."));
+    expect(controls).toContainElement(screen.getByRole("button", { name: "Retry outcomes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry outcomes" }));
+    expect(loadOutcomes).toHaveBeenLastCalledWith();
+    fireEvent.click(screen.getByRole("button", { name: "Load earlier outcomes" }));
+    expect(loadOutcomes).toHaveBeenLastCalledWith(true);
+    expect(loadOutcomes).toHaveBeenCalledTimes(2);
+    act(() => useSessionStore.setState({ composerFailureHistoryError: null, composerFailureNextCursor: null }));
+    expect(container.querySelector(".chat-panel-history-controls")).toBeNull();
+  });
+
   it("does not mount run results in the freeform authoring pane", () => {
     useSessionStore.setState({
       activeSessionId: "session-1",

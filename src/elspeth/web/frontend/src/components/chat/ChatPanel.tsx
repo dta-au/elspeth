@@ -1184,9 +1184,13 @@ export function ChatPanelContent({
               {standaloneFailureOutcomes.map((outcome) => <ComposerOperationOutcomeNotice key={`${outcome.session_id}:${outcome.operation_id}`} outcome={outcome} />)}
             </section>
           )}
-          {failureHistoryLoading && <p role="status">Loading saved operation outcomes…</p>}
-          {failureHistoryError !== null && <div role="status"><p>{failureHistoryError}</p><Button onClick={() => void loadFailureOutcomes()}>Retry outcomes</Button></div>}
-          {failureNextCursor !== null && <Button disabled={failureHistoryLoading} onClick={() => void loadFailureOutcomes(true)}>Load earlier outcomes</Button>}
+          {(failureHistoryLoading || failureHistoryError !== null || failureNextCursor !== null) && (
+            <div className="chat-panel-history-controls">
+              {failureHistoryLoading && <p role="status">Loading saved operation outcomes…</p>}
+              {failureHistoryError !== null && <div role="status"><p>{failureHistoryError}</p><Button onClick={() => void loadFailureOutcomes()}>Retry outcomes</Button></div>}
+              {failureNextCursor !== null && <Button disabled={failureHistoryLoading} onClick={() => void loadFailureOutcomes(true)}>Load earlier outcomes</Button>}
+            </div>
+          )}
           {/* Standalone fallback for the inline-source summary: only painted
               when no complete agent turn exists to absorb it into the bubble
               (e.g. session-restore where a composition was loaded before any
