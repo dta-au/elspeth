@@ -137,6 +137,7 @@ def _minimal_inline_blob_args(content: str) -> dict[str, Any]:
         "source": {
             "plugin": "csv",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": {"schema": {"mode": "observed"}},
             "inline_blob": {
                 "filename": "ada.csv",

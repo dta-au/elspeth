@@ -463,6 +463,7 @@ def test_effect_resolution_and_summaries_never_write_seeded_blob_storage(tmp_pat
         "source": {
             "plugin": "csv",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "inline_blob": {"filename": "input.csv", "mime_type": "text/csv", "content": "SECRET_SENTINEL_RAW"},
         },
         "nodes": [],
@@ -1547,6 +1548,8 @@ class TestComposerMultiTurnToolCalls:
         otherwise that reply can anchor on (quote/rebut) text the real user
         never saw. The repair turn's own tool-call/tool-result messages
         (which carry the real state change) must NOT be elided."""
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
+
         catalog = _mock_catalog()
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
@@ -1571,17 +1574,23 @@ class TestComposerMultiTurnToolCalls:
             tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
         )
         # Turn 3: no tool calls again -> END advisor gate re-runs, CLEAN -> finalize.
-        turn3 = _make_llm_response(content="Pipeline is ready.")
+        turn3 = _make_llm_response(content="The pipeline name is now Repaired.")
+        reviews: list[AdvisorPublicationReview] = []
 
-        verdicts = iter(
-            [
-                AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating"),
-                AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
-            ]
-        )
-
-        async def _fake_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
-            return next(verdicts)
+        async def _fake_advisor_checkpoint(*_args: object, **kwargs: Any) -> AdvisorCheckpointVerdict:
+            assert kwargs["phase"] == "end"
+            review = kwargs["publication_review"]
+            assert type(review) is AdvisorPublicationReview
+            reviews.append(review)
+            assert len(reviews) <= 2, "No additional review allowance is supplied by this fixture"
+            flagged = len(reviews) == 1
+            return AdvisorCheckpointVerdict(
+                ok=True,
+                blocking=flagged,
+                findings_text="FLAGGED: sink omits rating" if flagged else "CLEAN",
+                publication_verdict="WITHHOLD" if flagged else "ADMIT",
+                publication_binding=review.binding,
+            )
 
         responses = iter([turn1, turn2, turn3])
         captured_messages: list[list[dict[str, Any]]] = []
@@ -1594,12 +1603,15 @@ class TestComposerMultiTurnToolCalls:
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
-            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True, side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
-        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
+        assert len(reviews) == 2 and reviews[0].binding != reviews[1].binding
+        assert result.state.metadata.name == "Repaired"
+        assert result.message == "The pipeline name is now Repaired."
+        assert result.raw_assistant_content is None
         assert len(captured_messages) == 3
         # Turn 2 (the repair call) saw the injected advisor findings.
         assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
@@ -1802,6 +1814,8 @@ class TestComposerMultiTurnToolCalls:
 
     @pytest.mark.asyncio
     async def test_advisor_rereview_without_mutation_is_explicit_not_a_blind_replay(self) -> None:
+        from elspeth.web.composer.advisor_decision import AdvisorGateBlocked
+
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         state = CompositionState(
             source=SourceSpec(
@@ -1819,33 +1833,63 @@ class TestComposerMultiTurnToolCalls:
         service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
             service._advisor_checkpoint, AdvisorCheckpointOwner
         )  # type: ignore[method-assign]
+        reviewed: list[dict[str, Any]] = []
+
+        async def rereview(
+            arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
+        ) -> tuple[str, dict[str, object]]:
+            review = json.loads(arguments["publication_review"])
+            reviewed.append(review)
+            assert len(reviewed) <= 2, "Only two END responses are supplied"
+            assert review["current_request"] == "Review this pipeline"
+            assert review["candidate_reply"] == ("Looks ready.", "The pipeline has no configured output.")[len(reviewed) - 1]
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
+            if on_provider_dispatch is not None:
+                on_provider_dispatch()
+            return json.dumps(
+                {
+                    "verdict": "FLAGGED",
+                    "category": "other",
+                    "steps": [],
+                    "findings": "FLAGGED: missing output",
+                    "note": "Configure a pipeline output.",
+                    "publication_verdict": "WITHHOLD",
+                }
+            ), {}
 
         with (
             patch.object(
                 service._provider_gateway,
                 "_call_llm",
                 new_callable=AsyncMock,
-                side_effect=[_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")],
-            ),
+                side_effect=[
+                    _make_llm_response(content="Looks ready."),
+                    _make_llm_response(content="The pipeline has no configured output."),
+                ],
+            ) as primary_call,
             patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=_advisor_checkpoint_responses(
-                    _advisor_checkpoint_reply(verdict="FLAGGED", findings="FLAGGED: missing output", note="Configure a pipeline output."),
-                    _advisor_checkpoint_reply(verdict="CLEAN", findings="", note=None),
-                ),
+                side_effect=rereview,
             ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
-        assert result.runtime_preflight is None or result.runtime_preflight.is_valid
+        assert primary_call.await_count == advisor_call.await_count == len(reviewed) == 2
+        assert reviewed[0]["current_graph_hash"] == reviewed[1]["current_graph_hash"]
+        assert result.state == state
+        assert result.tool_invocations == ()
+        assert isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
+        assert "Looks ready." not in result.message
+        assert "The pipeline has no configured output." not in result.message
         second_arguments = advisor_call.await_args_list[1].args[0]
         assert any("FLAGGED: missing output" in item for item in second_arguments["recent_errors"])
         assert second_arguments["attempted_actions"] == ["No successful pipeline mutation occurred since the prior advisor pass."]
         assert "current evidence identity" in second_arguments["problem_summary"].lower()
-        assert "prior evidence identity" in second_arguments["problem_summary"].lower()
+        assert "prior semantic repair evidence identity" in second_arguments["problem_summary"].lower()
 
     @staticmethod
     def _wired_source_only_state() -> CompositionState:
@@ -2533,6 +2577,11 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        supplied_arguments = {"plugin": "csv"}
+        declared_required = tuple(tool_registry._DECLARATIONS_BY_NAME["set_source"].json_schema["required"])
+        missing = tuple(name for name in declared_required if name not in supplied_arguments)
+        assert missing == ("on_success", "options")
+        missing_detail = ", ".join(missing)
 
         # Turn 1: set_source with missing required field
         bad_call = _make_llm_response(
@@ -2540,12 +2589,12 @@ class TestComposerErrorHandling:
                 {
                     "id": "call_bad",
                     "name": "set_source",
-                    "arguments": {"plugin": "csv"},  # missing on_success
+                    "arguments": supplied_arguments,
                 }
             ],
         )
         # Turn 2: text
-        text = _make_llm_response(content="Fixed.")
+        text = _make_llm_response(content="No pipeline changes were saved.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             script = _ReconciliationLLMScript(bad_call, text, text)
@@ -2557,7 +2606,15 @@ class TestComposerErrorHandling:
         _assert_no_mutation_empty_state_blocker(
             result,
             tool_name="set_source",
-            expected_detail="on_success, options, on_validation_failure",
+            expected_detail=missing_detail,
+        )
+        assert len(result.tool_invocations) == 1
+        invocation = result.tool_invocations[0]
+        assert invocation.error_class == "ToolArgumentError"
+        assert invocation.error_message == f"missing: {missing_detail}"
+        assert result.runtime_preflight.checks[0].detail == (
+            "No composition-state mutation completed successfully; state_exists=false. Blocking result: "
+            f"set_source failed before mutation (ToolArgumentError: missing: {missing_detail})."
         )
 
     @pytest.mark.asyncio

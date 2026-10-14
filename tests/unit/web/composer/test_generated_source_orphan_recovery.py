@@ -128,6 +128,7 @@ async def test_historical_orphan_rebind_requests_new_term_and_resolves_strictly(
                     "blob_id": blob_ids[source_name],
                     "source_name": source_name,
                     "on_success": f"{source_name}_rows",
+                    "on_validation_failure": "discard",
                     "options": {"schema": {"mode": "observed"}},
                 },
                 state,

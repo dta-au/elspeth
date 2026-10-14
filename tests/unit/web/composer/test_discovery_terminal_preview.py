@@ -20,6 +20,7 @@ from elspeth.web.composer.service import (
 )
 from elspeth.web.composer.state import OutputSpec, SourceSpec, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 from elspeth.web.execution.schemas import ValidationResult
 from tests.unit.web.composer._helpers import (
     _clean_advisor_checkpoint,
@@ -150,7 +151,15 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
     async def advisor(*args: object, **kwargs: Any) -> AdvisorCheckpointVerdict:
         advisor_phases.append(kwargs["phase"])
         if final_kind in {"advisor_block", "protocol_echo_advisor_block"}:
-            return AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="The requested output needs review.")
+            review = kwargs["publication_review"]
+            assert type(review) is AdvisorPublicationReview
+            return AdvisorCheckpointVerdict(
+                ok=True,
+                blocking=True,
+                findings_text="The requested output needs review.",
+                publication_verdict="WITHHOLD",
+                publication_binding=review.binding,
+            )
         return await _clean_advisor_checkpoint(*args, **kwargs)
 
     monkeypatch.setattr(service._advisor_checkpoint, "_run_advisor_checkpoint", advisor)
@@ -187,7 +196,13 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
         elif final_kind in {"protocol_echo", "protocol_echo_advisor_block"}:
             assert result.message.count("final reply is unavailable") == 1
             assert _PROTOCOL_ECHO not in result.message
-            assert result.raw_assistant_content == ""
+            if final_kind == "protocol_echo_advisor_block":
+                # The rejected echo is absent; the retained prefix explains
+                # the verified absence of saved mutations in this request.
+                assert result.raw_assistant_content == "No pipeline changes were saved in this request."
+                assert result.message.startswith(result.raw_assistant_content)
+            else:
+                assert result.raw_assistant_content == ""
             assert len(result.llm_calls) == 2
             assert tuple(call.status for call in result.llm_calls) == (
                 ComposerLLMCallStatus.SUCCESS,

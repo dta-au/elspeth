@@ -16,11 +16,13 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.application_policy import PluginPolicyContextFactory
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.composer_preflight import ComposerPreflight
+from elspeth.web.composer.composition_completion import CompositionCompletion
 from elspeth.web.composer.pipeline_commit import PipelineCommitError
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.planning_application import PlanningApplication
@@ -345,6 +347,8 @@ async def test_actual_planner_creation_cancel_retains_nonzero_child_rejection_sc
     from tests.unit.web.test_app import _settings
 
     settings = _settings(tmp_path, operator_metrics_bearer_token=None)
+    advisor_checkpoint = MagicMock(spec=AdvisorCheckpointOwner)
+    completion = MagicMock(spec=CompositionCompletion)
     planner = PlanningApplication(
         sessions_service=service,
         policy_context=MagicMock(spec=PluginPolicyContextFactory),
@@ -364,6 +368,8 @@ async def test_actual_planner_creation_cancel_retains_nonzero_child_rejection_sc
         endpoint_api_key=None,
         advisor_endpoint_base_url=None,
         advisor_endpoint_api_key=None,
+        advisor_checkpoint=advisor_checkpoint,
+        completion=completion,
     )
     telemetry_original = RuntimeError("actual creation postSQL telemetry failure")
     if telemetry_failure:
@@ -440,6 +446,8 @@ async def test_actual_planner_creation_cancel_retains_nonzero_child_rejection_sc
             ).one()
         events = proposal_events(engine, row.id)
         assert len(events) == 1 and events[0].payload["reason_code"] == "request_cancelled"
+        assert advisor_checkpoint.mock_calls == []
+        assert completion.mock_calls == []
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)

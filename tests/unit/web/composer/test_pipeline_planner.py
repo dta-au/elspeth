@@ -6782,6 +6782,7 @@ _INJECTED_CLAUSE = f"Invalid options for transform '{_INJECTED_PLUGIN}'"
                     "plugin": "field_mapper",
                     "input": "clean",
                     "on_success": "out",
+                    "on_error": "discard",
                     "options": {"bogus_option": True},
                 }
             ],
@@ -6793,7 +6794,7 @@ _INJECTED_CLAUSE = f"Invalid options for transform '{_INJECTED_PLUGIN}'"
             "output",
             None,
             [],
-            [{"sink_name": "out", "plugin": "json", "options": {}}],
+            [{"sink_name": "out", "plugin": "json", "options": {}, "on_write_failure": "discard"}],
             [("source", "csv"), ("sink", "json")],
             id="producer-output",
         ),
@@ -6823,7 +6824,14 @@ def test_every_producer_records_the_identity_it_resolved(
         "edges": [],
         "outputs": outputs
         if outputs is not None
-        else [{"sink_name": "out", "plugin": "json", "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}}}],
+        else [
+            {
+                "sink_name": "out",
+                "plugin": "json",
+                "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
+            }
+        ],
         "metadata": {"name": "p"},
     }
     if sources is None:
@@ -6854,7 +6862,14 @@ def test_the_secret_ref_placement_producer_records_its_identity_too(tmp_path: Pa
             "source": _bad_source(blobs, **{"schema": {"mode": "observed"}, _INJECTED_CLAUSE: {"secret_ref": "N"}}),
             "nodes": [],
             "edges": [],
-            "outputs": [{"sink_name": "out", "plugin": "json", "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}}}],
+            "outputs": [
+                {
+                    "sink_name": "out",
+                    "plugin": "json",
+                    "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}},
+                    "on_write_failure": "discard",
+                }
+            ],
             "metadata": {"name": "p"},
         },
         _empty_state(),
@@ -6923,11 +6938,19 @@ def test_no_model_authored_text_can_inject_an_identity_into_the_contract_attach(
                     "plugin": "field_mapper",
                     "input": "clean",
                     "on_success": "out",
+                    "on_error": "discard",
                     "options": {"bogus_option": True},
                 }
             ],
             "edges": [],
-            "outputs": [{"sink_name": "out", "plugin": "json", "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}}}],
+            "outputs": [
+                {
+                    "sink_name": "out",
+                    "plugin": "json",
+                    "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}},
+                    "on_write_failure": "discard",
+                }
+            ],
             "metadata": {"name": "p"},
         },
         _empty_state(),

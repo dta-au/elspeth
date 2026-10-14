@@ -20,6 +20,7 @@ not a downstream integration miss.
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from typing import Any
 
@@ -321,7 +322,7 @@ class TestCacheMarkersWiredAtCallSite:
         state = _empty_state()
         captured: list[dict[str, Any]] = []
 
-        text_response = _make_llm_response(content="Done.")
+        text_response = _make_llm_response(content="No pipeline changes were saved.")
         anthropic_response = _Resp(choices=text_response.choices, usage={"prompt_tokens": 10, "completion_tokens": 2})
 
         async def fake_acompletion(**kwargs: Any) -> Any:
@@ -342,8 +343,23 @@ class TestCacheMarkersWiredAtCallSite:
             # the sliding tail advances past the prior assistant response.
             sent_messages = request["messages"]
             system_messages = [m for m in sent_messages if m.get("role") == "system"]
-            assert len(system_messages) == 1
-            stable_system_msg = system_messages[0]
+            assert len(system_messages) == 2
+            stable_system_msg, retained_history_msg = system_messages
+            assert stable_system_msg is sent_messages[0]
+            assert json.loads(retained_history_msg["content"]) == {
+                "retained_operation_history": {
+                    "availability": "unknown",
+                    "has_more": False,
+                    "outcomes": [],
+                    "scope": (
+                        "No authenticated retained operation history was supplied; do not infer prior success or zero saved progress."
+                    ),
+                }
+            }
+            if retained_history_msg is sent_messages[-1]:
+                assert retained_history_msg["cache_control"] == {"type": "ephemeral"}
+            else:
+                assert "cache_control" not in retained_history_msg
             catalog_context_msg = sent_messages[1]
             state_context_msg = sent_messages[2]
             assert stable_system_msg["cache_control"] == {"type": "ephemeral"}
@@ -407,7 +423,7 @@ class TestCacheMarkersWiredAtCallSite:
         state = _empty_state()
         captured: list[dict[str, Any]] = []
 
-        text_response = _make_llm_response(content="Done.")
+        text_response = _make_llm_response(content="No pipeline changes were saved.")
         oai_response = _Resp(choices=text_response.choices, usage={"prompt_tokens": 10, "completion_tokens": 2})
 
         async def fake_acompletion(**kwargs: Any) -> Any:
@@ -425,7 +441,18 @@ class TestCacheMarkersWiredAtCallSite:
         for request, call in zip(captured, result.llm_calls, strict=True):
             sent_messages = request["messages"]
             system_messages = [m for m in sent_messages if m.get("role") == "system"]
-            assert len(system_messages) == 1
+            assert len(system_messages) == 2
+            assert system_messages[0] is sent_messages[0]
+            assert json.loads(system_messages[1]["content"]) == {
+                "retained_operation_history": {
+                    "availability": "unknown",
+                    "has_more": False,
+                    "outcomes": [],
+                    "scope": (
+                        "No authenticated retained operation history was supplied; do not infer prior success or zero saved progress."
+                    ),
+                }
+            }
             for message in sent_messages:
                 assert "cache_control" not in message
             assert sent_messages[1]["role"] == "user"

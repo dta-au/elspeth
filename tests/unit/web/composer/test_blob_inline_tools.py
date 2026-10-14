@@ -958,6 +958,7 @@ class TestSetSourceFromBlobMode:
             {
                 "blob_id": blob.data["blob_id"],
                 "on_success": "rows",
+                "on_validation_failure": "discard",
                 "options": {
                     "schema": {"mode": "observed"},
                     INTERPRETATION_REQUIREMENTS_KEY: [
@@ -988,7 +989,12 @@ class TestSetSourceFromBlobMode:
 
         result = execute_tool(
             "set_source_from_blob",
-            {"blob_id": blob.data["blob_id"], "on_success": "rows", "options": {"schema": {"mode": "observed"}}},
+            {
+                "blob_id": blob.data["blob_id"],
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
             _empty_state(),
             _catalog(),
             data_dir=blob_env["data_dir"],
@@ -1011,7 +1017,12 @@ class TestSetSourceFromBlobMode:
         blob = _create_blob(blob_env, filename="input.csv", mime_type="text/csv", content="name\nAda")
         result = execute_tool(
             "set_source_from_blob",
-            {"blob_id": blob.data["blob_id"], "on_success": "rows", "options": {"schema": {"mode": "observed"}}},
+            {
+                "blob_id": blob.data["blob_id"],
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
             _empty_state(),
             _catalog(),
             data_dir=blob_env["data_dir"],

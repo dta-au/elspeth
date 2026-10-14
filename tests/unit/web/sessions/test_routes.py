@@ -4393,6 +4393,7 @@ class TestIDORCoverageDrift:
             "send_message",
             "recompose",
             "get_composer_operation",
+            "list_composer_operation_failures",
             "cancel_composer_operation",
             "stream_operation",
             "get_composer_preferences",
@@ -4762,6 +4763,15 @@ class TestIDORProtection:
         # Bob tries to GET messages -- should be 404
         resp = bob_client.get(f"/api/sessions/{session_id}/messages")
         assert resp.status_code == 404
+
+        # Retained operation outcomes are private to the session owner.
+        resp = bob_client.get(f"/api/sessions/{session_id}/operations")
+        assert resp.status_code == 404
+        assert resp.headers["Cache-Control"] == "no-store"
+        resp = alice_client.get(f"/api/sessions/{session_id}/operations")
+        assert resp.status_code == 200
+        assert resp.json() == {"session_id": session_id, "items": [], "next_cursor": None}
+        assert resp.headers["Cache-Control"] == "no-store"
 
         # Bob tries to POST a message -- should be 404
         resp = bob_client.post(
@@ -6224,6 +6234,7 @@ class TestMessageRoutes:
         """A failed success cohort rolls back before complete failure evidence commits."""
         from sqlalchemy import select
 
+        from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
         from elspeth.web.sessions.models import chat_messages_table, token_usage_ledger_table
 
         app, service = _make_app(tmp_path)
@@ -6270,7 +6281,7 @@ class TestMessageRoutes:
             phase = (kwargs["audit_only"], len(kwargs["drafts"]))
             cohort_phases.append(phase)
             cohort_contexts.append(kwargs["session_operation_context"])
-            if kwargs["audit_only"]:
+            if kwargs["audit_only"] and len(cohort_phases) == 2:
                 assert cohort_phases == [(False, 2), (True, 2)]
                 existing_roles = (
                     conn.execute(
@@ -6283,6 +6294,12 @@ class TestMessageRoutes:
                 )
                 assert existing_roles == ["user"], "a success bundle prefix survived before failure evidence"
                 rollback_witnessed = True
+            elif kwargs["audit_only"]:
+                assert cohort_phases == [(False, 2), (True, 2), (True, 1)]
+                terminal_draft = kwargs["drafts"][0]
+                assert terminal_draft.role == "audit"
+                assert len(terminal_draft.tool_calls) == 1
+                assert terminal_draft.tool_calls[0]["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
             return original_cohort(conn, **kwargs)
 
         service._write_audit_cohort_on_connection = witnessed_cohort
@@ -6298,8 +6315,8 @@ class TestMessageRoutes:
         )
 
         assert llm_audit_inserts["count"] == 4
-        assert cohort_phases == [(False, 2), (True, 2)]
-        assert cohort_contexts[0] == cohort_contexts[1]
+        assert cohort_phases == [(False, 2), (True, 2), (True, 1)]
+        assert cohort_contexts[0] == cohort_contexts[1] == cohort_contexts[2]
         assert rollback_witnessed
         composer.compose.assert_awaited_once()
         messages = asyncio.run(service.get_messages(session_id, limit=None))
@@ -6313,6 +6330,29 @@ class TestMessageRoutes:
         assert all(row.composition_state_id is None for row, _envelope in audit_rows)
         assert [envelope["call"]["prompt_tokens"] for _row, envelope in audit_rows] == [13, 13]
         assert [envelope["call"]["completion_tokens"] for _row, envelope in audit_rows] == [8, 8]
+        private_rows = [
+            message
+            for message in messages
+            if message.role == "audit" and message.tool_calls and message.tool_calls[0]["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
+        ]
+        assert len(private_rows) == 1
+        evidence = ComposerDiagnosticEvidence.from_envelope(
+            private_rows[0].tool_calls[0],
+            expected_session_id=str(session_id),
+            expected_operation_id=cohort_contexts[2].fence.operation_id,
+            expected_tool_call_id="operation:" + body["operation_id"],
+        )
+        assert evidence.operation_epoch == cohort_contexts[2].fence.operation_epoch
+        assert evidence.tool_name == "composer_failure"
+        assert evidence.status == "operation_failure"
+        assert evidence.arguments.content is not None
+        correlation = json.loads(evidence.arguments.content)
+        assert correlation["durable_operation_id"] == body["operation_id"]
+        assert correlation["correlation_kind"] == "internal_operation"
+        assert evidence.result.content is not None
+        facts = json.loads(evidence.result.content)
+        assert facts["record_type"] == "failure_facts"
+        assert any(node["class"] == "OperationalError" for node in facts["nodes"])
         with service._engine.connect() as connection:
             ledger = connection.execute(
                 select(token_usage_ledger_table.c.prompt_tokens, token_usage_ledger_table.c.completion_tokens).where(

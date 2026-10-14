@@ -286,4 +286,30 @@ async def test_recovery_and_actual_audit_sql_failure_retain_group_and_recover_on
         assert result.http_status == 500 and result.error_type == "audit_integrity_error"
         assert "CANARY" not in terminal.result_json
         assert ledger_snapshot() == ledger
-        assert tuple(message for message in await service.get_messages(session.id, limit=None) if message.role == "audit") == cohort
+        settled_cohort = tuple(message for message in await service.get_messages(session.id, limit=None) if message.role == "audit")
+        assert settled_cohort[:-1] == cohort
+        assert len(settled_cohort) == len(cohort) + 1
+        assert settled_cohort[-1].content == "Private credential-filtered operation failure facts"
+        assert settled_cohort[-1].tool_calls is not None and len(settled_cohort[-1].tool_calls) == 1
+        terminal_evidence = ComposerDiagnosticEvidence.from_envelope(
+            settled_cohort[-1].tool_calls[0],
+            expected_session_id=str(session.id),
+            expected_operation_id=job.lease.context.fence.operation_id,
+            expected_tool_call_id="operation:" + terminal.operation_id,
+        )
+        assert terminal_evidence.operation_epoch == job.lease.context.fence.operation_epoch
+        assert terminal_evidence.tool_name == "composer_failure" and terminal_evidence.status == "operation_failure"
+        assert terminal_evidence.arguments.disposition == "retained" and terminal_evidence.arguments.content is not None
+        assert json.loads(terminal_evidence.arguments.content) == {
+            "durable_operation_id": terminal.operation_id,
+            "request_id": terminal.request_id,
+            "diagnostic_id": result.diagnostic_id,
+            "failure_code": result.failure_code,
+            "correlation_kind": "internal_operation",
+        }
+        assert terminal_evidence.result.disposition == "retained" and terminal_evidence.result.content is not None
+        facts = json.loads(terminal_evidence.result.content)
+        assert facts["record_type"] == "failure_facts"
+        assert any(node["class"] == "ComposerOwnedSettlementFailure" for node in facts["nodes"])
+        assert "state private cause" in terminal_evidence.result.content
+        assert "audit private cause" in terminal_evidence.result.content
