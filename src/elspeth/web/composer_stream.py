@@ -104,6 +104,9 @@ class BoundedComposerStreamResponse(Response):
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         outstanding: set[asyncio.Task[object]] = set()
         headers_attempted = False
+        headers_completed = False
+        send_active = False
+        final_attempted = False
         released = False
         cancellable: set[asyncio.Task[object]] = set()
 
@@ -139,11 +142,33 @@ class BoundedComposerStreamResponse(Response):
                     return
 
         async def emit(message: Message) -> None:
+            nonlocal send_active
             if message["type"] == "http.response.body" and message["body"] and self._may_send is not None and not self._may_send():
                 raise ComposerStreamAuthorizationDenied
-            await send(message)
+            send_active = True
+            try:
+                await send(message)
+            finally:
+                send_active = False
 
         disconnect = asyncio.create_task(disconnected())
+
+        async def finish_response() -> None:
+            nonlocal final_attempted
+            if not headers_completed or final_attempted or send_active or disconnect.done():
+                return
+            # A failed or resistant closing send is never retried. It remains
+            # in outstanding so subscriber capacity follows actual completion.
+            final_attempted = True
+            try:
+                await bounded(
+                    emit({"type": "http.response.body", "body": b"", "more_body": False}), self._send_deadline, cancel_on_timeout=True
+                )
+            except (TimeoutError, SQLAlchemyError, AuditIntegrityError, AsyncWorkerAdmissionTimeoutError) as exc:
+                structlog.get_logger(__name__).info(
+                    "composer_stream.closed", reason="bounded_close_failure", failure_class=type(exc).__name__
+                )
+
         try:
             if not await bounded(self._authorize(), 2.0):
                 raise HTTPException(status_code=404, detail="Session not found", headers={"Cache-Control": "no-store"})
@@ -153,6 +178,7 @@ class BoundedComposerStreamResponse(Response):
                 self._send_deadline,
                 cancel_on_timeout=True,
             )
+            headers_completed = True
             deadline = asyncio.get_running_loop().time() + self._lifetime
             iterator = self._frames.__aiter__()
             while True:
@@ -175,6 +201,7 @@ class BoundedComposerStreamResponse(Response):
                             reason="peer_disconnect" if disconnect in done else "read_deadline",
                             read_remaining_seconds=read_deadline - asyncio.get_running_loop().time(),
                         )
+                        await finish_response()
                         return
                     remaining = deadline - asyncio.get_running_loop().time()
                 try:
@@ -194,14 +221,10 @@ class BoundedComposerStreamResponse(Response):
                 await bounded(
                     emit({"type": "http.response.body", "body": frame, "more_body": True}), self._send_deadline, cancel_on_timeout=True
                 )
-            await bounded(
-                emit({"type": "http.response.body", "body": b"", "more_body": False}), self._send_deadline, cancel_on_timeout=True
-            )
+            await finish_response()
         except ComposerStreamAuthorizationDenied:
             structlog.get_logger(__name__).info("composer_stream.closed", reason="expiry_before_send")
-            await bounded(
-                send({"type": "http.response.body", "body": b"", "more_body": False}), self._send_deadline, cancel_on_timeout=True
-            )
+            await finish_response()
         except (TimeoutError, SQLAlchemyError, AuditIntegrityError, AsyncWorkerAdmissionTimeoutError) as exc:
             structlog.get_logger(__name__).info(
                 "composer_stream.closed", reason="bounded_io_failure", failure_class=type(exc).__name__, headers_attempted=headers_attempted
@@ -210,8 +233,9 @@ class BoundedComposerStreamResponse(Response):
                 raise HTTPException(
                     status_code=503, detail="Composer stream is temporarily unavailable", headers={"Cache-Control": "no-store"}
                 ) from exc
-            # The connection closes; unfinished I/O retains subscriber capacity.
-            return
+            # Finish a writable response without overlapping a resistant send.
+            # Unfinished reads and sends retain subscriber capacity separately.
+            await finish_response()
         finally:
             disconnect.cancel()
             outstanding.add(disconnect)
