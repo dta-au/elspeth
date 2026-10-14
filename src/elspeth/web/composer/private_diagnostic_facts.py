@@ -28,28 +28,50 @@ def _safe_text(value: object, limit: int) -> str | None:
 
 
 def capture_failure_facts(exc: BaseException) -> PrivateFailureFacts:
-    """Read only builtin exception storage, never stringification or SDK data."""
+    """Capture a bounded private graph from builtin exception storage only.
+
+    Node relation is first discovery; explicit edges describe all captured
+    relationships. Suppressed context and group membership are provenance,
+    not a selection of the operative cause. Reserve topology before text.
+    """
     nodes: list[JsonValue] = []
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    relation = "exception"
-    termination = "complete"
-    while current is not None and len(nodes) < 5:
-        if id(current) in seen:
-            termination = "cycle"
-            break
-        seen.add(id(current))
+    edges: list[JsonValue] = []
+    seen: dict[int, int] = {}
+    active: set[int] = set()
+    reasons: set[str] = set()
+    text_slots: list[tuple[dict[str, JsonValue], str]] = []
+    omitted_edges = 0
+
+    def visit(current: BaseException, relation: str, depth: int) -> None:
+        nonlocal omitted_edges
+        node_id = len(nodes)
+        seen[id(current)] = node_id
+        active.add(id(current))
         name = type.__dict__["__name__"].__get__(type(current))
+        safe_name = _safe_text(name, 128) or "unavailable"
+        if len(canonical_json(safe_name).encode("utf-8")) > 160:
+            safe_name = "unavailable"
         arguments: list[JsonValue] = []
-        node: dict[str, JsonValue] = {"relation": relation, "class": _safe_text(name, 128) or "unavailable", "arguments": arguments}
+        node: dict[str, JsonValue] = {
+            "id": node_id,
+            "relation": relation,
+            "class": safe_name,
+            "arguments": arguments,
+            "suppressed_context": BaseException.__dict__["__suppress_context__"].__get__(current),
+        }
         args = BaseException.__dict__["args"].__get__(current)
         if type(args) is tuple:
             for argument in args[:4]:
                 safe = _safe_text(argument, 2048)
+                # Filter the whole bounded original before fitting any text.
                 disposition = (
                     "unavailable" if safe is None else ("filtered" if find_credential_material(argument) is not None else "retained")
                 )
-                arguments.append({"disposition": disposition, "text": safe})
+                slot: dict[str, JsonValue] = {"disposition": disposition, "text": None}
+                arguments.append(slot)
+                if safe is not None:
+                    slot["text_omitted"] = True
+                    text_slots.append((slot, safe))
             node["omitted_arguments"] = max(0, len(args) - 4)
         if any(base is OSError for base in type.__dict__["__mro__"].__get__(type(current))[:16]):
             number = OSError.__dict__["errno"].__get__(current)
@@ -58,17 +80,89 @@ def capture_failure_facts(exc: BaseException) -> PrivateFailureFacts:
                 node["errno_name"] = errno.errorcode[number]
         nodes.append(node)
         cause = BaseException.__dict__["__cause__"].__get__(current)
-        suppressed = BaseException.__dict__["__suppress_context__"].__get__(current)
         context = BaseException.__dict__["__context__"].__get__(current)
-        current = cause if cause is not None else (None if suppressed else context)
-        relation = "cause" if cause is not None else "context"
-    if current is not None and termination == "complete":
+        candidates: list[tuple[str, BaseException, int | None]] = []
+        if cause is not None:
+            candidates.append(("cause", cause, None))
+        if context is not None:
+            candidates.append(("context", context, None))
+        try:
+            members = BaseExceptionGroup.__dict__["exceptions"].__get__(current)
+        except TypeError:
+            # The builtin descriptor refuses nongroups without subclass hooks.
+            members = ()
+        if members:
+            node["omitted_members"] = max(0, len(members) - 8)
+            if len(members) > 8:
+                reasons.add("group_member_limit")
+            candidates.extend(("group_member", member, index) for index, member in enumerate(members[:8]))
+        for index, (edge_relation, target, member_index) in enumerate(candidates):
+            if len(edges) == 16:
+                omitted: dict[str, JsonValue] = {
+                    "cause": sum(item[0] == "cause" for item in candidates[index:]),
+                    "context": sum(item[0] == "context" for item in candidates[index:]),
+                    "group_member": sum(item[0] == "group_member" for item in candidates[index:]),
+                }
+                node["omitted_relations"] = omitted
+                omitted_edges += len(candidates) - index
+                reasons.add("edge_limit")
+                break
+            edge: dict[str, JsonValue] = {"from": node_id, "to": None, "relation": edge_relation}
+            if member_index is not None:
+                edge["member_index"] = member_index
+            target_identity = id(target)
+            # Existing targets require neither a new node nor deeper traversal.
+            if target_identity in seen:
+                edge["to"] = seen[target_identity]
+                edge["disposition"] = "cycle" if target_identity in active else "shared"
+                if target_identity in active:
+                    reasons.add("cycle")
+                edges.append(edge)
+            elif depth == 4:
+                edge["disposition"] = "depth_limit"
+                reasons.add("depth_limit")
+                edges.append(edge)
+            elif len(nodes) == 8:
+                edge["disposition"] = "node_limit"
+                reasons.add("node_limit")
+                edges.append(edge)
+            else:
+                edge["to"] = len(nodes)
+                edge["disposition"] = "captured"
+                edges.append(edge)
+                visit(target, edge_relation, depth + 1)
+        active.remove(id(current))
+
+    visit(exc, "exception", 0)
+    if "node_limit" in reasons or "depth_limit" in reasons:
         termination = "node_limit"
-    facts = {"record_type": "failure_facts", "nodes": nodes, "termination": termination}
-    encoded = canonical_json(facts)
-    if len(encoded.encode("utf-8")) > 8192:
-        encoded = canonical_json({"record_type": "failure_facts", "nodes": [], "termination": "serialized_bounds"})
-    return PrivateFailureFacts(encoded)
+    elif "edge_limit" in reasons:
+        termination = "edge_limit"
+    elif "group_member_limit" in reasons:
+        termination = "group_member_limit"
+    else:
+        termination = "cycle" if "cycle" in reasons else "complete"
+    facts: dict[str, JsonValue] = {
+        "record_type": "failure_facts",
+        "nodes": nodes,
+        "edges": edges,
+        "termination": termination,
+        "termination_reasons": cast("list[JsonValue]", sorted(reasons)),
+        "omitted_edges": omitted_edges,
+        "trimmed_arguments": len(text_slots),
+    }
+    trimmed = len(text_slots)
+    for slot, text in text_slots:
+        slot["text"] = text
+        del slot["text_omitted"]
+        facts["trimmed_arguments"] = trimmed - 1
+        if len(canonical_json(facts).encode("utf-8")) <= 8192:
+            trimmed -= 1
+        else:
+            slot["text"] = None
+            slot["text_omitted"] = True
+            facts["trimmed_arguments"] = trimmed
+    return PrivateFailureFacts(canonical_json(facts))
 
 
 def _snapshot(value: object) -> dict[object, object] | None:
