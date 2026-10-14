@@ -46,7 +46,12 @@ _TYPE_DRIVEN_INPUTS: dict[str, dict[str, Any]] = {
     "update_blob": {"blob_id": "blob", "content": "x\n2\n"},
     "set_source_from_blob": {"blob_id": "blob", "on_success": "rows"},
     "set_source_from_blobs": {"blob_ids": ["blob"], "on_success": "rows"},
-    "set_pipeline": {"source": {"plugin": "csv", "on_success": "rows"}, "nodes": [], "edges": [], "outputs": []},
+    "set_pipeline": {
+        "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    },
     "patch_source_options": {"source_name": "source", "patch": {"nested": [None, False, 1]}},
     "patch_node_options": {"node_id": "node", "patch": {"nested": [None, False, 1]}},
     "patch_output_options": {"sink_name": "output", "patch": {"nested": [None, False, 1]}},

@@ -17,6 +17,7 @@ from sqlalchemy import select
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.interpretation_state import (
@@ -281,19 +282,16 @@ class TestSetPipeline:
         assert "source:customers" in result.affected_nodes
         assert "source:orders" in result.affected_nodes
 
-    def test_set_pipeline_source_defaults_validation_failures_to_discard(self) -> None:
-        """Omitting on_validation_failure must not synthesize an absent quarantine sink."""
+    def test_set_pipeline_source_requires_validation_failure_choice(self) -> None:
+        """A full replacement requires an authored validation-failure choice."""
         state = _empty_state()
         catalog = _mock_catalog()
         args = _valid_pipeline_args()
         del args["source"]["on_validation_failure"]
 
-        result = execute_tool("set_pipeline", args, state, catalog)
-
-        assert result.success is True
-        assert _default_source(result.updated_state) is not None
-        assert _default_source(result.updated_state).on_validation_failure == "discard"
-        assert result.data is None
+        with pytest.raises(ToolArgumentError):
+            execute_tool("set_pipeline", args, state, catalog)
+        assert _default_source(state) is None
 
     def test_set_pipeline_missing_json_output_options_returns_exact_repair_hint(self) -> None:
         state = _empty_state()
@@ -1826,6 +1824,7 @@ class TestSetPipeline:
                     "plugin": "passthrough",
                     "input": "in",
                     "on_success": "out",
+                    "on_error": "discard",
                     "options": {"schema": {"mode": "observed"}},
                 },
                 state,
@@ -1870,7 +1869,7 @@ class TestSetPipeline:
                 "plugin": "passthrough",
                 "input": "orphan_channel",
                 "on_success": "main",
-                "on_error": None,
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             }
         )

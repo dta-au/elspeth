@@ -1455,7 +1455,7 @@ class SetSourceArgumentsModel(BaseModel):
     plugin: str
     on_success: str
     options: _LlmJsonObject
-    on_validation_failure: str
+    on_validation_failure: str | None = None
     # One-sentence composer-authored prose for the Spec tab. Free-text scalar
     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
     # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
@@ -1551,19 +1551,11 @@ class SetSourceFromBlobArgumentsModel(BaseModel):
     ``{}`` preserves "absent = no options" at the argument boundary AND
     records it accurately on the audit side as an empty-options dict.
 
-    ``plugin`` and ``on_validation_failure`` keep ``str | None = None``
-    because the handler distinguishes their absent semantics: ``plugin``
-    absent triggers MIME-type-based inference at
-    ``_resolve_source_blob``; ``on_validation_failure`` absent falls back
-    to ``_DEFAULT_SOURCE_VALIDATION_FAILURE`` ("discard").  A default of
-    ``""`` would conflate "operator did not specify" with "operator
-    specified empty string" — fabrication (see
-    docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
-    The model deliberately does NOT judge an authored ``""`` either: what an
-    empty string means is owned by exactly one place, the handler-side
-    ``canonicalize_source_validation_failure`` (``tools/_common``), which
-    folds it into "discard" because "" can never name a sink route
-    (elspeth-bcd7051143).
+    ``plugin`` omission triggers MIME-type-based inference. Failure-choice
+    omission is tracked by model_fields_set and preserves only an existing
+    named source's choice. New sources require an explicit non-empty route;
+    null and empty reach the handler's owned semantic rejection, never a
+    fabricated discard policy.
 
     ``extra="forbid"`` is required (rev-2 M.1).  Fields belonging to
     neighbouring tools (``filename``, ``mime_type``, ``content``,
@@ -1576,7 +1568,7 @@ class SetSourceFromBlobArgumentsModel(BaseModel):
     on_success: str
     source_name: str = "source"
     plugin: _OmittableString = None
-    on_validation_failure: _OmittableString = None
+    on_validation_failure: str | None = None
     options: _LlmJsonObject = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")
@@ -1596,7 +1588,7 @@ class SetSourceFromBlobsArgumentsModel(BaseModel):
     blob_ids: list[str] = Field(min_length=1, max_length=1000)
     on_success: str
     source_name: str = "source"
-    on_validation_failure: _OmittableString = None
+    on_validation_failure: str | None = None
     options: _LlmJsonObject = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")
@@ -1781,7 +1773,7 @@ class _SetPipelineNamedSourceModel(BaseModel):
     plugin: str
     on_success: str
     options: _LlmJsonObject = Field(default_factory=dict)
-    on_validation_failure: str | None = None
+    on_validation_failure: str
     # One-sentence composer-authored prose for the Spec tab. Free-text scalar
     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
     # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
@@ -1818,17 +1810,9 @@ class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
     :class:`SetSourceFromBlobArgumentsModel.options` and applies
     identically here.
 
-    ``on_validation_failure`` default
-    ----------------------------------
-    The handler at :func:`_execute_set_pipeline` canonicalizes both absent
-    (``None``) and the unroutable ``""`` spelling to
-    ``_DEFAULT_SOURCE_VALIDATION_FAILURE`` ("discard") via
-    ``canonicalize_source_validation_failure`` — the single owner of that
-    fold shared by every source-authoring seam (elspeth-bcd7051143).  The
-    model preserves operator-omitted-vs-specified semantics with
-    ``str | None = None`` so the handler can apply the fold explicitly
-    (not via fabrication; see docs/guides/data-trust-and-error-handling.md
-    §The Three-Tier Trust Model).
+    ``on_validation_failure`` is a required nonnullable field inherited from
+    the named-source model. Full replacement cannot borrow an old choice;
+    empty values are rejected by semantic admission without choosing discard.
 
     ``blob_id`` / ``inline_blob`` exclusivity
     ------------------------------------------
@@ -1884,8 +1868,8 @@ class _PipelineNodeModel(BaseModel):
     (``X | None = None``) because the handler at
     :func:`_execute_set_pipeline` distinguishes "absent" from "operator-
     specified empty/default" for several of them (``plugin`` is None for
-    gates and coalesces; ``on_error`` defaults to ``"discard"`` for
-    transform/aggregation when None).  ``options`` defaults to ``{}`` via
+    gates and coalesces; ordinary transform/aggregation ``on_error`` is
+    required by conditional semantic admission). ``options`` defaults to ``{}`` via
     :func:`Field(default_factory=dict)` (matches the handler's
     ``n.get("options", {})``).
 
@@ -2005,14 +1989,14 @@ class _PipelineOutputModel(BaseModel):
     behind reusing the source-side summarizer at the node/output
     boundary.
 
-    ``on_write_failure`` preserves operator-omitted-vs-specified semantics
-    so the handler can apply its ``"discard"`` fallback explicitly.
+    ``on_write_failure`` is required: full replacement never borrows an old
+    sink's choice or applies a server default.
     """
 
     sink_name: str
     plugin: str
     options: _LlmJsonObject = Field(default_factory=dict)
-    on_write_failure: str | None = None
+    on_write_failure: str
     # One-sentence composer-authored prose for the Spec tab. Free-text scalar
     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
     # Sensitive marker (the §4.4.2 walker admits closed-list scalars).

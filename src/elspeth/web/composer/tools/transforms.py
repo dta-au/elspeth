@@ -43,6 +43,7 @@ from elspeth.web.composer.tools._common import (
     _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _STEP_DESCRIPTION_DESCRIPTION,
     EmptyToolArgumentsModel,
+    FailureRouteChoiceError,
     ToolContext,
     ToolResult,
     _apply_merge_patch,
@@ -69,6 +70,7 @@ from elspeth.web.composer.tools._common import (
     _validate_plugin_name,
     _validate_transform_provider_config_path,
     _validate_transform_provider_config_policy,
+    resolve_failure_route_choice,
     review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
@@ -267,7 +269,9 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "type": ["string", "null"],
             "minLength": 1,
             "description": (
-                "Node-level error policy (transform/aggregation/gate): 'discard' or a declared sink name. "
+                "Node-level error policy (transform/aggregation/gate): 'discard' or an eligible named sink. "
+                "New transforms/aggregations require an explicit non-empty choice; omission on an update preserves "
+                "the same node kind's existing choice. Null/empty is invalid for transforms/aggregations. "
                 "For a gate it covers row expression-evaluation errors and is authored here, never as an "
                 "edge; omit it to preserve fail-fast behavior. A failed aggregation batch applies this policy to every buffered row; discard records quarantine outcomes."
             ),
@@ -653,6 +657,20 @@ def _execute_upsert_node(
     plugin = validated.plugin
     node_options: Mapping[str, Any] = validated.options
     existing_node = next((node for node in state.nodes if node.id == node_id), None)
+    prior_node = existing_node if existing_node is not None and existing_node.node_type == node_type else None
+    on_error = validated.on_error
+    if node_type in ("transform", "aggregation"):
+        try:
+            on_error = resolve_failure_route_choice(
+                on_error,
+                supplied="on_error" in validated.model_fields_set,
+                field="on_error",
+                previous=prior_node.on_error if prior_node is not None else None,
+            )
+        except FailureRouteChoiceError as exc:
+            return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=f"node:{node_id}")
+    elif node_type == "gate" and "on_error" not in validated.model_fields_set and prior_node is not None:
+        on_error = prior_node.on_error
     # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
     # from the stored node reduce to author shells; the reconciliation pass
     # below restores the server rows. Non-matching values still reject.
@@ -793,7 +811,7 @@ def _execute_upsert_node(
         plugin=plugin,
         input=validated.input,
         on_success=validated.on_success,
-        on_error=validated.on_error or ("discard" if node_type in ("transform", "aggregation") else None),
+        on_error=on_error,
         options=review_options,
         condition=validated.condition,
         routes=validated.routes,
@@ -883,7 +901,7 @@ def _normalized_splice_node_projection(node: NodeSpec) -> dict[str, Any]:
     return {
         "id": node.id,
         "plugin": node.plugin,
-        "on_error": node.on_error or "discard",
+        "on_error": node.on_error,
         "options": serialize_authoring_review_options(node.options),
     }
 
@@ -1184,7 +1202,7 @@ def _execute_splice_transform(
             plugin=node_args.plugin,
             input_name=existing.input,
             on_success=existing.on_success,
-            on_error=node_args.on_error,
+            on_error=node_args.on_error if "on_error" in node_args.model_fields_set else existing.on_error,
             options=node_args.options,
             existing_options=existing.options,
             description=node_args.description,
@@ -1895,6 +1913,10 @@ def _prepare_transform_candidate(
     description: str | None = None,
 ) -> NodeSpec | ToolResult:
     """Validate and prepare one transform candidate without mutating state."""
+    try:
+        on_error = resolve_failure_route_choice(on_error, supplied=True, field="on_error")
+    except FailureRouteChoiceError as exc:
+        return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=f"node:{node_id}")
     if plugin is None:
         return _failure_result(state, f"Node '{node_id}': transform plugin is required.")
     runtime_owned_error = _runtime_owned_llm_option_error(
@@ -1989,7 +2011,7 @@ def _prepare_transform_candidate(
         plugin=plugin,
         input=input_name,
         on_success=on_success,
-        on_error=on_error or "discard",
+        on_error=on_error,
         options=review_options,
         condition=None,
         routes=None,
@@ -2061,7 +2083,8 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
             "node": {
                 "type": "object",
                 "description": (
-                    "The single transform to insert: provide id, plugin, and options; optionally on_error and description. "
+                    "The single transform to insert: provide id, plugin, options, and an explicit non-empty on_error choice for a NEW insertion. "
+                    "An exact already-applied replay may omit on_error to preserve its existing choice. Description is optional. "
                     "Do not supply node_type, input, or on_success: the tool authors the transform kind and derives routing "
                     "from the insertion point."
                 ),
@@ -2074,7 +2097,7 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
                     },
                     "on_error": {
                         "type": ["string", "null"],
-                        "description": "Optional error route; defaults to discard.",
+                        "description": "Explicit non-empty failure choice required for a NEW insertion. Omit only on a verified identical replay to preserve its choice. Null/empty is invalid; no default.",
                     },
                     "description": {
                         "type": ["string", "null"],

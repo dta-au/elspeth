@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -19,7 +19,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.library_authority import RepositoryLibraryAuthority
-from elspeth.web.sessions.models import identities_table, identity_roles_table, library_entries_table
+from elspeth.web.sessions.models import identities_table, identity_roles_table, library_entries_table, sessions_table
 from elspeth.web.sessions.protocol import SessionNotFoundError, SessionRecord
 from elspeth.web.sessions.routes.workflow.library import create_library_router
 from tests.fixtures.identities import ensure_test_identity
@@ -219,6 +219,41 @@ def test_publish_without_compartment_returns_named_refusal(
     refused = client.post(f"/api/sessions/{session_id}/library/publish", json={"title": "unmarked"})
     assert (refused.status_code, refused.json()["detail"]["error_type"]) == (409, "compartment_not_configured")
     assert events == []
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "sources:\n  PRIVATE_SOURCE_MARKER:\n    plugin: csv\n    on_success: out\n    options: {}\n",
+        'sources:\n  PRIVATE_SOURCE_MARKER:\n    plugin: "null"\n    on_success: out\n    options: {}\n',
+        "sources: [PRIVATE_YAML_MARKER]\n",
+    ],
+)
+def test_fork_invalid_yaml_refuses_before_session_creation_without_private_echo(library_client, monkeypatch, document):
+    client, actor, _events = library_client
+    _, published = _publish(client)
+    actor.identity_id = "carol"
+    accepted = client.post(f"/api/library/{published['entry_id']}/accept", json={})
+    assert accepted.status_code == 200
+    actor.identity_id = "bob"
+    authority = client.app.state.library_authority
+    authorize = authority.authorize_fork_source
+
+    def historical_source(self, **kwargs):
+        # Exercise the real authority read, then supply the older authored
+        # payload at its owned return seam. Authorization is not bypassed.
+        return replace(authorize(**kwargs), payload_yaml=document)
+
+    monkeypatch.setattr(RepositoryLibraryAuthority, "authorize_fork_source", historical_source)
+    engine = client.app.state.session_engine
+    with engine.connect() as conn:
+        before = conn.execute(select(func.count()).select_from(sessions_table)).scalar_one()
+    response = client.post(f"/api/library/{published['entry_id']}/fork")
+    assert response.status_code == 400
+    assert "explicit non-empty failure choices" in response.text
+    assert "PRIVATE_" not in response.text
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(sessions_table)).scalar_one() == before
 
 
 def test_fork_passes_exact_frozen_yaml_and_provenance_to_seed_seam(

@@ -26,10 +26,9 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools import _options_with_default_llm_reviews
 
-# The shared on_validation_failure canonicalizer is the single owner of the
-# missing/"" -> 'discard' fold (elspeth-bcd7051143); deep-importing
-# tools._common is the established cross-package pattern.
-from elspeth.web.composer.tools._common import canonicalize_source_validation_failure
+# Share explicit failure-choice validation with Composer authoring tools;
+# importing YAML must not manufacture a policy the author did not choose.
+from elspeth.web.composer.tools._common import FailureRouteChoiceError, resolve_failure_route_choice
 
 MAX_RUNTIME_YAML_IMPORT_CHARS = 262_144
 _UNSUPPORTED_COALESCE_FIELDS = frozenset(
@@ -565,8 +564,8 @@ def _row_union_branches(value: Any, path: str) -> dict[str, str] | tuple[str, ..
     suppresses=("R1", "R5"),
     invariant=(
         "raises RuntimeYamlImportError on non-mapping entries, unknown structural fields, missing "
-        "plugin/on_success, inline blob_ref, conflicting validation-failure spellings, or non-string "
-        "non-null on_validation_failure; missing, null, and empty routes canonicalize to 'discard'"
+        "plugin/on_success, inline blob_ref, conflicting canonical validation-failure spellings, "
+        "or missing/null/empty/non-string on_validation_failure; never invents a route"
     ),
     test_ref="tests/unit/web/composer/test_yaml_importer.py::test_source_from_runtime_entry_rejects_non_mapping_entry",
     test_fingerprint="464ba44200f35d34d3eed43f62f4a50595385f53a9879dde0a9bd1e898dc8bae",
@@ -583,19 +582,23 @@ def _source_from_runtime_entry(source_name: str, entry: Any) -> SourceSpec:
     options = dict(_json_mapping(source.get("options"), f"{path}.options"))
     if "blob_ref" in options:
         raise RuntimeYamlImportError(f"{path}.options.blob_ref must be supplied via source_blob_ids")
-    on_validation_failure = source.get("on_validation_failure")
-    has_option_on_validation_failure = "on_validation_failure" in options
-    option_on_validation_failure = options.pop("on_validation_failure") if has_option_on_validation_failure else None
-    if "on_validation_failure" in source and has_option_on_validation_failure and on_validation_failure != option_on_validation_failure:
-        raise RuntimeYamlImportError(f"{path} contains conflicting on_validation_failure values at the entry and options levels")
-    if on_validation_failure is None:
-        on_validation_failure = option_on_validation_failure
-    if on_validation_failure is not None and not isinstance(on_validation_failure, str):
-        raise RuntimeYamlImportError(f"{path}.on_validation_failure must be a string or null")
-    # None and "" both mean 'discard' via the shared canonicalizer — the
-    # single owner of that fold (elspeth-bcd7051143), shared with every
-    # composer source-authoring seam.
-    on_validation_failure = canonicalize_source_validation_failure(on_validation_failure)
+    routes: list[str] = []
+    for spelling in (source, options):
+        if "on_validation_failure" not in spelling:
+            continue
+        value = spelling["on_validation_failure"]
+        if type(value) is not str:
+            raise RuntimeYamlImportError("sources.item.on_validation_failure requires an explicit non-empty string")
+        try:
+            routes.append(resolve_failure_route_choice(value, supplied=True, field="on_validation_failure"))
+        except FailureRouteChoiceError as exc:
+            raise RuntimeYamlImportError(f"sources.item: {exc}") from exc
+    if not routes:
+        raise RuntimeYamlImportError("sources.item.on_validation_failure requires an explicit non-empty string")
+    if len(routes) == 2 and routes[0] != routes[1]:
+        raise RuntimeYamlImportError("sources.item contains conflicting on_validation_failure values at the entry and options levels")
+    on_validation_failure = routes[0]
+    options.pop("on_validation_failure", None)
     return SourceSpec(
         plugin=_require_str(source, "plugin", f"sources.{source_name}"),
         on_success=_require_str(source, "on_success", f"sources.{source_name}"),

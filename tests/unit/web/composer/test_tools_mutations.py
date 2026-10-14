@@ -186,7 +186,7 @@ class TestAwsS3EndpointUrlComposerPolicy:
 
         with patch("elspeth.web.composer.tools.sources._resolve_source_blob", return_value=resolved):
             result = _execute_set_source_from_blob(
-                {"blob_id": str(uuid4()), "on_success": "main", "options": {}},
+                {"blob_id": str(uuid4()), "on_success": "main", "on_validation_failure": "discard", "options": {}},
                 state,
                 _trained_tool_context(),
             )
@@ -448,7 +448,7 @@ class TestAwsS3SourceComposerPolicy:
 
         with patch("elspeth.web.composer.tools.sources._resolve_source_blob", return_value=resolved):
             result = _execute_set_source_from_blob(
-                {"blob_id": str(uuid4()), "on_success": "main", "options": {}},
+                {"blob_id": str(uuid4()), "on_success": "main", "on_validation_failure": "discard", "options": {}},
                 state,
                 ToolContext(catalog=view, plugin_snapshot=snapshot),
             )
@@ -480,7 +480,7 @@ class TestAwsS3SourceComposerPolicy:
 
         with patch("elspeth.web.composer.tools.sources._resolve_source_blob", return_value=resolved):
             result = _execute_set_source_from_blob(
-                {"blob_id": str(uuid4()), "on_success": "main", "options": {}},
+                {"blob_id": str(uuid4()), "on_success": "main", "on_validation_failure": "discard", "options": {}},
                 state,
                 _trained_tool_context(),
             )
@@ -545,6 +545,7 @@ class TestAwsS3SourceComposerPolicy:
             {
                 "sink_name": "archive",
                 "plugin": "aws_s3",
+                "on_write_failure": "discard",
                 "options": {"bucket": "test-bucket", "key": "out.jsonl", "schema": {"mode": "observed"}},
             },
             _empty_state(),
@@ -1028,6 +1029,7 @@ class TestUpsertNode:
                 "plugin": "passthrough",
                 "input": "source_out",
                 "on_success": "main",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             state,
@@ -1142,6 +1144,7 @@ class TestUpsertNode:
                 "plugin": "passthrough",
                 "input": "in",
                 "on_success": "out",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             state,
@@ -1238,6 +1241,7 @@ class TestUpsertNode:
                 "plugin": "nonexistent_xyz",
                 "input": "in",
                 "on_success": "out",
+                "on_error": "discard",
                 "options": {},
             },
             state,
@@ -1402,6 +1406,7 @@ class TestUpsertNode:
                 "plugin": "batch_stats",
                 "input": "source_out",
                 "on_success": "main",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}, "value_field": "amount"},
                 "trigger": {"condition": "end_of_source"},
             },
@@ -1455,6 +1460,7 @@ class TestUpsertNode:
                 "plugin": "passthrough",
                 "input": "in",
                 "on_success": "out",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
                 "condition": "this is not python!!!",
             },
@@ -1521,6 +1527,7 @@ class TestUpsertEdge:
                 "plugin": "passthrough",
                 "input": "in",
                 "on_success": "old_stream",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             state,
@@ -1561,6 +1568,7 @@ class TestUpsertEdge:
                 "plugin": "passthrough",
                 "input": "in",
                 "on_success": "out",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             state,
@@ -1846,6 +1854,7 @@ class TestUpsertEdge:
                 "plugin": "passthrough",
                 "input": "in",
                 "on_success": "out",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             state,
@@ -1926,6 +1935,7 @@ class TestUpsertEdge:
                 "plugin": "passthrough",
                 "input": "in",
                 "on_success": "stream_a",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             state,
@@ -1939,6 +1949,7 @@ class TestUpsertEdge:
                 "plugin": "passthrough",
                 "input": "stream_a",
                 "on_success": "out",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             r1.updated_state,
@@ -1966,6 +1977,7 @@ class TestUpsertEdge:
                 "plugin": "passthrough",
                 "input": "in",
                 "on_success": "csv_out",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             state,
@@ -2009,6 +2021,7 @@ class TestRemoveNode:
                 "plugin": "passthrough",
                 "input": "in",
                 "on_success": "out",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             state,
@@ -3181,6 +3194,7 @@ class TestPatchNodeOptions:
                 "plugin": "passthrough",
                 "input": "source_out",
                 "on_success": "main",
+                "on_error": "discard",
                 "options": options,
             },
             state,

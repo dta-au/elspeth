@@ -36,6 +36,26 @@ sinks:
 """
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plugin", ["csv", "null"])
+async def test_public_yaml_missing_failure_choice_is_private_safe_and_atomic(tmp_path: Path, plugin: str) -> None:
+    app, service = _make_app(tmp_path)
+    session = await service.create_session("alice", "Import refused", "local")
+    client = SyncASGITestClient(app)
+    document = (
+        _YAML.replace("    on_validation_failure: discard\n", "")
+        .replace("  source:\n", "  PRIVATE_SOURCE_MARKER:\n")
+        .replace("plugin: csv", f'plugin: "{plugin}"', 1)
+    )
+    response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": document})
+    assert response.status_code == 400
+    assert "on_validation_failure" in response.text
+    assert "PRIVATE_SOURCE_MARKER" not in response.text
+    assert await service.get_current_state(session.id) is None
+    with app.state.session_engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
+
+
 async def _pass_preflight(_state: object, **_context: object) -> ValidationResult:
     return ValidationResult(
         is_valid=True,

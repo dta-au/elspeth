@@ -216,7 +216,7 @@ Set or replace the pipeline source.
 | `plugin` | string | **Yes** | Source plugin name (e.g. `"csv"`, `"json"`, `"text"`) |
 | `on_success` | string | **Yes** | Connection name for downstream nodes (e.g. `"source_out"`) |
 | `options` | object | **Yes** | Plugin-specific configuration (check schema first) |
-| `on_validation_failure` | string | **Yes** | `"discard"` or `"quarantine"` |
+| `on_validation_failure` | string | For new sources | Explicit `"discard"` or an eligible named route. Omission preserves the same existing source's choice; null/empty is invalid. |
 
 **Behaviour:** Replaces the current source entirely. A pipeline must have exactly one source.
 
@@ -236,7 +236,7 @@ row unions, queues, or collectors.
 | `input` | string | **Yes** | Input connection name (must match an upstream `on_success`) |
 | `plugin` | string | No | Plugin name. Required for transforms, aggregations, and collectors. Null for gates, coalesces, row unions, and queues. |
 | `on_success` | string | No | Output connection name. Required for transforms, row unions, and collectors. Null for gates and queues. |
-| `on_error` | string | No | Row-error output — a sink name or `"discard"`; for gates this handles expression-evaluation failures, and omission preserves fail-fast execution. Collectors reject this field because their failures are whole-group verdicts. |
+| `on_error` | string | For new transforms/aggregations | Explicit `"discard"` or an eligible named route. An update may omit it to preserve the same node kind's choice. New gates omit it for fail-fast; gate updates preserve an omitted prior choice and clear to fail-fast with null. Collectors reject this field because failures are whole-group verdicts. |
 | `options` | object | No | Plugin-specific configuration |
 | `condition` | string | No | Gate expression (gates only) |
 | `routes` | object | No | Gate route mapping to a sink name, downstream connection name, `"fork"`, or virtual `"discard"` target, e.g. `{"true": "sink_name", "false": "discard"}` (gates only) |
@@ -341,7 +341,7 @@ Add or replace a pipeline output (sink).
 | `sink_name` | string | **Yes** | Sink name — this is the connection point used in routes and edges |
 | `plugin` | string | **Yes** | Sink plugin name (e.g. `"csv"`, `"json"`, `"database"`) |
 | `options` | object | **Yes** | Plugin-specific configuration (check schema first) |
-| `on_write_failure` | string | No | `"discard"` (default) or `"quarantine"` |
+| `on_write_failure` | string | For new sinks | Explicit `"discard"` or an eligible named route. Omission preserves the same existing sink's choice; null/empty is invalid. |
 
 **Behaviour:** If a sink with the given name exists, it is replaced. A pipeline must have at least one sink.
 
@@ -409,10 +409,10 @@ Atomically replace the entire pipeline in one call.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `source` | object | **Yes** | `{plugin, options, on_success, on_validation_failure?}` |
+| `source` | object | **Yes** | `{plugin, options, on_success, on_validation_failure}`; full replacement requires an explicit nonempty failure choice. |
 | `nodes` | array | **Yes** | Array of `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, `queue`, or `collector` node specs: `[{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, routes?, fork_to?, branches?, policy?, merge?, timeout_seconds?, scope_name?, scope_opener?, scope_policy?}]` |
 | `edges` | array | **Yes** | Array of edge specs: `[{id, from_node, to_node, edge_type}]` |
-| `outputs` | array | **Yes** | Array of output specs: `[{name, plugin, options, on_write_failure?}]` |
+| `outputs` | array | **Yes** | Array of output specs with required explicit `on_write_failure`: `[{name, plugin, options, on_write_failure}]`. |
 | `metadata` | object | No | `{name?, description?}` |
 
 **When to use:** When the user describes a complete pipeline and you can construct the whole thing at once. More efficient than sequential `set_source` + `upsert_node` + `upsert_edge` + `set_output` calls. Also useful for major restructuring where most components change.
@@ -474,7 +474,7 @@ Wire a blob as the pipeline source. Resolves the blob's storage path internally 
 | `blob_id` | string | **Yes** | Blob ID to use as source |
 | `plugin` | string | No | Source plugin override. Inferred from MIME type if omitted. |
 | `on_success` | string | **Yes** | Connection name for downstream nodes |
-| `on_validation_failure` | string | No | `"quarantine"` (default) or `"discard"` |
+| `on_validation_failure` | string | For new sources | Explicit `"discard"` or an eligible named route. Omission preserves the same existing source's choice; null/empty is invalid. |
 
 **When to use:** When the user has uploaded a file through the web UI and wants to use it as the pipeline input. Prefer this over `set_source` for uploaded files — it handles path resolution and plugin inference.
 

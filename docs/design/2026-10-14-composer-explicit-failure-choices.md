@@ -1,10 +1,10 @@
 # Composer explicit failure choices
 
-Status: systems/security ordinary-component contract accepted with the public
-import clarification incorporated below; independent LLM/correctness design
-review remains pending before production or test edits. Tracks GitHub issue
-#171. This changes Composer admission, not runtime failure policy or
-required-control coverage.
+Status: bounded contract accepted by independent systems/security and
+LLM/correctness design reviews, with the subsequent schema/admission
+reconciliation incorporated below. Implementation and code acceptance remain
+separate. Tracks GitHub issue #171. This changes Composer admission, not runtime
+failure policy or required-control coverage.
 
 ## Problem and bounded decision
 
@@ -41,6 +41,13 @@ unchanged; all tools use the ordinary shared contract.
 
 Full `set_pipeline` is a replacement, not a partial update: every required
 ordinary component supplies a choice even if its identifier existed before.
+Full-state sources and sinks have genuinely required nonnullable fields in
+both argument models and declarations. Normal early ARG_ERROR admission remains
+in place for missing/invalid shape; existing closed, sanitized schema paths
+provide a fixed actionable failure-choice repair instruction. No raw preflight
+or schema bypass converts these errors into semantic rejections. Conditional
+transform/aggregation choices remain handler-enforced on the generic node shape;
+the complete semantic contract is intentionally stricter than that grammar.
 An options-only patch preserves existing routing. A changed node kind does not
 inherit a policy from an unrelated prior kind. The new splice transform always
 needs its own choice; an idempotent already-applied splice keeps existing state.
@@ -114,12 +121,17 @@ their provenance is not retroactively relabeled as a new planner decision.
    Existing before-write postdominator and author-around-error refusal remain.
 7. `src/elspeth/web/composer/redaction.py` and tool JSON declarations: preserve
    omission tracking and align nonempty/null semantics with handler admission.
-   Full-state source/sink required fields are advertised as required. Upsert
+   Full-state source/sink fields are required and nonnullable in both models
+   and declarations. Upsert
    and source/sink update descriptions explain new-versus-existing behavior;
    conditional omission cannot be expressed as an unconditional JSON required
    field. Node variants must not globally require `on_error` for gates or
    structural kinds; retain queue-specific refusal rules for authored routing
-   fields. The splice nested transform advertises required `on_error`. Update
+   fields. Splice advertises omission-aware `on_error`: a new insertion must
+   supply a nonempty choice, while a verified identical already-applied replay
+   may omit it and preserve its valid stored choice. Explicit null/empty is
+   refused before idempotent success; changed topology/identity is not replay
+   authority. Update
    schema/model parity, required-path consumers and generated catalog pins from
    the actual producer where affected, never by hand-invented values.
 8. `src/elspeth/web/composer/prompts.py` and `docs/reference/composer-tools.md`:
@@ -185,6 +197,12 @@ are rejected without state/version/proposal mutation. Check owned diagnostic
 field paths and public value privacy. Pair each with explicit discard and
 explicit named-route controls; acceptance of a route value is distinct from
 whole-graph validity or coverage eligibility.
+For full-state source/sink schema failures, inspect the actual ARG_ERROR payload
+and masked paths `source.on_validation_failure`,
+`sources.item.on_validation_failure`, and `outputs.index.on_write_failure`.
+Keep validation_errors and audit classification intact. The ordinary direct
+dispatch diagnostic remains private-safe; the compose-loop repair_instruction
+adds fixed guidance without selecting a route or echoing authored values.
 
 Partial-update controls must prove a named policy and explicit discard survive
 omitted routing, null/empty reject without resetting, changed kind does not

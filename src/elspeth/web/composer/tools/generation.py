@@ -1576,6 +1576,13 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "cannot name a coalesce, row_union or collector: an aggregation never sits inside a bound region.",
     ),
     DirectValidationGuidance(
+        "failure_route_required",
+        "This ordinary component has no explicit non-empty failure choice. Composer does not choose a route for it.",
+        "Supply the component's failure field with 'discard' or an eligible named route. Existing sink and required-control "
+        "restrictions still apply. Null/empty is invalid. Omit the field only when updating the same component to preserve "
+        "its existing choice; full replacement and new components require an explicit choice.",
+    ),
+    DirectValidationGuidance(
         "aggregation_expected_output_count_mode_invalid",
         "expected_output_count is only applicable to aggregation output_mode='transform'.",
         "For passthrough, omit expected_output_count. If transformed output is intended, choose "

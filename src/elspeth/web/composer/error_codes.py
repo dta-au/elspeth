@@ -182,6 +182,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "surface_projection_unavailable",
         "transform_contract_violation",
         "transform_declared_output_not_guaranteed",
+        "failure_route_required",
         "transform_missing_on_error",
         "transform_missing_on_success",
         "transform_missing_plugin",

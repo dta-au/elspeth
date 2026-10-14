@@ -71,8 +71,8 @@ from elspeth.web.composer.tools._common import (
     _FULL_STATE_COMPONENT_ALIAS_SET,
     _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
-    _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
+    FailureRouteChoiceError,
     ReviewedSourceAuthority,
     ToolContext,
     ToolResult,
@@ -107,9 +107,9 @@ from elspeth.web.composer.tools._common import (
     _validate_source_path,
     _validate_transform_provider_config_path,
     _validate_transform_provider_config_policy,
-    canonicalize_source_validation_failure,
     normalize_tool_result_validation,
     rejected_component_prefix,
+    resolve_failure_route_choice,
     review_reconciliation_failure_message,
     validate_composer_file_sink_collision_policy,
 )
@@ -891,6 +891,61 @@ def build_set_pipeline_candidate(
             error_code="no_source_configured",
         )
 
+    source_failure_routes: dict[str, str] = {}
+    node_failure_routes: dict[int, str] = {}
+    output_failure_routes: dict[int, str] = {}
+
+    def _required_choice(
+        value: str | None,
+        *,
+        supplied: bool,
+        field: Literal["on_error", "on_validation_failure", "on_write_failure"],
+        component: str,
+    ) -> str | None:
+        try:
+            return resolve_failure_route_choice(value, supplied=supplied, field=field)
+        except FailureRouteChoiceError as exc:
+            _record_component_rejection(_failure_result(state, str(exc), rejected_component=component, error_code="failure_route_required"))
+            return None
+
+    if validated.source is not None:
+        route = _required_choice(
+            validated.source.on_validation_failure,
+            supplied="on_validation_failure" in validated.source.model_fields_set,
+            field="on_validation_failure",
+            component="source",
+        )
+        if route is not None:
+            source_failure_routes["source"] = route
+    for name, source_model in (validated.sources or {}).items():
+        route = _required_choice(
+            source_model.on_validation_failure,
+            supplied="on_validation_failure" in source_model.model_fields_set,
+            field="on_validation_failure",
+            component=_source_component_id(name),
+        )
+        if route is not None:
+            source_failure_routes[name] = route
+    for index, node in enumerate(validated.nodes):
+        if node.node_type in ("transform", "aggregation"):
+            route = _required_choice(
+                node.on_error, supplied="on_error" in node.model_fields_set, field="on_error", component=f"node:{node.id}"
+            )
+            if route is not None:
+                node_failure_routes[index] = route
+    for index, output in enumerate(validated.outputs):
+        route = _required_choice(
+            output.on_write_failure,
+            supplied="on_write_failure" in output.model_fields_set,
+            field="on_write_failure",
+            component=f"output:{output.sink_name}",
+        )
+        if route is not None:
+            output_failure_routes[index] = route
+    choice_failure = _collected_component_failure()
+    if choice_failure is not None:
+        return choice_failure
+
     # Intrinsic applicability is checked before resolving or preparing source
     # custody. Report only these checks; later plugin/source work has not run.
     for node in validated.nodes:
@@ -996,9 +1051,7 @@ def build_set_pipeline_candidate(
             )
         source_blob_id = legacy_source_model.blob_id
         inline_blob = legacy_source_model.inline_blob
-        # None and "" both mean 'discard' — one shared owner
-        # (elspeth-bcd7051143), so persistence agrees with auto-wiring.
-        src_on_vf = canonicalize_source_validation_failure(legacy_source_model.on_validation_failure)
+        src_on_vf = source_failure_routes["source"]
         if source_blob_id is not None and inline_blob is not None:
             return _failure_result(
                 state, "set_pipeline source must use either an existing blob_id or inline_blob, not both.", rejected_component="source"
@@ -1210,9 +1263,7 @@ def build_set_pipeline_candidate(
             source_ref = _source_component_id(source_name)
             src_plugin = source_model.plugin
             src_options = dict(source_model.options)
-            # None and "" both mean 'discard' — one shared owner
-            # (elspeth-bcd7051143), so persistence agrees with auto-wiring.
-            src_on_vf = canonicalize_source_validation_failure(source_model.on_validation_failure)
+            src_on_vf = source_failure_routes[source_name]
             reviewed_options = _reviewed_source_options(
                 source_name=source_name,
                 plugin=src_plugin,
@@ -1654,7 +1705,7 @@ def build_set_pipeline_candidate(
                         _missing_output_options_repair_error(
                             sink_name=out_name,
                             plugin_name=out_plugin,
-                            on_write_failure=output.on_write_failure if output.on_write_failure is not None else "discard",
+                            on_write_failure=output_failure_routes[index],
                             validation_error=validation_error,
                         ),
                         # The repair hint embeds the sink's option-shape
@@ -1755,7 +1806,7 @@ def build_set_pipeline_candidate(
             plugin=n.plugin,
             input=n.input,
             on_success=n.on_success,
-            on_error=n.on_error or ("discard" if nt in ("transform", "aggregation") else None),
+            on_error=node_failure_routes[node_index] if nt in ("transform", "aggregation") else n.on_error,
             options=canonical_node_options[node_index],
             condition=n.condition,
             routes=n.routes,
@@ -1813,7 +1864,7 @@ def build_set_pipeline_candidate(
                 name=o.sink_name,
                 plugin=o.plugin,
                 options=canonical_out_options[output_index],
-                on_write_failure=o.on_write_failure if o.on_write_failure is not None else "discard",
+                on_write_failure=output_failure_routes[output_index],
                 description=o.description,
             )
         )
@@ -2022,8 +2073,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         ),
                     },
                     "on_validation_failure": {
-                        "type": ["string", "null"],
-                        "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
+                        "type": "string",
+                        "description": "Required explicit non-empty source-validation failure choice: 'discard' or an eligible named sink. Full replacement does not reuse prior choices; null/empty is invalid.",
                     },
                     "description": {
                         "type": ["string", "null"],
@@ -2047,7 +2098,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "required": ["filename", "mime_type", "content"],
                     },
                 },
-                "required": ["plugin", "on_success"],
+                "required": ["plugin", "on_success", "on_validation_failure"],
             },
             "sources": {
                 "type": "object",
@@ -2067,15 +2118,15 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         },
                         "on_success": {"type": "string"},
                         "on_validation_failure": {
-                            "type": ["string", "null"],
-                            "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
+                            "type": "string",
+                            "description": "Required explicit non-empty source-validation failure choice: 'discard' or an eligible named sink. Full replacement does not reuse prior choices; null/empty is invalid.",
                         },
                         "description": {
                             "type": ["string", "null"],
                             "description": _STEP_DESCRIPTION_DESCRIPTION,
                         },
                     },
-                    "required": ["plugin", "on_success"],
+                    "required": ["plugin", "on_success", "on_validation_failure"],
                 },
             },
             "nodes": {
@@ -2108,7 +2159,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "minLength": 1,
                             "description": (
                                 "Node-level error policy (transform/aggregation/gate): 'discard' or a declared sink "
-                                "name. For a gate it covers row expression-evaluation errors and is authored on the "
+                                "name. Transforms/aggregations require an explicit non-empty choice; full replacement "
+                                "does not reuse prior choices. For a gate it covers row expression-evaluation errors and is authored on the "
                                 "node, never as an edge; omit it to preserve fail-fast behavior. A failed aggregation batch applies this policy to every buffered row; discard records quarantine outcomes."
                             ),
                         },
@@ -2241,13 +2293,16 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "type": "object",
                             "description": "Plugin-specific sink config." + _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                         },
-                        "on_write_failure": {"type": ["string", "null"]},
+                        "on_write_failure": {
+                            "type": "string",
+                            "description": "Required explicit non-empty failure choice; full replacement does not reuse prior choices.",
+                        },
                         "description": {
                             "type": ["string", "null"],
                             "description": _STEP_DESCRIPTION_DESCRIPTION,
                         },
                     },
-                    "required": ["sink_name", "plugin"],
+                    "required": ["sink_name", "plugin", "on_write_failure"],
                     "additionalProperties": False,
                     "examples": [
                         {

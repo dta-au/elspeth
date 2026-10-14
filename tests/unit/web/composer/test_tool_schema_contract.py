@@ -61,7 +61,7 @@ def _provider_transported_set_pipeline_schema(provider: str) -> dict[str, Any]:
 
 
 _BASE_PIPELINE: dict[str, Any] = {
-    "source": {"plugin": "csv", "on_success": "rows"},
+    "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
     "nodes": [],
     "edges": [],
     "outputs": [],
@@ -77,8 +77,8 @@ _BASE_PIPELINE: dict[str, Any] = {
         pytest.param(
             "both_non_null",
             {
-                "source": {"plugin": "csv", "on_success": "rows"},
-                "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+                "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
+                "sources": {"orders": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}},
             },
             id="both-non-null",
         ),
@@ -86,14 +86,14 @@ _BASE_PIPELINE: dict[str, Any] = {
             "source_null_with_named_sources",
             {
                 "source": None,
-                "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+                "sources": {"orders": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}},
             },
             id="source-null-with-named-sources",
         ),
         pytest.param(
             "sources_null_with_singular_source",
             {
-                "source": {"plugin": "csv", "on_success": "rows"},
+                "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
                 "sources": None,
             },
             id="sources-null-with-singular-source",
@@ -121,9 +121,9 @@ def test_set_pipeline_source_selection_is_rejected_by_provider_and_runtime_contr
 @pytest.mark.parametrize(
     "source_selection",
     [
-        pytest.param({"source": {"plugin": "csv", "on_success": "rows"}}, id="singular-source"),
+        pytest.param({"source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}}, id="singular-source"),
         pytest.param(
-            {"sources": {"orders": {"plugin": "csv", "on_success": "rows"}}},
+            {"sources": {"orders": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}}},
             id="named-sources",
         ),
     ],
@@ -170,8 +170,8 @@ def test_set_pipeline_source_selection_accepts_each_real_provider_shape(
             "both_non_null",
             {
                 "pipeline": {
-                    "source": {"plugin": "csv", "on_success": "rows"},
-                    "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+                    "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
+                    "sources": {"orders": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}},
                     "nodes": [],
                     "edges": [],
                     "outputs": [],
@@ -185,7 +185,7 @@ def test_set_pipeline_source_selection_accepts_each_real_provider_shape(
             {
                 "pipeline": {
                     "source": None,
-                    "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+                    "sources": {"orders": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}},
                     "nodes": [],
                     "edges": [],
                     "outputs": [],
@@ -198,7 +198,7 @@ def test_set_pipeline_source_selection_accepts_each_real_provider_shape(
             "sources_null_with_singular_source",
             {
                 "pipeline": {
-                    "source": {"plugin": "csv", "on_success": "rows"},
+                    "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
                     "sources": None,
                     "nodes": [],
                     "edges": [],
@@ -212,7 +212,7 @@ def test_set_pipeline_source_selection_accepts_each_real_provider_shape(
             "singular_source",
             {
                 "pipeline": {
-                    "source": {"plugin": "csv", "on_success": "rows"},
+                    "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
                     "nodes": [],
                     "edges": [],
                     "outputs": [],
@@ -225,7 +225,7 @@ def test_set_pipeline_source_selection_accepts_each_real_provider_shape(
             "named_sources",
             {
                 "pipeline": {
-                    "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+                    "sources": {"orders": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}},
                     "nodes": [],
                     "edges": [],
                     "outputs": [],
@@ -254,7 +254,6 @@ def test_set_pipeline_source_selection_survives_supported_provider_adapter(
     [
         (("metadata",), None),
         (("source", "blob_id"), None),
-        (("source", "on_validation_failure"), None),
         (("source", "inline_blob"), None),
         (("nodes",), [{"id": "gate", "node_type": "gate", "input": "rows", "plugin": None}]),
         (
@@ -300,7 +299,6 @@ def test_set_pipeline_source_selection_survives_supported_provider_adapter(
             ("edges",),
             [{"id": "edge", "from_node": "source", "to_node": "sink", "edge_type": "on_success", "label": None}],
         ),
-        (("outputs",), [{"sink_name": "rows", "plugin": "json", "on_write_failure": None}]),
         (("metadata",), {"name": None, "description": None}),
     ],
 )
@@ -518,11 +516,9 @@ def test_registered_schema_lookup_rejects_missing_internal_definition_name(monke
     ("path", "non_null_type"),
     [
         (("properties", "source", "properties", "inline_blob", "properties", "description"), "string"),
-        (("properties", "sources", "additionalProperties", "properties", "on_validation_failure"), "string"),
         (("properties", "nodes", "items", "properties", "trigger", "properties", "timeout_seconds"), "number"),
         (("properties", "nodes", "items", "properties", "timeout_seconds"), "number"),
         (("properties", "edges", "items", "properties", "label"), "string"),
-        (("properties", "outputs", "items", "properties", "on_write_failure"), "string"),
     ],
 )
 def test_directional_guard_rejects_advertised_nullability_narrowing(
@@ -726,7 +722,7 @@ def test_canonical_schema_rejects_dunder_prefixed_connection_and_sink_names(
 def test_canonical_schema_property_name_rules_reject_dunder_prefixed_keys() -> None:
     schema = canonical_set_pipeline_schema()
     payload_source_key = {
-        "sources": {"__hidden": {"plugin": "csv", "on_success": "rows"}},
+        "sources": {"__hidden": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}},
         "nodes": [],
         "edges": [],
         "outputs": [],
@@ -742,7 +738,7 @@ def test_canonical_schema_property_name_rules_reject_uppercase_source_names() ->
     # implementation missed this and disclosed the wider node rule).
     schema = canonical_set_pipeline_schema()
     payload_mixed_case_source = {
-        "sources": {"MySource": {"plugin": "csv", "on_success": "rows"}},
+        "sources": {"MySource": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}},
         "nodes": [],
         "edges": [],
         "outputs": [],
@@ -751,7 +747,7 @@ def test_canonical_schema_property_name_rules_reject_uppercase_source_names() ->
     assert errors, "expected a mixed-case source name to be rejected"
 
     payload_lowercase_source = {
-        "sources": {"mysource": {"plugin": "csv", "on_success": "rows"}},
+        "sources": {"mysource": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}},
         "nodes": [],
         "edges": [],
         "outputs": [],
@@ -764,7 +760,6 @@ def test_canonical_schema_property_name_rules_reject_uppercase_source_names() ->
     [
         ("properties", "nodes", "items", "properties", "on_success"),
         ("properties", "nodes", "items", "properties", "on_error"),
-        ("properties", "outputs", "items", "properties", "on_write_failure"),
     ],
 )
 def test_canonical_schema_accepts_null_on_nullable_disclosed_fields(path: tuple[str, ...]) -> None:
@@ -773,7 +768,7 @@ def test_canonical_schema_accepts_null_on_nullable_disclosed_fields(path: tuple[
     # constrains strings), so it VACUOUSLY MATCHES null — and the enclosing
     # "not" then REJECTS null, even though every one of these three fields is
     # declared `["string", "null"]` and `SetPipelineArgumentsModel` accepts
-    # null on all of them. The fix adds an explicit "type": "string" guard to
+    # null on both of them. The fix adds an explicit "type": "string" guard to
     # that arm. This test fails red against the unguarded clause.
     schema = canonical_set_pipeline_schema()
     leaf = _node_at(schema, path)
@@ -788,7 +783,7 @@ def test_canonical_schema_is_valid_draft_2020_12() -> None:
 
 def test_canonical_schema_still_validates_a_representative_valid_pipeline() -> None:
     payload = {
-        "source": {"plugin": "csv", "on_success": "rows"},
+        "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
         "nodes": [
             {
                 "id": "route_amount",
@@ -831,10 +826,8 @@ def test_canonical_schema_still_validates_a_representative_valid_pipeline() -> N
         ],
         "edges": [],
         "outputs": [
-            # Explicit null on_write_failure — third and last nullable
-            # sink-rule field.
-            {"sink_name": "flagged", "plugin": "json", "on_write_failure": None},
-            {"sink_name": "unioned", "plugin": "json"},
+            {"sink_name": "flagged", "plugin": "json", "on_write_failure": "discard"},
+            {"sink_name": "unioned", "plugin": "json", "on_write_failure": "discard"},
         ],
     }
 
@@ -869,7 +862,7 @@ def test_canonical_schema_admits_fork_and_discard_route_destination_escapes() ->
     # only 'continue'/'on_success' — not the full reserved-label set — so
     # 'fork' and 'discard' stay admitted.
     payload = {
-        "source": {"plugin": "csv", "on_success": "rows"},
+        "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
         "nodes": [
             {
                 "id": "router",

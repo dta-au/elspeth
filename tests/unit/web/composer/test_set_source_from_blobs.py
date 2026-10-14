@@ -131,7 +131,7 @@ class TestSetSourceFromBlobs:
         png_id = _create_ready_blob(harness, content=_PNG, filename="page-1.png", mime_type="image/png")
         jpg_id = _create_ready_blob(harness, content=_JPEG, filename="page-2.jpg", mime_type="image/jpeg")
 
-        result = _run(harness, {"blob_ids": [jpg_id, png_id], "on_success": "documents"})
+        result = _run(harness, {"blob_ids": [jpg_id, png_id], "on_success": "documents", "on_validation_failure": "discard"})
 
         assert result.success, _first_error(result)
         source = result.updated_state.sources["source"]
@@ -165,7 +165,7 @@ class TestSetSourceFromBlobs:
         png_id = _create_ready_blob(harness, content=_PNG, filename="p.png", mime_type="image/png")
         state = _empty_state()
 
-        result = _run(harness, {"blob_ids": [png_id, str(uuid4())], "on_success": "docs"}, state)
+        result = _run(harness, {"blob_ids": [png_id, str(uuid4())], "on_success": "docs", "on_validation_failure": "discard"}, state)
 
         assert not result.success
         assert "not found" in _first_error(result)
@@ -203,7 +203,7 @@ class TestSetSourceFromBlobs:
                 )
             )
 
-        result = _run(harness, {"blob_ids": [str(foreign.id)], "on_success": "docs"})
+        result = _run(harness, {"blob_ids": [str(foreign.id)], "on_success": "docs", "on_validation_failure": "discard"})
 
         assert not result.success
         assert "not found" in _first_error(result)
@@ -218,7 +218,7 @@ class TestSetSourceFromBlobs:
 
         pending = _seed_pending_blob(engine, blob_service, UUID(session_id), "out.csv")
 
-        result = _run(harness, {"blob_ids": [str(pending.id)], "on_success": "docs"})
+        result = _run(harness, {"blob_ids": [str(pending.id)], "on_success": "docs", "on_validation_failure": "discard"})
 
         assert not result.success
         assert "not ready" in _first_error(result)
@@ -226,7 +226,7 @@ class TestSetSourceFromBlobs:
     def test_duplicate_request_ids_rejected(self, harness) -> None:
         png_id = _create_ready_blob(harness, content=_PNG, filename="p.png", mime_type="image/png")
 
-        result = _run(harness, {"blob_ids": [png_id, png_id], "on_success": "docs"})
+        result = _run(harness, {"blob_ids": [png_id, png_id], "on_success": "docs", "on_validation_failure": "discard"})
 
         assert not result.success
         assert "Duplicate blob id" in _first_error(result)
@@ -235,7 +235,7 @@ class TestSetSourceFromBlobs:
         first = _create_ready_blob(harness, content=_PNG, filename="a.png", mime_type="image/png")
         second = _create_ready_blob(harness, content=_PNG, filename="b.png", mime_type="image/png")
 
-        result = _run(harness, {"blob_ids": [first, second], "on_success": "docs"})
+        result = _run(harness, {"blob_ids": [first, second], "on_success": "docs", "on_validation_failure": "discard"})
 
         assert not result.success
         assert "same content" in _first_error(result)
@@ -248,6 +248,7 @@ class TestSetSourceFromBlobs:
             {
                 "blob_ids": [png_id],
                 "on_success": "docs",
+                "on_validation_failure": "discard",
                 "options": {"blobs": [{"blob_id": "forged", "payload_ref": "a" * 64}]},
             },
         )
@@ -275,26 +276,26 @@ class TestSetSourceFromBlobs:
             return record
 
         with patch.object(sources_module, "_sync_get_blob", side_effect=_llm_authored):
-            result = _run(harness, {"blob_ids": [png_id], "on_success": "docs"})
+            result = _run(harness, {"blob_ids": [png_id], "on_success": "docs", "on_validation_failure": "discard"})
 
         assert not result.success
         assert "LLM-authored" in _first_error(result)
         assert "set_source_from_blob" in _first_error(result)
 
     def test_malformed_uuid_rejected(self, harness) -> None:
-        result = _run(harness, {"blob_ids": ["not-a-uuid"], "on_success": "docs"})
+        result = _run(harness, {"blob_ids": ["not-a-uuid"], "on_success": "docs", "on_validation_failure": "discard"})
         assert not result.success
 
     def test_empty_blob_ids_is_an_argument_error(self, harness) -> None:
         with pytest.raises(ToolArgumentError):
-            _run(harness, {"blob_ids": [], "on_success": "docs"})
+            _run(harness, {"blob_ids": [], "on_success": "docs", "on_validation_failure": "discard"})
 
     def test_named_source_binding(self, harness) -> None:
         png_id = _create_ready_blob(harness, content=_PNG, filename="p.png", mime_type="image/png")
 
         result = _run(
             harness,
-            {"blob_ids": [png_id], "on_success": "docs", "source_name": "documents"},
+            {"blob_ids": [png_id], "on_success": "docs", "source_name": "documents", "on_validation_failure": "discard"},
         )
 
         assert result.success, _first_error(result)

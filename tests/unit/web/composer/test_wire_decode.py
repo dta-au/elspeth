@@ -396,7 +396,7 @@ def test_decode_law_over_every_promoted_position(tool: str, data: st.DataObject)
 # ---------------------------------------------------------------- envelope
 
 _PIPELINE: dict[str, Any] = {
-    "source": {"plugin": "csv", "on_success": "rows", "options": {"path": "rows.csv"}},
+    "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard", "options": {"path": "rows.csv"}},
     "nodes": [],
     "edges": [],
     "outputs": [],

@@ -74,6 +74,7 @@ def _json_output_arguments(sink_name: str, path: Path) -> dict[str, Any]:
     return {
         "sink_name": sink_name,
         "plugin": "json",
+        "on_write_failure": "discard",
         "options": {"path": str(path), "schema": {"mode": "observed"}},
     }
 
@@ -98,16 +99,13 @@ def test_successful_source_mutation_echoes_the_applied_component(tmp_path: Path)
     assert "metadata" not in echo
 
 
-def test_echo_reports_the_post_finalizer_route_the_model_did_not_write(tmp_path: Path) -> None:
+def test_echo_reports_the_canonical_explicit_route(tmp_path: Path) -> None:
     """The echo shows a server-canonicalized field, not the authored bytes.
 
-    ``canonicalize_source_validation_failure`` folds an unspecified route
-    ("" — a sink name can never be empty, so it carries no routing intent)
-    into the 'discard' default. That fold is exactly the class of server
-    transform the model cannot see in a bare success envelope: it authored
-    "", and what persisted is "discard".
+    An explicitly authored route is trimmed before persistence. The echo
+    reports that admitted value without supplying an unchosen policy.
     """
-    result = _run("set_source", _csv_source_arguments(tmp_path / "in.csv", on_validation_failure=""), _empty_state())
+    result = _run("set_source", _csv_source_arguments(tmp_path / "in.csv", on_validation_failure=" discard "), _empty_state())
 
     assert result.success is True
     assert result.updated_state.sources["source"].on_validation_failure == "discard"
@@ -133,6 +131,7 @@ def test_echo_carries_the_server_retargeted_mirror_edge(tmp_path: Path) -> None:
         "plugin": "field_mapper",
         "input": "rows",
         "on_success": "rows_out",
+        "on_error": "discard",
         "options": {"mapping": {"a": "b"}, "schema": {"mode": "observed"}},
     }
     state = _run("upsert_node", node, state).updated_state
@@ -280,6 +279,7 @@ def _collision_state(tmp_path: Path) -> CompositionState:
             "plugin": "field_mapper",
             "input": "rows",
             "on_success": "rows_out",
+            "on_error": "discard",
             "options": {"mapping": {"a": "b"}, "schema": {"mode": "observed"}},
         },
         state,

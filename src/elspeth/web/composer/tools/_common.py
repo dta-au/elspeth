@@ -26,7 +26,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Final, NotRequired, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 from pydantic import ValidationError as PydanticValidationError
@@ -1793,7 +1793,9 @@ def _serialize_full_pipeline_state(state: CompositionState, *, requested_compone
 _DEFAULT_SOURCE_VALIDATION_FAILURE: Final[str] = "discard"
 
 _SOURCE_VALIDATION_FAILURE_DESCRIPTION: Final[str] = (
-    "'discard' drops rows that fail source validation. Any other value, including 'quarantine', must match a configured output/sink name."
+    "Explicit non-empty failure choice required for new sources. 'discard' records the drop; "
+    "a named route must satisfy sink and required-control policy. Omit only to preserve the same existing source's choice. "
+    "Null/empty is invalid; no server default is supplied."
 )
 
 _STEP_DESCRIPTION_DESCRIPTION: Final[str] = (
@@ -1803,32 +1805,26 @@ _STEP_DESCRIPTION_DESCRIPTION: Final[str] = (
 )
 
 
-def canonicalize_source_validation_failure(value: str | None) -> str:
-    """Fold unspecified spellings of ``on_validation_failure`` into 'discard'.
+class FailureRouteChoiceError(ValueError):
+    """Owned, value-free feedback for an absent ordinary failure choice."""
 
-    THE single owner of what an authored empty-string route means
-    (elspeth-bcd7051143). ``None`` (not specified) and ``""`` (specified but
-    naming no route — a sink name can never be the empty string, so "" carries
-    no distinct routing intent) both canonicalize to the 'discard' default.
-    Every composer seam that admits an authored ``on_validation_failure``
-    routes through here: ``set_source``, ``set_source_from_blob``, both
-    ``set_pipeline`` source branches, runtime-YAML import
-    (``yaml_importer._source_from_runtime_entry``), and the required-control
-    auto-wire projection (``required_controls._parse_source``). Before this
-    owner existed the seams disagreed — ``set_pipeline`` truthiness-coerced
-    "", ``set_source``/``set_source_from_blob`` passed it through to the
-    engine plugin-config rejection, and the auto-wire pass refused the whole
-    candidate as non-discard — an accepted-then-wedged repair defect. The
-    boundary canonicalization ensures "" cannot lawfully reach persisted
-    composer state. The
-    engine-side plugin-config validator
-    (``plugins/infrastructure/config_base.py``) still rejects "" for
-    non-composer-authored configs; composer-persisted state is always
-    canonical before it gets there.
-    """
-    if value is None or value == "":
-        return _DEFAULT_SOURCE_VALIDATION_FAILURE
-    return value
+
+def resolve_failure_route_choice(
+    value: str | None,
+    *,
+    supplied: bool,
+    field: Literal["on_error", "on_validation_failure", "on_write_failure"],
+    previous: str | None = None,
+) -> str:
+    """Preserve only omitted updates; never invent a row-loss policy."""
+    route = value if supplied else previous
+    if route is None or not route.strip():
+        raise FailureRouteChoiceError(
+            f"{field} requires an explicit non-empty failure choice for a new component. "
+            "Supply 'discard' or an eligible named route; null and empty values are not choices. "
+            "Omit the field only to preserve an existing component's choice."
+        )
+    return route.strip()
 
 
 def _credential_wiring_contract_failure(

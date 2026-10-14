@@ -189,7 +189,6 @@ class TestSetSourceFromBlobMigration:
 
     def test_get_tool_definitions_emits_expected_set_source_from_blob_definition(self) -> None:
         from elspeth.web.composer.tools._common import (
-            _DEFAULT_SOURCE_VALIDATION_FAILURE,
             _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
         )
         from elspeth.web.composer.tools.sources import _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
@@ -224,9 +223,8 @@ class TestSetSourceFromBlobMigration:
                         "examples": ["raw_url_rows", "csv_rows", "fetched_text"],
                     },
                     "on_validation_failure": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
-                        "default": _DEFAULT_SOURCE_VALIDATION_FAILURE,
                     },
                     "options": {
                         "type": "object",
@@ -761,9 +759,7 @@ class TestStep3MutationTierMigration:
         assert on_vf["description"] == _SOURCE_VALIDATION_FAILURE_DESCRIPTION
 
     def test_set_pipeline_source_validation_failure_resolved(self) -> None:
-        """set_pipeline carries the same constant; same drift check."""
-        from elspeth.web.composer.tools._common import _SOURCE_VALIDATION_FAILURE_DESCRIPTION
-
+        """Full replacement describes required choices without update preservation."""
         defn = self._get("set_pipeline")
         params = defn["parameters"]
         assert isinstance(params, dict)
@@ -771,7 +767,10 @@ class TestStep3MutationTierMigration:
         assert isinstance(source, dict)
         on_vf = source["properties"]["on_validation_failure"]
         assert isinstance(on_vf, dict)
-        assert on_vf["description"] == _SOURCE_VALIDATION_FAILURE_DESCRIPTION
+        assert on_vf["type"] == "string"
+        assert "on_validation_failure" in source["required"]
+        assert "Full replacement does not reuse prior choices" in on_vf["description"]
+        assert "Omit only" not in on_vf["description"]
 
     def test_set_pipeline_required_top_level(self) -> None:
         """set_pipeline.required is exactly ['nodes', 'edges', 'outputs'].

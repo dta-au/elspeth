@@ -76,7 +76,12 @@ def test_empty_handler_admits_only_empty_original_input(tool: str) -> None:
 def test_expected_output_count_rejects_coerced_scalar(value, full_pipeline: bool) -> None:
     node = {"id": "a", "node_type": "transform", "input": "rows", "expected_output_count": 3}
     if full_pipeline:
-        arguments = {"source": {"plugin": "csv", "on_success": "rows"}, "nodes": [node], "edges": [], "outputs": []}
+        arguments = {
+            "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
+            "nodes": [node],
+            "edges": [],
+            "outputs": [],
+        }
         SetPipelineArgumentsModel.model_validate(arguments)
         node["expected_output_count"] = value
         with pytest.raises(ValidationError):
@@ -93,7 +98,7 @@ def test_json_integer_and_nullable_controls(value) -> None:
     node = {"id": "a", "node_type": "transform", "input": "rows", "expected_output_count": value}
     assert _UpsertNodeArgumentsModel.model_validate(node).expected_output_count == value
     SetPipelineArgumentsModel.model_validate(
-        {"source": {"plugin": "csv", "on_success": "rows"}, "nodes": [node], "edges": [], "outputs": []}
+        {"source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"}, "nodes": [node], "edges": [], "outputs": []}
     )
 
 
@@ -192,7 +197,6 @@ def test_json_looking_content_remains_literal_string_data() -> None:
     [
         pytest.param("create_blob", {"filename": "a.txt", "mime_type": "text/plain", "content": "x"}, "description"),
         pytest.param("set_source_from_blob", {"blob_id": "b", "on_success": "rows"}, "plugin"),
-        pytest.param("set_source_from_blob", {"blob_id": "b", "on_success": "rows"}, "on_validation_failure"),
     ],
 )
 def test_shared_redaction_model_omission_is_not_supplied_null(model, arguments, field) -> None:

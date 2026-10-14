@@ -406,15 +406,15 @@ def test_composition_state_from_runtime_yaml_rejects_nested_non_string_option_ke
 
 
 @pytest.mark.parametrize("authored", ["", None])
-def test_source_from_runtime_entry_canonicalizes_unspecified_validation_failure_to_discard(
+def test_source_from_runtime_entry_rejects_unspecified_validation_failure(
     authored: object,
 ) -> None:
-    """Null and empty strings use the shared canonicalizer's unspecified route."""
-    spec = _source_from_runtime_entry(
-        "s",
-        {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": authored},
-    )
-    assert spec.on_validation_failure == "discard"
+    """Public imports never select discard for an unspecified choice."""
+    with pytest.raises(RuntimeYamlImportError, match="on_validation_failure"):
+        _source_from_runtime_entry(
+            "s",
+            {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": authored},
+        )
 
 
 @pytest.mark.parametrize("carrier", ["entry", "options"])
@@ -426,13 +426,13 @@ def test_runtime_yaml_import_rejects_malformed_source_validation_failure(carrier
     else:
         entry["options"] = {"on_validation_failure": authored}
     document = yaml.safe_dump({"sources": {"primary": entry}})
-    with pytest.raises(RuntimeYamlImportError, match=r"sources\.primary\.on_validation_failure must be a string or null"):
+    with pytest.raises(RuntimeYamlImportError, match=r"sources\.item\.on_validation_failure requires an explicit non-empty string"):
         composition_state_from_runtime_yaml(document)
 
 
 @pytest.mark.parametrize("carrier", ["entry", "options"])
 @pytest.mark.parametrize("spelling", ["missing", "null", "empty"])
-def test_runtime_yaml_import_preserves_unspecified_source_validation_failure(carrier: str, spelling: str) -> None:
+def test_runtime_yaml_import_rejects_unspecified_source_validation_failure(carrier: str, spelling: str) -> None:
     entry: dict[str, object] = {"plugin": "csv", "on_success": "rows"}
     if spelling != "missing":
         authored = None if spelling == "null" else ""
@@ -440,8 +440,8 @@ def test_runtime_yaml_import_preserves_unspecified_source_validation_failure(car
             entry["on_validation_failure"] = authored
         else:
             entry["options"] = {"on_validation_failure": authored}
-    state = composition_state_from_runtime_yaml(yaml.safe_dump({"sources": {"primary": entry}}))
-    assert state.sources["primary"].on_validation_failure == "discard"
+    with pytest.raises(RuntimeYamlImportError, match="on_validation_failure"):
+        composition_state_from_runtime_yaml(yaml.safe_dump({"sources": {"primary": entry}}))
 
 
 def test_nodes_from_runtime_list_rejects_non_sequence_section() -> None:
@@ -1186,6 +1186,7 @@ sources:
   source:
     plugin: csv
     on_success: score
+    on_validation_failure: discard
     options:
       schema:
         mode: observed
@@ -1273,6 +1274,7 @@ sources:
   orders:
     plugin: csv
     on_success: inbound
+    on_validation_failure: discard
     options:
       schema:
         mode: observed
@@ -1460,6 +1462,7 @@ def _minimal_pipeline_doc() -> str:
         "  primary:\n"
         "    plugin: csv\n"
         "    on_success: out\n"
+        "    on_validation_failure: discard\n"
         "    options:\n"
         "      path: in.csv\n"
         "      schema:\n"

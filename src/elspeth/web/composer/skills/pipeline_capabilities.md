@@ -94,6 +94,17 @@ Pipelines have one or more named sources, zero or more structural/processing
 nodes, explicit connections, and one or more named outputs. Connection strings
 are the routing contract: a producer's `on_success`, `routes`, or `fork_to`
 value must match a downstream node's `input` or an output's `sink_name`.
+New sources, transforms, aggregations and sinks require an explicit non-empty
+failure choice. Do not rely on an implicit discard default. Choose `discard`
+or an eligible named route according to the requested workflow; named routing
+still must satisfy sink and required-control policy. An incremental update may
+omit the field to preserve that same component's existing choice. Full pipeline
+replacement requires the choices again. Null and empty are not choices. New gates
+omit the field for fail-fast; updates preserve an omitted prior choice and can
+clear it to fail-fast with null. Structural nodes retain their
+own contracts. Public YAML import uses this explicit-choice rule even for
+internal placeholder plugin names; it grants no resume authority.
+
 Error policies are narrower: transform/aggregation/gate `on_error` may be
 `discard` or an output `sink_name`, never a downstream processing input. Node
 ids ordinarily identify components rather than connections. The only implicit
