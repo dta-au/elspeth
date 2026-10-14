@@ -100,6 +100,7 @@ from tests.helpers.execution_custody import (
     ExecutionTestCustody,
     PhysicalPipelineCompletionControl,
 )
+from tests.helpers.web_reserve_proposal_child_transfers import copy_ast_fields
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 execution_fixture = execution_custody.execution_fixture
@@ -3090,7 +3091,6 @@ def _exact_recovery_lease_owner_edges(member: _FunctionNode) -> frozenset[int]:
     # and collision-free cleanup role alpha-renames are canonicalized. Thus a
     # new class/global consumer, call, with statement, comprehension or alias
     # cannot ride on the fact that it avoids the receiver-use inventory.
-    import copy
     import hashlib
 
     inert_indices: set[int] = set()
@@ -3111,7 +3111,10 @@ def _exact_recovery_lease_owner_edges(member: _FunctionNode) -> frozenset[int]:
         ):
             return frozenset()
         inert_indices.add(index)
-    canonical = copy.deepcopy(member)
+    # Parser context/operator nodes can carry another scanner's parent links.
+    # The proof hashes grammar fields only, so do not copy foreign metadata.
+    canonical = copy_ast_fields(member)
+    assert isinstance(canonical, (ast.FunctionDef, ast.AsyncFunctionDef))
     canonical.body = [statement for index, statement in enumerate(canonical.body) if index not in inert_indices]
     alpha_roles = {
         handler.name: "primary",
@@ -4179,8 +4182,6 @@ def test_done_callback_is_nonblocking_and_async_cleanup_closes_exactly_once() ->
     ["duplicate_handoff", "removed_handoff", "wrong_owner", "duplicate_close", "early_return", "narrowed_handler", "unjoined_close"],
 )
 def test_async_completion_close_owner_rejects_broken_handoff(mutation: str) -> None:
-    import copy
-
     owner = _class_node(ExecutionServiceImpl)
     helper = ast.parse(textwrap.dedent(inspect.getsource(execution_service_module.close_execute_lease_before_transfer))).body[0]
     assert isinstance(helper, ast.AsyncFunctionDef)
@@ -4191,7 +4192,9 @@ def test_async_completion_close_owner_rejects_broken_handoff(mutation: str) -> N
         node for node in ast.walk(close) if isinstance(node, ast.Call) and _call_name(node) == "close_execute_lease_before_transfer"
     )
     if mutation == "duplicate_handoff":
-        close.body.append(ast.Expr(value=ast.Await(value=copy.deepcopy(handoff))))
+        duplicate = copy_ast_fields(handoff)
+        assert isinstance(duplicate, ast.Call)
+        close.body.append(ast.Expr(value=ast.Await(value=duplicate)))
     elif mutation == "removed_handoff":
         handoff.func = ast.Name(id="unrelated_helper", ctx=ast.Load())
     elif mutation == "wrong_owner":
@@ -4211,6 +4214,46 @@ def test_async_completion_close_owner_rejects_broken_handoff(mutation: str) -> N
     ast.fix_missing_locations(helper)
     with pytest.raises(AssertionError):
         _assert_async_completion_close_owner(owner, helper)
+
+
+@pytest.mark.parametrize("scanner", ["landscape", "inventory"])
+def test_execution_lease_ast_clones_ignore_foreign_parent_metadata(scanner: str) -> None:
+    from tests.unit.architecture.test_session_db_mutation_authority import _attach_parents as attach_inventory_parents
+    from tests.unit.architecture.test_web_landscape_mutation_fencing import _attach_parents as attach_landscape_parents
+
+    owner = _class_node(ExecutionServiceImpl)
+    recovery = next(member for member in owner.body if isinstance(member, ast.AsyncFunctionDef) and member.name == "recover_run")
+    original_fields = _stable_ast_bytes(recovery)
+    original_edges = _exact_recovery_lease_owner_edges(recovery)
+    assert len(original_edges) == 5
+    assert original_edges <= {id(node) for node in ast.walk(recovery)}
+    shared_context = ast.parse("foreign").body[0].value.ctx
+    original_metadata = shared_context.__dict__.copy()
+    try:
+        unrelated = ast.parse("foreign" + ".value" * 500)
+        if scanner == "landscape":
+            attach_landscape_parents(unrelated)
+            foreign_parent = shared_context._landscape_parent
+        else:
+            attach_inventory_parents(unrelated)
+            foreign_parent = shared_context._inventory_parent
+        assert isinstance(foreign_parent, ast.Name) and foreign_parent.id == "foreign"
+        assert any(node is shared_context for node in ast.walk(recovery))
+        clone = copy_ast_fields(recovery)
+        assert isinstance(clone, ast.AsyncFunctionDef)
+        assert _stable_ast_bytes(clone) == original_fields
+        assert {id(node) for node in ast.walk(clone)}.isdisjoint(id(node) for node in ast.walk(recovery))
+        # Admission still checks the unchanged reviewed canonical hash and
+        # returns edges in the caller's tree, never the canonical copy.
+        assert _exact_recovery_lease_owner_edges(recovery) == original_edges
+        test_admission_cleanup_scanner_controls("none")
+        test_approval_binding_worker_edge_admits_only_exact_transferred_context("rebound_worker")
+        test_async_completion_close_owner_rejects_broken_handoff("duplicate_handoff")
+        recovery.body.insert(0, ast.parse("foreign_effect()").body[0])
+        assert _exact_recovery_lease_owner_edges(recovery) == frozenset()
+    finally:
+        shared_context.__dict__.clear()
+        shared_context.__dict__.update(original_metadata)
 
 
 def test_submit_failure_terminalizes_under_same_context_before_authority_returns() -> None:
