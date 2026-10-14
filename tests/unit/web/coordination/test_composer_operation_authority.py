@@ -163,10 +163,48 @@ async def test_failure_history_counts_only_exact_session_fence_revisions(operati
     assert authority.list_failure_outcomes(session_id=uuid4(), actor_user_id="alice", operation_id=record.operation_id) == ((), None)
 
 
+def test_failure_cursor_codec_preserves_wire_bytes_and_concrete_dto():
+    from datetime import UTC, datetime
+
+    from elspeth.web.sessions.composer_operations import (
+        ComposerOperationFailureCursor,
+        decode_composer_failure_cursor,
+        encode_composer_failure_cursor,
+    )
+
+    cursor = ComposerOperationFailureCursor(
+        settled_at=datetime(2026, 10, 15, 1, 2, 3, 456789, tzinfo=UTC),
+        operation_id="00000000-0000-4000-8000-000000000001",
+    )
+    # Measured from the immutable pre-extraction codec; independent of this DTO's current serialization.
+    previous_wire = (
+        "eyJzZXR0bGVkX2F0IjoiMjAyNi0xMC0xNVQwMTowMjowMy40NTY3ODlaIiwib3BlcmF0aW9uX2lk"
+        "IjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0="
+    )
+    assert encode_composer_failure_cursor(cursor) == previous_wire
+    restored = decode_composer_failure_cursor(previous_wire)
+    assert type(restored) is ComposerOperationFailureCursor
+    assert restored == cursor
+    assert "encode" not in ComposerOperationFailureCursor.__dict__
+    assert "decode" not in ComposerOperationFailureCursor.__dict__
+
+
+@pytest.mark.parametrize("value", ("", "x" * 513, "!", "é", "e30=", "bnVsbA=="))
+def test_failure_cursor_codec_retains_invalid_wire_refusal(value):
+    from elspeth.web.sessions.composer_operations import decode_composer_failure_cursor
+
+    with pytest.raises(ValueError):
+        decode_composer_failure_cursor(value)
+
+
 def test_failure_history_tied_timestamp_cursor_is_stable_and_actor_scoped(operation_store, monkeypatch):
     from datetime import timedelta
 
-    from elspeth.web.sessions.composer_operations import ComposerOperationFailureCursor
+    from elspeth.web.sessions.composer_operations import (
+        ComposerOperationFailureCursor,
+        decode_composer_failure_cursor,
+        encode_composer_failure_cursor,
+    )
 
     engine, _repository, authority, _service, sid = operation_store
     with engine.connect() as conn:
@@ -181,7 +219,7 @@ def test_failure_history_tied_timestamp_cursor_is_stable_and_actor_scoped(operat
     # A controlled clock forces the tie; every continuation must constrain both keys.
     for index, outcome in enumerate(all_outcomes):
         cursor = ComposerOperationFailureCursor(settled_at=outcome.settled_at, operation_id=outcome.operation_id)
-        restored = ComposerOperationFailureCursor.decode(cursor.encode())
+        restored = decode_composer_failure_cursor(encode_composer_failure_cursor(cursor))
         remaining, _ = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice", cursor=restored)
         assert remaining == all_outcomes[index + 1 :]
         assert authority.list_failure_outcomes(session_id=sid, actor_user_id="other-actor", cursor=restored) == ((), None)

@@ -194,15 +194,18 @@ class ComposerOperationFailureCursor(BaseModel):
     def _validate_operation_id(cls, value: str) -> str:
         return require_canonical_operation_id(value)
 
-    def encode(self) -> str:
-        return base64.urlsafe_b64encode(self.model_dump_json().encode("utf-8")).decode("ascii")
 
-    @classmethod
-    def decode(cls, value: str) -> Self:
-        if not 1 <= len(value) <= 512:
-            raise ValueError("Invalid failure history cursor")
-        encoded = base64.b64decode(value.encode("ascii"), altchars=b"-_", validate=True)
-        return cls.model_validate_json(encoded, strict=True)
+def encode_composer_failure_cursor(cursor: ComposerOperationFailureCursor) -> str:
+    """Serialize the owned history ordering keys for the public cursor wire."""
+    return base64.urlsafe_b64encode(cursor.model_dump_json().encode("utf-8")).decode("ascii")
+
+
+def decode_composer_failure_cursor(value: str) -> ComposerOperationFailureCursor:
+    """Parse a bounded wire cursor into the concrete history ordering DTO."""
+    if not 1 <= len(value) <= 512:
+        raise ValueError("Invalid failure history cursor")
+    encoded = base64.b64decode(value.encode("ascii"), altchars=b"-_", validate=True)
+    return ComposerOperationFailureCursor.model_validate_json(encoded, strict=True)
 
 
 class ComposerOperationCancelledFailure(Protocol):

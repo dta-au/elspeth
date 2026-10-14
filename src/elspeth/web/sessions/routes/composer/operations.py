@@ -32,11 +32,12 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationCapacityError,
     ComposerOperationConflictError,
     ComposerOperationError,
-    ComposerOperationFailureCursor,
     ComposerOperationKind,
     ComposerOperationPreconditionRefused,
     ComposerOperationRecord,
     composer_operation_request_hash,
+    decode_composer_failure_cursor,
+    encode_composer_failure_cursor,
 )
 from elspeth.web.sessions.schemas import (
     ComposerOperationAcceptedResponse,
@@ -223,7 +224,7 @@ async def list_composer_operation_failures(
     if operation_id is not None and (cursor is not None or limit is not None):
         raise HTTPException(status_code=422, detail="Exact operation lookup cannot be paginated", headers={"Cache-Control": "no-store"})
     try:
-        position = ComposerOperationFailureCursor.decode(cursor) if cursor is not None else None
+        position = decode_composer_failure_cursor(cursor) if cursor is not None else None
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid operation history cursor", headers={"Cache-Control": "no-store"}) from exc
     items, next_cursor = await run_sync_in_worker(
@@ -236,7 +237,9 @@ async def list_composer_operation_failures(
     )
     response.headers["Cache-Control"] = "no-store"
     return ComposerOperationFailurePageResponse(
-        session_id=session_id, items=list(items), next_cursor=next_cursor.encode() if next_cursor is not None else None
+        session_id=session_id,
+        items=list(items),
+        next_cursor=encode_composer_failure_cursor(next_cursor) if next_cursor is not None else None,
     )
 
 
