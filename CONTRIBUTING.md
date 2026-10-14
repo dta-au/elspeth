@@ -80,7 +80,12 @@ environment credentials and remote service access.
 
 - **No defensive programming** against our own code. Access typed fields directly (`obj.field`), not defensively (`getattr(obj, "field", None)`). See [Data Trust and Error Handling](docs/guides/data-trust-and-error-handling.md) for the trust-boundary rationale.
 - **Three-tier trust model.** Handle errors differently based on data origin: crash on audit data corruption, quarantine bad user data, validate external API responses at the boundary.
-- **No legacy shims or backwards compatibility.** When changing something, delete the old code completely. No deprecation wrappers, no commented-out code, no compatibility layers.
+- **Consider backwards compatibility from 0.8.5 onward.** Compatibility layers
+  and deprecation paths are permitted when justified by supported interfaces,
+  data or workflows; perpetual support for historical versions is not promised.
+  State the supported boundary and preserve existing preserve/refuse contracts
+  unless a separate change is approved. Remove obsolete and commented-out code;
+  this policy alone does not authorize migrations, resets or downgrades.
 - **Test through production code paths.** Integration tests must use `ExecutionGraph.from_plugin_instances()` and `instantiate_plugins_from_config()`, not manually constructed objects.
 
 ## Writing Tests
