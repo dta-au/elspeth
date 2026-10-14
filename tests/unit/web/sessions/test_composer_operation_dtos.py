@@ -73,6 +73,50 @@ def queued_record() -> ComposerOperationRecord:
     )
 
 
+def test_failure_projection_rejects_unknown_vs_zero_and_private_shape_corruption() -> None:
+    from elspeth.web.sessions.composer_operations import ComposerOperationFailureOutcome, ComposerOperationSavedRevisions
+    from elspeth.web.sessions.schemas import ComposerOperationFailurePageResponse
+
+    saved = ComposerOperationSavedRevisions(attribution="fenced", count=2, latest_state_id=SID, latest_version=7)
+    outcome = ComposerOperationFailureOutcome(
+        session_id=SID,
+        operation_id=OP,
+        kind="compose_message",
+        user_message_id=None,
+        settled_at=NOW,
+        failure_code="operation_failed",
+        error_type="operation_failed",
+        diagnostic_id=OP,
+        request_id="correlation",
+        saved_revisions=saved,
+    )
+    assert ComposerOperationFailurePageResponse(session_id=SID, items=[outcome], next_cursor=None).items == [outcome]
+    for changes in (
+        {"body": {"detail": "private"}},
+        {"error_type": "private_exception"},
+        {"diagnostic_id": None},
+        {"failure_code": "worker_lost"},
+        {"operation_id": OP.replace("-", "")},
+        {"settled_at": NOW.replace(tzinfo=None)},
+    ):
+        with pytest.raises(ValueError):
+            ComposerOperationFailureOutcome.model_validate({**outcome.model_dump(), **changes})
+    for changes in (
+        {"attribution": "unavailable"},
+        {"attribution": "unstarted"},
+        {"count": True},
+        {"count": None},
+        {"count": 0},
+        {"latest_state_id": None},
+        {"latest_version": 0},
+    ):
+        with pytest.raises(ValueError):
+            ComposerOperationSavedRevisions.model_validate({**saved.model_dump(), **changes})
+    for items in ([outcome, outcome], [outcome.model_copy(update={"session_id": UUID(OP)})]):
+        with pytest.raises(ValueError):
+            ComposerOperationFailurePageResponse(session_id=SID, items=items, next_cursor=None)
+
+
 @pytest.mark.parametrize(
     "changes",
     [

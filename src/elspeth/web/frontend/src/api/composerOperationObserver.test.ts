@@ -64,14 +64,17 @@ describe("one durable operation observer", () => {
     await expect(submitAndObserveComposerOperation(descriptor())).rejects.toBeInstanceOf(ComposerObservationDetached);
     expect(findComposerOperationCustody(scope, sid).foreground?.operationId).toBe(id);
   });
-  it("active refusal attaches observation-only and preserves an earlier ambiguous submission", async () => {
+  it.each(["completed", "failed"] as const)("active refusal carries the %s winner terminal and preserves an earlier ambiguous submission", async (status) => {
     vi.useFakeTimers();
     const refusal = { status: 409, error_type: "composer_operation_active", operation_id: other, kind: "compose_message" };
     vi.mocked(api.submitComposerOperation).mockRejectedValueOnce(new TypeError("late admission")).mockRejectedValueOnce(refusal);
     vi.mocked(api.composerActiveOperation).mockImplementation((error) => error === refusal ? { operation_id: other, kind: "compose_message" } : null);
-    vi.mocked(api.fetchComposerOperation).mockResolvedValueOnce({ kind: "operation_missing" }).mockResolvedValue(snapshot("completed", other));
+    const winner = snapshot("completed", other);
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 503, detail: "Server stopped" });
+    vi.mocked(api.fetchComposerOperation).mockResolvedValueOnce({ kind: "operation_missing" }).mockResolvedValue(status === "completed" ? winner : { ...winner, status: "failed", result: null, error: { http_status: 503, failure_code: "worker_lost", error_type: "composer_operation_worker_lost", diagnostic_id: null, body: {} } });
     const observing = submitAndObserveComposerOperation(descriptor()); const caught = observing.catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(1000); expect(await caught).toBeInstanceOf(ComposerActiveAttachment);
+    expect((await caught as ComposerActiveAttachment).terminal).toMatchObject(status === "completed" ? { status, result: winner.result } : { status, error: { composer_operation: { operation_id: other, kind: "compose_message" }, failure_code: "worker_lost" } });
     const record = findComposerOperationCustody(scope, sid); expect(record.unresolvedSubmissions.get(id)?.body.operation_id).toBe(id);
     expect(api.fetchComposerOperation).toHaveBeenLastCalledWith(sid, other);
     expect(vi.mocked(api.submitComposerOperation).mock.calls.every(([submission]) => submission.operationId === id)).toBe(true);

@@ -41,6 +41,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationError as ComposerOperationError,
 )
 from elspeth.web.sessions.composer_operations import (
+    ComposerOperationFailureOutcome,
     ComposerOperationKind,
     ComposerOperationStatus,
     require_canonical_operation_id,
@@ -764,6 +765,22 @@ class ComposerOperationStatusResponse(ComposerOperationAcceptedResponse):
                 raise ValueError("Invalid completed operation response")
         elif self.error is None or self.result is not None or self.deadline_remaining_ms != 0:
             raise ValueError("Invalid failed operation response")
+        return self
+
+
+class ComposerOperationFailurePageResponse(_StrictResponse):
+    """Bounded retained operation outcomes, separate from audited chat history."""
+
+    session_id: UUID
+    items: list[ComposerOperationFailureOutcome] = Field(max_length=100)
+    next_cursor: str | None = Field(max_length=512)
+
+    @model_validator(mode="after")
+    def _validate_scope(self) -> ComposerOperationFailurePageResponse:
+        if any(item.session_id != self.session_id for item in self.items):
+            raise ValueError("Failure history contains a foreign session")
+        if len({item.operation_id for item in self.items}) != len(self.items):
+            raise ValueError("Failure history contains duplicate operations")
         return self
 
 

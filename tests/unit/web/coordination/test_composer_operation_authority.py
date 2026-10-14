@@ -124,6 +124,99 @@ def failed():
     )
 
 
+@pytest.mark.asyncio
+async def test_failure_history_counts_only_exact_session_fence_revisions(operation_store):
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    _engine, repository, authority, service, sid = operation_store
+    initial = repository.acquire(
+        session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
+    )
+    initial_state = await service.save_composition_state(
+        sid, CompositionStateData(), provenance="session_seed", session_operation_context=initial
+    )
+    repository.release(initial)
+    record, running = start(operation_store, SendMessageRequest(operation_id=str(uuid4()), content="Build", state_id=initial_state.id))
+    assert record.operation_id != running.session_operation_context.fence.operation_id
+    for _ in range(2):
+        last_owned = await service.save_composition_state(
+            sid, CompositionStateData(), provenance="session_seed", session_operation_context=running.session_operation_context
+        )
+    await service.fail_composer_async_operation(running, failure=failed())
+    repository.release(running.session_operation_context)
+    later = repository.acquire(
+        session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
+    )
+    later_state = await service.save_composition_state(
+        sid, CompositionStateData(), provenance="session_seed", session_operation_context=later
+    )
+    repository.release(later)
+    (outcome,), cursor = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice")
+    assert cursor is None
+    assert outcome.operation_id == record.operation_id
+    assert outcome.saved_revisions.attribution == "fenced"
+    assert outcome.saved_revisions.count == 2
+    assert outcome.saved_revisions.latest_state_id == last_owned.id
+    assert outcome.saved_revisions.latest_version == last_owned.version
+    assert later_state.version > outcome.saved_revisions.latest_version
+    assert authority.list_failure_outcomes(session_id=sid, actor_user_id="other-actor") == ((), None)
+    assert authority.list_failure_outcomes(session_id=uuid4(), actor_user_id="alice", operation_id=record.operation_id) == ((), None)
+
+
+def test_failure_history_tied_timestamp_cursor_is_stable_and_actor_scoped(operation_store, monkeypatch):
+    from datetime import timedelta
+
+    from elspeth.web.sessions.composer_operations import ComposerOperationFailureCursor
+
+    engine, _repository, authority, _service, sid = operation_store
+    with engine.connect() as conn:
+        fixed_now = database_now(conn) + timedelta(seconds=1)
+    monkeypatch.setattr("elspeth.web.coordination.composer_operation_authority.database_now", lambda _conn: fixed_now)
+    for _ in range(4):
+        record, _ = admit(authority, sid)
+        authority.request_cancel(session_id=sid, operation_id=record.operation_id, cancelled_failure=cancelled)
+    all_outcomes, _ = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice")
+    assert {outcome.settled_at for outcome in all_outcomes} == {fixed_now}
+    assert [outcome.operation_id for outcome in all_outcomes] == sorted((outcome.operation_id for outcome in all_outcomes), reverse=True)
+    # A controlled clock forces the tie; every continuation must constrain both keys.
+    for index, outcome in enumerate(all_outcomes):
+        cursor = ComposerOperationFailureCursor(settled_at=outcome.settled_at, operation_id=outcome.operation_id)
+        restored = ComposerOperationFailureCursor.decode(cursor.encode())
+        remaining, _ = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice", cursor=restored)
+        assert remaining == all_outcomes[index + 1 :]
+        assert authority.list_failure_outcomes(session_id=sid, actor_user_id="other-actor", cursor=restored) == ((), None)
+
+
+def test_failure_history_omits_private_error_body_and_checks_sealed_hash(operation_store):
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    engine, _repository, authority, _service, sid = operation_store
+    record, _ = admit(authority, sid)
+    private = "SYNTHETIC_PRIVATE_FAILURE_CANARY"
+
+    def private_cancelled(*, request_id):
+        return ComposerOperationError(
+            http_status=499,
+            failure_code="request_cancelled",
+            error_type=private,
+            body={"detail": private, "request_id": private},
+            diagnostic_id=None,
+        )
+
+    authority.request_cancel(session_id=sid, operation_id=record.operation_id, cancelled_failure=private_cancelled)
+    (outcome,), _ = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice")
+    assert private not in outcome.model_dump_json()
+    assert outcome.request_id == "correlation"
+    assert outcome.error_type is None
+    with engine.begin() as conn, pytest.raises(IntegrityError):
+        conn.execute(update(jobs).where(jobs.c.operation_id == record.operation_id).values(result_sha256="0" * 64))
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DROP TRIGGER trg_composer_async_operations_transition_guard")
+        conn.execute(update(jobs).where(jobs.c.operation_id == record.operation_id).values(result_sha256="0" * 64))
+    with pytest.raises(AuditIntegrityError):
+        authority.list_failure_outcomes(session_id=sid, actor_user_id="alice")
+
+
 def response(message, proposals, state):
     return MessageWithStateResponse(
         message=ChatMessageResponse(

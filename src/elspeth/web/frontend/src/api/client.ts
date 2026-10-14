@@ -1,4 +1,4 @@
-import { canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerOperationAck, decodeComposerOperationSnapshot } from "./composerOperationDecoder";
+import { canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerOperationAck, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
 import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwnsCredential } from "./authSession";
 // ============================================================================
 // ELSPETH API Client
@@ -323,6 +323,7 @@ function buildApiError(status: number, errorBody: unknown, statusText: string, s
     let storageQuota: ApiError["storage_quota"];
     let sources: string[] | undefined;
     let requestId: string | undefined;
+    let diagnosticId: string | undefined;
     let failureCode: string | undefined;
     let guidance: string | undefined;
     let componentId: string | undefined;
@@ -378,6 +379,8 @@ function buildApiError(status: number, errorBody: unknown, statusText: string, s
         : undefined;
 
       requestId = firstStringField([body, nestedDetail], ["request_id"]);
+      const rawDiagnostic = firstStringField([body, nestedDetail], ["diagnostic_id"]);
+      if (rawDiagnostic !== undefined && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rawDiagnostic)) diagnosticId = rawDiagnostic;
       failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
       guidance = firstStringField([body, nestedDetail], ["guidance"]);
 
@@ -531,6 +534,7 @@ function buildApiError(status: number, errorBody: unknown, statusText: string, s
       storage_quota: storageQuota,
       sources,
       request_id: requestId,
+      diagnostic_id: diagnosticId,
       failure_code: failureCode,
       guidance,
       component_id: componentId,
@@ -938,11 +942,13 @@ export async function updateUserComposerPreferences(
 /** List composition proposals for a session. */
 export async function fetchCompositionProposals(
   sessionId: string,
+  signal?: AbortSignal,
 ): Promise<CompositionProposal[]> {
   const response = await authFetch(
     `/api/sessions/${sessionId}/proposals?status=pending`,
     {
       headers: authHeaders(),
+      signal,
     },
   );
   return parseResponse<CompositionProposal[]>(response);
@@ -1015,6 +1021,15 @@ export async function submitComposerOperation(descriptor: import("@/types/compos
   }
   if (response.status !== 202) throw new Error("Composer admission must return 202");
   return decodeComposerOperationAck(await response.json());
+}
+export async function fetchComposerOperationFailures(sessionId: string, options: { cursor?: string; operationId?: string; signal?: AbortSignal } = {}): Promise<import("@/types/composerOperations").ComposerOperationFailurePage> {
+  const params = new URLSearchParams();
+  if (options.cursor !== undefined) params.set("cursor", options.cursor);
+  if (options.operationId !== undefined) params.set("operation_id", options.operationId);
+  const response = await authFetch(`/api/sessions/${sessionId}/operations?${params}`, {
+    headers: authHeaders(), signal: options.signal ?? AbortSignal.timeout(15000), cache: "no-store",
+  });
+  return decodeComposerOperationFailurePage(await parseResponse<unknown>(response), sessionId, options.operationId);
 }
 export async function fetchComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
   const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}`, { headers: authHeaders(), signal: AbortSignal.timeout(15000), cache: "no-store" });
@@ -1129,9 +1144,11 @@ export async function forkFromMessage(
 /** Get the current composition state for a session. Returns null if none exists. */
 export async function fetchCompositionState(
   sessionId: string,
+  signal?: AbortSignal,
 ): Promise<CompositionState | null> {
   const response = await authFetch(`/api/sessions/${sessionId}/state`, {
     headers: authHeaders(),
+    signal,
   });
   if (response.status === 404) {
     return null;

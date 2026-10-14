@@ -1,6 +1,6 @@
 import { decodeCompositionState } from "./compositionDecoder";
 import type { ChatMessage, MessageWithStateResponse } from "@/types/index";
-import type { ComposerOperationAck, ComposerOperationError, ComposerOperationSnapshot, ComposerOperationFrame, OperationKind, OperationStatus } from "@/types/composerOperations";
+import type { ComposerOperationAck, ComposerOperationError, ComposerOperationSnapshot, ComposerOperationFrame, ComposerOperationFailureOutcome, ComposerOperationFailurePage, ComposerOperationPublicFailureType, OperationKind, OperationStatus } from "@/types/composerOperations";
 
 export class ComposerOperationDecodeError extends Error {
   constructor(message: string) { super(message); this.name = "ComposerOperationDecodeError"; }
@@ -36,6 +36,50 @@ function timestamp(value: unknown): string {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(result) || !Number.isFinite(Date.parse(result))) throw new ComposerOperationDecodeError("Invalid timestamp");
   return result;
 }
+function failureCode(value: unknown): ComposerOperationError["failure_code"] {
+  const codes = ["http_error", "operation_failed", "worker_lost", "request_cancelled", "deadline_expired"] as const;
+  const code = codes.find((item) => item === value);
+  if (code === undefined) throw new ComposerOperationDecodeError("Unknown failure code");
+  return code;
+}
+function failureOutcome(value: unknown, sessionId: string): ComposerOperationFailureOutcome {
+  const record = exactRecord(value, ["session_id", "operation_id", "kind", "user_message_id", "settled_at", "failure_code", "error_type", "diagnostic_id", "request_id", "saved_revisions"]);
+  if (canonicalUuid(record.session_id) !== sessionId) throw new ComposerOperationDecodeError("Failure outcome scope mismatch");
+  const code = failureCode(record.failure_code);
+  const diagnostic = record.diagnostic_id === null ? null : canonicalUuid(record.diagnostic_id);
+  if ((code === "operation_failed") !== (diagnostic !== null)) throw new ComposerOperationDecodeError("Invalid diagnostic binding");
+  const categories: readonly ComposerOperationPublicFailureType[] = ["request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost", "operation_failed", "audit_integrity_error", "database_unavailable", "storage_unavailable", "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed"];
+  const category = record.error_type === null ? null : categories.find((item) => item === record.error_type);
+  if (category === undefined) throw new ComposerOperationDecodeError("Unknown public failure category");
+  const requestId = record.request_id === null ? null : text(record.request_id);
+  if (requestId !== null && (requestId.length < 1 || requestId.length > 128)) throw new ComposerOperationDecodeError("Invalid request reference");
+  const saved = exactRecord(record.saved_revisions, ["attribution", "count", "latest_state_id", "latest_version"]);
+  if (saved.attribution !== "fenced" && saved.attribution !== "unstarted" && saved.attribution !== "unavailable") throw new ComposerOperationDecodeError("Unknown revision attribution");
+  const count = saved.count === null ? null : integer(saved.count);
+  const latestId = saved.latest_state_id === null ? null : canonicalUuid(saved.latest_state_id);
+  const version = saved.latest_version === null ? null : integer(saved.latest_version, 1);
+  if (saved.attribution === "unavailable") {
+    if (count !== null || latestId !== null || version !== null) throw new ComposerOperationDecodeError("Unavailable revisions must remain unknown");
+  } else if (count === null || (saved.attribution === "unstarted" && count !== 0) || (count === 0 ? latestId !== null || version !== null : latestId === null || version === null)) {
+    throw new ComposerOperationDecodeError("Inconsistent saved revision identity");
+  }
+  return {
+    session_id: sessionId, operation_id: canonicalUuid(record.operation_id), kind: operationKind(record.kind),
+    user_message_id: record.user_message_id === null ? null : canonicalUuid(record.user_message_id), settled_at: timestamp(record.settled_at),
+    failure_code: code, error_type: category, diagnostic_id: diagnostic, request_id: requestId,
+    saved_revisions: { attribution: saved.attribution, count, latest_state_id: latestId, latest_version: version },
+  };
+}
+export function decodeComposerOperationFailurePage(value: unknown, sessionId: string, operationId?: string): ComposerOperationFailurePage {
+  const record = exactRecord(value, ["session_id", "items", "next_cursor"]);
+  if (canonicalUuid(record.session_id) !== sessionId) throw new ComposerOperationDecodeError("Failure page scope mismatch");
+  if (!Array.isArray(record.items) || record.items.length > 100) throw new ComposerOperationDecodeError("Unbounded failure page");
+  const items = record.items.map((item) => failureOutcome(item, sessionId));
+  if (new Set(items.map((item) => item.operation_id)).size !== items.length || (operationId !== undefined && items.some((item) => item.operation_id !== operationId))) throw new ComposerOperationDecodeError("Failure page operation mismatch");
+  const nextCursor = record.next_cursor === null ? null : text(record.next_cursor);
+  if (nextCursor !== null && (nextCursor.length < 1 || nextCursor.length > 512)) throw new ComposerOperationDecodeError("Invalid failure cursor");
+  return { session_id: sessionId, items, next_cursor: nextCursor };
+}
 export function decodeComposerOperationAck(value: unknown): ComposerOperationAck {
   const record = exactRecord(value, ["operation_id", "kind", "status", "poll_after_ms"]);
   return { operation_id: canonicalUuid(record.operation_id), kind: operationKind(record.kind), status: operationStatus(record.status), poll_after_ms: pollAfter(record.poll_after_ms) };
@@ -70,9 +114,7 @@ function decodeError(value: unknown, sessionId: string): ComposerOperationError 
   if (status > 599) throw new ComposerOperationDecodeError("Invalid HTTP error status");
   if (typeof record.body !== "object" || record.body === null || Array.isArray(record.body)) throw new ComposerOperationDecodeError("Invalid error body");
   validateComposerRecoveryBody(record.body, sessionId);
-  const codes = ["http_error", "operation_failed", "worker_lost", "request_cancelled", "deadline_expired"] as const;
-  const code = codes.find((item) => item === record.failure_code);
-  if (code === undefined) throw new ComposerOperationDecodeError("Unknown failure code");
+  const code = failureCode(record.failure_code);
   const diagnostic_id = record.diagnostic_id === null ? null : canonicalUuid(record.diagnostic_id);
   if ((code === "operation_failed") !== (diagnostic_id !== null)) throw new ComposerOperationDecodeError("Invalid diagnostic binding");
   return { http_status: status, body: record.body as Record<string, unknown>, error_type: record.error_type === null ? null : text(record.error_type), failure_code: code, diagnostic_id };

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Final, Literal, Protocol, Self, final
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -97,6 +98,111 @@ class ComposerOperationError(BaseModel):
         elif self.diagnostic_id is not None:
             raise ValueError("Only operation_failed may carry a diagnostic id")
         return self
+
+
+class ComposerOperationSavedRevisions(BaseModel):
+    """Operation-owned saved revisions, distinct from requested edits or current head."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+    attribution: Literal["fenced", "unstarted", "unavailable"]
+    count: int | None = Field(ge=0)
+    latest_state_id: UUID | None
+    latest_version: int | None = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _validate_progress(self) -> Self:
+        if self.attribution == "unavailable":
+            if self.count is not None or self.latest_state_id is not None or self.latest_version is not None:
+                raise ValueError("Unavailable progress cannot claim saved revisions")
+            return self
+        if self.count is None or (self.attribution == "unstarted" and self.count != 0):
+            raise ValueError("Known progress requires an attributed revision count")
+        if self.count == 0:
+            if self.latest_state_id is not None or self.latest_version is not None:
+                raise ValueError("Zero revisions cannot identify a saved state")
+        elif self.latest_state_id is None or self.latest_version is None:
+            raise ValueError("Saved revisions require their latest state identity and version")
+        return self
+
+
+type ComposerOperationPublicFailureType = Literal[
+    "request_cancelled",
+    "composer_operation_deadline_expired",
+    "composer_operation_worker_lost",
+    "operation_failed",
+    "audit_integrity_error",
+    "database_unavailable",
+    "storage_unavailable",
+    "stale_compose_state",
+    "fingerprint_key_missing",
+    "secret_decryption_failed",
+]
+COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
+    (
+        "request_cancelled",
+        "composer_operation_deadline_expired",
+        "composer_operation_worker_lost",
+        "operation_failed",
+        "audit_integrity_error",
+        "database_unavailable",
+        "storage_unavailable",
+        "stale_compose_state",
+        "fingerprint_key_missing",
+        "secret_decryption_failed",
+    )
+)
+
+
+class ComposerOperationFailureOutcome(BaseModel):
+    """Closed public projection of a sealed failed operation; never its private body."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+    session_id: UUID
+    operation_id: str = Field(min_length=36, max_length=36)
+    kind: ComposerOperationKind
+    user_message_id: UUID | None
+    settled_at: AwareDatetime
+    failure_code: ComposerOperationFailureCode
+    error_type: ComposerOperationPublicFailureType | None
+    diagnostic_id: str | None
+    request_id: str | None = Field(min_length=1, max_length=128)
+    saved_revisions: ComposerOperationSavedRevisions
+
+    @field_validator("operation_id")
+    @classmethod
+    def _validate_operation_id(cls, value: str) -> str:
+        return require_canonical_operation_id(value)
+
+    @model_validator(mode="after")
+    def _validate_diagnostic(self) -> Self:
+        if self.failure_code == "operation_failed":
+            require_canonical_operation_id(self.diagnostic_id)
+        elif self.diagnostic_id is not None:
+            raise ValueError("Only operation_failed may carry a diagnostic id")
+        return self
+
+
+class ComposerOperationFailureCursor(BaseModel):
+    """Ordering keys only; every page independently rechecks session and actor authority."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+    settled_at: AwareDatetime
+    operation_id: str = Field(min_length=36, max_length=36)
+
+    @field_validator("operation_id")
+    @classmethod
+    def _validate_operation_id(cls, value: str) -> str:
+        return require_canonical_operation_id(value)
+
+    def encode(self) -> str:
+        return base64.urlsafe_b64encode(self.model_dump_json().encode("utf-8")).decode("ascii")
+
+    @classmethod
+    def decode(cls, value: str) -> Self:
+        if not 1 <= len(value) <= 512:
+            raise ValueError("Invalid failure history cursor")
+        encoded = base64.b64decode(value.encode("ascii"), altchars=b"-_", validate=True)
+        return cls.model_validate_json(encoded, strict=True)
 
 
 class ComposerOperationCancelledFailure(Protocol):

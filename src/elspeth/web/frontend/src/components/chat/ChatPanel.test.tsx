@@ -286,6 +286,30 @@ describe("ChatPanel", () => {
     expect(screen.getByTestId("inline-run-results")).toBeInTheDocument();
   });
 
+  it("shows retained operation outcomes without fabricating chat and moves a loaded user anchor once", () => {
+    const sid = "11111111-1111-4111-8111-111111111111";
+    const operationId = "22222222-2222-4222-8222-222222222222";
+    const userId = "33333333-3333-4333-8333-333333333333";
+    const loadEarlier = vi.fn().mockResolvedValue(undefined);
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({ sendMessage: vi.fn(), retryMessage: vi.fn(), isComposing: false, compositionState: null, error: null });
+    useSessionStore.setState({
+      activeSessionId: sid, messages: [], composerFailureNextCursor: "earlier-page", loadComposerFailureOutcomes: loadEarlier,
+      composerFailureOutcomes: [{ session_id: sid, operation_id: operationId, kind: "compose_message", user_message_id: userId, settled_at: "2026-10-14T04:02:45Z", failure_code: "operation_failed", error_type: "operation_failed", diagnostic_id: operationId, request_id: "support-request", saved_revisions: { attribution: "fenced", count: 2, latest_state_id: userId, latest_version: 7 } }],
+    });
+    render(<ChatPanel />);
+    expect(screen.getByRole("note", { name: "Composer operation outcome" })).toHaveTextContent("Composition failed");
+    expect(screen.getByText(/2 draft revisions/)).toBeInTheDocument();
+    expect(screen.getByText(/last saved version 7/)).toBeInTheDocument();
+    expect(useSessionStore.getState().messages).toEqual([]);
+    fireEvent.click(screen.getByRole("button", { name: "Load earlier outcomes" }));
+    expect(loadEarlier).toHaveBeenCalledWith(true);
+    act(() => useSessionStore.setState({ messages: [{ id: userId, operation_id: operationId, session_id: sid, role: "user", content: "The bound original request", created_at: "2026-10-14T04:00:00Z", tool_calls: null }] }));
+    const notices = screen.getAllByRole("note", { name: "Composer operation outcome" });
+    expect(notices).toHaveLength(1);
+    expect(notices[0].previousElementSibling).toHaveTextContent("The bound original request");
+    expect(useSessionStore.getState().messages).toHaveLength(1);
+  });
+
   it("does not mount run results in the freeform authoring pane", () => {
     useSessionStore.setState({
       activeSessionId: "session-1",

@@ -1,11 +1,33 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cancelComposerOperation, fetchComposerOperation, fetchComposerOperationStream, submitComposerOperation } from "./client";
+import { apiErrorFromBody, cancelComposerOperation, fetchComposerOperation, fetchComposerOperationFailures, fetchComposerOperationStream, submitComposerOperation } from "./client";
 import type { SubmittedCustody } from "@/types/composerOperations";
 const sid = "11111111-1111-4111-8111-111111111111", id = "22222222-2222-4222-8222-222222222222";
 const descriptor: SubmittedCustody = { mode: "submitted", scope: { principalId: "principal", authProvider: "local" }, sessionId: sid, operationId: id, kind: "compose_message", createdAt: Date.now(), body: { operation_id: id, content: "hello", state_id: null } };
 beforeEach(() => { localStorage.setItem("auth_token", "operation-test-token"); });
 afterEach(() => { vi.unstubAllGlobals(); localStorage.clear(); });
 describe("authenticated composer operation wire", () => {
+  it("authenticates and bounds every retained page and exact operation read", async () => {
+    const fetch = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ session_id: sid, items: [], next_cursor: null })));
+    vi.stubGlobal("fetch", fetch);
+    await fetchComposerOperationFailures(sid, { cursor: "opaque+/=" });
+    const signal = new AbortController().signal;
+    await fetchComposerOperationFailures(sid, { operationId: id, signal });
+    for (const [url, init] of fetch.mock.calls as [string, RequestInit][]) {
+      expect(url).not.toContain("operation-test-token");
+      expect(new Headers(init.headers).get("Authorization")).toBe("Bearer operation-test-token");
+      expect(init.cache).toBe("no-store");
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+    }
+    expect(fetch.mock.calls[0][0]).toBe(`/api/sessions/${sid}/operations?cursor=opaque%2B%2F%3D`);
+    expect(fetch.mock.calls[1][0]).toBe(`/api/sessions/${sid}/operations?operation_id=${id}`);
+    expect(fetch.mock.calls[1][1].signal).toBe(signal);
+  });
+  it("extracts the canonical diagnostic from both public error envelope shapes", async () => {
+    for (const body of [{ diagnostic_id: id, request_id: "request-reference", detail: "Failed" }, { detail: { diagnostic_id: id, request_id: "request-reference", detail: "Failed" } }]) {
+      expect(await apiErrorFromBody(500, body)).toMatchObject({ diagnostic_id: id, request_id: "request-reference" });
+    }
+    expect((await apiErrorFromBody(500, { diagnostic_id: "private malformed value", detail: "Failed" })).diagnostic_id).toBeUndefined();
+  });
   it("sends bearer only in headers and preserves the exact admission body", async () => {
     const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ operation_id: id, kind: "compose_message", status: "queued", poll_after_ms: 1000 }), { status: 202 })); vi.stubGlobal("fetch", fetch);
     await submitComposerOperation(descriptor);
