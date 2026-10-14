@@ -291,7 +291,7 @@ class TestBlobTools:
         catalog = _mock_catalog()
         result = execute_tool(
             "set_source_from_blob",
-            {"blob_id": self.blob_id, "on_success": "out", "options": {"schema": {"mode": "observed"}}},
+            {"blob_id": self.blob_id, "on_success": "out", "on_validation_failure": "discard", "options": {"schema": {"mode": "observed"}}},
             state,
             catalog,
             session_engine=self.engine,
@@ -313,6 +313,7 @@ class TestBlobTools:
                 "blob_id": self.blob_id,
                 "source_name": "orders",
                 "on_success": "orders_rows",
+                "on_validation_failure": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             state,
@@ -367,7 +368,12 @@ class TestBlobTools:
 
         result = execute_tool(
             "set_source_from_blob",
-            {"blob_id": self.blob_id, "on_success": "out", "options": {"schema": {"mode": "observed"}, "column": "line"}},
+            {
+                "blob_id": self.blob_id,
+                "on_success": "out",
+                "on_validation_failure": "discard",
+                "options": {"schema": {"mode": "observed"}, "column": "line"},
+            },
             state,
             catalog,
             session_engine=self.engine,
@@ -391,7 +397,7 @@ class TestBlobTools:
 
         result = execute_tool(
             "set_source_from_blob",
-            {"blob_id": self.blob_id, "on_success": "out", "options": {"schema": {"mode": "observed"}}},
+            {"blob_id": self.blob_id, "on_success": "out", "on_validation_failure": "discard", "options": {"schema": {"mode": "observed"}}},
             state,
             catalog,
             session_engine=self.engine,
@@ -424,6 +430,7 @@ class TestBlobTools:
             {
                 "blob_id": self.blob_id,
                 "on_success": "out",
+                "on_validation_failure": "discard",
                 "options": {
                     "column": "line",
                     "schema": {"mode": "observed"},
@@ -460,6 +467,7 @@ class TestBlobTools:
             {
                 "blob_id": self.blob_id,
                 "on_success": "out",
+                "on_validation_failure": "discard",
                 "options": {
                     "path": "/etc/passwd",  # Attempted path injection
                     "schema": {"mode": "observed"},
@@ -487,6 +495,7 @@ class TestBlobTools:
             {
                 "blob_id": self.blob_id,
                 "on_success": "out",
+                "on_validation_failure": "discard",
                 "options": {
                     "blob_ref": "malicious-ref",
                     "schema": {"mode": "observed"},
@@ -509,7 +518,7 @@ class TestBlobTools:
         catalog = _mock_catalog()
         result = execute_tool(
             "set_source_from_blob",
-            {"blob_id": self.blob_id, "on_success": "out", "options": {"schema": {"mode": "observed"}}},
+            {"blob_id": self.blob_id, "on_success": "out", "on_validation_failure": "discard", "options": {"schema": {"mode": "observed"}}},
             state,
             catalog,
             session_engine=self.engine,
@@ -531,7 +540,7 @@ class TestBlobTools:
         threaded = state.validate()
         result = execute_tool(
             "set_source_from_blob",
-            {"blob_id": self.blob_id, "on_success": "out", "options": {"schema": {"mode": "observed"}}},
+            {"blob_id": self.blob_id, "on_success": "out", "on_validation_failure": "discard", "options": {"schema": {"mode": "observed"}}},
             state,
             catalog,
             session_engine=self.engine,
@@ -548,6 +557,7 @@ class TestBlobTools:
         blob_args: dict[str, Any] = {
             "blob_id": self.blob_id,
             "on_success": "out",
+            "on_validation_failure": "discard",
             "options": {"schema": {"mode": "observed"}},
         }
         # Fresh (no threading)
@@ -2642,6 +2652,200 @@ class TestGetBlobContentGuards:
         assert result.success is True
         assert result.data["content"] == self.content_bytes.decode("utf-8")
 
+    def test_explicit_null_identity_at_zero_reads_the_verified_current_blob(self) -> None:
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id, "offset_chars": 0, "expected_content_hash": None},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+        assert result.success
+        assert result.data["content"] == self.content_bytes.decode("utf-8")
+        assert result.data["content_hash"] == self.content_hash_hex
+
+    def _replace_content(self, content: str) -> str:
+        from elspeth.web.blobs.service import content_hash
+
+        data = content.encode("utf-8")
+        digest = content_hash(data)
+        self.storage_path.write_bytes(data)
+        with self.engine.begin() as conn:
+            conn.execute(blobs_table.update().where(blobs_table.c.id == self.blob_id).values(size_bytes=len(data), content_hash=digest))
+        return digest
+
+    @pytest.mark.parametrize(
+        "content",
+        ["", "x" * 50_000, "x" * 50_001, "\x00" * 50_001, "🙂e\u0301" * 20_000],
+        ids=["empty", "ascii-cap", "ascii-over", "escaped-ascii", "non-bmp-combining"],
+    )
+    def test_pages_reconstruct_exact_unicode_content_with_verified_identity(self, content: str) -> None:
+        import json
+
+        from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+
+        digest = self._replace_content(content)
+        offset = 0
+        chunks = []
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            for _ in range(32):
+                arguments = {"blob_id": self.blob_id, "offset_chars": offset, "expected_content_hash": digest}
+                result = execute_tool(
+                    "get_blob_content",
+                    arguments,
+                    _empty_state(),
+                    _mock_catalog(),
+                    data_dir=str(self.data_dir),
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=authority,
+                    session_operation_context=context,
+                )
+                assert result.success, result.validation.errors
+                assert result.data["content_hash"] == digest
+                assert result.data["total_chars"] == len(content)
+                assert result.data["start_char"] == offset
+                end = result.data["end_char"]
+                assert result.data["content"] == content[offset:end]
+                assert end - offset <= 50_000
+                assert result.data["truncated"] is (end < len(content))
+                serialized = serialize_admitted_discovery_result(admit_discovery_result("get_blob_content", result))
+                assert len(serialized.encode("utf-8")) <= 65_536
+                assert json.loads(serialized)["data"]["content"] == content[offset:end]
+                chunks.append(result.data["content"])
+                if result.data["next_offset_chars"] is None:
+                    assert end == len(content)
+                    break
+                assert result.data["next_offset_chars"] == end > offset
+                offset = end
+            else:
+                pytest.fail("Continuation failed to advance within the synthetic page bound")
+        assert "".join(chunks) == content
+
+    @pytest.mark.parametrize("offset", [0, 2, 4, 5])
+    def test_explicit_offsets_and_eof(self, offset: int) -> None:
+        content = "a🙂e\u0301"
+        digest = self._replace_content(content)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id, "offset_chars": offset, "expected_content_hash": digest},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+        assert result.success is (offset <= len(content))
+        if result.success:
+            assert result.data["content"] == content[offset:]
+            assert result.data["start_char"] == offset
+            assert result.data["end_char"] == len(content)
+            assert result.data["next_offset_chars"] is None
+
+    @pytest.mark.parametrize("offset", [0, 1])
+    def test_expected_identity_mismatch_discloses_no_content(self, offset: int) -> None:
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id, "offset_chars": offset, "expected_content_hash": "0" * 64},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+        assert not result.success
+        assert result.data is None
+
+    def test_replaced_blob_cannot_continue_the_previous_verified_series(self) -> None:
+        from elspeth.web.composer.tools import blobs
+        from tests.unit.web.composer.test_set_pipeline_candidate import _trained_context
+
+        digest = self._replace_content("before")
+        with _blob_operation(self.engine, self.session_id) as (authority, operation):
+            context = _trained_context(
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=operation,
+            )
+            initial = blobs._execute_get_blob_content({"blob_id": self.blob_id}, _empty_state(), context)
+        assert initial.success
+        assert initial.data["content_hash"] == digest
+        replacement_digest = self._replace_content("after")
+        with _blob_operation(self.engine, self.session_id) as (authority, operation):
+            context = _trained_context(
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=operation,
+            )
+            stale = blobs._execute_get_blob_content(
+                {"blob_id": self.blob_id, "offset_chars": 1, "expected_content_hash": digest},
+                _empty_state(),
+                context,
+            )
+            fresh = blobs._execute_get_blob_content(
+                {"blob_id": self.blob_id, "offset_chars": 1, "expected_content_hash": replacement_digest},
+                _empty_state(),
+                context,
+            )
+        assert not stale.success
+        assert stale.data is None
+        assert fresh.success
+        assert fresh.data["content"] == "fter"
+
+    def test_credential_after_page_boundary_refuses_the_first_page(self) -> None:
+        content = "x" * 49_996 + "\nsk-" + "A" * 48
+        self._replace_content(content)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+        assert not result.success
+        assert result.data is None
+        assert result.validation.errors[0].error_code == "credential_material_rejected"
+
+    def test_escaped_page_must_fit_complete_provider_envelope(self) -> None:
+        from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+
+        self._replace_content("\x00" * 50_000)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+        assert result.success
+        encoded = serialize_admitted_discovery_result(admit_discovery_result("get_blob_content", result))
+        assert len(encoded.encode("utf-8")) <= 65_536
+
     def test_pending_blob_refused(self) -> None:
         """Status guard — pending blobs may be partial writes."""
         self._set_status("pending")
@@ -2935,6 +3139,11 @@ class TestGetBlobContentOrigin:
             "size_bytes",
             "created_by",
             "creation_modality",
+            "content_hash",
+            "total_chars",
+            "start_char",
+            "end_char",
+            "next_offset_chars",
         }
 
     def test_composer_written_user_content_is_not_reported_as_assistant_authored(self) -> None:

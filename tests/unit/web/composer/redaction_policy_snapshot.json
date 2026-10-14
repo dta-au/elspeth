@@ -30,8 +30,8 @@
     "shape": "declarative"
   },
   "get_blob_content": {
-    "hash": "57f71f697c55cd53cb54e1d4302dd587ae79ca9b269cf9963186e958f81f5441",
-    "sensitive_path_count": 2,
+    "hash": "a41cc4524b2f4341f1e5e4c7be7f8e4a2a65d9b7ad2c2f2d7599682bec1aae90",
+    "sensitive_path_count": 3,
     "shape": "type_driven"
   },
   "get_blob_metadata": {
