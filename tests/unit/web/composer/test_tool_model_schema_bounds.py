@@ -6,6 +6,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.sessions import _RequestInterpretationReviewArgumentsModel
@@ -58,6 +59,15 @@ def test_review_string_bounds_match_whole_model(field: str, maximum: int, positi
     assert validator.is_valid(payload) is accepted
     if accepted:
         _RequestInterpretationReviewArgumentsModel.model_validate(payload)
+    elif field == "llm_draft" and position == "too_long":
+        with pytest.raises(ToolArgumentError) as caught:
+            _RequestInterpretationReviewArgumentsModel.model_validate(payload)
+        assert str(caught.value) == (
+            "'llm_draft' must be an inline review draft of at most 8192 characters; "
+            "omit llm_draft to use the exact staged draft, or ask the user for a shorter review draft, "
+            "got review draft exceeds the 8192-character inline limit"
+        )
+        assert payload[field] not in repr(caught.value)
     else:
         with pytest.raises(ValidationError):
             _RequestInterpretationReviewArgumentsModel.model_validate(payload)

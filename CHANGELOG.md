@@ -4,7 +4,7 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## 0.8.5 - Unreleased (LLM compatibility and Composer recovery)
+## 0.8.5 - LLM compatibility and Composer recovery
 
 - **Omitted LLM temperature uses the provider default.** Common source and
   transform configurations now omit temperature when absent or explicitly
@@ -33,9 +33,11 @@ stores remain preserved and refused; this release does not authorize migration,
 reset or downgrade. Ordered dependent LLM queries and the quarantine/discard
 visibility toggle are separate 0.8.6 work and are not included.
 
-This is an unreleased source candidate. Focused synthetic checks and independent
-source reviews do not establish final exact-head qualification, live model or
-tutorial acceptance, a release tag, signed image publication or deployment.
+This entry describes the source changes in 0.8.5. Focused synthetic checks and
+independent source reviews are separate from final exact-head qualification,
+live model or tutorial acceptance, release tagging, signed image publication
+and deployment. Verify the evidence for the exact source head and image digest
+before upgrading.
 
 ## 0.8.4 - Unreleased (Restricted SQL and credential lifecycle hardening)
 

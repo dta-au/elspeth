@@ -100,19 +100,21 @@ describe what is exported and how to configure it.
 
 ## What changed in 0.8.5
 
-This unreleased candidate improves LLM sampling compatibility, ordinary
+0.8.5 improves LLM sampling compatibility, ordinary
 execution ownership for the tutorial, document-review recovery, and graph
 route inspection at shared sinks. Omitted sampling now leaves the provider
 default; explicit numbers retain their authored meaning. Composer accepts
 legitimate long review lines and gives actionable feedback for remaining
-constraints. Final qualification is pending. See the [release notes](CHANGELOG.md).
+constraints. See the [release notes](CHANGELOG.md).
 
-This candidate requires session epoch 75 and Landscape epoch 49. Existing
+This version requires session epoch 75 and Landscape epoch 49. Existing
 unsupported stores are refused before writes: preserve them unchanged and
 configure explicitly new compatible databases. ELSPETH does not migrate either
 store in place or authorize downgrading these stores. This pre-release
 compatibility policy has no fixed expiry. Package metadata is 0.8.5;
-this source candidate is not a published release image. See the
+the package version alone does not establish qualification or image publication.
+Automatic image publication from main is held; verify the release tag and image
+digest before installing a published image. See the
 [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.
 
