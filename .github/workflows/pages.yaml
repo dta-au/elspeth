@@ -1,10 +1,9 @@
 name: Deploy website to GitHub Pages
 
-# Publishes the static `website/` tree only on an authorized manual dispatch
-# from the protected repository default branch. Automatic push publication is
-# held by the deploy job guard. The first deployment selects "GitHub Actions"
-# as the Pages source via configure-pages `enablement`, then serves `website/`
-# at the site root (so /tutorial-site/project-N.html resolves as before).
+# Publishes the static `website/` tree on relevant pushes to the protected
+# repository default branch, or manual dispatch from that same branch. PRs
+# and untrusted refs cannot deploy. Uses the configured Pages environment and
+# serves `website/` at the site root, including /tutorial-site/project-N.html.
 
 on:
   push:
@@ -28,9 +27,9 @@ concurrency:
 jobs:
   deploy:
     name: Deploy website/ to Pages
-    # Hold automatic publication while Composer fixes land; source integration
-    # and schema-preservation guidance do not authorize a Pages deployment.
-    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.ref_protected
+    # Publish only reviewed default-branch pushes or trusted manual dispatches.
+    # Both paths require the protected repository default branch.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.ref_protected
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-pages
@@ -42,7 +41,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
-      - name: Configure Pages (enable + select GitHub Actions source)
+      - name: Configure Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6.0.0
         with:
           enablement: true

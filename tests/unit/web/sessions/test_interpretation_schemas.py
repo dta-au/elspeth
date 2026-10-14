@@ -172,8 +172,6 @@ class TestInterpretationEventResponse:
             ("affected_node_id", 257),
             ("tool_call_id", 257),
             ("user_term", 8193),
-            ("llm_draft", 8193),
-            ("accepted_value", 8193),
             ("actor", 257),
             ("model_identifier", 257),
             ("model_version", 129),
@@ -201,6 +199,21 @@ class TestInterpretationEventResponse:
         kwargs["actor"] = ""
         with pytest.raises(ValidationError):
             InterpretationEventResponse(**kwargs)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("content", ["x" * 8193, "界" * 4097, "x" * 262145])
+    def test_owned_artifact_text_is_preserved_without_an_inline_read_cap(self, content: str) -> None:
+        kwargs = _valid_event_kwargs()
+        kwargs.update(llm_draft=content, accepted_value=content)
+        event = InterpretationEventResponse.model_validate(kwargs)
+        assert event.llm_draft == event.accepted_value == content
+
+    @pytest.mark.parametrize("field", ["llm_draft", "accepted_value"])
+    @pytest.mark.parametrize("value", [1, b"text", {}, []])
+    def test_owned_artifact_text_remains_strict(self, field: str, value: object) -> None:
+        kwargs = _valid_event_kwargs()
+        kwargs[field] = value
+        with pytest.raises(ValidationError):
+            InterpretationEventResponse.model_validate(kwargs)
 
     def test_response_is_frozen(self) -> None:
         event = InterpretationEventResponse(**_valid_event_kwargs())  # type: ignore[arg-type]

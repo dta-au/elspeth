@@ -6433,9 +6433,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=738,
     ),
-    # ``with open_landscape_db(settings) as db, db.write_connection() as conn``:
-    # the tutorial's live-run projection writes the Landscape ``runs`` row and
-    # hands the connection to two counting helpers (hence the escape).
+    # ``with open_landscape_db(settings) as db, db.read_only_connection() as conn``:
+    # the tutorial's live-run projection reads Landscape data and hands the
+    # connection to two counting helpers (hence the escape).
     WriterIdentity(
         "src/elspeth/web/composer/tutorial_service.py",
         "_project_live_tutorial_output",

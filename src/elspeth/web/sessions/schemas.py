@@ -546,8 +546,11 @@ class InterpretationEventResponse(_StrictResponse):
     tool_call_id: str | None = Field(default=None, max_length=PROVIDER_TOOL_CALL_ID_MAX_LENGTH)
     user_term: str | None = Field(default=None, max_length=8192)
     kind: InterpretationKind | None = None
-    llm_draft: str | None = Field(default=None, max_length=8192)
-    accepted_value: str | None = Field(default=None, max_length=8192)
+    # Mirror complete owned event text. Producer-specific admission bounds
+    # differ from inline tool/amendment limits; reads must not reject an
+    # already admitted staged artifact or its accepted-as-drafted value.
+    llm_draft: str | None = None
+    accepted_value: str | None = None
     choice: InterpretationChoice
     created_at: datetime
     resolved_at: datetime | None = None

@@ -53,6 +53,7 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_heading = f"\n## {CURRENT_VERSION} - "
     assert changelog.count(current_heading) == 1
     current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_084 = changelog.split("\n## 0.8.4 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_082 = changelog.split("\n## 0.8.2 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_081 = changelog.split("\n## 0.8.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_080 = changelog.split("\n## 0.8.0 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
@@ -60,9 +61,13 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
 
     assert f"Session epoch {SESSION_SCHEMA_EPOCH}" in current_release
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_release
-    assert "Session epoch 72 adds durable Composer jobs" in current_release
-    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in current_release
-    assert "A Landscape database already at epoch 49 remains usable" in " ".join(current_release.split())
+    assert "are unchanged" in current_release
+    assert "Existing unsupported\nstores remain preserved and refused" in current_release
+    assert "LLM compatibility and Composer recovery" in current_release
+    assert "Omitted LLM temperature uses the provider default" in current_release
+    assert "Session epoch 72 adds durable Composer jobs" in release_084
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in release_084
+    assert "A Landscape database already at epoch 49 remains usable" in " ".join(release_084.split())
 
     assert "Session epoch 71 and Landscape epoch 49" in release_082
     assert "unchanged from 0.8.1; this release adds no schema-epoch cutover" in " ".join(release_082.split())

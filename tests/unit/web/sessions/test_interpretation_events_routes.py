@@ -18,6 +18,7 @@ schema as a full stack.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -34,6 +35,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.source_demand import SOURCE_DATA_CONTRACT_USER_TERM, build_source_data_contract_draft
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY, SOURCE_COMPONENT_ID
@@ -208,7 +210,7 @@ def _prompt_template_review_node(*, node_id: str = "identify_colour") -> dict[st
     return state.to_dict()["nodes"][0]
 
 
-def _llm_generated_source() -> dict[str, Any]:
+def _llm_generated_source(*, draft: str = "https://example.gov.au") -> dict[str, Any]:
     state = CompositionState(
         source=SourceSpec(
             plugin="csv",
@@ -217,7 +219,7 @@ def _llm_generated_source() -> dict[str, Any]:
                 "path": "/tmp/generated.csv",
                 SOURCE_AUTHORING_KEY: {
                     "modality": CreationModality.LLM_GENERATED.value,
-                    "content_hash": "0" * 64,
+                    "content_hash": sha256(draft.encode("utf-8")).hexdigest(),
                     "review_event_id": None,
                     "resolved_kind": None,
                 },
@@ -227,7 +229,7 @@ def _llm_generated_source() -> dict[str, Any]:
                         "kind": InterpretationKind.INVENTED_SOURCE.value,
                         "user_term": "inline_source_url_list",
                         "status": "pending",
-                        "draft": "https://example.gov.au",
+                        "draft": draft,
                         "event_id": None,
                         "accepted_value": None,
                         "accepted_artifact_hash": None,
@@ -338,7 +340,7 @@ async def _seed_session_with_pending_event(
     return {"session_id": sid, "state": state, "event": event}
 
 
-async def _seed_session_with_source_pending_event(test_client: TestClient) -> dict[str, Any]:
+async def _seed_session_with_source_pending_event(test_client: TestClient, *, draft: str = "https://example.gov.au") -> dict[str, Any]:
     sid = uuid4()
     service: SessionServiceImpl = test_client.app.state.session_service
     with test_client.app.state.phase3_engine.begin() as conn:
@@ -347,7 +349,7 @@ async def _seed_session_with_source_pending_event(test_client: TestClient) -> di
         service,
         sid,
         CompositionStateData(
-            source=_llm_generated_source(),
+            source=_llm_generated_source(draft=draft),
             nodes=[],
             metadata_={"name": "Phase 5b Routes Test", "description": ""},
             is_valid=True,
@@ -361,7 +363,7 @@ async def _seed_session_with_source_pending_event(test_client: TestClient) -> di
         tool_call_id="call_source_review",
         user_term="inline_source_url_list",
         kind=InterpretationKind.INVENTED_SOURCE,
-        llm_draft="https://example.gov.au",
+        llm_draft=draft,
         model_identifier="anthropic/claude-opus-4-7",
         model_version="2026-05-01",
         provider="anthropic",
@@ -373,6 +375,105 @@ async def _seed_session_with_source_pending_event(test_client: TestClient) -> di
 # --------------------------------------------------------------------------- #
 # POST /resolve happy paths
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["list", "accept"])
+@pytest.mark.parametrize("prose", ["Synthetic document evidence. ", "合成文書の根拠。"])
+async def test_large_staged_source_review_survives_http_projection(test_client: TestClient, operation: str, prose: str) -> None:
+    draft = "url,label\nhttps://example.gov.au/a," + prose * 1200 + "\n"
+    assert len(draft) > 8192
+    seeded = await _seed_session_with_source_pending_event(test_client, draft=draft)
+    service: SessionServiceImpl = test_client.app.state.session_service
+    session_id = seeded["session_id"]
+    event_id = seeded["event"].id
+    before = await service.list_interpretation_events(session_id, status="pending")
+    assert len(before) == 1 and before[0].llm_draft == draft
+    if operation == "list":
+        try:
+            response = await _get(test_client, f"/api/sessions/{session_id}/interpretations")
+        finally:
+            assert await service.list_interpretation_events(session_id, status="pending") == before
+        assert response.status_code == 200, response.text
+        assert response.json()["events"][0]["llm_draft"] == draft
+        assert await service.list_interpretation_events(session_id, status="pending") == before
+    else:
+        try:
+            response = await _post(
+                test_client,
+                f"/api/sessions/{session_id}/interpretations/{event_id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+        finally:
+            # Resolution is durable before HTTP projection, including on the
+            # original failing read-model boundary. Do not retry the write.
+            rows = await service.list_interpretation_events(session_id, status="all")
+            assert len(rows) == 1
+            assert rows[0].choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
+            assert rows[0].llm_draft == rows[0].accepted_value == draft
+            assert rows[0].composition_state_id == seeded["state"].id
+            head = await service.get_composition_head(session_id)
+            assert head.state_id is not None
+            durable = await service.get_state(UUID(str(head.state_id)))
+            assert durable.version == seeded["state"].version + 1
+            assert durable.sources is not None
+            durable_options = durable.sources[SOURCE_COMPONENT_ID]["options"]
+            expected_hash = sha256(draft.encode("utf-8")).hexdigest()
+            assert durable_options[SOURCE_AUTHORING_KEY]["content_hash"] == expected_hash
+            assert durable_options[SOURCE_AUTHORING_KEY]["review_event_id"] == str(event_id)
+            assert durable_options[SOURCE_AUTHORING_KEY]["resolved_kind"] == InterpretationKind.INVENTED_SOURCE.value
+            requirement = durable_options[INTERPRETATION_REQUIREMENTS_KEY][0]
+            assert requirement["status"] == "resolved"
+            assert requirement["accepted_artifact_hash"] == expected_hash
+            assert requirement["accepted_value"] == draft
+            assert requirement["event_id"] == str(event_id)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["event"]["llm_draft"] == body["event"]["accepted_value"] == draft
+        assert body["event"]["composition_state_id"] == str(seeded["state"].id)
+        assert body["event"]["arguments_hash"] == rows[0].arguments_hash
+        assert body["event"]["hash_domain_version"] == rows[0].hash_domain_version == "v2"
+        assert rows[0].arguments_hash == stable_hash(
+            {
+                "session_id": str(session_id),
+                "composition_state_id": str(seeded["state"].id),
+                "affected_node_id": SOURCE_COMPONENT_ID,
+                "tool_call_id": "call_source_review",
+                "user_term": "inline_source_url_list",
+                "kind": InterpretationKind.INVENTED_SOURCE.value,
+                "llm_draft": draft,
+                "accepted_value": draft,
+                "actor": rows[0].actor,
+                "model_identifier": rows[0].model_identifier,
+                "model_version": rows[0].model_version,
+                "provider": rows[0].provider,
+                "composer_skill_hash": rows[0].composer_skill_hash,
+            }
+        )
+        assert body["new_state"]["version"] == seeded["state"].version + 1
+        assert body["new_state"]["id"] == str(durable.id) == str(head.state_id)
+        returned_options = body["new_state"]["sources"][SOURCE_COMPONENT_ID]["options"]
+        assert returned_options[SOURCE_AUTHORING_KEY] == durable_options[SOURCE_AUTHORING_KEY]
+        # HTTP arrays are lists; the owned durable record freezes them as tuples.
+        assert tuple(returned_options[INTERPRETATION_REQUIREMENTS_KEY]) == durable_options[INTERPRETATION_REQUIREMENTS_KEY]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["list", "accept"])
+async def test_large_review_does_not_widen_session_authorization(test_client: TestClient, operation: str) -> None:
+    draft = "Synthetic private review. " * 400
+    seeded = await _seed_session_with_pending_event(test_client, user_id="bob", llm_draft=draft)
+    service: SessionServiceImpl = test_client.app.state.session_service
+    before = await service.list_interpretation_events(seeded["session_id"], status="all")
+    url = f"/api/sessions/{seeded['session_id']}/interpretations"
+    if operation == "list":
+        response = await _get(test_client, url)
+    else:
+        response = await _post(test_client, f"{url}/{seeded['event'].id}/resolve", json={"choice": "accepted_as_drafted"})
+    assert response.status_code == 404
+    assert draft not in response.text
+    assert "Synthetic private review." not in response.text
+    assert await service.list_interpretation_events(seeded["session_id"], status="all") == before
 
 
 @pytest.mark.asyncio
