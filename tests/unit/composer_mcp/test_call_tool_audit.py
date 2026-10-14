@@ -492,13 +492,14 @@ async def test_set_pipeline_output_without_options_preserves_collision_control_e
             server.request_handlers,
             "set_pipeline",
             {
-                "source": {"plugin": "null", "on_success": "rows"},
+                "source": {"plugin": "null", "on_success": "rows", "on_validation_failure": "discard"},
                 "nodes": [],
                 "edges": [],
                 "outputs": [
                     {
                         "sink_name": "main",
                         "plugin": "csv",
+                        "on_write_failure": "discard",
                     },
                 ],
             },

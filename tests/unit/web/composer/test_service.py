@@ -1358,6 +1358,10 @@ class TestComposerSingleToolCall:
     @pytest.mark.asyncio
     async def test_inline_complete_pipeline_incremental_replay_uses_atomic_tool_shape(self, tmp_path: Path) -> None:
         """Incremental inline full replacement retains the atomic tool shape."""
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+        from elspeth.web.composer.turn_effects import authored_state_hash
+
         catalog = _mock_catalog()
         engine, session_id = _session_engine_with_session()
         settings = _make_settings(data_dir=tmp_path)
@@ -1368,14 +1372,6 @@ class TestComposerSingleToolCall:
             session_engine=engine,
         )
 
-        # Stub the EARLY advisory checkpoint (fires on the empty->non-empty
-        # transition this test drives) so it makes no advisor LLM call — this
-        # test is about the atomic tool shape and its `llm_calls == 3`
-        # bookkeeping, not the advisor pass.
-        async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
-            return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
-
-        service._advisor_checkpoint._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
@@ -1455,9 +1451,36 @@ class TestComposerSingleToolCall:
         )
         preview_turn = _make_raw_llm_response(tool_calls=[{"id": "call_preview", "name": "preview_pipeline", "arguments": {}}])
         final_turn = _make_raw_llm_response(content="Pipeline configured.")
+        primary_requests = []
+        reviews = []
+
+        async def completion(**kwargs: Any):
+            if kwargs["model"] == service._model:
+                primary_requests.append(deepcopy(kwargs))
+                assert len(primary_requests) <= 3, "Only the original build/preview/final primary responses are supplied"
+                return (build_turn, preview_turn, final_turn)[len(primary_requests) - 1]
+            assert kwargs["model"] == settings.composer_advisor_model, "No response is supplied for another role"
+            assert not reviews, "Only one independent END SDK response is supplied"
+            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            reviews.append(review)
+            assert review["candidate_reply"] == "Pipeline configured."
+            assert review["current_request"] == user_message_content
+            assert review["saved_effects"]["saved_revision_count"] == 1
+            assert review["saved_effects"]["net_changed"] is True
+            return _make_raw_llm_response(
+                content=json.dumps(
+                    {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+                )
+            )
 
         with (
-            patch("litellm.acompletion", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", side_effect=completion) as mock_llm,
+            patch.object(
+                service._advisor_checkpoint,
+                "_run_advisor_checkpoint",
+                new=_REAL_RUN_ADVISOR_CHECKPOINT.__get__(service._advisor_checkpoint, AdvisorCheckpointOwner),
+            ),
             patch.object(
                 service._preflight,
                 "cached_runtime_preflight",
@@ -1465,7 +1488,6 @@ class TestComposerSingleToolCall:
                 return_value=ValidationResult(is_valid=True, checks=[], errors=[]),
             ),
         ):
-            mock_llm.side_effect = [build_turn, preview_turn, final_turn]
             result = await service.compose(
                 user_message_content,
                 [],
@@ -1475,16 +1497,29 @@ class TestComposerSingleToolCall:
             )
 
         assert result.message == "Pipeline configured."
-        assert mock_llm.call_count == 3
+        assert len(primary_requests) == 3 and len(reviews) == 1
+        assert mock_llm.call_count == 4
+        assert reviews[0]["current_graph_hash"] == authored_state_hash(result.state)
         tool_names = [inv.tool_name for inv in result.tool_invocations]
         assert tool_names == ["set_pipeline", "preview_pipeline"]
         assert "create_blob" not in tool_names
         assert "set_source_from_blob" not in tool_names
         assert "upsert_node" not in tool_names
         assert "set_output" not in tool_names
-        assert len(result.llm_calls) == 3
+        assert len(result.llm_calls) == 4
         assert result.state.sources["source"] is not None
         assert "blob_ref" in result.state.sources["source"].options
+        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
+        passes = [
+            row.tool_calls[0]["pass"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert len(passes) == 1
+        assert passes[0]["phase"] == "end" and passes[0]["source"] == "model"
+        assert passes[0]["publication_verdict"] == "ADMIT" and passes[0]["first_attempt_accepted"] is True
+        assert passes[0]["provider_attempts"] == 1
+        assert type(passes[0]["publication_binding"]) is str and len(passes[0]["publication_binding"]) == 64
 
 
 class TestComposerMultiTurnToolCalls:
@@ -1822,6 +1857,8 @@ class TestComposerMultiTurnToolCalls:
 
     @pytest.mark.asyncio
     async def test_advisor_rereview_carries_prior_finding_mutation_and_current_evidence(self) -> None:
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+
         catalog = _mock_catalog()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
         state = CompositionState(
@@ -1840,30 +1877,56 @@ class TestComposerMultiTurnToolCalls:
         llm_responses = [
             _make_llm_response(content="Looks ready."),
             _make_llm_response(tool_calls=[{"id": "repair-1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}]),
-            _make_llm_response(content="Ready after repair."),
+            _make_llm_response(content="The pipeline name is now Repaired."),
         ]
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         prior_finding = "FLAGGED: sink omits rating"
         service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
             service._advisor_checkpoint, AdvisorCheckpointOwner
         )  # type: ignore[method-assign]
+        reviews = []
+
+        async def rereview(
+            arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
+        ) -> tuple[str, dict[str, object]]:
+            review = json.loads(arguments["publication_review"])
+            reviews.append(review)
+            assert len(reviews) <= 2, "Only the original two review responses are supplied"
+            assert review["current_request"] == "Review this pipeline"
+            assert review["candidate_reply"] == ("Looks ready.", "The pipeline name is now Repaired.")[len(reviews) - 1]
+            assert review["saved_effects"]["saved_revision_count"] == len(reviews) - 1
+            assert review["saved_effects"]["net_changed"] is (len(reviews) == 2)
+            if on_provider_dispatch is not None:
+                on_provider_dispatch()
+            flagged = len(reviews) == 1
+            return json.dumps(
+                {
+                    "verdict": "FLAGGED" if flagged else "CLEAN",
+                    "category": "other",
+                    "steps": [],
+                    "findings": prior_finding if flagged else "",
+                    "note": "Add the rating field to the sink output." if flagged else None,
+                    "publication_verdict": "WITHHOLD" if flagged else "ADMIT",
+                }
+            ), {}
 
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=llm_responses),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=llm_responses) as primary_call,
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=_advisor_checkpoint_responses(
-                    _advisor_checkpoint_reply(verdict="FLAGGED", findings=prior_finding, note="Add the rating field to the sink output."),
-                    _advisor_checkpoint_reply(verdict="CLEAN", findings="", note=None),
-                ),
+                side_effect=rereview,
             ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
         assert result.runtime_preflight is None or result.runtime_preflight.is_valid
+        assert primary_call.await_count == 3 and advisor_call.await_count == len(reviews) == 2
+        assert result.state.metadata.name == "Repaired"
+        assert result.message == "The pipeline name is now Repaired."
+        assert reviews[0]["current_graph_hash"] != reviews[1]["current_graph_hash"]
         first_arguments = advisor_call.await_args_list[0].args[0]
         second_arguments = advisor_call.await_args_list[1].args[0]
         assert first_arguments["recent_errors"] == []
@@ -1873,6 +1936,19 @@ class TestComposerMultiTurnToolCalls:
         assert "review pass 2" in second_arguments["problem_summary"].lower()
         assert "assess the current evidence independently" in second_arguments["problem_summary"].lower()
         assert "Pipeline: Repaired" in second_arguments["schema_excerpt"]
+        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
+        passes = [
+            row.tool_calls[0]["pass"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert [(item["verdict"], item["publication_verdict"], item["provider_attempts"]) for item in passes] == [
+            ("flagged", "WITHHOLD", 1),
+            ("clean", "ADMIT", 1),
+        ]
+        assert all(item["first_attempt_accepted"] is True for item in passes)
+        assert all(type(item["publication_binding"]) is str and len(item["publication_binding"]) == 64 for item in passes)
+        assert passes[0]["publication_binding"] != passes[1]["publication_binding"]
 
     @pytest.mark.asyncio
     async def test_advisor_rereview_without_mutation_is_explicit_not_a_blind_replay(self) -> None:

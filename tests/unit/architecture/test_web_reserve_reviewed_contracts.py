@@ -194,7 +194,7 @@ def test_composer_admission_structure_refuses_drift_even_with_rebound_grammar(
 @pytest.mark.parametrize("fault", ("authority", "binding", "join", "outcome", "error", "context", "move"))
 def test_history_receiver_prefix_refuses_changed_transfer_without_body_hash(fault: str) -> None:
     method = fencing._reserve_node_at(_source_units((TURN,))[0], "_run_composer_turn")
-    prefix = method.body[37].body[5:21]
+    prefix = method.body[37].body[4:15] + method.body[37].body[16:21]
     assert receiver.receiver_transfer_prefix(prefix)
     if fault in {"authority", "binding"}:
         read = next(
@@ -355,3 +355,80 @@ def test_landscape_to_domain_cursor_codec_remains_a_sessions_dependency(codec: s
         f"class RunLifecycleRepository:\n    def complete_run(self, value):\n        return {codec}(value)\n",
     )
     assert fencing._cross_database_violations((unit,))
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        None,
+        "early_capture",
+        "suspend",
+        "escape",
+        "rebind",
+        "deferred_default",
+        "pre_suspend",
+        "join",
+        "supplier",
+        "unknown_definition",
+        "title_default",
+        "title_escape",
+    ),
+)
+def test_captured_composer_receiver_interval_is_closed_after_history(fault: str | None) -> None:
+    paths = (
+        TURN,
+        "src/elspeth/web/sessions/routes/_helpers.py",
+        "src/elspeth/web/sessions/composer_app_services.py",
+        "src/elspeth/web/sessions/_auto_title.py",
+    )
+    units = _source_units(paths)
+    if fault is not None:
+        original = units[0]
+        source = original.source
+        capture = "        composer = services.composer_service\n"
+        if fault == "early_capture":
+            assert source.count(capture) == 1
+            source = source.replace(capture, "").replace(
+                "        from openai import OpenAIError\n", capture + "        from openai import OpenAIError\n"
+            )
+        elif fault == "deferred_default":
+            source = source.replace(
+                "async def settle_post_provider(result: ComposerResult | GraphRecoveryResponse)",
+                "async def settle_post_provider(result: ComposerResult | GraphRecoveryResponse = mutate_receiver())",
+            )
+        elif fault == "pre_suspend":
+            source = source.replace(capture, "        await foreign_effect()\n" + capture)
+        elif fault == "join":
+            source = source.replace(
+                "history_outcome, _ = await _join_freeform_owned_task(history_task,",
+                "history_outcome, _ = await foreign_join(history_task,",
+            )
+        elif fault == "supplier":
+            source = source.replace(
+                "_read_retained_operation_context(\n                    authority=", "foreign_read(\n                    authority="
+            )
+        elif fault == "unknown_definition":
+            source = source.replace(capture, "        def foreign(default=mutate_receiver()):\n            pass\n" + capture)
+        elif fault == "title_default":
+            source = source.replace("async def run_owned_title()", "async def run_owned_title(value=mutate_receiver())")
+        elif fault == "title_escape":
+            source = source.replace(
+                "async def run_owned_title() -> None:\n", "async def run_owned_title() -> None:\n                foreign_effect(composer)\n"
+            )
+        else:
+            extra = {"suspend": "await foreign_effect()", "escape": "foreign_effect(composer)", "rebind": "composer = foreign"}[fault]
+            source = source.replace(capture, capture + "        " + extra + "\n")
+        assert source != original.source
+        units = (fencing._parse_source(TURN, source), *units[1:])
+    turn = fencing._reserve_node_at(units[0], "_run_composer_turn")
+    dispatch = next(node for node in ast.walk(turn) if isinstance(node, ast.Call) and ast.unparse(node.func) == "composer.compose")
+    dto = units[2]
+    factory = fencing._reserve_node_at(dto, "composer_app_services")
+    read = next(keyword.value for keyword in factory.body[-1].value.keywords if keyword.arg == "composer_service")
+    failures, receipt = fencing._reserve_captured_composer_receiver(units, (dto.path, id(read)), (TURN, id(dispatch)))
+    if fault is None:
+        assert failures == []
+        assert receipt is not None
+    else:
+        assert failures
+        assert receipt is None

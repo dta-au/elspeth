@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 
@@ -251,6 +252,11 @@ class TestUnknownToolNameComposeLoopAuditShape:
         Pin: ``tests/unit/web/composer/test_compose_loop_unknown_tool_name.py``
         (this file). Closes plan-review M7 / W3.
         """
+        import litellm
+
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+
         catalog = _mock_catalog()
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
@@ -272,20 +278,60 @@ class TestUnknownToolNameComposeLoopAuditShape:
         clarification = _make_llm_response(content="Which data source should the pipeline use?")
         responses = iter((unknown_tool_call, self_correction, clarification))
         provider_messages: list[list[dict[str, Any]]] = []
+        reviews: list[dict[str, Any]] = []
+
+        async def review_clarification(**kwargs: Any) -> Any:
+            assert kwargs["model"] == settings.composer_advisor_model
+            assert not reviews, "Only one independent END SDK response is supplied"
+            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            reviews.append(review)
+            assert review["candidate_reply"] == "Which data source should the pipeline use?"
+            assert review["current_request"] == "Build a pipeline"
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
+            return litellm.ModelResponse(
+                model=kwargs["model"],
+                choices=[
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "verdict": "CLEAN",
+                                    "category": "other",
+                                    "steps": [],
+                                    "findings": "",
+                                    "note": None,
+                                    "publication_verdict": "ADMIT",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 20},
+            )
 
         async def scripted_provider(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> _AdmittedLLMCompletion:
             # The service extends one shared message list between calls.
             # Snapshot each provider boundary before those later mutations.
             provider_messages.append(deepcopy(messages))
+            assert len(provider_messages) <= 3, "Only the original three primary responses are supplied"
             return next(responses)
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with (
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", side_effect=review_clarification),
+        ):
             mock_llm.side_effect = scripted_provider
             result = await service.compose("Build a pipeline", [], state, session_id=session_id)
 
         # Assert 5: one neutral reconciliation turn follows the failed
         # dispatch; the provider supplies the final clarification.
         assert mock_llm.await_count == 3
+        assert len(reviews) == 1
         assert "Which data source should the pipeline use?" in result.message
         reconciliation_prefix = "[composer-system] No composition-state mutation completed successfully this turn"
         assert not any(
@@ -329,6 +375,17 @@ class TestUnknownToolNameComposeLoopAuditShape:
         rejection = payload["validation"]["errors"][0]
         assert rejection["component"] == "rejected_mutation"
         assert "Unknown tool: this_tool_does_not_exist" in rejection["message"]
+        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
+        passes = [
+            row.tool_calls[0]["pass"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert len(passes) == 1
+        assert passes[0]["phase"] == "end" and passes[0]["source"] == "model"
+        assert passes[0]["publication_verdict"] == "ADMIT" and passes[0]["first_attempt_accepted"] is True
+        assert passes[0]["provider_attempts"] == 1
+        assert type(passes[0]["publication_binding"]) is str and len(passes[0]["publication_binding"]) == 64
 
 
 # ---------------------------------------------------------------------------

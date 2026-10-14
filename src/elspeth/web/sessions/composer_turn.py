@@ -1057,7 +1057,6 @@ async def _run_composer_turn(
                 title_producer.complete_owned(failure)
                 raise
 
-        composer = services.composer_service
         from openai import OpenAIError
 
         async def settle_post_provider(result: ComposerResult | GraphRecoveryResponse) -> ComposerOperationRecord:
@@ -1373,6 +1372,7 @@ async def _run_composer_turn(
         if retained_operation_context is None:
             raise AuditIntegrityError("Retained history success lacks its actual projected context")
 
+        composer = services.composer_service
         post_provider_error: BaseException | None = None
         settled_record: ComposerOperationRecord | None = None
         # E14/F-C5: what is left of the admitted deadline NOW, with no await between

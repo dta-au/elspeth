@@ -955,9 +955,14 @@ def composer_receiver_local_contracts(units):
                 bi = next(i for i, n in enumerate(owner.body) if n is bindings[0])
                 ci = next(i for i, n in enumerate(owner.body) if n is invoke)
                 oi = next(i for i, n in enumerate(turn.body) if n is owner)
-                active_path = bi < ci and not early_abrupt(owner.body[:ci]) and not early_abrupt(turn.body[:oi])
-                active_path = active_path and receiver_transfer_prefix(owner.body[bi + 1 : ci])
-                deferred = [n for n in owner.body[bi + 1 : ci] if isinstance(n, ast.AsyncFunctionDef) and n.name == "settle_post_provider"]
+                active_path = bi == 15 and ci == 21 and not early_abrupt(owner.body[:ci]) and not early_abrupt(turn.body[:oi])
+                # The exact import/deferred/history operations precede capture;
+                # only the five scalar/deadline statements follow it. Preserve
+                # all sixteen operation checks without admitting a suspended
+                # receiver interval.
+                prefix = owner.body[4:bi] + owner.body[bi + 1 : ci]
+                active_path = active_path and receiver_transfer_prefix(prefix)
+                deferred = [n for n in prefix if isinstance(n, ast.AsyncFunctionDef) and n.name == "settle_post_provider"]
                 deferred_valid = False
                 if len(deferred) == 1:
                     deferred_valid, record = invocation_kind(trees[TURN], [turn, deferred[0]], "NATIVE_COROUTINE")
@@ -977,7 +982,7 @@ def composer_receiver_local_contracts(units):
                     "recovery_call": (TURN, id(recovery_calls[0])),
                     "qualification": "ACTUAL_CLOSED_BRANCH_AWAIT_PATHS_SAME_RETAINED_BINDING",
                 }
-                receipt["receiver_transfer_prefix_nodes"] = [(TURN, id(n)) for n in owner.body[bi + 1 : ci]]
+                receipt["receiver_transfer_prefix_nodes"] = [(TURN, id(n)) for n in prefix]
     require(active_path, "actual direct awaited path and same-block receiver dominance")
     turn_scope = function_binding_scope(trees[TURN], turn)
     require(

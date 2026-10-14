@@ -307,6 +307,7 @@ def test_undeclared_path_segment_becomes_generic(source_key: str) -> None:
     assert json.loads(rendered)["validation_errors"] == [
         {"loc": ["sources", "item", "plugin"], "msg": _MSG_MISSING, "type": "missing"},
         {"loc": ["sources", "item", "on_success"], "msg": _MSG_MISSING, "type": "missing"},
+        {"loc": ["sources", "item", "on_validation_failure"], "msg": _MSG_MISSING, "type": "missing"},
     ]
     if source_key == "my key!":
         assert source_key not in rendered
