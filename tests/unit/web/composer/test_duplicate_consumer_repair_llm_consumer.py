@@ -134,3 +134,66 @@ def test_suggested_consumer_arguments_omit_runtime_owned_llm_keys() -> None:
     [consumer_call] = [call for call in repair["tool_sequence"] if call["arguments"].get("id") == "a"]
 
     assert "approved_prompt_artifact_hash" not in consumer_call["arguments"]["options"]
+
+
+def test_fork_wiring_repair_keeps_missing_internal_sink_field_until_mapping_repair() -> None:
+    catalog = _mock_catalog()
+    state = _empty_state().with_source(
+        SourceSpec(
+            plugin="csv",
+            on_success="shared",
+            on_validation_failure="discard",
+            options={"path": "/data/in.csv", "schema": {"mode": "fixed", "fields": ["text: str"]}},
+        )
+    )
+    state = state.with_node(_passthrough("a")).with_node(_passthrough("b"))
+    state = state.with_output(OutputSpec(name="out_a", plugin="csv", options={"path": "outputs/out_a.csv"}, on_write_failure="discard"))
+    state = state.with_output(
+        OutputSpec(
+            name="out_b",
+            plugin="csv",
+            options={
+                "path": "outputs/out_b.csv",
+                # Flexible allows extras; it still requires category.
+                "schema": {"mode": "flexible", "fields": ["category: str"]},
+            },
+            on_write_failure="discard",
+        )
+    )
+    initial = state.validate()
+    assert "duplicate_connection_consumer" in {entry.error_code for entry in initial.errors}
+    [repair] = execute_tool("preview_pipeline", {}, state, catalog).to_dict()["validation"]["graph_repair_suggestions"]
+    for call in repair["tool_sequence"]:
+        result = execute_tool(call["tool"], call["arguments"], state, catalog, validate_arguments=True)
+        assert result.success, result.to_dict()
+        state = result.updated_state
+
+    repaired = state.validate()
+    assert "duplicate_connection_consumer" not in {entry.error_code for entry in repaired.errors}
+    assert "fork_branch_no_destination" not in {entry.error_code for entry in repaired.errors}
+    assert all(node.node_type not in ("coalesce", "row_union") for node in state.nodes)
+    [missing] = [entry for entry in repaired.errors if entry.error_code == "sink_contract_violation" and entry.component == "output:out_b"]
+    assert missing.contract is not None
+    assert missing.contract.missing_fields == ("category",)
+    assert repaired.is_valid is False
+
+    # A real internal-field mapping supplies the requirement; presentation or
+    # allowing additional fields cannot manufacture category from text.
+    mapped = execute_tool(
+        "upsert_node",
+        {
+            "id": "b",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": _node(state, "b").input,
+            "on_success": "out_b",
+            "on_error": "discard",
+            "options": {"mapping": {"text": "category"}, "schema": {"mode": "observed"}},
+        },
+        state,
+        catalog,
+        validate_arguments=True,
+    )
+    assert mapped.success, mapped.to_dict()
+    final = mapped.updated_state.validate()
+    assert final.is_valid, [entry.message for entry in final.errors]
