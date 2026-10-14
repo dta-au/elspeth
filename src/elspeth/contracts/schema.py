@@ -33,6 +33,7 @@ from typing import Annotated, Any, Literal, cast
 from pydantic import BeforeValidator, Field
 
 from elspeth.contracts.enums import NodeType
+from elspeth.contracts.field_spelling import normalized_field_name_or_empty
 from elspeth.contracts.identifiers import is_valid_field_name, validate_field_name, validate_field_names
 from elspeth.contracts.trust_boundary import trust_boundary
 
@@ -78,6 +79,14 @@ _LLM_GUARANTEED_SUFFIXES: tuple[str, ...] = ("", "_usage", "_model")
 _LLM_DEFAULT_RESPONSE_FIELD = "llm_response"
 
 
+def _field_name_example_guidance(name: str) -> str:
+    """Suggest a valid spelling example without promising schema-wide uniqueness."""
+    suggested = normalized_field_name_or_empty(name)
+    if is_valid_field_name(suggested) and FIELD_PATTERN.fullmatch(f"{suggested}: str") is not None:
+        return f"For example, use '{suggested}' instead; choose a name unique within the schema."
+    return "Choose a non-empty field name unique within the schema."
+
+
 def _field_spec_invalid_identifier_message(name: str, spec: str) -> str:
     if name and name[0].isdigit():
         return (
@@ -87,19 +96,18 @@ def _field_spec_invalid_identifier_message(name: str, spec: str) -> str:
         f"Invalid field name '{name}' in field spec '{spec}'. "
         f"Field names must be valid Python identifiers "
         f"(letters, digits, underscores only). "
-        f"Use '{name.replace('-', '_').replace('.', '_')}' instead."
+        f"{_field_name_example_guidance(name)}"
     )
 
 
 def _dict_field_spec_invalid_identifier_message(name: str) -> str:
     if name and name[0].isdigit():
         return f"Invalid field name '{name}' in dict field spec. Field names must be valid Python identifiers (cannot start with a digit)."
-    suggested = name.replace("-", "_").replace(".", "_")
     return (
         f"Invalid field name '{name}' in dict field spec. "
         f"Field names must be valid Python identifiers "
         f"(letters, digits, underscores only). "
-        f"Use '{suggested}' instead."
+        f"{_field_name_example_guidance(name)}"
     )
 
 
