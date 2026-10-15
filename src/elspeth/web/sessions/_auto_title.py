@@ -404,6 +404,9 @@ async def maybe_auto_title_session(
         "model": model,
         "messages": audit_messages,
         "max_tokens": _AUTO_TITLE_MAX_TOKENS,
+        # Each physical attempt needs its own admission and usage outcome.
+        "num_retries": 0,
+        "max_retries": 0,
     }
     if temperature is not None:
         kwargs["temperature"] = temperature
