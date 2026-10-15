@@ -2115,7 +2115,7 @@ class CompositionCompletion:
                 evidence_hash=evidence_hash,
                 pass_index=pass_index,
             )
-            if verdict.ok or (advisor_checkpoint_passes_used + passes_delta) >= max_passes:
+            if verdict.ok or not verdict.retryable or (advisor_checkpoint_passes_used + passes_delta) >= max_passes:
                 break
 
         is_last_pass = (advisor_checkpoint_passes_used + passes_delta) >= max_passes
@@ -2132,10 +2132,9 @@ class CompositionCompletion:
             if verdict.failure_class == "budget_exhausted"
             else "malformed",
         )
-        # ``not verdict.ok`` can only survive the loop above with the budget
-        # spent, so ``is_last_pass`` is True there and the gate always
-        # terminates blocked — it can never fall through to a silent finalize
-        # with no sign-off at all.
+        # A failed review terminates once its budget is spent or its provider
+        # disposition forbids another unchanged request. Stopping early does
+        # not charge unused passes or grant publication/repair permission.
         # elspeth-25f7b757e7 (A1): ``repair_unactionable`` blocks on the FIRST
         # pass — the flagged surface is the user's own message, so a granted
         # repair-continue would inject an instruction no tool call can satisfy
@@ -2156,6 +2155,7 @@ class CompositionCompletion:
                 or stalled_repair
                 or verdict.repair_unactionable
                 or verdict.failure_class == "budget_exhausted"
+                or not verdict.retryable
             )
         )
         if terminal_block:

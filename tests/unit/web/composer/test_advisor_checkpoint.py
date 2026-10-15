@@ -2370,6 +2370,7 @@ async def test_advisor_respects_existing_provider_retryability(make_service, sim
     )
     assert not verdict.ok
     assert call.await_count == (2 if failure_kind in {"unavailable", "connection"} else 1)
+    assert verdict.retryable is (failure_kind in {"unavailable", "connection"})
     assert "private provider detail" not in verdict.findings_text
 
 
@@ -2699,6 +2700,7 @@ async def drive_try_terminate(
     completion_gates: CompletionGateFacts | None = None,
     finalize_result: ComposerResult | None = None,
     orphan_result: ComposerResult | None = None,
+    session_operation_context: SessionOperationContext | None = None,
 ):
     """Drive ``_try_terminate_no_tools`` with the full kwarg set.
 
@@ -2792,10 +2794,10 @@ async def drive_try_terminate(
     kwargs = {}
     if deadline is not None:
         kwargs["deadline"] = deadline
-    session_id = str(uuid.uuid4())
+    session_id = session_operation_context.fence.session_id if session_operation_context is not None else str(uuid.uuid4())
     from elspeth.web.composer.turn_effects import TurnEvidence
 
-    context = _compose_context(session_id)
+    context = session_operation_context or _compose_context(session_id)
     return await service._completion._try_terminate_no_tools(
         assistant_message=_AdmittedAssistantMessage(content=candidate),
         turn_evidence=TurnEvidence(
@@ -4309,6 +4311,138 @@ async def test_end_gate_malformed_is_not_labelled_unavailable(make_service, clea
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["auth", "bad_request"])
+async def test_end_gate_nonretryable_sdk_failure_waits_for_later_request(monkeypatch, make_service, clean_runnable_state, failure_kind):
+    """A failed request stops automatic re-asks, not a later user's review."""
+    import litellm
+    from litellm.exceptions import AuthenticationError, BadRequestError
+
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+
+    failure_type = AuthenticationError if failure_kind == "auth" else BadRequestError
+    private_detail = "PRIVATE_NONRETRYABLE_DIAGNOSTIC"
+    failure = failure_type(private_detail, model="advisor", llm_provider="openai")
+    configuration_fixed = False
+    calls: list[dict[str, Any]] = []
+
+    async def sdk_fake(**kwargs):
+        calls.append(kwargs)
+        assert len(calls) <= 4, "Unexpected extra advisor SDK dispatch"
+        if not configuration_fixed:
+            raise failure
+        return SimpleNamespace(
+            model="advisor-test-model",
+            choices=[SimpleNamespace(message=SimpleNamespace(content=_checkpoint_reply(publication_verdict="ADMIT"), tool_calls=None))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=4, total_tokens=14),
+        )
+
+    service = make_service()
+    monkeypatch.setattr(litellm, "acompletion", sdk_fake)
+    first_context = _compose_context(str(uuid.uuid4()))
+    first_recorder = make_recorder()
+    first = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        candidate="UNREVIEWED_FIRST_CANDIDATE",
+        recorder=first_recorder,
+        session_operation_context=first_context,
+    )
+
+    assert len(calls) == 1
+    assert first.action == "return" and first.advisor_passes_delta == 1
+    assert first.result.runtime_preflight.readiness.completion_ready is False
+    fact = first.result.advisor_gate_decision.fact
+    assert fact.cause is AdvisorBlockCause.UNAVAILABLE
+    assert first.result.graph_review_identity.source == "unavailable"
+    assert private_detail not in first.result.message + first.result.runtime_preflight.model_dump_json()
+    assert "UNREVIEWED_FIRST_CANDIDATE" not in first.result.message
+    assert first_recorder.llm_calls[0].status is (
+        ComposerLLMCallStatus.AUTH_ERROR if failure_kind == "auth" else ComposerLLMCallStatus.BAD_REQUEST_ERROR
+    )
+
+    configuration_fixed = True
+    next_context = dataclass_replace(
+        first_context,
+        fence=dataclass_replace(
+            first_context.fence,
+            operation_id=first_context.fence.operation_id + "-next",
+            lease_token=first_context.fence.lease_token + "-next",
+            operation_epoch=2,
+        ),
+    )
+    next_candidate = "Truthful reply after the configuration was corrected."
+    next_recorder = make_recorder()
+    recovered = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        completion_gates=CompletionGateFacts(advisor_signoff=fact),
+        candidate=next_candidate,
+        message="Please review the reply again after the configuration change.",
+        recorder=next_recorder,
+        session_operation_context=next_context,
+    )
+
+    assert len(calls) == 2
+    assert recovered.action == "return" and recovered.result.message == next_candidate
+    assert recovered.publication_binding is not None
+    assert recovered.publication_binding != first.result.graph_review_identity.binding
+    assert recovered.result.advisor_gate_decision == AdvisorGatePassed(completion_gate_fingerprint(clean_runnable_state))
+    assert [call.status for call in next_recorder.llm_calls] == [ComposerLLMCallStatus.SUCCESS]
+    pass_writes = [
+        call
+        for call in service._sessions_service.add_message.calls
+        if call.kwargs["tool_calls"][0]["_kind"] == "advisor_checkpoint_pass_audit"
+    ]
+    assert [call.kwargs["session_operation_context"] for call in pass_writes] == [first_context, next_context]
+    assert [call.kwargs["tool_calls"][0]["pass"]["pass_index"] for call in pass_writes] == [1, 1]
+    assert next_candidate in calls[-1]["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["transient", "malformed"])
+async def test_end_gate_retryable_sdk_failure_still_uses_remaining_pass(monkeypatch, make_service, clean_runnable_state, failure_kind):
+    import litellm
+    from litellm.exceptions import ServiceUnavailableError
+
+    calls = 0
+
+    async def sdk_fake(**_kwargs):
+        nonlocal calls
+        calls += 1
+        assert calls <= 3, "Unexpected extra advisor SDK dispatch"
+        if calls < 3 and failure_kind == "transient":
+            raise ServiceUnavailableError("PRIVATE_TRANSIENT_DIAGNOSTIC", model="advisor", llm_provider="openai")
+        content = "not a JSON verdict" if calls < 3 else _checkpoint_reply(publication_verdict="ADMIT")
+        return SimpleNamespace(
+            model="advisor-test-model",
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=4, total_tokens=14),
+        )
+
+    service = make_service()
+    monkeypatch.setattr(litellm, "acompletion", sdk_fake)
+    candidate = "A truthful reviewed reply."
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0, candidate=candidate)
+
+    assert calls == 3
+    assert outcome.action == "return" and outcome.result.message == candidate
+    assert outcome.publication_binding is not None
+    pass_rows = [
+        call.kwargs["tool_calls"][0]["pass"]
+        for call in service._sessions_service.add_message.calls
+        if call.kwargs["tool_calls"][0]["_kind"] == "advisor_checkpoint_pass_audit"
+    ]
+    assert [row["pass_index"] for row in pass_rows] == [1, 2]
+    assert [row["provider_attempts"] for row in pass_rows] == [2, 1]
+    assert [row["verdict"] for row in pass_rows] == ["unavailable" if failure_kind == "transient" else "malformed", "clean"]
+    assert pass_rows[-1]["publication_verdict"] == "ADMIT"
+    assert pass_rows[-1]["publication_binding"] == outcome.publication_binding
+    assert "PRIVATE_TRANSIENT_DIAGNOSTIC" not in outcome.result.message
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure_kind", ["bad_request", "api_error"])
 async def test_end_gate_sdk_request_failure_withholds_without_malformed_claim(
     monkeypatch, make_service, clean_runnable_state, failure_kind
@@ -4322,7 +4456,7 @@ async def test_end_gate_sdk_request_failure_withholds_without_malformed_claim(
         if failure_kind == "bad_request"
         else APIError(status_code=503, message=private_detail, model="advisor", llm_provider="openai")
     )
-    expected_calls = 2 if failure_kind == "bad_request" else 4
+    expected_calls = 1 if failure_kind == "bad_request" else 4
     calls = 0
 
     async def sdk_fake(**_kwargs):
@@ -4336,8 +4470,9 @@ async def test_end_gate_sdk_request_failure_withholds_without_malformed_claim(
     candidate = "UNREVIEWED_COMPLETION_CANDIDATE"
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0, candidate=candidate)
 
-    assert calls == expected_calls  # F3's outer retry policy is unchanged here.
-    assert outcome.action == "return" and outcome.advisor_passes_delta == 2
+    assert calls == expected_calls
+    assert outcome.action == "return"
+    assert outcome.advisor_passes_delta == (1 if failure_kind == "bad_request" else 2)
     result = outcome.result
     assert result.runtime_preflight.readiness.completion_ready is False
     assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.UNAVAILABLE

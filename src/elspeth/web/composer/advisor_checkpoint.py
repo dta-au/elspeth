@@ -162,6 +162,10 @@ class AdvisorCheckpointVerdict:
     # applied inline by ``_run_advisor_checkpoint``'s exception handling and
     # read by ``_evaluate_terminal_no_tool_advisor_gate``.
     failure_class: Literal["none", "unavailable", "malformed", "budget_exhausted"] = "none"
+    # A failed checkpoint may be re-asked within this request unless the
+    # shared provider policy requires intervention. This is retry control,
+    # never publication permission; observed format errors remain retryable.
+    retryable: bool = True
     # Schema-admitted category and raw step ids; publication revalidates ids
     # against live state. Only the sanitized note may reach user surfaces.
     category: str = "other"
@@ -1176,6 +1180,7 @@ class AdvisorCheckpointOwner:
         provider_failures: tuple[type[Exception], ...] = (TimeoutError, ConnectionError, *advisor_provider_failure_types())
         last_exc: Exception | None = None
         last_response_unparseable = False
+        last_failure_retryable = True
         call_arguments: dict[str, Any] = arguments
 
         def provider_dispatched() -> None:
@@ -1252,7 +1257,8 @@ class AdvisorCheckpointOwner:
                 last_response_unparseable = False
                 call_arguments = arguments
                 failure = classify_provider_failure(exc)
-                if failure is not None and not failure.retryable:
+                last_failure_retryable = failure is None or failure.retryable
+                if not last_failure_retryable:
                     # The primary path uses this same value-free policy.
                     # Repeating an unchanged rejected request cannot repair it.
                     break
@@ -1314,6 +1320,7 @@ class AdvisorCheckpointOwner:
                 blocking=False,
                 failure_class=failure_class,
                 findings_text=findings_text,
+                retryable=last_failure_retryable,
             ),
             source="model",
         )
