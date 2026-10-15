@@ -2052,6 +2052,28 @@ def _candidate_credential_wiring_contract_failure(
     )
 
 
+def _saved_graph_credential_wiring_contract_failure(
+    state: CompositionState,
+    *,
+    component_id: str,
+    component_type: str,
+    plugin_type: PluginKind | None = None,
+    plugin_name: str | None = None,
+    options: Any,
+) -> ToolResult | None:
+    """Refuse literal credentials while retaining the surviving saved graph."""
+    return _build_credential_wiring_contract_failure(
+        state,
+        component_id=component_id,
+        component_type=component_type,
+        operation=_RejectionOperation.SAVED_GRAPH,
+        error_code="credential_literal_forbidden",
+        plugin_type=plugin_type,
+        plugin_name=plugin_name,
+        options=options,
+    )
+
+
 def _credential_wiring_contract_failure(
     state: CompositionState,
     *,
@@ -2248,6 +2270,22 @@ def _candidate_plugin_policy_failure(
 ) -> ToolResult:
     message = violation.message if component is None else f"{component}: {violation.message}"
     return _candidate_rejection_result(
+        state,
+        message,
+        error_code=violation.error_code.value,
+        rejected_component=rejected_component,
+    )
+
+
+def _saved_graph_plugin_policy_failure(
+    state: CompositionState,
+    violation: PluginPolicyViolation,
+    *,
+    component: str | None,
+    rejected_component: str | None,
+) -> ToolResult:
+    message = violation.message if component is None else f"{component}: {violation.message}"
+    return _saved_graph_rejection_result(
         state,
         message,
         error_code=violation.error_code.value,

@@ -1692,6 +1692,12 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "input binding and evaluation transforms when repairing it.",
     ),
     DirectValidationGuidance(
+        "output_not_found",
+        "The requested output is not in the current saved graph. The requested change was not applied.",
+        "Inspect the current outputs and use the intended existing name. Create an output with set_output only "
+        "when that is the user's intended change; do not create or remove a different destination to silence this refusal.",
+    ),
+    DirectValidationGuidance(
         "source_binding_ambiguous",
         "The candidate supplies competing source bindings. No replacement was applied.",
         "Keep the intended input and supply exactly one source or named sources map. For a blob-backed source, choose "

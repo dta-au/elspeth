@@ -74,6 +74,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         # PluginUnavailableReason members; the registry holds every value.
         ("composer/tools/_common.py", "_plugin_policy_failure", "violation.error_code.value"),
         ("composer/tools/_common.py", "_candidate_plugin_policy_failure", "violation.error_code.value"),
+        ("composer/tools/_common.py", "_saved_graph_plugin_policy_failure", "violation.error_code.value"),
         ("composer/tools/_common.py", "_plugin_selection_violation", "PluginUnavailableReason.NOT_INSTALLED"),
         ("composer/tools/_common.py", "_validate_plugin_name", "PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING"),
         ("composer/tools/_common.py", "_plugin_selection_violation", "reason"),

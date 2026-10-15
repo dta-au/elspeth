@@ -316,14 +316,14 @@ PostgreSQL, native, frontend, signing, CI or release qualification is claimed.
 | Item | Current packet status | Remaining owner/evidence obligation |
 |---|---|---|
 | 0 | Baseline inventory complete | Keep live registry measurements separate from execution coverage. |
-| 1 | Packet 1a independently accepted within its bounded scope; local checkpoint pending | Incremental source/output/transform/blob/secret/discovery producers and dispatch remain unresolved legacy families for bounded 1b. Preserve aggregation candidate-only and splice mixed candidate/standing findings. |
+| 1 | Packet 1a committed as `620231a`; output-only packet 1b independently accepted, local checkpoint pending | Output group is set/patch/remove output only. Source/transform/blob/secret/discovery producers and dispatch remain unresolved legacy families. Preserve aggregation candidate-only and splice mixed candidate/standing findings. |
 | 2 | Existing save/readiness separation retained; joined lifecycle witness pending | Real mutation → returned block and exception → exact retained revision → authenticated history/reload/UI. G3 teaching remains fixed. |
 | 3 | Model-catalog provenance teaching fixed in 0.8.6; regression closure pending | Supplied current catalog or permitted `list_models` discovery; missing facts and stale names must trigger discovery/refusal. No repeated repair authorized. |
 | 4 | Runtime explicit-choice guard exists; CSV assistance defect survives | Correct G4 assistance and measure its existing stamp/history/corpus reach in its own packet. |
-| 5 | Approved: complete scoring rubric belongs in the criterion reviewed definition; implementation pending | Include scale, anchors and meaning; preserve literal content. Systems review of exact representation and amended final rendering precedes code. |
+| 5 | Approved direction and systems representation review complete; implementation pending | Complete rubric uses the existing criterion string and node-level prompt reference. Preserve literals, independent prompt review and either resolution order. Per-query overrides do not inherit the reference; no new rendering target or schema is approved. |
 | 6 | Source review found no demonstrated public admission bypass; tests pending | Prefer public-versus-owned authority behavior controls over structural refactor. |
 | 7 | Existing typed `ComposerAppServices` retained; double fidelity work pending | Strict real signatures and actual context/owner/binding forwarding, not a replacement dependency container. |
-| 8 | Approved: missing/nonready claimed source ends readiness-blocked; exact interface review pending | Static wait/reselect/re-upload guidance; no automatic planner calls, wait loop or repair-exhaustion mislabel. Preserve claim-aware/fail-closed custody and review the exact adapter before code. |
+| 8 | Approved direction and concrete systems interface review complete; implementation pending | Private explicit contexts/outcomes and preview-specific terminal stop; static wait/reselect/re-upload guidance, no automatic recovery or exhaustion mislabel. Preserve custody and completed-prefix persistence. Current restricted planner entry requires empty state and needs no speculative result expansion. |
 | 9 | Owning repair-debt query direction reviewed; implementation pending | `interpretation_surfacing` owns meaning; revert preserves receipt ordering, advisory precheck and under-writer rechecks. |
 | 10 | Approved: characterize compatibility, then clearly refuse both non-null source forms | Refuse singular plus empty or populated plural; preserve unambiguous valid legacy/incomplete forms and exact proposal authority. No wipe, reset or migration authorized. |
 | 11 | Local validation observability work pending | Preserve prerequisite stops, independent-component collection, changed/unchanged candidate convergence and accounting; a phase schema is not approved. |
@@ -500,22 +500,45 @@ checks passed. The reviewed semantic delta remains zero added and one removed
 obsolete argument assertion; positional identity remains 78 added and 79 removed.
 This is keyless drift evidence, not operator signing clearance. Independent
 Astra review accepts bounded packet 1a with no remaining blocking findings.
-Root-owned staging/commit/integration remain pending. The implementation worker
-has stopped all edits; later plan and priority patches remain outside packet 1a.
+Root committed the accepted packet as `620231a951b9bbc7fe28e3cc6b0e9ab38ebb898e`.
+All triggered commit checks passed, and root reverified clean status and the
+unchanged tested input digest after the commit. The worker froze packet 1a;
+later packets and priority patches remain separate acceptance boundaries.
 
 ### Priority audit remediation under separate owners
 
-These four findings are tracked here to preserve the current integration order.
-They do not expand this implementation worker's packet 1a. Root integrates
-only accepted owner commits from their separate worktrees; no patch is accepted
-or integrated yet and deployed behavior is unverified.
+These findings preserve the current integration order and include related
+defects found during review. They do not expand packet 1a. Root integrates only
+accepted owner commits from their separate worktrees. Shared-link application
+has completed locally; quota acceptance and deployed behavior remain unverified.
 
 | Finding | Current evidence and status | Owner and boundary |
 | --- | --- | --- |
-| Q1 (P1): configured container token-policy provisioning missing | The quota audit and independent Astra review confirmed the source on main `9d7735c` and the .6 baseline `02e6b893f35230db544c1f277988c61b89203a54`. Initial audit had no test execution; bounded remediation is now testing. | Quota owner, worktree `38f0`; separate Sol implementation and independent Astra/systems review. |
-| Q2 (P2): autotitle hidden SDK retries | Same two source baselines confirmed. The owner's offline physical-transport negative returned synthetic 503 and observed two actual HTTP requests under one admission, versus the required one. Repair testing is pending. A separate required-custody stall is being investigated; it is not an accepted third product defect or passing result. | Same quota owner and bounded retry-policy remediation; no shared-link or packet-1b work. |
-| SL1: malformed shared fragment routes to recipient workspace | Offline probes reported 13 selected passes and six pre-stream controls; replay on the pre-stream version reproduced the bad routing, so PR #281 is not established as its origin. Permanent regression tests are red as expected before repair. | Shared-link owner, worktree `fcee`; John explicitly approved .7 fixes with tests and independent review. |
-| SL2: failed private sender link loses hash and bootstrap resumes recipient graph | The pre-stream replay also reproduced this bad behavior. Valid generated-share substitution was not reproduced and streaming causation is not established. Independent security/correctness and systems reviews are underway; normal root-URL SSO autoresume requires a passing positive control. Vitest command-line failures are not product test results. | Same shared-link owner, two confirmed routing corrections only; accepted handoff/root integration pending. |
+| Q1 (P1): configured container token-policy provisioning missing | Accepted owner commit `acfcc58bd982e9849ca5fec57e6938a8baa98c57` implements serialized create-or-verify startup. Owner evidence includes 175 focused cases, 267 app/writer checks, seven selected PostgreSQL cases and cancellation controls. Root application and integrated checks pending. | Quota owner completed its local patch; root integrates after the current output checkpoint, with final epoch and exact-candidate reviews. |
+| Q2 (P2): autotitle hidden SDK retries | Owner's synthetic 503 negative observed two physical sends under one admission. Retry-disable repair passed all four transport cases, 106 affected checks and final seven-case clock/masquerade selection; independent Astra accepted. Committed locally as `43dc7f886b3f81e3bfe2cabd0e69076a6ed3fefd`; root integration pending. Earlier required-custody stall is not an accepted third product defect. | Same quota owner; F2 acceptance is independent of the remaining container-policy patch. |
+| Q3: token-only container policy incorrectly requires storage cap | Fixed in accepted owner F1 commit with a distinct container-policy carrier and nullable container storage; explicit values and mandatory identity storage remain. | Root integration and aggregate checks pending. |
+| Q4: active container singleton index keys actor | Fixed in F1 with a checked non-null constant slot, partial unique index and serialized empty-population provisioning. | Root integration, final Sessions epoch and aggregate PostgreSQL gate pending. |
+| Q5: cancellation during new startup provisioning can race database shutdown | Fixed in F1 by retaining the exact worker task through repeated cancellation before closing database owners; owner cancellation selection passed 46 cases and both reviews closed the issue. This arose in the remediation candidate. | Exact integrated candidate still requires systems and independent Astra acceptance. Three deferred-propagation R4/R6 findings require repository adjudication and operator clearance. |
+| SL1: malformed shared fragment routes to recipient workspace | Owner commit `b6a430a` accepted by independent Astra and systems reviews; applied here as `9d8b43b`. Malformed routes stay on the authenticated shared-error surface without a shared fetch. | Root integrated locally; focused checks passed and independent Astra integration review accepted with no blockers. |
+| SL2: failed private sender link loses hash and bootstrap resumes recipient graph | Same accepted/applied patch preserves arrival intent through bootstrap, same-document navigation and SSO remount. Ordinary root SSO autoresume remains covered. Both original fallbacks reproduced before PR #281; actual incident and streaming causation remain unproven. | Same bounded owner patch and root integration; no backend ownership relaxation. |
+| SL3: authentication restores stale shared destination A over explicit B | Corrected by the same reviewed current-destination precedence rule, with permanent navigation/authentication regressions. | Included in the accepted link patch as part of consistent authentication intent. |
+| SL4: old shared snapshot can remain mounted under a new token | Corrected by route-identity-keyed shared child mounting and existing fetch cancellation. | Included in the accepted link patch. |
+| SL5 (P2): Composer shortcuts act on recipient workspace during shared inspection | Owner's real-App synthetic negative reproduced Ctrl/Cmd+N creating a recipient session. Validation shortcut is source-supported but not separately reproduced. Sender snapshot mutation/cross-user access is not established. | Separately documented in the investigation report; outside John's narrowed two-fallback patch, still open. |
+
+On `9d8b43b962d733e9fe65ac1de1b088096a1cc731`, root ran the eight
+owner-selected frontend files plus five affected .6 session-store/transport
+files: 13 files and 457 tests passed, with no failures, errors or skips. The
+seven synthetic backend capability/ownership controls passed. TypeScript and
+ESLint exited 0. Inputs stayed unchanged, digest
+`c4d5cbbf9877e469d11315c058889e8b3d968a8c54bdd2f88425df3f1fa65a9c`.
+Complete logs, exit files and JUnit results remain in the ignored lane. Frontend
+React `act` warnings and the upstream Starlette/httpx deprecation are retained
+in those logs; no assertion was weakened. This is focused integrated evidence,
+not real browser/identity-provider, stream/reconnect or deployed acceptance.
+Independent Astra integration review accepts this exact commit with no blocking
+applicability findings. Its full source/dependency comparisons also confirm that
+the newer .6 session store, observer and transport remain intact. The subsequent
+output-only packet 1b is excluded from that reviewed identity.
 
 The quota continuation permits optional container storage while identity limits
 remain mandatory, preserving explicit numeric values. Serialized create-or-verify
@@ -527,6 +550,71 @@ test stores under repository rules. Systems and Astra review cover the singleton
 readers, constraints and Sessions epoch; root coordinates the final epoch against
 the integrated tree. No user-store migration or reset is authorized. Title-retry
 acceptance remains independent, and the full quota re-audit waits for integration.
+The .6-derived integration tree and the main-derived quota candidate currently
+both provisionally name epoch 76 for different changes. Root must allocate a
+single new integrated epoch and retain both schema contracts; neither standalone
+epoch number establishes compatibility with the other tree. The conversion
+proposal remains a SQLite fixture experiment, not a supported migration command,
+crash-recovery proof or live cutover test.
+The .6 epoch change includes a persisted semantic contract with unchanged table
+DDL. The proposal's unrelated-DDL check cannot detect that semantic delta, so an
+apparent run against epoch 77 would still not establish integrated conversion
+support. Its evidence remains the reviewed standalone predecessor/target pair.
 
 Items 16–18 remain conditional. No .6 suite, quota implementation, shared-link
 implementation, migration or deployment work is authorized in this packet.
+
+### Packet 1b: output mutation rejection handling
+
+The three output mutations now use the existing saved-graph operation with
+required producer codes and output subjects. Whole-state invariant refusal uses
+explicitly no output subject. Policy reasons, credential-repair payloads,
+admitted options/schema identity, original graph/version and standing validation
+survive. Path refusals use static safe text. The new `output_not_found` code has
+direct guidance; no public schema, persisted record or epoch changed. Legacy
+plugin-selection probe behavior remains for later bounded caller migration.
+
+The affected schema-augmentation AST tripwire previously recognized only the
+old helper. It now includes the migrated saved-graph call while retaining floors,
+identity and order obligations. A copy of the actual migrated output source with
+its schema identity keyword removed is observed by, and fails, that owning gate.
+
+Root's serial positive selection exited 0: **479 tests, zero failures, errors or
+skips**, including output behavior, existing schema/guidance/catalogue/censuses,
+attribute contracts and masquerade gates. Ruff, source mypy and contracts exited
+0. The keyless scan exited 1 with the same standing **3274** records; controlled
+qualified-owner/source-line multiset comparison reports **zero semantic additions
+and zero removals**. This is drift evidence, not signature clearance.
+
+Deliberate controls provide **25 intended assertion failures across ten families**:
+17 valid cases from negative run 1, four corrected schema-publication cases from
+run 2 and four direct privacy-canary cases from run 3. Four run-1 schema cases
+failed inside a frozen/mutable test-harness comparison and are excluded. Four
+run-1 path cases first failed on remedy wording and are superseded for privacy
+efficacy by run 3, which retains the remedy and fails at canary absence. Only the
+ignored mutation harness changed between these runs; production and tests stayed
+fixed, so no repeated positive suite was needed. Every accepted negative has an
+actual activation witness; none has a setup error or skip.
+
+The complete root input manifest is unchanged before/after all runs, digest
+`d5e5fc2d609aaac41e3f42898f660c7f4633e73fd2361993a86b7e900cbcd180`.
+The worker's separately labelled digest is
+`34e4d19e796dc350013d782959ba24b970b5b404facd1add322bd82310b23006`.
+Independent Astra read all four production files, the tests, controls and actual
+receipts and accepts this bounded packet with no blockers. Full branch/default,
+PostgreSQL, CI, operator signing and release/deployment acceptance remain open.
+
+### Additional source-family findings awaiting implementation
+
+Systems review of the next source group at `9d8b43b` resolves two integrity
+classification questions without expanding a schema. A ready blob with a null
+hash violates the existing ready-hash invariant; the plural resolver must raise
+the owned integrity failure rather than offer model repair. Invalid stored MIME
+already raises at the row reader, so its redundant recoverable source branch
+needs no new public classifier. The `StorageMimeType` comment claiming a MIME
+database CHECK is inaccurate: service write validation and read guards are the
+actual MIME controls. No new constraint or epoch is proposed for that comment.
+Pure policy admission must precede direct schema access in the selected source
+handlers; an admitted catalog construction error must propagate. These remain
+source-reviewed next-group obligations, not implemented or runtime-qualified
+fixes. The existing singular resolver and inline-CSV result stay intact.

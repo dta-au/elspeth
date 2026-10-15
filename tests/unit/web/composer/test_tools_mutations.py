@@ -94,7 +94,13 @@ class TestAwsS3EndpointUrlComposerPolicy:
             _mock_catalog(),
         )
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        assert not result.success
+        assert result.updated_state is state and result.updated_state.version == state.version
+        assert result.data is None
+        entry = result.validation.errors[0]
+        assert (entry.error_code, entry.rejected_component) == ("aws_s3_endpoint_url_not_allowed", "output:main")
+        assert "endpoint_url" in entry.message
+        assert _AWS_S3_ENDPOINT_SENTINEL not in repr(result.validation)
 
     def test_aws_s3_patch_output_options_rejects_endpoint_url_without_mutating_state(self) -> None:
         state = _aws_s3_output_state()
@@ -106,7 +112,13 @@ class TestAwsS3EndpointUrlComposerPolicy:
             _mock_catalog(),
         )
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        assert not result.success
+        assert result.updated_state is state and result.updated_state.version == state.version
+        assert result.data is None
+        entry = result.validation.errors[0]
+        assert (entry.error_code, entry.rejected_component) == ("aws_s3_endpoint_url_not_allowed", "output:main")
+        assert "endpoint_url" in entry.message
+        assert _AWS_S3_ENDPOINT_SENTINEL not in repr(result.validation)
 
     def test_aws_s3_set_pipeline_named_source_rejects_endpoint_url_without_mutating_state(self) -> None:
         state = _empty_state()

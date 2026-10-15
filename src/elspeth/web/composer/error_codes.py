@@ -132,6 +132,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "node_timeout_unsupported",
         "on_error_closer_out_of_region",
         "output_name_invalid",
+        "output_not_found",
         "pipeline_collection_cap_exceeded",
         "pipeline_cycle",
         "pipeline_decision_unregistered",
