@@ -4,6 +4,7 @@ import json
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.errors import FrameworkBugError
@@ -96,8 +97,95 @@ def test_argument_error_projection_preserves_exact_bytes(code, category):
             "severity": "high",
             "error_code": code or "argument_error",
             "error_class": "ToolArgumentError",
+            "error_category": error.category.value,
         }
     }
     assert json.dumps(response.to_wire()) == json.dumps(expected)
     with pytest.raises(FrameworkBugError, match="cannot be cached"):
         response.readmit(None)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "loc", "code", "message", "category"),
+    [
+        (
+            {"plugin_type": "node", "name": "ok"},
+            ["plugin_type"],
+            "invalid_choice",
+            "Value is not an allowed choice",
+            ToolArgumentErrorCategory.SCHEMA_SHAPE,
+        ),
+        (
+            {"plugin_type": "source", "name": 19},
+            ["name"],
+            "invalid_type",
+            "Value has invalid type",
+            ToolArgumentErrorCategory.SCHEMA_SHAPE,
+        ),
+        (
+            {"plugin_type": "source", "name": "PRIVATE_REJECTED_VALUE"},
+            ["name"],
+            "out_of_bounds",
+            "Value is outside allowed bounds",
+            ToolArgumentErrorCategory.SCHEMA_BOUND,
+        ),
+        (
+            {"plugin_type": "source", "name": "ok", "PRIVATE_API_KEY_CANARY": "PRIVATE_REJECTED_VALUE"},
+            [],
+            "unexpected",
+            "Unexpected value",
+            ToolArgumentErrorCategory.SCHEMA_SHAPE,
+        ),
+        (
+            {"plugin_type": "source", "name": "ok", "options": {"PRIVATE_API_KEY_CANARY": "PRIVATE_REJECTED_VALUE"}},
+            ["options", "item"],
+            "invalid_type",
+            "Value has invalid type",
+            ToolArgumentErrorCategory.SCHEMA_SHAPE,
+        ),
+        ([], [], "invalid_type", "Value has invalid type", ToolArgumentErrorCategory.SCHEMA_SHAPE),
+    ],
+    ids=["choice", "type", "bound", "unknown-root", "unknown-mapping-key", "malformed-root"],
+)
+def test_argument_error_projection_keeps_closed_repair_facts_without_private_input(arguments, loc, code, message, category):
+    from elspeth.web.composer.pipeline_planner import _allowlisted_argument_error_entry
+    from elspeth.web.composer.tools._dispatch import require_arguments_conform_to_schema
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "plugin_type": {"type": "string", "enum": ["source", "transform", "sink"]},
+            "name": {"type": "string", "maxLength": 4},
+            "options": {"type": "object", "additionalProperties": {"type": "integer"}},
+        },
+        "required": ["plugin_type", "name"],
+        "additionalProperties": False,
+    }
+    with pytest.raises(ToolArgumentError) as caught:
+        require_arguments_conform_to_schema("get_plugin_schema", Draft202012Validator(schema), arguments)
+    error = caught.value
+    error.__cause__ = RuntimeError("PRIVATE_CAUSE_CANARY")
+
+    response = argument_error_response(error)
+    entry = response.to_wire()["argument_error"]
+    assert entry["error_category"] == category.value
+    assert entry["validation_errors"] == [{"loc": loc, "msg": message, "type": code}]
+    assert _allowlisted_argument_error_entry(error) == entry
+    encoded = json.dumps(response.to_wire())
+    assert "PRIVATE_" not in encoded
+    entry["validation_errors"][0]["loc"].append("MUTATED_WIRE")
+    assert "MUTATED_WIRE" not in json.dumps(response.to_wire())
+
+
+def test_argument_error_projection_marks_over_budget_without_leaking_values():
+    from elspeth.web.composer.tools._dispatch import require_arguments_conform_to_schema
+
+    with pytest.raises(ToolArgumentError) as caught:
+        require_arguments_conform_to_schema(
+            "get_plugin_schema",
+            Draft202012Validator({"type": "array", "items": {"type": "integer"}}),
+            ["PRIVATE_REJECTED_VALUE"] * 9,
+        )
+    entry = argument_error_response(caught.value).to_wire()["argument_error"]
+    assert entry["validation_errors"] == [{"loc": [], "msg": "Validation produced more than 8 errors", "type": "truncated"}]
+    assert "PRIVATE_" not in json.dumps(entry)

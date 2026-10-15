@@ -102,7 +102,6 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         # a closed ``ToolArgumentError.code`` or a closed category value.
         ("composer/pipeline_planner.py", "_allowlisted_candidate_feedback", "code"),
         ("composer/pipeline_planner.py", "_plan_pipeline_inner", "entry.error_code or 'validation_error'"),
-        ("composer/pipeline_planner.py", "_allowlisted_argument_error_entry", "error.code or 'argument_error'"),
         ("composer/pipeline_planner.py", "execute_one_discovery", "exc.category.value"),
         ("composer/pipeline_commit.py", "prepare_pipeline_proposal_commit", "exc.category.value"),
         ("composer/provider_discovery_response.py", "to_wire", "code"),

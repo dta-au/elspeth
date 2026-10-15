@@ -28,7 +28,7 @@ from uuid import UUID, uuid4
 
 import structlog
 from jsonschema import Draft202012Validator
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, JsonValue
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
 
@@ -149,7 +149,7 @@ from elspeth.web.composer.tools._common import (
     ToolContext,
     ToolResult,
 )
-from elspeth.web.composer.tools._dispatch import execute_discovery_tool_with_context
+from elspeth.web.composer.tools._dispatch import _schema_violation_loc, execute_discovery_tool_with_context
 from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
@@ -2755,28 +2755,37 @@ def _schema_violation_component_ref(parts: Sequence[Any]) -> str | None:
 def _structural_schema_violations(errors: Iterable[Any]) -> tuple[list[_SchemaViolation], int]:
     """Project JSON-Schema errors into located, value-free repair facts.
 
-    The pre-check runs against the payload the planner itself authored, and
-    the schema is the one already advertised to it on this surface: the JSON
-    path, the violated keyword, and a scalar constraint are all facts the
-    same provider holds, so naming them discloses nothing new. The error's
-    own ``message`` is NOT projected — jsonschema embeds the rejected
-    instance in it, and a rejected value is the one thing this projection
-    must never echo back into an audited transcript.
+    Use the dispatch gate's bounded schema-owned locations: model-named map
+    keys become generic tokens. A required error names its parent, so append
+    only absent names from the owned schema, once per required keyword. The
+    error's message and rejected values never enter this projection.
     """
     violations: list[_SchemaViolation] = []
     withheld = 0
+    schema = canonical_set_pipeline_schema()
+    required_locations: set[tuple[tuple[str | int, ...], tuple[str | int, ...]]] = set()
     for error in errors:
-        if len(violations) >= _MAX_REPORTED_SCHEMA_VIOLATIONS:
-            withheld += 1
-            continue
-        violation: _SchemaViolation = {
-            "path": _schema_violation_path(list(error.absolute_path)),
-            "rule": str(error.validator),
-        }
-        constraint = error.validator_value
-        if type(constraint) is str or type(constraint) is int:
-            violation["constraint"] = constraint
-        violations.append(violation)
+        path = tuple(error.absolute_path)
+        if error.validator == "required":
+            location = (path, tuple(error.absolute_schema_path))
+            if location in required_locations:
+                continue
+            required_locations.add(location)
+            paths = [(*path, name) for name in error.validator_value if name not in error.instance]
+        else:
+            paths = [path]
+        for located_path in paths:
+            if len(violations) >= _MAX_REPORTED_SCHEMA_VIOLATIONS:
+                withheld += 1
+                continue
+            violation: _SchemaViolation = {
+                "path": _schema_violation_path(_schema_violation_loc(schema, located_path)),
+                "rule": str(error.validator),
+            }
+            constraint = error.validator_value
+            if type(constraint) is str or type(constraint) is int:
+                violation["constraint"] = constraint
+            violations.append(violation)
     return violations, withheld
 
 
@@ -2908,16 +2917,15 @@ class _AllowlistedArgumentErrorEntry(TypedDict):
     severity: str
     error_code: str
     error_class: str
+    error_category: str
+    validation_errors: NotRequired[JsonValue]
 
 
 def _allowlisted_argument_error_entry(error: ToolArgumentError) -> _AllowlistedArgumentErrorEntry:
     """Project a semantic argument failure without its message or input."""
-    return {
-        "component": error.argument,
-        "severity": "high",
-        "error_code": error.code or "argument_error",
-        "error_class": "ToolArgumentError",
-    }
+    payload = argument_error_response(error).to_wire()
+    assert isinstance(payload, dict)
+    return cast(_AllowlistedArgumentErrorEntry, payload["argument_error"])
 
 
 def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any]:

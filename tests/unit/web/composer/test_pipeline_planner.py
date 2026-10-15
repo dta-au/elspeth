@@ -3518,6 +3518,7 @@ async def test_safe_candidate_argument_error_gets_closed_feedback_then_repairs_w
             "severity": "high",
             "error_code": "argument_error",
             "error_class": "ToolArgumentError",
+            "error_category": "semantic_rule",
         }
     ]
     assert raw_canary not in canonical_json(feedback)
@@ -3706,6 +3707,80 @@ async def test_structurally_invalid_terminal_draft_gets_located_schema_repair(
     # The rejected VALUE never rides along — jsonschema puts it in the
     # message, which this projection deliberately never reads.
     assert "123" not in completion.requests[1]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_missing_node_input_names_the_absent_owned_property(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    malformed = _pipeline(tmp_path)
+    malformed["nodes"] = [{"id": "clean", "node_type": "transform", "plugin": "field_mapper", "options": {}}]
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": malformed})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert proposal.proposal.repair_count == 1
+    assert len(completion.requests) == 2
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    entry = feedback["validation"]["errors"][0]
+    assert entry["error_code"] == "canonical_schema"
+    assert {"path": "nodes/index/input", "rule": "required"} in entry["schema_violations"]
+
+
+@pytest.mark.parametrize("case", ["unknown-root", "unknown-source-key"])
+def test_structural_schema_feedback_never_echoes_authored_keys_or_values(tmp_path: Path, case: str) -> None:
+    from jsonschema import Draft202012Validator
+
+    canary = "private_api_key_canary"
+    malformed = _pipeline(tmp_path)
+    if case == "unknown-root":
+        malformed[canary] = "PRIVATE_REJECTED_VALUE"
+        expected = {"path": "pipeline", "rule": "additionalProperties"}
+    else:
+        source = malformed.pop("source")
+        source["plugin"] = {"PRIVATE_REJECTED_VALUE": True}
+        malformed["sources"] = {canary: source}
+        expected = {"path": "sources/item/plugin", "rule": "type", "constraint": "string"}
+    errors = list(Draft202012Validator(canonical_set_pipeline_schema()).iter_errors(malformed))
+    assert errors
+    if case == "unknown-source-key":
+        assert any(canary in error.absolute_path for error in errors)
+
+    violations, withheld = pipeline_planner._structural_schema_violations(errors)
+
+    assert expected in violations
+    assert withheld == 0
+    encoded = canonical_json(violations)
+    assert canary not in encoded
+    assert "PRIVATE_REJECTED_VALUE" not in encoded
+
+
+def test_required_schema_feedback_deduplicates_missing_names_and_counts_omissions(tmp_path: Path) -> None:
+    from jsonschema import Draft202012Validator
+
+    malformed = _pipeline(tmp_path)
+    malformed["nodes"] = [{"node_type": "transform", "plugin": "field_mapper", "options": {}} for _ in range(5)]
+    errors = list(Draft202012Validator(canonical_set_pipeline_schema()).iter_errors(malformed))
+    assert len(errors) == 10
+    assert all(error.validator == "required" for error in errors)
+
+    violations, withheld = pipeline_planner._structural_schema_violations(errors)
+
+    assert (
+        violations
+        == [
+            {"path": "nodes/index/id", "rule": "required"},
+            {"path": "nodes/index/input", "rule": "required"},
+        ]
+        * 4
+    )
+    assert withheld == 2
+    feedback = pipeline_planner._canonical_schema_feedback(violations, violations_withheld=withheld)
+    assert feedback["validation"]["errors"][0]["schema_violations_withheld"] == 2
 
 
 _CANONICAL_SCHEMA_FEEDBACK = {
@@ -8271,6 +8346,14 @@ async def test_discovery_argument_error_is_recoverable_not_fatal(
     assert len(tool_messages) == 1
     payload = json.loads(tool_messages[0]["content"])
     assert payload["success"] is False
+    argument_error = payload["data"]["argument_error"]
+    assert argument_error["error_category"] == "schema_shape"
+    assert argument_error["validation_errors"] == [
+        {"loc": ["plugin_type"], "msg": "Value is not an allowed choice", "type": "invalid_choice"}
+    ]
+    assert "node" not in json.dumps(argument_error)
+    assert set(payload["data"]) == {"argument_error"}
+    assert {entry["error_code"] for entry in payload["validation"]["errors"]} == {"no_source_configured", "no_sinks_configured"}
     repaired_messages = [m for m in completion.requests[2]["messages"] if m["role"] == "tool"]
     assert len(repaired_messages) == 2
     repaired_payload = json.loads(repaired_messages[-1]["content"])
@@ -8280,6 +8363,37 @@ async def test_discovery_argument_error_is_recoverable_not_fatal(
     assert not any(message.get("content") == closure_notice for message in completion.requests[1]["messages"])
     assert sum(message.get("content") == closure_notice for message in completion.requests[2]["messages"]) == 1
     # The invocation is still audited as an argument error.
+    assert recorder.invocations[0].status.value == "arg_error"
+
+
+@pytest.mark.asyncio
+async def test_discovery_wire_wrapper_repair_keeps_its_owned_instruction(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        model_overrides={"tool_contract_dialect": ToolContractDialect.OPENAI_STRICT},
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 2
+    (tool_message,) = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
+    assert tool_message["tool_call_id"] == "call-1"
+    feedback = json.loads(tool_message["content"])
+    assert feedback["success"] is False
+    assert feedback["data"]["argument_error"]["error_category"] == "wire_envelope"
+    assert "validation_errors" not in feedback["data"]["argument_error"]
+    assert feedback["message"] == "Tool 'list_sources' takes no semantic arguments. Call it with {\"_elspeth_no_arguments\": true} exactly."
     assert recorder.invocations[0].status.value == "arg_error"
 
 
@@ -9539,7 +9653,7 @@ def test_argument_rejection_projections_split_by_surface() -> None:
     """
     error = ToolArgumentError(argument="plugin_type", expected="a plugin kind", actual_type="str", code="DISCOVERY_ONLY")
     entry = pipeline_planner._allowlisted_argument_error_entry(error)
-    assert tuple(entry) == ("component", "severity", "error_code", "error_class")
+    assert tuple(entry) == ("component", "severity", "error_code", "error_class", "error_category")
     assert entry == {
         # ``plugin_type`` is not in the closed schema-owned label vocabulary,
         # so ToolArgumentError canonicalizes it: what the projection carries is
@@ -9548,6 +9662,7 @@ def test_argument_rejection_projections_split_by_surface() -> None:
         "severity": "high",
         "error_code": "DISCOVERY_ONLY",
         "error_class": "ToolArgumentError",
+        "error_category": "discovery_only",
     }
 
     payload = pipeline_planner.argument_error_response(error).to_wire()
