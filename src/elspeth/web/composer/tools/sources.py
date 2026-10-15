@@ -16,7 +16,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine, select
 
-from elspeth.contracts.blobs import STORAGE_MIME_TYPES
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
@@ -60,7 +59,6 @@ from elspeth.web.composer.tools._common import (
     _attach_post_call_hints,
     _canonical_interpretation_requirement_error,
     _canonicalize_authored_interpretation_requirements,
-    _credential_wiring_contract_failure,
     _discovery_result,
     _echoed_metadata_note,
     _failure_result,
@@ -68,15 +66,16 @@ from elspeth.web.composer.tools._common import (
     _normalize_echoed_interpretation_requirements,
     _options_with_pending_requirement,
     _pending_interpretation_requirement,
-    _plugin_policy_failure,
     _plugin_selection_violation,
     _prevalidate_source_for_context,
     _prohibited_section,
     _RejectionOperation,
     _resolver_owned_interpretation_requirement_error,
+    _saved_graph_credential_wiring_contract_failure,
+    _saved_graph_plugin_policy_failure,
+    _saved_graph_rejection_result,
     _source_review_requirement_id,
     _validate_mutation_arguments,
-    _validate_plugin_name,
     _validate_source_path,
     resolve_failure_route_choice,
     review_reconciliation_failure_message,
@@ -1043,10 +1042,11 @@ def _execute_set_source(
         source=True,
     )
     if review_metadata_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_metadata_error,
             error_code="interpretation_requirements_invalid",
+            rejected_component=_source_component_id(source_name),
         )
     options = _canonicalize_authored_interpretation_requirements(
         options,
@@ -1059,20 +1059,23 @@ def _execute_set_source(
         tool_name="set_source",
     )
     if canonical_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             canonical_error,
             error_code="interpretation_requirements_invalid",
+            rejected_component=_source_component_id(source_name),
         )
 
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(plugin, options)
     if endpoint_policy_error is not None:
-        return _failure_result(state, endpoint_policy_error)
+        return _saved_graph_rejection_result(
+            state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=_source_component_id(source_name)
+        )
 
-    # Validate plugin exists in catalog
-    plugin_error = _validate_plugin_name(context, "source", plugin)
+    plugin_error = _plugin_selection_violation(context, "source", plugin)
     if plugin_error is not None:
-        return _plugin_policy_failure(state, plugin_error)
+        return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=_source_component_id(source_name))
+    context.catalog.get_schema("source", plugin)
 
     # Reject manual blob_ref injection.  The canonical write path for a
     # blob-backed source is set_source_from_blob, which forces the path to
@@ -1082,13 +1085,22 @@ def _execute_set_source(
     # composer/runtime agreement.
     manual_blob_ref_error = _reject_manual_source_blob_ref(options, tool_name="set_source")
     if manual_blob_ref_error is not None:
-        return _failure_result(state, manual_blob_ref_error)
+        return _saved_graph_rejection_result(
+            state, manual_blob_ref_error, error_code="plugin_options_invalid", rejected_component=_source_component_id(source_name)
+        )
     manual_authoring_error = _reject_manual_source_authoring(options, tool_name="set_source")
     if manual_authoring_error is not None:
-        return _failure_result(state, manual_authoring_error)
+        return _saved_graph_rejection_result(
+            state,
+            manual_authoring_error,
+            error_code="interpretation_requirements_invalid",
+            rejected_component=_source_component_id(source_name),
+        )
     manual_blobs_error = _reject_manual_source_blobs(options, tool_name="set_source")
     if manual_blobs_error is not None:
-        return _failure_result(state, manual_blobs_error)
+        return _saved_graph_rejection_result(
+            state, manual_blobs_error, error_code="plugin_options_invalid", rejected_component=_source_component_id(source_name)
+        )
     guarantee_stamp_error = _planner_guarantee_stamp_error(
         options,
         stored_options=stored_source_options,
@@ -1096,8 +1108,10 @@ def _execute_set_source(
         tool_name="set_source",
     )
     if guarantee_stamp_error is not None:
-        return _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required")
-    credential_error = _credential_wiring_contract_failure(
+        return _saved_graph_rejection_result(
+            state, guarantee_stamp_error, error_code="source_data_contract_required", rejected_component=_source_component_id(source_name)
+        )
+    credential_error = _saved_graph_credential_wiring_contract_failure(
         state,
         component_id=_source_component_id(source_name),
         component_type="source",
@@ -1116,7 +1130,13 @@ def _execute_set_source(
         require_data_dir=context.require_data_dir_for_paths,
     )
     if path_error is not None:
-        return _failure_result(state, path_error)
+        return _saved_graph_rejection_result(
+            state,
+            "Source file path options (path or file) must use this session's permitted source locations. "
+            "Use the session's blob binding or an authorized source path.",
+            error_code="source_path_policy_invalid",
+            rejected_component=_source_component_id(source_name),
+        )
 
     try:
         on_vf = resolve_failure_route_choice(
@@ -1126,7 +1146,9 @@ def _execute_set_source(
             previous=state.sources[source_name].on_validation_failure if source_name in state.sources else None,
         )
     except FailureRouteChoiceError as exc:
-        return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=_source_component_id(source_name))
+        return _saved_graph_rejection_result(
+            state, str(exc), error_code="failure_route_required", rejected_component=_source_component_id(source_name)
+        )
     prevalidation_error = _prevalidate_source_for_context(
         context,
         plugin,
@@ -1135,10 +1157,11 @@ def _execute_set_source(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             prevalidation_error[0],
             error_code=prevalidation_error[1],
+            rejected_component=_source_component_id(source_name),
             plugin_identity=("source", plugin),
         )
 
@@ -1153,10 +1176,11 @@ def _execute_set_source(
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+            rejected_component=None,
         )
     affected = (_source_component_id(source_name),)
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
@@ -1234,10 +1258,11 @@ def _execute_set_source_from_blob(
         source=True,
     )
     if review_metadata_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_metadata_error,
             error_code="interpretation_requirements_invalid",
+            rejected_component=_source_component_id(source_name),
         )
     caller_options = _canonicalize_authored_interpretation_requirements(
         caller_options,
@@ -1247,7 +1272,9 @@ def _execute_set_source_from_blob(
     )
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(validated.plugin, caller_options)
     if endpoint_policy_error is not None:
-        return _failure_result(state, endpoint_policy_error)
+        return _saved_graph_rejection_result(
+            state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=_source_component_id(source_name)
+        )
 
     try:
         on_vf = resolve_failure_route_choice(
@@ -1257,7 +1284,9 @@ def _execute_set_source_from_blob(
             previous=state.sources[source_name].on_validation_failure if source_name in state.sources else None,
         )
     except FailureRouteChoiceError as exc:
-        return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=_source_component_id(source_name))
+        return _saved_graph_rejection_result(
+            state, str(exc), error_code="failure_route_required", rejected_component=_source_component_id(source_name)
+        )
     resolved = _resolve_source_blob(
         blob_id=validated.blob_id,
         rejection_operation=_RejectionOperation.SAVED_GRAPH,
@@ -1277,10 +1306,9 @@ def _execute_set_source_from_blob(
 
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(resolved.plugin, resolved.options)
     if endpoint_policy_error is not None:
-        return _failure_result(state, endpoint_policy_error)
-    plugin_error = _validate_plugin_name(context, "source", resolved.plugin)
-    if plugin_error is not None:
-        return _plugin_policy_failure(state, plugin_error)
+        return _saved_graph_rejection_result(
+            state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=_source_component_id(source_name)
+        )
 
     source = SourceSpec(
         plugin=resolved.plugin,
@@ -1292,10 +1320,11 @@ def _execute_set_source_from_blob(
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+            rejected_component=None,
         )
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
     data = {"server_owned_metadata_note": echo_note} if echo_note is not None else {}
@@ -1325,23 +1354,44 @@ def _resolve_source_blobs(
     """
     manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name="set_source_from_blobs")
     if manual_authoring_error is not None:
-        return _failure_result(state, manual_authoring_error)
+        return _saved_graph_rejection_result(
+            state,
+            manual_authoring_error,
+            error_code="interpretation_requirements_invalid",
+            rejected_component=_source_component_id(source_name),
+        )
     manual_blob_ref_error = _reject_manual_source_blob_ref(caller_options, tool_name="set_source_from_blobs")
     if manual_blob_ref_error is not None:
-        return _failure_result(state, manual_blob_ref_error)
+        return _saved_graph_rejection_result(
+            state, manual_blob_ref_error, error_code="plugin_options_invalid", rejected_component=_source_component_id(source_name)
+        )
     manual_blobs_error = _reject_manual_source_blobs(caller_options, tool_name="set_source_from_blobs")
     if manual_blobs_error is not None:
-        return _failure_result(state, manual_blobs_error)
+        return _saved_graph_rejection_result(
+            state, manual_blobs_error, error_code="plugin_options_invalid", rejected_component=_source_component_id(source_name)
+        )
     if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _saved_graph_rejection_result(
+            state,
+            "Blob tools require session context.",
+            error_code="source_binding_context_unavailable",
+            rejected_component=_source_component_id(source_name),
+        )
     seen_ids: set[str] = set()
     for blob_id in blob_ids:
         blob_id_error = _blob_id_uuid_validation_error(blob_id)
         if blob_id_error is not None:
-            return _failure_result(state, blob_id_error)
+            return _saved_graph_rejection_result(
+                state, blob_id_error, error_code="source_blob_identity_invalid", rejected_component=_source_component_id(source_name)
+            )
         normalized = blob_id.lower()
         if normalized in seen_ids:
-            return _failure_result(state, f"Duplicate blob id '{blob_id}' in blob_ids.")
+            return _saved_graph_rejection_result(
+                state,
+                f"Duplicate blob id '{blob_id}' in blob_ids.",
+                error_code="source_blob_duplicate",
+                rejected_component=_source_component_id(source_name),
+            )
         seen_ids.add(normalized)
 
     entries: list[dict[str, Any]] = []
@@ -1350,14 +1400,22 @@ def _resolve_source_blobs(
     for blob_id in blob_ids:
         blob = _sync_get_blob(session_engine, blob_id, session_id)
         if blob is None:
-            return _failure_result(state, f"Blob '{blob_id}' not found.")
+            return _saved_graph_rejection_result(
+                state,
+                f"Blob '{blob_id}' not found.",
+                error_code="source_blob_unavailable",
+                rejected_component=_source_component_id(source_name),
+            )
         if blob["status"] != "ready":
-            return _failure_result(state, f"Blob '{blob_id}' is not ready (status: {blob['status']}).")
+            return _saved_graph_rejection_result(
+                state,
+                f"Blob '{blob_id}' is not ready (status: {blob['status']}).",
+                error_code="source_blob_unavailable",
+                rejected_component=_source_component_id(source_name),
+            )
         content_hash_value = blob["content_hash"]
         if content_hash_value is None:
-            return _failure_result(state, f"Blob '{blob_id}' has no canonical content hash.")
-        if blob["mime_type"] not in STORAGE_MIME_TYPES:
-            return _failure_result(state, f"Blob '{blob_id}' has unsupported MIME type '{blob['mime_type']}'.")
+            raise AuditIntegrityError(f"Ready blob '{blob_id}' has no canonical content hash.")
         creation_modality = CreationModality(blob["creation_modality"])
         if is_llm_authored_creation_modality(creation_modality):
             # Fail-closed v1 boundary (recorded design deviation): the
@@ -1367,14 +1425,19 @@ def _resolve_source_blobs(
             # serves the authenticated upload/paste flow, whose blobs are
             # always user-verbatim; admitting LLM-authored blobs here
             # without an equivalent review shape would bypass human review.
-            return _failure_result(
+            return _saved_graph_rejection_result(
                 state,
-                f"Blob '{blob_id}' is LLM-authored; bind it through set_source_from_blob so its interpretation review is staged.",
+                f"Blob '{blob_id}' is LLM-authored; use a supported set_source_from_blob flow to stage its interpretation review. "
+                "If its content is not representable there, preserve the intended artifact and report the limitation.",
+                error_code="source_blob_review_required",
+                rejected_component=_source_component_id(source_name),
             )
         if content_hash_value in seen_hashes:
-            return _failure_result(
+            return _saved_graph_rejection_result(
                 state,
                 f"Blob '{blob_id}' has the same content as blob '{seen_hashes[content_hash_value]}'; entries must be unique documents.",
+                error_code="source_blob_duplicate",
+                rejected_component=_source_component_id(source_name),
             )
         seen_hashes[content_hash_value] = blob["id"]
         entries.append(
@@ -1405,11 +1468,13 @@ def _resolve_source_blobs(
         merged_options["schema"] = {"mode": "observed"}
     canonical_error = _canonical_interpretation_requirement_error(merged_options, tool_name="set_source_from_blobs")
     if canonical_error is not None:
-        return _failure_result(state, canonical_error, error_code="interpretation_requirements_invalid")
-    try:
-        context.catalog.get_schema("source", "blob_rows")
-    except (ValueError, KeyError) as exc:
-        return _failure_result(state, f"Unknown source plugin 'blob_rows': {exc}")
+        return _saved_graph_rejection_result(
+            state, canonical_error, error_code="interpretation_requirements_invalid", rejected_component=_source_component_id(source_name)
+        )
+    plugin_error = _plugin_selection_violation(context, "source", "blob_rows")
+    if plugin_error is not None:
+        return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=_source_component_id(source_name))
+    context.catalog.get_schema("source", "blob_rows")
     prevalidation_error = _prevalidate_source_for_context(
         context,
         "blob_rows",
@@ -1418,10 +1483,11 @@ def _resolve_source_blobs(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             prevalidation_error[0],
             error_code=prevalidation_error[1],
+            rejected_component=_source_component_id(source_name),
             plugin_identity=("source", "blob_rows"),
         )
     return merged_options, tuple(payloads)
@@ -1471,7 +1537,12 @@ def _execute_set_source_from_blobs(
         source=True,
     )
     if review_metadata_error is not None:
-        return _failure_result(state, review_metadata_error, error_code="interpretation_requirements_invalid")
+        return _saved_graph_rejection_result(
+            state,
+            review_metadata_error,
+            error_code="interpretation_requirements_invalid",
+            rejected_component=_source_component_id(source_name),
+        )
     caller_options = _canonicalize_authored_interpretation_requirements(
         caller_options,
         component_id=_source_component_id(source_name),
@@ -1489,7 +1560,9 @@ def _execute_set_source_from_blobs(
         tool_name="set_source_from_blobs",
     )
     if guarantee_stamp_error is not None:
-        return _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required")
+        return _saved_graph_rejection_result(
+            state, guarantee_stamp_error, error_code="source_data_contract_required", rejected_component=_source_component_id(source_name)
+        )
     try:
         on_vf = resolve_failure_route_choice(
             validated.on_validation_failure,
@@ -1498,7 +1571,9 @@ def _execute_set_source_from_blobs(
             previous=state.sources[source_name].on_validation_failure if source_name in state.sources else None,
         )
     except FailureRouteChoiceError as exc:
-        return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=_source_component_id(source_name))
+        return _saved_graph_rejection_result(
+            state, str(exc), error_code="failure_route_required", rejected_component=_source_component_id(source_name)
+        )
     resolved = _resolve_source_blobs(
         blob_ids=validated.blob_ids,
         caller_options=caller_options,
@@ -1513,10 +1588,6 @@ def _execute_set_source_from_blobs(
         return resolved
     merged_options, payloads = resolved
 
-    plugin_error = _validate_plugin_name(context, "source", "blob_rows")
-    if plugin_error is not None:
-        return _plugin_policy_failure(state, plugin_error)
-
     source = SourceSpec(
         plugin="blob_rows",
         on_success=validated.on_success,
@@ -1527,10 +1598,11 @@ def _execute_set_source_from_blobs(
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+            rejected_component=None,
         )
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
     data = {"server_owned_metadata_note": echo_note} if echo_note is not None else {}
@@ -1941,7 +2013,12 @@ def _execute_patch_source_options(
         ) from exc
     source_name = validated.source_name
     if source_name not in state.sources:
-        return _failure_result(state, f"No source named '{source_name}' configured to patch.")
+        return _saved_graph_rejection_result(
+            state,
+            f"No source named '{source_name}' configured to patch.",
+            error_code="source_not_found",
+            rejected_component=_source_component_id(source_name),
+        )
     current_source = state.sources[source_name]
     # The plugin comes from persisted state, not from this request: resolve
     # it through the request's policy view before anything downstream
@@ -1949,9 +2026,10 @@ def _execute_patch_source_options(
     # plugin removed or renamed between deployments, or no longer authorized
     # by this snapshot, is a policy rejection — the same one set_source gives
     # — never a raise out of the schema augmentation (elspeth-e405ad7cd2 R8-fix1).
-    plugin_error = _validate_plugin_name(context, "source", current_source.plugin)
+    plugin_error = _plugin_selection_violation(context, "source", current_source.plugin)
     if plugin_error is not None:
-        return _plugin_policy_failure(state, plugin_error)
+        return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=_source_component_id(source_name))
+    context.catalog.get_schema("source", current_source.plugin)
     patch: Mapping[str, Any] = validated.patch
 
     # Echo tolerance (elspeth-c67fbbbd83): a patch echoing the stored
@@ -1969,10 +2047,17 @@ def _execute_patch_source_options(
 
     manual_authoring_error = _reject_manual_source_authoring(patch, tool_name="patch_source_options")
     if manual_authoring_error is not None:
-        return _failure_result(state, manual_authoring_error)
+        return _saved_graph_rejection_result(
+            state,
+            manual_authoring_error,
+            error_code="interpretation_requirements_invalid",
+            rejected_component=_source_component_id(source_name),
+        )
     manual_blobs_error = _reject_manual_source_blobs(patch, tool_name="patch_source_options")
     if manual_blobs_error is not None:
-        return _failure_result(state, manual_blobs_error)
+        return _saved_graph_rejection_result(
+            state, manual_blobs_error, error_code="plugin_options_invalid", rejected_component=_source_component_id(source_name)
+        )
     # Checked on the PATCH delta like the forged-requirement gate below: an
     # echoed stamp asserts nothing new; a new or changed one is the silent
     # stamp the evidence-class ruling forbids (elspeth-1dddcfee3a).
@@ -1983,7 +2068,9 @@ def _execute_patch_source_options(
         tool_name="patch_source_options",
     )
     if guarantee_stamp_error is not None:
-        return _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required")
+        return _saved_graph_rejection_result(
+            state, guarantee_stamp_error, error_code="source_data_contract_required", rejected_component=_source_component_id(source_name)
+        )
     # Check the LLM-supplied PATCH delta (not the merged result): a patch that
     # carries a forged "resolved" INVENTED_SOURCE requirement is the live review
     # bypass vector. Checking the delta — mirroring patch_node_options — leaves a
@@ -1995,10 +2082,11 @@ def _execute_patch_source_options(
         source=True,
     )
     if review_metadata_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_metadata_error,
             error_code="interpretation_requirements_invalid",
+            rejected_component=_source_component_id(source_name),
         )
     patch = _canonicalize_authored_interpretation_requirements(
         patch,
@@ -2007,28 +2095,29 @@ def _execute_patch_source_options(
         existing_options=current_source.options,
     )
     if _SOURCE_BLOB_REF_OPTION_KEY in patch:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
-            "Cannot patch 'blob_ref' on a source. Re-bind via set_source_from_blob "
-            "(or call clear_source first) to change the underlying blob.",
+            "Cannot patch 'blob_ref' on a source. Re-bind via set_source_from_blob to change the underlying blob.",
+            error_code="source_binding_locked",
+            rejected_component=_source_component_id(source_name),
         )
 
     # Lock the (path, blob_ref) pair on blob-backed sources.  Once
     # set_source_from_blob has bound a source to a blob, the path is the
     # blob's canonical storage_path and is not patchable: any divergence
     # breaks runtime path resolution and composer/runtime agreement.
-    # Replace the binding via a fresh set_source_from_blob (or
-    # clear_source) instead of patching it.
+    # Replace the binding via a fresh set_source_from_blob instead of patching it.
     if _SOURCE_BLOB_REF_OPTION_KEY in current_source.options:
         forbidden_keys = {"path"} & patch.keys()
         if forbidden_keys:
-            return _failure_result(
+            return _saved_graph_rejection_result(
                 state,
                 "Cannot patch "
                 f"{sorted(forbidden_keys)} on a blob-backed source. "
                 "The 'path' is bound to the referenced blob's canonical "
-                "storage_path. Re-bind via set_source_from_blob (or call "
-                "clear_source first) to change the underlying blob.",
+                "storage_path. Re-bind via set_source_from_blob to change the underlying blob.",
+                error_code="source_binding_locked",
+                rejected_component=_source_component_id(source_name),
             )
 
     new_options = _apply_merge_patch(current_source.options, dict(patch))
@@ -2037,15 +2126,18 @@ def _execute_patch_source_options(
         tool_name="patch_source_options",
     )
     if canonical_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             canonical_error,
             error_code="interpretation_requirements_invalid",
+            rejected_component=_source_component_id(source_name),
         )
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(current_source.plugin, new_options)
     if endpoint_policy_error is not None:
-        return _failure_result(state, endpoint_policy_error)
-    credential_error = _credential_wiring_contract_failure(
+        return _saved_graph_rejection_result(
+            state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=_source_component_id(source_name)
+        )
+    credential_error = _saved_graph_credential_wiring_contract_failure(
         state,
         component_id=_source_component_id(source_name),
         component_type="source",
@@ -2064,7 +2156,13 @@ def _execute_patch_source_options(
         require_data_dir=context.require_data_dir_for_paths,
     )
     if path_error is not None:
-        return _failure_result(state, path_error)
+        return _saved_graph_rejection_result(
+            state,
+            "Source file path options (path or file) must use this session's permitted source locations. "
+            "Use the session's blob binding or an authorized source path.",
+            error_code="source_path_policy_invalid",
+            rejected_component=_source_component_id(source_name),
+        )
 
     # Pre-validate patched options against config model
     prevalidation_error = _prevalidate_source_for_context(
@@ -2075,10 +2173,11 @@ def _execute_patch_source_options(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             prevalidation_error[0],
             error_code=prevalidation_error[1],
+            rejected_component=_source_component_id(source_name),
             plugin_identity=("source", current_source.plugin),
         )
 
@@ -2091,10 +2190,11 @@ def _execute_patch_source_options(
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+            rejected_component=None,
         )
     data = None
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
@@ -2162,7 +2262,12 @@ def _execute_clear_source(
     source_name = validated.source_name
     new_state = state.without_named_source(source_name)
     if new_state is None:
-        return _failure_result(state, f"No source named '{source_name}' configured to clear.")
+        return _saved_graph_rejection_result(
+            state,
+            f"No source named '{source_name}' configured to clear.",
+            error_code="source_not_found",
+            rejected_component=_source_component_id(source_name),
+        )
     return _mutation_result(new_state, (_source_component_id(source_name),))
 
 

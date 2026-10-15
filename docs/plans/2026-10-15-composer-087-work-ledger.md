@@ -53,7 +53,7 @@ packet; it does not mean merged, signed, released or deployed.
 | Planned work | Current status |
 |---|---|
 | 0. Baseline inventories and ownership | Complete; live registry/profile and direct-call inventories recorded. |
-| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement and output groups accepted locally in `620231a` and `208bf8d`. Source group design reviewed; source, transform/splice, blob, secret, discovery and remaining dispatch migrations pending. |
+| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement and output groups accepted locally in `620231a` and `208bf8d`. Source group accepted for local integration after both reviews and focused qualification; transform/splice, blob, secret, discovery and remaining dispatch migrations remain pending. |
 | 2. Saved-but-blocked persistence/reload/UI | Pending joined behavioral evidence; inherited .6 teaching retained. |
 | 3. Model-catalog provenance | Fixed in .6; .7 regression closure pending. |
 | 4. Explicit CSV failure choice | Runtime refusal already exists. False assistance claim that omission defaults to discard still needs correction and its provenance checks. |
@@ -84,7 +84,7 @@ Additional defects and controls found during this work:
 | Changed CSV reader authority binding | Rebound and controlled locally in packet 1a; separate pre-existing global writer-inventory expected failure remains unqualified. |
 | Output missing-target code/subject and standing saved findings lost | Fixed locally in packet 1b, retaining credential-repair payload and admitted schema identity. |
 | Schema-augmentation AST tripwire misses migrated saved-graph helper | Fixed locally; actual missing-identity mutation now fails the owning gate. |
-| Q1: configured container token ceiling is not provisioned | Combined candidate independently accepted after focused integration checks; local Git completion and broader gates remain separate. |
+| Q1: configured container token ceiling is not provisioned | Accepted locally in combined integration `9d6533fe`; focused checks, independent/system reviews and normal hooks complete. Broader gates remain separate. |
 | Q2: automatic titles make hidden SDK retries | Applied locally as `32673a1`; bounded combined integration accepted, retaining the physical-transport/accounting evidence and provider limitations. |
 | Q3: token-only container policy incorrectly needs a storage cap | Combined candidate accepted; optional container storage and mandatory identity storage verified within the focused scope. |
 | Q4: active container singleton is keyed by actor | Checked constant-slot fix accepted; focused PostgreSQL quota authority cases pass. Full PostgreSQL qualification remains due. |
@@ -96,9 +96,9 @@ Additional defects and controls found during this work:
 | SL3: stale authentication destination A overrides explicit B | Fixed and accepted locally in the same shared-link packet. |
 | SL4: previous shared snapshot remains under a new token | Fixed and accepted locally in the same packet using route identity. |
 | SL5: shared-view global keyboard shortcuts act on recipient workspace | Open, outside the narrowed fallback patch. New-session shortcut reproduced; validation shortcut source-supported only. No sender mutation or cross-user access established. |
-| Ready plural source blob with NULL hash is treated as repairable | Source-reviewed integrity correction pending in the next source group. |
-| Invalid stored MIME has a redundant recoverable branch; MIME DB-CHECK comment is false | Source-reviewed branch/comment correction pending. Existing row reader already fails invalid MIME. |
-| Source policy refusal occurs after schema access | Source-reviewed ordering correction pending; admitted schema faults must propagate. |
+| Ready plural source blob with NULL hash is treated as repairable | Corrected in accepted source1c candidate; real corruption and laundering controls preserve the owned integrity failure. Local commit pending. |
+| Invalid stored MIME has a redundant recoverable branch; MIME DB-CHECK comment is false | Corrected in source1c; the real row reader retains MIME integrity ownership, and the comment names the actual write/read guards. No constraint or epoch change. |
+| Source policy refusal occurs after schema access | Corrected in source1c with pure policy admission before direct schema access. Actual unavailable reasons and admitted ValueError/KeyError propagation are qualified separately. |
 | Null/malformed source claims disappear or are string-coerced | Included in approved item-8 design; implementation pending. |
 | Missing proof context is conflated with no authored source claim | Included in approved item-8 design; implementation pending. |
 | Metadata-only source proof permits later unlocked content fallback | Included in approved item-8 design; implementation pending. |
@@ -109,6 +109,9 @@ Additional defects and controls found during this work:
 | Aggregation output-count refusal hides standing saved findings | Source-confirmed `with_state_validation=False` in upsert; systems-reviewed transform/splice correction pending. |
 | Transform provider-path refusal exposes private path/root text | Source-confirmed in upsert, patch and splice preparation; static producer projection and privacy controls pending in the reviewed transform group. |
 | Node refusals omit codes/subjects or mask admitted schema faults | Systems source design complete for upsert, patch and splice plus existing helpers; implementation and discriminating controls pending. |
+| New predecessor test bypasses the required session-engine factory | Normal hook exposed it; repaired with the existing read-only inspection factory. All39 epoch cases plus masquerade gate pass, and actual initializer-admission mutation still fails as intended. Normal hooks now pass. |
+| Credential-envelope census still names the legacy adapter instead of its payload builder | Corrected at the real builder with explicit per-row constructor ownership. The complete affected gate and witnessed key/missing-payload/owner controls pass their intended checks; no wire expansion. |
+| Source contract tests contain invalid fixture and outer-fault assumptions | Repaired with real owner premises and accurate outer/endpoint oracles; all104 affected cases pass. The original46 failures and2 teardown errors remain historical red evidence, not new product defects. |
 
 The earlier title custody stall was an execution-environment investigation,
 not a confirmed additional product defect. The deployed shared-link incident
@@ -786,9 +789,24 @@ quota integration. The original red positive1/2 runs remain unchanged; reuse is
 limited to reviewed unchanged production and affected follow-up. No new green
 1316/602 aggregate is claimed, and overlapping selections are not summed.
 
-This ledger update follows those completed frozen runs and changes only status
-documentation. The actual incoming cherry-pick remains unfinished until root's
-normal local Git step. Full default/full serial PostgreSQL, final applicable
+The normal commit hook then found one bare SQLAlchemy constructor in the new
+direct-initializer test. The existing read-only session factory preserves the
+separate initializer/probe operation, WAL visibility and strict assertions;
+no helper, suppression, alias evasion or rule change was added. Freeze4 focused
+verification exited0/frozen with283 passed and0 failures/errors/skips. The affected
+initializer negative exited1/frozen with one intended `DID NOT RAISE` and actual
+old-store admission witness,0 errors/skips. Both use input digest
+`ae1874179c8aa3e074b336646ef6067b195128c78ab59caf4b98cff07ffae046`;
+both reviewers extended bounded acceptance. Prior PostgreSQL/Azure/other controls/
+keyless receipts retain their explicit unchanged-source reuse limits.
+
+Root completed local combined integration as
+`9d6533fe07ef0cdb5270611cc4f1b343cc39de5f`. Canonical preflight and normal hooks
+passed; no hook changed source bytes. Fresh postcommit verification found a clean
+checkout, no unfinished cherry-pick/unmerged index, all48 freeze4 bindings matching
+and all46 committed blobs matching reviewed files. This later ledger/status update
+is documentation only; the recorded clean state precedes it. Full default/full
+serial PostgreSQL, final applicable
 whole-tree gates, protected CI, operator adjudication/signing and whole-plan
 acceptance remain due. No release, deployment or conversion is qualified.
 
@@ -800,3 +818,78 @@ preflight owners retain actual partial progress. The output admitted-schema
 masking and transform findings above are pending repairs, not silently covered
 by the earlier output/candidate packets. The entire approved plan0–15 continues;
 items16–18 remain conditional.
+
+### Source1c initial qualification and counterevidence
+
+The writer froze eight product/test paths and the ignored controls. Root and
+both reviewers independently matched all54 bindings; source/design review
+found no blocking placement or representation issue. The affected run exited1
+on unchanged inputs `48a8ffce988ee33cd1fcfb2f4b859bbd8e17b1ac68c034b1e9753a538197a550`:
+**1191 passed,46 failed,2 teardown errors,0 skipped**. The JUnit suite reports
+1237 tests; its1239 testcase elements include the two teardown-error elements.
+The failures comprise20 standing-warning preconditions,4 profile-code oracles,
+4 outer-fault tests,4 older AWS endpoint oracles and14 envelope-census cases.
+Original artifacts remain red; no deliberate negative or PostgreSQL source1c
+run has started.
+
+Live owner review confirms the profile code is correct: an invalid authored
+alias with usable aliases available is `plugin_options_invalid`; no usable
+profile is `profile_unavailable`. The shared helper retains the actual finding
+code. Tests must use an honest distinct-code case rather than change this
+policy. Ordinary outer schema cases initially fail while patching an immutable
+dispatch registry, before their target operation. Integrity cases reach the
+real ready-null/MIME guard and then the existing service audit wrapper; that
+wrapper and its causal exception/invocations must remain intact. The credential
+payload census must follow its actual builder rather than its legacy adapter.
+Same-writer repairs and independent/system review are active, with root runtime
+idle until a new freeze.
+
+The separately completed keyless diagnostic exited1/frozen with3277 records.
+Controlled comparison against the verified quota baseline at `9d6533fe` finds
+zero semantic additions/removals. Root verified1965 committed source/lint/census
+inputs against the baseline receipt, and the independent reviewer checked the
+full record sets and complete6591 before/after inputs. This remains keyless
+drift evidence; operator adjudication/signing and whole-plan gates remain due.
+
+### Final bounded source1c acceptance
+
+Both independent correctness/security and systems reviews accept final freeze2
+`09cc09e35b690819f525c49e1cc3655bd71960b4585e175afa957ecd5e762098`
+for local integration, with no remaining packet blocker. Root and both reviewers
+matched all57 source/test/dependency/control bindings. Production is unchanged
+by the test/oracle/census repair; all1966 declared production/lint/config inputs
+match the original positive1/keyless1 receipts and current files. The complete
+input-map comparison has8 modified test/control/document inputs and3 added
+ignored repair-evidence inputs; these do not constitute production drift.
+
+| Completed source1c receipt | Measured result |
+|---|---|
+| `packet1c-root-positive2` | Exit0/frozen,104 passed,0 failures/errors/skips:93 source-contract and11 endpoint cases. |
+| `packet1c-root-gates2` | Exit0/frozen,436 passed,0 failures/errors/skips: complete affected envelope, attribute, masquerade, code/redaction and error-class gates. |
+| `packet1c-root-negative1` through `7` | Each exit1/frozen;78 intended failure events across21 mutation families, each activated and witnessed,0 errors/skips/passes. |
+| `packet1c-root-postgres1` | Exit0/frozen,40 passed,0 failures/errors/skips: blob-read custody9, lock isolation13, pipeline rejection18. Explicit serial testcontainer selection on isolated local stores; external target absent. |
+
+All ten completed runs share complete input digest
+`9d4f0f7d0671a993d596a30d8e52c9460bf2ed52bc0ff43dbc946a04184a767e`.
+Root recomputed each before/after map and verified all6594 recorded files and
+symlinks still match current inputs. Negative-control review checked the actual
+assertion and witness for each case, including profile-outage tuple forwarding,
+actual open-based reading, ready-null/MIME laundering and credential-builder
+ownership. The privacy mutation retains the static remedy and appends actual
+private validator text; its exact-message assertion fails on that canary.
+
+After a relay-driven continuation check, root recovered the already completed
+40-pass source PostgreSQL receipt instead of launching it again. It is distinct
+from the earlier142-pass quota selection. Current HEAD remains `9d6533fe` until
+normal local integration; no unfinished Git operation or task-owned test process
+was found. Shared host allocation was4, below the12-slot ceiling. The same two
+reviewers were resumed, and no replacement owner or product writer was created.
+The separate0.8.6 owner's publication and runtime changes remain held.
+
+The keyless1 scan remains the separately completed3277-finding no-drift
+diagnostic, reused only for unchanged production/lint/config. Original positive1
+stays red; no green1237-case aggregate or sum of overlapping selections is
+claimed. Scoped Ruff, source mypy, contracts and skill-inventory receipts retain
+their stated bounds. Normal local Git integration, full branch/default/full
+PostgreSQL, protected exact-head CI/merge, operator adjudication/signing and
+the remaining plan0–15 work remain separate. Items16–18 are conditional.

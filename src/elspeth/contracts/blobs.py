@@ -65,7 +65,7 @@ StorageMimeType = Literal[
 ]
 """Storage-level union: what a persisted managed blob may declare.
 
-Mirrors the blobs-table MIME CHECK constraint. Kept as an explicit Literal
+Enforced by the blob service's write and row-read guards. Kept as an explicit Literal
 (rather than a type alias union) so ``get_args`` yields the flat member
 set; the derivation test pins it equal to the union of the two derived
 closed sets."""

@@ -450,6 +450,10 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("set_pipeline", "source_blob_plugin_required"),
         ("set_pipeline", "source_blob_changed"),
         ("set_pipeline", "source_blob_encoding_invalid"),
+        ("set_source_from_blobs", "source_blob_duplicate"),
+        ("set_source_from_blobs", "source_blob_review_required"),
+        ("patch_source_options", "source_binding_locked"),
+        ("clear_source", "source_not_found"),
     ],
 )
 def test_registered_code_survives_response_redaction(tool_name: str, error_code: str) -> None:

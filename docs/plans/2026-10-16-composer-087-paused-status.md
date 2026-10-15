@@ -1,5 +1,17 @@
 # Composer 0.8.7 — paused status and resume point
 
+Current work is **active** under the chronology correction below. Quota integration
+was accepted and committed locally as `9d6533fe`; current progress and remaining
+fixes are in [the work ledger](2026-10-15-composer-087-work-ledger.md) and the ignored
+coordinator record. The pause/source/Git snapshots below remain historical.
+
+Source1c has bounded acceptance from both independent and systems reviews:
+104 affected behavior cases,436 gate cases and40 focused PostgreSQL cases pass;
+78 witnessed deliberate failures cover21 regressions. Local Git integration is
+next. Its original1191-pass/46-failure/2-teardown-error run remains historical
+red evidence. The3277-finding keyless scan has no semantic drift and is reused
+only for unchanged production inputs. Whole-plan and broader gates remain open.
+
 **Historical pause report — resumed after chronology correction and fresh
 readiness checks at 2026-10-15 20:17 UTC.** The 20:05 checkpoint reprocessed the
 original pause; it was not a new direct user instruction. Preserve the report
