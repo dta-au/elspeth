@@ -219,6 +219,8 @@ def _assert_aws_s3_endpoint_url_rejected(
     expected_prefix = "" if rejected_component is None else rejected_component_prefix(rejected_component)
     assert result.validation.errors[0].message == f"{expected_prefix}{AWS_S3_ENDPOINT_URL_POLICY_ERROR}"
     assert result.validation.errors[0].rejected_component == rejected_component
+    if rejected_component is not None:
+        assert result.validation.errors[0].error_code == "aws_s3_endpoint_url_not_allowed"
     assert forbidden_value not in repr(result.data)
     assert forbidden_value not in repr(result.validation)
 

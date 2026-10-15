@@ -1,0 +1,532 @@
+# Composer 0.8.7 work ledger
+
+This is the working implementation ledger for the approved Composer 0.8.7
+plan. It records source reconciliation and later behavioral evidence; it is
+ordinary project documentation, not a release approval or immutable plan.
+
+## Baseline and boundaries
+
+- Target branch: `codex/composer087-contracts-20261015`.
+- Baseline HEAD: `02e6b893f35230db544c1f277988c61b89203a54`.
+- Packet 0 changed documentation and ignored lane inventory only. No production
+  or test edit, test execution, provider call, installation, deployment, push,
+  PR or merge occurred in this packet.
+- The matching 0.8.6 `FINAL-LOCAL2-COMPLETE-RECEIPT.json` records all five local
+  stages exiting 0 on a frozen tree: default pytest `68197 passed, 113 skipped,
+  2 xfailed`; PostgreSQL `1039 passed, 1 skipped`. Those are inherited local
+  evidence for the unchanged baseline, not new 0.8.7 results or remote CI,
+  native-proof, frontend, signing or deployment clearance. Do not rerun them
+  as packet-0 work.
+- Live `AGENTS.md` and `CONTRIBUTING.md`, including whole-tree gates, were read.
+  Both source roots must be explicit for Python execution. Registry measurement
+  used existing Python 3.13.15 and proved both ELSPETH modules resolve inside
+  this worktree. No environment rebuilding is authorized.
+- Root owns shared test capacity and independent Astra review. The current
+  focused allocation is one serial runtime process; broad, native and
+  PostgreSQL qualification need a later capacity allocation. Packet 0 itself
+  ran no tests.
+- One implementation worker owns production and test edits for automatic
+  rows 1–15 in this worktree. The root coordinates packets, capacity and
+  independent review; the release coordinator owns semantic/policy decisions
+  including item 5 and conditional items 16–18. No conditional item starts
+  merely because its source seam was inventoried.
+- Every established schema/TypedDict expansion or typing relaxation stops for
+  independent systems review of operation meanings, invariants, ownership and
+  all producers/consumers. Preserve public wire and existing preserve/refuse
+  contracts unless a separate extension is agreed.
+- The LLM remains the author of pipeline structure. Tutorial and ordinary
+  entry paths share the same backend. Literal user content is preserved.
+
+The ignored lane directory is `.claude/lanes/composer087-contracts-20261015/`.
+Raw registry/API evidence is in `live-registry.json`,
+`live-profile-combinations.json`, `live-issues.json` and
+`direct-symbol-inventory.json`; the item-1 proposal is `packet1-design.md`.
+These are coordination inputs and must never be staged.
+
+## Live tool and plugin inventories
+
+The tool universe was queried through `_REGISTERED_TOOLS`,
+`get_tool_definitions()` and `ASYNC_TOOL_EFFECTS`, not counted from source
+text. Raw output:
+
+```json
+{
+  "sync_tools_by_kind": {
+    "blob_discovery": 5, "blob_mutation": 6,
+    "discovery": 12, "mutation": 14,
+    "secret_discovery": 2, "secret_mutation": 1
+  },
+  "sync_count": 40,
+  "llm_visible_count": 42,
+  "async_exceptions": ["request_interpretation_review", "request_advisor_hint"],
+  "plugins_by_kind": {"source": 10, "transform": 39, "sink": 10},
+  "controls": {
+    "tool_positive_set_pipeline": true, "tool_negative_not_registered": true,
+    "plugin_positive_source_csv": true, "plugin_negative_not_registered": true
+  }
+}
+```
+
+Tool identities by semantic family, read from those live objects:
+
+| Family | Registered operations | Baseline evidence to preserve/extend |
+|---|---|---|
+| Catalog, assistance and grammar | `list_sources`, `list_transforms`, `list_sinks`, `get_plugin_schema`, `get_plugin_assistance`, `get_expression_grammar`, `explain_validation_error`, `get_audit_info`, `list_models` | `test_tools_discovery.py`, `test_discovery_response_contracts.py`, `test_validation_guidance_catalogue.py`, `test_provider_discovery_response.py` |
+| Source binding and inspection | `set_source`, `patch_source_options`, `clear_source`, `set_source_from_blob`, `set_source_from_blobs`, `inspect_source` | `test_explicit_failure_choices.py`, `test_set_source_from_blobs.py`, `test_source_inspection.py`, `test_promote_set_source.py` |
+| Graph and output mutation | `upsert_node`, `splice_transform`, `upsert_edge`, `remove_node`, `remove_edge`, `set_metadata`, `patch_node_options`, `set_output`, `remove_output`, `patch_output_options` | `test_tools_mutations.py`, `test_splice_transform_tool.py`, `test_edge_route_reconciliation.py`, `test_applied_component_echo.py` |
+| Whole pipeline and checks | `get_pipeline_state`, `set_pipeline`, `preview_pipeline`, `diff_pipeline` | `test_set_pipeline_candidate.py`, `test_pipeline_commit_operation_authority.py`, `test_set_pipeline_review_finalization.py`, `tools/test_tools_preview.py` |
+| Blob discovery | `list_blobs`, `list_composer_blobs`, `get_blob_metadata`, `get_blob_content` | `test_blob_response_contracts.py`, `test_blob_inline_tools.py`, `test_tools_blobs.py` |
+| Blob writes and inline wiring | `create_blob`, `update_blob`, `delete_blob`, `wire_blob_inline_ref` | `test_promote_create_blob.py`, `test_promote_update_blob.py`, `test_inline_blob_prompt_surface_tool_parity.py` |
+| Secret references | `list_secret_refs`, `validate_secret_ref`, `wire_secret_ref` | `test_secret_response_contracts.py`, `test_secret_wiring_collector.py`; secret-policy integration selection is resolved with the owning packet |
+| Async exceptions | `request_interpretation_review`, `request_advisor_hint` | `test_request_interpretation_review_tool.py`, `test_advisor_tool.py`, `test_dispatch_arms_characterization.py` |
+
+The family table is a test-selection map, not a claim that those suites prove
+every lifecycle dimension. Item 13 must deliberately exercise success,
+refusal, retry, cancellation, missing context, privacy and retained/reloaded
+outcomes where each operation supports them. Keep async dispatch explicit:
+`tools/_registry.py:119` owns async effects;
+`tool_batch.py:2464` and `session_tool.py` dispatch interpretation work;
+`tool_batch.py:2099` intercepts advisor work.
+
+Live `PluginManager.register_builtin_plugins()` and its `get_sources`,
+`get_transforms`, `get_sinks` methods produced these installed identities:
+
+- Sources: `aws_s3`, `azure_blob`, `blob_rows`, `csv`, `dataverse`, `json`,
+  `null`, `power_automate`, `text`, `llm`.
+- Transforms: `batch_classifier_metrics`, `batch_data_quality_report`,
+  `batch_distribution_profile`, `batch_drift_compare`, `batch_effect_size`,
+  `batch_experiment_compare`, `batch_outlier_annotator`,
+  `batch_paired_preference`, `batch_rank`, `batch_replicate`, `batch_stats`,
+  `batch_threshold_summary`, `batch_top_k`, `blob_csv_expand`, `blob_fetch`,
+  `blob_json_expand`, `blob_text_expand`, `field_mapper`, `json_explode`,
+  `keyword_filter`, `line_explode`, `passthrough`, `pdf_rasterize`,
+  `reference_join`, `report_assemble`, `truncate`, `type_coerce`,
+  `value_transform`, `web_scrape`, `aws_bedrock_content_safety`,
+  `aws_bedrock_prompt_shield`, `aws_textract_document_analysis`,
+  `aws_textract_inline_analysis`, `azure_ai_search`, `azure_content_safety`,
+  `azure_document_intelligence`, `azure_prompt_shield`, `llm`, `rag_retrieval`.
+  See the raw registry for the authoritative full transform list; this prose
+  is not an inventory gate.
+- Sinks: `aws_s3`, `azure_blob`, `chroma_sink`, `csv`, `database`, `dataverse`,
+  `document`, `json`, `power_automate`, `text`.
+
+Profile combinations were separately enumerated through
+`OperatorProfileRegistry.profile_availability()` over every installed
+identity using pure synthetic settings and a synthetic credential inventory.
+No real deployment configuration or credential was read. The known-positive
+`source:llm` and known-negative `source:csv` controls passed.
+
+| Plugin identity | Configured synthetic profile combinations returned by the registry | Qualification boundary |
+|---|---|---|
+| `source:llm`, `transform:llm` | OpenRouter server reference; OpenRouter user reference; Bedrock task role; gateway server reference | Discovery/local requirement availability only; no provider or runtime construction proof |
+| `source:aws_s3` | Profiled source location, task/default credential chain | No storage call |
+| `transform:aws_bedrock_prompt_shield` | Guardrail profile, task/default credential chain | No provider call |
+| `transform:aws_bedrock_content_safety` | Guardrail profile, task/default credential chain | No provider call |
+| `transform:aws_textract_document_analysis` | Document location profile, task/default credential chain | No provider call |
+| `transform:azure_ai_search` | Managed identity; server API-key reference | No provider call |
+
+All returned synthetic profiles reported local requirements available. This
+does not establish deployment enablement, valid real credentials, live
+qualification or computed-contract parity. Item 14 must explicitly record
+live, disabled and unqualified lanes rather than treating installation as
+authorization.
+
+## Entry surfaces and ownership map
+
+| Surface | Concrete boundary/call sites | Authority or compatibility obligation |
+|---|---|---|
+| Web/freeform/tutorial turn | `sessions/routes/composer/compose.py`; `sessions/composer_turn.py:832`; `composer/service.py`; `composer/tool_batch.py:906` | Shared planner/provider path, authenticated snapshot, audited argument admission, cancellation and partial-state persistence |
+| Planner discovery and terminal candidate | `composer/pipeline_planner.py:3194`, `4407`; `composer/planning_application.py`; `composer/tool_batch.py:665` | Planner owns authored candidate repeat identity before finalization; producer owns rejected subject/handling; finalizer-owned information remains private |
+| Synchronous tool dispatch | `composer/tools/_dispatch.py:796`, `994`; uniform handlers from live declaration registry | Public schema/path admission versus owned internal callers requires characterization; structural flags are not proof of a bypass |
+| Local Composer MCP | `composer_mcp/server.py:402` | Explicit trained-operator snapshot and public argument admission; preserve wire |
+| Proposal settlement | `sessions/routes/composer/proposals.py`; `composer/pipeline_commit.py`; `composer/tools/sessions.py:650` | Full candidate validation, inline custody and required review settlement precede publication/commit; no rejection may be mistaken for saved graph |
+| YAML import, seed, revert, versions/export | `sessions/routes/composer/state.py:627`, `685`, `708`, `890`, `901`, `1125`, `1321` | Preserve/refuse and round-trip contracts; historical state and effective review overlay remain distinct |
+| Validation/execution | `web/execution/routes.py:903`, `970`; `composer/composer_preflight.py:79`; `composer/tools/generation.py:3943` | Green Stage 2, approval, execution readiness and actual execution remain distinct; resolver/store proof contexts cannot silently imply evidence |
+| Persistence, reconnect and UI | `sessions/composer_operations.py:103`, `156`; `sessions/converters.py:21`; frontend `api/composerOperationDecoder.ts:45`, `hooks/useComposer.ts`, `components/chat/completionOutcome.ts` | Exact record shape, saved revision attribution, closed public failures, outcome decoding and privacy |
+
+## Approved-plan reconciliation
+
+“Surviving” means live source demonstrates the stated remaining contract;
+“untested” means packet 0 establishes the seam but makes no new runtime
+verdict. Existing test names below are affected selections, not execution
+results. Deferred rows require the stated decision before implementation.
+
+| Item | Baseline status | Current source evidence and next bounded work |
+|---|---|---|
+| 0. Baseline inventory | Completed for packet 0 | Live registries/API evidence above; direct AST symbol-reference inventory has positive/negative controls. Reconcile later edits against this baseline. |
+| 1. Producer-owned rejection identity/handling and closed feedback | Surviving; systems review required before implementation | `_common.py:1288` has optional code plus framing boolean; `sessions.py:700` already requires rejected subject; `pipeline_planner.py:2473` compiles soft feedback; `generation.py:1889` still makes a false-impossibility statement for repeated masked classifiers. Candidate-only withholding/normalization at `_common.py:1527`, `3592` is fixed and retained. Propose explicit candidate-only/surviving-state operations over one builder and internal structural/argument/candidate feedback variants. Preserve planner-owned authored hash at `pipeline_planner.py:4407`. Focus on `test_rejection_authority.py`, `test_failure_validation_guidance.py`, `test_failure_schema_augmentation.py`, planner rejection/repair tests. |
+| 2. Broad saved-but-blocked behavior | Untested behavior expansion; retain fixed .6 G3 teaching | `SetPipelineCandidate.acceptable` at `sessions.py:593` requires success and authoring validity; candidate construction at 1902 advances a provisional version; execution settles only after checks at 1982. Existing operation saved-revision DTO at `sessions/composer_operations.py:103` tracks retained revisions independently. Fixed G3 guidance at `skills/pipeline_composer.md:490-495` already says applied successful mutations can carry separate runtime preflight, which neither changes the structural verdict nor undoes the mutation, and mutation success does not establish execution readiness. Retain that teaching and its envelope/teaching-gate coverage. Characterize and extend broad saved-blocked behavior through state versions, display and E2E; do not label a saved draft validated/approved/ready. Tests: set-pipeline candidate/review finalization, operation outcomes, frontend completion outcome. |
+| 3. Model-catalog provenance guidance | Fixed in .6 G2; regression only | `planner_authoring_aids.py:731-739` permits model identifiers only from this request's supplied model catalog or a current-session `list_models` result, never invention/training recall; lines 1956-1958 and 2156-2158 require stale snapshots to be refreshed before binding unserved literal slugs. `skills/pipeline_composer.md:839` teaches the same provenance. `test_planner_authoring_aids.py:1523-1531` pins the sanctioned supplied-catalog/discovery alternative; `test_model_discovery_scope.py:95-114` preserves scoped/complete discovery distinctions. Missing facts require permitted discovery; stale/invented identifiers remain refused. Do not repeat the fixed G2 repair. Validation-code guidance is a separate existing facility retained under item 1. |
+| 4. Explicit CSV failure policy | Existing runtime guard fixed; G4 wording surviving | `resolve_failure_route_choice` at `_common.py:1813` refuses absent/null/empty new choices and preserves omitted updates; source use at `sources.py:1099`; CSV assistance at `plugins/sources/csv_source.py:713` still falsely says omission defaults to discard. Retain missing/null/empty create/full-replace refusal before effects and explicit discard/named-route behavior. Tests: `test_explicit_failure_choices.py`, CSV schema repair guidance, blob source cases. G4 provenance reach below is mandatory. |
+| 5. Scoring scale independence/ownership | Deferred pending coordinator decision | `skills/pipeline_composer.md:1024`, `1028`, `1072` keep fixed 1–10 outside the criterion slot, under whole-prompt review; lines 929 and 1261 describe authored scale as vague-term semantics. Decide criterion reviewed value versus a distinct reviewed scale before editing. Preserve literal user-provided scale/rubric content. |
+| 6. Public admitted versus internal owned dispatch | Untested structural risk; no bypass claimed | `_dispatch.py:796` exposes admission flags defaulting false; documented public requirements at 889 and private interpretation seam at 907. MCP call at `composer_mcp/server.py:402`, worker dispatch through `tool_batch.py`, planner discovery and proposal paths need authority characterization. Tests-only is a valid outcome if all actual public producers enforce admission. Do not refactor on flags alone. |
+| 7. Typed application dependencies and real-signature doubles | Existing typed owner; characterization needed | `sessions/composer_app_services.py:30` already defines frozen typed `ComposerAppServices`; resolver at 45 reads actual app dependencies. Inventory includes all direct producers/consumers. Review fixture signatures before any service expansion; use existing `test_composer_async_worker.py`, `test_run_composer_turn.py`, structure/attribute-contract checks. |
+| 8. Explicit proof contexts/results | Surviving overloaded absence; semantics decision required | `compute_proof_diagnostics` at `generation.py:3943` accepts stored-session and resolver context in one optional signature; 3961/3965 return `[]` when session/store context is absent. Determine absent versus unavailable meanings before replacing them with explicit owned contexts/results. Existing callers include completion, preview and authoritative execution. Tests: configured-source proof, source inspection, preview/preflight and blob integrity suites. |
+| 9. Fresh settlement versus historical debt repair | Existing shared implementation with mode; characterization needed | `interpretation_surfacing.py:795` uses `only_missing_evidence` to distinguish repair; repair docs at 821 specify no duplicate/resurrected evidence. `/validate` at `web/execution/routes.py:903` acquires writer-related lease and runs repair for both latest and explicit state arms. Import debt check is separately off-loop at `routes/composer/state.py:855`. Preserve idempotence and writer acquisition; split operation meaning only when review supports it. Tests: `test_validate_route_repair_pass.py`, review debt/drift, surfacing and set-pipeline settlement. |
+| 10. Owned persisted record admission | Surviving soft record containers; compatibility preserved | `CompositionStateRecord` at `sessions/protocol.py:1126` freezes raw mappings; `sessions/converters.py:21` reconstructs via `CompositionState.from_dict`, retaining singular-source and nullable initial collections. Admit to owned records without migration or loss of exact shape/round-trip compatibility. Tests: `sessions/test_converters.py`, state serialisation/round-trip, YAML and effective review overlay tests. |
+| 11. Checked/failed/skipped candidate validation phases | Untested behavior expansion | Candidate property at `sessions.py:593` is authoring-only; preview includes runtime evidence at `generation.py:4196`; Stage-2 projection at 4156 excludes `CHECK_OUTCOME_SKIPPED_AFTER_FAILURE` from real failures. Produce honest phase/next-action facts while preserving .6 convergence and current accounting. Tests: planner-stage runtime preflight, preview, runtime-preflight pending-review verification, mutation preflight audit boundary. |
+| 12. Bounded source-demand capacity refusals | Surviving diagnostic normalization work; #247 open | `source_demand.py:88`, `235`, `261` bound work; `interpretation_state.py:1494` translates to `InterpretationReviewCapacityError`. Direct consumer seams include surfacing lines 207/392/414/539/583/708, completion 1846/2171 and pending preflight `tool_batch.py:3138`; AST inventory enumerates all direct references. Normalize to stable `source_data_contract_analysis_limit_exceeded`, preserving fail-closed/no-mutation behavior and value-free public errors/telemetry. Tests: source-demand, capacity, completion/preflight/surfacing/turn-audit. |
+| 13. Tool semantic family coverage | Untested breadth expansion | The live 42-tool universe and family matrix above replace guessed coverage counts. Extend owning behavioral cases for valid/refused/retried/cancelled/missing-context/privacy/persisted outcomes with deliberate broken controls. No assertion of universal baseline coverage is made. |
+| 14. Plugin/profile guidance, misuse and repair | Untested breadth expansion; #195 open | Live installed and pure configured-profile registry inventory above; `plugin_policy/profiles.py:1533` owns resolver assembly, `validation.py` owns profile-aware Stage-1 lowering. #195 requires measured construction/contract parity, not assumed breakage for every profiled plugin. Existing parity suites cover profile lowering/readiness/source paths; extend case-by-case, explicitly marking live/disabled/unqualified lanes. |
+| 15. Outcome details through lifecycle/UI | Existing retained-failure/saved-revision surface; broader behavior untested | `sessions/composer_operations.py:103`, `156` separate attribution and retained failure; frontend decoder at `api/composerOperationDecoder.ts:45` admits closed outcomes; `completionOutcome.ts:16` separates update/review/ready. Trace blocked/rejected/pending/validated/executable/executed facts through persistence, API, reconnect, reload and UI without exposing private provider/session detail. Tests: operation outcome routes/codec/recovery and frontend outcome/observer/store suites. |
+| 16. Repair-credit policy | Conditional; deferred | Item 11 must first establish phase semantics and failed/skipped work. Existing planner budget owners `pipeline_planner.py:678`, `770` and composition repair state are retained. No credit/accounting change without explicit coordinator decision and behavioral evidence. |
+| 17. Request-local source-demand cache | Conditional; deferred; #246 open | `interpretation_sites` at `interpretation_state.py:1132`, surfacer enumeration/preparation and writer recomputation share immutable facts. #246 requires measured 10/20/40-source cost and exact-state/disregard-aware lifetime; no baseline performance number or cache is invented. Writer-boundary recomputation stays authoritative. |
+| 18. Validation-work admission | Conditional; deferred; #249 open | `/validate` at `web/execution/routes.py:903` verifies ownership and acquires existing lease before worker validation at 970. #249 remains resource-fairness work, not a demonstrated authorization defect. Inventory all authoritative-validation consumers, measure contention and obtain policy/fairness decision before adding a separate/shared per-user budget. |
+
+All four referenced GitHub issues were read live from `dta-au/elspeth` on this
+baseline pass and remain **open**: [#195](https://github.com/dta-au/elspeth/issues/195),
+[#246](https://github.com/dta-au/elspeth/issues/246),
+[#247](https://github.com/dta-au/elspeth/issues/247),
+[#249](https://github.com/dta-au/elspeth/issues/249).
+No issue was modified or closed.
+
+## G4 provenance reach retained from 0.8.6
+
+The read 0.8.6 `GUIDANCE-G4-REACH.md` reports the CSV source stamp
+`sha256:5a67572be967d4aa`, 15 manifest literals across 13 parsed registered
+cases, a measured restart-history pin and the canonical case-registry digest.
+This packet confirms the erroneous live CSV sentence at line 713 and does not
+claim to have rerun those historical measurements. No selected native-proof
+binding refresh was identified there; do not invent one or duplicate native
+proof execution.
+
+When item 4 changes that sentence, use the existing owning hash/harness
+workflow in dependency order: source stamp after formatting; manifest literals;
+actual restart-history measurement for `resumed_full_projection_sha256`; then
+typed canonical case-registry digest. Preserve frozen behavioral oracle files.
+The 0.8.6 report names the focused CSV assistance/reference tests, plugin-hash
+checks, case-provenance/parity tests and checkpoint-reopen proof with drift
+negatives. The root allocates wider DAG/architecture qualification and the
+ordinary exact-head native gate.
+
+## Proposed first implementation packet
+
+Item 1 is the next bounded packet after Astra systems review. It will give
+rejection producers explicit candidate-only/surviving-state operations over one
+builder, close internal feedback variants without public-wire expansion, and
+repair the residual masked-repeat impossibility wording. Rejection subject,
+planner-authored repeat identity, handling scope, withheld information and
+proof of non-repairability remain separate.
+
+Special cases that must be classified, not renamed mechanically:
+`transforms.py:648` aggregation rejection is already candidate-only;
+`transforms.py:1367` splice refusal carries candidate deltas plus standing
+validation; `sessions.py:1997` and `tool_batch.py:1797` refuse postbuilder inline
+custody/quota before graph effects; planner missing-source/threshold refusal
+are direct producers outside the shared helper. Keep existing component
+ordering, independent metadata and safe guidance.
+
+Positive behavioral checks and deliberate broken controls must show: saved
+state/version unchanged on rejection; old graph errors excluded from candidate
+feedback; standing findings retained where the surviving-state operation owns
+them; identity/handling omissions rejected; changed candidates not treated as
+impossible merely because masked classifiers repeat; privacy and guidance
+preserved through normalization and merge. Run affected static/runtime gates
+within the allocated capacity, then obtain independent gpt-6-astra review.
+No conditional item 16–18 work is included automatically.
+
+### Packet 1a implementation boundary
+
+The independent Astra preimplementation report and classifier/source-resolver
+addendum approved the internal operation split, closed schema/argument/candidate
+feedback variants and producer classifier assignments before production edits.
+The required correction was applied to the source resolver: request-scoped
+plugin policy admission precedes schema access; unavailable identities keep
+their actual `PluginPolicyViolation` reason and are never flattened to
+`plugin_not_installed`. The resolver has a required nominal rejection operation
+at both production callers, with source subject derived from `source_name`.
+
+Packet 1a is in progress, limited to the full-replacement family, its necessary
+shared credential/policy/blob glue, internal feedback compiler and generic
+withheld-guidance wording. The existing generic failure and credential helpers
+remain explicit legacy surfaces for unresolved packet-1b families. Splice,
+aggregation and ordinary saved-graph producer semantics are preserved.
+No public/persisted response fields, authored-candidate hash ownership or
+universal terminal/retry classification were added. Focused runtime evidence
+and deliberate negative controls are still pending; this entry is not closure.
+
+The first focused batch completed with pytest exit 1: JUnit reports 140 tests,
+5 failures, 0 errors. Four old atomic-rejection expectations still assumed
+codeless failures, and the new inline-quota control omitted complete provenance.
+The fixture now uses the existing complete context and exact persisted verbatim
+CSV. Production provenance remains strict. Independent placement review also
+identified that using `plugin_options_invalid` for path-policy refusals would
+publish server-owned directory text through the existing authored-option detail
+exception. Dedicated static path/policy classifiers and disclosure/useful-guidance
+canaries are required before this packet can be approved. No passing packet or
+release claim is made from the first batch.
+
+### Systems-thinking placement decision
+
+The user-requested independent review traced operation meaning and custody to
+the existing owners. Historical repair-debt meaning belongs in
+`src/elspeth/web/composer/interpretation_surfacing.py`; the revert route in
+`src/elspeth/web/sessions/routes/composer/state.py` preserves verified-receipt
+ordering and short lease orchestration. An advisory read must retain the
+writer's live evidence/anchor rechecks in the sessions service and pending
+interpretation owner. Item 9 implementation and validation remain pending;
+this review does not move fresh settlement into historical repair semantics.
+
+For packet 1a, `_common.py` owns rejection construction and `tools/sources.py`
+requires its caller to select candidate versus saved-graph diagnostic framing.
+The operation enum grants no write authority. `pipeline_planner.py` owns
+provider-facing custody projection, while the planner continues to own authored
+repeat identity before finalization. Safe static candidate path messages plus
+the three dedicated path codes correct the identified server-root disclosure
+hazard on both serialized tool messages and planner feedback. Untouched
+noncandidate producers retain their existing behavior for a later bounded
+packet; no tree-wide privacy closure is claimed.
+
+Pure plugin selection in `tools/_common.py` delegates policy classification to
+the existing request availability view in `catalog/policy_view.py`. The shared
+blob resolver propagates schema-owner failures after admission instead of
+inventing local unavailability; legacy producer families retain their separate
+schema-probe behavior. New closed codes are deliberately registered in
+`composer/error_codes.py` and receive static guidance in `tools/generation.py`.
+The source changes and canaries are in progress; focused rerun, deliberate
+broken controls and independent concrete-diff review remain pending.
+
+### Packet 1a validation chronology and current obligations
+
+HEAD remains `02e6b893f35230db544c1f277988c61b89203a54` on the target branch;
+packet 1a is uncommitted. The second serial batch exited 1 with JUnit
+`644 tests, 2 failures, 0 errors, 0 skipped`: a new authored-option positive
+omitted its contract resolver, and an old atomic case expected the raw sink
+path message intentionally replaced by static guidance. Both test fixtures were
+corrected without weakening their unchanged-state checks. The third serial
+batch, admitted after the 11:35:30 UTC host snapshot, exited 0 with JUnit
+`296 tests, 0 failures, 0 errors, 0 skipped`. It includes both direct and
+in-loop postbuilder quota refusals, genuine authored-option detail and real
+contract enrichment, non-authored server-root canaries on ordinary tool history
+and planner projection, required operation/code contracts, schema propagation,
+policy refusal, retry applicability, and reused endpoint/blob-modality codes.
+
+Final focused Ruff, mypy over all seven changed production modules and the
+contracts CLI each exited 0. The controlled source/test/config/script input
+digest before and after batch 3 is identical:
+`1d03f94439b9addc14949ad639c26d246dcb2183e881cca5638bfc6605f88e10`.
+The owning contracts workflow regenerated only the planner census, reducing
+soft occurrences from 2552 to 2544, and the two obsolete broad return-type
+whitelist entries were removed. Batch 2's affected attribute, masquerade,
+contract, error-code and error-class census gates had no failed cases. Its
+receipt remains a failed batch, not an acceptance result. Deliberate broken
+controls and independent concrete-diff review remain pending. No broad,
+PostgreSQL, native, frontend, signing, CI or release qualification is claimed.
+
+| Item | Current packet status | Remaining owner/evidence obligation |
+|---|---|---|
+| 0 | Baseline inventory complete | Keep live registry measurements separate from execution coverage. |
+| 1 | Packet 1a independently accepted within its bounded scope; local checkpoint pending | Incremental source/output/transform/blob/secret/discovery producers and dispatch remain unresolved legacy families for bounded 1b. Preserve aggregation candidate-only and splice mixed candidate/standing findings. |
+| 2 | Existing save/readiness separation retained; joined lifecycle witness pending | Real mutation → returned block and exception → exact retained revision → authenticated history/reload/UI. G3 teaching remains fixed. |
+| 3 | Model-catalog provenance teaching fixed in 0.8.6; regression closure pending | Supplied current catalog or permitted `list_models` discovery; missing facts and stale names must trigger discovery/refusal. No repeated repair authorized. |
+| 4 | Runtime explicit-choice guard exists; CSV assistance defect survives | Correct G4 assistance and measure its existing stamp/history/corpus reach in its own packet. |
+| 5 | Approved: complete scoring rubric belongs in the criterion reviewed definition; implementation pending | Include scale, anchors and meaning; preserve literal content. Systems review of exact representation and amended final rendering precedes code. |
+| 6 | Source review found no demonstrated public admission bypass; tests pending | Prefer public-versus-owned authority behavior controls over structural refactor. |
+| 7 | Existing typed `ComposerAppServices` retained; double fidelity work pending | Strict real signatures and actual context/owner/binding forwarding, not a replacement dependency container. |
+| 8 | Approved: missing/nonready claimed source ends readiness-blocked; exact interface review pending | Static wait/reselect/re-upload guidance; no automatic planner calls, wait loop or repair-exhaustion mislabel. Preserve claim-aware/fail-closed custody and review the exact adapter before code. |
+| 9 | Owning repair-debt query direction reviewed; implementation pending | `interpretation_surfacing` owns meaning; revert preserves receipt ordering, advisory precheck and under-writer rechecks. |
+| 10 | Approved: characterize compatibility, then clearly refuse both non-null source forms | Refuse singular plus empty or populated plural; preserve unambiguous valid legacy/incomplete forms and exact proposal authority. No wipe, reset or migration authorized. |
+| 11 | Local validation observability work pending | Preserve prerequisite stops, independent-component collection, changed/unchanged candidate convergence and accounting; a phase schema is not approved. |
+| 12 | Source-traced normalization gaps survive; implementation pending | Direct preflight/completion/surfacing/persistence adapters must preserve bounded refusal and completed work, without empty demand or value-bearing telemetry. |
+| 13 | Registry-based family acceptance map prepared; behavior expansion pending | Success/refusal/retry/cancel/context and privacy controls by actual effect family; no universal coverage claim. |
+| 14 | Installed/profile inventory and acceptance map prepared; qualification pending | Explicit local/live/disabled/unqualified lanes; no provider spend or #195 closure from inventory. |
+| 15 | Existing outcome carriers retained; lifecycle/UI witness pending | Keep rejected, saved-blocked, pending, validated, executable and executed distinct through reload and privacy projection. |
+| 16 | Conditional; not started | Coordinator decision after item 11 evidence; no repair credit or budget change. |
+| 17 | Conditional; not started | #246 measurements and coordinator decision; writer rechecks remain authoritative. |
+| 18 | Conditional; not started | #249 contention/fairness measurements and coordinator decision; no new admission layer inferred. |
+
+The independent source reviews identify specific later-packet obligations,
+without establishing live failures or granting new interface scope. For item
+12, `composition_completion.py` enumerates demand before normalized validation
+at its no-tool/advisor-blocked seams; `tool_batch.py` does likewise before
+pending-review preflight. Shared surfacing and prepared cohorts can raise before
+their outward validation owners. `turn_audit.py:124` computes pending sites
+before persistence payload construction; a capacity refusal can therefore
+prevent interim authoring-invalid persistence of already completed work.
+`execution/validation.py:337–361` catches broad `ValueError` while selecting a
+tolerant compiled identity, losing the capacity classification. These need
+narrow semantic adapters, preserving the upstream bound and under-writer
+rechecks, rather than empty demand, partial cards or a new tool-argument code.
+The already-normalized runtime path still exposes source component attribution;
+changing that existing public attribution is a separate compatibility decision.
+
+Item 8's current soft abstention and resolver-only context ambiguity are not a
+proved execution bypass: authoritative execution has custody/path/integrity
+guards. Item 10 already qualifies current editable checkpoints in
+`sessions/service.py` through `composer/graph_recovery.py`; it intentionally
+permits structurally representable unfinished state and dynamic plugin options,
+while exact owned proposal restoration refuses normalization drift. Preserve
+those operation meanings and decide simultaneous singular/plural source
+ambiguity explicitly before moving admission. No implementation of these later
+rows is included in packet 1a.
+
+Independent concrete-diff review then found an additional packet-1a classifier
+defect: `tools/sources.py::_header_only_inline_csv_conflict` returns a string
+for both proven matching-upload conflict and bounded parse/candidate-scan
+refusal. The candidate caller currently stamps all of them
+`inline_source_content_conflict`, whose guidance claims a proven retained-row
+conflict. Capacity refusal does not establish that fact. Packet acceptance is
+held for an owner-level typed result/classifier decision; production remains
+frozen, and message parsing is not an acceptable repair. The positive batch
+does not establish this missing semantic distinction. The planner rejection
+code docstring also needs a narrow correction: ordinary state findings retain
+the placeholder fallback, while explicit codeless candidate refusal now raises.
+
+The exact private owner correction was independently approved and implemented:
+frozen `_InlineCsvSourceRefusal` carries its required message and one of
+`inline_source_csv_inspection_failed`, `inline_source_comparison_incomplete`,
+or `inline_source_content_conflict`. The sole production caller forwards those
+facts into candidate rejection. Inspection failure and unfinished comparison
+do not imply a match. The final matching branch establishes only a larger
+ready uploaded CSV with matching headers; guidance now explicitly avoids
+claiming verified data rows. Query/read caps, custody and integrity exceptions
+are unchanged. Two new closed codes are registered; the owning code census
+names the typed forwarder. Corrected-tree checks are pending, so batch 3's
+positive receipt is prior-tree evidence, not final acceptance.
+
+The first deliberate-negative run is **invalid validation evidence**: pytest
+exited 1 with `14 tests, 12 failures, 2 errors`. Its custom setup hook requested
+fixtures before pytest's normal setup lifecycle, causing setup errors and
+leaving a prior monkeypatch active in a later wording case. The run is
+discarded; its failures are not credited as semantic controls. The ignored
+plugin now uses a normal autouse fixture so pytest owns setup/teardown. The
+rerun must show each intended assertion, an actual activation witness, zero
+setup/teardown errors and no unrelated mutant stack. It also includes nominal
+operation admission and the new inspection/comparison misclassification
+control. Production files are not mutated by these in-memory controls.
+
+Corrected-source batch 4 completed with pytest exit 1 and JUnit
+`983 tests, 5 failures, 0 errors, 1 skipped`; before/after input hashes both
+equal `5f7e80f015ff05096ad5fa6edb5c914403e8c9c4d9c27812230cbf1d7563355b`.
+All five failures were the new CSV-only assertion seeing an additional,
+correctly collected sink-path refusal from three old fixtures' non-session
+output paths. Only those fixture paths were repaired to the real session
+subtree. Exact CSV code/guidance, unchanged-state and file-read-budget
+assertions remain. Named rerun and paired negative controls are pending;
+the whole 983-case run is not reported as passing. The affected whole-tree
+gates in it have no failed cases; production is unchanged by the fixture repair.
+
+Root's corrected-production keyless scan exited 1 with the standing corpus,
+3275 baseline findings versus 3274 current findings. Positional fingerprints
+show 78 added and 79 removed; root's controlled AST owner/code/rule/message
+comparison shows zero added and one removed finding at the argument projector.
+These are keyless diagnostic comparisons, not HMAC/signature clearance or
+release approval. The coordinator confirmed that approved requirements for
+items 5, 8 and 10 are settled. The later relay explicitly approved the current
+table's complete criterion-owned rubric, terminal unavailable-source readiness
+outcome and dual-non-null source refusal after characterization; earlier pending
+representation/completion/mixed-source requests are superseded. Packet 1a does
+not implement those choices. Exact interface/representation review still
+precedes those packets. If a material core conflict requires choosing a clean
+versus compatible design, show both designs and any wipe impact for a separate
+John decision; no wipe/reset/migration is authorized by default. Items 16–18
+remain conditional.
+
+Batch 4's session database authority inventory case is an inherited expected
+failure, represented as the single skipped JUnit case. It is **not a passing
+authority-inventory gate**. Root verified the baseline already calls
+`pytest.xfail` at that inventory check; source-inventory churn and this limit
+remain separate from the passing behavioral cases. No broad tooling repair is
+included in packet 1a.
+
+The isolated fixture rerun (batch 5, serial slot measured at 12:01:00 UTC)
+exited 0 with JUnit `98 tests, 0 failures, 0 errors, 0 skipped`. It includes
+all repaired CSV cases, their nonconflict/integrity siblings and the unchanged
+positive controls paired with the planned mutants, including real authored
+option detail and both quota paths. Before/after bounded input hashes are
+identical: `44a49852dd1162b8cd84069b26ce75337f0bc7fd704138f41ef487cbb984f1a8`.
+Only three test fixture paths differ from batch 4; production and its successful
+static checks/keyless comparison are unchanged. This focused rerun closes the
+five diagnosed fixture failures; it is not a rerun of the whole 983-case batch.
+The repaired deliberate-negative harness and independent evidence review remain
+pending.
+
+The repaired negative run (serial slot measured at 12:05:58 UTC) completed with
+pytest exit 1 as intended: JUnit `19 tests, 19 assertion failures, 0 errors,
+0 skipped`. Every case records its actual activated mutation; all eight
+families are detected: candidate/saved scope, required code, nominal operation
+admission, ordinary raw path message, planner raw detail, admitted schema
+failure masking, unsupported withheld impossibility wording and CSV refusal
+misclassification. The matched-at-budget case was not mutated into an invalid
+precondition. Unchanged paired cases passed in batch 5. Before/after inputs
+remain `44a49852dd1162b8cd84069b26ce75337f0bc7fd704138f41ef487cbb984f1a8`;
+independent review verified the intended assertions and absence of fixture
+errors or leaked patches. The discarded first negative run remains invalid.
+
+The expected-failure authority inventory also contained this packet's own
+moved read identity. Independent review required an honest bounded refresh:
+only `_header_only_inline_csv_conflict`'s reviewed read fingerprint and line
+changed to the live `cb9dd966393cab1d`, line 1750. Path, symbol, operation,
+table, ordinal, absent mutation authority, nonescape status and all other
+manifest/policy entries are preserved. The SELECT/query/read caps are unchanged.
+Focused controls now require the live owner to subtract exactly and inject
+real blob deletion or connection forwarding into an AST copy, requiring actual
+DML/escape detection rather than relying on fingerprint movement alone.
+The first focused read-binding/catalogue batch exited 1 with JUnit `37 tests,
+1 failure, 0 errors, 0 skipped`; input hashes both equal
+`59f27e5528e433388aad22c1b9867151378ada9db4b6733b5636ab4918a0da14`.
+The live owner subtraction, actual copied-helper DML/escape detection and
+existing catalogue controls passed except the all-record noisy-code lookup.
+The inherited global expected failure is not repaired or claimed green by
+this refresh.
+
+Controlled calls through the real public `explain_validation_error` tool
+identified the exact failure: canonical `BLOB_QUOTA_EXCEEDED` has correct exact
+guidance, but `LOG BLOB_QUOTA_EXCEEDED END` returned generic no-match help with
+no `error_code`. It did not match a legacy prose pattern. The fuzzy route
+lowercased only the input while comparing the canonical uppercase code.
+Independent review approved only lowercasing that comparison operand; emitted
+canonical code, exact index, registry iteration and legacy prose precedence
+are preserved. The existing all-record assertion remains unchanged, with an
+explicit uppercase-canonical noisy positive and an actual old-predicate
+negative control added. Batch 6, admitted after the 12:29:11 UTC host snapshot,
+exited 0 with JUnit `40 tests, 0 failures, 0 errors, 0 skipped`: the full catalogue
+file, all three explicit noisy casing variants, exact owner read admission,
+actual copied DML/escape rejection and selected existing generic/blob controls
+passed. Before/after bounded inputs both equal
+`97ad2ce9e7efc31a0262759860ca4595de72213cb5a39cd64eecdc893b248f98`.
+Final Ruff, seven-file mypy and contracts each exited 0. The old-predicate
+negative, admitted after the 12:31:18 UTC snapshot, exited 1 as intended:
+JUnit `3 tests, 3 assertion failures, 0 errors, 0 skipped`. An AST copy of the
+actual handler reverted exactly the comparison operand and was installed at
+the public dispatch handler. All three casing cases record the actual generic
+no-match response, pass exact-lookup assertions and fail only the intended
+noisy-result `error_code` assertion. Inputs after this control retain the same
+batch-6 hash above. No source, test or config changes occurred during either
+run. Root's final frozen-production keyless scan exited 1 with the expected
+standing corpus: 3274 findings versus baseline 3275. Every full final finding
+record equals the prior reviewed scan; controlled equality and mutated-fingerprint
+checks passed. The reviewed semantic delta remains zero added and one removed
+obsolete argument assertion; positional identity remains 78 added and 79 removed.
+This is keyless drift evidence, not operator signing clearance. Independent
+Astra review accepts bounded packet 1a with no remaining blocking findings.
+Root-owned staging/commit/integration remain pending. The implementation worker
+has stopped all edits; later plan and priority patches remain outside packet 1a.
+
+### Priority audit remediation under separate owners
+
+These four findings are tracked here to preserve the current integration order.
+They do not expand this implementation worker's packet 1a. Root integrates
+only accepted owner commits from their separate worktrees; no patch is accepted
+or integrated yet and deployed behavior is unverified.
+
+| Finding | Current evidence and status | Owner and boundary |
+| --- | --- | --- |
+| Q1 (P1): configured container token-policy provisioning missing | The quota audit and independent Astra review confirmed the source on main `9d7735c` and the .6 baseline `02e6b893f35230db544c1f277988c61b89203a54`. Initial audit had no test execution; bounded remediation is now testing. | Quota owner, worktree `38f0`; separate Sol implementation and independent Astra/systems review. |
+| Q2 (P2): autotitle hidden SDK retries | Same two source baselines confirmed. The owner's offline physical-transport negative returned synthetic 503 and observed two actual HTTP requests under one admission, versus the required one. Repair testing is pending. A separate required-custody stall is being investigated; it is not an accepted third product defect or passing result. | Same quota owner and bounded retry-policy remediation; no shared-link or packet-1b work. |
+| SL1: malformed shared fragment routes to recipient workspace | Offline probes reported 13 selected passes and six pre-stream controls; replay on the pre-stream version reproduced the bad routing, so PR #281 is not established as its origin. Permanent regression tests are red as expected before repair. | Shared-link owner, worktree `fcee`; John explicitly approved .7 fixes with tests and independent review. |
+| SL2: failed private sender link loses hash and bootstrap resumes recipient graph | The pre-stream replay also reproduced this bad behavior. Valid generated-share substitution was not reproduced and streaming causation is not established. Independent security/correctness and systems reviews are underway; normal root-URL SSO autoresume requires a passing positive control. Vitest command-line failures are not product test results. | Same shared-link owner, two confirmed routing corrections only; accepted handoff/root integration pending. |
+
+The quota continuation permits optional container storage while identity limits
+remain mandatory, preserving explicit numeric values. Serialized create-or-verify
+must refuse conflicting or ambiguous active container policies. Automatic policy
+replacement, removal on absent configuration, activation of container-storage
+configuration and replica-precedence changes are excluded. The quota owner may
+develop and test a preserving compatibility-conversion proposal only on isolated
+test stores under repository rules. Systems and Astra review cover the singleton,
+readers, constraints and Sessions epoch; root coordinates the final epoch against
+the integrated tree. No user-store migration or reset is authorized. Title-retry
+acceptance remains independent, and the full quota re-audit waits for integration.
+
+Items 16–18 remain conditional. No .6 suite, quota implementation, shared-link
+implementation, migration or deployment work is authorized in this packet.

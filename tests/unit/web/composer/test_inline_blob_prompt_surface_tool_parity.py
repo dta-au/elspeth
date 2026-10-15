@@ -179,6 +179,7 @@ def test_authoring_tool_refuses_llm_authored_blob_marker_in_llm_prompt_surface(
     )
     if tool == "set_pipeline":
         assert error.rejected_component == f"node:{node_id}"
+        assert error.error_code == "llm_authored_inline_blob_content"
     assert "Prompt {{ row.x }}" not in error.message
 
 

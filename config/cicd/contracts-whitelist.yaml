@@ -825,8 +825,6 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/pipeline_planner.py:planner_terminal_tool_definition:return"
   - "src/elspeth/web/composer/pipeline_planner.py:planner_tool_definitions:return (list)"
   - "src/elspeth/web/composer/pipeline_planner.py:_assistant_tool_calls_message:return"
-  - "src/elspeth/web/composer/pipeline_planner.py:_allowlisted_candidate_feedback:return"
-  - "src/elspeth/web/composer/pipeline_planner.py:_canonical_schema_feedback:return"
   # The provider-authored pipeline is open JSON until the canonical
   # SetPipelineArgumentsModel validates it. This helper only rejects and
   # reports invalid structure; it never rewrites the candidate.

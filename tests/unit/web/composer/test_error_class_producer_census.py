@@ -41,10 +41,10 @@ _COMPOSER = Path(__file__).resolve().parents[4] / "src" / "elspeth" / "web" / "c
 # Planner-facing labels and redaction echoes that are not audit ``error_class``
 # fields, keyed by (file under web/composer, enclosing function, label).
 _OUT_OF_SCOPE: dict[tuple[str, str, str], str] = {
-    ("pipeline_planner.py", "_allowlisted_candidate_feedback", "ValidationError"): (
+    ("pipeline_planner.py", "_compile_candidate_feedback", "ValidationError"): (
         "planner feedback entry label for a closed validation code; sent to the planner, never an audit field"
     ),
-    ("pipeline_planner.py", "_canonical_schema_feedback", "SchemaValidationError"): (
+    ("pipeline_planner.py", "_compile_planner_feedback", "SchemaValidationError"): (
         "planner feedback entry label for a canonical-schema rejection; sent to the planner, never an audit field"
     ),
     ("provider_discovery_response.py", "to_wire", "ToolArgumentError"): (

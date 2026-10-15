@@ -1442,9 +1442,9 @@ def _stamped_identity(call: ast.Call) -> tuple[str, str] | None:
 def _resolved_before(function: ast.FunctionDef, lineno: int) -> set[tuple[str, str]]:
     """Every ``(kind, name expression)`` the function resolves through the policy view above ``lineno``.
 
-    Two resolution idioms exist: ``_validate_plugin_name(context, <kind>,
-    <name>)`` (rejecting on its violation) and the blob binders' guarded
-    ``context.catalog.get_schema(<kind>, <name>)``. Both go through
+    Selection uses ``_plugin_selection_violation`` or the legacy
+    ``_validate_plugin_name`` (rejecting on its violation); schema admission
+    uses ``context.catalog.get_schema(<kind>, <name>)``. All go through
     ``ToolContext.catalog`` — the request's ``PolicyCatalogView`` — which is
     the only authority ``_failure_result``'s contract admits.
     """
@@ -1452,7 +1452,11 @@ def _resolved_before(function: ast.FunctionDef, lineno: int) -> set[tuple[str, s
     for node in ast.walk(function):
         if not isinstance(node, ast.Call) or node.lineno >= lineno:
             continue
-        if isinstance(node.func, ast.Name) and node.func.id == "_validate_plugin_name" and len(node.args) == 3:
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in {"_validate_plugin_name", "_plugin_selection_violation"}
+            and len(node.args) == 3
+        ):
             kind, name = node.args[1], node.args[2]
         elif (
             isinstance(node.func, ast.Attribute)
@@ -1466,6 +1470,19 @@ def _resolved_before(function: ast.FunctionDef, lineno: int) -> set[tuple[str, s
         if isinstance(kind, ast.Constant) and isinstance(kind.value, str):
             resolved.add((kind.value, ast.unparse(name)))
     return resolved
+
+
+@pytest.mark.parametrize("helper", ["_validate_plugin_name", "_plugin_selection_violation"])
+def test_policy_resolution_instrument_pins_identity_and_order(helper: str) -> None:
+    function = ast.parse(
+        f"def f(context, plugin, other):\n    {helper}(context, 'source', plugin)\n    marker()\n    {helper}(context, 'sink', other)\n"
+    ).body[0]
+    assert isinstance(function, ast.FunctionDef)
+    resolved = _resolved_before(function, 3)
+    assert ("source", "plugin") in resolved
+    assert ("source", "other") not in resolved
+    assert ("sink", "other") not in resolved
+    assert _resolved_before(function, 2) == set()
 
 
 def test_every_stamped_plugin_identity_was_resolved_through_the_policy_view_first() -> None:

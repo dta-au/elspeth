@@ -1691,6 +1691,115 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "on acknowledgement. A rejected replacement is not the current saved graph: retain the requested "
         "input binding and evaluation transforms when repairing it.",
     ),
+    DirectValidationGuidance(
+        "source_binding_ambiguous",
+        "The candidate supplies competing source bindings. No replacement was applied.",
+        "Keep the intended input and supply exactly one source or named sources map. For a blob-backed source, choose "
+        "either an existing blob_id or new inline_blob content, never both.",
+    ),
+    DirectValidationGuidance(
+        "source_path_policy_invalid",
+        "The source path is outside this session's permitted input locations. The candidate was not applied.",
+        "Keep the intended input artifact and use its canonical authenticated blob binding, or preserve an approved "
+        "existing source binding. Do not invent an absolute host directory or replace the input with empty data.",
+    ),
+    DirectValidationGuidance(
+        "sink_path_policy_invalid",
+        "The sink destination is outside this session's permitted output locations. The candidate was not applied.",
+        "Use a relative destination under outputs/ for the current session. Preserve the sink's purpose, output format "
+        "and explicit failure policy; do not guess a server filesystem root.",
+    ),
+    DirectValidationGuidance(
+        "provider_config_path_policy_invalid",
+        "A transform's local provider path is outside this session's permitted storage locations.",
+        "Use a session-local relative path under outputs/ for the provider's local store, or the supported authenticated "
+        "blob binding where applicable. Keep the transform's purpose and do not guess an absolute server directory.",
+    ),
+    DirectValidationGuidance(
+        "aws_s3_endpoint_url_not_allowed",
+        "The Web Composer does not permit an authored AWS S3 endpoint override.",
+        "Remove endpoint_url from the source or sink options and retain the intended authorized S3 location. Use the "
+        "deployment's served profile or supported AWS binding rather than supplying a replacement endpoint.",
+    ),
+    DirectValidationGuidance(
+        "llm_authored_inline_blob_content",
+        "LLM-authored blob content cannot replace the reviewable text or model selection of an LLM node.",
+        "Author the reviewable prompt text or served model/profile binding through its declared options and review "
+        "requirements. Use user-uploaded content only through a supported inline-reference surface; do not change blob provenance.",
+    ),
+    DirectValidationGuidance(
+        "llm_retry_budget_policy",
+        "A sequential multi-query LLM transform must use a bounded local capacity-retry budget allowed by Web policy.",
+        "Keep the intended queries and set max_capacity_retry_seconds to a positive value no greater than 30 seconds, "
+        "or use pool_size > 1 for pooled retry handling. Operator-profiled nodes use the profile's supplied retry configuration. Do not change "
+        "planner repair budgets or invent additional attempts to bypass this policy.",
+    ),
+    DirectValidationGuidance(
+        "source_binding_context_unavailable",
+        "The source binding requires session or storage context that this operation did not receive. No candidate was saved.",
+        "Retain the intended candidate and source artifact. Report the missing session/storage context and retry only "
+        "through a surface that supplies it; do not replace the source with invented empty data.",
+    ),
+    DirectValidationGuidance(
+        "inline_source_csv_inspection_failed",
+        "The inline CSV could not be inspected within the bounded CSV grammar and size limits. No uploaded-file conflict was established.",
+        "Keep the intended input content. Correct malformed CSV or use the supported uploaded-file binding for input "
+        "that exceeds inline inspection limits; do not silently truncate rows or assume that matching uploaded data exists.",
+    ),
+    DirectValidationGuidance(
+        "inline_source_comparison_incomplete",
+        "The ready uploaded CSV candidate scan exceeded its fixed limit, so the inline-source comparison did not finish.",
+        "Identify the intended input through list_blobs and bind its exact source.blob_id or use set_source_from_blob. "
+        "Keep the intended artifact; an incomplete comparison does not prove a matching upload or a content conflict.",
+    ),
+    DirectValidationGuidance(
+        "inline_source_content_conflict",
+        "The inline source contains only headers and a larger ready uploaded CSV has matching headers. Its data rows were not verified by this check.",
+        "Inspect the intended complete input artifact and bind its ready uploaded blob when appropriate, or re-supply "
+        "all intended literal rows. Do not replace the intended data with column names or infer verified rows from this header comparison.",
+    ),
+    DirectValidationGuidance(
+        "credential_literal_forbidden",
+        "Candidate options contain literal credential material. The literal values were not stored.",
+        "Discover an authorized secret reference and replace each named credential field with its inline secret_ref "
+        "marker in the rejected call. Do not echo credential values or rebuild unrelated pipeline components.",
+    ),
+    DirectValidationGuidance(
+        "BLOB_QUOTA_EXCEEDED",
+        "The inline source could not acquire blob storage within this session's quota. The replacement was not applied.",
+        "Retain the intended source data. Reuse an appropriate ready artifact or resolve the session storage limit before "
+        "retrying; do not silently drop rows to make the artifact smaller.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_identity_invalid",
+        "The source binding does not name a valid canonical blob identifier.",
+        "Use the exact blob_id returned by authenticated blob discovery for the intended source artifact; do not invent "
+        "or reconstruct an identifier from a filename or storage path.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_unavailable",
+        "The source artifact is missing, not ready, or has unavailable stored bytes.",
+        "Inspect the intended artifact's current readiness through authenticated blob discovery. Keep the requested "
+        "binding and resolve its availability before retrying; do not fabricate a replacement or assume an empty input.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_plugin_required",
+        "The artifact's MIME type does not determine a supported source plugin.",
+        "Choose an explicit source plugin from the served catalog whose input format matches the intended artifact, "
+        "then retry the same binding with that plugin and its declared options.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_changed",
+        "The artifact changed while its source binding was being checked. The attempted binding was not applied.",
+        "Re-read the intended artifact's current metadata and content evidence, then retry the binding against that "
+        "version. Do not keep a stale hash or change unrelated graph structure.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_encoding_invalid",
+        "The selected source artifact is not valid UTF-8 text for this binding.",
+        "Use an artifact with the source plugin's supported encoding and format, preserving the intended data. Do not "
+        "silently coerce bytes or discard undecodable content.",
+    ),
     *_direct_plugin_policy_guidance(),
 )
 
@@ -1893,8 +2002,9 @@ _WITHHELD_VALIDATION_GUIDANCE: Final[tuple[str, str]] = (
     "Do not guess at the withheld configuration — you cannot see or edit it. Re-verify only the "
     "components you authored yourself: call get_plugin_schema(<plugin_type>, <plugin_name>) for "
     "the exact option shapes and allowed values, and change only fields the other errors name. "
-    "If this exact rejection set repeats, a near-identical candidate cannot succeed: restructure "
-    "the pipeline, or decline honestly.",
+    "If visible rejection classifiers repeat, compare the fields you changed: matching classifiers alone do not "
+    "prove the cause is unchanged or that repair is impossible. When necessary facts remain withheld, explain that "
+    "limitation and ask for the smallest actionable input rather than guessing.",
 )
 
 
@@ -1979,7 +2089,7 @@ def _execute_explain_validation_error(
     # an upper-cased code echoed from a log line.
     lowered = error_text.lower()
     for code in _CLOSED_VALIDATION_ERROR_CODES:
-        if code in lowered:
+        if code.lower() in lowered:
             guidance = explain_validation_code(code)
             if guidance is None:  # pragma: no cover — catalogue invariant is test-pinned
                 continue
