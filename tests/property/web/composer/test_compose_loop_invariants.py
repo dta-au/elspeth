@@ -638,10 +638,9 @@ def _drive_single_example_trace_with(
         from litellm import AuthenticationError
 
         from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
-        from elspeth.web.validation import _redact_sensitive_content
 
         assert kwargs["model"] == harness.service._settings.composer_advisor_model
-        assert len(reviews) < 2, "Only two nonretryable END SDK refusals are supplied per trace"
+        assert len(reviews) < 1, "Only one nonretryable END SDK refusal is supplied per trace"
         assert "tools" not in kwargs and kwargs["num_retries"] == kwargs["max_retries"] == 0
         assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
         payload = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
@@ -650,7 +649,7 @@ def _drive_single_example_trace_with(
         states = _state_rows(harness)
         assert review["saved_effects"]["saved_revision_count"] == len(states)
         if states:
-            assert review["saved_effects"]["latest_committed_state_id"] == _redact_sensitive_content(states[-1].id)
+            assert review["saved_effects"]["latest_committed_state_id"] == states[-1].id
         reviews.append(review)
         raise AuthenticationError(message="property fixture advisor unavailable", llm_provider="anthropic", model=kwargs["model"])
 
@@ -680,8 +679,7 @@ def _drive_single_example_trace_with(
                 )
             )
     if harness.completed_results:
-        assert not cancelled and len(harness.completed_results) == 1 and len(reviews) == 2
-        assert reviews[0] == reviews[1], "Both unavailable attempts review the same current candidate/effects"
+        assert not cancelled and len(harness.completed_results) == 1 and len(reviews) == 1
         _assert_completed_trace_ledger(harness, harness.completed_results[0], reviews[0])
     else:
         assert reviews == [], "Cancellation or failed atomic persistence must prevent END dispatch"
@@ -716,11 +714,11 @@ def _assert_completed_trace_ledger(harness: _Harness, result: ComposeLoopTestRes
     if prior:
         assert prior[0].content == "prior"
     cohort = rows[len(prior) :]
-    assert [row.role for row in cohort] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit", "audit"]
+    assert [row.role for row in cohort] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit"]
     _assert_private_tool_cohort(cohort[:3], harness.compose_context.fence.operation_id, harness.compose_context.fence.operation_epoch)
     assert cohort[1].composition_state_id == cohort[2].composition_state_id
     assert all(row.session_id == harness.session_id for row in cohort)
-    pass_rows = cohort[3:5]
+    pass_rows = cohort[3:4]
     for index, row in enumerate(pass_rows, 1):
         envelope = {
             "_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND,
@@ -744,10 +742,10 @@ def _assert_completed_trace_ledger(harness: _Harness, result: ComposeLoopTestRes
             },
         }
         assert json.loads(row.tool_calls) == [envelope] and json.loads(row.content) == envelope
-    assert cohort[5].content == "Done."
-    assert json.loads(cohort[5].tool_calls) == [withheld_reply_envelope("advisor_publication_withheld", "Done.")]
-    assert cohort[6].content == advisor_policy.ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
-    assert json.loads(cohort[6].tool_calls) == [advisor_signoff_withheld_control_envelope(cohort[6].content)]
+    assert cohort[4].content == "Done."
+    assert json.loads(cohort[4].tool_calls) == [withheld_reply_envelope("advisor_publication_withheld", "Done.")]
+    assert cohort[5].content == advisor_policy.ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
+    assert json.loads(cohort[5].tool_calls) == [advisor_signoff_withheld_control_envelope(cohort[5].content)]
     terminal = {
         "_kind": ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND,
         "publication": {
@@ -757,7 +755,7 @@ def _assert_completed_trace_ledger(harness: _Harness, result: ComposeLoopTestRes
             "findings_backend_authored": False,
         },
     }
-    assert json.loads(cohort[7].tool_calls) == [terminal] and json.loads(cohort[7].content) == terminal
+    assert json.loads(cohort[6].tool_calls) == [terminal] and json.loads(cohort[6].content) == terminal
     states = _state_rows(harness)
     assert all(state.provenance == "tool_call" for state in states)
     assert {state.id for state in states} == ({cohort[1].composition_state_id} if cohort[1].composition_state_id else set())
@@ -993,7 +991,7 @@ def test_compose_loop_audit_machine_examples(cancellation_arrival_time: Cancella
         "after_response_yielded",
     }:
         if cancellation_arrival_time == "after_response_yielded":
-            assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit", "audit"]
+            assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit"]
             assert len(outcome.state_rows) == 1 and outcome.state_rows[0].id == outcome.rows[1].composition_state_id
         else:
             assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit"]

@@ -4346,8 +4346,8 @@ class TestComposeTimeout:
         checkpoint_persist.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_end_advisor_generic_api_error_with_outage_name_remains_malformed(self) -> None:
-        """An SDK subclass name cannot override the generic APIError disposition."""
+    async def test_end_advisor_generic_api_error_with_outage_name_reports_unavailable(self) -> None:
+        """A provider API failure establishes unavailability, without response evidence."""
         service, _ = _composer_service_with_session(_mock_catalog(), _make_settings())
         named_generic_api_error = type("ServiceUnavailableError", (LiteLLMAPIError,), {})
         failure = named_generic_api_error(status_code=503, message="provider secret", llm_provider="test", model="test/advisor")
@@ -4357,8 +4357,8 @@ class TestComposeTimeout:
                 service._advisor_checkpoint, phase="end", state=_empty_state(), session_id=None, recorder=None
             )
 
-        assert verdict.failure_class == "malformed"
-        assert verdict.findings_text == "advisor response was malformed"
+        assert verdict.failure_class == "unavailable"
+        assert verdict.findings_text == "advisor model was unavailable"
         assert "provider secret" not in repr(verdict)
 
     @pytest.mark.asyncio

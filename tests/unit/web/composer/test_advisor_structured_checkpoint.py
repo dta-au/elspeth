@@ -59,7 +59,7 @@ async def test_unavailable_public_detail_does_not_invent_a_retry(make_service, s
 
 
 @pytest.mark.asyncio
-async def test_nonretryable_malformed_failure_does_not_invent_a_format_retry(make_service, simple_state):
+async def test_nonretryable_provider_failure_does_not_invent_a_format_retry(make_service, simple_state):
     from litellm.exceptions import BadGatewayError
 
     from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
@@ -79,11 +79,11 @@ async def test_nonretryable_malformed_failure_does_not_invent_a_format_retry(mak
         phase="end", state=simple_state, recorder=None, **_fenced_session(service)
     )
     assert physical_calls == 1
-    assert verdict.failure_class == "malformed"
+    assert verdict.failure_class == "unavailable"
     record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
     assert record["provider_attempts"] == 1
     assert record["format_reprompt_sent"] is False
-    detail, suggestion = advisor_signoff_blocked_wording(reason="malformed", findings=verdict.findings_text)
+    detail, suggestion = advisor_signoff_blocked_wording(reason="unavailable", findings=verdict.findings_text)
     assert "after a format retry" not in suggestion
     assert "private-malformed-marker" not in detail + suggestion
 

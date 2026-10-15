@@ -1381,7 +1381,6 @@ def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
     from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
     from elspeth.web.sessions.routes._helpers import _composer_chat_history
-    from elspeth.web.validation import _redact_sensitive_content
 
     reviews = _observe_publication_reviews(monkeypatch)
     planner_completion = _marker_decline_completion()
@@ -1492,7 +1491,7 @@ def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message
     assert passes[0]["verdict"] == "clean" and passes[0]["publication_verdict"] == publication_verdict
     assert passes[0]["provider_attempts"] == 1 and passes[0]["first_attempt_accepted"] is True
     assert passes[0]["publication_binding"] in {
-        review.binding for review in reviews if json.loads(_redact_sensitive_content(review.payload_json)) == reviewed_payloads[0]
+        review.binding for review in reviews if json.loads(review.provider_payload_json) == reviewed_payloads[0]
     }
 
 
@@ -1615,7 +1614,6 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
     )
     from elspeth.web.sessions.pending_interpretation import _interpretation_hash_domain_v2
     from elspeth.web.sessions.protocol import CompositionStateData
-    from elspeth.web.validation import _redact_sensitive_content
 
     # This test scripts only the physical planner SDK boundary. No provider
     # bootstrap, credential discovery, socket connect, or row execution is
@@ -2089,7 +2087,7 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
     assert passes[0]["verdict"] == "flagged" and passes[0]["publication_verdict"] == "ADMIT"
     assert passes[0]["provider_attempts"] == 1 and passes[0]["first_attempt_accepted"] is True
     assert passes[0]["publication_binding"] in {
-        review.binding for review in reviews if json.loads(_redact_sensitive_content(review.payload_json)) == end_payloads[0]
+        review.binding for review in reviews if json.loads(review.provider_payload_json) == end_payloads[0]
     }
     with engine.connect() as conn:
         operation = (

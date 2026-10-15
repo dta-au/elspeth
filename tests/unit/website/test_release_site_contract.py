@@ -70,7 +70,10 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     assert "no migration,\nreset, restamping or downgrade" in current_release
     assert "Composer correctness and recovery" in current_release
     assert "Reply admission does not clear graph" in current_release
-    assert "0.8.6 container publication is not authorized" in current_release
+    assert "Automatic image publication from main remains held" in " ".join(current_release.split())
+    assert "The 0.8.6 tag and container publication follow successful required checks and the protected merge" in " ".join(
+        current_release.split()
+    )
     assert "LLM compatibility and Composer recovery" in release_085
     assert "Omitted LLM temperature uses the provider default" in release_085
     assert "Session epoch 72 adds durable Composer jobs" in release_084
