@@ -4,7 +4,7 @@
 (`MANIFEST` in `src/elspeth/web/composer/redaction.py`) or the policy
 snapshot (`tests/unit/web/composer/redaction_policy_snapshot.json`).
 
-**Status.** Current as of spec rev-5 rev-2 iteration (2026-05-12).
+**Status.** Checked against the current direction checker on 2026-10-15.
 The authoritative control definition now lives in the redaction `MANIFEST` and
 its policy snapshot tests. Historical spec and review context are preserved in
 git history or maintainer-local archives; generated reviewer sidecars are not
@@ -18,7 +18,8 @@ Any PR that modifies:
 
 - `src/elspeth/web/composer/redaction.py` (manifest entries, summarizers,
   `MANIFEST` dict)
-- `src/elspeth/web/composer/tools.py` (promoted handler argument models)
+- `src/elspeth/web/composer/redaction_telemetry.py`
+- `src/elspeth/web/composer/tools/` (promoted handler argument models)
 - `tests/unit/web/composer/redaction_policy_snapshot.json`
 - `tests/unit/web/composer/test_adequacy_guard.py`
 - `tests/unit/web/composer/test_walk_model_schema.py`
@@ -39,10 +40,12 @@ redaction-sensitive files changed.
 SHA-256 hash per manifest entry. The `test_adequacy_guard.py` test
 module asserts the live manifest's hashes match the committed file.
 
-Any change to a manifest entry — `Sensitive[T]` annotation removed,
-declarative key set narrowed, summarizer replaced, structured reason
-rewritten — flips the entry's hash. This change must be committed to
-the snapshot file before CI goes green.
+Changes to the hashed schema walk, declarative key sets, summarizer key sets
+or structured reason text flip the entry's hash. Commit the corresponding
+snapshot change before CI goes green. Declarative summarizer callable bodies
+are not hashed: changing a callable without changing its registered keys
+requires direct behavior review and tests, even if the snapshot stays equal.
+The shared implementation is `tests/unit/web/composer/_adequacy_helpers.py`.
 
 Preview the snapshot after editing the manifest:
 
@@ -59,20 +62,29 @@ Regenerate the snapshot after reviewing the dry-run output:
 ### 2. Direction-aware label-gate CI step
 
 The `composer-redaction-gate` CI workflow performs its **direction-aware** check
-when the snapshot file changes on a PR:
+when the snapshot file changes on a PR. The implementation is
+`scripts/cicd/check_redaction_direction.py`:
 
-- Computes the `sensitive_path_count` per manifest entry (the number of
-  `Sensitive`-annotated field paths as enumerated by `walk_model_schema`)
-  in both the PR-head snapshot and the `main` snapshot.
-- If the total count across changed entries **decreased** (a weakening):
-  the PR MUST carry the `policy-weaken-justified` label. Using
-  `policy-strengthen` on a weakening diff fails CI.
-- If the total count **increased or stayed the same** with a hash change
-  (a strengthening or neutral semantic shift): the PR MUST carry the
-  `policy-strengthen` label. Using `policy-weaken-justified` on a
-  strengthening diff fails CI with the message "snapshot diff shows no
-  coverage reduction; do not use `policy-weaken-justified` for this
-  change."
+- Compares every changed manifest entry in the PR-head snapshot with the
+  pull request's base-branch snapshot. Type-driven entries count
+  `Sensitive`-annotated paths from `walk_model_schema`; declarative entries
+  count sensitive argument keys plus sensitive response keys.
+- If **any entry's count decreases**, the direction is `weaken`. An
+  unrelated entry's increase cannot offset that decrease: aggregate totals
+  are diagnostic only.
+- An existing entry that changes while keeping the **same nonzero count**
+  also yields `weaken`. Snapshot hashes do not identify individual paths, so
+  an equal-count change could replace sensitive coverage. This conservative
+  routing also applies to editorial or summarizer changes on such entries.
+- Otherwise the direction is `strengthen`. A changed entry with zero paths
+  on both sides therefore takes this default direction.
+- A `weaken` result requires `policy-weaken-justified` and the rationale
+  section below; a `strengthen` result requires `policy-strengthen`.
+  `scripts/cicd/assert_redaction_label.py` rejects the opposite label.
+
+These direction names route review. A `weaken` result can reflect uncertainty
+about a same-count change; a `strengthen` result does not establish that the
+new semantics protect sensitive content. Review the actual diff in either case.
 
 ### 3. Adequacy guard (CI-time, five assertions)
 
@@ -101,9 +113,15 @@ pytest gate and asserts:
 | Added a new `sensitive_argument_key` | `policy-strengthen` |
 | Removed a `Sensitive()` annotation | `policy-weaken-justified` |
 | Removed a `sensitive_argument_key` | `policy-weaken-justified` |
-| Broadened `sensitive_response_keys` to include previously-redacted keys | depends on net count change |
-| Replaced a summarizer with a more informative one (same coverage) | `policy-strengthen` (hash flips) |
-| Editorial change to `HandlesNoSensitiveDataReason` text only | `policy-strengthen` (hash flips via text hash) |
+| Replaced sensitive keys or paths at the same nonzero count | `policy-weaken-justified` |
+| Summarizer change that changes the snapshot hash at the same nonzero count | `policy-weaken-justified` (conservative routing) |
+| Editorial hash change on an entry with the same nonzero count | `policy-weaken-justified` (conservative routing) |
+| Editorial change to a zero-path `HandlesNoSensitiveDataReason` entry | `policy-strengthen` |
+
+The table assumes no other changed entry requires `weaken`. Any per-entry
+decrease or same-nonzero-count change determines the direction for the PR.
+Callable-only edits that leave the snapshot unchanged do not trigger this
+label gate; they still require the behavior review described above.
 
 When using `policy-weaken-justified`, the PR body MUST include a section
 headed exactly:
@@ -124,9 +142,15 @@ A label is a routing signal; the rationale is the substantive control.
 The CI gate cannot inspect the *content* of the rationale section — that
 is the auditor's job. A complete rationale answers all of the following:
 
-1. **What was weakened, and how?** Name the manifest entry or entries
-   and the specific path(s) removed or replaced. Quote the
-   `sensitive_path_count` before and after.
+For conservative same-count routing without an actual coverage reduction,
+explain why the snapshot changed and show that the sensitive paths remain
+covered. Do not describe a semantic weakening that did not occur. The
+weakening-specific questions and acknowledgement below apply when coverage
+actually changes; the required section heading and routing label stay the same.
+
+1. **What changed, and why was it routed as weakening?** Name the manifest
+   entries and any paths removed or replaced. Quote the
+   `sensitive_path_count` before and after, including equal counts.
 
 2. **Why is this weakening *safe*?** From an auditor's perspective, not
    the implementer's. The default presumption is that redaction
@@ -168,10 +192,11 @@ is the auditor's job. A complete rationale answers all of the following:
    > side-effect of refactoring. I am not relying on reviewer fatigue
    > to land it.
 
-   If the author cannot make this assertion honestly, the PR should
-   be split: refactoring in one PR with `policy-strengthen` (or no
-   redaction label if the manifest is untouched), and the weakening
-   alone in a small follow-up PR with the rationale.
+   Do not make that assertion for an editorial change routed conservatively
+   at the same nonzero count. Explain the unchanged coverage instead. If an
+   actual weakening is obscured by unrelated refactoring, split the changes
+   for review; apply the checker-derived label to each resulting PR, since
+   a refactoring-only hash change can still route as `weaken`.
 
 ---
 
@@ -219,8 +244,9 @@ merging, even when CI is green. Specifically:
 
 1. Open the snapshot diff and verify the `sensitive_path_count` deltas
    match the intent of the change.
-2. If any entry's count decreased, verify the `policy-weaken-justified`
-   label is accurate — not applied out of habit or error.
+2. If any entry's count decreased or an existing entry changed at the same
+   nonzero count, verify the `policy-weaken-justified` label and explain the
+   actual coverage change or conservative same-count routing.
 3. If the PR description includes a "Redaction policy weakening
    rationale" section, verify it accurately describes the change.
 
@@ -232,6 +258,10 @@ the label gate.
 
 ## References
 
+- `scripts/cicd/check_redaction_direction.py` — authoritative direction logic
+- `scripts/cicd/assert_redaction_label.py` — label and rationale enforcement
+- `tests/unit/web/composer/test_label_gate_direction.py` — executable controls
+- `.github/workflows/composer-redaction-gate.yml` — paths and base-branch wiring
 - Spec §4.4.5 — label-gate CI step definition and governance note
 - Spec §4.4.3 — policy-hash snapshot (hash semantics; known false-negative
   class for closure-state mutations)
