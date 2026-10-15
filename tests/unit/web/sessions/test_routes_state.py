@@ -2472,6 +2472,57 @@ sinks:
         assert await service.get_current_state(session.id) is None
 
     @pytest.mark.asyncio
+    async def test_post_state_yaml_preserves_field_mapper_data_labels(self, tmp_path) -> None:
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from tests.helpers.session_fences import fenced_operation_context
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Data field mapping", "local")
+        blobs = BlobServiceImpl(service._engine, tmp_path, session_operation_authority=service.session_operation_authority)
+        app.state.blob_service = blobs
+        with fenced_operation_context(service._engine, str(session.id), operation_kind=SessionOperationKind.CREATE) as upload_context:
+            blob = await blobs.create_blob(
+                session.id, "customers.csv", b"customer_key\nC1\n", "text/csv", session_operation_context=upload_context
+            )
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: rows
+    options:
+      path: SYNTHETIC_SOURCE_PATH
+      on_validation_failure: discard
+      schema:
+        mode: fixed
+        fields: ['customer_key: str']
+transforms:
+  - name: rename_customer
+    plugin: field_mapper
+    input: rows
+    on_success: main
+    on_error: discard
+    options:
+      mapping: {customer_key: customer_id}
+      schema: {mode: observed}
+sinks:
+  main:
+    plugin: csv
+    options:
+      path: outputs/out.csv
+      schema: {mode: observed}
+    on_write_failure: discard
+"""
+        response = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": yaml_text.replace("SYNTHETIC_SOURCE_PATH", blob.storage_path), "source_blob_ids": {"source": str(blob.id)}},
+        )
+        assert response.status_code == 200, response.text
+        current = await service.get_current_state(session.id)
+        assert current is not None
+        assert current.nodes[0]["options"]["mapping"] == {"customer_key": "customer_id"}
+
+    @pytest.mark.asyncio
     async def test_post_state_yaml_rejects_plugin_specific_credential_field(self, tmp_path) -> None:
         """Hardening (T-1 review follow-up): the fabricated-secret import gate
         must match plugin-specific credential fields, not just the name/suffix

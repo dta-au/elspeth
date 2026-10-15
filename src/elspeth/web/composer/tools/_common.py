@@ -1858,6 +1858,10 @@ def _credential_wiring_contract_failure(
     plugin_specific_fields = (
         allowed_secret_ref_fields(plugin_type, plugin_name) if plugin_type is not None and plugin_name is not None else frozenset()
     )
+    if component_type == "node" and plugin_type == "transform" and plugin_name == "field_mapper":
+        from elspeth.web.credential_guard import field_mapper_credential_options_projection
+
+        options = field_mapper_credential_options_projection(options)
     fields = tuple(
         dict.fromkeys(
             collect_credential_field_violations(

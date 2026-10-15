@@ -607,7 +607,15 @@ class _FakeComposeLLM:
         self._responses = list(responses)
         self.execute_tool_invocations = 0
 
-    async def __call__(self, _messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+    async def __call__(
+        self,
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: CompositionState | None = None,
+    ) -> _AdmittedLLMCompletion:
+        del provider_custody, credential_state
         if not self._responses:
             return _admit_composer_llm_completion(_fake_llm_response(content="Done."))
         return _admit_composer_llm_completion(self._responses.pop(0))

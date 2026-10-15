@@ -323,7 +323,9 @@ async def test_bonus_over_cap_raises_shared_cap_error_before_bonus_dispatch(
         ]
     )
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return provider_gateway._admit_composer_llm_completion(next(responses))
 
     original_execute_tool = tool_batch_module.execute_tool
@@ -369,7 +371,9 @@ async def test_bonus_exactly_at_cap_keeps_generic_composition_exhaustion(
         ]
     )
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return provider_gateway._admit_composer_llm_completion(next(responses))
 
     with pytest.raises(ComposerConvergenceError) as excinfo:

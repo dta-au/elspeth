@@ -972,11 +972,15 @@ async def run_tool_batch(
         provider_served=completion.provider_metadata.provider_served,
         surface="composer_tool_batch",
     )
+    from elspeth.web.credential_guard import credential_state_for_tool_batch
+
+    batch_credential_state = credential_state_for_tool_batch(state, tuple(call.function.name for call in assistant_tool_calls))
     for tool_call in assistant_tool_calls:
         require_no_credential_material_in_tool_wire(
             tool_call.function.name,
             tool_call.function.arguments,
             surface="composer_tool_wire",
+            credential_state=batch_credential_state,
         )
     provider_model_version = completion.provider_metadata.model_returned or ctx.provenance.model_identifier
     if (

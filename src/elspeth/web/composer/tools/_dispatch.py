@@ -906,7 +906,7 @@ def execute_tool(
             proposal revalidation seam. It is not a declared tool argument
             and must remain false for public LLM/MCP dispatch.
     """
-    require_no_credential_material_for_tool(tool_name, arguments, surface="composer_tool_arguments")
+    require_no_credential_material_for_tool(tool_name, arguments, surface="composer_tool_arguments", credential_state=state)
     if catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
 

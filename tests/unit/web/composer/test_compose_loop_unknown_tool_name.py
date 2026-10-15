@@ -314,7 +314,13 @@ class TestUnknownToolNameComposeLoopAuditShape:
                 usage={"prompt_tokens": 10, "completion_tokens": 20},
             )
 
-        async def scripted_provider(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> _AdmittedLLMCompletion:
+        async def scripted_provider(
+            messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]],
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+        ) -> _AdmittedLLMCompletion:
             # The service extends one shared message list between calls.
             # Snapshot each provider boundary before those later mutations.
             provider_messages.append(deepcopy(messages))

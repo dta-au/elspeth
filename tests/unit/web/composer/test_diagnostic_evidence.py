@@ -29,6 +29,54 @@ def build(arguments: object, *, wire: str | None = None, result: object = None, 
     )
 
 
+@pytest.mark.parametrize("tool", ("upsert_node", "splice_transform", "set_pipeline", "emit_pipeline_proposal"))
+@pytest.mark.parametrize("authoring_metadata", (False, True))
+def test_private_evidence_preserves_owned_field_mapper_labels(tool: str, authoring_metadata: bool) -> None:
+    node = {
+        "id": "rename_customer",
+        "node_type": "transform",
+        "plugin": "field_mapper",
+        "input": "rows",
+        "on_success": "output",
+        "on_error": "discard",
+        "options": {"mapping": {"customer_key": "customer_id"}, "schema": {"mode": "observed"}},
+    }
+    if authoring_metadata:
+        node["options"]["interpretation_requirements"] = [
+            {"id": "rename-review", "kind": "pipeline_decision", "user_term": "customer identifier", "status": "pending"}
+        ]
+    arguments = (
+        node
+        if tool == "upsert_node"
+        else {"node": {"plugin": "field_mapper", "options": node["options"]}}
+        if tool == "splice_transform"
+        else {"pipeline": {"nodes": [node]}}
+    )
+    evidence = build(arguments, tool=tool)
+    assert evidence.arguments.disposition == "retained"
+    assert json.loads(evidence.arguments.content) == arguments
+
+
+def test_private_field_mapper_projection_retains_credential_refusal_and_unknown_patch_filtering() -> None:
+    patch = {"node_id": "rename_customer", "patch": {"mapping": {"customer_key": "customer_id"}}}
+    evidence = build(patch, tool="patch_node_options")
+    assert evidence.arguments.disposition == "filtered"
+    assert "customer_id" not in evidence.arguments.content
+    node = {
+        "node_type": "transform",
+        "plugin": "field_mapper",
+        "options": {"mapping": {"customer_key": "customer_id"}, "schema": {"mode": "observed"}, "api_key": "low-entropy-secret"},
+    }
+    evidence = build(node, tool="upsert_node")
+    assert evidence.arguments.disposition == "filtered"
+    assert "low-entropy-secret" not in evidence.arguments.content
+    del node["options"]["api_key"]
+    node["options"]["interpretation_requirements"] = [{"draft": "sk-" + "a" * 24}]
+    evidence = build(node, tool="upsert_node")
+    assert evidence.arguments.disposition == "filtered"
+    assert "sk-" + "a" * 24 not in evidence.arguments.content
+
+
 @pytest.mark.parametrize("mismatch", ("operation", "request", "fence", "epoch"))
 def test_operation_failure_capture_rejects_other_request_or_fence(mismatch: str) -> None:
     from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind

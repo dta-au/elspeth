@@ -45,7 +45,9 @@ async def test_proposal_cap_after_a_discovery_turn_reports_turns_used_and_failed
         _text_response("Done."),
     ]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     with pytest.raises(ComposerConvergenceError) as raised:

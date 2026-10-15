@@ -3228,13 +3228,16 @@ class ComposerServiceImpl:
                 )
             try:
                 if provider_custody is None:
-                    return await self._provider_gateway._call_llm_with_audit(messages, tools, timeout=remaining, recorder=recorder)
+                    return await self._provider_gateway._call_llm_with_audit(
+                        messages, tools, timeout=remaining, recorder=recorder, credential_state=state
+                    )
                 return await self._provider_gateway._call_llm_with_audit(
                     messages,
                     tools,
                     timeout=remaining,
                     recorder=recorder,
                     provider_custody=provider_custody,
+                    credential_state=state,
                 )
             except TimeoutError:
                 raise ComposerConvergenceError.capture(

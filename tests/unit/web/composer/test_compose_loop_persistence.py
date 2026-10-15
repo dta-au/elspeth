@@ -476,6 +476,98 @@ async def _capture_tool_batch_rejection(
     return None
 
 
+@pytest.mark.parametrize("replace_identity", (False, True), ids=("stable", "replace-plugin"))
+@pytest.mark.asyncio
+async def test_field_mapper_patch_batch_uses_owned_identity_and_refuses_stale_snapshot(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    replace_identity: bool,
+) -> None:
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.sessions.converters import state_from_record
+
+    sessions = composer_service_with_real_sessions._sessions_service
+    assert sessions is not None
+    service = ComposerServiceImpl.for_trained_operator(
+        catalog=create_catalog_service(), settings=composer_service_with_real_sessions._settings, sessions_service=sessions
+    )
+    _patch_auto_commit_preferences(monkeypatch, sessions)
+    node = {
+        "id": "rename_customer",
+        "node_type": "transform",
+        "plugin": "field_mapper",
+        "input": "rows",
+        "on_success": "output",
+        "on_error": "discard",
+        "options": {"mapping": {"customer_code": "customer_id"}, "schema": {"mode": "observed"}},
+    }
+    source_path = service._settings.data_dir / "blobs" / result_session_id / "customers.csv"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("customer_code,customer_key\nC1,C1\n")
+    sources = {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "on_validation_failure": "discard",
+            "options": {"path": str(source_path), "schema": {"mode": "fixed", "fields": ["customer_code: str", "customer_key: str"]}},
+        }
+    }
+    outputs = [
+        {
+            "name": "output",
+            "plugin": "csv",
+            "on_write_failure": "discard",
+            "options": {"path": "outputs/customer_ids.csv", "schema": {"mode": "observed"}},
+        }
+    ]
+    saved = await sessions.save_composition_state(
+        UUID(result_session_id),
+        CompositionStateData(
+            sources=sources, nodes=[node], outputs=outputs, metadata_={"name": "synthetic", "description": ""}, is_valid=False
+        ),
+        provenance="session_seed",
+    )
+    before_messages = await sessions.get_messages(UUID(result_session_id), limit=None)
+    before_versions = await sessions.get_state_versions(UUID(result_session_id))
+    calls = [
+        ("rename-metadata", "set_metadata", {"patch": {"name": "Stable identity"}}),
+        ("patch-mapping", "patch_node_options", {"node_id": node["id"], "patch": {"mapping": {"customer_key": "customer_id"}}}),
+    ]
+    if replace_identity:
+        calls[0] = (
+            "replace-plugin",
+            "upsert_node",
+            {**node, "plugin": "llm", "options": {"schema": {"mode": "observed"}}},
+        )
+        calls[1][2]["patch"]["mapping"] = {"api_key": "private_value"}
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    responses = [_admit_composer_llm_completion(_tool_batch_response(*calls)), _admit_composer_llm_completion(_raw_text_response("Done."))]
+
+    async def internal_completion(_messages: Any, _tools: Any, **_kwargs: Any) -> _AdmittedLLMCompletion:
+        return responses.pop(0)
+
+    async def run() -> Any:
+        with patch.object(service._provider_gateway, "_call_llm", new=internal_completion):
+            return await service._run_one_turn_for_test(
+                session_id=result_session_id, current_state_id=str(saved.id), initial_state=state_from_record(saved)
+            )
+
+    if replace_identity:
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            await run()
+        assert caught.value.surface == "composer_tool_wire"
+        assert handler_calls == []
+        assert await sessions.get_messages(UUID(result_session_id), limit=None) == before_messages
+        assert await sessions.get_state_versions(UUID(result_session_id)) == before_versions
+    else:
+        await run()
+        assert handler_calls == ["set_metadata", "patch_node_options"]
+        current = await sessions.get_current_state(UUID(result_session_id))
+        assert current is not None
+        assert current.nodes[0]["options"]["mapping"] == {"customer_key": "customer_id"}
+
+
 def _assert_provider_tool_batch_rejection(caught: BaseException | None, expected_message: str) -> None:
     assert type(caught) is _MalformedLLMResponseError
     assert str(caught) == f"LLM tool batch failed admission: {expected_message}"
@@ -647,7 +739,9 @@ async def test_mixed_internal_tool_batch_refuses_atomically_before_any_handler_o
         )
     )
 
-    async def _internal_completion(_messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+    async def _internal_completion(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> _AdmittedLLMCompletion:
         return completion
 
     handler_calls = _record_real_tool_handlers(monkeypatch)
@@ -756,7 +850,9 @@ async def test_internal_completion_control_metadata_refuses_atomically_before_an
             provider_metadata=replace(completion.provider_metadata, **{credential_field: metadata_value}),
         )
 
-    async def _internal_completion(_messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+    async def _internal_completion(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> _AdmittedLLMCompletion:
         return completion
 
     handler_calls = _record_real_tool_handlers(monkeypatch)
@@ -816,7 +912,9 @@ async def test_internal_no_tool_completion_is_refused_before_audit_or_history(
     completion = _text_response("ordinary")
     completion = replace(completion, message=replace(completion.message, content=candidate))
 
-    async def _internal_completion(_messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+    async def _internal_completion(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> _AdmittedLLMCompletion:
         return completion
 
     sessions_service = composer_service_with_real_sessions._sessions_service
@@ -1446,7 +1544,9 @@ async def test_tool_batch_snapshots_calls_before_first_await(
     )
     responses = [_admit_composer_llm_completion(response), _text_response("Done.")]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     handler_calls = _record_real_tool_handlers(monkeypatch)
@@ -1515,7 +1615,9 @@ async def test_tool_batch_snapshots_calls_before_preference_await(
     )
     responses = [_admit_composer_llm_completion(response), _text_response("Done.")]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     handler_calls = _record_real_tool_handlers(monkeypatch)
@@ -1597,7 +1699,9 @@ async def test_tool_batch_rejects_session_reused_id_before_current_turn_proposal
         _text_response("Done."),
     ]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     handler_calls = _record_real_tool_handlers(monkeypatch)
@@ -1993,7 +2097,7 @@ async def test_current_loop_schema_valid_semantic_arg_error_persists_only_closed
         _text_response("Recovered after the semantic argument error."),
     ]
 
-    async def _llm(_messages: Any, _tools: Any) -> Any:
+    async def _llm(_messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None) -> Any:
         return responses.pop(0)
 
     result = await _run_one_turn(
@@ -2054,7 +2158,7 @@ async def test_current_loop_non_object_arg_error_matches_durable_projection_and_
         _text_response("Recovered after the non-object argument error."),
     ]
 
-    async def _llm(_messages: Any, _tools: Any) -> Any:
+    async def _llm(_messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None) -> Any:
         return responses.pop(0)
 
     result = await _run_one_turn(
@@ -2184,7 +2288,7 @@ async def test_current_loop_plugin_crash_with_invalid_arguments_uses_closed_clas
         )
     ]
 
-    async def _llm(_messages: Any, _tools: Any) -> Any:
+    async def _llm(_messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None) -> Any:
         return responses.pop(0)
 
     with pytest.raises(ComposerPluginCrashError):
@@ -2308,7 +2412,9 @@ async def test_step2_persists_intercepted_advisor_tool_call_rows(
         _text_response("Done."),
     ]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     async def _fake_advisor(**_kwargs: Any) -> Any:
@@ -2385,7 +2491,9 @@ async def test_step2_advisor_compose_timeout_persists_recovery_envelope(
         _advisor_tool_call_response("call_advisor_timeout"),
     ]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     provider_calls = 0
@@ -2466,7 +2574,9 @@ async def test_step2_advisor_compose_timeout_preserves_audit_failure_primacy(
         _advisor_tool_call_response("call_advisor_timeout"),
     ]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     monkeypatch.setattr("elspeth.web.composer.tool_batch._remaining_compose_seconds", lambda _deadline: 0.0)
@@ -2527,7 +2637,9 @@ async def test_step2_redacts_intercepted_advisor_unknown_arguments_before_persis
         _text_response("Done."),
     ]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     async def _fake_advisor(**_kwargs: Any) -> Any:
@@ -2576,7 +2688,9 @@ async def test_step2_unknown_tool_canary_is_absent_from_actual_persistence(
         _text_response("Recovered after the unknown tool failure."),
     ]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     result = await _run_one_turn(
@@ -2633,7 +2747,9 @@ async def test_step2_registered_tool_missing_manifest_fails_before_persistence(
     monkeypatch.setattr(redaction_module, "MANIFEST", manifest_without_set_metadata)
     response = _metadata_tool_response("call_manifest_drift", "must-not-persist")
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return response
 
     with pytest.raises(AuditIntegrityError, match="missing from the redaction manifest"):
@@ -2745,7 +2861,9 @@ async def test_overlapping_composes_keep_tool_audits_with_their_own_sessions(
 
     turns = {"alpha": 0, "beta": 0}
 
-    async def _llm(messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+    async def _llm(
+        messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> _AdmittedLLMCompletion:
         prompt = json.dumps(messages)
         label = "alpha" if "overlap alpha 8472" in prompt else "beta"
         assert label == "alpha" or "overlap beta 9351" in prompt
@@ -2942,7 +3060,7 @@ async def test_cancellation_during_sync_tool_waits_for_result_audit_persist(
 
     llm_calls = 0
 
-    async def _llm(_messages: Any, _tools: Any) -> Any:
+    async def _llm(_messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None) -> Any:
         nonlocal llm_calls
         llm_calls += 1
         if llm_calls == 1:
@@ -3333,7 +3451,7 @@ async def test_unwind_failure_retains_only_current_turn_after_committed_prefix(
         _metadata_tool_response("call_unpersisted_crash", "crash"),
     ]
 
-    async def _llm(_messages: Any, _tools: Any) -> Any:
+    async def _llm(_messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None) -> Any:
         return responses.pop(0)
 
     with pytest.raises(ComposerPluginCrashError) as excinfo:

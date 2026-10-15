@@ -274,7 +274,7 @@ async def test_gateway_terminal_paths_keep_the_preawait_context(tmp_path, monkey
     messages = [{"role": "user", "content": "PRIVATE REQUEST BEFORE AWAIT"}]
     expected = deepcopy(messages)
 
-    async def completion(wire_messages, wire_tools):
+    async def completion(wire_messages, wire_tools, *, provider_custody: object | None = None, credential_state: object | None = None):
         assert wire_messages == expected
         wire_messages[0]["content"] = "MUTATED AFTER SNAPSHOT"
         if mode == "timeout":

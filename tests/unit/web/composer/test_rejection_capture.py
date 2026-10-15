@@ -116,7 +116,9 @@ async def test_failed_mutation_persists_unredacted_rejection_row(
     service = composer_service_with_real_sessions
     responses = [_mutation_response("call_reject_1"), _text_response("Stopping.")]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     with patch(
@@ -151,7 +153,9 @@ async def test_argument_error_persists_rejection_row_with_raw_message(
     service = composer_service_with_real_sessions
     responses = [_mutation_response("call_arg_err"), _text_response("Stopping.")]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     arg_error = ToolArgumentError(argument="patch", expected="valid metadata patch", actual_type="int")
@@ -179,7 +183,9 @@ async def test_successful_mutation_persists_no_rejection_row(
     service = composer_service_with_real_sessions
     responses = [_mutation_response("call_ok"), _text_response("Done.")]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         return responses.pop(0)
 
     await _run_one_turn(service, llm=_fake_llm, session_id=result_session_id)

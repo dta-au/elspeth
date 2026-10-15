@@ -779,7 +779,14 @@ def validate_secret_evidence(
                 disallowed_components.append((source_component, "source", source.plugin, disallowed))
         for node in state.nodes:
             all_refs.extend(_collect_secret_refs(node.options, env_ref_names))
-            fabricated = collect_credential_field_violations(node.options, env_ref_names)
+            from elspeth.web.credential_guard import field_mapper_credential_options_projection
+
+            fabricated = collect_credential_field_violations(
+                field_mapper_credential_options_projection(node.options)
+                if node.node_type == "transform" and node.plugin == "field_mapper"
+                else node.options,
+                env_ref_names,
+            )
             if fabricated:
                 fabricated_components.append((node.id, "transform", fabricated))
             node_plugin = node.plugin or "<unset>"

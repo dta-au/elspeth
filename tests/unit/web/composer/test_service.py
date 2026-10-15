@@ -1630,7 +1630,13 @@ class TestComposerMultiTurnToolCalls:
         responses = iter([turn1, turn2, turn3])
         captured_messages: list[list[dict[str, Any]]] = []
 
-        async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
+        async def _fake_call_llm(
+            messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]],
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+        ) -> Any:
             captured_messages.append(list(messages))
             return next(responses)
 
@@ -2336,7 +2342,13 @@ class TestComposerMultiTurnToolCalls:
                     )
                 )
 
-        async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
+        async def _fake_call_llm(
+            messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]],
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+        ) -> Any:
             assert len(captured_messages) < len(replies), "Only the original finite primary responses are supplied"
             captured_messages.append(deepcopy(messages))
             revision_snapshots.append(saved_revisions())
@@ -2531,7 +2543,13 @@ class TestComposerMultiTurnToolCalls:
         responses = iter([turn1, turn2, turn3])
         captured_messages: list[list[dict[str, Any]]] = []
 
-        async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
+        async def _fake_call_llm(
+            messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]],
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+        ) -> Any:
             captured_messages.append(list(messages))
             return next(responses)
 
