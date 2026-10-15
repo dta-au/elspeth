@@ -40,6 +40,31 @@ All notable changes to ELSPETH are documented here.
   Fork guidance describes ordinary downstream consumers without requiring
   coalescing. Failed-operation diagnostics retain bounded private original
   causes atomically with the failed terminal under the existing live fence.
+- **Provider failures retain their actual disposition.** Failed advisor requests
+  report review unavailability; malformed-response wording is reserved for an
+  observed unusable response. Nonretryable failures stop automatic re-review
+  within that operation without consuming unused passes. A later user request
+  can retry after configuration changes.
+- **Planner repairs retain safe diagnostic facts.** Argument failures include
+  bounded schema categories, canonical locations and missing required fields,
+  without echoing rejected values. Repeated coarse error codes no longer stop
+  successive repairs to different authored candidates; an unchanged candidate
+  with the same failure remains subject to the repeat guard and existing budgets.
+- **FieldMapper labels remain data through Composer admission.** Valid mapping
+  labels such as `customer_key` survive tool-wire, state, YAML import, preflight
+  and execution-envelope checks. Known-node patches use the owned current plugin
+  identity; batches that may replace it remain conservative. Actual credential
+  strings and all authoring metadata remain scanned. Private identity-bearing
+  diagnostics preserve valid mappings; context-free patch diagnostics retain
+  their existing filtering.
+- **YAML authoring and internal query chains are documented.** The
+  [YAML guide](docs/guides/yaml-authoring.md) covers control nodes, plugin families,
+  validation, execution and audit commands. The
+  [reference lookup](examples/reference_join_chain/) and
+  [ordered LLM](examples/llm_ordered_chain/) examples each demonstrate a later
+  lookup or query consuming the previous output within one node. Advisor
+  evidence labels identify redacted text, and the redaction-policy guide now
+  describes the existing label checker accurately.
 
 Session epoch advances from 75 to 76; Landscape remains at epoch 49. Committed
 graph-review facts now govern effective completion status without rewriting
