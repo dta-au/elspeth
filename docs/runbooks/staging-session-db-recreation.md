@@ -9,13 +9,14 @@ The current guidance below supersedes every legacy reset procedure later in
 this document. Those procedures are historical reference only and do not
 apply to the current candidate. They do not authorize a deployment or a reset.
 
-## Current Cutover: 0.8.6 candidate (session epoch 76, Landscape epoch 49)
+## Current Cutover: 0.8.7 candidate (session epoch 77, Landscape epoch 49)
 
-The current candidate uses session epoch 76 for authoritative committed
-graph-review facts, retaining graph recovery, authentication families and bound
-websocket tickets, with Landscape epoch 49. Epoch-75 readers ignore the new
-facts and cannot preserve effective completion blockers. Preserve epoch-75
-stores and prior compatible application access; use an explicitly new epoch-76
+The unreleased candidate uses session epoch 77, retaining epoch 76's authoritative
+committed graph-review facts and adding the container quota representation.
+Graph recovery, authentication families and bound websocket tickets remain,
+with Landscape epoch 49. Epoch-75 readers ignore effective completion blockers;
+neither distinct epoch-76 predecessor has the combined contract. Preserve epoch-75
+and epoch-76 stores and prior compatible application access; use an explicitly new epoch-77
 target. Drain and isolate old/new deployments: they must not share a session
 store, and compatibility keys do not automatically evict existing replicas.
 The ambiguous session epoch 73 is retired. Existing compatible stores
@@ -30,6 +31,13 @@ existing session, Landscape, authentication, blob, and payload data intact.
 Creation is allowed only for an object-free, unstamped target. PostgreSQL
 requires an empty, supported target namespace. This is not an upgrade of the
 preserved store, and it does not make predecessor rows readable by this code.
+
+SQLite read-only admission preserves committed database content while using
+normal WAL coordination. A reader can create an empty WAL and create or update
+the shared-memory (`-shm`) coordination file; leave those artifacts in place.
+This does not authorize schema repair, restamping, migration, or cleanup.
+Read-only probes must observe committed WAL content: do not use `immutable=1`
+for a live store, because a main-file-only observation can miss that content.
 
 The local authentication store has its own exact schema admission. Preserving
 `auth.db` does not make an older credential schema compatible: a legacy `users`
@@ -55,12 +63,12 @@ store automatically.
    create a database:
 
 ```bash
-sqlite3 -readonly "$DB_PATH" 'PRAGMA user_version;'         # expect 76 (== SESSION_SCHEMA_EPOCH)
+sqlite3 -readonly "$DB_PATH" 'PRAGMA user_version;'         # expect 77 (== SESSION_SCHEMA_EPOCH)
 sqlite3 -readonly "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 49 (== SQLITE_SCHEMA_EPOCH)
 ```
 
 These epoch probes supplement exact shape admission; they do not replace it.
-Record the session-epoch-76/Landscape-epoch-49 result for the candidate. On a
+Record the session-epoch-77/Landscape-epoch-49 result for the candidate. On a
 mismatch, preserve both stores and refuse candidate startup against them.
 After separately authorized startup, a fresh test session can complete the
 freeform Build step, run the pipeline, and inspect its recorded audit story.
@@ -69,6 +77,14 @@ Do not reset an existing user's tutorial or data to perform this verification.
 All remaining cutovers and procedures below are historical reference. Their
 reset, deletion, and recreation instructions are not applicable to this
 candidate or to existing/user stores under the current preservation policy.
+
+## Prior Cutover: 0.8.6 candidate (session epoch 76, Landscape epoch 49)
+
+The .6 candidate made committed terminal graph-review facts authoritative over
+immutable snapshots. Epoch-75 readers ignore those facts and cannot preserve
+effective completion blockers. That historical boundary remains; the current
+candidate additionally requires epoch 77's quota representation. This history
+does not authorize restamping, resetting or converting either predecessor.
 
 ## Prior Cutover: 0.8.3 candidate (session epoch 72, Landscape epoch 49)
 

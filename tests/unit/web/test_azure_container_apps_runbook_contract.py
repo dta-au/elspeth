@@ -1,9 +1,9 @@
 """Executable contract for the Azure Container Apps runbooks.
 
 Mirrors ``test_aws_ecs_runbook_contract.py`` for the ACA trio. The two rules
-that matter most here are the ECS lessons: every epoch literal in prose or
-JSON is byte-bound to the live constants (a drifted literal is exactly the
-runbook hazard the ECS acceptance found), and every platform call in the
+that matter most here are the ECS lessons: every current epoch literal in prose
+or JSON is byte-bound to the live constants, declared history is pinned to its
+historical contract, and every platform call in the
 acceptance runbook goes through the protected capture wrappers so raw output
 never reaches a receipt.
 """
@@ -36,6 +36,7 @@ KEY_DERIVATION_TEST = REPO_ROOT / "tests" / "unit" / "web" / "test_key_derivatio
 FACTS_LINK = "../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md"
 CURRENT_VERSION = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 RECEIPT_PATH = f"docs/operator/evidence/azure-container-apps/{CURRENT_VERSION}.json"
+HISTORICAL_REDEPLOY_SCHEMA_STATEMENT = "**Historical 0.8.6:** The 0.8.6 candidate expects session epoch 76 and Landscape epoch 49."
 INGRESS_REQUEST_TIMEOUT_SECONDS = 240
 MECHANISMS = (
     "session_operation_fence",
@@ -180,23 +181,79 @@ def test_compatibility_record_is_byte_bound_to_the_live_derivation() -> None:
         assert stale_subject not in json.dumps(record), stale_subject
 
 
-def test_every_epoch_literal_matches_the_live_constants() -> None:
-    texts = [_text(runbook) for runbook in RUNBOOKS]
+def _assert_epoch_literals(text: str, *, historical_statement: str | None = None) -> tuple[int, int]:
+    if historical_statement is not None:
+        assert text.count(historical_statement) == 1, "historical schema statement must retain its exact contract"
+        text = text.replace(historical_statement, "")
     session_hits = 0
     landscape_hits = 0
-    for text in texts:
-        for match in re.finditer(r"session epoch (\d+)", text, flags=re.IGNORECASE):
-            session_hits += 1
-            assert int(match.group(1)) == SESSION_SCHEMA_EPOCH, match.group(0)
-        for match in re.finditer(r"landscape epoch (\d+)", text, flags=re.IGNORECASE):
-            landscape_hits += 1
-            assert int(match.group(1)) == SQLITE_SCHEMA_EPOCH, match.group(0)
-        for match in re.finditer(r'"session_epoch":\s*(\d+)', text):
-            assert int(match.group(1)) == SESSION_SCHEMA_EPOCH, match.group(0)
-        for match in re.finditer(r'"landscape_epoch":\s*(\d+)', text):
-            assert int(match.group(1)) == SQLITE_SCHEMA_EPOCH, match.group(0)
+    for match in re.finditer(r"session epoch (\d+)", text, flags=re.IGNORECASE):
+        session_hits += 1
+        assert int(match.group(1)) == SESSION_SCHEMA_EPOCH, match.group(0)
+    for match in re.finditer(r"landscape epoch (\d+)", text, flags=re.IGNORECASE):
+        landscape_hits += 1
+        assert int(match.group(1)) == SQLITE_SCHEMA_EPOCH, match.group(0)
+    for match in re.finditer(r'"session_epoch":\s*(\d+)', text):
+        assert int(match.group(1)) == SESSION_SCHEMA_EPOCH, match.group(0)
+    for match in re.finditer(r'"landscape_epoch":\s*(\d+)', text):
+        assert int(match.group(1)) == SQLITE_SCHEMA_EPOCH, match.group(0)
+    return session_hits, landscape_hits
+
+
+def test_every_current_epoch_literal_matches_live_constants_and_history_is_pinned() -> None:
+    session_hits = 0
+    landscape_hits = 0
+    for runbook in RUNBOOKS:
+        historical_statement = HISTORICAL_REDEPLOY_SCHEMA_STATEMENT if runbook == REDEPLOY_RUNBOOK else None
+        sessions, landscape = _assert_epoch_literals(_text(runbook), historical_statement=historical_statement)
+        session_hits += sessions
+        landscape_hits += landscape
     assert session_hits >= 3
     assert landscape_hits >= 3
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "current-session",
+        "current-landscape",
+        "json-session",
+        "json-landscape",
+        "historical-epoch",
+        "historical-removed",
+        "historical-duplicated",
+    ],
+)
+def test_epoch_gate_rejects_current_drift_and_historical_corruption(mutation: str) -> None:
+    if mutation.startswith("historical"):
+        original = _text(REDEPLOY_RUNBOOK)
+        historical_statement = HISTORICAL_REDEPLOY_SCHEMA_STATEMENT
+        if mutation == "historical-epoch":
+            changed = original.replace("session epoch 76", "session epoch 77", 1)
+        elif mutation == "historical-removed":
+            changed = original.replace(historical_statement, "", 1)
+        else:
+            changed = original.replace(historical_statement, historical_statement + "\n" + historical_statement, 1)
+        expected = "historical schema statement must retain its exact contract"
+    else:
+        original = _text(ACCEPTANCE_RUNBOOK)
+        historical_statement = None
+        if mutation == "current-session":
+            changed = original.replace(f"session epoch {SESSION_SCHEMA_EPOCH}", "session epoch 76", 1)
+            expected = "session epoch 76"
+        elif mutation == "current-landscape":
+            changed = original.replace(f"Landscape epoch {SQLITE_SCHEMA_EPOCH}", "Landscape epoch 48", 1)
+            expected = "Landscape epoch 48"
+        elif mutation == "json-session":
+            changed = original.replace(f'"session_epoch": {SESSION_SCHEMA_EPOCH}', '"session_epoch": 76', 1)
+            expected = '"session_epoch": 76'
+        else:
+            changed = original.replace(f'"landscape_epoch": {SQLITE_SCHEMA_EPOCH}', '"landscape_epoch": 48', 1)
+            expected = '"landscape_epoch": 48'
+    _assert_epoch_literals(original, historical_statement=historical_statement)
+    assert changed != original, "document mutation must activate"
+    with pytest.raises(AssertionError, match=re.escape(expected)):
+        _assert_epoch_literals(changed, historical_statement=historical_statement)
 
 
 def test_storage_contract_is_stated_identically_in_every_runbook() -> None:

@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from elspeth.web.config import WebSettings
     from elspeth.web.coordination.approval_authority import ApprovalRecord, ApprovalSupersession
     from elspeth.web.coordination.identity_authority import PendingIdentitiesPurged
-    from elspeth.web.coordination.quota_authority import QuotaExceeded
+    from elspeth.web.coordination.quota_authority import ContainerQuotaPolicyRow, QuotaExceeded
     from elspeth.web.coordination.quota_policy_authority import QuotaPolicyChange
 
 
@@ -1727,6 +1727,33 @@ class AuthAuditRecorder:
                     },
                     **provenance.request_columns,
                 )
+
+    def record_container_quota_set(self, *, provider: AuthProviderType, policy: ContainerQuotaPolicyRow) -> None:
+        """Record a configured token ceiling without inventing a granting identity."""
+        with self._open_landscape(AuthAuditOperation.QUOTA_SET) as db:
+            self._auth_audit(db).record_auth_event(
+                event_type="quota_set",
+                outcome="success",
+                provider=provider,
+                identity_id=None,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "config",
+                    "source": "config",
+                    "scope": "container",
+                    "action": "set",
+                    "dimension": "tokens",
+                    "cap": policy.tokens_per_day,
+                    "tokens_per_day": policy.tokens_per_day,
+                    "storage_bytes": policy.storage_bytes,
+                    "policy_id": policy.policy_id,
+                },
+            )
 
     def record_quota_exceeded(self, outcome: QuotaExceeded) -> None:
         """Write the ``quota_exceeded`` row: dimension, cap, ceiling in force and measured usage (spec :834).

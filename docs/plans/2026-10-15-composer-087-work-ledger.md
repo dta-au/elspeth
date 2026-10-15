@@ -43,6 +43,83 @@ Raw registry/API evidence is in `live-registry.json`,
 `direct-symbol-inventory.json`; the item-1 proposal is `packet1-design.md`.
 These are coordination inputs and must never be staged.
 
+## Current status worklist
+
+This is the current status view requested by the maintainer. The detailed
+reconciliation table below retains the original baseline findings. “Accepted
+locally” means committed, independently reviewed and checked within the stated
+packet; it does not mean merged, signed, released or deployed.
+
+| Planned work | Current status |
+|---|---|
+| 0. Baseline inventories and ownership | Complete; live registry/profile and direct-call inventories recorded. |
+| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement and output groups accepted locally in `620231a` and `208bf8d`. Source group design reviewed; source, transform/splice, blob, secret, discovery and remaining dispatch migrations pending. |
+| 2. Saved-but-blocked persistence/reload/UI | Pending joined behavioral evidence; inherited .6 teaching retained. |
+| 3. Model-catalog provenance | Fixed in .6; .7 regression closure pending. |
+| 4. Explicit CSV failure choice | Runtime refusal already exists. False assistance claim that omission defaults to discard still needs correction and its provenance checks. |
+| 5. Scoring scale, anchors and meaning | Approved together in the existing criterion reviewed value. Systems representation/rendering design complete; implementation pending. |
+| 6. Public argument admission | Characterization pending; no public bypass established. |
+| 7. Typed services and faithful test doubles | Typed production owner exists. Real-signature/context-forwarding characterization pending. |
+| 8. Source proof context and unavailable content | Approved terminal readiness-blocked behavior; concrete systems design complete, implementation pending. |
+| 9. Fresh settlement versus historical review-debt repair | Ownership/placement reviewed; debt query, repair placement and unnecessary exclusive-lease correction pending. |
+| 10. Persisted record admission | Narrow mixed singular/plural-source refusal approved, including empty plural maps; compatibility characterization and implementation pending. Supported unambiguous forms must remain. |
+| 11. Checked, failed and skipped validation phases | Pending honest phase/next-action behavior; no new phase schema or repair credit approved. |
+| 12. Source-demand capacity refusal | Pending stable normalization through preflight, completion, surfacing and persistence; preserve completed work and fail closed. |
+| 13. Tool-family lifecycle coverage | Actual tool map complete; broader success/refusal/retry/cancellation/privacy/reload evidence pending. |
+| 14. Plugin/profile qualification and repair | Registry inventory complete; case-specific construction/parity and repair checks pending. Inventory is not live-provider qualification or closure of #195. |
+| 15. Lifecycle/API/UI outcome distinctions | Broader rejected, saved-blocked, pending, validated, executable and executed witnesses pending. |
+| 16. Repair-credit policy | Conditional; not started. |
+| 17. Request-local source-demand cache (#246) | Conditional; not started. |
+| 18. Validation fairness/admission (#249) | Conditional; not started; no authorization defect established. |
+
+Additional defects and controls found during this work:
+
+| Finding | Current status |
+|---|---|
+| Rejection policy reasons flattened; admitted schema faults masked | Candidate/shared-resolver packet accepted locally. Output policy reasons and saved rejection identity are fixed; output admitted-schema propagation still needs its separate two-seam migration. Other caller families remain pending. |
+| Migrated candidate paths disclose raw path details | Fixed locally with static safe guidance and deliberate privacy controls; output path/history cases also accepted. |
+| Repeated masked-classifier guidance falsely says the request is impossible | Fixed locally in packet 1a. |
+| Inline CSV parse, scan-cap and content-conflict refusals conflated | Fixed locally in packet 1a. |
+| Uppercase quota validation codes miss their guidance | Fixed locally by case-insensitive lookup in packet 1a. |
+| Changed CSV reader authority binding | Rebound and controlled locally in packet 1a; separate pre-existing global writer-inventory expected failure remains unqualified. |
+| Output missing-target code/subject and standing saved findings lost | Fixed locally in packet 1b, retaining credential-repair payload and admitted schema identity. |
+| Schema-augmentation AST tripwire misses migrated saved-graph helper | Fixed locally; actual missing-identity mutation now fails the owning gate. |
+| Q1: configured container token ceiling is not provisioned | Combined candidate independently accepted after focused integration checks; local Git completion and broader gates remain separate. |
+| Q2: automatic titles make hidden SDK retries | Applied locally as `32673a1`; bounded combined integration accepted, retaining the physical-transport/accounting evidence and provider limitations. |
+| Q3: token-only container policy incorrectly needs a storage cap | Combined candidate accepted; optional container storage and mandatory identity storage verified within the focused scope. |
+| Q4: active container singleton is keyed by actor | Checked constant-slot fix accepted; focused PostgreSQL quota authority cases pass. Full PostgreSQL qualification remains due. |
+| Q5: new startup provisioning can outlive database owners on cancellation | Retained-worker join accepted with unchanged production/cancellation receipts; preserve deferred exception propagation and independent recovery. Broader qualification remains due. |
+| Quota standalone epoch 76 collides with .6 semantic epoch 76 | Combined epoch 77 accepted with retained graph-review semantics, both predecessor refusals and witnessed negative controls. No user-store conversion/reset is authorized. |
+| Three quota startup R4/R6 deferred-propagation lint findings | Source reviewed without a product blocker; repository adjudication/operator signing remains open. Correct lifecycle code is retained. |
+| SL1: malformed shared route opens recipient workspace | Fixed and accepted locally in `9d8b43b`. |
+| SL2: unavailable private link loses intent and resumes recipient workspace | Fixed and accepted locally in `9d8b43b`, including navigation and authentication remount. |
+| SL3: stale authentication destination A overrides explicit B | Fixed and accepted locally in the same shared-link packet. |
+| SL4: previous shared snapshot remains under a new token | Fixed and accepted locally in the same packet using route identity. |
+| SL5: shared-view global keyboard shortcuts act on recipient workspace | Open, outside the narrowed fallback patch. New-session shortcut reproduced; validation shortcut source-supported only. No sender mutation or cross-user access established. |
+| Ready plural source blob with NULL hash is treated as repairable | Source-reviewed integrity correction pending in the next source group. |
+| Invalid stored MIME has a redundant recoverable branch; MIME DB-CHECK comment is false | Source-reviewed branch/comment correction pending. Existing row reader already fails invalid MIME. |
+| Source policy refusal occurs after schema access | Source-reviewed ordering correction pending; admitted schema faults must propagate. |
+| Null/malformed source claims disappear or are string-coerced | Included in approved item-8 design; implementation pending. |
+| Missing proof context is conflated with no authored source claim | Included in approved item-8 design; implementation pending. |
+| Metadata-only source proof permits later unlocked content fallback | Included in approved item-8 design; implementation pending. |
+| Source unavailability reaches completion too late or becomes false budget exhaustion | Included in approved item-8 design; implementation pending across preview/completion/review entrances. |
+| Per-query scoring override does not inherit node criterion references | Actual boundary identified; teaching/characterization pending. No new override mechanism approved. |
+| LiteLLM conditional parameter repair/fallback can differ from ordinary retries | Separate documented limitation; title retry pins do not universally qualify provider behavior. |
+| Output admitted-schema ValueError/KeyError becomes availability repair | Source-confirmed remaining migration at set/patch output selection; accepted packet 1b identity, credential and privacy behavior stays qualified separately. |
+| Aggregation output-count refusal hides standing saved findings | Source-confirmed `with_state_validation=False` in upsert; systems-reviewed transform/splice correction pending. |
+| Transform provider-path refusal exposes private path/root text | Source-confirmed in upsert, patch and splice preparation; static producer projection and privacy controls pending in the reviewed transform group. |
+| Node refusals omit codes/subjects or mask admitted schema faults | Systems source design complete for upsert, patch and splice plus existing helpers; implementation and discriminating controls pending. |
+
+The earlier title custody stall was an execution-environment investigation,
+not a confirmed additional product defect. The deployed shared-link incident
+and streaming causation remain unproven. The conversion probe is only an
+isolated predecessor-to-quota-shape proposal; it does not establish integrated
+epoch-77 semantic conversion support.
+
+Whole-branch default and full serial PostgreSQL gates, protected CI, operator
+signature clearance, merge and deployment remain unfinished for .7. The quota
+owner's selected PostgreSQL results are not the full PostgreSQL gate.
+
 ## Live tool and plugin inventories
 
 The tool universe was queried through `_REGISTERED_TOOLS`,
@@ -316,7 +393,7 @@ PostgreSQL, native, frontend, signing, CI or release qualification is claimed.
 | Item | Current packet status | Remaining owner/evidence obligation |
 |---|---|---|
 | 0 | Baseline inventory complete | Keep live registry measurements separate from execution coverage. |
-| 1 | Packet 1a committed as `620231a`; output-only packet 1b independently accepted, local checkpoint pending | Output group is set/patch/remove output only. Source/transform/blob/secret/discovery producers and dispatch remain unresolved legacy families. Preserve aggregation candidate-only and splice mixed candidate/standing findings. |
+| 1 | Packet 1a committed as `620231a`; independently accepted output-only packet 1b committed as `208bf8d` | Output group is set/patch/remove output only. Source/transform/blob/secret/discovery producers and dispatch remain unresolved legacy families. Preserve aggregation candidate-only and splice mixed candidate/standing findings. |
 | 2 | Existing save/readiness separation retained; joined lifecycle witness pending | Real mutation → returned block and exception → exact retained revision → authenticated history/reload/UI. G3 teaching remains fixed. |
 | 3 | Model-catalog provenance teaching fixed in 0.8.6; regression closure pending | Supplied current catalog or permitted `list_models` discovery; missing facts and stale names must trigger discovery/refusal. No repeated repair authorized. |
 | 4 | Runtime explicit-choice guard exists; CSV assistance defect survives | Correct G4 assistance and measure its existing stamp/history/corpus reach in its own packet. |
@@ -515,7 +592,7 @@ has completed locally; quota acceptance and deployed behavior remain unverified.
 | Finding | Current evidence and status | Owner and boundary |
 | --- | --- | --- |
 | Q1 (P1): configured container token-policy provisioning missing | Accepted owner commit `acfcc58bd982e9849ca5fec57e6938a8baa98c57` implements serialized create-or-verify startup. Owner evidence includes 175 focused cases, 267 app/writer checks, seven selected PostgreSQL cases and cancellation controls. Root application and integrated checks pending. | Quota owner completed its local patch; root integrates after the current output checkpoint, with final epoch and exact-candidate reviews. |
-| Q2 (P2): autotitle hidden SDK retries | Owner's synthetic 503 negative observed two physical sends under one admission. Retry-disable repair passed all four transport cases, 106 affected checks and final seven-case clock/masquerade selection; independent Astra accepted. Committed locally as `43dc7f886b3f81e3bfe2cabd0e69076a6ed3fefd`; root integration pending. Earlier required-custody stall is not an accepted third product defect. | Same quota owner; F2 acceptance is independent of the remaining container-policy patch. |
+| Q2 (P2): autotitle hidden SDK retries | Owner's synthetic 503 negative observed two physical sends under one admission. Retry-disable repair passed all four transport cases, 106 affected checks and final seven-case clock/masquerade selection; independent Astra accepted. Owner `43dc7f8` applied cleanly here as `32673a1b7f6572c7636bafbc57f653c8899ed99e`; integrated qualification pending. Earlier required-custody stall is not an accepted third product defect. | Same quota owner; F2 acceptance remains separate from F1 and the aggregate integration gates. |
 | Q3: token-only container policy incorrectly requires storage cap | Fixed in accepted owner F1 commit with a distinct container-policy carrier and nullable container storage; explicit values and mandatory identity storage remain. | Root integration and aggregate checks pending. |
 | Q4: active container singleton index keys actor | Fixed in F1 with a checked non-null constant slot, partial unique index and serialized empty-population provisioning. | Root integration, final Sessions epoch and aggregate PostgreSQL gate pending. |
 | Q5: cancellation during new startup provisioning can race database shutdown | Fixed in F1 by retaining the exact worker task through repeated cancellation before closing database owners; owner cancellation selection passed 46 cases and both reviews closed the issue. This arose in the remediation candidate. | Exact integrated candidate still requires systems and independent Astra acceptance. Three deferred-propagation R4/R6 findings require repository adjudication and operator clearance. |
@@ -618,3 +695,108 @@ Pure policy admission must precede direct schema access in the selected source
 handlers; an admitted catalog construction error must propagate. These remain
 source-reviewed next-group obligations, not implemented or runtime-qualified
 fixes. The existing singular resolver and inline-CSV result stay intact.
+
+Item 8's source review also identifies separate implementation obligations:
+present-null/malformed scalar claims must refuse rather than disappear or be
+string-coerced; missing proof context must be distinct from no authored claim;
+metadata-only evidence must not trigger a later unlocked content fallback; and
+observed unavailability must dominate every ordinary preview/completion/review
+handoff before a repair call or false exhaustion notice. These are reviewed
+design findings, not completed fixes. Existing nonready no-read and execution
+custody/integrity refusals remain requirements.
+
+### Fork continuation and integrated quota counterevidence
+
+John selected the restarted fork as sole .7 owner. The full approved plan 0–15
+and discovered findings remain its scope, with independent Astra and required
+systems reviews. Draft PR and protected merge on exact-head green are now
+authorized; items16–18 remain conditional. Deployment, paid calls/new spending,
+user-store conversion/reset and protection bypass remain excluded. A user pause
+was observed and all workers stopped; John's later conditional continuation was
+forwarded by the authorized bridge, and fresh readiness/ownership checks preceded
+resumption. Shared application session locks were not cleared or processes killed.
+
+The first integrated quota selection completed on frozen inputs: **1302 passed,
+14 failed, zero errors/skips**, exit1. Thirteen new epoch cases correctly refuse
+at the factory and then fail a strict main/sidecar snapshot assertion. One case
+finds the shared current AWS/Azure compatibility-version constant still0.8.6 while
+project/runbook surfaces are0.8.7. The canonical whole-branch Ruff, mypy and
+contracts aggregate separately passed with all stage exits0, driver0 and
+frozen=yes. This is not integrated runtime acceptance.
+
+A controlled single-node diagnostic measures the inherited read-only factory:
+the main DB, catalog, schema identity and policy rows are unchanged; refusal adds
+an empty WAL and32768-byte SHM, changing or removing no pre-existing file. The
+actual connection closes. Equal/add/remove/byte-change controls and a planted
+one-byte change to a copied DB verify the comparator. The preservation contract
+and appropriate repair/characterization are under systems and independent review;
+no assertion was silently weakened and no immutable-reader shortcut was added.
+Live committed WAL visibility must survive any accepted change. The inaccurate
+introductory models docstring describing stale-store deletion is a separate narrow
+documentation finding.
+
+Integrated keyless scan exit1 is unchanged in source before/after. Controlled
+semantic comparison is **3274→3277**, exactly one R6 and two R4 additions in the
+startup worker join, zero semantic removals. Repository adjudication/operator
+signing remains open. Deliberate integration controls, integrated PostgreSQL,
+full default/full PostgreSQL, final exact-candidate acceptance, CI and merge are
+still pending; owner PostgreSQL receipts do not replace those gates.
+
+The separate user-authorized worktree cleanup is complete:21 clean merged trees
+removed, registrations71→50, all removal exits0, branches and active owners
+preserved. Four merged trees were retained for local stores/authentication,
+signing worklists or unresolved scratch source. No additional cleanup is implied.
+
+### Final bounded quota acceptance and remaining Composer work
+
+The authorized bridge corrected the instruction chronology: the 20:05 pause
+checkpoint reprocessed the original 19:08 direct stop after compaction; it was
+not a new user instruction. John's later 19:11:41 conditional continuation
+applies. Supported thread reads found no newer direct user stop, and fresh
+ownership/readiness checks preceded resuming the same workers. The exact message
+IDs, timestamp qualification and both historical reports are preserved in
+[the status report](2026-10-16-composer-087-paused-status.md). Do not infer a new
+instruction from a checkpoint's write time or a repeated prompt after compaction.
+
+The preservation correction retains strict static DELETE-journal file equality
+and separately proves WAL-aware operational durability, logical state, committed
+WAL visibility and owner continuity. Production admission is unchanged. The
+shared current candidate version is 0.8.7; models documentation now says
+preserve/refuse. The Azure repair retains and pins the historical 0.8.6/session76/
+Landscape49 sentence while enforcing all current prose/JSON facts, and updates
+four prospective evidence paths without creating a live receipt.
+
+Completed root results, read from complete receipt/JUnit artifacts:
+
+| Artifact | Measured result |
+|---|---|
+| `quota-root-positive2` | Exit1, frozen, 602 cases:599 passed,3 Azure documentation failures,0 errors/skips. All39 quota epoch/preservation cases passed. |
+| `quota-root-positive3` | Exit0, frozen, 290 passed,0 failures/errors/skips: repaired Azure contract and whole-tree masquerade gate, including current/history mutation controls. |
+| `quota-root-negative1/2/3` | Each exit1/frozen; four intended `DID NOT RAISE` failures across three families, no setup errors/skips. Actual old-epoch admission, missing CHECK/factory return and both WAL-only incompatibility/immutable-reader/factory-return outcomes are witnessed. |
+| `quota-root-postgres1` | Exit0, frozen,142 passed,0 failures/errors/skips: quota authority6, graph-review facts25, schema probe111. Explicit `-m testcontainer -n 0`, isolated local containers and no external target. |
+| `quota-root-keyless2` | Exit1, frozen;3274→3277, exactly one R6/two R4 startup deferred-propagation additions,0 semantic removals. Production/config inputs remain unchanged through the final runtime candidate. |
+
+Positive3, all three negative families and focused PostgreSQL share complete
+input digest `f07ea5cff8c95e102eccb7a362a4b35b8013442eae40d357119d8981def1e26b`.
+Final freeze3 digest is
+`33a7033021ff898b52781dabea4dad01e32a4c65ee1cd26f15e04c08f9c515ea`.
+Root and both reviewers verified all48 bindings and final stored inputs. Both
+independent correctness/security and systems verdicts accept this bounded local
+quota integration. The original red positive1/2 runs remain unchanged; reuse is
+limited to reviewed unchanged production and affected follow-up. No new green
+1316/602 aggregate is claimed, and overlapping selections are not summed.
+
+This ledger update follows those completed frozen runs and changes only status
+documentation. The actual incoming cherry-pick remains unfinished until root's
+normal local Git step. Full default/full serial PostgreSQL, final applicable
+whole-tree gates, protected CI, operator adjudication/signing and whole-plan
+acceptance remain due. No release, deployment or conversion is qualified.
+
+Source-only follow-up reviews revalidate source packet1c against the settled
+saved credential/policy adapters, with four explicit source codes and no public
+schema expansion. A separate transform/splice group also fits saved-graph
+semantics; private proposed states are not applied partial results, and batch/
+preflight owners retain actual partial progress. The output admitted-schema
+masking and transform findings above are pending repairs, not silently covered
+by the earlier output/candidate packets. The entire approved plan0–15 continues;
+items16–18 remain conditional.

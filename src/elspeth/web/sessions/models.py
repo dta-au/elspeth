@@ -4,8 +4,8 @@ Tables include session content plus epoch-44 web coordination authority,
 run-start, transient handoff, rate-limit, and cleanup state.
 
 Current schema bootstrap lives in ``sessions/schema.py``. Pre-release
-session databases are created from this metadata and stale runtime DBs
-are deleted/recreated rather than migrated.
+session databases are created from this metadata. Incompatible runtime DBs
+are preserved and refused; bootstrap does not migrate or recreate them.
 
 All tables live in a dedicated session database, separate from the
 Landscape audit database.
@@ -61,8 +61,11 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # Epoch 76 makes committed terminal graph-review facts authoritative over
 # immutable snapshots. Older readers ignore these private facts, so sharing
 # or rolling back across this semantic format boundary is unsupported.
+# Epoch 77 retains those graph-review semantics, separates container token caps
+# from optional storage ceilings, and enforces a single active container policy
+# across all granting actors. Both predecessor epoch-76 contracts are incompatible.
 # There is no migration path; preserve incompatible stores and prior access.
-SESSION_SCHEMA_EPOCH = 76
+SESSION_SCHEMA_EPOCH = 77
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3430,7 +3433,12 @@ quota_policies_table = Table(
     # byte-admitting site. The bound is eventually consistent, not exact: the
     # existing blob lock is keyed on session_id alone, so two sessions of one
     # identity do not serialise against each other.
-    Column("storage_bytes", BigInteger, nullable=False),
+    # Identity allowances always include storage. A container token ceiling
+    # need not activate a storage ceiling.
+    Column("storage_bytes", BigInteger, nullable=True),
+    # An ordinary checked column makes the partial singleton index reflectable
+    # on both supported dialects (SQLite omits expression indexes on reflection).
+    Column("container_slot", Integer, nullable=False, server_default="1"),
     Column("dual_control_above_tokens", BigInteger, nullable=True),
     # NULLABLE beside a closed actor vocabulary: the container ceiling row is
     # derived from configuration and has no granting identity. A non-null FK
@@ -3446,6 +3454,8 @@ quota_policies_table = Table(
     Column("set_at", DateTime(timezone=True), nullable=False),
     Column("revoked_at", DateTime(timezone=True), nullable=True),
     CheckConstraint(_QUOTA_SET_BY_ACTOR_CHECK, name="ck_quota_policies_set_by_actor"),
+    CheckConstraint("container_slot = 1", name="ck_quota_policies_container_slot"),
+    CheckConstraint("identity_id IS NULL OR storage_bytes IS NOT NULL", name="ck_quota_policies_identity_storage_required"),
     CheckConstraint(
         "(set_by_actor = 'identity') = (set_by_identity_id IS NOT NULL)",
         name="ck_quota_policies_identity_actor_names_an_identity",
@@ -3463,7 +3473,7 @@ Index(
 )
 Index(
     "uq_quota_policies_active_container_ceiling",
-    quota_policies_table.c.set_by_actor,
+    quota_policies_table.c.container_slot,
     unique=True,
     sqlite_where=quota_policies_table.c.revoked_at.is_(None) & quota_policies_table.c.identity_id.is_(None),
     postgresql_where=quota_policies_table.c.revoked_at.is_(None) & quota_policies_table.c.identity_id.is_(None),

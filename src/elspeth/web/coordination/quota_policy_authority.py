@@ -18,7 +18,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.identity_authority import IdentityAdminActor
-from elspeth.web.coordination.quota_authority import ActiveQuotaPolicies, QuotaPolicyRow, utc_day_start
+from elspeth.web.coordination.quota_authority import ActiveQuotaPolicies, ContainerQuotaPolicyRow, QuotaPolicyRow, utc_day_start
 from elspeth.web.sessions.models import (
     blobs_table,
     identities_table,
@@ -39,7 +39,7 @@ MAX_QUOTA_VALUE = 2**63 - 1
 class IdentityQuotaStatus:
     identity_id: str
     identity_policy: QuotaPolicyRow | None
-    container_policy: QuotaPolicyRow | None
+    container_policy: ContainerQuotaPolicyRow | None
     tokens_used_today: int | None
     storage_bytes_used: int
 
@@ -53,7 +53,7 @@ class QuotaPolicyChange:
     dimension: QuotaDimension | None
     policy: QuotaPolicyRow | None
     previous: QuotaPolicyRow | None
-    container_policy: QuotaPolicyRow | None
+    container_policy: ContainerQuotaPolicyRow | None
     tokens_used_today: int | None
     storage_bytes_used: int
     on_behalf_of: str | None
@@ -99,6 +99,11 @@ class QuotaPolicyMissing(QuotaPolicyRefusal):
     pass
 
 
+@final
+class ContainerQuotaPolicyConflict(QuotaPolicyRefusal):
+    pass
+
+
 def _storage_bytes_used_on_connection(connection: Connection, *, identity_id: str) -> int:
     """Count every live blob row held by the identity across its sessions."""
     total = connection.execute(
@@ -129,7 +134,14 @@ def _active_policies_on_connection(conn: Connection, *, identity_id: str) -> Act
         .where(policy.identity_id.is_(None), policy.revoked_at.is_(None))
         .with_for_update()
     ).one_or_none()
-    return ActiveQuotaPolicies(identity=_policy(identity), container=_policy(container))
+    return ActiveQuotaPolicies(
+        identity=_policy(identity),
+        container=None
+        if container is None
+        else ContainerQuotaPolicyRow(
+            policy_id=container.policy_id, tokens_per_day=container.tokens_per_day, storage_bytes=container.storage_bytes
+        ),
+    )
 
 
 def _daily_tokens_on_connection(conn: Connection, *, identity_id: str, now: datetime) -> int | None:
@@ -184,6 +196,60 @@ class RepositoryQuotaPolicyAuthority:
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
+
+    def ensure_container_token_policy(
+        self,
+        *,
+        tokens_per_day: int | None,
+        record: Callable[[ContainerQuotaPolicyRow], None],
+    ) -> ContainerQuotaPolicyRow | None:
+        """Create an absent configured ceiling, or verify without changing policy.
+
+        Explicit operator/system policies retain precedence. A config-owned
+        mismatch refuses startup rather than letting a stale replica replace
+        another replica's policy. Absent configuration never revokes a row.
+        """
+        if tokens_per_day is not None and (type(tokens_per_day) is not int or not 1 <= tokens_per_day <= MAX_QUOTA_VALUE):
+            raise QuotaValueOutOfRange(f"quota value must be an integer between 1 and {MAX_QUOTA_VALUE}")
+        if not callable(record):
+            raise TypeError("record must be callable")
+        with self._engine.begin() as conn:
+            if conn.dialect.name == "postgresql":
+                # Lock the population before reading: FOR UPDATE cannot lock an
+                # absent row. SQLite's engine.begin() takes BEGIN IMMEDIATE.
+                conn.exec_driver_sql("LOCK TABLE quota_policies IN SHARE ROW EXCLUSIVE MODE")
+            rows = conn.execute(
+                select(quota_policies_table).where(
+                    quota_policies_table.c.identity_id.is_(None), quota_policies_table.c.revoked_at.is_(None)
+                )
+            ).all()
+            if len(rows) > 1:
+                raise ContainerQuotaPolicyConflict("ambiguous active container quota policies; preserve the store for operator review")
+            if rows:
+                current = rows[0]
+                if current.set_by_actor == "config" and tokens_per_day is not None and current.tokens_per_day != tokens_per_day:
+                    raise ContainerQuotaPolicyConflict("configured container token cap conflicts with the active config-owned policy")
+                return ContainerQuotaPolicyRow(
+                    policy_id=current.policy_id, tokens_per_day=current.tokens_per_day, storage_bytes=current.storage_bytes
+                )
+            if tokens_per_day is None:
+                return None
+            now = database_now(conn)
+            policy = ContainerQuotaPolicyRow(policy_id=str(uuid.uuid4()), tokens_per_day=tokens_per_day, storage_bytes=None)
+            conn.execute(
+                insert(quota_policies_table).values(
+                    policy_id=policy.policy_id,
+                    identity_id=None,
+                    tokens_per_day=policy.tokens_per_day,
+                    storage_bytes=None,
+                    set_by_identity_id=None,
+                    set_by_actor="config",
+                    set_at=now,
+                    revoked_at=None,
+                )
+            )
+            record(policy)
+            return policy
 
     def status(self, *, identity_id: str) -> IdentityQuotaStatus:
         if type(identity_id) is not str or not identity_id.strip():
