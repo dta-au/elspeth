@@ -20448,7 +20448,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "0f0d2bcbf88ed81a",
             1,
             None,
-            line=184,
+            line=186,
         ),
         # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,
         # so it poisons the otherwise-proven Landscape origin of this
@@ -20593,7 +20593,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "730473cf9d5628ab",
             1,
             "SessionSchemaAuthority",
-            line=283,
+            line=285,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -20603,7 +20603,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "d7ac5811a7ee7916",
             1,
             "SessionSchemaAuthority",
-            line=318,
+            line=320,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -20613,7 +20613,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "983f117ba847fe0d",
             1,
             "SessionSchemaAuthority",
-            line=432,
+            line=434,
         ),
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",

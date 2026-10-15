@@ -24,6 +24,9 @@ All notable changes to ELSPETH are documented here.
   actually delivered to the reviewing provider. A saved revision count does not
   establish that requested edits were completed; complete inspection does not
   establish semantic equivalence.
+- **Advisor redaction preserves evidence identities.** Sensitive text is scrubbed
+  separately from server-owned graph hashes and state IDs, so phone-shaped digit
+  sequences cannot corrupt the structured review evidence.
 - **Operation outcomes survive refreshes.** Authenticated retained outcomes
   expose bounded saved progress and safe diagnostics. Known terminal outcomes
   appear before optional refreshes finish, including attachment to another
@@ -50,7 +53,8 @@ than relying on compatibility keys to evict existing replicas automatically.
 These notes describe source changes. Focused checks and source review do not
 establish final exact-head or PostgreSQL qualification, live provider acceptance,
 operator signature clearance, release tagging or deployment. Automatic image
-publication from main remains held; 0.8.6 container publication is not authorized.
+publication from main remains held. The 0.8.6 tag and container publication follow
+successful required checks and the protected merge.
 
 ## 0.8.5 - LLM compatibility and Composer recovery
 

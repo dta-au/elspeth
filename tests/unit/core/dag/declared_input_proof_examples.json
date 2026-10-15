@@ -313,6 +313,11 @@
     "transform:passthrough_0": []
   },
   "examples/large_scale_test/settings.yaml": {},
+  "examples/llm_ordered_chain/settings.yaml": {
+    "transform:assess_expense": [
+      "receipt_text"
+    ]
+  },
   "examples/llm_source/settings.yaml": {},
   "examples/multi_flow/settings.yaml": {
     "transform:normalize_signups": [],
@@ -392,6 +397,11 @@
   },
   "examples/reference_join/settings_nested.yaml": {
     "transform:enrich_products": []
+  },
+  "examples/reference_join_chain/settings.yaml": {
+    "transform:resolve_support_policy": [
+      "customer_id"
+    ]
   },
   "examples/reference_join_fork_llm/settings.yaml": {
     "transform:draft_reply": [

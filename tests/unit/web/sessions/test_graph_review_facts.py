@@ -45,8 +45,8 @@ pytest_plugins = ("tests.unit.web.coordination.test_composer_operation_authority
 
 @pytest.fixture(autouse=True)
 def no_provider(monkeypatch):
-    async_sdk = AsyncMock(side_effect=AssertionError("storage control must not dispatch an SDK call"))
-    sync_sdk = Mock(side_effect=AssertionError("storage control must not execute a row provider"))
+    async_sdk = AsyncMock(spec=litellm.acompletion, side_effect=AssertionError("storage control must not dispatch an SDK call"))
+    sync_sdk = Mock(spec=litellm.completion, side_effect=AssertionError("storage control must not execute a row provider"))
     monkeypatch.setattr(litellm, "acompletion", async_sdk)
     monkeypatch.setattr(litellm, "completion", sync_sdk)
     yield

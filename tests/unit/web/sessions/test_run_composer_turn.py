@@ -2394,6 +2394,11 @@ async def test_detached_retry_preserves_partial_tool_prefix_without_replaying_to
 
     app, service = _make_app(tmp_path)
     composer = _make_composer_mock("Recovered reply.")
+
+    async def preserve_current_state(_message, _history, state: CompositionState, **_kwargs) -> ComposerResult:
+        return ComposerResult(message="Recovered reply.", state=state)
+
+    composer.compose.side_effect = preserve_current_state
     app.state.composer_service = composer
     session = await service.create_session("alice", "Partial tool retry", "local")
     user = await service.add_message(session.id, "user", "Set the name once", writer_principal="route_user_message")

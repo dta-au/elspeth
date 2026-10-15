@@ -529,7 +529,7 @@ def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None
     # the first-message title branch, retaining all AST fields and strings.
     assert hashlib.sha256(_stable_ast_bytes(public)).hexdigest() == "fe4e8e57be8fd03171e86ac2516422ce4f5d2dc7e75e282ada139fb06980ce0c"
     assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=helper.body[:-1], type_ignores=[]))).hexdigest() == (
-        "863662cb0d75d75747b30fb768236f45e14a55187c3c59290fe13e4e3487474c"
+        "02f2e650fc7028278be731ffefe2f2f3013d7fe08c5e04ebba2c6bcb80484350"
     )
     assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=main_try.body[:4], type_ignores=[]))).hexdigest() == (
         "2f65c341a560baf72b0f8ba1c12a939c8724a2d7691d83690529e79413b31929"

@@ -723,7 +723,7 @@ class AdvisorCheckpointOwner:
         if publication_review is not None:
             if type(publication_review) is not AdvisorPublicationReview:
                 raise TypeError("END publication review must be an owned snapshot")
-            end_arguments["publication_review"] = publication_review.payload_json
+            end_arguments["publication_review"] = publication_review
         return end_arguments
 
     def _advisor_blocked_result(

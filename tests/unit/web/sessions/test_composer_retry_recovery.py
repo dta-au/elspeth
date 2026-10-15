@@ -9,6 +9,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient, Request
 from openai import APIConnectionError
 
+from elspeth.web.composer.protocol import ComposerResult
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.sessions.composer_operations import COMPOSER_SHUTDOWN
 from elspeth.web.sessions.protocol import CompositionStateData
 from tests.helpers.composer_operations import SettledComposerOperation, current_head_state_id, submit_and_settle
@@ -26,6 +28,11 @@ from tests.unit.web.sessions.test_routes import (
 async def test_partial_tool_turn_retries_from_current_state_without_replaying_tools(tmp_path, narration: str) -> None:
     app, service, engine, _composer = _file_app(tmp_path)
     composer = _make_composer_mock(response_text="Recovered reply.")
+
+    async def preserve_current_state(_message, _history, state: CompositionState, **_kwargs) -> ComposerResult:
+        return ComposerResult(message="Recovered reply.", state=state)
+
+    composer.compose.side_effect = preserve_current_state
     app.state.composer_service = composer
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

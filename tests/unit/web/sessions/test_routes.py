@@ -5297,6 +5297,11 @@ class TestMessageRoutes:
 
         mock_composer = _make_composer_mock(response_text="Acknowledged")
 
+        async def preserve_current_state(_message, _history, state: CompositionState, **_kwargs) -> ComposerResult:
+            return ComposerResult(message="Acknowledged", state=state)
+
+        mock_composer.compose.side_effect = preserve_current_state
+
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
         client = TestClient(app)
@@ -5305,9 +5310,8 @@ class TestMessageRoutes:
         resp = client.post("/api/sessions", json={"title": "Chat"})
         session_id = resp.json()["id"]
 
-        # Create a composition state via the service (the mock composer
-        # returns version=1 which won't trigger state persistence in the
-        # route, so we seed one directly).
+        # Seed the observed snapshot; this conversational reply preserves its
+        # authored content and version instead of returning an unrelated draft.
         loop = asyncio.new_event_loop()
         state_record = loop.run_until_complete(
             _save_test_composition_state(
@@ -5334,6 +5338,14 @@ class TestMessageRoutes:
         body = msg_resp.json()
         assert body["message"]["role"] == "assistant"
         assert body["message"]["content"] == "Acknowledged"
+        mock_composer.compose.assert_awaited_once()
+        call = mock_composer.compose.await_args
+        assert call.args[0] == "Hello"
+        assert call.args[2].version == state_record.version
+        assert call.args[2].metadata.name == "Test"
+        assert call.kwargs["current_state_id"] == state_id
+        assert asyncio.run(service.get_current_state(uuid.UUID(session_id))) == state_record
+        assert asyncio.run(service.get_state_versions(uuid.UUID(session_id))) == [state_record]
 
         # Verify provenance: the user message was persisted with the
         # client-asserted state_id as its composition_state_id.
@@ -5728,9 +5740,11 @@ class TestMessageRoutes:
         app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
             spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
         )
-        composer.compose = AsyncMock(
-            spec=ComposerService.compose, return_value=ComposerResult(message="Saved with audit.", state=_EMPTY_STATE, llm_calls=llm_calls)
-        )
+
+        async def preserve_current_state(_message, _history, state: CompositionState, **_kwargs) -> ComposerResult:
+            return ComposerResult(message="Saved with audit.", state=state, llm_calls=llm_calls)
+
+        composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=preserve_current_state)
         app.state.composer_service = composer
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -5758,9 +5772,17 @@ class TestMessageRoutes:
         )
 
         assert send_resp.status_code == 200
+        composer.compose.assert_awaited_once()
+        call = composer.compose.await_args
+        assert call.args[0] == "Build it"
+        assert call.args[2].version == pre_state.version
+        assert call.args[2].metadata.name == "Precompose"
+        assert call.kwargs["current_state_id"] == str(pre_state.id)
         loop = asyncio.new_event_loop()
         try:
             persisted = loop.run_until_complete(service.get_messages(session_id, limit=None))
+            assert loop.run_until_complete(service.get_current_state(session_id)) == pre_state
+            assert loop.run_until_complete(service.get_state_versions(session_id)) == [pre_state]
         finally:
             loop.close()
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, final
+from typing import Any, Literal, cast, final
 
 from pydantic import JsonValue
 
@@ -21,6 +21,7 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._registry import response_contract_for
 from elspeth.web.sessions._persist_payload import CommittedCheckpointWitness
 from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.validation import _redact_sensitive_content
 
 
 def authored_state_hash(state: CompositionState) -> str:
@@ -112,6 +113,7 @@ class AdvisorPublicationReview:
     binding: str
     semantic_repair_key: str
     payload_json: str = field(repr=False)
+    provider_payload_json: str = field(repr=False)
 
 
 def _coverage(pages: Sequence[_RegisteredBlobPage]) -> tuple[BlobInspectionCoverage, ...]:
@@ -446,6 +448,30 @@ class TurnEvidence:
         }
         if self._retained_history is not None:
             payload.update(json.loads(self._retained_history))
+        # Preserve owned identities; only authored/provider text is PII-shaped
+        # prose. Scrubbing serialized JSON also corrupts numeric digest runs.
+        current_call = self._current_calls[scope]
+        provider_payload = payload | {
+            "candidate_reply": _redact_sensitive_content(candidate),
+            "current_request": _redact_sensitive_content(request),
+            "saved_effects": cast(dict[str, JsonValue], payload["saved_effects"])
+            | {"changed_fields": [_redact_sensitive_content(item) for item in fields[:field_limit]] if fields is not None else None},
+            "inspection": cast(dict[str, JsonValue], payload["inspection"])
+            | {
+                "current_candidate_call": (
+                    [_redact_sensitive_content(current_call[0]), current_call[1]] if current_call is not None else None
+                )
+            },
+        }
+        if self._retained_history is not None:
+            history = json.loads(self._retained_history)["retained_operation_history"]
+            provider_payload["retained_operation_history"] = history | {
+                "outcomes": [
+                    outcome
+                    | {"request_id": _redact_sensitive_content(outcome["request_id"]) if outcome["request_id"] is not None else None}
+                    for outcome in history["outcomes"]
+                ]
+            }
         evidence_identity = self.identity
         if scope == "planner":
             evidence_identity = stable_hash(
@@ -487,7 +513,10 @@ class TurnEvidence:
         if self._retained_history is not None:
             semantic_repair_key = stable_hash({"repair": semantic_repair_key, "retained_history": self._retained_history})
         return AdvisorPublicationReview(
-            binding=binding, semantic_repair_key=semantic_repair_key, payload_json=json.dumps(payload, ensure_ascii=False)
+            binding=binding,
+            semantic_repair_key=semantic_repair_key,
+            payload_json=json.dumps(payload, ensure_ascii=False),
+            provider_payload_json=json.dumps(provider_payload, ensure_ascii=False),
         )
 
     def accept_checkpoint(

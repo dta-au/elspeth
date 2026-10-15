@@ -226,7 +226,7 @@ def test_reviewed_app_whole_scope_matches_live_source_and_refuses_drift(fault: s
     assert worker_caller.worker_caller_local_contracts(units)[0] == expected_caller_failures
 
 
-@pytest.mark.parametrize("fault", ("recovery_guard", "recovery_default", "recovery_import"))
+@pytest.mark.parametrize("fault", ("recovery_guard", "review_identity_guard", "recovery_default", "recovery_import"))
 def test_reviewed_writer_recipes_match_live_source_and_refuse_recovery_drift(fault: str) -> None:
     canonical_units = fencing._production_units()
     assert fencing._reserve_recipe_failures(canonical_units) == []
@@ -235,9 +235,18 @@ def test_reviewed_writer_recipes_match_live_source_and_refuse_recovery_drift(fau
     symbol = "ComposerResult"
     if fault == "recovery_guard":
         method = fencing._reserve_node_at(unit, "ComposerResult.__post_init__")
-        guard = method.body[0]
+        # The owned review-identity guard precedes the existing recovery guard.
+        guard = method.body[1]
         assert isinstance(guard, ast.If)
         assert ast.unparse(guard.test).startswith("self.graph_recovery_intent is not None and ")
+        guard.test = ast.Constant(value=False)
+    elif fault == "review_identity_guard":
+        method = fencing._reserve_node_at(unit, "ComposerResult.__post_init__")
+        guard = method.body[0]
+        assert isinstance(guard, ast.If)
+        assert ast.unparse(guard.test) == (
+            "self.graph_review_identity is not None and type(self.graph_review_identity) is not AdvisorGraphReviewIdentity"
+        )
         guard.test = ast.Constant(value=False)
     elif fault == "recovery_default":
         owner = fencing._reserve_node_at(unit, symbol)

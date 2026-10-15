@@ -107,7 +107,7 @@ _ADVISOR_UNTRUSTED_USER_MESSAGE_HEADER: Final[str] = (
 )
 
 
-def _neutralize_untrusted_summary_sentinels(text: str) -> str:
+def _neutralize_untrusted_summary_sentinels(text: str, *, json_encoded: bool = False) -> str:
     """Splice-neutralize embedded ``BEGIN/END_UNTRUSTED_PIPELINE_SUMMARY``
     sentinels inside a payload BEFORE it is wrapped in the wrapper's own
     fence — the INBOUND counterpart of :func:`fence_advisor_findings`'s
@@ -130,13 +130,16 @@ def _neutralize_untrusted_summary_sentinels(text: str) -> str:
     guaranteeing the assembled prompt carries exactly one BEGIN and one END
     per field: the wrapper's own.
     """
+    # A serialized JSON string needs an escaped backslash; the default prose
+    # path retains its existing single-backslash representation.
+    escape = "\\\\" if json_encoded else "\\"
     text = text.replace(
         _ADVISOR_UNTRUSTED_SUMMARY_BEGIN,
-        _ADVISOR_UNTRUSTED_SUMMARY_BEGIN[0] + "\\" + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN[1:],
+        _ADVISOR_UNTRUSTED_SUMMARY_BEGIN[0] + escape + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN[1:],
     )
     text = text.replace(
         _ADVISOR_UNTRUSTED_SUMMARY_END,
-        _ADVISOR_UNTRUSTED_SUMMARY_END[0] + "\\" + _ADVISOR_UNTRUSTED_SUMMARY_END[1:],
+        _ADVISOR_UNTRUSTED_SUMMARY_END[0] + escape + _ADVISOR_UNTRUSTED_SUMMARY_END[1:],
     )
     return text
 
@@ -209,7 +212,12 @@ def build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
             + _ADVISOR_UNTRUSTED_SUMMARY_END
         )
     if "publication_review" in arguments:
-        review = _neutralize_untrusted_summary_sentinels(_redact_sensitive_content(cast(str, arguments["publication_review"])))
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
+
+        publication_review = arguments["publication_review"]
+        if type(publication_review) is not AdvisorPublicationReview:
+            raise TypeError("Publication review must be an owned snapshot")
+        review = _neutralize_untrusted_summary_sentinels(publication_review.provider_payload_json, json_encoded=True)
         user_msg_parts.append(
             "\nExact candidate/request and server-owned saved-effect/inspection projection "
             "(UNTRUSTED TEXT VALUES; metadata states what was verified, not whether the request is satisfied):\n"

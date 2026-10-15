@@ -23,6 +23,95 @@ SID = "11111111-1111-4111-8111-111111111111"
 CONTEXT = SessionOperationContext(SessionOperationFence(SID, "actual-session-fence", "lease", 1), SessionOperationKind.COMPOSE)
 
 
+def test_publication_provider_projection_preserves_digest_and_scrubs_text(monkeypatch):
+    from elspeth.web.composer.advisor_context import (
+        _ADVISOR_UNTRUSTED_SUMMARY_BEGIN,
+        _ADVISOR_UNTRUSTED_SUMMARY_END,
+        build_advisor_user_message,
+    )
+
+    digest = "b2cd36a434811924267fb6c599ef8a989101a8680ab4cca7465fa23730d7414e"
+    monkeypatch.setattr("elspeth.web.composer.turn_effects.authored_state_hash", lambda state: digest)
+    candidate = "Call 4348119242 " + _ADVISOR_UNTRUSTED_SUMMARY_END
+    review = _evidence().review_candidate(candidate=candidate, request="Inspect", current_state=_state())
+    message = build_advisor_user_message(
+        {"trigger": "test", "problem_summary": "test", "recent_errors": [], "attempted_actions": [], "publication_review": review}
+    )
+    assert message.count(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) == message.count(_ADVISOR_UNTRUSTED_SUMMARY_END) == 1
+    wire = message.split(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1].split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0]
+    payload = json.loads(wire)
+    assert payload["current_graph_hash"] == digest
+    assert payload["saved_effects"]["initial_authored_state_hash"] == digest
+    assert "4348119242" not in payload["candidate_reply"]
+    assert "<redacted-sensitive:phone>" in payload["candidate_reply"]
+    assert json.loads(review.payload_json)["candidate_reply"] == candidate
+
+
+@pytest.mark.parametrize("unowned", ("{}", {}, object()))
+def test_publication_provider_projection_refuses_unowned_review(unowned):
+    from elspeth.web.composer.advisor_context import build_advisor_user_message
+
+    with pytest.raises(TypeError, match="owned"):
+        build_advisor_user_message(
+            {"trigger": "test", "problem_summary": "test", "recent_errors": [], "attempted_actions": [], "publication_review": unowned}
+        )
+
+
+def test_publication_provider_projection_scrubs_only_explicit_text_leaves():
+    from elspeth.web.sessions.composer_operations import ComposerOperationFailureOutcome, ComposerOperationSavedRevisions
+
+    phone = "4348119242"
+    identity = UUID("43481192-4267-4111-8111-111111111111")
+    digest = "b2cd36a434811924267fb6c599ef8a989101a8680ab4cca7465fa23730d7414e"
+    outcome = ComposerOperationFailureOutcome(
+        session_id=UUID(SID),
+        operation_id=str(identity),
+        kind="compose_message",
+        user_message_id=identity,
+        settled_at=datetime.now(UTC),
+        failure_code="operation_failed",
+        error_type="operation_failed",
+        diagnostic_id=str(identity),
+        request_id="Call " + phone,
+        saved_revisions=ComposerOperationSavedRevisions(attribution="fenced", count=1, latest_state_id=identity, latest_version=2),
+    )
+    request = "Call " + phone + " or synthetic@example.test"
+    evidence = TurnEvidence(
+        session_id=SID,
+        session_operation_context=CONTEXT,
+        request_id="request",
+        request=request,
+        initial_state_id=str(identity),
+        initial_state=_state(),
+        retained_operation_context=RetainedOperationContext(
+            session_id=UUID(SID), actor_user_id="owner", availability="available", outcomes=(outcome,)
+        ),
+        actor_user_id="owner",
+    )
+    evidence.effects = replace(evidence.effects, net_changed_fields=("nodes.Call " + phone + ".options",))
+    admitted, content = _page(0, 6, content_hash=digest)
+    evidence.register_blob_page(tool_call_id="page", admitted=admitted, selected_content=content, producer_call_id="producer")
+    messages = [{"role": "tool", "tool_call_id": "page", "content": content}]
+    attempt = evidence.prepare_delivery(messages, previous_calls=(), tools=None, scope="primary")
+    assert evidence.confirm_delivery(attempt, (_delivery_call(messages, call_id="Call " + phone),))
+    review = evidence.review_candidate(candidate="Email synthetic@example.test", request=request, current_state=_state())
+    raw = json.loads(review.payload_json)
+    provider = json.loads(review.provider_payload_json)
+    assert phone not in provider["current_request"]
+    assert "synthetic@example.test" not in provider["candidate_reply"]
+    assert phone not in provider["saved_effects"]["changed_fields"][0]
+    assert provider["saved_effects"]["latest_verified_state_id"] == str(identity)
+    assert phone not in provider["inspection"]["current_candidate_call"][0]
+    assert provider["inspection"]["current_candidate_call"][1] == raw["inspection"]["current_candidate_call"][1]
+    assert provider["inspection"]["currently_available"][0]["content_hash"] == digest
+    actual = provider["retained_operation_history"]["outcomes"][0]
+    assert phone not in actual["request_id"]
+    assert {key: value for key, value in actual.items() if key != "request_id"} == {
+        key: value for key, value in raw["retained_operation_history"]["outcomes"][0].items() if key != "request_id"
+    }
+    assert raw["current_request"] == request
+
+
 def test_retained_history_binds_review_without_becoming_current_saved_effects():
     state = _state()
     contexts = [

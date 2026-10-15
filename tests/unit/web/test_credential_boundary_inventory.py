@@ -606,6 +606,10 @@ _STATE_MATERIALIZATION_DISPOSITIONS = {
     # The nominal committed witness is checked against this session/fence;
     # materialization compares authored hashes and effects, not a new input.
     "src/elspeth/web/composer/turn_effects.py:TurnEvidence.accept_checkpoint.state_from_record": "committed_checkpoint_comparison",
+    # Graph-review qualification compares the committed checkpoint's identity,
+    # fingerprint and field bounds; neither hydration dispatches or publishes it.
+    "src/elspeth/web/sessions/service.py:SessionServiceImpl._graph_review_on_connection.read_state.state_from_record": "committed_checkpoint_comparison",
+    "src/elspeth/web/sessions/service.py:SessionServiceImpl._validate_terminal_graph_review.state_from_record": "committed_checkpoint_comparison",
     "src/elspeth/web/sessions/graph_recovery.py:read_editable_checkpoint.state_from_record": "recovery_checkpoint_guard",
     "src/elspeth/web/sessions/service.py:SessionServiceImpl.load_graph_recovery_context._sync.state_from_record": "recovery_checkpoint_guard",
     "src/elspeth/web/sessions/service.py:SessionServiceImpl.read_current_composition_graph._sync.state_from_record": "recovery_checkpoint_guard",

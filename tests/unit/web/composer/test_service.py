@@ -1743,7 +1743,7 @@ class TestComposerMultiTurnToolCalls:
         async def review_echo(
             arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
         ) -> tuple[str, dict[str, object]]:
-            review = json.loads(arguments["publication_review"])
+            review = json.loads(arguments["publication_review"].payload_json)
             reviews.append(review)
             assert len(reviews) <= 2, "Only two END responses are supplied"
             assert review["current_request"] == "Review this pipeline"
@@ -1889,7 +1889,7 @@ class TestComposerMultiTurnToolCalls:
         async def rereview(
             arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
         ) -> tuple[str, dict[str, object]]:
-            review = json.loads(arguments["publication_review"])
+            review = json.loads(arguments["publication_review"].payload_json)
             reviews.append(review)
             assert len(reviews) <= 2, "Only the original two review responses are supplied"
             assert review["current_request"] == "Review this pipeline"
@@ -1976,7 +1976,7 @@ class TestComposerMultiTurnToolCalls:
         async def rereview(
             arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
         ) -> tuple[str, dict[str, object]]:
-            review = json.loads(arguments["publication_review"])
+            review = json.loads(arguments["publication_review"].payload_json)
             reviewed.append(review)
             assert len(reviewed) <= 2, "Only two END responses are supplied"
             assert review["current_request"] == "Review this pipeline"
@@ -2290,7 +2290,6 @@ class TestComposerMultiTurnToolCalls:
         from elspeth.web.sessions.models import composition_states_table
         from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_or_tool_messages
         from elspeth.web.sessions.state_envelope import unwrap_state_column
-        from elspeth.web.validation import _redact_sensitive_content
 
         catalog = _mock_catalog()
         settings = _make_settings()
@@ -2357,7 +2356,7 @@ class TestComposerMultiTurnToolCalls:
             assert review["saved_effects"]["saved_revision_count"] == saved_count == len(saved_revisions())
             assert review["saved_effects"]["net_changed"] is bool(saved_count)
             if saved_count:
-                assert review["saved_effects"]["latest_committed_state_id"] == _redact_sensitive_content(saved_revisions()[0][0])
+                assert review["saved_effects"]["latest_committed_state_id"] == saved_revisions()[0][0]
                 # This fixture has no seeded durable state: SQL allocates its
                 # first version as 1, independently of the in-memory version.
                 assert saved_revisions()[0][1:] == (1, {"name": "Repaired", "description": ""})
@@ -2404,11 +2403,9 @@ class TestComposerMultiTurnToolCalls:
         bindings = [call.kwargs["publication_review"].binding for call in checkpoints.await_args_list]
         assert all(call.kwargs["phase"] == "end" for call in checkpoints.await_args_list)
         owned_reviews = [json.loads(call.kwargs["publication_review"].payload_json) for call in checkpoints.await_args_list]
-        # Native provider context applies privacy redaction even to UUID text
-        # that happens to resemble a phone number; owned binding stays exact.
-        assert [
-            json.loads(_redact_sensitive_content(call.kwargs["publication_review"].payload_json)) for call in checkpoints.await_args_list
-        ] == reviews
+        # Provider text is scrubbed without changing owned metadata identities.
+        assert [json.loads(call.kwargs["publication_review"].provider_payload_json) for call in checkpoints.await_args_list] == reviews
+        assert [review["current_graph_hash"] for review in reviews] == [review["current_graph_hash"] for review in owned_reviews]
         assert (owned_reviews[0]["current_graph_hash"] != owned_reviews[1]["current_graph_hash"]) is mutate_after_discovery
         assert revision_snapshots[:3] == [(), (), ()], "Neither initial review nor list_sources saves a revision"
         assert result.state.outputs == ()
