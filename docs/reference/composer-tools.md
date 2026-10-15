@@ -465,6 +465,32 @@ Get metadata for a specific blob by ID.
 
 ---
 
+### `get_blob_content`
+
+Read a ready blob's decoded text for inspection, with bounded continuation.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `blob_id` | string | **Yes** | Blob ID to read |
+| `offset_chars` | integer | No | Nonnegative start offset in original Unicode code points; defaults to `0` |
+| `expected_content_hash` | string or null | After offset `0` | Lowercase 64-hex SHA-256 of the original bytes. Omit or use null at offset `0` for no expected-identity constraint; every non-null hash is checked, including at offset `0` |
+
+**Returns:** `content`, verified original-byte `content_hash`, full `size_bytes`
+and `total_chars`, half-open `[start_char, end_char)` range, `truncated`, and
+`next_offset_chars`, plus blob identity and recorded origin metadata. Each page
+contains at most 50,000 original Unicode code points; the complete serialized
+JSON tool response is bounded to 65,536 bytes, so escaping and metadata can
+reduce the returned text.
+
+Continue with `offset_chars` set to the returned `next_offset_chars` and
+`expected_content_hash` set to the returned `content_hash`. A changed content
+identity is refused. `truncated`
+means `end_char < total_chars`; `next_offset_chars` is null at the end. A prefix
+does not establish whole-file inspection, and `size_bytes` describes the full
+blob rather than this page.
+
+---
+
 ### `set_source_from_blob`
 
 Wire a blob as the pipeline source. Resolves the blob's storage path internally and infers the source plugin from its MIME type.

@@ -19,9 +19,9 @@ Spec: docs-archive/specs/2026-08-01-composer-completion-gate-persistence-design.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, Final, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, Final, NotRequired, TypedDict
 
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.advisor_decision import (
@@ -44,6 +44,10 @@ from elspeth.web.execution.schemas import (
     ValidationResult,
 )
 from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
+    from elspeth.web.sessions.protocol import CompositionStateRecord
 
 COMPLETION_GATES_META_KEY: Final[str] = "completion_gates"
 _ADVISOR_SIGNOFF_GATE_KEY: Final[str] = "advisor_signoff"
@@ -93,6 +97,24 @@ class CompletionGateFacts:
     """Parsed ``completion_gates`` envelope. ``None`` fields = gate not withheld."""
 
     advisor_signoff: AdvisorSignoffGateFact | None
+
+
+def project_committed_graph_review(
+    stored: CompositionStateRecord,
+    review: AdvisorGraphReviewFact,
+) -> CompositionStateRecord:
+    """Expose effective gate metadata without rewriting the immutable snapshot."""
+    from elspeth.web.sessions.protocol import CompositionStateReviewProjection
+
+    if stored.review_projection is not None:
+        raise ValueError("Graph review projection requires the raw stored snapshot")
+    metadata = dict(stored.composer_meta) if stored.composer_meta is not None else {}
+    metadata[COMPLETION_GATES_META_KEY] = completion_gates_meta_from_facts(review.gates)
+    return replace(
+        stored,
+        composer_meta=metadata,
+        review_projection=CompositionStateReviewProjection(stored=stored, review=review),
+    )
 
 
 def advisor_signoff_check_failed(checks: Sequence[ValidationCheck]) -> bool:

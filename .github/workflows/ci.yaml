@@ -387,7 +387,9 @@ jobs:
     # Run tests even if static analysis fails, so both results are visible.
     strategy:
       fail-fast: false
-      max-parallel: 2
+      # Four ordinary jobs use eight pytest workers; the two proof jobs
+      # retain capacity on the six trusted runners.
+      max-parallel: 4
       matrix:
         python-version: ["3.12", "3.13"]
         shard: [0, 1, 2, 3, 4, 5, 6, 7]

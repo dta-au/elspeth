@@ -56,6 +56,7 @@ from elspeth.web.async_workers import (
     run_stream_read_in_worker,
     run_sync_in_worker,
 )
+from elspeth.web.composer.advisor_audit import ADVISOR_GRAPH_REVIEW_AUDIT_KIND, AdvisorGraphReviewFact
 from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent, GraphRecoveryPark, qualify_editable_checkpoint
 from elspeth.web.composer.no_tool_policy import visible_message_segments
@@ -217,6 +218,7 @@ from elspeth.web.sessions.models import (
     audit_access_log_table,
     blobs_table,
     chat_messages_table,
+    composer_async_operations_table,
     composition_graph_parks_table,
     composition_proposals_table,
     composition_rejection_events_table,
@@ -891,8 +893,8 @@ class SessionServiceImpl:
                     .limit(1)
                 ).one_or_none()
                 return (
-                    self._row_to_state_record(anchor_row) if anchor_row is not None else None,
-                    self._row_to_state_record(live_row) if live_row is not None else None,
+                    self._effective_state_record_on_connection(conn, anchor_row) if anchor_row is not None else None,
+                    self._effective_state_record_on_connection(conn, live_row) if live_row is not None else None,
                 )
 
         return cast(tuple[CompositionStateRecord | None, CompositionStateRecord | None], await self._run_sync(_read))
@@ -5230,7 +5232,7 @@ class SessionServiceImpl:
                 ).one_or_none()
                 if live_state_row is None:
                     raise AuditIntegrityError(f"resolve_interpretation_event: session {sid!r} has no composition state to patch")
-                state_record = self._row_to_state_record(live_state_row)
+                state_record = self._effective_state_record_on_connection(conn, live_state_row)
                 surfacing_state_record: CompositionStateRecord | None = None
                 if event_row.composition_state_id is not None:
                     surfacing_state_row = conn.execute(
@@ -5239,7 +5241,7 @@ class SessionServiceImpl:
                         .where(composition_states_table.c.session_id == sid)
                     ).one_or_none()
                     if surfacing_state_row is not None:
-                        surfacing_state_record = self._row_to_state_record(surfacing_state_row)
+                        surfacing_state_record = self._effective_state_record_on_connection(conn, surfacing_state_row)
                 if surfacing_state_record is None:
                     raise AuditIntegrityError(f"resolve_interpretation_event: event {eid!r} has no same-session surfacing state")
                 if inline_blob_snapshot is not None:
@@ -6516,12 +6518,21 @@ class SessionServiceImpl:
 
         return cast(CompositionStateHead, await self._run_sync(_sync))
 
-    async def read_current_composition_graph(self, session_id: UUID) -> CompositionGraphRead:
-        """Hydrate the exact immutable row named by the scalar head read."""
+    async def read_current_composition_graph(
+        self, session_id: UUID, *, required_work: RequiredWorkTicket | None = None
+    ) -> CompositionGraphRead:
+        """Read one exact head and its effective gates, including an absent head."""
         from elspeth.web.execution.completion_gates import parse_completion_gates
+
+        _validate_required_sql_ticket(required_work, sources=(RequiredWorkSource.PREPARATION_READ_SQL,), session_id=str(session_id))
 
         def _sync() -> CompositionGraphRead:
             with self._engine.begin() as conn:
+                if required_work is not None:
+                    context = required_work.key.authority.context
+                    self._require_session_operation_context_on_connection(
+                        conn, context, session_id=str(session_id), expected_kind=context.operation_kind, now=database_now(conn)
+                    )
                 scalar = conn.execute(
                     select(composition_states_table.c.id, composition_states_table.c.version)
                     .where(composition_states_table.c.session_id == str(session_id))
@@ -6529,7 +6540,10 @@ class SessionServiceImpl:
                     .limit(1)
                 ).one_or_none()
                 if scalar is None:
-                    return CompositionGraphRead(CompositionStateHead(None, 0), None)
+                    review = self._graph_review_on_connection(conn, session_id=session_id, stored=None)
+                    return CompositionGraphRead(
+                        CompositionStateHead(None, 0), None, effective_completion_gates=review.gates if review is not None else None
+                    )
                 if type(scalar.version) is not int or scalar.version < 1:
                     raise AuditIntegrityError("Composition head version is invalid")
                 head = CompositionStateHead(recovery_identity(scalar.id), scalar.version)
@@ -6546,9 +6560,14 @@ class SessionServiceImpl:
                     parse_completion_gates(record.composer_meta)
                 except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError) as exc:
                     return CompositionGraphRead(head, None, type(exc).__name__)
-                return CompositionGraphRead(head, record)
+                record = self._effective_state_record_on_connection(conn, row)
+                return CompositionGraphRead(head, record, effective_completion_gates=parse_completion_gates(record.composer_meta))
 
-        return cast(CompositionGraphRead, await self._run_sync(_sync))
+        return (
+            await run_required_sql_in_worker(required_work, _sync)
+            if required_work is not None
+            else cast(CompositionGraphRead, await self._run_sync(_sync))
+        )
 
     async def load_graph_recovery_context(
         self,
@@ -6622,6 +6641,13 @@ class SessionServiceImpl:
                         # established. The damaged payload is never sent to a model.
                         record = None
                         malformed = True
+                effective_gates = None
+                if record is not None:
+                    record = self._effective_state_record_on_connection(conn, row)
+                    effective_gates = parse_completion_gates(record.composer_meta)
+                elif current_id is None:
+                    review = self._graph_review_on_connection(conn, session_id=session_id, stored=None)
+                    effective_gates = review.gates if review is not None else None
                 return GraphRecoveryAdmission(
                     context=GraphRecoveryContext(
                         turn_start_state_id=str(current_id) if current_id is not None else None,
@@ -6632,6 +6658,7 @@ class SessionServiceImpl:
                         parked_graphs=tuple(parks),
                     ),
                     record=record,
+                    effective_completion_gates=effective_gates,
                 )
 
         return cast(GraphRecoveryAdmission, await self._run_sync(_sync))
@@ -6740,6 +6767,43 @@ class SessionServiceImpl:
                 empty_fallback = state is None
                 if state is None:
                     state = empty_recovery_state()
+                from elspeth.web.execution.completion_gates import completion_gates_meta_from_facts, parse_completion_gates
+
+                data = checkpoint_data(state)
+                prior = None
+                reviewed_state = state
+                if target_id is not None:
+                    # Graph eligibility remains independent of legacy gate or
+                    # validation decoding. A damaged old metadata envelope must
+                    # not prevent the existing graph-only recovery path.
+                    try:
+                        reviewed_state = read_editable_checkpoint(conn, session_id, target_id)
+                    except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                        # Only park can select a new valid candidate over an
+                        # unreadable current target. A new authoritative fact,
+                        # if present, still has to match below or fail closed.
+                        reviewed_state = state
+                    legacy_meta = conn.execute(
+                        select(composition_states_table.c.composer_meta).where(
+                            composition_states_table.c.id == str(target_id), composition_states_table.c.session_id == sid
+                        )
+                    ).scalar_one()
+                    try:
+                        prior = parse_completion_gates(self._unwrap_envelope(legacy_meta))
+                    except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                        prior = None
+                # This validation is outside the legacy damage handler. New
+                # fact corruption/custody loss is an integrity refusal, never
+                # silently treated as an absent review or a safe checkpoint.
+                review = self._graph_review_for_base_on_connection(
+                    conn, session_id=session_id, state_id=target_id, read_state=lambda: reviewed_state
+                )
+                if review is not None:
+                    review.validate_for_state(reviewed_state, prior=prior)
+                    self._assert_graph_review_receipt(conn, review)
+                    prior = review.gates
+                if prior is not None and prior.advisor_signoff is not None:
+                    data = replace(data, composer_meta={"completion_gates": completion_gates_meta_from_facts(prior)})
                 return GraphRecoverySettlement(
                     session_id=session_id,
                     operation_id=operation_id,
@@ -6750,7 +6814,7 @@ class SessionServiceImpl:
                     state_id=(
                         expected_id if intent.action == "park" and expected_id is not None and not park_changes_head else uuid.uuid4()
                     ),
-                    data=checkpoint_data(state),
+                    data=data,
                     park_id=uuid.uuid4() if intent.action == "park" else None,
                     empty_fallback=empty_fallback,
                     receipt_id=uuid.uuid4(),
@@ -6769,21 +6833,22 @@ class SessionServiceImpl:
 
         _validate_required_sql_ticket(required_work, sources=(RequiredWorkSource.PREPARATION_READ_SQL,), session_id=str(session_id))
 
-        def _sync() -> Any:
+        def _sync() -> CompositionStateRecord | None:
             with self._engine.begin() as conn:
-                return conn.execute(
+                row = conn.execute(
                     select(composition_states_table)
                     .where(composition_states_table.c.session_id == str(session_id))
                     .order_by(desc(composition_states_table.c.version))
                     .limit(1)
                 ).fetchone()
+                return self._effective_state_record_on_connection(conn, row) if row is not None else None
 
         row = await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync)
 
         if row is None:
             return None
 
-        return self._row_to_state_record(row)
+        return row
 
     async def get_state_versions(
         self,
@@ -6835,6 +6900,201 @@ class SessionServiceImpl:
             derived_from_state_id=(UUID(row.derived_from_state_id) if row.derived_from_state_id is not None else None),
             composer_meta=self._unwrap_envelope(row.composer_meta),
         )
+
+    def _graph_review_on_connection(
+        self,
+        conn: Connection,
+        *,
+        session_id: UUID,
+        stored: CompositionStateRecord | None,
+    ) -> AdvisorGraphReviewFact | None:
+        """Resolve effective facts on a normally hydrated immutable snapshot."""
+        from elspeth.web.execution.completion_gates import parse_completion_gates
+
+        def read_state() -> CompositionState:
+            return state_from_record(stored) if stored is not None else empty_recovery_state()
+
+        fact = self._graph_review_for_base_on_connection(
+            conn, session_id=session_id, state_id=stored.id if stored is not None else None, read_state=read_state
+        )
+        if fact is not None:
+            fact.validate_for_state(read_state(), prior=parse_completion_gates(stored.composer_meta) if stored is not None else None)
+            self._assert_graph_review_receipt(conn, fact)
+        return fact
+
+    def _graph_review_for_base_on_connection(
+        self,
+        conn: Connection,
+        *,
+        session_id: UUID,
+        state_id: UUID | None,
+        read_state: Callable[[], CompositionState],
+    ) -> AdvisorGraphReviewFact | None:
+        """Read one typed latest fact, then verify its committed terminal by PK.
+
+        The session/sequence index bounds returned data, not worst-case scan
+        work. Never fetch a transcript or infer authority from provider audits.
+        The qualification owner must check field bounds and the exact END
+        receipt before exposing this fact as an effective gate.
+        """
+        from elspeth.web.execution.completion_gates import completion_gate_fingerprint
+
+        row = conn.execute(
+            select(chat_messages_table.c.tool_calls)
+            .where(
+                chat_messages_table.c.session_id == str(session_id),
+                chat_messages_table.c.composition_state_id == (str(state_id) if state_id is not None else None),
+                chat_messages_table.c.role == "audit",
+                chat_messages_table.c.writer_principal == "compose_loop",
+                chat_messages_table.c.tool_calls[0]["_kind"].as_string() == ADVISOR_GRAPH_REVIEW_AUDIT_KIND,
+            )
+            .order_by(chat_messages_table.c.sequence_no.desc())
+            .limit(1)
+        ).one_or_none()
+        if row is None:
+            return None
+        if type(row.tool_calls) is not list or len(row.tool_calls) != 1:
+            raise AuditIntegrityError("Committed graph review row has malformed framing")
+        fact = AdvisorGraphReviewFact.from_envelope(row.tool_calls[0])
+        state = read_state()
+        if (
+            fact.session_id != session_id
+            or fact.state_id != state_id
+            or fact.content_hash != composition_content_hash(state)
+            or fact.identity.for_graph != completion_gate_fingerprint(state)
+        ):
+            raise AuditIntegrityError("Committed graph review does not match the exact immutable base")
+        operation = conn.execute(
+            select(
+                composer_async_operations_table.c.status,
+                composer_async_operations_table.c.session_operation_id,
+                composer_async_operations_table.c.session_operation_epoch,
+            ).where(
+                composer_async_operations_table.c.session_id == str(session_id),
+                composer_async_operations_table.c.operation_id == fact.terminal_operation_id,
+            )
+        ).one_or_none()
+        if (
+            operation is None
+            or operation.status != "completed"
+            or operation.session_operation_id != fact.operation_id
+            or operation.session_operation_epoch != fact.operation_epoch
+        ):
+            raise AuditIntegrityError("Graph review lacks its exact committed terminal custody")
+        return fact
+
+    def _assert_graph_review_receipt(self, conn: Connection, fact: AdvisorGraphReviewFact) -> None:
+        """Require the exact owned END receipt, never the latest unrelated call."""
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, AdvisorCheckpointPassRecord
+
+        if fact.identity.source != "model":
+            return
+        receipt = conn.execute(
+            select(chat_messages_table.c.tool_calls)
+            .where(
+                chat_messages_table.c.session_id == str(fact.session_id),
+                chat_messages_table.c.role == "audit",
+                chat_messages_table.c.writer_principal == "compose_loop",
+                chat_messages_table.c.tool_calls[0]["_kind"].as_string() == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND,
+                chat_messages_table.c.tool_calls[0]["pass"]["phase"].as_string() == "end",
+                chat_messages_table.c.tool_calls[0]["pass"]["source"].as_string() == "model",
+                chat_messages_table.c.tool_calls[0]["pass"]["publication_binding"].as_string() == fact.identity.binding,
+            )
+            .order_by(chat_messages_table.c.sequence_no.desc())
+            .limit(1)
+        ).one_or_none()
+        if receipt is None or type(receipt.tool_calls) is not list or len(receipt.tool_calls) != 1:
+            raise AuditIntegrityError("Graph review lost its exact model review receipt")
+        try:
+            accepted = AdvisorCheckpointPassRecord(**receipt.tool_calls[0]["pass"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AuditIntegrityError("Graph review model receipt is malformed") from exc
+        if accepted.provider_attempts < 1:
+            raise AuditIntegrityError("Model review has no actual provider attempt")
+        if fact.action == "passed" and (accepted.verdict != "clean" or accepted.publication_verdict != "ADMIT"):
+            raise AuditIntegrityError("Graph pass is not an admitted CLEAN model review")
+
+    def _effective_state_record_on_connection(self, conn: Connection, row: Any) -> CompositionStateRecord:
+        from elspeth.web.execution.completion_gates import project_committed_graph_review
+
+        stored = self._row_to_state_record(row)
+        review = self._graph_review_on_connection(conn, session_id=stored.session_id, stored=stored)
+        return project_committed_graph_review(stored, review) if review is not None else stored
+
+    def _validate_terminal_graph_review(
+        self,
+        conn: Connection,
+        *,
+        running: ComposerOperationRunning,
+        drafts: Sequence[AuditMessageDraft],
+        audit_state_id: UUID | None,
+    ) -> AdvisorGraphReviewFact | None:
+        """Validate the captured base and actual review inside terminal custody."""
+        from elspeth.web.composer.advisor_decision import AdvisorBlockCause
+        from elspeth.web.execution.completion_gates import CompletionGateFacts, completion_gate_fingerprint, parse_completion_gates
+
+        found: AdvisorGraphReviewFact | None = None
+        for draft in drafts:
+            for envelope in draft.tool_calls or ():
+                if "_kind" not in envelope or envelope["_kind"] != ADVISOR_GRAPH_REVIEW_AUDIT_KIND:
+                    continue
+                if found is not None or draft.role != "audit" or draft.tool_calls is None or len(draft.tool_calls) != 1:
+                    raise AuditIntegrityError("Terminal graph review must be one private cohort row")
+                fact = AdvisorGraphReviewFact.from_envelope(envelope)
+                found = fact
+                context = running.session_operation_context
+                if (
+                    fact.session_id != running.claim.session_id
+                    or fact.terminal_operation_id != running.claim.operation_id
+                    or fact.operation_id != context.fence.operation_id
+                    or fact.operation_epoch != context.fence.operation_epoch
+                    or draft.content != canonical_json(fact.to_envelope())
+                    or draft.effective_composition_state_id(str(audit_state_id) if audit_state_id is not None else None)
+                    != (str(fact.state_id) if fact.state_id is not None else None)
+                ):
+                    raise AuditIntegrityError("Terminal graph review differs from actual cohort custody")
+                head = conn.execute(
+                    select(composition_states_table)
+                    .where(composition_states_table.c.session_id == str(fact.session_id))
+                    .order_by(composition_states_table.c.version.desc())
+                    .limit(1)
+                ).one_or_none()
+                actual_id = UUID(head.id) if head is not None else None
+                stored = self._row_to_state_record(head) if head is not None else None
+                state = state_from_record(stored) if stored is not None else empty_recovery_state()
+                if (
+                    actual_id != fact.state_id
+                    or composition_content_hash(state) != fact.content_hash
+                    or completion_gate_fingerprint(state) != fact.identity.for_graph
+                ):
+                    raise AuditIntegrityError("Terminal graph review captured base changed before commit")
+                prior_review = self._graph_review_on_connection(conn, session_id=fact.session_id, stored=stored)
+                prior = (
+                    prior_review.gates
+                    if prior_review is not None
+                    else parse_completion_gates(stored.composer_meta)
+                    if stored is not None
+                    else None
+                )
+                prior = prior if prior is not None else CompletionGateFacts(advisor_signoff=None)
+                fact.validate_for_state(state, prior=prior)
+                if fact.action == "unchanged" and fact.gates != prior:
+                    raise AuditIntegrityError("Unchanged graph review attempted to replace prior facts")
+                if fact.action == "blocked" and (
+                    fact.gates.advisor_signoff is None or fact.gates.advisor_signoff.for_graph != fact.identity.for_graph
+                ):
+                    raise AuditIntegrityError("New graph blocker is not bound to the reviewed graph")
+                if (
+                    fact.action == "passed"
+                    and prior.advisor_signoff is not None
+                    and (
+                        prior.advisor_signoff.cause is AdvisorBlockCause.GRAPH_REJECTED
+                        and prior.advisor_signoff.for_graph == fact.identity.for_graph
+                    )
+                ):
+                    raise AuditIntegrityError("Unchanged graph rejection cannot be erased by prose review")
+                self._assert_graph_review_receipt(conn, fact)
+        return found
 
     async def create_run(
         self,
@@ -7571,19 +7831,20 @@ class SessionServiceImpl:
                 required_work, sources=(RequiredWorkSource.PREPARATION_READ_SQL,), session_id=required_work.key.session_id
             )
 
-        def _sync() -> Any:
+        def _sync() -> CompositionStateRecord | None:
             with self._engine.begin() as conn:
                 query = select(composition_states_table).where(composition_states_table.c.id == str(state_id))
                 if required_work is not None:
                     query = query.where(composition_states_table.c.session_id == required_work.key.session_id)
-                return conn.execute(query).fetchone()
+                row = conn.execute(query).fetchone()
+                return self._effective_state_record_on_connection(conn, row) if row is not None else None
 
         row = await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync)
 
         if row is None:
             raise ValueError(f"State not found: {state_id}")
 
-        return self._row_to_state_record(row)
+        return row
 
     async def get_state_in_session(
         self,
@@ -7653,6 +7914,7 @@ class SessionServiceImpl:
                 ).one_or_none()
                 if prior_row is None or prior_row.session_id != sid:
                     raise ValueError("State not found")
+                prior_record = self._effective_state_record_on_connection(conn, prior_row)
                 current_row = conn.execute(
                     select(composition_states_table)
                     .where(composition_states_table.c.session_id == sid)
@@ -7725,7 +7987,7 @@ class SessionServiceImpl:
                             metadata_=self._unwrap_envelope(prior_row.metadata_),
                             is_valid=prior_row.is_valid,
                             validation_errors=decode_stored_composition_validation_errors(prior_row.validation_errors),
-                            composer_meta=self._unwrap_envelope(prior_row.composer_meta),
+                            composer_meta=prior_record.composer_meta,
                         ),
                         derived_from_state_id=target_state_id,
                     ),
@@ -8026,13 +8288,18 @@ class SessionServiceImpl:
         if fork_msg.role != "user":
             raise InvalidForkTargetError(str(fork_message_id), fork_msg.role)
 
-        # Private diagnostics belong to the source session and its operation
-        # bindings. A fork copies conversation/state, not private evidence.
+        # Private diagnostics and graph-review authority belong to the source
+        # session and its operation bindings. A fork copies conversation/state,
+        # not private evidence or the parent's authoritative review facts.
         # Recognize the kind even on a damaged row rather than copying it.
         messages_to_copy = [
             message
             for message in source_messages[:fork_idx]
-            if message.tool_calls is None or not any(is_diagnostic_evidence_envelope(envelope) for envelope in message.tool_calls)
+            if message.tool_calls is None
+            or not any(
+                is_diagnostic_evidence_envelope(envelope) or ("_kind" in envelope and envelope["_kind"] == ADVISOR_GRAPH_REVIEW_AUDIT_KIND)
+                for envelope in message.tool_calls
+            )
         ]
         pre_send_state_id = fork_msg.composition_state_id
 
@@ -8179,6 +8446,13 @@ class SessionServiceImpl:
                 if locked_source_row is None:
                     raise AuditIntegrityError("Fork source checkpoint is missing or cross-session")
                 locked_source_state = self._row_to_state_record(locked_source_row)
+                if source_state_record.review_projection is not None:
+                    # The parent fork fence excludes concurrent COMPOSE writes.
+                    # Match the immutable row captured by the effective read;
+                    # carry only its gate metadata into the ordinary child copy.
+                    if locked_source_state != source_state_record.review_projection.stored:
+                        raise AuditIntegrityError("Fork source snapshot changed after effective review read")
+                    locked_source_state = source_state_record
                 forked_composer_meta = deep_thaw(locked_source_state.composer_meta)
                 # Custody no rewriter can rebase is refused HERE, inside the
                 # staging transaction and before any child row is written, so
@@ -9009,6 +9283,9 @@ class SessionServiceImpl:
                 if attempted_response is not None and not _can_retry(current_job, now):
                     raise _ComposerTerminalRetryStateChanged("immutable terminal retry driving state changed")
                 attempted_deadline_expired = current_job.deadline_at <= now
+                terminal_review = self._validate_terminal_graph_review(
+                    conn, running=running, drafts=audit_cohort, audit_state_id=audit_composition_state_id
+                )
                 recovery_state_id = (
                     self._settle_graph_recovery_on_connection(
                         conn,
@@ -9102,6 +9379,15 @@ class SessionServiceImpl:
                         .limit(1)
                     ).one_or_none()
                     state = self._row_to_state_record(state_row) if state_row is not None else None
+                    if state is not None:
+                        from elspeth.web.execution.completion_gates import project_committed_graph_review
+
+                        # This candidate fact was validated under this same live
+                        # terminal transaction. It is not publicly visible until
+                        # the response, cohort and terminal all commit together.
+                        review = terminal_review or self._graph_review_on_connection(conn, session_id=state.session_id, stored=state)
+                        if review is not None:
+                            state = project_committed_graph_review(state, review)
                 if attempted_response is not None and (proposals != attempted_proposals or state != attempted_state):
                     raise _ComposerTerminalRetryStateChanged("immutable terminal response snapshot changed")
                 attempted_proposals, attempted_state = proposals, state

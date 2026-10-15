@@ -63,6 +63,7 @@ These examples run locally with no credentials or external services.
 | [`scope_collector`](scope_collector/) | `scopes:` + `collectors:` — the barrier that closes an EXPAND group. `require_all` vs `best_effort` on a document with one lost page: no statistic at all, or a mean over the survivors |
 | [`transform_pipeline`](transform_pipeline/) | Normalize CSV field types, then compute derived values with `type_coerce` and `value_transform` |
 | [`reference_join`](reference_join/) | Enrich a row from a keyed reference table bound as configuration; three configs — flat CSV, nested JSON with a sparse entry, and the default `on_miss: fail` quarantining an unknown key (exit 1 by design) |
+| [`reference_join_chain`](reference_join_chain/) | One `reference_join` node: customer lookup produces a region, then the next internal lookup consumes it to select a support policy; original-row quarantine on either miss |
 | [`database_sink`](database_sink/) | Write pipeline output to SQLite via `./examples/database_sink/run.sh`, which provisions the operator-owned target and effect ledger |
 | [`checkpoint_resume`](checkpoint_resume/) | Crash recovery via checkpointing and `elspeth resume` |
 | [`retention_purge`](retention_purge/) | Payload retention lifecycle and `elspeth purge` |
@@ -148,6 +149,7 @@ shown in the individual READMEs.
 | Example | What It Demonstrates |
 |---------|---------------------|
 | [`chaosllm_sentiment`](chaosllm_sentiment/) | Sentiment analysis against ChaosLLM (mirrors `openrouter_sentiment`) |
+| [`llm_ordered_chain`](llm_ordered_chain/) | One `llm` node: typed receipt extraction feeds a later policy query through ordered internal bindings; local request-sensitive fixture and audited dependency checks |
 | [`ab_llm_experiment`](ab_llm_experiment/) | Two-arm A/B over ChaosLLM; `run.sh` starts its own server, runs all three configs and self-verifies each |
 | [`reference_join_fork_llm`](reference_join_fork_llm/) | Enrich once with `reference_join`, then fork into two LLM branches on separate endpoints and merge with a `require_all` / `merge: nested` coalesce; `run.sh` starts both ChaosLLM servers with zero fault injection |
 | [`document_review_panel`](document_review_panel/) | Two-reviewer panel per page over ChaosLLM; `run.sh` runs the clean, cascade and run-as-one-row configs and self-verifies each |

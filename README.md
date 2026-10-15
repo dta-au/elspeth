@@ -106,7 +106,9 @@ saved changes and delivered inspection evidence, or withheld when admission
 cannot be established within existing limits. Reply admission does not clear
 graph or execution blockers. See the [release notes](CHANGELOG.md).
 
-Session epoch 75 and Landscape epoch 49 are unchanged. Compatible stores
+Session epoch 76 replaces session epoch 75; Landscape epoch 49 is unchanged.
+Preserve epoch 75 session stores and use a separately provisioned epoch 76
+session store. Keep old workers isolated from the new store. Compatible stores
 still require exact schema admission; unsupported stores are preserved and
 refused before incompatible writes. Backwards compatibility is permitted and
 considered from 0.8.5 within explicitly supported boundaries. This candidate

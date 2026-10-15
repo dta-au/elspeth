@@ -2274,15 +2274,24 @@ class TestComposerMultiTurnToolCalls:
         assert all(row.content != "Renaming it as the review asked." for row in stored if row.role == "assistant")
 
     @pytest.mark.asyncio
-    async def test_flagged_discovery_only_tool_call_does_not_elide_advisor_message(self) -> None:
-        """R2-F12 Step 3 non-regression (review finding 1): a discovery-only
-        tool call (list_sources — no mutation) following a FLAGGED advisor
-        pass must NOT drain the injected advisor message. If it did, the
-        model's NEXT no-tool reply would be asked to "fix" findings it can
-        no longer see, the END gate would re-flag on unchanged state, and
-        the run would needlessly block. The advisor message must survive
-        into the discovery turn's own context and into whatever follows it,
-        right up until a turn that actually mutates state."""
+    @pytest.mark.parametrize("mutate_after_discovery", [True, False], ids=["rename_after_discovery", "discovery_only"])
+    async def test_flagged_discovery_only_tool_call_does_not_elide_advisor_message(self, mutate_after_discovery: bool) -> None:
+        """Discovery neither saves a revision nor drains a FLAGGED exchange.
+
+        A later metadata rename saves one revision and drains the exchange;
+        it does not repair the missing output or authorize completion prose.
+        """
+        import litellm
+
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
+        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+        from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
+        from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
+        from elspeth.web.sessions.models import composition_states_table
+        from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_or_tool_messages
+        from elspeth.web.sessions.state_envelope import unwrap_state_column
+        from elspeth.web.validation import _redact_sensitive_content
+
         catalog = _mock_catalog()
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
@@ -2303,49 +2312,188 @@ class TestComposerMultiTurnToolCalls:
         turn1 = _make_llm_response(content="Looks ready to me.")
         # Turn 2: discovery only — no mutation. Must NOT drain.
         turn2 = _make_llm_response(tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}])
-        # Turn 3: the genuine repair — this mutates. Drain fires HERE.
+        # Turn 3: a metadata mutation drains the exchange, but cannot repair
+        # the missing output or authorize a completion claim.
         turn3 = _make_llm_response(
             tool_calls=[{"id": "c2", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
         )
-        # Turn 4: no tool calls -> END advisor gate re-runs, CLEAN -> finalize.
+        # The final no-tool reply requires a new independent END review.
         turn4 = _make_llm_response(content="Pipeline is ready.")
-
-        verdicts = iter(
-            [
-                AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating"),
-                AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
-            ]
-        )
-
-        async def _fake_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
-            return next(verdicts)
-
-        responses = iter([turn1, turn2, turn3, turn4])
+        replies = [turn1, turn2, *([turn3] if mutate_after_discovery else []), turn4]
+        responses = iter(replies)
         captured_messages: list[list[dict[str, Any]]] = []
+        sessions = service._require_sessions_service()
+        reviews: list[dict[str, Any]] = []
+        revision_snapshots: list[tuple[tuple[str, int, dict[str, Any]], ...]] = []
+
+        def saved_revisions() -> tuple[tuple[str, int, dict[str, Any]], ...]:
+            with sessions._engine.connect() as conn:
+                return tuple(
+                    (row.id, row.version, unwrap_state_column(row.metadata_))
+                    for row in conn.execute(
+                        select(composition_states_table.c.id, composition_states_table.c.version, composition_states_table.c.metadata_)
+                        .where(composition_states_table.c.session_id == session_id)
+                        .order_by(composition_states_table.c.version)
+                    )
+                )
 
         async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
-            captured_messages.append(list(messages))
+            assert len(captured_messages) < len(replies), "Only the original finite primary responses are supplied"
+            captured_messages.append(deepcopy(messages))
+            revision_snapshots.append(saved_revisions())
             return next(responses)
+
+        async def review_completion(**kwargs: Any) -> Any:
+            assert kwargs["model"] == settings.composer_advisor_model
+            assert len(reviews) < 2, "Only the original two independent END responses are supplied"
+            assert "tools" not in kwargs and kwargs["num_retries"] == kwargs["max_retries"] == 0
+            assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
+            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            reviews.append(review)
+            assert review["current_request"] == "Review this pipeline"
+            assert review["candidate_reply"] == ("Looks ready to me.", "Pipeline is ready.")[len(reviews) - 1]
+            saved_count = int(mutate_after_discovery and len(reviews) == 2)
+            assert review["saved_effects"]["saved_revision_count"] == saved_count == len(saved_revisions())
+            assert review["saved_effects"]["net_changed"] is bool(saved_count)
+            if saved_count:
+                assert review["saved_effects"]["latest_committed_state_id"] == _redact_sensitive_content(saved_revisions()[0][0])
+                # This fixture has no seeded durable state: SQL allocates its
+                # first version as 1, independently of the in-memory version.
+                assert saved_revisions()[0][1:] == (1, {"name": "Repaired", "description": ""})
+            return litellm.ModelResponse(
+                model=kwargs["model"],
+                choices=[
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "verdict": "FLAGGED",
+                                    "category": "request_not_met",
+                                    "steps": [],
+                                    "findings": "The pipeline has no configured output. The completion claim is unsupported.",
+                                    "note": None,
+                                    "publication_verdict": "WITHHOLD",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 20},
+            )
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
-            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight) as preflight,
+            patch.object(
+                service._advisor_checkpoint,
+                "_run_advisor_checkpoint",
+                side_effect=_REAL_RUN_ADVISOR_CHECKPOINT.__get__(service._advisor_checkpoint, AdvisorCheckpointOwner),
+            ) as checkpoints,
+            patch.object(litellm, "acompletion", side_effect=review_completion) as advisor_sdk,
         ):
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
-        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
-        assert len(captured_messages) == 4
+        assert len(captured_messages) == mock_llm.await_count == 3 + int(mutate_after_discovery)
+        assert checkpoints.await_count == advisor_sdk.await_count == len(reviews) == settings.composer_advisor_checkpoint_max_passes == 2
+        bindings = [call.kwargs["publication_review"].binding for call in checkpoints.await_args_list]
+        assert all(call.kwargs["phase"] == "end" for call in checkpoints.await_args_list)
+        owned_reviews = [json.loads(call.kwargs["publication_review"].payload_json) for call in checkpoints.await_args_list]
+        # Native provider context applies privacy redaction even to UUID text
+        # that happens to resemble a phone number; owned binding stays exact.
+        assert [
+            json.loads(_redact_sensitive_content(call.kwargs["publication_review"].payload_json)) for call in checkpoints.await_args_list
+        ] == reviews
+        assert (owned_reviews[0]["current_graph_hash"] != owned_reviews[1]["current_graph_hash"]) is mutate_after_discovery
+        assert revision_snapshots[:3] == [(), (), ()], "Neither initial review nor list_sources saves a revision"
+        assert result.state.outputs == ()
+        assert result.state.metadata.name == ("Repaired" if mutate_after_discovery else state.metadata.name)
+        assert result.state.version == state.version + int(mutate_after_discovery)
+        if mutate_after_discovery:
+            assert revision_snapshots[3] == saved_revisions() and len(saved_revisions()) == 1
+            preflight.assert_called_once()
+        else:
+            assert saved_revisions() == () and result.state == state
+            preflight.assert_not_called()
+        saved_scope = (
+            "This request saved 1 draft revisions with verified changes. Saved changes do not establish that the requested task is complete."
+            if mutate_after_discovery
+            else "No pipeline changes were saved in this request."
+        )
+        suffix = (
+            _no_tool_policy_module._ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX
+            if mutate_after_discovery
+            else _no_tool_policy_module._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+        )
+        assert result.raw_assistant_content == saved_scope and result.message == saved_scope + suffix
+        assert result.runtime_preflight is not None and result.runtime_preflight.readiness.completion_ready is False
+        assert isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
+        assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.GRAPH_REJECTED
         # Turn 2 (discovery-only) still sees it — not drained by a non-mutating turn.
         assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
-        # Turn 3 (the mutating repair call) STILL sees it — the discovery
-        # turn must not have consumed it early.
+        # The next primary call (metadata mutation or final reply) still sees
+        # the finding: discovery cannot consume the injected exchange.
         assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[2])
-        # Turn 4 (the finalize call, after the mutating repair) must NOT —
-        # drained only once a real mutation landed.
-        assert not any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[3])
+        assert [m for m in captured_messages[1] if "Completion advisory review" in (m.get("content") or "")] == [
+            m for m in captured_messages[2] if "Completion advisory review" in (m.get("content") or "")
+        ]
+        # The final call drains that exchange only after the real rename.
+        assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[-1]) is not mutate_after_discovery
+        assert [inv.tool_name for inv in result.tool_invocations] == ["list_sources", *(["set_metadata"] if mutate_after_discovery else [])]
+        assert all(inv.status == "success" for inv in result.tool_invocations)
+        assert {m["tool_call_id"] for m in captured_messages[-1] if m["role"] == "tool"} == {
+            "c1",
+            *(["c2"] if mutate_after_discovery else []),
+        }
+        assert result.tool_invocations[0].version_before == result.tool_invocations[0].version_after == state.version
+        if mutate_after_discovery:
+            assert result.tool_invocations[1].version_before == state.version
+            assert result.tool_invocations[1].version_after == state.version + 1
+        stored = await sessions.get_messages(UUID(session_id), limit=None)
+        withheld = [
+            row for row in stored if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == COMPOSER_WITHHELD_REPLY_KIND
+        ]
+        assert [(row.tool_calls[0]["origin"], row.content) for row in withheld] == [
+            ("repair_gate_superseded", "Looks ready to me."),
+            ("advisor_publication_withheld", "Pipeline is ready."),
+        ]
+        public_rows = _composer_conversation_or_tool_messages(stored)
+        assert all(row not in public_rows for row in withheld)
+        for candidate in ("Looks ready to me.", "Pipeline is ready."):
+            assert candidate not in result.message
+            assert all(row.content != candidate and row.raw_content != candidate for row in public_rows)
+            assert all(item["content"] != candidate for item in _composer_chat_history(stored))
+        passes = [
+            row.tool_calls[0]["pass"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert [(item["verdict"], item["publication_verdict"], item["provider_attempts"]) for item in passes] == [
+            ("flagged", "WITHHOLD", 1),
+            ("flagged", "WITHHOLD", 1),
+        ]
+        assert all(item["first_attempt_accepted"] is True for item in passes)
+        assert all(type(item["publication_binding"]) is str and len(item["publication_binding"]) == 64 for item in passes)
+        assert [item["publication_binding"] for item in passes] == bindings
+        assert passes[0]["publication_binding"] != passes[1]["publication_binding"]
+        terminal = [
+            row.tool_calls[0]["publication"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
+        ]
+        assert terminal == [
+            {
+                "branch": "terminal_block",
+                "reason": "flagged_final_pass",
+                "preflight_shape": "green" if mutate_after_discovery else "absent",
+                "findings_backend_authored": False,
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_irrelevant_mutation_does_not_clear_a_fresh_final_flag(self) -> None:

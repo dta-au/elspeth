@@ -26,6 +26,7 @@ from elspeth.web.composer.pipeline_commit import (
 )
 from elspeth.web.composer.protocol import PipelineCommitIntent
 from elspeth.web.composer.state import ValidationSummary
+from elspeth.web.execution.completion_gates import completion_gates_meta_from_facts
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
     RequiredWorkAuthority,
@@ -38,6 +39,7 @@ from elspeth.web.required_work import (
 )
 from elspeth.web.sessions.composer_app_services import ComposerAppServices
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+from elspeth.web.sessions.graph_recovery import CompositionGraphRead
 from elspeth.web.sessions.pipeline_finish_once import (
     ComposerPipelineBusinessReturned,
     ComposerPipelineRaised,
@@ -167,6 +169,16 @@ def _project_preparation_state(value: CompositionStateRecord | None, session_id:
         return
     if type(value) is not CompositionStateRecord or value.session_id != session_id:
         raise AuditIntegrityError("Pipeline preparation state belongs to another authority")
+
+
+def _project_preparation_graph(value: CompositionGraphRead, session_id: UUID) -> None:
+    if type(value) is not CompositionGraphRead or value.hydration_error is not None:
+        raise AuditIntegrityError("Pipeline preparation requires a readable composition head")
+    _project_preparation_state(value.record, session_id)
+    if value.head.state_id != (value.record.id if value.record is not None else None) or value.head.version != (
+        value.record.version if value.record is not None else 0
+    ):
+        raise AuditIntegrityError("Pipeline preparation graph disagrees with its captured head")
 
 
 def _project_preparation_messages(value: list[ChatMessageRecord], session_id: UUID) -> None:
@@ -381,18 +393,23 @@ async def _settle_pipeline_proposal_under_compose_lock(
     if proposal.status != "pending":
         raise HTTPException(status_code=409, detail="Only pending proposals can be accepted.")
 
-    current_record = await _required_preparation_read(
+    current_graph = await _required_preparation_read(
         proposal_work,
-        lambda ticket: service.get_current_state(proposal.session_id, required_work=ticket),
-        lambda value: _project_preparation_state(value, proposal.session_id),
+        lambda ticket: service.read_current_composition_graph(proposal.session_id, required_work=ticket),
+        lambda value: _project_preparation_graph(value, proposal.session_id),
         state=cancellation_state,
     )
+    current_record = current_graph.record
     current_state = _state_from_record(current_record) if current_record is not None else _initial_composition_state()
     user_message_content = await _proposal_user_message_content(
         service, proposal, required_work=proposal_work, cancellation_state=cancellation_state
     )
     if composer_meta is None:
         previous_meta = current_record.composer_meta if current_record is not None else None
+        if current_graph.effective_completion_gates is not None:
+            previous_meta = merge_composer_meta_updates(
+                previous_meta, {"completion_gates": completion_gates_meta_from_facts(current_graph.effective_completion_gates)}
+            )
         chat_ingress_inputs = await _proposal_chat_ingress_inputs(
             service,
             proposal,

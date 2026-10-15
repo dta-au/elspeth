@@ -38,10 +38,14 @@ All notable changes to ELSPETH are documented here.
   coalescing. Failed-operation diagnostics retain bounded private original
   causes atomically with the failed terminal under the existing live fence.
 
-Session epoch 75 and Landscape epoch 49 are unchanged. Existing unsupported
-stores remain preserved and refused; this candidate authorizes no migration,
-reset or downgrade. Backwards compatibility is considered within explicitly
-supported boundaries.
+Session epoch advances from 75 to 76; Landscape remains at epoch 49. Committed
+graph-review facts now govern effective completion status without rewriting
+immutable graph snapshots or invalidating pending proposal bases. Older readers
+ignore these facts, so 0.8.5 and 0.8.6 cannot share session stores or replicas.
+Preserve epoch-75 stores and their compatible prior application; configure an
+explicitly new epoch-76 target for this candidate. This authorizes no migration,
+reset, restamping or downgrade. Drain and isolate old/new deployments rather
+than relying on compatibility keys to evict existing replicas automatically.
 
 These notes describe source changes. Focused checks and source review do not
 establish final exact-head or PostgreSQL qualification, live provider acceptance,

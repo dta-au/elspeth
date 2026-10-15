@@ -35,7 +35,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
-from elspeth.web.composer.advisor_audit import AdvisorTerminalPublication
+from elspeth.web.composer.advisor_audit import AdvisorGraphReviewIdentity, AdvisorTerminalPublication
 from elspeth.web.composer.advisor_decision import AdvisorGateDecision
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationResult
@@ -327,6 +327,7 @@ class ComposerResult:
     runtime_preflight: ValidationResult | None = None
     # Only a completed END checkpoint can replace a durable advisor fact.
     advisor_gate_decision: AdvisorGateDecision | None = None
+    graph_review_identity: AdvisorGraphReviewIdentity | None = None
     raw_assistant_content: str | None = None
     pipeline_commit_intent: PipelineCommitIntent | None = None
     graph_recovery_intent: GraphRecoveryIntent | None = None
@@ -399,6 +400,8 @@ class ComposerResult:
         return self.advisor_terminal_publication is not None and self.advisor_terminal_publication.branch == "terminal_block"
 
     def __post_init__(self) -> None:
+        if self.graph_review_identity is not None and type(self.graph_review_identity) is not AdvisorGraphReviewIdentity:
+            raise AuditIntegrityError("Composer result requires its owned final graph review identity")
         if self.graph_recovery_intent is not None and (
             self.pipeline_commit_intent is not None or self.advisor_gate_decision is not None or self.runtime_preflight is not None
         ):

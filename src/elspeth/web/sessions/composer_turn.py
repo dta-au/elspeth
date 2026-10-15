@@ -50,7 +50,7 @@ import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Final, Literal, TypedDict, final
+from typing import Final, Literal, NotRequired, TypedDict, final
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
@@ -62,14 +62,18 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.core.canonical import canonical_json
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_required_sql_finish_once
 from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord, compartment_ingress_record
+from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
+from elspeth.web.composer.advisor_decision import AdvisorGateBlocked, AdvisorGatePassed
 from elspeth.web.composer.audit import ComposerToolCancellation, ComposerToolFailure
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import compose_graph_recovery_refusal_message
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import (
     PIPELINE_STAGED_REVIEW_MESSAGE,
     ComposerAdmissionRefused,
@@ -89,7 +93,14 @@ from elspeth.web.coordination.composer_progress_authority import ComposerRequest
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import CredentialMaterialRefused
-from elspeth.web.execution.completion_gates import completion_gate_decision_changes, parse_completion_gates
+from elspeth.web.execution.completion_gates import (
+    CompletionGatesDict,
+    completion_gate_decision_changes,
+    completion_gates_meta_from_facts,
+    parse_completion_gates,
+    project_committed_graph_review,
+    resolve_completion_gate_facts,
+)
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
@@ -263,6 +274,7 @@ class ComposerPostComposeUpdates(TypedDict):
     repair_turns_used: int
     ingress: CompositionIngressRecord
     chat_ingress_inputs: list[ChatIngressInput]
+    completion_gates: NotRequired[CompletionGatesDict]
 
 
 @final
@@ -901,7 +913,13 @@ async def _run_composer_turn(
         if state_record is None
         else _state_from_record(state_record)
     )
-    prior_completion_gates_facts = parse_completion_gates(state_record.composer_meta) if state_record is not None else None
+    prior_completion_gates_facts = (
+        recovery_admission.effective_completion_gates
+        if recovery_admission.effective_completion_gates is not None
+        else parse_completion_gates(state_record.composer_meta)
+        if state_record is not None
+        else None
+    )
     plugin_snapshot = services.plugin_snapshot_for_user_id(turn.actor_user_id)
     profile_registry = services.operator_profile_registry
 
@@ -1128,6 +1146,8 @@ async def _run_composer_turn(
                 "ingress": chat_ingress,
                 "chat_ingress_inputs": chat_ingress_inputs,
             }
+            if prior_completion_gates_facts is not None:
+                _post_compose_updates["completion_gates"] = completion_gates_meta_from_facts(prior_completion_gates_facts)
             _post_compose_meta = merge_composer_meta_updates(
                 state_record.composer_meta if state_record is not None else None,
                 _post_compose_updates,
@@ -1137,6 +1157,7 @@ async def _run_composer_turn(
             post_compose_state_id: UUID | None = compose_base_state_id
             assistant_record: ChatMessageRecord | None = None
             route_settlement: PipelineRouteSettlement | None = None
+            graph_review_draft: AuditMessageDraft | None = None
             if result.pipeline_commit_intent is not None:
                 # E14: auto-commit settlement gets what is left of the job budget.
                 commit_timeout_seconds = budget_anchor.remaining_seconds(monotonic_now=time.monotonic())
@@ -1171,9 +1192,7 @@ async def _run_composer_turn(
                 )
                 post_compose_state_id = route_settlement.settlement.state.id
                 assistant_record = route_settlement.settlement.transition_message
-            elif result.state.version != state.version or completion_gate_decision_changes(
-                prior_completion_gates_facts, result.advisor_gate_decision, result.state
-            ):
+            elif result.state.version != state.version:
                 await _publish_progress(
                     progress_sink,
                     event=ComposerProgressEvent(
@@ -1281,6 +1300,39 @@ async def _run_composer_turn(
                     checkpoint_projection.complete_owned(exc)
                     raise
                 checkpoint_projection.complete_owned()
+            else:
+                gate_changed = completion_gate_decision_changes(prior_completion_gates_facts, result.advisor_gate_decision, result.state)
+                if composition_content_hash(result.state) != composition_content_hash(state):
+                    raise AuditIntegrityError("Unversioned authored graph change cannot be a review-only projection")
+                identity = result.graph_review_identity
+                if gate_changed and identity is None:
+                    raise AuditIntegrityError("Changed graph review decision lost its final owned review identity")
+                if identity is not None:
+                    fact = AdvisorGraphReviewFact(
+                        session_id=session.id,
+                        state_id=compose_base_state_id,
+                        content_hash=composition_content_hash(result.state),
+                        operation_id=lease.context.fence.operation_id,
+                        terminal_operation_id=running.claim.operation_id,
+                        operation_epoch=lease.context.fence.operation_epoch,
+                        identity=identity,
+                        action="passed"
+                        if type(result.advisor_gate_decision) is AdvisorGatePassed
+                        else "blocked"
+                        if type(result.advisor_gate_decision) is AdvisorGateBlocked
+                        else "unchanged",
+                        gates=resolve_completion_gate_facts(prior_completion_gates_facts, result.advisor_gate_decision, result.state),
+                    )
+                    envelope = fact.to_envelope()
+                    graph_review_draft = AuditMessageDraft(
+                        role="audit",
+                        content=canonical_json(envelope),
+                        tool_calls=(envelope,),
+                        composition_state_id=str(fact.state_id) if fact.state_id is not None else None,
+                    )
+                    if state_record is not None:
+                        stored = state_record.review_projection.stored if state_record.review_projection is not None else state_record
+                        state_response = _state_response(project_committed_graph_review(stored, fact))
             # R2: the assistant row (unless the settlement wrote it), the turn audit
             # cohort, the pending proposals and the terminal CAS in ONE transaction.
             assistant_write: ComposerOperationAssistantWrite | None
@@ -1304,6 +1356,8 @@ async def _run_composer_turn(
                 parent_assistant_id=parent_assistant_id,
                 session_operation_context=lease.context,
             )
+            if graph_review_draft is not None:
+                audit_cohort = (*audit_cohort, graph_review_draft)
             # Joined through cancellation: a lease-loss cancel of this child must not
             # leave the composite's worker thread committing while the frame decides
             # the terminal and persists the cancelled-turn audit. Its own outcome is

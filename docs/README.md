@@ -17,6 +17,7 @@ history.
 | You are... | Read this first |
 | ---------- | --------------- |
 | New to ELSPETH | [Your First Pipeline](guides/your-first-pipeline.md) then [User Manual](guides/user-manual.md) |
+| Writing pipelines as version-controlled text | [Authoring pipelines in YAML](guides/yaml-authoring.md) |
 | Deploying a new AWS stack | [AWS ECS Cold Install](runbooks/aws-ecs-cold-install.md), then the [Terraform package reference](../deploy/aws-ecs/terraform/README.md) |
 | Building or operating pipelines | [Configuration Reference](reference/configuration.md), [Runbooks](runbooks/index.md), and [Troubleshooting](guides/troubleshooting.md) |
 | Investigating audit data | [Landscape MCP Analysis](guides/landscape-mcp-analysis.md) and [Architecture Overview](../ARCHITECTURE.md) |
@@ -76,6 +77,7 @@ authors, and integrators must uphold.
 Tutorials and operator/developer how-to material.
 
 - [Your First Pipeline](guides/your-first-pipeline.md)
+- [Authoring pipelines in YAML](guides/yaml-authoring.md)
 - [User Manual](guides/user-manual.md)
 - [Web Composer in One Hour — training plan (draft)](guides/composer-training-one-hour.md)
 - [Test System](guides/test-system.md)

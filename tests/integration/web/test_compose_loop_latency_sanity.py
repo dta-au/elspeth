@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import statistics
 import time
+from uuid import uuid4
 
 import pytest
 import structlog
@@ -91,8 +92,9 @@ def test_per_turn_p95_under_250ms_with_8_tool_calls(service):
     For Phase 1 the sync baseline is the right scope: Phase 1's
     only caller of ``persist_compose_turn`` is this test.
     """
+    session_id = str(uuid4())
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="lat")
+        _make_session(conn, session_id=session_id)
 
     expected_current_state_id = None
 
@@ -100,7 +102,7 @@ def test_per_turn_p95_under_250ms_with_8_tool_calls(service):
     for turn in range(_WARMUP_TURNS):
         calls, rows = _build_turn(turn)
         service.persist_compose_turn(
-            session_id="lat",
+            session_id=session_id,
             assistant_content="",
             redacted_assistant_tool_calls=calls,
             redacted_tool_rows=rows,
@@ -111,7 +113,8 @@ def test_per_turn_p95_under_250ms_with_8_tool_calls(service):
         )
         with service._engine.begin() as conn:
             expected_current_state_id = conn.execute(
-                text("SELECT id FROM composition_states WHERE session_id='lat' ORDER BY version DESC LIMIT 1")
+                text("SELECT id FROM composition_states WHERE session_id=:session_id ORDER BY version DESC LIMIT 1"),
+                {"session_id": session_id},
             ).scalar_one()
 
     # Measured: 50 turns is enough for stable p95 via 20-quantiles
@@ -121,7 +124,7 @@ def test_per_turn_p95_under_250ms_with_8_tool_calls(service):
         calls, rows = _build_turn(turn)
         start = time.perf_counter()
         service.persist_compose_turn(
-            session_id="lat",
+            session_id=session_id,
             assistant_content="",
             redacted_assistant_tool_calls=calls,
             redacted_tool_rows=rows,
@@ -133,7 +136,8 @@ def test_per_turn_p95_under_250ms_with_8_tool_calls(service):
         durations.append((time.perf_counter() - start) * 1000)
         with service._engine.begin() as conn:
             expected_current_state_id = conn.execute(
-                text("SELECT id FROM composition_states WHERE session_id='lat' ORDER BY version DESC LIMIT 1")
+                text("SELECT id FROM composition_states WHERE session_id=:session_id ORDER BY version DESC LIMIT 1"),
+                {"session_id": session_id},
             ).scalar_one()
 
     p95 = statistics.quantiles(durations, n=20)[18]  # 19th of 20 quantiles == p95

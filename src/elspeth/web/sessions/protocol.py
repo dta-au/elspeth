@@ -68,6 +68,7 @@ from elspeth.web.sessions.pipeline_publication import PipelineProposalSettlement
 from elspeth.web.sessions.pipeline_settlement_payloads import ComposerOperationBinding
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
     from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
@@ -1145,6 +1146,9 @@ class CompositionStateRecord:
     composer_meta: Mapping[str, Any] | None = None
     sources: Mapping[str, Mapping[str, Any]] | None = None
     source: Mapping[str, Any] | None = None
+    # Effective reads retain the actual immutable row separately. Historical
+    # version-list reads leave this unset and return the original snapshot.
+    review_projection: CompositionStateReviewProjection | None = None
 
     def __post_init__(self) -> None:
         serialize_composition_validation_errors(self.validation_errors)
@@ -1167,6 +1171,25 @@ class CompositionStateRecord:
             non_none.append("composer_meta")
         if non_none:
             freeze_fields(self, *non_none)
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CompositionStateReviewProjection:
+    """Explicit live review overlay; never another composition-state row."""
+
+    stored: CompositionStateRecord
+    review: AdvisorGraphReviewFact
+
+    def __post_init__(self) -> None:
+        from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
+
+        if type(self.stored) is not CompositionStateRecord or self.stored.review_projection is not None:
+            raise AuditIntegrityError("Review projection requires one raw immutable snapshot")
+        if type(self.review) is not AdvisorGraphReviewFact:
+            raise AuditIntegrityError("Review projection requires an owned committed fact")
+        if self.review.session_id != self.stored.session_id or self.review.state_id != self.stored.id:
+            raise AuditIntegrityError("Review projection belongs to another snapshot")
 
 
 @final
@@ -3018,7 +3041,9 @@ class SessionServiceProtocol(Protocol):
 
     async def get_composition_head(self, session_id: UUID) -> CompositionStateHead: ...
 
-    async def read_current_composition_graph(self, session_id: UUID) -> CompositionGraphRead: ...
+    async def read_current_composition_graph(
+        self, session_id: UUID, *, required_work: RequiredWorkTicket | None = None
+    ) -> CompositionGraphRead: ...
 
     async def prepare_graph_recovery(
         self,

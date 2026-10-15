@@ -2037,6 +2037,7 @@ class ComposerServiceImpl:
                     else advisor_gate.advisor_gate_decision
                     if advisor_gate is not None
                     else None,
+                    advisor_gate.graph_review_identity if advisor_gate is not None else None,
                 )
                 if reply is None:
                     handoff_result = replace(
@@ -2259,7 +2260,9 @@ class ComposerServiceImpl:
                             message=_no_tool_policy.compose_review_reply_unavailable_message(result.message),
                             raw_assistant_content="" if result.raw_assistant_content is None else result.raw_assistant_content,
                         )
-                    result = _with_advisor_gate_decision(result, completion_gates, advisor_gate.advisor_gate_decision)
+                    result = _with_advisor_gate_decision(
+                        result, completion_gates, advisor_gate.advisor_gate_decision, advisor_gate.graph_review_identity
+                    )
                     threaded = replace(
                         result,
                         repair_turns_used=repair_turns_used,

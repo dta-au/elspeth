@@ -1,0 +1,99 @@
+# ONE llm node, TWO actual provider queries, with an explicit internal edge.
+# Query apply consumes validated extract_* outputs absent from input.csv.
+sources:
+  expenses:
+    plugin: csv
+    on_success: expense_in
+    options:
+      path: examples/llm_ordered_chain/input.csv
+      on_validation_failure: quarantine
+      schema:
+        mode: fixed
+        fields: ["expense_id: str", "receipt_text: str"]
+
+transforms:
+  - name: assess_expense
+    plugin: llm
+    input: expense_in
+    on_success: output
+    on_error: quarantine
+    options:
+      provider: openrouter
+      api_key: fake-key-chaosllm-does-not-check
+      base_url: http://127.0.0.1:8199/v1
+      model: chaosllm/expense-reviewer
+      timeout_seconds: 10
+      temperature: 0.0
+      max_tokens: 250
+      # Also bounds batch-result waiting; allow cold local client initialization.
+      max_capacity_retry_seconds: 60
+      query_input_mode: ordered
+      pool_size: 1
+      required_input_fields: [receipt_text]
+      response_field: answer
+      schema:
+        mode: observed
+      queries:
+        - name: extract
+          input_fields:
+            receipt: receipt_text
+          template: |
+            EXTRACT_RECEIPT
+            Extract the amount in US dollars and the expense type from this receipt.
+            Receipt: {{ row.receipt }}
+            Respond with amount_usd and expense_type (transport, meals, equipment).
+          response_format: structured
+          output_fields:
+            - suffix: amount_usd
+              type: number
+            - suffix: expense_type
+              type: enum
+              values: [transport, meals, equipment]
+        - name: apply
+          input_fields:
+            amount: extract_amount_usd
+            expense_type: extract_expense_type
+          template: |
+            APPLY_REIMBURSEMENT_POLICY
+            Extracted amount_usd: {{ row.amount }}
+            Extracted expense_type: {{ row.expense_type }}
+            Approve transport up to USD 75 and meals up to USD 25.
+            Equipment and higher claims require manual_review.
+            Respond with decision (approve, manual_review) and a short reason.
+          response_format: structured
+          output_fields:
+            - suffix: decision
+              type: enum
+              values: [approve, manual_review]
+            - suffix: reason
+              type: string
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/llm_ordered_chain/output/assessed_expenses.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/llm_ordered_chain/output/quarantine.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+concurrency:
+  max_workers: 1
+retry:
+  max_attempts: 1
+  initial_delay_seconds: 0.1
+  max_delay_seconds: 0.1
+  exponential_base: 2.0
+landscape:
+  url: sqlite:///examples/llm_ordered_chain/runs/audit.db
+payload_store:
+  base_path: examples/llm_ordered_chain/runs/payloads

@@ -1090,10 +1090,10 @@ async def _durable_completion_gates(
     the fact's ``for_graph`` fingerprint downgrades it to pending wording on
     read if the persisted graph moved.
     """
-    record = await service.get_current_state(session_id)
-    if record is None:
-        return completion_gates_meta_from_facts(None)
-    return completion_gates_meta_from_facts(parse_completion_gates(record.composer_meta))
+    graph = await service.read_current_composition_graph(session_id)
+    if graph.hydration_error is not None:
+        raise AuditIntegrityError("Cannot carry completion gates from an unreadable composition head")
+    return completion_gates_meta_from_facts(graph.effective_completion_gates)
 
 
 def merge_composer_meta_updates(

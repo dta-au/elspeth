@@ -45,7 +45,7 @@ from elspeth.core.schema_identity import create_schema_identity_table
 from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH
 
 # ``SESSION_SCHEMA_EPOCH`` — schema version sentinel. Bump this constant
-# whenever a table is added, removed, or otherwise altered in a way that
+# whenever a table or persisted semantic contract is changed in a way that
 # makes existing session stores incompatible. The startup
 # validator (``schema._assert_schema_sentinels``) reads ``PRAGMA user_version``
 # and crashes if it does not match, producing an actionable
@@ -58,8 +58,11 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 #
 # Epoch 74 adds graph recovery parks and checkpoint operation ownership.
 # Epoch 75 adds durable auth families and derived-token revocation bindings.
+# Epoch 76 makes committed terminal graph-review facts authoritative over
+# immutable snapshots. Older readers ignore these private facts, so sharing
+# or rolling back across this semantic format boundary is unsupported.
 # There is no migration path; preserve incompatible stores and prior access.
-SESSION_SCHEMA_EPOCH = 75
+SESSION_SCHEMA_EPOCH = 76
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"

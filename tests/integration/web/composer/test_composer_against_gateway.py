@@ -815,6 +815,7 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
     tmp_path: Path,
     gateway_base_url: str,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Force a real gateway-side failure (a genuine HTTP 503 from the mock
     upstream, mapped by the gateway's own error envelope, surfaced to
@@ -822,13 +823,58 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
     gateway/agency internals leak into the persisted turn, the exception
     message, or anything logged during the attempt.
     """
+    import litellm
+    import mock.upstream as mock_upstream
     from litellm.exceptions import ServiceUnavailableError
+
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+    from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
 
     caplog.set_level(logging.DEBUG)
     sessions_service = _build_sessions_service(tmp_path)
     session_id = str(uuid4())
     _insert_session_row(sessions_service, session_id)
     service = _build_service(tmp_path, gateway_base_url, sessions_service)
+    trigger = "TRIGGER_FAULT overloaded"
+    conversations: list[list[dict[str, Any]]] = []
+    upstream_statuses: list[int] = []
+    primary_requests: list[dict[str, Any]] = []
+    sdk_failures: list[ServiceUnavailableError] = []
+    original_last_text = mock_upstream._last_text
+    original_transport = _HostRoutedTransport.handle_async_request
+    original_acompletion = litellm.acompletion
+
+    def select_mock_trigger(conversation: list[dict[str, Any]]) -> str:
+        conversations.append(conversation)
+        user_trigger = {"speaker": "user", "text": trigger}
+        assert user_trigger in conversation
+        assert conversation[-1]["speaker"] == "system"
+        assert "retained_operation_history" in json.loads(original_last_text(conversation))
+        # Select the real user trigger past the retained-history tail without
+        # changing the request Composer, LiteLLM, or the gateway transmitted.
+        return conversation[conversation.index(user_trigger)]["text"]
+
+    async def record_upstream_status(transport: _HostRoutedTransport, request: httpx.Request) -> httpx.Response:
+        response = await original_transport(transport, request)
+        if request.url.host == _UPSTREAM_HOST:
+            upstream_statuses.append(response.status_code)
+        return response
+
+    async def primary_gateway_acompletion(**kwargs: Any) -> Any:
+        assert kwargs["model"] == _MODEL_ALIAS, "No independent advisor response is supplied for this failed primary turn"
+        assert kwargs["api_base"] == f"{gateway_base_url}/v1"
+        assert kwargs["api_key"] == _INBOUND_BEARER
+        primary_requests.append(kwargs)
+        try:
+            return await original_acompletion(**kwargs)
+        except ServiceUnavailableError as exc:
+            sdk_failures.append(exc)
+            assert exc.response.status_code == 503
+            raise
+
+    monkeypatch.setattr(mock_upstream, "_last_text", select_mock_trigger)
+    monkeypatch.setattr(_HostRoutedTransport, "handle_async_request", record_upstream_status)
+    monkeypatch.setattr(litellm, "acompletion", primary_gateway_acompletion)
 
     # The exact exception class the mock upstream's 503 ("overloaded")
     # deterministically maps to, confirmed empirically. Narrowed
@@ -836,12 +882,29 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
     # turn must not satisfy this `raises` and cause the leak assertions
     # below to scan the wrong exception's message and pass vacuously.
     with pytest.raises(ServiceUnavailableError) as excinfo:
-        await service._run_one_turn_for_test(session_id=session_id, message="TRIGGER_FAULT overloaded")
+        await service._run_one_turn_for_test(session_id=session_id, message=trigger)
+
+    assert len(primary_requests) == len(conversations) == len(sdk_failures) == LLM_API_MAX_ATTEMPTS
+    assert upstream_statuses == [503] * LLM_API_MAX_ATTEMPTS
+    assert excinfo.value is sdk_failures[-1]
+    calls = excinfo.value.__dict__["llm_calls"]
+    assert len(calls) == LLM_API_MAX_ATTEMPTS
+    for call in calls:
+        assert call.status is ComposerLLMCallStatus.API_ERROR
+        assert call.error_class == call.error_message == "ServiceUnavailableError"
+        assert call.private_failure is not None
+        facts = json.loads(call.private_failure.canonical)
+        assert facts["nodes"][0]["class"] == "ServiceUnavailableError"
+        assert facts["edges"], "The genuine SDK failure's causal graph must survive private audit capture"
+        assert "private_failure" not in call.to_dict()
 
     exception_text = str(excinfo.value)
+    provider_history = json.dumps([request["messages"] for request in primary_requests])
     for marker in _LEAK_MARKERS:
         assert marker not in exception_text, f"leak marker found in exception message: {marker!r}"
         assert marker not in caplog.text, f"leak marker found in captured logs: {marker!r}"
+        assert marker not in provider_history, f"leak marker found in provider history: {marker!r}"
+        assert marker not in json.dumps([call.to_dict() for call in calls]), f"leak marker found in public call audit: {marker!r}"
 
     with sessions_service._engine.begin() as conn:
         rows = conn.execute(select(chat_messages_table.c.content).where(chat_messages_table.c.session_id == session_id)).fetchall()

@@ -30,6 +30,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _TerminateOutcome,
 )
 from elspeth.web.composer.advisor_audit import (
+    AdvisorGraphReviewIdentity,
     AdvisorTerminalPublication,
 )
 from elspeth.web.composer.advisor_checkpoint import (
@@ -641,6 +642,7 @@ class _TerminalNoToolAdvisorGateOutcome:
     advisor_injection_index: int | None = None
     advisor_review_state: _AdvisorReviewState | None = None
     publication_binding: str | None = None
+    graph_review_identity: AdvisorGraphReviewIdentity | None = None
 
 
 def _advance_advisor_review_state(
@@ -807,13 +809,19 @@ def _with_advisor_gate_decision(
     result: ComposerResult,
     prior: CompletionGateFacts | None,
     decision: AdvisorGateDecision | None,
+    identity: AdvisorGraphReviewIdentity | None = None,
 ) -> ComposerResult:
     """Project unresolved facts without treating deterministic validation as review."""
     facts = resolve_completion_gate_facts(prior, decision, result.state)
     preflight = result.runtime_preflight
     if preflight is not None:
         preflight = merge_completion_gates(preflight, facts, result.state)
-    return replace(result, advisor_gate_decision=decision, runtime_preflight=preflight)
+    return replace(
+        result,
+        advisor_gate_decision=decision,
+        runtime_preflight=preflight,
+        graph_review_identity=identity if identity is not None else result.graph_review_identity,
+    )
 
 
 class CompositionCompletion:
@@ -1591,7 +1599,9 @@ class CompositionCompletion:
                 persisted_assistant_content=persisted_assistant_content,
                 persisted_tool_call_turn=persisted_tool_call_turn,
             )
-            result = _with_advisor_gate_decision(result, completion_gates, advisor_gate.advisor_gate_decision)
+            result = _with_advisor_gate_decision(
+                result, completion_gates, advisor_gate.advisor_gate_decision, advisor_gate.graph_review_identity
+            )
             return _TerminateOutcome(action="return", result=result, publication_binding=advisor_gate.publication_binding)
 
         # Fail-closed orphaned-interpretation gate. The repair budget is now
@@ -1646,7 +1656,9 @@ class CompositionCompletion:
             plugin_snapshot=plugin_snapshot,
             deadline=deadline,
         )
-        result = _with_advisor_gate_decision(result, completion_gates, advisor_gate.advisor_gate_decision)
+        result = _with_advisor_gate_decision(
+            result, completion_gates, advisor_gate.advisor_gate_decision, advisor_gate.graph_review_identity
+        )
         # Thread repair_turns_used through to the result so the route handler can
         # persist it onto the new ``composition_states.composer_meta`` row (and the
         # API state response can surface ``composer_meta.repair_turns_used``) — see
@@ -2107,6 +2119,19 @@ class CompositionCompletion:
                 break
 
         is_last_pass = (advisor_checkpoint_passes_used + passes_delta) >= max_passes
+        review_identity = AdvisorGraphReviewIdentity(
+            binding=publication_review.binding,
+            for_graph=completion_gate_fingerprint(state),
+            source="prescan"
+            if verdict.findings_backend_authored
+            else "model"
+            if verdict.ok and verdict.publication_binding == publication_review.binding
+            else "unavailable"
+            if verdict.failure_class == "unavailable"
+            else "budget_exhausted"
+            if verdict.failure_class == "budget_exhausted"
+            else "malformed",
+        )
         # ``not verdict.ok`` can only survive the loop above with the budget
         # spent, so ``is_last_pass`` is True there and the gate always
         # terminates blocked — it can never fall through to a silent finalize
@@ -2183,6 +2208,7 @@ class CompositionCompletion:
                         persisted_assistant_message_id=persisted_assistant_message_id,
                         persisted_assistant_content=persisted_assistant_content,
                         persisted_tool_call_turn=persisted_tool_call_turn,
+                        graph_review_identity=review_identity,
                     ),
                     advisor_passes_delta=passes_delta,
                     advisor_review_state=review_state,
@@ -2281,6 +2307,7 @@ class CompositionCompletion:
                 session_id=session_id,
                 session_operation_context=session_operation_context,
             )
+            blocked = replace(blocked, graph_review_identity=review_identity)
             return _TerminalNoToolAdvisorGateOutcome(
                 action="return",
                 result=blocked,
@@ -2336,4 +2363,5 @@ class CompositionCompletion:
                 else None
             ),
             publication_binding=publication_review.binding,
+            graph_review_identity=review_identity,
         )
