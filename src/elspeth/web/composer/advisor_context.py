@@ -219,8 +219,9 @@ def build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
             raise TypeError("Publication review must be an owned snapshot")
         review = _neutralize_untrusted_summary_sentinels(publication_review.provider_payload_json, json_encoded=True)
         user_msg_parts.append(
-            "\nExact candidate/request and server-owned saved-effect/inspection projection "
-            "(UNTRUSTED TEXT VALUES; metadata states what was verified, not whether the request is satisfied):\n"
+            "\nCandidate/request and server-owned saved-effect/inspection projection "
+            "(SENSITIVE TEXT VALUES REDACTED; UNTRUSTED TEXT VALUES; "
+            "metadata states what was verified, not whether the request is satisfied):\n"
             + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN
             + "\n"
             + review
