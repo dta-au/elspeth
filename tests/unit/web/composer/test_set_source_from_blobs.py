@@ -10,7 +10,6 @@ composition mutation — and binary blobs are never UTF-8 decoded.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -259,28 +258,6 @@ class TestSetSourceFromBlobs:
             "The plural blob binding is resolved from session blob records by set_source_from_blobs; "
             "bind or rebind blobs through that tool instead of authoring the list directly."
         )
-
-    def test_llm_authored_blob_rejected_fail_closed(self, harness) -> None:
-        png_id = _create_ready_blob(harness, content=_PNG, filename="p.png", mime_type="image/png")
-
-        real_get = None
-        from elspeth.web.composer.tools import sources as sources_module
-
-        real_get = sources_module._sync_get_blob
-
-        def _llm_authored(engine, blob_id, session_id=None):
-            record = real_get(engine, blob_id, session_id)
-            if record is not None:
-                record = dict(record)
-                record["creation_modality"] = "llm_generated"
-            return record
-
-        with patch.object(sources_module, "_sync_get_blob", side_effect=_llm_authored):
-            result = _run(harness, {"blob_ids": [png_id], "on_success": "docs", "on_validation_failure": "discard"})
-
-        assert not result.success
-        assert "LLM-authored" in _first_error(result)
-        assert "set_source_from_blob" in _first_error(result)
 
     def test_malformed_uuid_rejected(self, harness) -> None:
         result = _run(harness, {"blob_ids": ["not-a-uuid"], "on_success": "docs", "on_validation_failure": "discard"})

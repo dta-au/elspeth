@@ -1704,6 +1704,18 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "either an existing blob_id or new inline_blob content, never both.",
     ),
     DirectValidationGuidance(
+        "source_binding_locked",
+        "The requested option patch would change a server-owned source blob binding. The saved source was retained.",
+        "Rebind the intended artifact through set_source_from_blob or set_source_from_blobs as appropriate. "
+        "Preserve its content and review provenance; do not clear the source merely to silence this refusal.",
+    ),
+    DirectValidationGuidance(
+        "source_not_found",
+        "The requested source is not in the current saved graph. The requested change was not applied.",
+        "Inspect the current named sources and select the intended existing name. Create or rebind a source only "
+        "when that is the user's intended operation; do not replace a different input to silence this refusal.",
+    ),
+    DirectValidationGuidance(
         "source_path_policy_invalid",
         "The source path is outside this session's permitted input locations. The candidate was not applied.",
         "Keep the intended input artifact and use its canonical authenticated blob binding, or preserve an approved "
@@ -1787,6 +1799,18 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "The source artifact is missing, not ready, or has unavailable stored bytes.",
         "Inspect the intended artifact's current readiness through authenticated blob discovery. Keep the requested "
         "binding and resolve its availability before retrying; do not fabricate a replacement or assume an empty input.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_duplicate",
+        "The plural binding repeats a blob identity or canonical document content. No source replacement was applied.",
+        "Remove the duplicate entries while preserving every distinct intended input and its order. Use authenticated "
+        "blob discovery to select the intended artifacts; do not invent identities or change their content.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_review_required",
+        "The plural binding contains LLM-authored content whose interpretation review is not established by this flow.",
+        "Use a supported set_source_from_blob flow to stage the intended artifact's review where its content is "
+        "representable. Otherwise preserve the artifact and report the limitation; never relabel provenance or drop review.",
     ),
     DirectValidationGuidance(
         "source_blob_plugin_required",
