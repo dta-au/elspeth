@@ -1,6 +1,7 @@
 import { useEffect, type ReactNode } from "react";
 import { useAuth } from "../../hooks/useAuth";
 import { LoginPage } from "../auth/LoginPage";
+import { isAuthCallbackHash, isNavigationDestination, POST_LOGIN_REDIRECT_KEY } from "../../utils/hashRoutes";
 
 interface AuthGuardProps {
   children: ReactNode;
@@ -12,7 +13,7 @@ interface AuthGuardProps {
  * - Renders LoginPage if the user is not authenticated.
  * - Renders children if authenticated.
  *
- * Phase 6B FIX-C: shared-route hash round-trip via sessionStorage.
+ * Navigation destinations survive authentication through sessionStorage.
  *
  *   When a reviewer follows a `#/shared/{token}` link without being
  *   logged in, the unauth→auth transition must preserve the hash so
@@ -28,25 +29,34 @@ interface AuthGuardProps {
  *   The key `elspeth_post_login_redirect` is self-disarming — the
  *   restore effect removes it after restoring the hash, so a
  *   subsequent auth check on a fresh page load doesn't loop back to a
- *   stale shared-route.
+ *   stale destination. Ordinary session links use the same mechanism;
+ *   their normal ownership checks still decide whether access is allowed.
  */
-const POST_LOGIN_REDIRECT_KEY = "elspeth_post_login_redirect";
-const SHARED_HASH_PREFIX = "#/shared/";
-
 export function AuthGuard({ children }: AuthGuardProps) {
   const { isAuthenticated, isLoading } = useAuth();
 
-  // SAVE: while unauthenticated, persist the current hash if it's a
-  // shared-route. We don't save other hashes (the regular composer's
-  // session-id hashes are not deep-linkable in the same way; the
-  // shared route is the only surface today where the URL alone
-  // selects the post-login destination).
+  // Preserve shared and private session destinations through authentication.
+  // Restoring a private destination still goes through the owner's normal
+  // authorization check; a refused link must not become a root auto-resume.
   useEffect(() => {
     if (isLoading || isAuthenticated) return;
-    const hash = window.location.hash;
-    if (!hash.startsWith(SHARED_HASH_PREFIX)) return;
-    if (window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY) !== null) return;
-    window.sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, hash);
+    function saveDestination(event?: Event) {
+      const hash = window.location.hash;
+      if (isNavigationDestination(hash)) {
+        window.sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, hash);
+      } else if (event && !isAuthCallbackHash(hash)) {
+        // Explicit navigation away abandons the destination. Initial root
+        // render may follow callback scrubbing, so only an event disarms it.
+        window.sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY);
+      }
+    }
+    saveDestination();
+    window.addEventListener("hashchange", saveDestination, true);
+    window.addEventListener("popstate", saveDestination, true);
+    return () => {
+      window.removeEventListener("hashchange", saveDestination, true);
+      window.removeEventListener("popstate", saveDestination, true);
+    };
   }, [isAuthenticated, isLoading]);
 
   // RESTORE: on transition to authenticated, if we saved a hash
@@ -59,6 +69,10 @@ export function AuthGuard({ children }: AuthGuardProps) {
     const saved = window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY);
     if (saved === null) return;
     window.sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY);
+    if (!isNavigationDestination(saved)) return;
+    // An explicit current destination outranks a pending/stale one. A root
+    // arrival after an SSO callback has no current destination to preserve.
+    if (isNavigationDestination(window.location.hash)) return;
     // Only restore if the saved value differs from the current hash —
     // a hard-reload that preserved the hash naturally doesn't need
     // restoration, and re-writing the same hash would dispatch a

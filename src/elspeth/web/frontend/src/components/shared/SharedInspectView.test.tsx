@@ -75,6 +75,14 @@ describe("SharedInspectView", () => {
     vi.restoreAllMocks();
   });
 
+  it("refuses a malformed route locally without fetching a token or showing a graph", () => {
+    const fetch = vi.spyOn(api, "fetchSharedInspect");
+    render(<SharedInspectView token={null} />);
+    expect(screen.getByTestId("shared-inspect-error")).toHaveTextContent("This share link is malformed");
+    expect(screen.queryByTestId("shared-inspect-graph")).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("shows the loading state while the request is in flight", () => {
     vi.spyOn(api, "fetchSharedInspect").mockImplementation(
       () => new Promise(() => {}), // never resolves

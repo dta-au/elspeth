@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
 import { useAutoResumeSession } from "./useAutoResumeSession";
@@ -25,6 +25,7 @@ describe("useAutoResumeSession", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
     window.history.replaceState(null, "", window.location.pathname);
+    window.sessionStorage.clear();
   });
 
   it("selects the most recently active non-archived session once sessions load", () => {
@@ -81,6 +82,69 @@ describe("useAutoResumeSession", () => {
 
     renderHook(() => useAutoResumeSession(true));
 
+    expect(selectSession).not.toHaveBeenCalled();
+  });
+
+  it("remembers an arrival deep link rejected before bootstrap enables resume", () => {
+    const selectSession = vi.fn();
+    seedSessions();
+    useSessionStore.setState({ selectSession } as never);
+    window.history.replaceState(null, "", "#/unavailable-session");
+    const { rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => useAutoResumeSession(enabled),
+      { initialProps: { enabled: false } },
+    );
+    // A 404 or the session-list router can clear the fragment while auth or
+    // preferences are still loading. That must not turn arrival into resume.
+    window.history.replaceState(null, "", "/");
+    rerender({ enabled: true });
+    expect(selectSession).not.toHaveBeenCalled();
+  });
+
+  it("still auto-resumes after an ordinary root SSO callback is scrubbed", () => {
+    const selectSession = vi.fn();
+    seedSessions();
+    useSessionStore.setState({ selectSession } as never);
+    window.history.replaceState(null, "", "#/auth/callback?code=synthetic");
+    const { rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => useAutoResumeSession(enabled),
+      { initialProps: { enabled: false } },
+    );
+    window.history.replaceState(null, "", "/");
+    rerender({ enabled: true });
+    expect(selectSession).toHaveBeenCalledWith("recent");
+  });
+
+  it("does not auto-resume before SSO restores a pending private session destination", () => {
+    const selectSession = vi.fn();
+    seedSessions();
+    useSessionStore.setState({ selectSession } as never);
+    window.history.replaceState(null, "", "#/auth/callback?code=synthetic");
+    window.sessionStorage.setItem("elspeth_post_login_redirect", "#/11111111-1111-4111-8111-111111111111");
+    const { rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => useAutoResumeSession(enabled),
+      { initialProps: { enabled: false } },
+    );
+    window.history.replaceState(null, "", "/");
+    rerender({ enabled: true });
+    expect(selectSession).not.toHaveBeenCalled();
+  });
+
+  it("remembers explicit navigation erased before any bootstrap dependency changes", () => {
+    const selectSession = vi.fn();
+    seedSessions();
+    useSessionStore.setState({ selectSession, sessionsLoaded: false } as never);
+    const { rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => useAutoResumeSession(enabled),
+      { initialProps: { enabled: false } },
+    );
+    act(() => {
+      window.history.replaceState(null, "", "#/unavailable-session");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+      window.history.replaceState(null, "", "/");
+    });
+    act(() => useSessionStore.setState({ sessionsLoaded: true }));
+    rerender({ enabled: true });
     expect(selectSession).not.toHaveBeenCalled();
   });
 
