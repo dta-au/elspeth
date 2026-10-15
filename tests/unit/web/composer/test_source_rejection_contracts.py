@@ -5,7 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
-from unittest.mock import AsyncMock
+from unittest.mock import create_autospec
 from uuid import UUID, uuid4
 
 import pytest
@@ -740,7 +740,7 @@ async def test_source_outer_fault_keeps_distinct_integrity_and_completed_outcome
             {"id": "source_fault", "name": tool, "arguments": args},
         ]
     )
-    llm = AsyncMock(return_value=response)
+    llm = create_autospec(service._provider_gateway._call_llm, return_value=response)
     monkeypatch.setattr(service._provider_gateway, "_call_llm", llm)
     recorder = BufferingRecorder()
     monkeypatch.setattr("elspeth.web.composer.service.BufferingRecorder", lambda: recorder)

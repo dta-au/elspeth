@@ -7,10 +7,20 @@ coordinator record. The pause/source/Git snapshots below remain historical.
 
 Source1c has bounded acceptance from both independent and systems reviews:
 104 affected behavior cases,436 gate cases and40 focused PostgreSQL cases pass;
-78 witnessed deliberate failures cover21 regressions. Local Git integration is
-next. Its original1191-pass/46-failure/2-teardown-error run remains historical
+78 witnessed deliberate failures cover21 regressions. Local integration completed
+as `41348ede`, with normal hooks and unchanged reviewed bytes. Its original
+1191-pass/46-failure/2-teardown-error run remains historical
 red evidence. The3277-finding keyless scan has no semantic drift and is reused
 only for unchanged production inputs. Whole-plan and broader gates remain open.
+
+The output schema-fault follow-up has bounded acceptance from both reviewers
+for local integration:85 behavior,448 gate and18 focused PostgreSQL passes,
+20 intended witnessed negative failures, and zero fresh keyless drift. The
+source/output provider mocks now use the real bound method's autospec; their
+actual turn cases and owning mock gate pass. Broader gates remain open.
+A fresh supported thread read still finds no new
+direct stop in the active continuation. Repeated copies of the original pause
+after compaction do not supersede the later authorized continuation.
 
 **Historical pause report — resumed after chronology correction and fresh
 readiness checks at 2026-10-15 20:17 UTC.** The 20:05 checkpoint reprocessed the
@@ -47,11 +57,11 @@ The entire approved plan 0–15 and discovered findings remain in scope, with
 
 Recorded at **2026-10-15 20:02 UTC / 2026-10-16 07:02 Australia/Canberra**.
 
-John's latest instruction is: **“please pause all work and write yourself a status report.”**
-All work owned by this thread is paused. This instruction supersedes the earlier
-19:11:41 UTC conditional continuation forwarded by Emmy. Do not resume agents,
-implementation, checks, cleanup, signing preparation, PR work or merge work until
-John explicitly resumes. This report records state; it does not authorize work.
+The historical checkpoint below reprocessed **“please pause all work and write
+yourself a status report.”** It incorrectly characterized that original message
+as newer than the 19:11:41 UTC continuation. The verified chronology above
+corrects that mistake. Its recorded stop actions and checkout snapshot are
+historical; they do not describe current execution or authorize new work.
 
 ## Stop and ownership
 
@@ -71,9 +81,9 @@ John explicitly resumes. This report records state; it does not authorize work.
   `01a140e3-fc15-7900-b0c5-cc80ebc95fb2`. Root owns Git, ledger and test capacity;
   Sol is the sole product/test writer; independent Astra and systems reviews
   remain separate. Do not revive the superseded original .7 thread.
-- Emmy and the relay have John-confirmed direction authority. Preserve their
-  earlier approved decisions, but do not treat an older continuation as an
-  override of this latest explicit pause.
+- Emmy and the relay have John-confirmed direction authority. The historical
+  stop below was superseded by the verified later continuation above; obey any
+  actually new direct stop, identified by its message and time.
 
 ## Exact checkout state
 

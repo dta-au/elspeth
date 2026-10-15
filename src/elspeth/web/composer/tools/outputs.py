@@ -27,13 +27,13 @@ from elspeth.web.composer.tools._common import (
     _apply_merge_patch,
     _attach_post_call_hints,
     _mutation_result,
+    _plugin_selection_violation,
     _post_mutation_invariant_error,
     _prevalidate_sink,
     _saved_graph_credential_wiring_contract_failure,
     _saved_graph_plugin_policy_failure,
     _saved_graph_rejection_result,
     _validate_mutation_arguments,
-    _validate_plugin_name,
     _validate_sink_path,
     resolve_failure_route_choice,
     validate_composer_file_sink_collision_policy,
@@ -160,12 +160,12 @@ def _execute_set_output(
         return _saved_graph_rejection_result(
             state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=f"output:{validated.sink_name}"
         )
-    # Validate plugin exists in catalog
-    plugin_error = _validate_plugin_name(context, "sink", plugin)
+    plugin_error = _plugin_selection_violation(context, "sink", plugin)
     if plugin_error is not None:
         return _saved_graph_plugin_policy_failure(
             state, plugin_error, component=f"output:{validated.sink_name}", rejected_component=f"output:{validated.sink_name}"
         )
+    context.catalog.get_schema("sink", plugin)
 
     # S2: Validate sink path allowlist (mirrors source path check)
     credential_error = _saved_graph_credential_wiring_contract_failure(
@@ -274,11 +274,12 @@ def _execute_patch_output_options(
         )
     # State-held plugin: resolve it through the request's policy view before
     # prevalidation stamps it (see _execute_patch_source_options).
-    plugin_error = _validate_plugin_name(context, "sink", current.plugin)
+    plugin_error = _plugin_selection_violation(context, "sink", current.plugin)
     if plugin_error is not None:
         return _saved_graph_plugin_policy_failure(
             state, plugin_error, component=f"output:{sink_name}", rejected_component=f"output:{sink_name}"
         )
+    context.catalog.get_schema("sink", current.plugin)
     new_options = _apply_merge_patch(current.options, patch)
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(current.plugin, new_options)
     if endpoint_policy_error is not None:

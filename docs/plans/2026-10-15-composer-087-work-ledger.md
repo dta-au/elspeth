@@ -53,7 +53,7 @@ packet; it does not mean merged, signed, released or deployed.
 | Planned work | Current status |
 |---|---|
 | 0. Baseline inventories and ownership | Complete; live registry/profile and direct-call inventories recorded. |
-| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement and output groups accepted locally in `620231a` and `208bf8d`. Source group accepted for local integration after both reviews and focused qualification; transform/splice, blob, secret, discovery and remaining dispatch migrations remain pending. |
+| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement, output and source groups accepted locally in `620231a`, `208bf8d` and `41348ede`. Transform/splice, blob, secret, discovery and remaining dispatch migrations remain pending. |
 | 2. Saved-but-blocked persistence/reload/UI | Pending joined behavioral evidence; inherited .6 teaching retained. |
 | 3. Model-catalog provenance | Fixed in .6; .7 regression closure pending. |
 | 4. Explicit CSV failure choice | Runtime refusal already exists. False assistance claim that omission defaults to discard still needs correction and its provenance checks. |
@@ -76,7 +76,7 @@ Additional defects and controls found during this work:
 
 | Finding | Current status |
 |---|---|
-| Rejection policy reasons flattened; admitted schema faults masked | Candidate/shared-resolver packet accepted locally. Output policy reasons and saved rejection identity are fixed; output admitted-schema propagation still needs its separate two-seam migration. Other caller families remain pending. |
+| Rejection policy reasons flattened; admitted schema faults masked | Candidate/shared-resolver packet accepted locally. Output policy reasons and saved identity are fixed; its separate two-caller schema-fault follow-up is now reviewed and qualified for local integration. Other caller families remain pending. |
 | Migrated candidate paths disclose raw path details | Fixed locally with static safe guidance and deliberate privacy controls; output path/history cases also accepted. |
 | Repeated masked-classifier guidance falsely says the request is impossible | Fixed locally in packet 1a. |
 | Inline CSV parse, scan-cap and content-conflict refusals conflated | Fixed locally in packet 1a. |
@@ -96,7 +96,7 @@ Additional defects and controls found during this work:
 | SL3: stale authentication destination A overrides explicit B | Fixed and accepted locally in the same shared-link packet. |
 | SL4: previous shared snapshot remains under a new token | Fixed and accepted locally in the same packet using route identity. |
 | SL5: shared-view global keyboard shortcuts act on recipient workspace | Open, outside the narrowed fallback patch. New-session shortcut reproduced; validation shortcut source-supported only. No sender mutation or cross-user access established. |
-| Ready plural source blob with NULL hash is treated as repairable | Corrected in accepted source1c candidate; real corruption and laundering controls preserve the owned integrity failure. Local commit pending. |
+| Ready plural source blob with NULL hash is treated as repairable | Corrected locally in `41348ede`; real corruption and laundering controls preserve the owned integrity failure. |
 | Invalid stored MIME has a redundant recoverable branch; MIME DB-CHECK comment is false | Corrected in source1c; the real row reader retains MIME integrity ownership, and the comment names the actual write/read guards. No constraint or epoch change. |
 | Source policy refusal occurs after schema access | Corrected in source1c with pure policy admission before direct schema access. Actual unavailable reasons and admitted ValueError/KeyError propagation are qualified separately. |
 | Null/malformed source claims disappear or are string-coerced | Included in approved item-8 design; implementation pending. |
@@ -105,13 +105,14 @@ Additional defects and controls found during this work:
 | Source unavailability reaches completion too late or becomes false budget exhaustion | Included in approved item-8 design; implementation pending across preview/completion/review entrances. |
 | Per-query scoring override does not inherit node criterion references | Actual boundary identified; teaching/characterization pending. No new override mechanism approved. |
 | LiteLLM conditional parameter repair/fallback can differ from ordinary retries | Separate documented limitation; title retry pins do not universally qualify provider behavior. |
-| Output admitted-schema ValueError/KeyError becomes availability repair | Source-confirmed remaining migration at set/patch output selection; accepted packet 1b identity, credential and privacy behavior stays qualified separately. |
+| Output admitted-schema ValueError/KeyError becomes availability repair | Two-caller migration accepted by independent correctness/security and systems reviews for local integration. Actual handler/dispatch/turn positives, relevant gates, three witnessed controls, focused PostgreSQL and fresh keyless comparison complete; broader gates remain due. |
 | Aggregation output-count refusal hides standing saved findings | Source-confirmed `with_state_validation=False` in upsert; systems-reviewed transform/splice correction pending. |
 | Transform provider-path refusal exposes private path/root text | Source-confirmed in upsert, patch and splice preparation; static producer projection and privacy controls pending in the reviewed transform group. |
 | Node refusals omit codes/subjects or mask admitted schema faults | Systems source design complete for upsert, patch and splice plus existing helpers; implementation and discriminating controls pending. |
 | New predecessor test bypasses the required session-engine factory | Normal hook exposed it; repaired with the existing read-only inspection factory. All39 epoch cases plus masquerade gate pass, and actual initializer-admission mutation still fails as intended. Normal hooks now pass. |
 | Credential-envelope census still names the legacy adapter instead of its payload builder | Corrected at the real builder with explicit per-row constructor ownership. The complete affected gate and witnessed key/missing-payload/owner controls pass their intended checks; no wire expansion. |
 | Source contract tests contain invalid fixture and outer-fault assumptions | Repaired with real owner premises and accurate outer/endpoint oracles; all104 affected cases pass. The original46 failures and2 teardown errors remain historical red evidence, not new product defects. |
+| Source/output turn tests use unspecced provider mocks | Repaired with autospec of the actual bound provider method. All four affected source turn cases and the output turn cases pass, along with the owning mock-discipline gate. Earlier source1c receipts retain their original scope; no new production defect established. |
 
 The earlier title custody stall was an execution-environment investigation,
 not a confirmed additional product defect. The deployed shared-link incident
@@ -880,9 +881,9 @@ private validator text; its exact-message assertion fails on that canary.
 
 After a relay-driven continuation check, root recovered the already completed
 40-pass source PostgreSQL receipt instead of launching it again. It is distinct
-from the earlier142-pass quota selection. Current HEAD remains `9d6533fe` until
-normal local integration; no unfinished Git operation or task-owned test process
-was found. Shared host allocation was4, below the12-slot ceiling. The same two
+from the earlier142-pass quota selection. At that check HEAD was `9d6533fe`, with
+no unfinished Git operation or task-owned test process. Shared host allocation
+was4, below the12-slot ceiling. The same two
 reviewers were resumed, and no replacement owner or product writer was created.
 The separate0.8.6 owner's publication and runtime changes remain held.
 
@@ -890,6 +891,45 @@ The keyless1 scan remains the separately completed3277-finding no-drift
 diagnostic, reused only for unchanged production/lint/config. Original positive1
 stays red; no green1237-case aggregate or sum of overlapping selections is
 claimed. Scoped Ruff, source mypy, contracts and skill-inventory receipts retain
-their stated bounds. Normal local Git integration, full branch/default/full
+their stated bounds. Full branch/default/full
 PostgreSQL, protected exact-head CI/merge, operator adjudication/signing and
 the remaining plan0–15 work remain separate. Items16–18 are conditional.
+
+Root completed normal local integration as
+`41348ede3c667bf337ab6597a59df0f9e02dc5a5`. Canonical commit preflight exited0
+with no failures/warnings, and all triggered normal hooks passed. No hook changed
+file bytes. Fresh postcommit verification found a clean checkout, all12 committed
+blobs matching the staged reviewed files and all55 non-document freeze bindings
+unchanged. Only the two root status documents differ from the runtime snapshot,
+because they record the completed reviews/checks. This later status update is
+documentation only; the recorded clean state precedes it. The next bounded
+repair addresses the remaining two output schema-probe callers; source1c does
+not silently qualify that separately recorded fault-masking boundary.
+
+### Bounded output schema-fault follow-up acceptance
+
+Only set_output and patch_output_options change production behavior: pure
+policy admission precedes direct schema access. Actual denied reasons retain
+saved-state refusals; admitted ValueError/KeyError propagates instead of
+becoming availability repair. Shared helpers, source production, public shapes
+and epochs are unchanged. Both independent reviewers accept local integration;
+root Git integration is the next step, not a completed claim here.
+
+Root completed85 affected behavior cases,448 scanned-input gate cases and18
+focused PostgreSQL rejection cases, each with zero failures/errors/skips. The
+three deliberate controls produced20 intended witnessed failures:8 restored
+masking,8 denied reads and4 identity-publication assertions. The last control
+inserted actual identity and schema bytes before the identity guard failed; it
+does not separately discriminate schema-only publication. Controlled receipt
+checks reject missing witnesses, setup errors, unrelated failures and missing
+cases. All seven runs share6604 unchanged file/symlink inputs. Fresh keyless
+comparison against41348ede is3277 to3277 with zero semantic additions/removals;
+operator signature clearance remains separate.
+
+Final scanned-input review also found unspecced provider mocks in the source
+and output turn tests. Their narrow repair uses the actual bound method's
+autospec and preserves all other test bytes. The four affected source cases
+and owning mock gate now have fresh passing evidence; historical source1c
+receipts retain their original scope. Runtime evidence and reviews are under
+output-schema-root-* and reviews/astra-output-schema-*.md in the ignored lane.
+Full plan0–15 continues,16–18 conditional; broader gates and release are open.

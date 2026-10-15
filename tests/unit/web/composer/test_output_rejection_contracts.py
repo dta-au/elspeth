@@ -1,19 +1,27 @@
 """Incremental output refusals describe the unchanged surviving graph."""
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
+from unittest.mock import create_autospec
 
 import pytest
 
+from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_cache import serialize_tool_result
+from elspeth.web.composer.protocol import ComposerPluginCrashError
+from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import CompositionState, OutputSpec, ValidationSummary
 from elspeth.web.composer.tools import execute_tool, outputs
 from elspeth.web.composer.tools._common import ToolContext, ToolResult, _validate_sink_path, normalize_tool_result_validation
 from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
+from tests.unit.web.composer._helpers import _composer_service_with_session, _persisted_tool_responses
+from tests.unit.web.composer.test_compose_loop_audit_wiring import _make_llm_response, _make_settings
 from tests.unit.web.composer.test_semantic_validator import _wardline_state
 from tests.unit.web.composer.test_tools import _empty_state, _restricted_policy_pair
 
@@ -139,7 +147,7 @@ def test_output_path_refusal_is_safe_in_ordinary_response_and_history(tmp_path: 
 @pytest.mark.parametrize("tool", ["set_output", "patch_output_options"])
 @pytest.mark.parametrize("reason", [PluginUnavailableReason.NOT_AUTHORIZED, PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING])
 def test_output_policy_refusal_retains_actual_reason_without_schema_identity(
-    surface: Surface, tool: str, reason: PluginUnavailableReason
+    monkeypatch: pytest.MonkeyPatch, surface: Surface, tool: str, reason: PluginUnavailableReason
 ) -> None:
     catalog = create_catalog_service()
     view, snapshot = _restricted_policy_pair(catalog, PluginId("sink", "json"), reason)
@@ -148,14 +156,104 @@ def test_output_policy_refusal_retains_actual_reason_without_schema_identity(
     args = {"sink_name": "main", "patch": {"encoding": "utf-8"}}
     if tool == "set_output":
         args = {"sink_name": "main", "plugin": "json", "options": _options(), "on_write_failure": "discard"}
+    original_schema = PolicyCatalogView.get_schema
+    schema_calls = []
+
+    def schema(view, kind, name):
+        if (kind, name) == ("sink", "json"):
+            schema_calls.append((kind, name))
+            raise AssertionError("unadmitted output schema was read")
+        return original_schema(view, kind, name)
+
+    monkeypatch.setattr(PolicyCatalogView, "get_schema", schema)
     result = _invoke(surface, tool, args, state, context)
     assert not result.success and result.updated_state is state
     entry = result.validation.errors[0]
     assert (entry.error_code, entry.rejected_component) == (reason.value, "output:main")
     assert entry.plugin_identity is None
     assert result.plugin_schemas is None
+    assert schema_calls == []
     if surface == "dispatch":
         assert result.validation_guidance is not None and reason.value in result.validation_guidance["codes"]
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+@pytest.mark.parametrize("tool", ["set_output", "patch_output_options"])
+def test_output_unknown_plugin_has_real_not_installed_reason_and_no_schema_read(
+    monkeypatch: pytest.MonkeyPatch,
+    surface: Surface,
+    tool: str,
+) -> None:
+    state, context = _saved_state(), _context()
+    plugin = "not_installed_output_contract_sink"
+    assert context.catalog.unavailable_reason(PluginId("sink", plugin)) is PluginUnavailableReason.NOT_INSTALLED
+    state = replace(state, outputs=(*state.outputs[:-1], replace(state.outputs[-1], plugin=plugin)))
+    before = state.to_dict()
+    args = {"sink_name": "main", "patch": {"encoding": "utf-8"}}
+    if tool == "set_output":
+        args = {"sink_name": "main", "plugin": plugin, "options": _options(), "on_write_failure": "discard"}
+    original_schema = PolicyCatalogView.get_schema
+    schema_calls = []
+
+    def schema(view, kind, name):
+        if (kind, name) == ("sink", plugin):
+            schema_calls.append((kind, name))
+            raise AssertionError("uninstalled output schema was read")
+        return original_schema(view, kind, name)
+
+    monkeypatch.setattr(PolicyCatalogView, "get_schema", schema)
+    result = _invoke(surface, tool, args, state, context)
+    entry = result.validation.errors[0]
+    assert not result.success and result.updated_state is state and state.to_dict() == before
+    assert (entry.error_code, entry.rejected_component, entry.plugin_identity) == ("plugin_not_installed", "output:main", None)
+    assert result.plugin_schemas is None and schema_calls == []
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+@pytest.mark.parametrize("tool", ["set_output", "patch_output_options"])
+@pytest.mark.parametrize("error_type", [ValueError, KeyError])
+def test_output_admitted_schema_fault_propagates_from_the_actual_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    surface: Surface,
+    tool: str,
+    error_type: type[Exception],
+) -> None:
+    state, context = _saved_state(), _context()
+    before = state.to_dict()
+    assert context.catalog.unavailable_reason(PluginId("sink", "json")) is None
+    args = {"sink_name": "main", "patch": {"encoding": "utf-8"}}
+    if tool == "set_output":
+        args = {"sink_name": "main", "plugin": "json", "options": _options(), "on_write_failure": "discard"}
+    original_schema = PolicyCatalogView.get_schema
+    original_handler = outputs._execute_set_output if tool == "set_output" else outputs._execute_patch_output_options
+    in_handler = False
+    schema_calls = []
+    fault = error_type("OWNED-OUTPUT-SCHEMA-FAULT-CANARY")
+
+    def schema(view, kind, name):
+        if in_handler and (kind, name) == ("sink", "json"):
+            schema_calls.append((kind, name))
+            raise fault
+        return original_schema(view, kind, name)
+
+    def handler(arguments, saved, handler_context):
+        nonlocal in_handler
+        assert saved is state
+        in_handler = True
+        try:
+            return original_handler(arguments, saved, handler_context)
+        finally:
+            in_handler = False
+
+    monkeypatch.setattr(PolicyCatalogView, "get_schema", schema)
+    if tool == "set_output":
+        monkeypatch.setattr(outputs, "_execute_set_output", handler)
+    else:
+        monkeypatch.setattr(outputs, "_execute_patch_output_options", handler)
+    with pytest.raises(error_type) as caught:
+        _invoke(surface, tool, args, state, context)
+    assert caught.value is fault and schema_calls == [("sink", "json")]
+    assert state.to_dict() == before and state.version == 17
 
 
 @pytest.mark.parametrize("surface", ["handler", "dispatch"])
@@ -263,3 +361,79 @@ def test_output_collision_policy_refusal_has_its_own_code(surface: Surface, tool
     entry = result.validation.errors[0]
     assert (entry.error_code, entry.rejected_component) == ("file_sink_write_policy_invalid", "output:main")
     assert "collision_policy" in entry.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["set_output", "patch_output_options"])
+@pytest.mark.parametrize("error_type", [ValueError, KeyError])
+async def test_output_outer_schema_fault_preserves_earlier_completed_state_and_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    error_type: type[Exception],
+) -> None:
+    def available(*, model: str, **kwargs: Any) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="offline")
+
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", available)
+    service, session_id = _composer_service_with_session(catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path))
+    state = _saved_state()
+    before = state.to_dict()
+    args = {"sink_name": "main", "patch": {"encoding": "utf-8"}}
+    if tool == "set_output":
+        args = {"sink_name": "main", "plugin": "json", "options": _options(), "on_write_failure": "discard"}
+    original_schema = PolicyCatalogView.get_schema
+    original_handler = outputs._execute_set_output if tool == "set_output" else outputs._execute_patch_output_options
+    fault = error_type("OWNED-OUTPUT-SCHEMA-FAULT-CANARY")
+    in_handler = False
+    schema_calls = []
+
+    def schema(view, kind, name):
+        if in_handler and (kind, name) == ("sink", "json"):
+            schema_calls.append((kind, name))
+            raise fault
+        return original_schema(view, kind, name)
+
+    def handler(arguments, saved, handler_context):
+        nonlocal in_handler
+        assert saved.version == 18 and saved.metadata.name == "Earlier completed output edit"
+        assert saved.outputs == state.outputs
+        assert handler_context.catalog.unavailable_reason(PluginId("sink", "json")) is None
+        in_handler = True
+        try:
+            return original_handler(arguments, saved, handler_context)
+        finally:
+            in_handler = False
+
+    monkeypatch.setattr(PolicyCatalogView, "get_schema", schema)
+    if tool == "set_output":
+        monkeypatch.setattr(outputs, "_execute_set_output", handler)
+    else:
+        monkeypatch.setattr(outputs, "_execute_patch_output_options", handler)
+    response = _make_llm_response(
+        tool_calls=[
+            {"id": "output_prior", "name": "set_metadata", "arguments": {"patch": {"name": "Earlier completed output edit"}}},
+            {"id": "output_fault", "name": tool, "arguments": args},
+        ]
+    )
+    llm = create_autospec(service._provider_gateway._call_llm, return_value=response)
+    monkeypatch.setattr(service._provider_gateway, "_call_llm", llm)
+    recorder = BufferingRecorder()
+    monkeypatch.setattr("elspeth.web.composer.service.BufferingRecorder", lambda: recorder)
+    with pytest.raises(ComposerPluginCrashError) as caught:
+        await service._run_one_turn_for_test(session_id=session_id, initial_state=state)
+    assert schema_calls == [("sink", "json")] and llm.await_count == 1
+    assert caught.value.original_exc is fault and caught.value.__cause__ is fault
+    assert caught.value.partial_state is not None
+    assert caught.value.partial_state.version == 18 and caught.value.partial_state.metadata.name == "Earlier completed output edit"
+    assert caught.value.partial_state.outputs == state.outputs and state.to_dict() == before
+    assert caught.value.failed_turn is not None and caught.value.failed_turn.tool_calls_attempted == 2
+    invocations = recorder.invocations
+    assert [r.tool_call_id for r in invocations] == ["output_prior", "output_fault"]
+    assert [r.status for r in invocations] == [ComposerToolStatus.SUCCESS, ComposerToolStatus.PLUGIN_CRASH]
+    assert [r.version_after for r in invocations] == [18, None]
+    assert invocations[1].error_class == error_type.__name__
+    rows = _persisted_tool_responses(service, session_id)
+    assert [row["tool_call_id"] for row in rows] == ["output_prior", "output_fault"]
+    assert json.loads(rows[0]["result_canonical"])["success"] is True
+    assert json.loads(rows[1]["result_canonical"])["error_class"] == error_type.__name__
