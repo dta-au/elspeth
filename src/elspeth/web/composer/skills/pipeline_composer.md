@@ -487,11 +487,11 @@ Do not call `list_blobs` to rediscover it.
 <!-- taught:end -->
 
 <!-- taught:begin envelope * runtime_preflight; preflight * runtime_preflight.is_valid; preflight * runtime_preflight.checks; preflight * runtime_preflight.readiness; preflight * runtime_preflight.errors; preflight * runtime_preflight.warnings; preflight * runtime_preflight.semantic_contracts -->
-`runtime_preflight` appears
-only on `preview_pipeline`, and only when a runtime check ran, as its own
-top-level field: `is_valid`, `checks`,
-`readiness` (`execution_ready` and `blockers` say whether it can run), and
-runtime `errors` / `warnings` / `semantic_contracts`.
+`runtime_preflight` is separate runtime feedback on `preview_pipeline` or an
+applied successful mutation: `is_valid`, `checks`, `readiness`
+(`execution_ready`, `blockers`), `errors` / `warnings` / `semantic_contracts`.
+It neither changes the structural verdict nor undoes the mutation; mutation
+success alone does not establish execution readiness.
 <!-- taught:end -->
 
 ## Audit Boundaries
@@ -836,12 +836,13 @@ LLM node preflight has four independent review checks:
   with the alias the authoring aids deliver for this deployment and OMIT
   model/provider/credential options — operator policy supplies the concrete
   model and a profile-bound node carries NO `llm_model_choice` card. Author
-  `options.model` ONLY with a slug `list_models` served this session (never
-  invented, never recalled); picking a default, the cheapest, the latest, or
+  `options.model` ONLY from the supplied `model_catalog` or `list_models`
+  this session; discover a missing provider's models. Never invent or recall
+  slugs. Picking a default, the cheapest, the latest, or
   any served slug counts as authored — the auto-stager creates the
   `llm_model_choice` requirement when `options.model` is set, and YOU must
   surface it. Omitting the model binding entirely is not compliance: an `llm`
-  node needs either `options.profile` or a discovery-served `options.model`.
+  node needs either `options.profile` or a catalog/discovery-served `options.model`.
 - Does untrusted or externally controlled upstream content flow into this LLM
   without an authorized prompt-injection
   shield? Stage `pipeline_decision` with
