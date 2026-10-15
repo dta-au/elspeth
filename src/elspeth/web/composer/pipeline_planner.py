@@ -2247,13 +2247,12 @@ def route_destination_fact_keys(code: str) -> frozenset[str]:
 
 
 def _rejection_fingerprint(result: ToolResult) -> tuple[tuple[str, str], ...]:
-    """Identity of one candidate rejection: sorted (component, code) pairs.
+    """Visible rejection classifiers: sorted (component, code) pairs.
 
-    Two rejections with the same fingerprint failed for the same reasons on
-    the same components — the previous repair changed nothing that mattered.
-    Project doctrine: an identical fingerprint repeating across attempts is a
-    feedback-quality defect (ours), so the loop must at minimum TELL the model
-    the repetition happened instead of silently burning budget on it.
+    A repeat identifies the same classifiers, not the same causes or absence
+    of progress. One repaired field can reveal another defect under the same
+    component/code pair. Tell the model the classifiers repeated without
+    treating that observation as a semantic no-progress identity.
 
     The component half must be the ATTRIBUTED ref, not the raw one: every
     pre-application entry is filed under the literal ``rejected_mutation``, so
@@ -2270,21 +2269,18 @@ def _rejection_fingerprint(result: ToolResult) -> tuple[tuple[str, str], ...]:
 
 
 _REPEAT_NOTICE = (
-    "This candidate failed with EXACTLY the same rejection set (same components, same codes) "
-    "as an earlier candidate in this request: the intervening changes did not fix — or "
-    "reintroduced — the failure. Change ONLY the fields the errors below name, keep every "
-    "other part of your last candidate byte-identical, and re-emit."
+    "This candidate failed with the same rejection set of components and codes as an earlier "
+    "candidate in this request. Matching classifiers do not prove that the underlying causes "
+    "are unchanged. Repair the current disclosed errors, keep unrelated valid fields unchanged, and re-emit."
 )
 
-# Honest variant for a repeat whose facts are (partly) withheld: the ordinary
-# notice's "change ONLY the fields the errors below name" is unsatisfiable when
-# no field is named. Static text, never per-request data.
+# Withheld facts can preclude following disclosed-error repair directions.
+# Describe that limit without claiming repair is impossible. Static text only.
 _REPEAT_NOTICE_WITHHELD = (
-    "This candidate failed with EXACTLY the same rejection set (same components, same codes) "
-    "as an earlier candidate in this request. At least one failing component is configured "
-    "server-side for this surface and its validator detail is withheld, so re-emitting a "
-    "near-identical candidate cannot succeed. Only a structurally different candidate — or an "
-    "honest decline — can resolve this."
+    "This candidate failed with the same rejection set of components and codes as an earlier "
+    "candidate in this request. Some diagnostic facts are withheld to protect server-owned "
+    "configuration. Matching classifiers alone do not prove identical causes or that repair "
+    "is impossible. Use the disclosed contract and guidance to repair within the remaining limits."
 )
 
 # Honest variant for a repeat of a rejection that NO re-emitted candidate can
@@ -2701,11 +2697,9 @@ def _allowlisted_candidate_feedback(
         )
     if repeated_fingerprint:
         # Static text, never per-request data: names the repetition the model
-        # cannot see on its own (it has no attempt counter) so budget stops
-        # burning on byte-identical failures without the model knowing. The
-        # withheld variant is honest about WHY re-emitting cannot succeed —
-        # the ordinary notice's "change ONLY the fields the errors below
-        # name" names no field when facts are withheld.
+        # cannot see on its own (it has no attempt counter). Matching visible
+        # classifiers do not establish unchanged causes; the withheld variant
+        # must also avoid instructing a repair using facts it did not disclose.
         feedback["repeat_notice"] = _REPEAT_NOTICE_WITHHELD if any_facts_withheld else _REPEAT_NOTICE
     return feedback
 
@@ -3495,11 +3489,11 @@ async def _plan_pipeline_inner(
     # Summing each contract independently creates a small but real gap at the
     # 48 KiB boundary.
     selected_schema_contracts: list[dict[str, Any]] = []
-    # (component, code) fingerprints of every candidate rejection so far in
-    # this request. A repeat means the intervening repair changed nothing that
-    # mattered — the feedback then says so explicitly (repeat_notice) instead
-    # of letting the model burn budget without knowing it is looping.
+    # Pair recurrence informs feedback, but does not measure semantic progress.
     seen_rejection_fingerprints: set[tuple[tuple[str, str], ...]] = set()
+    # Internal only: bind the actual authored values and order semantics, not
+    # the value-free diagnostic shape hash or any finalizer/private values.
+    seen_rejected_candidates: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
 
     def _violated_plugin_contract(kind: PluginKind, plugin_name: str) -> Mapping[str, Any] | None:
         """Rehydrate and charge one violated plugin's planner contract.
@@ -4394,6 +4388,7 @@ async def _plan_pipeline_inner(
                         if terminal_feedback is None:
                             pipeline = payload.pipeline
             finalized_pipeline: Mapping[str, Any] | None = None
+            authored_candidate_identity: str | None = None
             finalizer_owned_refs: _FinalizerOwnedRefs = _FINALIZER_OWNS_NOTHING
             if terminal_feedback is None:
                 assert pipeline is not None
@@ -4409,8 +4404,13 @@ async def _plan_pipeline_inner(
                     seen_rejection_fingerprints.add(missing_source_fingerprint)
                     terminal_feedback = _allowlisted_candidate_feedback(missing_source, repeated_fingerprint=repeated_terminal_fingerprint)
                 else:
+                    authored_candidate_identity = stable_hash(project_composer_authority_payload(pipeline))
+                    # An owned finalizer may mutate its input. Keep the authored
+                    # mapping intact for both attribution and repeat identity.
+                    finalizer_input = deep_thaw(pipeline)
+                    assert type(finalizer_input) is dict
                     try:
-                        finalizer_result = candidate_finalizer(pipeline)
+                        finalizer_result = candidate_finalizer(finalizer_input)
                     except Exception as exc:
                         if is_hatch_turn:
                             trail.finalize_active_exception(exc)
@@ -4580,10 +4580,14 @@ async def _plan_pipeline_inner(
             except _PipelineCandidateRejected as exc:
                 assert finalized_pipeline is not None
                 assert pipeline is not None
+                assert authored_candidate_identity is not None
                 last_rejection_codes = _candidate_rejection_codes(exc.result)
                 rejection_fingerprint = _rejection_fingerprint(exc.result)
                 repeated_fingerprint = rejection_fingerprint in seen_rejection_fingerprints
                 seen_rejection_fingerprints.add(rejection_fingerprint)
+                candidate_rejection = (authored_candidate_identity, rejection_fingerprint)
+                repeated_candidate_rejection = candidate_rejection in seen_rejected_candidates
+                seen_rejected_candidates.add(candidate_rejection)
                 candidate_facts_withheld = _rejection_facts_withheld(exc.result, finalizer_owned_refs)
 
                 candidate_feedback = _allowlisted_candidate_feedback(
@@ -4624,16 +4628,12 @@ async def _plan_pipeline_inner(
                     trail.finish_attempt("hatch", "candidate_rejected", codes=last_rejection_codes, led_to="terminal")
                     assert hatch_error is not None
                     raise hatch_error from None
-                if repeated_fingerprint and candidate_facts_withheld:
-                    # Repeat-while-blind short-circuit (elspeth-5904b1683a): the
-                    # identical rejection set has already been answered once,
-                    # and at least one entry's candidate facts are withheld —
-                    # the model cannot see, and can never fix, the server-bound
-                    # configuration behind it. Burning the remaining budget on
-                    # near-identical candidates is deterministic waste, so this
-                    # resolves straight to the terminal path (hatch first, as
-                    # the budget-exhaustion path does). Budget semantics are
-                    # unchanged whenever every entry carries its facts.
+                if repeated_candidate_rejection and candidate_facts_withheld:
+                    # Stop another blind retry only for an unchanged authored
+                    # candidate with the same rejection classifiers. A changed
+                    # field can expose a new conflict under the same pair, so
+                    # pair recurrence alone still gets the bounded repair path.
+                    # Withholding, hatch and total/repair budgets stay intact.
                     if _hatch_available():
                         trail.finish_attempt(
                             attempt_phase,
@@ -4651,7 +4651,8 @@ async def _plan_pipeline_inner(
                         )
                         _engage_escape_hatch(
                             _rejection_exhausted(
-                                "planner repair short-circuited: repeated rejection with withheld candidate facts cannot converge"
+                                "planner repair short-circuited: unchanged authored candidate repeated the same rejection classifiers "
+                                "with withheld facts"
                             )
                         )
                         continue
@@ -4664,7 +4665,8 @@ async def _plan_pipeline_inner(
                         repeated_fingerprint=True,
                     )
                     raise _rejection_exhausted(
-                        "planner repair short-circuited: repeated rejection with withheld candidate facts cannot converge"
+                        "planner repair short-circuited: unchanged authored candidate repeated the same rejection classifiers "
+                        "with withheld facts"
                     ) from None
                 repair_count += 1
                 if repair_count > repair_budget:

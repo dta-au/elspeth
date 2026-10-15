@@ -3134,43 +3134,168 @@ async def test_profile_rejection_keeps_diagnosis_through_feedback_and_attempt_au
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("in_place_finalizer", [False, True])
+async def test_progressive_coalesce_repairs_do_not_stop_on_repeated_withheld_classifiers(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    in_place_finalizer: bool,
+) -> None:
+    def candidate(x_type: str, y_type: str) -> dict[str, Any]:
+        pipeline = _pipeline(tmp_path)
+        pipeline["source"]["options"]["schema"] = {"mode": "fixed", "fields": ["x: int", "y: int"]}
+        pipeline["nodes"] = [
+            {
+                "id": "fork_rows",
+                "node_type": "gate",
+                "input": "rows",
+                "condition": "True",
+                "routes": {"true": "fork", "false": "fork"},
+                "fork_to": ["left", "right"],
+                "options": {},
+            },
+            {
+                "id": "right_rows",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "right",
+                "on_success": "right_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "fixed", "fields": [f"x: {x_type}", f"y: {y_type}"]}},
+            },
+            {
+                "id": "merge_rows",
+                "node_type": "coalesce",
+                "input": "left",
+                "on_success": "merged",
+                "branches": {"left": "left", "right": "right_done"},
+                "policy": "require_all",
+                "merge": "union",
+                "options": {},
+            },
+        ]
+        pipeline["outputs"][0]["sink_name"] = "merged"
+        return pipeline
+
+    private_path = "outputs/PRIVATE-UNRELATED-FINALIZER.jsonl"
+
+    def finalize(pipeline: Mapping[str, Any]) -> Mapping[str, Any]:
+        finalized = pipeline if in_place_finalizer else deepcopy(dict(pipeline))
+        assert type(finalized) is dict
+        finalized["outputs"][0]["options"]["path"] = private_path
+        return finalized
+
+    candidates = [candidate("str", "str"), candidate("int", "str"), candidate("int", "int")]
+    context, _, _ = _candidate_context(tmp_path, _TEST_SESSION_ID)
+    results = [build_set_pipeline_candidate(finalize(deepcopy(item)), _empty_state(), context).result for item in candidates]
+    conflicts = [
+        next(entry for entry in result.validation.errors if entry.error_code == "coalesce_union_type_incompatible")
+        for result in results[:2]
+    ]
+    assert [entry.coalesce_union_type.field for entry in conflicts] == ["x", "y"]
+    assert results[2].success and results[2].validation.is_valid, results[2].validation.errors
+    assert _rejection_fingerprint(results[0]) == _rejection_fingerprint(results[1])
+    for item, result in zip(candidates[:2], results[:2], strict=True):
+        owned = _derive_finalizer_owned_refs(item, finalize(deepcopy(item)))
+        assert owned.config == frozenset({"output:merged"})
+        assert pipeline_planner._rejection_facts_withheld(result, owned)
+
+    completion = _ScriptedCompletion(
+        *[
+            _response_with_call_id(f"coalesce-{index}", "emit_pipeline_proposal", {"pipeline": item})
+            for index, item in enumerate(candidates, start=1)
+        ]
+    )
+    recorder = BufferingRecorder()
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        repair_budget=2,
+        candidate_finalizer=finalize,
+        model_overrides={"escape_hatch_model": None},
+    )
+
+    assert len(completion.requests) == 3
+    assert len(recorder.llm_calls) == 3
+    assert proposal.proposal.repair_count == 2
+    assert deep_thaw(proposal.proposal.pipeline) == finalize(deepcopy(candidates[2]))
+    assert [attempt.repeated_fingerprint for attempt in recorder.planner_attempts] == [False, True, False]
+    assert len({attempt.candidate_shape_hash for attempt in recorder.planner_attempts}) == 1
+    authored_hashes = [stable_hash(pipeline_planner.project_composer_authority_payload(item)) for item in candidates]
+    assert len(set(authored_hashes)) == 3
+    assert all(digest not in canonical_json(completion.requests) for digest in authored_hashes)
+    assert all(item["outputs"][0]["options"]["path"] == "outputs/result.jsonl" for item in candidates)
+    private_rejections = recorder.private_candidates[:2]
+    assert [item.status for item in private_rejections] == ["rejected", "rejected"]
+    assert [
+        next(
+            entry["coalesce_union_type"]["field"]
+            for entry in json.loads(item.result_canonical)["validation"]["errors"]
+            if entry["error_code"] == "coalesce_union_type_incompatible"
+        )
+        for item in private_rejections
+    ] == ["x", "y"]
+    for request in completion.requests[1:]:
+        (feedback_message,) = [message for message in request["messages"][-1:] if message["role"] == "tool"]
+        feedback = json.loads(feedback_message["content"])
+        coalesce = next(entry for entry in feedback["validation"]["errors"] if entry["error_code"] == "coalesce_union_type_incompatible")
+        assert "coalesce_union_type" not in coalesce
+    second_feedback = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert second_feedback["repeat_notice"] == _REPEAT_NOTICE_WITHHELD
+    assert "cannot succeed" not in second_feedback["repeat_notice"]
+    assert "Only a structurally different" not in second_feedback["repeat_notice"]
+    assert private_path not in canonical_json(completion.requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vary_private_option", [False, True])
 async def test_repeated_rejection_with_withheld_facts_short_circuits_budget(
     tmp_path: Path,
     tool_context: ToolContext,
+    vary_private_option: bool,
 ) -> None:
-    """Repeat-while-blind fails fast to the terminal path (elspeth-5904b1683a).
-
-    When the finalizer's own (server-bound) configuration is what fails
-    validation, no candidate the model emits can converge — burning the rest
-    of the repair budget on near-identical candidates is deterministic waste.
-    """
+    """An unchanged authored rejection does not earn another blind retry."""
+    finalized_values = []
 
     def finalize(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        finalized = deepcopy(dict(candidate))
-        finalized["source"]["options"]["private_flag"] = True
-        return finalized
+        assert type(candidate) is dict
+        value = not vary_private_option or not finalized_values
+        candidate["source"]["options"]["private_flag"] = value
+        finalized_values.append(value)
+        return candidate
 
     candidate = _pipeline(tmp_path)
     completion = _ScriptedCompletion(
         _response_with_call_id("blind-first", "emit_pipeline_proposal", {"pipeline": deepcopy(candidate)}),
         _response_with_call_id("blind-repeat", "emit_pipeline_proposal", {"pipeline": deepcopy(candidate)}),
     )
+    recorder = BufferingRecorder()
 
     with pytest.raises(PipelinePlannerError) as excinfo:
         await _plan(
             tmp_path=tmp_path,
             tool_context=tool_context,
             completion=completion,
+            recorder=recorder,
             repair_budget=5,
             candidate_finalizer=finalize,
         )
 
     assert excinfo.value.code == "REPAIR_EXHAUSTED"
     assert "short-circuited" in str(excinfo.value)
+    assert "cannot converge" not in str(excinfo.value)
     # Exactly two provider calls: the first rejection buys ONE blind repair
     # turn; its identical rejection terminates instead of burning the
     # remaining budget of 5.
     assert len(completion.requests) == 2
+    assert finalized_values == ([True, False] if vary_private_option else [True, True])
+    assert "private_flag" not in candidate["source"]["options"]
+    assert recorder.planner_attempts[-1].planner_code.value == "REPAIR_BLIND_REPEAT"
+    assert [item.status for item in recorder.private_candidates] == ["rejected", "rejected"]
+    assert all("private_flag" in item.result_canonical for item in recorder.private_candidates)
+    assert "private_flag" not in canonical_json(completion.requests)
+    assert stable_hash(pipeline_planner.project_composer_authority_payload(candidate)) not in canonical_json(completion.requests)
     first_feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
     assert [entry["component"] for entry in first_feedback["validation"]["errors"]] == ["pipeline"]
     assert "detail" not in first_feedback["validation"]["errors"][0]
