@@ -1997,6 +1997,8 @@ def _registered_tool_names() -> frozenset[str]:
 
 def _tool_name_for(fn_name: str | None, site: str) -> str:
     assert fn_name is not None, f"{site}: result constructed outside any function"
+    if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+        return "get_blob_content"
     if fn_name in _FUNCTION_TOOL_OVERRIDES:
         return _FUNCTION_TOOL_OVERRIDES[fn_name]
     name = fn_name
@@ -2006,6 +2008,14 @@ def _tool_name_for(fn_name: str | None, site: str) -> str:
             break
     assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
     return name
+
+
+def test_blob_page_producer_attribution_refuses_unowned_sites() -> None:
+    assert _tool_name_for("page", "src/elspeth/web/composer/tools/blobs.py:2084") == "get_blob_content"
+    with pytest.raises(AssertionError, match="cannot attribute function"):
+        _tool_name_for("page", "src/elspeth/web/composer/tools/sources.py:2084")
+    with pytest.raises(AssertionError, match="cannot attribute function"):
+        _tool_name_for("unowned_page", "src/elspeth/web/composer/tools/blobs.py:2084")
 
 
 def _data_expr(node: ast.Call) -> ast.AST | None:

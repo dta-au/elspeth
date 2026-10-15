@@ -42,8 +42,10 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # Epoch 70 replaces the persisted tutorial Build stage's old label with build.
 # Epoch 74 adds graph recovery parks and checkpoint operation ownership.
 # Epoch 75 adds durable auth families and derived-token revocation bindings.
+# Epoch 76 requires effective graph-review facts from committed terminal
+# cohorts. Epoch-75 readers ignore them and cannot preserve completion blocks.
 # Incompatible stores require a separately reviewed compatibility disposition.
-_COORDINATION_HARD_CUT_EPOCH = 75
+_COORDINATION_HARD_CUT_EPOCH = 76
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "auth_session_families": "ix_auth_session_families_expires_at",
     "web_instances": "ix_web_instances_lease_expires_at",

@@ -5815,11 +5815,11 @@ _reserve_FULL_SOURCE_PATHS = (
 )
 
 _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operations.py"
-_reserve_CANCEL_ROUTE_SHA256 = "86d206255665ac50b5e2c65bb77bfebc3971e335127483d40c0e1a8d8dd883c2"
+_reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6bc46d9e075c8a4e6"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "387e76e614f5835265f5940c61f0c96342933fc3ecacdd23843ae7b54b15c3ce",
-    "src/elspeth/web/sessions/composer_async_worker.py": "ce8543b819fbcf7e6b613a808724df892bf17a120831941cf9ff83cebf3191ee",
+    "src/elspeth/web/sessions/composer_turn.py": "fbd8951bb2cccff4d982072302e8484efd6446a1a7ebe1f5d4b5e0b5fd5389a2",
+    "src/elspeth/web/sessions/composer_async_worker.py": "863285bd0bc2ffb3c7002738834c09e892b479b2b11dd3dff062fe91ea905a2a",
 }
 
 
@@ -6605,6 +6605,7 @@ def _reserve_selected_origin_effect_failures(
     protected_reflection_candidate_sites=None,
     protected_constructed_classes=frozenset(),
     validated_worker_error_carrier_calls=frozenset(),
+    validated_retained_failure_calls=frozenset(),
 ):
     """Find source-visible effects on the finite coordinator/dispatch roots.
 
@@ -8236,31 +8237,41 @@ def _reserve_selected_origin_effect_failures(
                     and isinstance(node.args[0], ast.Call)
                     and scoped_expression(node.args[0].func, node) == ("object", "elspeth.web.required_work.RequiredWorkAuthority")
                 )
-                if target not in {
-                    ("object", "builtins.vars"),
-                    ("object", "builtins.globals"),
-                    ("object", "builtins.getattr"),
-                    ("object", "builtins.setattr"),
-                    ("object", "builtins.delattr"),
-                    ("object", "builtins.isinstance"),
-                    ("object", "builtins.issubclass"),
-                    *({("pure", "typing.cast")} if reviewed_noop_cast(node) else set()),
-                    *({("object", "builtins.enumerate")} if reviewed_public_error_iteration(node) else set()),
-                } and any(
-                    (origin := scoped_expression(argument, node)) is not None
-                    and (
-                        (origin[0] == "module" and origin[1] in selected_modules)
-                        or (origin[0] == "namespace" and origin[1] in selected_modules | selected)
-                        or origin == ("unknown", "protected-carrier")
-                        or origin[0] == "config-entry"
-                        or (origin[0] == "member" and protected_receiver_method(origin[1]) and not reviewed_telemetry_method_witness(node))
+                if (
+                    target
+                    not in {
+                        ("object", "builtins.vars"),
+                        ("object", "builtins.globals"),
+                        ("object", "builtins.getattr"),
+                        ("object", "builtins.setattr"),
+                        ("object", "builtins.delattr"),
+                        ("object", "builtins.isinstance"),
+                        ("object", "builtins.issubclass"),
+                        *({("pure", "typing.cast")} if reviewed_noop_cast(node) else set()),
+                        *({("object", "builtins.enumerate")} if reviewed_public_error_iteration(node) else set()),
+                    }
+                    and (unit.path, id(node)) not in validated_retained_failure_calls
+                    and any(
+                        (origin := scoped_expression(argument, node)) is not None
+                        and (
+                            (origin[0] == "module" and origin[1] in selected_modules)
+                            or (origin[0] == "namespace" and origin[1] in selected_modules | selected)
+                            or origin == ("unknown", "protected-carrier")
+                            or origin[0] == "config-entry"
+                            or (
+                                origin[0] == "member"
+                                and protected_receiver_method(origin[1])
+                                and not reviewed_telemetry_method_witness(node)
+                            )
+                        )
+                        for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
                     )
-                    for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
                 ):
                     unresolved.append("selected module capability passed to unreviewed caller " + unit.path + ":" + str(node.lineno))
                 if (
                     not reviewed_authority_construction
                     and (unit.path, id(node)) not in validated_transfer_nodes
+                    and (unit.path, id(node)) not in validated_retained_failure_calls
                     and target
                     not in {
                         ("object", "builtins.isinstance"),
@@ -9581,6 +9592,17 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     ):
         return ["composer turn function annotations have unreviewed definition effects"], None
     title_task, title = title_tasks[0], titles[0]
+    prefix = outer.body[4:index] + outer.body[index + 1 : 21]
+    if index != 15 or not _reserve_composer_receiver.receiver_transfer_prefix(prefix):
+        return ["captured composer receiver interval has an unreviewed effect"], None
+    # These are the exact deferred definitions admitted by the closed prefix
+    # and title checks. Their bodies do not execute at definition; defaults,
+    # decorators and postponed-annotation premises remain checked separately.
+    settlement_definition = prefix[1]
+    deferred_bodies = {
+        node for definition in (title, settlement_definition) for statement in definition.body for node in ast.walk(statement)
+    }
+    history_join = outer.body[8].value
     session_service_stores = [
         node
         for node in ast.walk(turn)
@@ -9594,6 +9616,15 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     title_calls = [node for node in ast.walk(title) if isinstance(node, ast.Call) and ast.unparse(node.func) == "maybe_auto_title_session"]
     if (
         title_task.lineno >= capture.lineno
+        or title.decorator_list
+        or title.args.posonlyargs
+        or title.args.args
+        or title.args.kwonlyargs
+        or title.args.defaults
+        or title.args.kw_defaults
+        or title.args.vararg is not None
+        or title.args.kwarg is not None
+        or title.type_params
         or len(title_calls) != 1
         or len(title_calls[0].args) != 0
         or [keyword.arg for keyword in title_calls[0].keywords]
@@ -9616,27 +9647,29 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
         or any(
             isinstance(node, ast.Await) and title_task.lineno <= node.lineno < capture.lineno
             for node in ast.walk(turn)
-            if node not in ast.walk(title)
+            if node not in deferred_bodies and node is not history_join
         )
     ):
         return ["parallel title task can reach or preempt the captured composer receiver"], None
-    suffix = outer.body[index + 1 : index + 9]
-    dispatch = _reserve_composer_receiver.composer_dispatch_calls(suffix[7]) if len(suffix) == 8 else None
+    prelude = outer.body[4:6]
+    suffix = outer.body[index + 1 : index + 7]
+    dispatch = _reserve_composer_receiver.composer_dispatch_calls(suffix[5]) if len(suffix) == 6 else None
     if (
-        [type(statement).__name__ for statement in suffix]
-        != ["ImportFrom", "AsyncFunctionDef", "AnnAssign", "AnnAssign", "Assign", "Assign", "If", "Try"]
-        or not isinstance(suffix[0], ast.ImportFrom)
-        or suffix[0].module != "openai"
-        or [(alias.name, alias.asname) for alias in suffix[0].names] != [("OpenAIError", None)]
-        or suffix[1].name != "settle_post_provider"
-        or suffix[1].decorator_list
-        or suffix[1].args.defaults
-        or any(suffix[1].args.kw_defaults)
-        or getattr(suffix[1], "type_params", ())
+        index != 15
+        or [type(statement).__name__ for statement in prelude] != ["ImportFrom", "AsyncFunctionDef"]
+        or [type(statement).__name__ for statement in suffix] != ["AnnAssign", "AnnAssign", "Assign", "Assign", "If", "Try"]
+        or not isinstance(prelude[0], ast.ImportFrom)
+        or prelude[0].module != "openai"
+        or [(alias.name, alias.asname) for alias in prelude[0].names] != [("OpenAIError", None)]
+        or prelude[1].name != "settle_post_provider"
+        or prelude[1].decorator_list
+        or prelude[1].args.defaults
+        or any(prelude[1].args.kw_defaults)
+        or getattr(prelude[1], "type_params", ())
         or any(
             ast.unparse(statement) != text
             for statement, text in zip(
-                suffix[2:4],
+                suffix[:2],
                 (
                     "post_provider_error: BaseException | None = None",
                     "settled_record: ComposerOperationRecord | None = None",
@@ -9644,23 +9677,21 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
                 strict=True,
             )
         )
-        or ast.unparse(suffix[4]) != "compose_budget_seconds = budget_anchor.remaining_seconds(monotonic_now=time.monotonic())"
-        or ast.unparse(suffix[5]) != "observation.compose_base_state_id = compose_base_state_id"
-        or ast.unparse(suffix[6].test) != "compose_budget_seconds <= 0"
-        or suffix[6].orelse
-        or not suffix[6].body
-        or not isinstance(suffix[6].body[-1], ast.Raise)
+        or ast.unparse(suffix[2]) != "compose_budget_seconds = budget_anchor.remaining_seconds(monotonic_now=time.monotonic())"
+        or ast.unparse(suffix[3]) != "observation.compose_base_state_id = compose_base_state_id"
+        or ast.unparse(suffix[4].test) != "compose_budget_seconds <= 0"
+        or suffix[4].orelse
+        or not suffix[4].body
+        or not isinstance(suffix[4].body[-1], ast.Raise)
         or dispatch is None
         or (turn_path, id(dispatch[0])) != compose_call
     ):
         return ["captured composer receiver interval has an unreviewed effect"], None
     # An await in the timeout arm cannot reach the following compose: that arm
     # raises. Any other await or receiver reference before the call is unsafe.
-    for statement in suffix[:7]:
-        if statement is suffix[1]:  # Deferred body is not executed now.
-            continue
+    for statement in suffix[:5]:
         for node in ast.walk(statement):
-            if isinstance(node, ast.Await) and statement is not suffix[6]:
+            if isinstance(node, ast.Await) and statement is not suffix[4]:
                 return ["composer receiver can suspend before its dispatch"], None
             if isinstance(node, ast.Name) and node.id in {"composer", "services"}:
                 return ["composer receiver escapes between capture and dispatch"], None
@@ -10635,6 +10666,120 @@ def _reserve_turn_title_call_receipt(units):
     return [], (path, id(title_calls[0]))
 
 
+_reserve_RETAINED_FAILURE_SUPPLIERS = {
+    "src/elspeth/web/sessions/composer_turn.py": (
+        "_read_retained_operation_context",
+        "_capture_retained_operation_read",
+        "_RetainedOperationReadOutcome",
+    ),
+    "src/elspeth/web/composer/audit_storage.py": ("ComposerOperationFailureFacts", "private_operation_failure_draft"),
+}
+_reserve_RETAINED_FAILURE_ORIGINS = frozenset(
+    path.removeprefix("src/").removesuffix(".py").replace("/", ".") + "." + name
+    for path, names in _reserve_RETAINED_FAILURE_SUPPLIERS.items()
+    for name in names
+)
+
+
+def _reserve_retained_failure_transfer_receipts(units):
+    """Close four current transfers, never infer capability-free call results.
+
+    The complete existing caller grammars retain task ownership, cancellation,
+    correlation, and retry ordering. Exact supplier bodies/namespaces below
+    prove that history transfers only its joined outcome and the private audit
+    projection consumes nominal failure fields rather than forwarding authority.
+    Receipts identify calls in these supplied ASTs, not spelling-based exemptions.
+    """
+    turn_path = "src/elspeth/web/sessions/composer_turn.py"
+    service_path = "src/elspeth/web/sessions/service.py"
+    selected = _reserve_RETAINED_FAILURE_SUPPLIERS
+    index = {unit.path: unit for unit in units}
+    if len(index) != len(units) or any(path not in index for path in (*selected, service_path)):
+        return ["retained/private transfer source missing or duplicated"], frozenset()
+    recipes = _reserve_json.loads((_reserve_BASE / "reviewed-writer-recipes.json").read_text())
+    for path, names in selected.items():
+        unit = index[path]
+        bindings = ast.Module(
+            body=[node for node in unit.tree.body if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))],
+            type_ignores=[],
+        )
+        if stable_ast_dump(bindings) != recipes.get(path + ":module-bindings"):
+            return ["retained/private transfer namespace changed " + path], frozenset()
+        for name in names:
+            declaration = _reserve_node_at(unit, name)
+            if declaration is None or stable_ast_dump(declaration) != recipes.get(path + ":" + name):
+                return ["retained/private transfer supplier changed " + path + ":" + name], frozenset()
+            if not _reserve_terminal_sql_transfers.owned_origin(unit.tree, name, declaration):
+                return ["retained/private transfer supplier binding changed " + path + ":" + name], frozenset()
+        imported = {
+            alias.asname or alias.name.split(".", 1)[0]
+            for statement in unit.tree.body
+            if isinstance(statement, (ast.Import, ast.ImportFrom))
+            for alias in statement.names
+        }
+        dependencies = {
+            node.id
+            for name in names
+            for node in ast.walk(_reserve_node_at(unit, name))
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        } & (imported | {"type", "isinstance", "BaseException", "BaseExceptionGroup", "Exception"})
+        # owned_origin deliberately covers evaluated module/class bindings.
+        # Retained suppliers additionally forbid deferred global replacement
+        # and direct member/code mutation; the enriched scanner protects their
+        # origins against aliases and sibling-module namespace writes too.
+        if any(
+            (isinstance(node, ast.Name) and node.id in names and isinstance(node.ctx, (ast.Store, ast.Del)))
+            or (isinstance(node, (ast.Global, ast.Nonlocal)) and bool(set(node.names) & set(names)))
+            or (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and isinstance(node.value, ast.Name)
+                and node.value.id in names
+            )
+            for node in ast.walk(unit.tree)
+        ):
+            return ["retained/private transfer owned supplier mutated " + path], frozenset()
+        if any(
+            (isinstance(node, ast.Name) and node.id in dependencies and isinstance(node.ctx, (ast.Store, ast.Del)))
+            or (isinstance(node, ast.arg) and node.arg in dependencies)
+            or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in dependencies)
+            or (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and isinstance(node.value, ast.Name)
+                and node.value.id in dependencies
+            )
+            for node in ast.walk(unit.tree)
+        ):
+            return ["retained/private transfer dependency rebound " + path], frozenset()
+    compose_failures, _ = _reserve_compose_proposal_transfers.compose_proposal_local_transfers(units)
+    terminal_failures, _ = _reserve_terminal_sql_transfers.terminal_sql_local_contracts(units)
+    if compose_failures or terminal_failures:
+        return [*compose_failures, *terminal_failures], frozenset()
+    turn = _reserve_node_at(index[turn_path], "_run_composer_turn")
+    failure = _reserve_node_at(index[service_path], "SessionServiceImpl.fail_composer_async_operation")
+    # Keep the independently checked history/cancellation structure even when a
+    # caller grammar is deliberately rebound by an adversarial control.
+    prefix = turn.body[37].body[4:15] + turn.body[37].body[16:21]
+    if not _reserve_composer_receiver.receiver_transfer_prefix(prefix):
+        return ["retained/private transfer history ownership or cancellation changed"], frozenset()
+    expected = {
+        "lease.create_task(_capture_retained_operation_read(_read_retained_operation_context(authority=services.composer_operation_authority, binding=provider_binding, session_id=turn.session_id, actor_user_id=turn.actor_user_id)), name='composer-retained-operation-history')",
+        "_capture_retained_operation_read(_read_retained_operation_context(authority=services.composer_operation_authority, binding=provider_binding, session_id=turn.session_id, actor_user_id=turn.actor_user_id))",
+        "_read_retained_operation_context(authority=services.composer_operation_authority, binding=provider_binding, session_id=turn.session_id, actor_user_id=turn.actor_user_id)",
+    }
+    history = [node for node in ast.walk(turn) if isinstance(node, ast.Call) and ast.unparse(node) in expected]
+    private = [
+        node
+        for node in ast.walk(failure)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node) == "private_operation_failure_draft(operation_failure_facts, failure=attempted_failure)"
+    ]
+    if len(history) != 3 or {ast.unparse(node) for node in history} != expected or len(private) != 1:
+        return ["retained/private transfer exact argument or caller set changed"], frozenset()
+    return [], frozenset({*((turn_path, id(node)) for node in history), (service_path, id(private[0]))})
+
+
 def _reserve_supported_boundary(units):
     """Join finite source receipts on these AST nodes; refuse unclosed effects."""
     family = _reserve_family_contracts.__dict__
@@ -10999,6 +11144,10 @@ def _reserve_supported_boundary(units):
     normal_carrier_calls.add((service_path, id(settlement_calls[0])))
     if len(normal_carrier_calls) != 12 or not normal_carrier_calls <= actual_nodes:
         return _reserve_ProtectedBoundary(("normal protected carrier source set is incomplete",), (), (), (), ())
+    retained_failures, retained_calls = _reserve_retained_failure_transfer_receipts(units)
+    if retained_failures:
+        return _reserve_ProtectedBoundary(retained_failures, (), (), (), ())
+    normal_carrier_calls.update(retained_calls)
     whole_worker_nodes = tuple(
         whole_worker[key]
         for key in (
@@ -11165,6 +11314,9 @@ def _reserve_supported_boundary(units):
         "elspeth.web.required_work.RequiredWorkSource",
         "elspeth.web.required_work.make_required_work_key",
     }
+    # New transfer receipts require the same cross-module rebinding/reflection
+    # protection as every other selected supplier, not only local body pins.
+    origins.update(_reserve_RETAINED_FAILURE_ORIGINS)
     guarded_classes = set()
     guarded_functions = set()
     for path, guard in _reserve_full_source_guards().items():
@@ -11242,6 +11394,7 @@ def _reserve_supported_boundary(units):
         protected_reflection_candidate_sites=reflection_candidates,
         protected_constructed_classes=frozenset(guarded_classes),
         validated_worker_error_carrier_calls=frozenset(error_carrier_calls | normal_carrier_calls),
+        validated_retained_failure_calls=retained_calls,
     )
     if origin_failures:
         return _reserve_ProtectedBoundary(origin_failures, (), (), (), (), qualified_owner_stores)

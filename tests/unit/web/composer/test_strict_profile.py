@@ -76,14 +76,15 @@ _OPTION_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# The 11 strict candidates that are NOT strict-clean as sent (optional
-# properties, or keywords outside the wire allowlist). The other 21 are.
+# The 12 strict candidates that are NOT strict-clean as sent (optional
+# properties, or keywords outside the wire allowlist). The other 20 are.
 _NOT_CLEAN_AS_SENT: frozenset[str] = frozenset(
     {
         "create_blob",
         "wire_blob_inline_ref",
         "clear_source",
         "get_pipeline_state",
+        "get_blob_content",
         "get_plugin_assistance",
         "list_models",
         "upsert_edge",
@@ -111,7 +112,7 @@ def _kinds(rows: tuple[StrictViolation, ...]) -> set[StrictViolationKind]:
 
 
 def _advisor_schema() -> dict[str, Any]:
-    return deepcopy(advisor_response_format()["json_schema"]["schema"])
+    return deepcopy(advisor_response_format(phase="early")["json_schema"]["schema"])
 
 
 def _advisor_schema_without_titles() -> dict[str, Any]:
@@ -352,7 +353,14 @@ def test_inventory_partition_over_flat_s_is_pinned_by_name() -> None:
 
     clean = {name for name in _STRICT_CANDIDATES if check_openai_strict(definitions[name], tool=name) == ()}
     assert clean == _STRICT_CANDIDATES - _NOT_CLEAN_AS_SENT
-    assert len(clean) == 21
+    assert len(clean) == 20
+    # Native continuation defaults remain optional. The strict-wire projection
+    # has its own controls; native inventory must not pretend it was projected.
+    assert {(row.kind, row.path) for row in check_openai_strict(definitions["get_blob_content"], tool="get_blob_content")} == {
+        (K.OPTIONAL_PROPERTY, "/properties/offset_chars"),
+        (K.OPTIONAL_PROPERTY, "/properties/expected_content_hash"),
+        (K.KEYWORD_NOT_ALLOWLISTED, "/properties/offset_chars/default"),
+    }
 
     for name in _STRICT_CANDIDATES:
         assert K.FREE_FORM_OBJECT not in _kinds(check_openai_strict(definitions[name], tool=name)), name

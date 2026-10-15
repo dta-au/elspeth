@@ -222,6 +222,49 @@ def test_initialize_session_schema_rejects_stale_user_version(
         initialize_session_schema(engine)
 
 
+@pytest.mark.parametrize("store_epoch,reader_epoch", [(75, 76), (76, 75)])
+@pytest.mark.parametrize("identity_only", [False, True])
+def test_graph_review_epoch_cut_refuses_both_directions_without_store_changes(
+    file_db_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    store_epoch: int,
+    reader_epoch: int,
+    identity_only: bool,
+) -> None:
+    """Existing exact sentinels protect semantic format changes, not just DDL.
+
+    This fixture uses the unchanged guard with each reader's declared epoch;
+    it does not migrate a real store or claim to run the old application.
+    The separate private source control checks the actual 0.8.5 reader.
+    """
+    import elspeth.web.sessions.schema as schema
+    from elspeth.web.sessions.models import schema_identity_table
+
+    engine = create_session_engine(file_db_url)
+    with monkeypatch.context() as creation:
+        creation.setattr(schema, "SESSION_SCHEMA_EPOCH", store_epoch)
+        creation.setattr(schema, "_COORDINATION_HARD_CUT_EPOCH", store_epoch)
+        initialize_session_schema(engine)
+    with engine.begin() as conn:
+        # Isolate the shared identity-row fence independently of SQLite's
+        # PRAGMA guard. Zero is its existing unmarked sentinel, not a migration.
+        if identity_only:
+            conn.execute(text("PRAGMA user_version = 0"))
+        before = conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all()
+        identity = conn.execute(schema_identity_table.select()).all()
+        version = conn.execute(text("PRAGMA user_version")).scalar_one()
+    with monkeypatch.context() as reader:
+        reader.setattr(schema, "SESSION_SCHEMA_EPOCH", reader_epoch)
+        reader.setattr(schema, "_COORDINATION_HARD_CUT_EPOCH", reader_epoch)
+        with pytest.raises(SessionSchemaError, match="Preserve this store unchanged and configure an explicitly new session database"):
+            initialize_session_schema(engine)
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == before
+        assert conn.execute(schema_identity_table.select()).all() == identity
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == version
+    engine.dispose()
+
+
 def test_initialize_session_schema_rejects_foreign_application_id(
     file_db_url: str,
 ) -> None:

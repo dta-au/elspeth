@@ -30,6 +30,7 @@ import {
   toInlineSourceProvenance,
 } from "@/api/client";
 import { MessageBubble } from "./MessageBubble";
+import { ComposerOperationOutcomeNotice } from "./ComposerOperationOutcomeNotice";
 import { groupIntoTurns, turnRepresentativeMessage, type ChatTurn } from "./turns";
 import { ComposingIndicator } from "./ComposingIndicator";
 import {
@@ -266,6 +267,13 @@ export function ChatPanelContent({
     return null;
   }, [chatTurns]);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const allFailureOutcomes = useSessionStore((s) => s.composerFailureOutcomes);
+  const failureNextCursor = useSessionStore((s) => s.composerFailureNextCursor);
+  const failureHistoryLoading = useSessionStore((s) => s.composerFailureHistoryLoading);
+  const failureHistoryError = useSessionStore((s) => s.composerFailureHistoryError);
+  const loadFailureOutcomes = useSessionStore((s) => s.loadComposerFailureOutcomes);
+  const failureOutcomes = useMemo(() => allFailureOutcomes.filter((item) => item.session_id === activeSessionId), [allFailureOutcomes, activeSessionId]);
+  const standaloneFailureOutcomes = useMemo(() => failureOutcomes.filter((item) => !messages.some((message) => message.role === "user" && (message.id === item.user_message_id || message.operation_id === item.operation_id))), [failureOutcomes, messages]);
   const compositionState = useSessionStore((s) => s.compositionState);
   const compositionProposals = useSessionStore((s) => s.compositionProposals);
   const staleProposalIds = useSessionStore((s) => s.staleProposalIds);
@@ -1151,6 +1159,9 @@ export function ChatPanelContent({
                       onEditInlineSource={handleEditInlineSource}
                       pendingReviewCreatedAt={pendingReviewCreatedAt}
                     />
+                    {turn.kind === "user" && failureOutcomes.filter((item) => item.user_message_id === repr.id || item.operation_id === repr.operation_id).map((outcome) => (
+                      <ComposerOperationOutcomeNotice key={`${outcome.session_id}:${outcome.operation_id}`} outcome={outcome} />
+                    ))}
                     {/* The graph's Approvals table owns resolved history once
                         a composition exists; keep the chat echo only while no
                         graph table can render it. */}
@@ -1166,6 +1177,19 @@ export function ChatPanelContent({
                   </Fragment>
                 );
               })
+          )}
+          {standaloneFailureOutcomes.length > 0 && (
+            <section aria-label="Operation outcomes">
+              <h3>Operation outcomes</h3>
+              {standaloneFailureOutcomes.map((outcome) => <ComposerOperationOutcomeNotice key={`${outcome.session_id}:${outcome.operation_id}`} outcome={outcome} />)}
+            </section>
+          )}
+          {(failureHistoryLoading || failureHistoryError !== null || failureNextCursor !== null) && (
+            <div className="chat-panel-history-controls">
+              {failureHistoryLoading && <p role="status">Loading saved operation outcomes…</p>}
+              {failureHistoryError !== null && <div role="status"><p>{failureHistoryError}</p><Button onClick={() => void loadFailureOutcomes()}>Retry outcomes</Button></div>}
+              {failureNextCursor !== null && <Button disabled={failureHistoryLoading} onClick={() => void loadFailureOutcomes(true)}>Load earlier outcomes</Button>}
+            </div>
           )}
           {/* Standalone fallback for the inline-source summary: only painted
               when no complete agent turn exists to absorb it into the bubble

@@ -31,6 +31,7 @@ interface Fixture {
   requests: string[];
   /** Leave the compose POST unanswered, so Build stays mid-compose. */
   holdCompose?: boolean;
+  historyUnavailable?: boolean;
 }
 
 function chatMessage(role: "user" | "assistant", content: string): Record<string, unknown> {
@@ -101,6 +102,15 @@ async function installRoutes(page: Page, fixture: Fixture): Promise<void> {
       fixture.title = (req.postDataJSON() as { title: string }).title;
       fixture.requests.push(`rename:${fixture.title}`);
       await fulfill({ ...session, title: fixture.title });
+      return;
+    }
+    if (path === `/api/sessions/${sid}/operations` && method === "GET") {
+      fixture.requests.push(fixture.historyUnavailable ? "outcomes:unavailable" : "outcomes:loaded");
+      if (fixture.historyUnavailable) {
+        await route.fulfill({ status: 503, json: { detail: "Synthetic history unavailable" } });
+      } else {
+        await fulfill({ session_id: sid, items: [], next_cursor: null });
+      }
       return;
     }
     if (path === `/api/tutorial/${sid}/sample` && method === "GET") {
@@ -295,4 +305,55 @@ test("Build keeps its chrome out of the authoring pane and its Continue reachabl
   await expect(page.getByRole("tab", { name: "Compose" })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByLabel("Message input")).toBeVisible();
   await expect(continueButton).toBeVisible();
+});
+
+test("Build keeps unavailable operation history inset and retries the actual read", async ({ page }) => {
+  const fixture: Fixture = {
+    created: false, composed: false, completed: false, title: session.title,
+    runCount: 0, messages: [], requests: [], holdCompose: true, historyUnavailable: true,
+  };
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await installRoutes(page, fixture);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Let's go" }).click();
+  await page.getByRole("button", { name: "Send tutorial brief" }).click();
+  await expect(page.getByRole("button", { name: "Continue to Run" })).toBeDisabled();
+  await expect(page.locator(".chat-panel-messages")).toBeVisible();
+  await expect(page.getByText("Could not load saved operation outcomes.")).toBeAttached();
+
+  const geometry = await page.evaluate(() => {
+    const rect = (selector: string): DOMRect => {
+      const element = document.querySelector(selector);
+      if (element === null) throw new Error(`missing ${selector}`);
+      return element.getBoundingClientRect();
+    };
+    const pane = rect(".workspace-authoring-pane");
+    const insets = Array.from(document.querySelectorAll(
+      ".workspace-authoring-pane :is(h2, p, pre, button, textarea)",
+    ))
+      .map((element) => element.getBoundingClientRect())
+      .filter((box) => box.width > 1 && box.height > 1)
+      .map((box) => Math.round(box.left - pane.left));
+    return {
+      minInset: Math.min(...insets),
+      paneTop: Math.round(pane.top),
+      transcriptTop: Math.round(rect(".chat-panel-messages").top),
+      toolbarTop: Math.round(rect(".artifact-workspace-toolbar").top),
+      transcript: Math.round(rect(".chat-panel-messages").height),
+    };
+  });
+  expect(geometry.minInset, "failed-history text and retry retain the 16px gutter").toBeGreaterThanOrEqual(16);
+  expect(geometry.paneTop).toBe(geometry.toolbarTop);
+  expect(geometry.transcriptTop).toBe(geometry.paneTop);
+  expect(geometry.transcript).toBeGreaterThanOrEqual(160);
+
+  const readsBeforeRetry = fixture.requests.filter((request) => request.startsWith("outcomes:")).length;
+  fixture.historyUnavailable = false;
+  const retry = page.getByRole("button", { name: "Retry outcomes" });
+  await retry.scrollIntoViewIfNeeded();
+  await retry.click();
+  await expect(page.getByText("Could not load saved operation outcomes.")).toHaveCount(0);
+  expect(fixture.requests.filter((request) => request.startsWith("outcomes:"))).toHaveLength(readsBeforeRetry + 1);
+  expect(fixture.requests.at(-1)).toBe("outcomes:loaded");
+  await expect(page.getByRole("button", { name: "Continue to Run" })).toBeDisabled();
 });

@@ -44,10 +44,10 @@ def test_object_fields_reject_string_encoding(model, baseline, field) -> None:
 @pytest.mark.parametrize("component", ["source", "node", "output"])
 def test_full_pipeline_rejects_nested_object_strings(component: str) -> None:
     arguments = {
-        "source": {"plugin": "csv", "on_success": "rows", "options": {}},
-        "nodes": [{"id": "n", "node_type": "transform", "input": "rows", "options": {}}],
+        "source": {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"},
+        "nodes": [{"id": "n", "node_type": "transform", "input": "rows", "options": {}, "on_error": "discard"}],
         "edges": [],
-        "outputs": [{"sink_name": "out", "plugin": "json", "options": {}}],
+        "outputs": [{"sink_name": "out", "plugin": "json", "options": {}, "on_write_failure": "discard"}],
     }
     SetPipelineArgumentsModel.model_validate(arguments)
     target = arguments["source"] if component == "source" else arguments["nodes" if component == "node" else "outputs"][0]

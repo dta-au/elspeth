@@ -10,6 +10,7 @@ from typing import Final, Literal, TypedDict, get_args
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from elspeth.contracts.json_parser import parse_json_strict
+from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase
 from elspeth.web.validation import _PII_WARNING_PATTERNS
 
 AdvisorFindingCategory = Literal["request_not_met", "error_handling", "prompt_defect", "schema_mismatch", "other"]
@@ -52,6 +53,12 @@ class AdvisorCheckpointResponse(BaseModel):
         return value
 
 
+class AdvisorEndResponse(AdvisorCheckpointResponse):
+    """END adds prose permission without changing graph verdict semantics."""
+
+    publication_verdict: Literal["ADMIT", "WITHHOLD"]
+
+
 @dataclass(frozen=True, slots=True)
 class AdvisorResponseAdmission:
     """Schema conformance and the semantically accepted response, if any."""
@@ -60,13 +67,19 @@ class AdvisorResponseAdmission:
     response: AdvisorCheckpointResponse | None
 
 
-def parse_advisor_checkpoint_response(text: str) -> AdvisorResponseAdmission:
+def parse_advisor_checkpoint_response(text: str, *, phase: AdvisorCheckpointPhase) -> AdvisorResponseAdmission:
     """Admit Tier-3 JSON without retaining provider-controlled error details."""
     parsed, error = parse_json_strict(text)
     if error is not None:
         return AdvisorResponseAdmission(schema_valid=False, response=None)
+    response: AdvisorCheckpointResponse
     try:
-        response = AdvisorCheckpointResponse.model_validate(parsed)
+        if phase == "end":
+            response = AdvisorEndResponse.model_validate(parsed)
+        elif phase == "early":
+            response = AdvisorCheckpointResponse.model_validate(parsed)
+        else:
+            raise ValueError("Unknown owned advisor checkpoint phase")
     except ValidationError:
         return AdvisorResponseAdmission(schema_valid=False, response=None)
 
@@ -77,13 +90,15 @@ def parse_advisor_checkpoint_response(text: str) -> AdvisorResponseAdmission:
         return AdvisorResponseAdmission(schema_valid=True, response=None)
     if response.verdict == "FLAGGED" and not response.findings.strip():
         return AdvisorResponseAdmission(schema_valid=True, response=None)
+    if isinstance(response, AdvisorEndResponse) and response.publication_verdict == "WITHHOLD" and not response.findings.strip():
+        return AdvisorResponseAdmission(schema_valid=True, response=None)
     return AdvisorResponseAdmission(schema_valid=True, response=response)
 
 
 class AdvisorJSONSchemaFormat(TypedDict):
     """Owned provider schema specification."""
 
-    name: Literal["advisor_checkpoint_response"]
+    name: Literal["advisor_checkpoint_response", "advisor_end_response"]
     strict: Literal[True]
     schema: dict[str, object]
 
@@ -95,14 +110,16 @@ class AdvisorResponseFormat(TypedDict):
     json_schema: AdvisorJSONSchemaFormat
 
 
-def advisor_response_format() -> AdvisorResponseFormat:
+def advisor_response_format(*, phase: AdvisorCheckpointPhase) -> AdvisorResponseFormat:
     """Build the same strict provider schema for checkpoints and boot probes."""
+    if phase not in ("early", "end"):
+        raise ValueError("Unknown owned advisor checkpoint phase")
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "advisor_checkpoint_response",
+            "name": "advisor_end_response" if phase == "end" else "advisor_checkpoint_response",
             "strict": True,
-            "schema": AdvisorCheckpointResponse.model_json_schema(),
+            "schema": (AdvisorEndResponse if phase == "end" else AdvisorCheckpointResponse).model_json_schema(),
         },
     }
 

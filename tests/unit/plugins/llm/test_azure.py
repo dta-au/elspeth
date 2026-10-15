@@ -46,6 +46,14 @@ def test_missing_cost_with_dated_model_does_not_block_transform(
     from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS, LLMProfileSettings, RuntimeLLMProfile, lower_llm_profile_options
 
     requests: list[dict[str, Any]] = []
+    metadata_requests: list[str] = []
+
+    def model_info(*, model: str) -> dict[str, object]:
+        metadata_requests.append(model)
+        assert model == (pricing_model or "private-production-deployment")
+        if pricing_model is None:
+            raise ValueError("Synthetic private deployment has no catalog price")
+        return {"key": pricing_model}
 
     def reply(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
@@ -84,6 +92,15 @@ def test_missing_cost_with_dated_model_does_not_block_transform(
         http_client=httpx.Client(transport=httpx.MockTransport(reply)),
     )
     monkeypatch.setattr(openai, "AzureOpenAI", lambda **kwargs: sdk)
+    # Isolate external metadata resolution as well as the calculator. An
+    # unknown deployment still follows the actual unavailable-cost path;
+    # known pricing must resolve to this explicit, bounded catalog entry.
+    monkeypatch.setattr(litellm, "get_model_info", model_info)
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {"azure/gpt-4o": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000002}},
+    )
     monkeypatch.setattr(litellm, "cost_per_token", calculate if pricing_model is not None else forbidden)
     monkeypatch.setattr(litellm, "completion_cost", forbidden)
     config = _make_azure_config(deployment_name="private-production-deployment", prompt_template="{{ row.text }}")
@@ -125,6 +142,7 @@ def test_missing_cost_with_dated_model_does_not_block_transform(
         assert result.row is not None
         expected_calls = 2 if multi_query else 1
         assert len(requests) == expected_calls
+        assert metadata_requests == [(pricing_model or "private-production-deployment")] * expected_calls
         assert writer.record_call.call_count == expected_calls
         assert all(request["model"] == "private-production-deployment" for request in requests)
         assert all("pricing_model" not in request for request in requests)

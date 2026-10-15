@@ -24,6 +24,7 @@ from elspeth.web.composer.tool_error_payloads import (
     unknown_tool_arguments_redaction,
 )
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.interpretation_state import pending_execution_interpretation_sites
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow, RejectionRecord
@@ -229,6 +230,7 @@ async def persist_turn_audit(
     ingress: CompositionIngressRecord | None = None,
     chat_ingress_inputs: list[ChatIngressInput] | None = None,
     required_work: RequiredWorkBinding | None = None,
+    turn_evidence: TurnEvidence | None = None,
 ) -> _PersistOutcome:
     """Phase P4 of the compose loop — redact then persist the turn audit.
 
@@ -393,6 +395,8 @@ async def persist_turn_audit(
     )
     failed_turn: FailedTurnMetadata | None = None
     unwind_audit_failed = False
+    checkpoint_projection = None
+    effect_verification_failure = None
     audit_outcome: AuditOutcome | None = None
     if session_id is not None:
         if type(session_operation_context) is not SessionOperationContext:
@@ -513,7 +517,6 @@ async def persist_turn_audit(
                 failure = AuditIntegrityError("Compose checkpoint returned a foreign audit outcome")
                 checkpoint_projection.complete_owned(failure)
                 raise failure
-            checkpoint_projection.complete_owned()
         unwind_audit_failed = audit_outcome.unwind_audit_failed
         current_state_id = audit_outcome.current_state_id
         failed_turn = FailedTurnMetadata(
@@ -522,15 +525,21 @@ async def persist_turn_audit(
             tool_responses_persisted=0 if audit_outcome.assistant_id is None else len(redacted_tool_rows),
         )
         if audit_outcome.assistant_id is None and not crash_pending:
-            raise AuditIntegrityError(
+            failure = AuditIntegrityError(
                 "persist_compose_turn_async returned unwind_audit_failed without an in-flight plugin crash",
                 failed_turn=failed_turn,
             )
+            if checkpoint_projection is not None:
+                checkpoint_projection.complete_owned(failure)
+            raise failure
         if audit_outcome.assistant_id is None and not audit_outcome.unwind_audit_failed:
-            raise AuditIntegrityError(
+            failure = AuditIntegrityError(
                 "persist_compose_turn_async returned no assistant id without the unwind-audit-failed disposition",
                 failed_turn=failed_turn,
             )
+            if checkpoint_projection is not None:
+                checkpoint_projection.complete_owned(failure)
+            raise failure
         persisted_assistant_message_id = audit_outcome.assistant_id
         # Derived here rather than by the caller because this is the only
         # frame that knows what reached the row: the persist call above sends
@@ -545,15 +554,60 @@ async def persist_turn_audit(
         # assistant or tool row survived, so the driver must retain the
         # in-flight invocation evidence on the propagated plugin crash.
         persisted_tool_call_turn = audit_outcome.assistant_id is not None
-    return _PersistOutcome(
-        current_state_id=current_state_id,
-        persisted_assistant_message_id=persisted_assistant_message_id,
-        persisted_assistant_content=persisted_assistant_content,
-        persisted_tool_call_turn=persisted_tool_call_turn,
-        persisted_assistant_matches_current_dispatch=(persisted_assistant_message_id is not None and assistant_row_uses_current_dispatch),
-        unwind_audit_failed=unwind_audit_failed,
-        failed_turn=failed_turn,
-        redacted_assistant_tool_calls=redacted_assistant_tool_calls,
-        redacted_tool_rows=redacted_tool_rows,
-        audit_outcome=audit_outcome,
-    )
+        if turn_evidence is not None and audit_outcome.checkpoint_disposition == "committed":
+            try:
+                witness = audit_outcome.checkpoint
+                if witness is None or audit_outcome.assistant_id is None:
+                    raise AuditIntegrityError("New compose checkpoint is missing its committed row witness")
+                expected_state = next(
+                    (
+                        outcome.response.updated_state
+                        for outcome in reversed(tool_outcomes)
+                        if outcome.post_version > outcome.pre_version
+                        and isinstance(outcome.response, ToolResult)
+                        and outcome.response.updated_state is not None
+                    ),
+                    None,
+                )
+                if expected_state is None:
+                    raise AuditIntegrityError("Committed compose checkpoint has no corresponding dispatched state")
+                turn_evidence.accept_checkpoint(
+                    witness,
+                    expected_state=expected_state,
+                    tool_call_ids=tuple(item.call.id for item in tool_outcomes),
+                    assistant_message_id=audit_outcome.assistant_id,
+                )
+            except Exception as exc:
+                # These rows already committed. Return the real metadata and
+                # propagate after the driver records it, never use rollback or
+                # unpersisted-suffix handling for a comparison failure.
+                if isinstance(exc, AuditIntegrityError):
+                    effect_verification_failure = exc
+                else:
+                    effect_verification_failure = AuditIntegrityError("Committed compose effect verification failed")
+                    effect_verification_failure.__cause__ = exc
+                effect_verification_failure.failed_turn = failed_turn
+                turn_evidence.mark_verification_unavailable()
+    try:
+        result = _PersistOutcome(
+            current_state_id=current_state_id,
+            persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
+            persisted_tool_call_turn=persisted_tool_call_turn,
+            persisted_assistant_matches_current_dispatch=(
+                persisted_assistant_message_id is not None and assistant_row_uses_current_dispatch
+            ),
+            unwind_audit_failed=unwind_audit_failed,
+            failed_turn=failed_turn,
+            redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+            redacted_tool_rows=redacted_tool_rows,
+            audit_outcome=audit_outcome,
+            effect_verification_failure=effect_verification_failure,
+        )
+    except BaseException as exc:
+        if checkpoint_projection is not None:
+            checkpoint_projection.complete_owned(exc)
+        raise
+    if checkpoint_projection is not None:
+        checkpoint_projection.complete_owned(effect_verification_failure)
+    return result

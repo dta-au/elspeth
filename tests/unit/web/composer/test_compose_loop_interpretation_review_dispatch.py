@@ -80,6 +80,7 @@ from elspeth.web.composer.tools import (
     ToolResult,
 )
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
+from elspeth.web.composer.turn_effects import AdvisorPublicationReview, TurnEvidence
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -218,7 +219,14 @@ class _ScriptedLLM:
         self.messages: list[list[dict[str, Any]]] = []
         self.tools: list[Any] = []
 
-    async def __call__(self, _messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def __call__(
+        self,
+        _messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+    ) -> Any:
         self.messages.append(_messages)
         self.tools.append(_tools)
         if not self._responses:
@@ -235,14 +243,20 @@ class _RecordedAsyncCall:
 class _AdvisorCheckpointFake:
     """Async advisor test double that records awaits and returns one verdict."""
 
-    def __init__(self, verdict: AdvisorCheckpointVerdict) -> None:
+    def __init__(self, verdict: AdvisorCheckpointVerdict, *, publication_admit: bool = False) -> None:
         self._verdict = verdict
+        self._publication_admit = publication_admit
         self.await_count = 0
         self.await_args_list: list[_RecordedAsyncCall] = []
 
     async def __call__(self, *args: Any, **kwargs: Any) -> AdvisorCheckpointVerdict:
         self.await_count += 1
         self.await_args_list.append(_RecordedAsyncCall(args=args, kwargs=kwargs))
+        if self._publication_admit and kwargs["phase"] == "end":
+            review = kwargs["publication_review"]
+            if type(review) is not AdvisorPublicationReview:
+                raise TypeError("Explicit P4 admission fixture requires the actual candidate/evidence snapshot")
+            return replace(self._verdict, publication_verdict="ADMIT", publication_binding=review.binding)
         return self._verdict
 
 
@@ -574,6 +588,7 @@ def _set_pipeline_with_pending_interpretation_args(term: str = "cool") -> dict[s
         "source": {
             "plugin": "null",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": {},
         },
         "nodes": [
@@ -700,6 +715,7 @@ def _set_pipeline_clean_llm_node_args() -> dict[str, Any]:
         "source": {
             "plugin": "null",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": {},
         },
         "nodes": [
@@ -739,6 +755,7 @@ def _set_pipeline_clean_llm_node_no_model_args() -> dict[str, Any]:
         "source": {
             "plugin": "null",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": {},
         },
         "nodes": [
@@ -2220,6 +2237,14 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
+            turn_evidence=TurnEvidence(
+                session_id=str(session_id),
+                session_operation_context=_compose_ctx,
+                request_id="interpretation-terminal-test",
+                request="rate how cool the pages are",
+                initial_state_id=str(state_id),
+                initial_state=state,
+            ),
             assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -3753,11 +3778,19 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
 
     # Per-instance assertable advisor stub (instance attr wins over the autouse
     # class-level CLEAN stub) so we can assert it was awaited.
-    advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
+    advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"), publication_admit=True)
     composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
+            turn_evidence=TurnEvidence(
+                session_id=str(session_id),
+                session_operation_context=_compose_ctx,
+                request_id="interpretation-terminal-test",
+                request="rate how cool the pages are",
+                initial_state_id=str(state_id),
+                initial_state=state,
+            ),
             assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -3807,12 +3840,20 @@ async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_mode
     sites = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
     assert sites == (("source", SOURCE_DATA_CONTRACT_USER_TERM, InterpretationKind.SOURCE_DATA_CONTRACT),)
 
-    advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
+    advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"), publication_admit=True)
     composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     llm_messages: list[dict[str, Any]] = []
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
+            turn_evidence=TurnEvidence(
+                session_id=str(session_id),
+                session_operation_context=_compose_ctx,
+                request_id="interpretation-terminal-test",
+                request="Select the colour column.",
+                initial_state_id=str(state_id),
+                initial_state=state,
+            ),
             assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready for review."),
             message="Select the colour column.",
             llm_messages=llm_messages,
@@ -3863,6 +3904,14 @@ async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
+            turn_evidence=TurnEvidence(
+                session_id=str(session_id),
+                session_operation_context=_compose_ctx,
+                request_id="interpretation-terminal-test",
+                request="Select the colour column.",
+                initial_state_id=str(state_id),
+                initial_state=state,
+            ),
             assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready for review."),
             message="Select the colour column.",
             llm_messages=[],
@@ -3928,7 +3977,7 @@ async def test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhau
     assert sites, "expected the unsurfaced PT site to be a (real) pending-review orphan pre-fix"
     assert all(site[2] is InterpretationKind.LLM_PROMPT_TEMPLATE for site in sites)
 
-    advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
+    advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"), publication_admit=True)
     composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     llm = _ScriptedLLM(
@@ -3954,13 +4003,11 @@ async def test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhau
     # PT site suppressed it). Discriminate on the END phase for robustness.
     end_calls = [call for call in advisor_mock.await_args_list if call.kwargs.get("phase") == "end"]
     assert end_calls, "P5 budget-exhaustion END advisor gate must fire for a PT pipeline"
-    from elspeth.web.composer.advisor_decision import AdvisorGatePassed
-    from elspeth.web.execution.completion_gates import completion_gate_fingerprint
-    from elspeth.web.sessions.converters import state_from_record
-
     current_state = await sessions_service.get_current_state(session_id)
     assert current_state is not None
-    assert result.advisor_gate_decision == AdvisorGatePassed(completion_gate_fingerprint(state_from_record(current_state)))
+    assert result.advisor_gate_decision is None
+    assert result.runtime_preflight is not None
+    assert is_pending_interpretation_handoff(result.runtime_preflight)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     assert any(e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE for e in events)
 
@@ -4012,6 +4059,14 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
+            turn_evidence=TurnEvidence(
+                session_id=str(session_id),
+                session_operation_context=_compose_ctx,
+                request_id="interpretation-terminal-test",
+                request="rate how cool the pages are",
+                initial_state_id=str(state_id),
+                initial_state=state,
+            ),
             assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -4094,6 +4149,14 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
+            turn_evidence=TurnEvidence(
+                session_id=str(session_id),
+                session_operation_context=_compose_ctx,
+                request_id="interpretation-terminal-test",
+                request="rate how cool the pages are",
+                initial_state_id=str(state_id),
+                initial_state=state,
+            ),
             assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -4220,6 +4283,14 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
         outcome = await composer._completion._try_terminate_no_tools(
+            turn_evidence=TurnEvidence(
+                session_id=str(session_id),
+                session_operation_context=_compose_ctx,
+                request_id="interpretation-terminal-test",
+                request="rate how cool the pages are",
+                initial_state_id=str(state_id),
+                initial_state=state,
+            ),
             assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -4453,7 +4524,13 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
         ]
     )
 
-    async def observed_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+    async def observed_llm(
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+    ) -> Any:
         if {tool["function"]["name"] for tool in tools} == {"handoff_to_user", "restore_parked_graph"}:
             snapshot = await progress_registry.get_latest("reply-progress")
             assert snapshot.phase == "calling_model"
@@ -4678,12 +4755,12 @@ async def test_advisor_repair_staged_handoff_does_not_claim_substituted_row_matc
     assert result.persisted_assistant_content != _REVIEW_TURN_PROSE
     assert result.persisted_assistant_matches_terminal_model_turn is False
     if with_prior_block:
-        assert result.advisor_gate_decision is None
+        from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
+
+        assert isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
+        assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.GRAPH_REJECTED
         assert result.runtime_preflight.readiness.completion_ready is True
-        assert any(
-            check.name == "advisor_signoff" and not check.passed and "review remains outstanding" in check.detail
-            for check in result.runtime_preflight.checks
-        )
+        assert any(check.name == "advisor_signoff" and not check.passed for check in result.runtime_preflight.checks)
 
 
 @pytest.mark.asyncio
@@ -4727,6 +4804,7 @@ async def test_staged_handoff_without_current_persist_keeps_same_turn_identity_f
             redacted_assistant_tool_calls=(),
             redacted_tool_rows=(),
             audit_outcome=None,
+            effect_verification_failure=None,
         )
 
     composer._persist_turn_audit = _drop_second_persist  # type: ignore[method-assign]
@@ -4817,7 +4895,13 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
     )
     reply_calls = 0
 
-    async def reply(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+    async def reply(
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+    ) -> Any:
         nonlocal reply_calls
         if {tool["function"]["name"] for tool in tools} != {"handoff_to_user", "restore_parked_graph"}:
             return await prefix(messages, tools)

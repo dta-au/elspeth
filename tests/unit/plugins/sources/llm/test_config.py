@@ -23,6 +23,7 @@ from elspeth.plugins.transforms.llm.transform import LLMTransform
 TRANSFORM_ONLY_FIELDS = {
     "required_input_fields",
     "queries",
+    "query_input_mode",
     "pool_size",
     "min_dispatch_delay_ms",
     "max_dispatch_delay_ms",

@@ -2,8 +2,9 @@
 #
 # When a PR modifies any redaction-touching file, this workflow:
 #   1. computes a snapshot diff vs the pull request base branch;
-#   2. classifies the diff as 'weaken' (sensitive_path_count decreased)
-#      or 'strengthen' (otherwise); and
+#   2. classifies the diff as 'weaken' if any entry's count decreases or
+#      an existing entry changes at the same nonzero count, otherwise
+#      'strengthen' (aggregate totals cannot offset a per-entry loss); and
 #   3. asserts the PR carries the correct direction label, with a
 #      rationale section when weakening.
 #

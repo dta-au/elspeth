@@ -259,7 +259,7 @@ def test_advisor_suggestion_survives_reload_and_clears_on_graph_change() -> None
         _green_result(), reason="unavailable", findings="Model unavailable.", category="other", step_ids=(), note=None
     )
     suggestion = (
-        "The advisor model was unavailable after retry; check the advisor model configuration. "
+        "The advisor model was unavailable; check the advisor model configuration. "
         "Validation and the advisory review run again on your next message."
     )
     assert result.readiness.blockers[0].suggestion == suggestion

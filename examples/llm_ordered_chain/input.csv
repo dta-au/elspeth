@@ -1,0 +1,5 @@
+expense_id,receipt_text
+E101,Taxi receipt for USD 48.00 from the station to the client office.
+E102,Client lunch receipt for USD 82.00.
+E103,Printer repair receipt for USD 126.50.
+E104,Faded meal receipt with an unreadable amount.

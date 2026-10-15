@@ -3,12 +3,18 @@ import { currentAuthGeneration, isCurrentAuthGeneration } from "./authSession";
 import { ComposerSseDecoder, validateComposerRecoveryBody, decodeComposerOperationFrame } from "./composerOperationDecoder";
 import { COMPOSER_CUSTODY_LIFETIME_MS, acquireComposerOperationCustody, composerStopRequested, requestComposerStop, attachComposerObserver, clearComposerSessionCustody, composerCustodyScope, findComposerOperationCustody, samePrincipal, settleComposerCustody } from "@/stores/composerOperationCustody";
 import { COMPOSE_CLIENT_GRACE_MS, COMPOSE_USER_CANCEL_ABORT_REASON } from "@/config/composer";
-import type { ComposerProgressSnapshot, MessageWithStateResponse } from "@/types/index";
+import type { ApiError, ComposerProgressSnapshot, MessageWithStateResponse } from "@/types/index";
 import type { OperationCustody, SubmittedCustody } from "@/types/composerOperations";
 
 export class ComposerObservationDetached extends Error { constructor() { super("Composer observation detached; the durable action remains pending"); this.name = "ComposerObservationDetached"; } }
 export class ComposerSessionMissing extends Error { constructor() { super("Session not found"); this.name = "ComposerSessionMissing"; } }
-export class ComposerActiveAttachment extends Error { constructor() { super("Another composer action is active. Your unsent content remains a draft."); this.name = "ComposerActiveAttachment"; } }
+/** The winner's authenticated terminal is separate from the refused submission. */
+export class ComposerActiveAttachment extends Error {
+  constructor(readonly terminal: { status: "completed"; result: MessageWithStateResponse } | { status: "failed"; error: ApiError }) {
+    super(`Another composer action ${terminal.status === "failed" ? "failed" : "finished"}. Your unsent content remains a draft.`);
+    this.name = "ComposerActiveAttachment";
+  }
+}
 interface ObserverOptions { signal?: AbortSignal; current?: () => boolean; progress?: (snapshot: ComposerProgressSnapshot) => void; timeout?: () => void; reconciliationOnly?: boolean }
 interface ObserverOwner { generation: number; descriptor: OperationCustody; controller: AbortController; stop: boolean; stopRequested: boolean; stopTarget: OperationCustody | null }
 const owners = new Map<string, ObserverOwner>();
@@ -154,11 +160,19 @@ export async function observeComposerOperation(initial: OperationCustody, option
         backoff = 1000;
         if (snapshot.status === "completed" || snapshot.status === "failed") {
           if (snapshot.status === "failed") validateComposerRecoveryBody(snapshot.error!.body, initial.sessionId);
-          const terminalError = snapshot.status === "failed" ? await api.apiErrorFromBody(snapshot.error!.http_status, snapshot.error!.body) : null;
+          const bodyError = snapshot.status === "failed" ? await api.apiErrorFromBody(snapshot.error!.http_status, snapshot.error!.body) : null;
+          const terminalError = bodyError !== null ? {
+            ...bodyError,
+            failure_code: snapshot.error!.failure_code === "http_error" ? bodyError.failure_code : snapshot.error!.failure_code,
+            diagnostic_id: snapshot.error!.diagnostic_id ?? undefined,
+            composer_operation: { operation_id: snapshot.operation_id, kind: snapshot.kind, failure_code: snapshot.error!.failure_code },
+          } : null;
           check();
           durableTerminal = true;
           settleComposerCustody(owner.descriptor);
-          if (owner.descriptor.mode === "observer" && initial.mode === "submitted") throw new ComposerActiveAttachment();
+          if (owner.descriptor.mode === "observer" && initial.mode === "submitted") throw new ComposerActiveAttachment(
+            snapshot.status === "completed" ? { status: "completed", result: snapshot.result! } : { status: "failed", error: terminalError! },
+          );
           if (snapshot.status === "completed") return snapshot.result!;
           throw terminalError;
         }

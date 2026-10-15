@@ -90,7 +90,7 @@ from elspeth.plugins.llm.config_validation import (
 )
 from elspeth.plugins.llm.pricing import observe_http_provider_cost
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.llm.multi_query import ResponseFormat, resolve_queries
+from elspeth.plugins.transforms.llm.multi_query import ResponseFormat
 from elspeth.plugins.transforms.llm.provider import (
     LLMAuditParent,
     LLMQueryResult,
@@ -205,7 +205,7 @@ class GatewayConfig(LLMConfig):
                 self.required_capabilities,
             )
             return self
-        structured = tuple(spec.name for spec in resolve_queries(self.queries) if spec.response_format is ResponseFormat.STRUCTURED)
+        structured = tuple(spec.name for spec in self.resolved_queries() if spec.response_format is ResponseFormat.STRUCTURED)
         validate_gateway_structured_output_capability(structured, self.required_capabilities)
         return self
 

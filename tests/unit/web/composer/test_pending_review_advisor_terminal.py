@@ -13,6 +13,7 @@ from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGate
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from tests.unit.web.execution.test_validation_complaint_triage import complaint_triage_state
@@ -36,7 +37,8 @@ async def test_pending_graph_error_preserves_fresh_advisor_block_and_deadline(ex
     service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(
             ok=True, blocking=True, findings_text="FLAGGED: requested behavior was removed", note="Requested behavior was removed"
-        )
+        ),
+        side_effect=_AdvisorCheckpointComposeDeadlineExpired if expired else None,
     )
     structural_message = "tidy_columns requires str while attach_sla emits Any"
     findings = ValidationResult(
@@ -58,14 +60,26 @@ async def test_pending_graph_error_preserves_fresh_advisor_block_and_deadline(ex
     service._advisor_checkpoint._sessions_service = service._sessions_service
     service._completion._sessions_service = service._sessions_service
     session_id = str(uuid4())
+    context = _compose_context(session_id)
+    current_state_id = str(uuid4())
+    request = "Keep the requested behavior and fix the graph"
+    evidence = TurnEvidence(
+        session_id=session_id,
+        session_operation_context=context,
+        request_id="pending-advisor-control",
+        request=request,
+        initial_state_id=current_state_id,
+        initial_state=state,
+    )
     deadline = asyncio.get_running_loop().time() + (-1 if expired else 60)
 
     async def evaluate():
         return await service._completion._evaluate_terminal_no_tool_advisor_gate(
             state=state,
+            turn_evidence=evidence,
             session_id=session_id,
-            session_operation_context=_compose_context(session_id),
-            current_state_id=str(uuid4()),
+            session_operation_context=context,
+            current_state_id=current_state_id,
             assistant_message=_admit_composer_llm_completion(_fake_llm_response(content="The pipeline is ready.")).message,
             llm_messages=[],
             recorder=BufferingRecorder(),
@@ -77,7 +91,7 @@ async def test_pending_graph_error_preserves_fresh_advisor_block_and_deadline(ex
             persisted_tool_call_turn=False,
             allow_repair_continue=False,
             runtime_preflight=_pending_handoff_preflight(),
-            user_message="Keep the requested behavior and fix the graph",
+            user_message=request,
             user_id="alice",
             runtime_preflight_cache=service._preflight.new_cache(),
             initial_version=0,
@@ -107,8 +121,10 @@ async def test_pending_graph_error_preserves_fresh_advisor_block_and_deadline(ex
     surface.assert_not_awaited()
     assert masked_preflight.await_count == 1
     assert masked_preflight.await_args.kwargs["deadline"] == deadline
-    assert messages.await_count == 2
-    disclosure, publication = messages.calls
+    assert "The pipeline is ready." not in result.message
+    assert messages.await_count == 3
+    withheld, disclosure, publication = messages.calls
+    assert withheld.kwargs["tool_calls"][0]["origin"] == "advisor_publication_withheld"
     assert disclosure.kwargs["tool_calls"][0]["origin"] == "advisor_signoff_withheld"
     assert result.advisor_terminal_publication is not None
     assert result.advisor_terminal_publication.branch == "terminal_block"

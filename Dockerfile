@@ -50,6 +50,12 @@ RUN npm run build
 # =============================================================================
 FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91 AS builder
 
+# psqlparse2 builds its bundled libpg_query and Python extension from source.
+# Keep make, the C compiler and libc headers in this builder stage only.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends make gcc libc6-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install uv for fast, deterministic dependency resolution
 # Using official installer (https://docs.astral.sh/uv/getting-started/installation/)
 COPY --from=ghcr.io/astral-sh/uv@sha256:e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3 /uv /usr/local/bin/uv

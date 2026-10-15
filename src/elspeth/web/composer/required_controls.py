@@ -69,13 +69,11 @@ from elspeth.web.composer.state import (
     validate_composer_source_name,
 )
 
-# The shared on_validation_failure canonicalizer is the single owner of the
-# "" -> 'discard' fold (elspeth-bcd7051143); deep-importing tools._common is
-# the established cross-package pattern (pipeline_planner and pipeline_commit
-# do the same).
+# Use the same explicit-choice admission as the mutation tools; projection
+# must not invent discard for an absent or invalid ordinary route.
 from elspeth.web.composer.tools._common import (
     _canonicalize_authored_interpretation_requirements,
-    canonicalize_source_validation_failure,
+    resolve_failure_route_choice,
 )
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -244,6 +242,8 @@ def _parse_node(raw: Mapping[str, Any]) -> NodeSpec:
         or (merge is not None and type(merge) is not str)
     ):
         raise TypeError("node fields have malformed types")
+    if node_type in ("transform", "aggregation"):
+        on_error = resolve_failure_route_choice(on_error, supplied="on_error" in raw, field="on_error")
     if routes is not None and (
         not isinstance(routes, Mapping) or any(type(key) is not str or type(value) is not str for key, value in routes.items())
     ):
@@ -327,8 +327,6 @@ def _parse_candidate_state(candidate: Mapping[str, Any]) -> CompositionState | N
             plugin = raw["plugin"]
             options = raw.get("options")
             on_write_failure = raw.get("on_write_failure")
-            if on_write_failure is None:
-                on_write_failure = "discard"
             if (
                 type(sink_name) is not str
                 or not sink_name
@@ -338,6 +336,7 @@ def _parse_candidate_state(candidate: Mapping[str, Any]) -> CompositionState | N
                 or type(on_write_failure) is not str
             ):
                 return None
+            on_write_failure = resolve_failure_route_choice(on_write_failure, supplied="on_write_failure" in raw, field="on_write_failure")
             outputs.append(
                 OutputSpec(
                     name=sink_name,
@@ -386,11 +385,11 @@ def _parse_source(block: Mapping[str, Any]) -> SourceSpec:
         or not isinstance(options, Mapping)
     ):
         raise TypeError("source string fields must be exact strings")
-    # None and "" both mean 'discard' via the shared canonicalizer — the
-    # single owner of that fold (elspeth-bcd7051143) — so this coverage
-    # projection sees exactly what the set_pipeline persistence seam will
-    # store instead of refusing a candidate persistence would accept.
-    on_validation_failure = canonicalize_source_validation_failure(authored_validation_failure)
+    on_validation_failure = resolve_failure_route_choice(
+        authored_validation_failure,
+        supplied="on_validation_failure" in block,
+        field="on_validation_failure",
+    )
     return SourceSpec(
         plugin=plugin,
         on_success=on_success,

@@ -23,6 +23,71 @@ make_service = checkpoint_fixtures.make_service
 simple_state = checkpoint_fixtures.simple_state
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retryable", [False, True])
+async def test_unavailable_public_detail_does_not_invent_a_retry(make_service, simple_state, retryable):
+    import httpx
+    from litellm.exceptions import ServiceUnavailableError
+    from openai import APITimeoutError
+
+    service = make_service()
+    failure = (
+        ServiceUnavailableError(message="private-provider-marker", llm_provider="test", model="test/advisor")
+        if retryable
+        else APITimeoutError(request=httpx.Request("POST", "https://example.test"))
+    )
+    physical_calls = 0
+
+    async def fail(*args, on_provider_dispatch=None, **kwargs):
+        nonlocal physical_calls
+        physical_calls += 1
+        if on_provider_dispatch is not None:
+            on_provider_dispatch()
+        raise failure
+
+    service._advisor_checkpoint._call_advisor_with_audit = fail
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, recorder=None, **_fenced_session(service)
+    )
+    expected_attempts = 2 if retryable else 1
+    assert physical_calls == expected_attempts
+    assert verdict.failure_class == "unavailable"
+    assert verdict.findings_text == "advisor model was unavailable"
+    record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
+    assert record["provider_attempts"] == expected_attempts
+    assert "private-provider-marker" not in repr(verdict)
+
+
+@pytest.mark.asyncio
+async def test_nonretryable_provider_failure_does_not_invent_a_format_retry(make_service, simple_state):
+    from litellm.exceptions import BadGatewayError
+
+    from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
+
+    service = make_service()
+    physical_calls = 0
+
+    async def fail(*args, on_provider_dispatch=None, **kwargs):
+        nonlocal physical_calls
+        physical_calls += 1
+        if on_provider_dispatch is not None:
+            on_provider_dispatch()
+        raise BadGatewayError(message="private-malformed-marker", llm_provider="test", model="test/advisor")
+
+    service._advisor_checkpoint._call_advisor_with_audit = fail
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, recorder=None, **_fenced_session(service)
+    )
+    assert physical_calls == 1
+    assert verdict.failure_class == "unavailable"
+    record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
+    assert record["provider_attempts"] == 1
+    assert record["format_reprompt_sent"] is False
+    detail, suggestion = advisor_signoff_blocked_wording(reason="unavailable", findings=verdict.findings_text)
+    assert "after a format retry" not in suggestion
+    assert "private-malformed-marker" not in detail + suggestion
+
+
 def _reply(**changes: object) -> str:
     fields: dict[str, object] = {
         "verdict": "FLAGGED",
@@ -40,8 +105,8 @@ async def test_end_checkpoint_retries_clean_content_with_tool_calls(make_service
     service = make_service()
     replies = iter(
         [
-            (_reply(verdict="CLEAN", steps=[], findings="", note=None), [object()]),
-            (_reply(), None),
+            (_reply(verdict="CLEAN", steps=[], findings="", note=None, publication_verdict="ADMIT"), [object()]),
+            (_reply(publication_verdict="WITHHOLD"), None),
         ]
     )
 
@@ -58,7 +123,7 @@ async def test_end_checkpoint_retries_clean_content_with_tool_calls(make_service
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     recorder = BufferingRecorder()
     verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-        phase="end", state=simple_state, recorder=recorder, **_fenced_session(service)
+        phase="end", state=simple_state, recorder=recorder, **_fenced_session(service, review_state=simple_state)
     )
 
     assert verdict.ok and verdict.blocking
@@ -93,8 +158,9 @@ async def test_excessively_nested_json_exhausts_checkpoint_retry_as_malformed(ma
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_structured_reply_records_counts_before_any_terminal_publication(make_service, simple_state, phase):
     service = make_service()
-    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_reply(), {}))
-    fenced = _fenced_session(service)
+    publication_fields = {"publication_verdict": "WITHHOLD"} if phase == "end" else {}
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_reply(**publication_fields), {}))
+    fenced = _fenced_session(service, review_state=simple_state if phase == "end" else None)
     with structlog.testing.capture_logs() as events:
         verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=simple_state, recorder=None, **fenced)
     assert verdict.findings_text == "TECHNICAL_CANARY: rate needs page content."

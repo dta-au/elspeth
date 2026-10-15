@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
@@ -48,7 +48,7 @@ from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import REDACTED_UNKNOWN_RESPONSE_KEY
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.config import WebSettings
@@ -94,9 +94,10 @@ class _ReplayLLM:
     def __init__(self, responses: tuple[_AdmittedLLMCompletion, ...]) -> None:
         self._responses = list(responses)
 
-    async def __call__(self, _messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
-        if not self._responses:
-            return _make_llm_response(content="Done.")
+    async def __call__(
+        self, _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> _AdmittedLLMCompletion:
+        assert self._responses, "No further primary response is supplied by this trace"
         return self._responses.pop(0)
 
 
@@ -105,7 +106,9 @@ class _BlockingLLM:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def __call__(self, _messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+    async def __call__(
+        self, _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> _AdmittedLLMCompletion:
         self.entered.set()
         await self.release.wait()
         return _make_llm_response(content="Done.")
@@ -122,6 +125,7 @@ class _Harness:
     # compose-turn audit persist, exactly as it was before the composer
     # required session-operation authority. No optional-context arm.
     compose_context: SessionOperationContext
+    completed_results: list[ComposeLoopTestResult] = field(default_factory=list)
 
     def release(self) -> None:
         """Release the harness lease; a lost fence means a trace already consumed it."""
@@ -253,7 +257,7 @@ def _make_harness(tmp_path: Path, *, session_state: SessionState = "empty") -> _
 
 async def _run_one_turn(harness: _Harness, llm: Any) -> Any:
     driver = cast(Any, harness.service)
-    return await driver._run_one_turn_for_test(
+    result = await driver._run_one_turn_for_test(
         llm=llm,
         session_id=harness.session_id,
         session_operation_context=harness.compose_context,
@@ -266,6 +270,8 @@ async def _run_one_turn(harness: _Harness, llm: Any) -> Any:
             version=1,
         ),
     )
+    harness.completed_results.append(result)
+    return result
 
 
 def _chat_rows(harness: _Harness) -> tuple[Any, ...]:
@@ -626,7 +632,31 @@ def _drive_single_example_trace_with(
 ) -> _TraceOutcome:
     chosen_tool_call = tool_call or ToolCallSpec(name="set_metadata", call_id=f"call_{uuid.uuid4().hex[:12]}")
     chosen_arguments = argument_dict or {"patch": {"name": "property trace"}}
-    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-openrouter-key"}):
+    reviews: list[dict[str, Any]] = []
+
+    async def unavailable_end(**kwargs: Any) -> Any:
+        from litellm import AuthenticationError
+
+        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+
+        assert kwargs["model"] == harness.service._settings.composer_advisor_model
+        assert len(reviews) < 1, "Only one nonretryable END SDK refusal is supplied per trace"
+        assert "tools" not in kwargs and kwargs["num_retries"] == kwargs["max_retries"] == 0
+        assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
+        payload = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+        review = json.loads(payload.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+        assert review["current_request"] == "one-turn compose-loop test driver" and review["candidate_reply"] == "Done."
+        states = _state_rows(harness)
+        assert review["saved_effects"]["saved_revision_count"] == len(states)
+        if states:
+            assert review["saved_effects"]["latest_committed_state_id"] == states[-1].id
+        reviews.append(review)
+        raise AuthenticationError(message="property fixture advisor unavailable", llm_provider="anthropic", model=kwargs["model"])
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-openrouter-key"}),
+        patch("litellm.acompletion", side_effect=unavailable_end),
+    ):
         if failure_injection_point == "audit_raises_OperationalError_on_commit":
             _drive_commit_failure_trace(harness, chosen_tool_call, chosen_arguments)
             cancelled = False
@@ -648,6 +678,11 @@ def _drive_single_example_trace_with(
                     argument_dict=chosen_arguments,
                 )
             )
+    if harness.completed_results:
+        assert not cancelled and len(harness.completed_results) == 1 and len(reviews) == 1
+        _assert_completed_trace_ledger(harness, harness.completed_results[0], reviews[0])
+    else:
+        assert reviews == [], "Cancellation or failed atomic persistence must prevent END dispatch"
     outcome = _TraceOutcome(
         cancellation_arrival_time=cancellation_arrival_time,
         operation_id=harness.compose_context.fence.operation_id,
@@ -663,6 +698,90 @@ def _drive_single_example_trace_with(
     )
     _assert_common_invariants(harness)
     return outcome
+
+
+def _assert_completed_trace_ledger(harness: _Harness, result: ComposeLoopTestResult, review: dict[str, Any]) -> None:
+    from elspeth.contracts.hashing import stable_hash
+    from elspeth.web.composer import advisor_policy, no_tool_policy
+    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
+    from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
+    from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope
+    from elspeth.web.composer.withheld_replies import withheld_reply_envelope
+    from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_or_tool_messages
+
+    rows = _chat_rows(harness)
+    prior = rows[:1] if rows[0].role == "user" else ()
+    if prior:
+        assert prior[0].content == "prior"
+    cohort = rows[len(prior) :]
+    assert [row.role for row in cohort] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit"]
+    _assert_private_tool_cohort(cohort[:3], harness.compose_context.fence.operation_id, harness.compose_context.fence.operation_epoch)
+    assert cohort[1].composition_state_id == cohort[2].composition_state_id
+    assert all(row.session_id == harness.session_id for row in cohort)
+    pass_rows = cohort[3:4]
+    for index, row in enumerate(pass_rows, 1):
+        envelope = {
+            "_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND,
+            "pass": {
+                "phase": "end",
+                "pass_index": index,
+                "verdict": "unavailable",
+                "source": "model",
+                "findings_hash": stable_hash({"advisor_findings": advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL}),
+                "provider_attempts": 1,
+                "first_attempt_schema_valid": None,
+                "first_attempt_accepted": None,
+                "format_reprompt_sent": False,
+                "step_ids_offered": None,
+                "step_ids_kept": None,
+                "note_present": None,
+                "url_redactions": None,
+                "email_redactions": None,
+                "publication_verdict": None,
+                "publication_binding": None,
+            },
+        }
+        assert json.loads(row.tool_calls) == [envelope] and json.loads(row.content) == envelope
+    assert cohort[4].content == "Done."
+    assert json.loads(cohort[4].tool_calls) == [withheld_reply_envelope("advisor_publication_withheld", "Done.")]
+    assert cohort[5].content == advisor_policy.ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
+    assert json.loads(cohort[5].tool_calls) == [advisor_signoff_withheld_control_envelope(cohort[5].content)]
+    terminal = {
+        "_kind": ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND,
+        "publication": {
+            "branch": "terminal_block",
+            "reason": "unavailable",
+            "preflight_shape": "absent",
+            "findings_backend_authored": False,
+        },
+    }
+    assert json.loads(cohort[6].tool_calls) == [terminal] and json.loads(cohort[6].content) == terminal
+    states = _state_rows(harness)
+    assert all(state.provenance == "tool_call" for state in states)
+    assert {state.id for state in states} == ({cohort[1].composition_state_id} if cohort[1].composition_state_id else set())
+    effects = review["saved_effects"]
+    assert effects["verification"] == "verified" and effects["saved_revision_count"] == len(states)
+    if effects["net_changed"]:
+        saved_scope = f"This request saved {len(states)} draft revisions with verified changes. Saved changes do not establish that the requested task is complete."
+    elif states:
+        saved_scope = f"This request saved {len(states)} draft revisions. The final authored configuration has no net change from the request's starting draft."
+    else:
+        saved_scope = "No pipeline changes were saved in this request."
+    assert result.raw_assistant_content == saved_scope
+    assert result.assistant_message == saved_scope + no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+    assert result.runtime_preflight is not None and result.runtime_preflight.readiness.completion_ready is False
+    assert (
+        isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
+        and result.advisor_gate_decision.fact.cause is AdvisorBlockCause.UNAVAILABLE
+    )
+    stored = asyncio.run(harness.sessions_service.get_messages(uuid.UUID(harness.session_id), limit=None))
+    public = _composer_conversation_or_tool_messages(stored)
+    assert [str(row.id) for row in public] == [row.id for row in (*prior, *cohort[:2])]
+    assert all(row.content != "Done." and row.raw_content != "Done." for row in public)
+    history = _composer_chat_history(stored)
+    assert [item["role"] for item in history] == [*("user" for _ in prior), "assistant", "user"]
+    assert history[-1]["content"] == advisor_policy.ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
+    assert all(item["content"] != "Done." for item in history)
 
 
 def _drive_advisory_lock_failure_trace(
@@ -871,8 +990,12 @@ def test_compose_loop_audit_machine_examples(cancellation_arrival_time: Cancella
         "after_commit_before_response_yielded",
         "after_response_yielded",
     }:
-        assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit"]
-        _assert_private_tool_cohort(outcome.rows, outcome.operation_id, outcome.operation_epoch)
+        if cancellation_arrival_time == "after_response_yielded":
+            assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit"]
+            assert len(outcome.state_rows) == 1 and outcome.state_rows[0].id == outcome.rows[1].composition_state_id
+        else:
+            assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit"]
+        _assert_private_tool_cohort(outcome.rows[:3], outcome.operation_id, outcome.operation_epoch)
     if cancellation_arrival_time in {
         "before_llm_call",
         "during_llm_call",

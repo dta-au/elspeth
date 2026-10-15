@@ -189,7 +189,6 @@ class TestSetSourceFromBlobMigration:
 
     def test_get_tool_definitions_emits_expected_set_source_from_blob_definition(self) -> None:
         from elspeth.web.composer.tools._common import (
-            _DEFAULT_SOURCE_VALIDATION_FAILURE,
             _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
         )
         from elspeth.web.composer.tools.sources import _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
@@ -224,9 +223,8 @@ class TestSetSourceFromBlobMigration:
                         "examples": ["raw_url_rows", "csv_rows", "fetched_text"],
                     },
                     "on_validation_failure": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
-                        "default": _DEFAULT_SOURCE_VALIDATION_FAILURE,
                     },
                     "options": {
                         "type": "object",
@@ -761,9 +759,7 @@ class TestStep3MutationTierMigration:
         assert on_vf["description"] == _SOURCE_VALIDATION_FAILURE_DESCRIPTION
 
     def test_set_pipeline_source_validation_failure_resolved(self) -> None:
-        """set_pipeline carries the same constant; same drift check."""
-        from elspeth.web.composer.tools._common import _SOURCE_VALIDATION_FAILURE_DESCRIPTION
-
+        """Full replacement describes required choices without update preservation."""
         defn = self._get("set_pipeline")
         params = defn["parameters"]
         assert isinstance(params, dict)
@@ -771,7 +767,10 @@ class TestStep3MutationTierMigration:
         assert isinstance(source, dict)
         on_vf = source["properties"]["on_validation_failure"]
         assert isinstance(on_vf, dict)
-        assert on_vf["description"] == _SOURCE_VALIDATION_FAILURE_DESCRIPTION
+        assert on_vf["type"] == "string"
+        assert "on_validation_failure" in source["required"]
+        assert "Full replacement does not reuse prior choices" in on_vf["description"]
+        assert "Omit only" not in on_vf["description"]
 
     def test_set_pipeline_required_top_level(self) -> None:
         """set_pipeline.required is exactly ['nodes', 'edges', 'outputs'].
@@ -948,8 +947,10 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "get_blob_content",
             "description": (
                 "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
-                "Large files are truncated to 50,000 characters "
-                "(`truncated` is true when so; `size_bytes` is the full size). "
+                "Pages contain at most 50,000 original Unicode code points and the complete JSON tool response is bounded to 65,536 bytes. "
+                "Read `next_offset_chars` with `expected_content_hash` to continue; ranges are [start_char,end_char), "
+                "`total_chars` counts the full decoded text and `content_hash` identifies the verified original bytes. "
+                "`truncated` means end_char < total_chars, not whole-file inspection; `size_bytes` is the full byte size. "
                 "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
                 "`creation_modality` — so content the assistant generated earlier is not mistaken for a discovered file."
             ),
@@ -959,6 +960,20 @@ class TestStep3BlobDiscoveryTierMigration:
                     "blob_id": {
                         "type": "string",
                         "description": "ID of the blob to read.",
+                    },
+                    "offset_chars": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Start offset in original Unicode code points.",
+                    },
+                    "expected_content_hash": {
+                        "type": ["string", "null"],
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": (
+                            "Verified original-byte SHA256. Use null at offset 0 for no expected identity constraint; "
+                            "a canonical non-null hash is required after offset 0. Every non-null hash is checked, even at offset 0."
+                        ),
                     },
                 },
                 "required": ["blob_id"],

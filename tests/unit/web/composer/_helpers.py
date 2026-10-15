@@ -150,6 +150,15 @@ def _composer_service_with_session(catalog: CatalogService, settings: WebSetting
 
 
 async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
+    from elspeth.web.composer.turn_effects import AdvisorPublicationReview
+
+    if _kwargs["phase"] == "end":
+        review = _kwargs["publication_review"]
+        if type(review) is not AdvisorPublicationReview:
+            raise TypeError("P4 test stub requires the actual candidate/evidence snapshot")
+        return AdvisorCheckpointVerdict(
+            ok=True, blocking=False, findings_text="CLEAN", publication_verdict="ADMIT", publication_binding=review.binding
+        )
     return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
 
 

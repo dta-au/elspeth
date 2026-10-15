@@ -124,6 +124,137 @@ def failed():
     )
 
 
+@pytest.mark.asyncio
+async def test_failure_history_counts_only_exact_session_fence_revisions(operation_store):
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    _engine, repository, authority, service, sid = operation_store
+    initial = repository.acquire(
+        session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
+    )
+    initial_state = await service.save_composition_state(
+        sid, CompositionStateData(), provenance="session_seed", session_operation_context=initial
+    )
+    repository.release(initial)
+    record, running = start(operation_store, SendMessageRequest(operation_id=str(uuid4()), content="Build", state_id=initial_state.id))
+    assert record.operation_id != running.session_operation_context.fence.operation_id
+    for _ in range(2):
+        last_owned = await service.save_composition_state(
+            sid, CompositionStateData(), provenance="session_seed", session_operation_context=running.session_operation_context
+        )
+    await service.fail_composer_async_operation(running, failure=failed())
+    repository.release(running.session_operation_context)
+    later = repository.acquire(
+        session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
+    )
+    later_state = await service.save_composition_state(
+        sid, CompositionStateData(), provenance="session_seed", session_operation_context=later
+    )
+    repository.release(later)
+    (outcome,), cursor = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice")
+    assert cursor is None
+    assert outcome.operation_id == record.operation_id
+    assert outcome.saved_revisions.attribution == "fenced"
+    assert outcome.saved_revisions.count == 2
+    assert outcome.saved_revisions.latest_state_id == last_owned.id
+    assert outcome.saved_revisions.latest_version == last_owned.version
+    assert later_state.version > outcome.saved_revisions.latest_version
+    assert authority.list_failure_outcomes(session_id=sid, actor_user_id="other-actor") == ((), None)
+    assert authority.list_failure_outcomes(session_id=uuid4(), actor_user_id="alice", operation_id=record.operation_id) == ((), None)
+
+
+def test_failure_cursor_codec_preserves_wire_bytes_and_concrete_dto():
+    from datetime import UTC, datetime
+
+    from elspeth.web.sessions.composer_operations import (
+        ComposerOperationFailureCursor,
+        decode_composer_failure_cursor,
+        encode_composer_failure_cursor,
+    )
+
+    cursor = ComposerOperationFailureCursor(
+        settled_at=datetime(2026, 10, 15, 1, 2, 3, 456789, tzinfo=UTC),
+        operation_id="00000000-0000-4000-8000-000000000001",
+    )
+    # Measured from the immutable pre-extraction codec; independent of this DTO's current serialization.
+    previous_wire = (
+        "eyJzZXR0bGVkX2F0IjoiMjAyNi0xMC0xNVQwMTowMjowMy40NTY3ODlaIiwib3BlcmF0aW9uX2lk"
+        "IjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0="
+    )
+    assert encode_composer_failure_cursor(cursor) == previous_wire
+    restored = decode_composer_failure_cursor(previous_wire)
+    assert type(restored) is ComposerOperationFailureCursor
+    assert restored == cursor
+    assert "encode" not in ComposerOperationFailureCursor.__dict__
+    assert "decode" not in ComposerOperationFailureCursor.__dict__
+
+
+@pytest.mark.parametrize("value", ("", "x" * 513, "!", "é", "e30=", "bnVsbA=="))
+def test_failure_cursor_codec_retains_invalid_wire_refusal(value):
+    from elspeth.web.sessions.composer_operations import decode_composer_failure_cursor
+
+    with pytest.raises(ValueError):
+        decode_composer_failure_cursor(value)
+
+
+def test_failure_history_tied_timestamp_cursor_is_stable_and_actor_scoped(operation_store, monkeypatch):
+    from datetime import timedelta
+
+    from elspeth.web.sessions.composer_operations import (
+        ComposerOperationFailureCursor,
+        decode_composer_failure_cursor,
+        encode_composer_failure_cursor,
+    )
+
+    engine, _repository, authority, _service, sid = operation_store
+    with engine.connect() as conn:
+        fixed_now = database_now(conn) + timedelta(seconds=1)
+    monkeypatch.setattr("elspeth.web.coordination.composer_operation_authority.database_now", lambda _conn: fixed_now)
+    for _ in range(4):
+        record, _ = admit(authority, sid)
+        authority.request_cancel(session_id=sid, operation_id=record.operation_id, cancelled_failure=cancelled)
+    all_outcomes, _ = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice")
+    assert {outcome.settled_at for outcome in all_outcomes} == {fixed_now}
+    assert [outcome.operation_id for outcome in all_outcomes] == sorted((outcome.operation_id for outcome in all_outcomes), reverse=True)
+    # A controlled clock forces the tie; every continuation must constrain both keys.
+    for index, outcome in enumerate(all_outcomes):
+        cursor = ComposerOperationFailureCursor(settled_at=outcome.settled_at, operation_id=outcome.operation_id)
+        restored = decode_composer_failure_cursor(encode_composer_failure_cursor(cursor))
+        remaining, _ = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice", cursor=restored)
+        assert remaining == all_outcomes[index + 1 :]
+        assert authority.list_failure_outcomes(session_id=sid, actor_user_id="other-actor", cursor=restored) == ((), None)
+
+
+def test_failure_history_omits_private_error_body_and_checks_sealed_hash(operation_store):
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    engine, _repository, authority, _service, sid = operation_store
+    record, _ = admit(authority, sid)
+    private = "SYNTHETIC_PRIVATE_FAILURE_CANARY"
+
+    def private_cancelled(*, request_id):
+        return ComposerOperationError(
+            http_status=499,
+            failure_code="request_cancelled",
+            error_type=private,
+            body={"detail": private, "request_id": private},
+            diagnostic_id=None,
+        )
+
+    authority.request_cancel(session_id=sid, operation_id=record.operation_id, cancelled_failure=private_cancelled)
+    (outcome,), _ = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice")
+    assert private not in outcome.model_dump_json()
+    assert outcome.request_id == "correlation"
+    assert outcome.error_type is None
+    with engine.begin() as conn, pytest.raises(IntegrityError):
+        conn.execute(update(jobs).where(jobs.c.operation_id == record.operation_id).values(result_sha256="0" * 64))
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DROP TRIGGER trg_composer_async_operations_transition_guard")
+        conn.execute(update(jobs).where(jobs.c.operation_id == record.operation_id).values(result_sha256="0" * 64))
+    with pytest.raises(AuditIntegrityError):
+        authority.list_failure_outcomes(session_id=sid, actor_user_id="alice")
+
+
 def response(message, proposals, state):
     return MessageWithStateResponse(
         message=ChatMessageResponse(
@@ -1162,6 +1293,155 @@ async def test_failed_terminal_has_one_exact_immutable_retry(operation_store, mo
     assert len(bundles) == 2 and bundles[0] == bundles[1]
     assert terminal.settled_at == bundles[0][1]
     assert authority.get(session_id=sid, operation_id=record.operation_id) == terminal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ("normal", "retry", "audit_failure", "cancel", "deadline", "lost_fence"))
+async def test_failed_terminal_private_cause_is_atomic_frozen_and_exactly_correlated(operation_store, monkeypatch, case):
+    import json
+
+    import elspeth.web.sessions.service as service_module
+    from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
+    from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+    from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+    from elspeth.web.coordination.contracts import SessionOperationFenceLost
+    from elspeth.web.sessions.composer_operation_errors import operation_failure_diagnostic_id, project_composer_operation_error
+    from elspeth.web.sessions.models import chat_messages_table
+    from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
+
+    engine, repository, authority, service, sid = operation_store
+    record, running = start(operation_store, deadline_seconds=1.0 if case == "deadline" else 180.0)
+    original = RuntimeError("B7_PRIVATE_CAUSE_CANARY: late settlement failure")
+    capture = ComposerOperationFailureFacts(
+        record.operation_id, record.request_id, running.session_operation_context, capture_failure_facts(original)
+    )
+    failure = project_composer_operation_error(
+        original,
+        request_id=record.request_id,
+        diagnostic_id=operation_failure_diagnostic_id(session_id=str(sid), operation_id=record.operation_id),
+    )
+    earlier = await service.add_message(
+        sid,
+        "audit",
+        "Earlier durable audit cohort",
+        writer_principal="compose_loop",
+        session_operation_context=running.session_operation_context,
+    )
+    if case == "cancel":
+        authority.request_cancel(session_id=sid, operation_id=record.operation_id, cancelled_failure=cancelled)
+    elif case == "deadline":
+        while authority.get_with_database_now(session_id=sid, operation_id=record.operation_id)[1] < record.deadline_at:
+            await asyncio.sleep(0.01)
+    elif case == "lost_fence":
+        repository.release(running.session_operation_context)
+    actual_write = service._write_audit_cohort_on_connection
+    actual_settle = service_module.settle_composer_operation_on_connection
+    writes = []
+    settlements = []
+
+    def write(conn, **kwargs):
+        writes.append((kwargs["drafts"], kwargs["message_ids"], kwargs["created_at"], kwargs["recorded_at"]))
+        result = actual_write(conn, **kwargs)
+        if case == "audit_failure":
+            raise RuntimeError("Synthetic private cohort insert failure")
+        return result
+
+    def settle(*args, **kwargs):
+        settlements.append((kwargs["outcome"], kwargs["settled_at"]))
+        result = actual_settle(*args, **kwargs)
+        if case == "retry" and len(settlements) == 1:
+            raise RuntimeError("Synthetic acknowledgment failure after diagnostic insert")
+        return result
+
+    monkeypatch.setattr(service, "_write_audit_cohort_on_connection", write)
+    monkeypatch.setattr(service_module, "settle_composer_operation_on_connection", settle)
+    if case in {"audit_failure", "lost_fence"}:
+        with pytest.raises(ComposerTerminalSQLCompletionUnknown if case == "audit_failure" else SessionOperationFenceLost):
+            await service.fail_composer_async_operation(running, failure=failure, operation_failure_facts=capture)
+        terminal = authority.get(session_id=sid, operation_id=record.operation_id)
+        assert terminal.status == "running"
+    else:
+        terminal = await service.fail_composer_async_operation(running, failure=failure, operation_failure_facts=capture)
+        assert terminal.status == "failed"
+        assert terminal.failure_code == (
+            "request_cancelled" if case == "cancel" else "deadline_expired" if case == "deadline" else "operation_failed"
+        )
+        assert "B7_PRIVATE_CAUSE_CANARY" not in terminal.result_json
+    rows = await service.get_messages(sid, limit=None)
+    assert rows[0].id == earlier.id
+    diagnostics = [envelope for row in rows for envelope in row.tool_calls or () if envelope.get("_kind") == "composer_diagnostic_evidence"]
+    if case in {"audit_failure", "lost_fence"}:
+        assert diagnostics == []
+        assert len(writes) == (2 if case == "audit_failure" else 0)
+        assert settlements == []
+    else:
+        assert len(diagnostics) == 1
+        evidence = ComposerDiagnosticEvidence.from_envelope(
+            diagnostics[0], expected_session_id=str(sid), expected_operation_id=running.session_operation_context.fence.operation_id
+        )
+        assert evidence.operation_epoch == running.session_operation_context.fence.operation_epoch
+        assert evidence.result.content == capture.facts.canonical
+        correlation = json.loads(evidence.arguments.content)
+        selected = ComposerOperationError.model_validate_json(terminal.result_json, strict=True)
+        assert correlation["diagnostic_id"] == selected.diagnostic_id
+        assert correlation["durable_operation_id"] == record.operation_id
+        assert correlation["request_id"] == record.request_id
+        assert correlation["failure_code"] == terminal.failure_code
+        assert len(writes) == len(settlements) == (2 if case == "retry" else 1)
+        with engine.connect() as conn:
+            stored = conn.execute(select(chat_messages_table).where(chat_messages_table.c.id == writes[-1][1][0])).one()
+        assert service._row_to_chat_message_record(stored).created_at == terminal.settled_at
+    if len(writes) == 2:
+        assert writes[0] == writes[1]
+        assert writes[0][0][0] is writes[1][0][0]
+    if case != "lost_fence":
+        repository.release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_private_cause_waits_for_actual_sql_through_caller_cancellation(operation_store, monkeypatch):
+    from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
+    from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+    from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
+
+    _engine, repository, _authority, service, sid = operation_store
+    record, running = start(operation_store)
+    original = RuntimeError("Private original finalization failure")
+    capture = ComposerOperationFailureFacts(
+        record.operation_id, record.request_id, running.session_operation_context, capture_failure_facts(original)
+    )
+    failure = project_composer_operation_error(original, request_id=record.request_id)
+    entered, release, completed = Event(), Event(), Event()
+    actual_write = service._write_audit_cohort_on_connection
+
+    def write(conn, **kwargs):
+        entered.set()
+        assert release.wait(5), "Controlled diagnostic SQL was not released"
+        result = actual_write(conn, **kwargs)
+        completed.set()
+        return result
+
+    monkeypatch.setattr(service, "_write_audit_cohort_on_connection", write)
+    task = asyncio.create_task(service.fail_composer_async_operation(running, failure=failure, operation_failure_facts=capture))
+    try:
+        await _wait_for_thread_event(entered)
+        task.cancel("First caller cancellation")
+        await asyncio.sleep(0)
+        task.cancel("Second caller cancellation")
+        await asyncio.sleep(0.02)
+        assert not completed.is_set() and not task.done()
+    finally:
+        release.set()
+    terminal = await task
+    assert completed.is_set() and terminal.status == "failed"
+    diagnostics = [
+        envelope
+        for row in await service.get_messages(sid, limit=None)
+        for envelope in row.tool_calls or ()
+        if envelope.get("_kind") == "composer_diagnostic_evidence"
+    ]
+    assert len(diagnostics) == 1
+    repository.release(running.session_operation_context)
 
 
 @pytest.mark.asyncio

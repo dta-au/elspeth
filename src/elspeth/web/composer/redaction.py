@@ -188,6 +188,10 @@ _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS = frozenset(
         "completion_tokens",
         "cached_prompt_tokens",
         "advisor_latency_ms",
+        "total_chars",
+        "start_char",
+        "end_char",
+        "next_offset_chars",
     }
 )
 # Exactly the classes the web ARG_ERROR producers raise, pinned by the
@@ -1455,7 +1459,7 @@ class SetSourceArgumentsModel(BaseModel):
     plugin: str
     on_success: str
     options: _LlmJsonObject
-    on_validation_failure: str
+    on_validation_failure: str | None = None
     # One-sentence composer-authored prose for the Spec tab. Free-text scalar
     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
     # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
@@ -1551,19 +1555,11 @@ class SetSourceFromBlobArgumentsModel(BaseModel):
     ``{}`` preserves "absent = no options" at the argument boundary AND
     records it accurately on the audit side as an empty-options dict.
 
-    ``plugin`` and ``on_validation_failure`` keep ``str | None = None``
-    because the handler distinguishes their absent semantics: ``plugin``
-    absent triggers MIME-type-based inference at
-    ``_resolve_source_blob``; ``on_validation_failure`` absent falls back
-    to ``_DEFAULT_SOURCE_VALIDATION_FAILURE`` ("discard").  A default of
-    ``""`` would conflate "operator did not specify" with "operator
-    specified empty string" — fabrication (see
-    docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
-    The model deliberately does NOT judge an authored ``""`` either: what an
-    empty string means is owned by exactly one place, the handler-side
-    ``canonicalize_source_validation_failure`` (``tools/_common``), which
-    folds it into "discard" because "" can never name a sink route
-    (elspeth-bcd7051143).
+    ``plugin`` omission triggers MIME-type-based inference. Failure-choice
+    omission is tracked by model_fields_set and preserves only an existing
+    named source's choice. New sources require an explicit non-empty route;
+    null and empty reach the handler's owned semantic rejection, never a
+    fabricated discard policy.
 
     ``extra="forbid"`` is required (rev-2 M.1).  Fields belonging to
     neighbouring tools (``filename``, ``mime_type``, ``content``,
@@ -1576,7 +1572,7 @@ class SetSourceFromBlobArgumentsModel(BaseModel):
     on_success: str
     source_name: str = "source"
     plugin: _OmittableString = None
-    on_validation_failure: _OmittableString = None
+    on_validation_failure: str | None = None
     options: _LlmJsonObject = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")
@@ -1596,7 +1592,7 @@ class SetSourceFromBlobsArgumentsModel(BaseModel):
     blob_ids: list[str] = Field(min_length=1, max_length=1000)
     on_success: str
     source_name: str = "source"
-    on_validation_failure: _OmittableString = None
+    on_validation_failure: str | None = None
     options: _LlmJsonObject = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")
@@ -1781,7 +1777,7 @@ class _SetPipelineNamedSourceModel(BaseModel):
     plugin: str
     on_success: str
     options: _LlmJsonObject = Field(default_factory=dict)
-    on_validation_failure: str | None = None
+    on_validation_failure: str
     # One-sentence composer-authored prose for the Spec tab. Free-text scalar
     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
     # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
@@ -1818,17 +1814,9 @@ class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
     :class:`SetSourceFromBlobArgumentsModel.options` and applies
     identically here.
 
-    ``on_validation_failure`` default
-    ----------------------------------
-    The handler at :func:`_execute_set_pipeline` canonicalizes both absent
-    (``None``) and the unroutable ``""`` spelling to
-    ``_DEFAULT_SOURCE_VALIDATION_FAILURE`` ("discard") via
-    ``canonicalize_source_validation_failure`` — the single owner of that
-    fold shared by every source-authoring seam (elspeth-bcd7051143).  The
-    model preserves operator-omitted-vs-specified semantics with
-    ``str | None = None`` so the handler can apply the fold explicitly
-    (not via fabrication; see docs/guides/data-trust-and-error-handling.md
-    §The Three-Tier Trust Model).
+    ``on_validation_failure`` is a required nonnullable field inherited from
+    the named-source model. Full replacement cannot borrow an old choice;
+    empty values are rejected by semantic admission without choosing discard.
 
     ``blob_id`` / ``inline_blob`` exclusivity
     ------------------------------------------
@@ -1884,8 +1872,8 @@ class _PipelineNodeModel(BaseModel):
     (``X | None = None``) because the handler at
     :func:`_execute_set_pipeline` distinguishes "absent" from "operator-
     specified empty/default" for several of them (``plugin`` is None for
-    gates and coalesces; ``on_error`` defaults to ``"discard"`` for
-    transform/aggregation when None).  ``options`` defaults to ``{}`` via
+    gates and coalesces; ordinary transform/aggregation ``on_error`` is
+    required by conditional semantic admission). ``options`` defaults to ``{}`` via
     :func:`Field(default_factory=dict)` (matches the handler's
     ``n.get("options", {})``).
 
@@ -2005,14 +1993,14 @@ class _PipelineOutputModel(BaseModel):
     behind reusing the source-side summarizer at the node/output
     boundary.
 
-    ``on_write_failure`` preserves operator-omitted-vs-specified semantics
-    so the handler can apply its ``"discard"`` fallback explicitly.
+    ``on_write_failure`` is required: full replacement never borrows an old
+    sink's choice or applies a server default.
     """
 
     sink_name: str
     plugin: str
     options: _LlmJsonObject = Field(default_factory=dict)
-    on_write_failure: str | None = None
+    on_write_failure: str
     # One-sentence composer-authored prose for the Spec tab. Free-text scalar
     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
     # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
@@ -3331,13 +3319,16 @@ class _RequestInterpretationReviewResponseModel(BaseModel):
 class GetBlobContentArgumentsModel(BaseModel):
     """Redaction-bearing argument model for the ``get_blob_content`` tool.
 
-    Mirrors the JSON schema declared at ``tools.py:1444-1455`` and its
-    required-paths (``blob_id``).  The argument surface carries no sensitive
-    material — ``blob_id`` is a UUID identity — so no fields are Sensitive.
+    Mirrors the declaration in ``tools/blobs.py``. ``blob_id`` and the
+    character offset are read selectors. The caller's expected hash is
+    Sensitive and masked in argument persistence; only the verified server
+    response may supply publicly retained content identity. At offset zero,
+    omission/null means no expected identity constraint; subsequent offsets
+    require a canonical non-null hash. Every non-null supplied hash is checked.
 
     ``get_blob_content`` is type-driven (not declarative) because the
     response surface IS sensitive: ``content`` carries the operator's
-    uploaded blob payload and must be summarized to a length-only scalar
+    uploaded blob payload and must be replaced by the fixed content sentinel
     before reaching ``chat_messages.tool_calls``.  Declarative entries have
     no ``response_summarizers`` field; the only way
     to attach a per-key summarizer is via a ``Annotated[T, Sensitive(...)]``
@@ -3350,8 +3341,16 @@ class GetBlobContentArgumentsModel(BaseModel):
     """
 
     blob_id: str
+    offset_chars: int = Field(default=0, ge=0)
+    expected_content_hash: Annotated[str | None, Sensitive()] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def require_continuation_identity(self) -> GetBlobContentArgumentsModel:
+        if self.offset_chars > 0 and self.expected_content_hash is None:
+            raise ValueError("Continuation requires expected_content_hash")
+        return self
 
 
 class GetBlobContentDataModel(BaseModel):
@@ -3363,6 +3362,11 @@ class GetBlobContentDataModel(BaseModel):
     content: Annotated[str, Sensitive(summarizer=_summarize_blob_content)]
     truncated: bool
     size_bytes: int
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    total_chars: int = Field(ge=0)
+    start_char: int = Field(ge=0)
+    end_char: int = Field(ge=0)
+    next_offset_chars: int | None = Field(ge=0)
     # Blob origin (elspeth-47eba5cced). Not Sensitive: both are closed
     # server-recorded vocabularies, and _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD
     # admits only their declared members, so the persisted audit row keeps
@@ -3372,7 +3376,19 @@ class GetBlobContentDataModel(BaseModel):
     created_by: str
     creation_modality: str
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def require_consistent_range(self) -> GetBlobContentDataModel:
+        if not self.start_char <= self.end_char <= self.total_chars or self.end_char - self.start_char > 50_000:
+            raise ValueError("Blob content range is invalid")
+        if self.end_char == self.start_char and self.end_char < self.total_chars:
+            raise ValueError("A nonterminal blob page must advance")
+        if self.truncated != (self.end_char < self.total_chars):
+            raise ValueError("Blob truncation must describe the returned range")
+        if self.next_offset_chars != (self.end_char if self.truncated else None):
+            raise ValueError("Blob continuation offset must match the returned range")
+        return self
 
 
 class GetBlobContentResponseModel(BaseModel):
@@ -4201,6 +4217,14 @@ def redact_tool_call_response(
             entry.response_model,
             telemetry=telemetry,
         )
+        if tool_name == "get_blob_content":
+            if not isinstance(validated, GetBlobContentResponseModel):
+                raise AuditIntegrityError("Blob content redaction requires its declared response model")
+            if validated.data is not None and "data" not in over_budget:
+                # Only this closed model's canonical SHA256 is public identity
+                # metadata. Preserve it without admitting arbitrary strings or
+                # hashes from any other tool's response projection.
+                schema_redacted["data"]["content_hash"] = _TrustedRedactionSummary(validated.data.content_hash)
         projected = _project_validated_response_scalars(schema_redacted)
         assert type(projected) is dict
         for key in response:

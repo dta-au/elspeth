@@ -26,7 +26,7 @@ from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope, replay_composer_control_message
 from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import SchemaViolation, SchemaViolationCode, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import (
     ComposerAvailability,
@@ -171,7 +171,8 @@ def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn() -> None:
+@pytest.mark.parametrize("different_errors", [False, True])
+async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn(different_errors: bool) -> None:
     """The hint must reach the model BEFORE the next LLM call, not after.
 
     Drive 3 turns where the LLM issues the same set_metadata call with the
@@ -199,17 +200,30 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
     ]
     scripted = _ScriptedCompletion(turns)
 
-    arg_error = ToolArgumentError(argument="patch", expected="non-anchored payload", actual_type="dict")
+    categories = (SchemaViolationCode.MISSING, SchemaViolationCode.INVALID_TYPE, SchemaViolationCode.OUT_OF_BOUNDS)
+    errors = [
+        ToolArgumentError(
+            argument="patch",
+            expected="non-anchored payload",
+            actual_type="dict",
+            schema_violations=(SchemaViolation(loc=("patch",), code=code),),
+        )
+        for code in (categories if different_errors else (categories[0],) * 3)
+    ]
+    events = []
+
+    async def capture_progress(event):
+        events.append(event)
 
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
-            side_effect=[arg_error, arg_error, arg_error],
+            side_effect=errors,
         ),
     ):
         mock_llm.side_effect = scripted.respond
-        result = await service.compose("Build something", [], state, session_id=session_id)
+        result = await service.compose("Build something", [], state, session_id=session_id, progress=capture_progress)
 
     # The fourth LLM call is the post-hint LLM call. Inspect its messages
     # argument and find the system-injected hint.
@@ -230,6 +244,12 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
     hint_text = hint_messages[0]["content"]
     assert "set_metadata" in hint_text, "hint should name the anchored tool"
     assert "byte-identical" in hint_text or "identical" in hint_text
+    assert "same error" not in hint_text
+    assert "will keep failing" not in hint_text
+    retry_event = next(event for event in events if event.headline == "ELSPETH detected a no-progress retry pattern.")
+    assert retry_event.evidence[0] == "The last 3 tool calls used identical arguments and failed."
+    reported = [json.loads(invocation.result_canonical)["validation_errors"][0]["type"] for invocation in result.tool_invocations]
+    assert reported == [code.value for code in (categories if different_errors else (categories[0],) * 3)]
 
 
 @pytest.mark.asyncio

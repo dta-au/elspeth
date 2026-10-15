@@ -1295,12 +1295,14 @@ sources:
     plugin: csv
     on_success: inbound
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
   refunds:
     plugin: csv
     on_success: inbound
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
 queues:

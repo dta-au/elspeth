@@ -140,6 +140,121 @@ async def _admit(app, service, authority, *, operation_id: str, deadline_seconds
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_turn_caller", (False, True))
+async def test_worker_retains_late_original_cause_after_durable_call_cohort(tmp_path, monkeypatch: pytest.MonkeyPatch, cancel_turn_caller):
+    import json
+    from dataclasses import replace
+    from uuid import UUID
+
+    from elspeth.contracts.errors import ComposerOwnedSettlementFailure
+    from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+    from elspeth.web.sessions import composer_turn
+    from elspeth.web.sessions.routes._helpers import _persist_turn_audit_cohort
+    from tests.unit.web.sessions.test_freeform_route_custody import _ActualCustodyGate
+
+    app, service, engine, composer = _file_app(tmp_path)
+    authority = ComposerAsyncOperationAuthority(
+        engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
+    )
+    actual_compose = composer.compose
+    captured = []
+    turn_tasks = []
+    actual_capture = worker_module.capture_failure_facts
+    original_failure = RuntimeError("B7_LATE_ORIGINAL_CANARY")
+    caller_marker = "B7_CALLER_CANCEL_CANARY"
+    gate = _ActualCustodyGate(asyncio.get_running_loop())
+    worker = _worker(app, authority)
+    app.state.composer_async_worker = worker
+    gate.install(app, service, engine, monkeypatch, "projection")
+
+    async def compose(*args, **kwargs):
+        # This existing composer fake returns one synthetic audited call. Settle
+        # it once before the actual post-provider transaction can fail.
+        turn_tasks.append(asyncio.current_task())
+        result = await actual_compose(*args, **kwargs)
+        await _persist_turn_audit_cohort(
+            service,
+            UUID(kwargs["session_id"]),
+            (),
+            result.llm_calls,
+            tool_composition_state_id=None,
+            llm_composition_state_id=None,
+            plugin_crash_pending=False,
+            required_audit=True,
+            required_work=kwargs["required_work"].coordinator,
+            session_operation_context=kwargs["session_operation_context"],
+        )
+        return replace(result, llm_calls=())
+
+    def fail_projection(*args, **kwargs):
+        gate.park_sql()
+        raise original_failure
+
+    def capture(root):
+        captured.append(root)
+        return actual_capture(root)
+
+    monkeypatch.setattr(composer, "compose", compose)
+    monkeypatch.setattr(composer_turn, "_message_with_state_response", fail_projection)
+    monkeypatch.setattr(worker_module, "capture_failure_facts", capture)
+    drive = None
+    try:
+        record = await _admit(app, service, authority, operation_id=str(uuid4()))
+        drive = asyncio.create_task(worker.run_until_idle())
+        await asyncio.wait_for(gate.entered.wait(), timeout=10)
+        if cancel_turn_caller:
+            assert turn_tasks[0] is gate.owners[0], "Composer runs inline in the actual operation/turn caller"
+            turn_tasks[0].cancel(caller_marker)
+            await asyncio.sleep(0)
+        assert not drive.done()
+        gate.release.set()
+        await asyncio.wait_for(drive, timeout=10)
+        terminal = authority.get(session_id=record.session_id, operation_id=record.operation_id)
+        assert terminal.status == "failed" and terminal.failure_code == "operation_failed"
+        assert composer.calls == 1
+        assert len(captured) == 1
+        originals = []
+        pending = captured.copy()
+        while pending:
+            root = pending.pop()
+            if any(root is earlier for earlier in originals):
+                continue
+            originals.append(root)
+            if isinstance(root, BaseExceptionGroup):
+                pending.extend(root.exceptions)
+            if root.__cause__ is not None:
+                pending.append(root.__cause__)
+            if root.__context__ is not None:
+                pending.append(root.__context__)
+        assert any(root is original_failure for root in originals)
+        assert any(isinstance(root, asyncio.CancelledError) and root.args == (caller_marker,) for root in originals) is cancel_turn_caller
+        (owned_primary,) = [root for root in originals if type(root) is ComposerOwnedSettlementFailure]
+        if cancel_turn_caller:
+            assert isinstance(owned_primary.__cause__, BaseExceptionGroup)
+            original_cause, joined_cancellation = owned_primary.__cause__.exceptions
+            assert original_cause is original_failure
+            assert joined_cancellation in originals and joined_cancellation.args == (caller_marker,)
+        else:
+            assert owned_primary.__cause__ is original_failure
+        rows = await service.get_messages(record.session_id, limit=None)
+        calls = [item for row in rows for item in row.tool_calls or () if item.get("_kind") == "llm_call_audit"]
+        assert len(calls) == 1
+        private = [item for row in rows for item in row.tool_calls or () if item.get("_kind") == "composer_diagnostic_evidence"]
+        evidence = [ComposerDiagnosticEvidence.from_envelope(item, expected_session_id=str(record.session_id)) for item in private]
+        (failure_evidence,) = [item for item in evidence if item.status == "operation_failure"]
+        selected = ComposerOperationError.model_validate_json(terminal.result_json, strict=True)
+        assert json.loads(failure_evidence.arguments.content)["diagnostic_id"] == selected.diagnostic_id
+        assert "B7_LATE_ORIGINAL_CANARY" in failure_evidence.result.content
+        assert (caller_marker in failure_evidence.result.content) is cancel_turn_caller
+        assert "B7_LATE_ORIGINAL_CANARY" not in terminal.result_json and caller_marker not in terminal.result_json
+    finally:
+        gate.release.set()
+        if drive is not None and not drive.done():
+            await asyncio.wait_for(drive, timeout=10)
+        engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_worker_completes_admitted_job_with_one_provider_call(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     from elspeth.web.sessions import composer_async_worker as worker_module
 
@@ -261,9 +376,7 @@ async def test_running_deadline_keeps_truthful_durable_detail(tmp_path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("deadline_source", ["timeout", "watcher"])
-async def test_owned_running_timeout_keeps_deadline_when_sqlite_clock_precedes_fractional_deadline(
-    tmp_path, monkeypatch, deadline_source
-) -> None:
+async def test_owned_running_timeout_classifies_retained_preexpiry_sql_snapshot(tmp_path, monkeypatch, deadline_source) -> None:
     app, service, engine, _composer = _file_app(tmp_path)
     canonical_snapshot_factory = app.state.plugin_snapshot_factory
     authority = ComposerAsyncOperationAuthority(
@@ -272,138 +385,160 @@ async def test_owned_running_timeout_keeps_deadline_when_sqlite_clock_precedes_f
     active_task = None
     active_held = None
     try:
-        # SQLite reports whole seconds. Begin each bounded attempt just after
-        # its real clock advances so the event-loop budget can expire while
-        # its next read still precedes the admitted fractional deadline.
-        for _attempt in range(3):
+        # Keep the original real-clock setup. A retained pre-await SQL snapshot
+        # controls classification independently of the actual later cancellation
+        # and settlement clocks; it never enters live terminal settlement.
+        with engine.connect() as conn:
+            previous = database_now(conn)
+        for _poll in range(150):
+            await asyncio.sleep(0.01)
             with engine.connect() as conn:
-                previous = database_now(conn)
-            for _poll in range(150):
-                await asyncio.sleep(0.01)
-                with engine.connect() as conn:
-                    current_time = database_now(conn)
-                if current_time > previous:
-                    break
-            else:
-                raise AssertionError("SQLite clock did not advance during bounded deadline setup")
-            held = _HeldComposer()
-            active_held = held
-            app.state.composer_service = held
-            record = await _admit(app, service, authority, operation_id=str(uuid4()), deadline_seconds=2.1)
-            app.state.plugin_snapshot_factory = canonical_snapshot_factory
-            worker = _worker(app, authority)
-            selections = []
-            owned_timeouts = []
-            watcher_deadlines = []
-            post_read_remaining = []
-            original_select = worker._failure_for
-            original_owned_failure = worker_module._owned_deadline_failure
-            original_watch = worker._watch
-            original_read = worker_module.ComposerOperationWatchReader.read
-            original_cadence = worker_module.ComposerOperationWatchReader.wait_watch_cadence
-            original_timeout = asyncio.timeout
-            admitted_operation_id = record.operation_id
+                current_time = database_now(conn)
+            if current_time > previous:
+                break
+        else:
+            raise AssertionError("SQLite clock did not advance during bounded deadline setup")
+        held = _HeldComposer()
+        active_held = held
+        app.state.composer_service = held
+        record = await _admit(app, service, authority, operation_id=str(uuid4()), deadline_seconds=2.1)
+        app.state.plugin_snapshot_factory = canonical_snapshot_factory
+        worker = _worker(app, authority)
+        selections = []
+        early_snapshots = []
+        body_cancellations = []
+        body_cancel_clocks = []
+        handoff_clocks = []
+        owned_timeouts = []
+        watcher_deadlines = []
+        post_read_remaining = []
+        original_select = worker._failure_for
+        original_owned_failure = worker_module._owned_deadline_failure
+        original_watch = worker._watch
+        original_read = worker_module.ComposerOperationWatchReader.read
+        original_cadence = worker_module.ComposerOperationWatchReader.wait_watch_cadence
+        original_timeout = asyncio.timeout
+        original_compose = held.compose
+        admitted_operation_id = record.operation_id
 
-            def observe_selection(
-                current, now, exc, *, _operation_id=record.operation_id, _selections=selections, _original_select=original_select, **kwargs
-            ):
-                if current.operation_id == _operation_id:
-                    _selections.append((now, exc))
-                return _original_select(current, now, exc, **kwargs)
+        async def observe_body_cancellation(*args, **kwargs):
+            early_snapshots.append(authority.get_with_database_now(session_id=record.session_id, operation_id=record.operation_id))
+            try:
+                return await original_compose(*args, **kwargs)
+            except asyncio.CancelledError as original:
+                body_cancellations.append(original)
+                body_cancel_clocks.append(
+                    authority.get_with_database_now(session_id=record.session_id, operation_id=record.operation_id)[1]
+                )
+                raise
 
-            def observe_owned_failure(
-                original,
-                *,
-                timeout_scope,
-                record,
-                anchor,
-                _operation_id=admitted_operation_id,
-                _owned_timeouts=owned_timeouts,
-                _original_owned_failure=original_owned_failure,
-            ):
-                if record.operation_id == _operation_id:
-                    _owned_timeouts.append((timeout_scope, original))
-                return _original_owned_failure(original, timeout_scope=timeout_scope, record=record, anchor=anchor)
+        def observe_selection(current, now, exc, **kwargs):
+            if current.operation_id == admitted_operation_id:
+                selections.append((now, exc))
+            return original_select(current, now, exc, **kwargs)
 
-            async def observe_watch(*args, _original_watch=original_watch, _watcher_deadlines=watcher_deadlines, **kwargs):
-                try:
-                    return await _original_watch(*args, **kwargs)
-                except ComposerTurnDeadlineExpired as watcher_failure:
-                    _watcher_deadlines.append(watcher_failure)
-                    raise
+        def observe_owned_failure(original, *, timeout_scope, record, anchor):
+            converted = original_owned_failure(original, timeout_scope=timeout_scope, record=record, anchor=anchor)
+            if record.operation_id == admitted_operation_id:
+                owned_timeouts.append((timeout_scope, original))
+                handoff_clocks.append(authority.get_with_database_now(session_id=record.session_id, operation_id=record.operation_id)[1])
+            return converted
 
-            async def wait_for_owned_timeout(reader, _original_cadence=original_cadence):
-                # Keep the real cadence's private-cleanup provenance while
-                # letting the owned timeout win this independent control.
-                while True:
-                    await _original_cadence(reader)
+        async def observe_watch(*args, **kwargs):
+            try:
+                return await original_watch(*args, **kwargs)
+            except ComposerTurnDeadlineExpired as watcher_failure:
+                watcher_deadlines.append(watcher_failure)
+                raise
 
-            async def resume_read_after_deadline(reader, _original_read=original_read, _post_read_remaining=post_read_remaining):
-                current, now = await _original_read(reader)
-                remaining = reader.anchor.remaining_seconds(monotonic_now=worker_module.time.monotonic())
-                assert remaining > 0
-                _post_read_remaining.append(remaining)
-                # Retain the actual SQL result across a scheduling delay. This
-                # selects the post-read expiry branch, rather than the reader's
-                # separate pre-submission cutoff.
-                await asyncio.sleep(remaining + 0.02)
-                return current, now
+        async def wait_for_owned_timeout(reader):
+            # Retain the existing real cadence/private-cleanup provenance while
+            # letting owned timeout win this independent control.
+            while True:
+                await original_cadence(reader)
 
-            def later_owned_timeout(delay, _original_timeout=original_timeout):
-                return _original_timeout(None if delay is None else delay + 2.0)
+        async def resume_read_after_deadline(reader):
+            current, now = await original_read(reader)
+            remaining = reader.anchor.remaining_seconds(monotonic_now=worker_module.time.monotonic())
+            assert remaining > 0
+            post_read_remaining.append(remaining)
+            # The existing watcher control retains its actual SQL result across
+            # scheduling delay to exercise post-read expiry, not submission cutoff.
+            await asyncio.sleep(remaining + 0.02)
+            return current, now
 
-            with monkeypatch.context() as patcher:
-                patcher.setattr(worker, "_failure_for", observe_selection)
-                patcher.setattr(worker_module, "_owned_deadline_failure", observe_owned_failure)
-                patcher.setattr(worker, "_watch", observe_watch)
-                if deadline_source == "timeout":
-                    patcher.setattr(worker_module.ComposerOperationWatchReader, "wait_watch_cadence", wait_for_owned_timeout)
-                else:
-                    patcher.setattr(worker_module.ComposerOperationWatchReader, "read", resume_read_after_deadline)
-                    patcher.setattr(asyncio, "timeout", later_owned_timeout)
-                active_task = asyncio.create_task(worker.run_until_idle())
-                await asyncio.wait_for(held.entered.wait(), timeout=5)
-                coordinator = worker._required_coordinators[(record.session_id, record.operation_id)]
-                await asyncio.wait_for(active_task, timeout=8)
-            terminal = authority.get(session_id=record.session_id, operation_id=record.operation_id)
-            assert terminal is not None and terminal.status == "failed"
-            assert held.dispatches == 1 and not worker._jobs
-            assert len(selections) == 1
-            observed_now, failure = selections[0]
-            if observed_now >= record.deadline_at:
-                assert terminal.failure_code == "deadline_expired"
-                continue
-            deadlines = tuple(leaf for leaf in required_failure_leaves(failure) if isinstance(leaf, ComposerTurnDeadlineExpired))
-            assert len(deadlines) == 1, tuple(required_failure_leaves(failure))
-            assert len(owned_timeouts) == 1
-            actual_scope, scoped_original = owned_timeouts[0]
-            assert actual_scope is not None
-            turn_tickets = tuple(
-                ticket for ticket in coordinator.tickets if ticket.key.source is RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER
-            )
-            assert len(turn_tickets) == 1 and turn_tickets[0].complete
-            assert any(error is scoped_original for error in turn_tickets[0].errors)
+        def later_owned_timeout(delay):
+            return original_timeout(None if delay is None else delay + 2.0)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(held, "compose", observe_body_cancellation)
+            patcher.setattr(worker, "_failure_for", observe_selection)
+            patcher.setattr(worker_module, "_owned_deadline_failure", observe_owned_failure)
+            patcher.setattr(worker, "_watch", observe_watch)
             if deadline_source == "timeout":
-                original_timeout_error = deadlines[0].__cause__
-                assert type(original_timeout_error) is TimeoutError
-                assert actual_scope.expired() is True
-                assert scoped_original is original_timeout_error
-                assert not watcher_deadlines and not post_read_remaining
+                patcher.setattr(worker_module.ComposerOperationWatchReader, "wait_watch_cadence", wait_for_owned_timeout)
             else:
-                assert actual_scope.expired() is False
-                assert isinstance(scoped_original, asyncio.CancelledError)
-                assert len(watcher_deadlines) == 1 and deadlines[0] is watcher_deadlines[0]
-                assert len(post_read_remaining) == 1 and post_read_remaining[0] > 0
-                assert deadlines[0].session_id == record.session_id
-                assert deadlines[0].operation_id == record.operation_id
-                assert deadlines[0].remaining_seconds <= 0
-                assert deadlines[0].budget_seconds_at_running > 0
-            assert terminal.failure_code == "deadline_expired"
-            assert terminal.result_json is not None
-            error = ComposerOperationError.model_validate_json(terminal.result_json, strict=True)
-            assert error.http_status == 504 and error.error_type == "composer_operation_deadline_expired"
-            return
-        raise AssertionError("No owned timeout crossed the real SQLite fractional deadline boundary in three attempts")
+                patcher.setattr(worker_module.ComposerOperationWatchReader, "read", resume_read_after_deadline)
+                patcher.setattr(asyncio, "timeout", later_owned_timeout)
+            active_task = asyncio.create_task(worker.run_until_idle())
+            await asyncio.wait_for(held.entered.wait(), timeout=5)
+            coordinator = worker._required_coordinators[(record.session_id, record.operation_id)]
+            await asyncio.wait_for(active_task, timeout=8)
+        terminal = authority.get(session_id=record.session_id, operation_id=record.operation_id)
+        assert terminal is not None and terminal.status == "failed"
+        assert held.dispatches == 1 and not worker._jobs
+        assert len(selections) == len(early_snapshots) == len(body_cancellations) == len(body_cancel_clocks) == len(handoff_clocks) == 1
+        observed_now, failure = selections[0]
+        early_current, early_now = early_snapshots[0]
+        assert early_current is not None and early_current.status == "running"
+        print(
+            "deadline_control_clocks",
+            deadline_source,
+            early_now.isoformat(),
+            record.deadline_at.isoformat(),
+            body_cancel_clocks[0].isoformat(),
+            handoff_clocks[0].isoformat(),
+            observed_now.isoformat(),
+        )
+        assert early_now < record.deadline_at
+        assert early_now <= body_cancel_clocks[0] <= handoff_clocks[0] <= observed_now
+        deadlines = tuple(leaf for leaf in required_failure_leaves(failure) if isinstance(leaf, ComposerTurnDeadlineExpired))
+        assert len(deadlines) == 1, tuple(required_failure_leaves(failure))
+        assert len(owned_timeouts) == 1
+        actual_scope, scoped_original = owned_timeouts[0]
+        assert actual_scope is not None
+        turn_tickets = tuple(
+            ticket for ticket in coordinator.tickets if ticket.key.source is RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER
+        )
+        assert len(turn_tickets) == 1 and turn_tickets[0].complete
+        assert any(error is scoped_original for error in turn_tickets[0].errors)
+        if deadline_source == "timeout":
+            original_timeout_error = deadlines[0].__cause__
+            assert type(original_timeout_error) is TimeoutError
+            assert actual_scope.expired() is True
+            assert scoped_original is original_timeout_error
+            assert original_timeout_error.__cause__ is body_cancellations[0]
+            assert not watcher_deadlines and not post_read_remaining
+        else:
+            assert actual_scope.expired() is False
+            assert isinstance(scoped_original, asyncio.CancelledError)
+            assert scoped_original is body_cancellations[0]
+            assert len(watcher_deadlines) == 1 and deadlines[0] is watcher_deadlines[0]
+            assert len(post_read_remaining) == 1 and post_read_remaining[0] > 0
+            assert deadlines[0].session_id == record.session_id
+            assert deadlines[0].operation_id == record.operation_id
+            assert deadlines[0].remaining_seconds <= 0
+            assert deadlines[0].budget_seconds_at_running > 0
+        # Exercise retained-preexpiry-snapshot classification independently after
+        # physical cleanup, with actual joined failure objects. This is not a
+        # fresh SQL sample at cancellation; no live coordinator is altered.
+        assert (record.session_id, record.operation_id) not in worker._required_coordinators
+        assert original_select(early_current, early_now, failure).failure_code == "deadline_expired"
+        assert original_select(early_current, early_now, scoped_original).failure_code != "deadline_expired"
+        assert terminal.failure_code == "deadline_expired"
+        assert terminal.result_json is not None
+        error = ComposerOperationError.model_validate_json(terminal.result_json, strict=True)
+        assert error.http_status == 504 and error.error_type == "composer_operation_deadline_expired"
     finally:
         if active_task is not None and not active_task.done():
             assert active_held is not None

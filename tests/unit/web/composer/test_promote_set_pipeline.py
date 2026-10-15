@@ -196,7 +196,7 @@ def _minimal_valid_args() -> dict[str, Any]:
     the handler skips per-output validation paths.
     """
     return {
-        "source": {"plugin": "text", "on_success": "rows"},
+        "source": {"plugin": "text", "on_success": "rows", "on_validation_failure": "discard"},
         "nodes": [],
         "edges": [],
         "outputs": [],
@@ -1105,6 +1105,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                     "plugin": "llm",
                     "input": "rows",
                     "on_success": "out",
+                    "on_error": "discard",
                     "options": {
                         "provider": "openrouter",
                         "model": "anthropic/claude-haiku-4.5",
@@ -1253,6 +1254,7 @@ def test_redaction_substitutes_source_options_via_summarizer() -> None:
             "plugin": "csv",
             "on_success": "rows",
             "options": {"path": _CANARY_PATH, "blob_ref": "abc123"},
+            "on_validation_failure": "discard",
         },
         "nodes": [],
         "edges": [],
@@ -1279,6 +1281,7 @@ def test_redaction_substitutes_inline_blob_content_via_summarizer() -> None:
         "source": {
             "plugin": "text",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "inline_blob": {
                 "filename": "input.txt",
                 "mime_type": "text/plain",
@@ -1328,7 +1331,7 @@ def test_redaction_substitutes_nested_node_and_output_dicts() -> None:
     # value-bearing leaf.  Putting it on ``count`` would require an int
     # canary; ``condition`` keeps the canary as a string.
     args = {
-        "source": {"plugin": "csv", "on_success": "rows"},
+        "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
         "nodes": [
             {
                 "id": "n1",
@@ -1345,6 +1348,7 @@ def test_redaction_substitutes_nested_node_and_output_dicts() -> None:
                 "sink_name": "main",
                 "plugin": "csv",
                 "options": {"path": _CANARY_OUTPUT_OPT},
+                "on_write_failure": "discard",
             }
         ],
     }
@@ -1378,6 +1382,7 @@ def test_redaction_redacts_sensitive_set_pipeline_option_values_inside_summaries
         "source": {
             "plugin": "csv",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": {
                 "path": _CANARY_PATH,
                 "dsn": _CANARY_SOURCE_DSN,
@@ -1406,6 +1411,7 @@ def test_redaction_redacts_sensitive_set_pipeline_option_values_inside_summaries
                     "path": _CANARY_OUTPUT_OPT,
                     "credential": _CANARY_OUTPUT_CREDENTIAL,
                 },
+                "on_write_failure": "discard",
             }
         ],
     }
@@ -1570,6 +1576,7 @@ def _valid_args_with_queue(queue_override: dict[str, Any] | None = None) -> dict
         "source": {
             "plugin": "csv",
             "on_success": "inbound",
+            "on_validation_failure": "discard",
             "options": {"path": "in.csv", "schema": {"mode": "observed"}},
         },
         "nodes": [queue],
@@ -1646,6 +1653,7 @@ def _valid_args_with_row_union(override: dict[str, Any] | None = None) -> dict[s
         "source": {
             "plugin": "csv",
             "on_success": "control_done",
+            "on_validation_failure": "discard",
             "options": {"path": "in.csv", "schema": {"mode": "observed"}},
         },
         "nodes": [node],
@@ -1752,6 +1760,7 @@ class TestSetPipelineRowUnion:
             "source": {
                 "plugin": "csv",
                 "on_success": "rows",
+                "on_validation_failure": "discard",
                 "options": {"path": "in.csv", "schema": {"mode": "observed"}},
             },
             "nodes": [node],

@@ -389,6 +389,7 @@ async function provePermanentRefusalReload(reason: "admission_refused" | "accoun
   vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...durableCompleted(operationId), status: "failed", result: null, error: { http_status: 422, failure_code: "http_error", error_type: "composer_admission_refused", diagnostic_id: null, body: { error_type: "composer_admission_refused", failure_code: code, detail: "Admission permanently refused." } } });
   await useSessionStore.getState().selectSession(durableSession);
   await vi.waitFor(() => expect(useSessionStore.getState().messages[0].local_failure_code).toBe(code));
+  expect(useSessionStore.getState().composerFailureOutcomes[0].failure_code).toBe("http_error");
   await useSessionStore.getState().retryMessage(durableUserId);
   expect(api.submitComposerOperation).not.toHaveBeenCalled();
   expect(api.recompose).not.toHaveBeenCalled();
@@ -537,6 +538,7 @@ describe("sessionStore", () => {
       expect(api.fetchCompositionState).toHaveBeenCalled();
       const failed = useSessionStore.getState().messages[0];
       expect(failed.local_failure_code).toBe("admission_refused");
+      expect(useSessionStore.getState().composerFailureOutcomes[0].failure_code).toBe("http_error");
       await useSessionStore.getState().retryMessage(failed.id);
       expect(api.sendMessage).toHaveBeenCalledTimes(1);
     });
@@ -604,6 +606,7 @@ describe("sessionStore", () => {
       await useSessionStore.getState().retryMessage(user.id);
       expect(useSessionStore.getState().compositionProposals[0].status).toBe("pending");
       expect(useSessionStore.getState().messages[0].local_status).toBe("failed");
+      expect(useSessionStore.getState().messages[0].local_failure_code).toBe("recompose_saved_proposal");
       await useSessionStore.getState().retryMessage(user.id);
       expect(api.recompose).toHaveBeenCalledTimes(1);
       expect(api.sendMessage).not.toHaveBeenCalled();
@@ -1357,6 +1360,7 @@ describe("sessionStore", () => {
       expect(state.isComposing).toBe(false);
       expect(state.messages[0].local_status).toBe("failed");
       expect(state.messages[0].local_failure_code).toBe("policy_blocked");
+      expect(state.composerFailureOutcomes[0].failure_code).toBe("http_error");
     });
 
     it("leaves local_failure_code unset when the send failure carries no failure_code (S1)", async () => {
@@ -1372,6 +1376,7 @@ describe("sessionStore", () => {
       const state = useSessionStore.getState();
       expect(state.messages[0].local_status).toBe("failed");
       expect(state.messages[0].local_failure_code).toBeUndefined();
+      expect(state.composerFailureOutcomes[0].failure_code).toBe("http_error");
     });
 
     it("renders the honest audit-integrity banner and keeps the saved user row un-failed (F-4b)", async () => {
@@ -2422,12 +2427,18 @@ describe("sessionStore", () => {
         });
 
         const send = useSessionStore.getState().sendMessage("hello");
-        await vi.waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
-        // A receipt from another authenticated observer may arrive while
-        // this terminal hydration is delayed. Local acceptance remains gated.
         if (decision === "accept") {
+          expect(useSessionStore.getState().isComposing).toBe(true);
           await useSessionStore.getState().acceptProposal(pending.id);
           expect(api.acceptCompositionProposal).not.toHaveBeenCalled();
+        }
+        await vi.waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
+        // The durable terminal has settled; optional hydration cannot prolong
+        // composing custody or prevent an explicit proposal acceptance.
+        expect(useSessionStore.getState().isComposing).toBe(false);
+        if (decision === "accept") {
+          await useSessionStore.getState().acceptProposal(pending.id);
+          expect(api.acceptCompositionProposal).toHaveBeenCalledTimes(1);
         }
         useSessionStore.setState({ compositionProposals: [receipt], compositionState: makeCompositionState(2) });
         expect(useSessionStore.getState().compositionProposals[0].status).toBe(receipt.status);
@@ -3170,7 +3181,7 @@ describe("sessionStore", () => {
         retryDeferred.promise,
       );
       const retriedMessage: ChatMessage = {
-        id: "a-user",
+        id: "30000000-0000-4000-8000-000000000008",
         session_id: "20000000-0000-4000-8000-000000000008",
         role: "user",
         content: "retry this",
@@ -3180,12 +3191,12 @@ describe("sessionStore", () => {
       useSessionStore.setState({
         activeSessionId: "20000000-0000-4000-8000-000000000008",
         messages: [retriedMessage],
-        compositionState: makeCompositionState(1, ["a-start"]),
+        compositionState: { ...makeCompositionState(1, ["a-start"]), session_id: retriedMessage.session_id },
       });
       const retryPromise = useSessionStore
         .getState()
-        .retryMessage("a-user");
-      await Promise.resolve();
+        .retryMessage(retriedMessage.id);
+      await vi.waitFor(() => expect(mockRecompose).toHaveBeenCalledTimes(1));
 
       const currentMessage: ChatMessage = {
         id: "b-message",
@@ -3195,7 +3206,7 @@ describe("sessionStore", () => {
         tool_calls: null,
         created_at: "2026-05-14T00:00:00Z",
       };
-      const currentState = makeCompositionState(20, ["b-node"]);
+      const currentState = { ...makeCompositionState(20, ["b-node"]), session_id: currentMessage.session_id };
       useSessionStore.setState({
         activeSessionId: "20000000-0000-4000-8000-000000000009",
         messages: [currentMessage],
@@ -3208,14 +3219,14 @@ describe("sessionStore", () => {
 
       retryDeferred.resolve({
         message: {
-          id: "a-assistant",
+          id: "40000000-0000-4000-8000-000000000008",
           session_id: "20000000-0000-4000-8000-000000000008",
           role: "assistant",
           content: "stale retry response",
           tool_calls: null,
           created_at: "2026-05-14T00:00:01Z",
         },
-        state: makeCompositionState(2, ["a-node"]),
+        state: { ...makeCompositionState(2, ["a-node"]), session_id: retriedMessage.session_id },
         proposals: [
           makeCompositionProposal({ id: "proposal-a", session_id: "20000000-0000-4000-8000-000000000008" }),
         ],

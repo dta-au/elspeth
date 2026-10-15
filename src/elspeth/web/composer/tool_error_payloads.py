@@ -74,6 +74,21 @@ def arg_error_payload(exc: ToolArgumentError, tool_name: str) -> Mapping[str, An
         payload["repair_instruction"] = (
             f"Inline llm_draft must contain {minimum} to {maximum} characters. "
             "Omit llm_draft to use the exact staged draft. If there is no staged draft, "
-            "ask the user for a shorter review draft. Keep the existing document and pipeline content unchanged."
+            "ask the user for a nonempty review draft within these bounds. Keep the existing document and pipeline content unchanged."
+        )
+    elif tool_name == "set_pipeline" and any(
+        violation.loc
+        in {
+            ("source", "on_validation_failure"),
+            ("sources", "item", "on_validation_failure"),
+            ("outputs", "index", "on_write_failure"),
+        }
+        and violation.code in (SchemaViolationCode.MISSING, SchemaViolationCode.INVALID_TYPE, SchemaViolationCode.OUT_OF_BOUNDS)
+        for violation in exc.schema_violations
+    ):
+        payload["repair_instruction"] = (
+            "Supply an explicit non-empty failure choice in the reported field. 'discard' intentionally drops failed rows "
+            "with an audit record; a named route must satisfy the existing routing and policy checks. "
+            "Full replacement does not reuse prior choices. Null and empty values are not choices."
         )
     return payload

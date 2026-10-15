@@ -250,6 +250,7 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
             {
                 "blob_id": "__missing__",
                 "on_success": "out",
+                "on_validation_failure": "discard",
             },
             _empty_state(),
             ToolContext(
@@ -300,6 +301,7 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
                 {
                     "blob_id": blob_id,
                     "on_success": "out",
+                    "on_validation_failure": "discard",
                     "options": {"column": "text", "schema": {"mode": "observed"}},
                 },
                 _empty_state(),
@@ -308,11 +310,8 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
         assert bind_result.success is True
         assert bind_result.updated_state.sources["source"].on_success == "out"
 
-    def test_empty_on_validation_failure_canonicalizes_to_discard(self, tmp_path: Path) -> None:
-        """elspeth-bcd7051143: this seam used to preserve "" (``is not None``)
-        while set_pipeline coerced it — an accepted-then-wedged divergence.
-        Every seam now routes through the shared canonicalizer: "" names no
-        route (sink names are non-empty), so it persists as 'discard'."""
+    def test_empty_on_validation_failure_is_rejected_without_binding(self, tmp_path: Path) -> None:
+        """An empty failure choice cannot select discard or bind a source."""
         user_message_content = "Use this exact text:\nhello"
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
         catalog = _mock_catalog()
@@ -346,8 +345,9 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
                 _empty_state(),
                 ctx,
             )
-        assert bind_result.success is True
-        assert bind_result.updated_state.sources["source"].on_validation_failure == "discard"
+        assert bind_result.success is False
+        assert not bind_result.updated_state.sources
+        assert bind_result.validation.errors[0].error_code == "failure_route_required"
 
     def test_omitted_options_validates_at_model_layer(self) -> None:
         """``options`` is optional at the model layer (default ``{}``).
@@ -411,6 +411,7 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
                     "blob_id": create_result.data["blob_id"],
                     "on_success": "out",
                     "options": {"column": "text", "schema": {"mode": "observed"}},
+                    "on_validation_failure": "discard",
                 },
                 _empty_state(),
                 ctx,
@@ -565,6 +566,7 @@ class TestSetSourceFromBlobTsvDelimiter:
                     "blob_id": create_result.data["blob_id"],
                     "on_success": "out",
                     "options": options if options is not None else {"schema": {"mode": "observed"}},
+                    "on_validation_failure": "discard",
                 },
                 _empty_state(),
                 ctx,
@@ -666,6 +668,7 @@ class TestSetSourceFromBlobDerivedGuarantees:
                     "blob_id": create_result.data["blob_id"],
                     "on_success": "out",
                     "options": options if options is not None else {"schema": {"mode": "observed"}},
+                    "on_validation_failure": "discard",
                 },
                 _empty_state(),
                 ctx,
@@ -971,6 +974,7 @@ class TestSetSourceFromBlobDerivedGuarantees:
                 "blob_id": str(record.id),
                 "on_success": "out",
                 "options": {"schema": {"mode": "observed"}, "encoding": "latin-1"},
+                "on_validation_failure": "discard",
             },
             _empty_state(),
             ctx,
@@ -1027,6 +1031,7 @@ class TestEchoedServerOwnedMetadata:
                 "blob_id": create.data["blob_id"],
                 "on_success": "rows",
                 "options": {"schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
             },
             _empty_state(),
             ctx,
@@ -1198,7 +1203,9 @@ class TestEchoedServerOwnedMetadata:
         state, _resolved_options = self._resolved_state(state, options)
         caller_options = {"schema": {"mode": "observed"}, **({"column": "line"} if "plugin" in change else {})}
         result = _execute_set_source_from_blob(
-            {"blob_id": options["blob_ref"], "on_success": "rows", "options": caller_options, **change}, state, ctx
+            {"blob_id": options["blob_ref"], "on_success": "rows", "on_validation_failure": "discard", "options": caller_options, **change},
+            state,
+            ctx,
         )
         assert result.success, result.data
         target = "other" if "source_name" in change else "source"

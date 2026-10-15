@@ -4,6 +4,83 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.6 - Candidate (Composer correctness and recovery)
+
+- **Dependent queries can run in one LLM node.** `query_input_mode: ordered`
+  lets explicitly bound later queries read earlier validated outputs. It
+  requires uniquely named list-form queries and `pool_size: 1`; each query
+  still makes a provider call. Recovery remains at the node boundary and can
+  repeat earlier calls. See [ordered LLM queries](docs/guides/ordered-llm-queries.md).
+- **Failure-route visibility is local presentation.** The graph's quarantine
+  and discard toggle filters the displayed routes after layout without changing
+  the authored graph, execution behavior or persisted pipeline.
+- **Final replies use the existing bounded review.** Ordinary explanations,
+  edit-completion replies, planner declines and proof-exhausted replies require
+  current candidate/evidence-bound publication admission. Unadmitted prose is
+  retained privately while trusted saved-progress and blocker text is shown.
+  Reply admission does not clear graph, pending-review or execution blockers.
+- **Saved changes and inspection evidence remain distinct.** Final review uses
+  committed-row witnesses and net authored changes, separately from the content
+  actually delivered to the reviewing provider. A saved revision count does not
+  establish that requested edits were completed; complete inspection does not
+  establish semantic equivalence.
+- **Advisor redaction preserves evidence identities.** Sensitive text is scrubbed
+  separately from server-owned graph hashes and state IDs, so phone-shaped digit
+  sequences cannot corrupt the structured review evidence.
+- **Operation outcomes survive refreshes.** Authenticated retained outcomes
+  expose bounded saved progress and safe diagnostics. Known terminal outcomes
+  appear before optional refreshes finish, including attachment to another
+  active operation, without replaying the losing submission.
+- **Blob inspection supports bounded continuation.** Pages bind to the original
+  content hash and actual returned character ranges. Response byte limits can
+  produce smaller pages; stale content identities cannot be combined into one
+  inspection. Stream completion remains bounded when the transport is writable.
+- **Diagnostics and guidance follow existing contracts.** Invalid schema-name
+  examples are checked against the actual field grammar without renaming input.
+  Fork guidance describes ordinary downstream consumers without requiring
+  coalescing. Failed-operation diagnostics retain bounded private original
+  causes atomically with the failed terminal under the existing live fence.
+- **Provider failures retain their actual disposition.** Failed advisor requests
+  report review unavailability; malformed-response wording is reserved for an
+  observed unusable response. Nonretryable failures stop automatic re-review
+  within that operation without consuming unused passes. A later user request
+  can retry after configuration changes.
+- **Planner repairs retain safe diagnostic facts.** Argument failures include
+  bounded schema categories, canonical locations and missing required fields,
+  without echoing rejected values. Repeated coarse error codes no longer stop
+  successive repairs to different authored candidates; an unchanged candidate
+  with the same failure remains subject to the repeat guard and existing budgets.
+- **FieldMapper labels remain data through Composer admission.** Valid mapping
+  labels such as `customer_key` survive tool-wire, state, YAML import, preflight
+  and execution-envelope checks. Known-node patches use the owned current plugin
+  identity; batches that may replace it remain conservative. Actual credential
+  strings and all authoring metadata remain scanned. Private identity-bearing
+  diagnostics preserve valid mappings; context-free patch diagnostics retain
+  their existing filtering.
+- **YAML authoring and internal query chains are documented.** The
+  [YAML guide](docs/guides/yaml-authoring.md) covers control nodes, plugin families,
+  validation, execution and audit commands. The
+  [reference lookup](examples/reference_join_chain/) and
+  [ordered LLM](examples/llm_ordered_chain/) examples each demonstrate a later
+  lookup or query consuming the previous output within one node. Advisor
+  evidence labels identify redacted text, and the redaction-policy guide now
+  describes the existing label checker accurately.
+
+Session epoch advances from 75 to 76; Landscape remains at epoch 49. Committed
+graph-review facts now govern effective completion status without rewriting
+immutable graph snapshots or invalidating pending proposal bases. Older readers
+ignore these facts, so 0.8.5 and 0.8.6 cannot share session stores or replicas.
+Preserve epoch-75 stores and their compatible prior application; configure an
+explicitly new epoch-76 target for this candidate. This authorizes no migration,
+reset, restamping or downgrade. Drain and isolate old/new deployments rather
+than relying on compatibility keys to evict existing replicas automatically.
+
+These notes describe source changes. Focused checks and source review do not
+establish final exact-head or PostgreSQL qualification, live provider acceptance,
+operator signature clearance, release tagging or deployment. Automatic image
+publication from main remains held. The 0.8.6 tag and container publication follow
+successful required checks and the protected merge.
+
 ## 0.8.5 - LLM compatibility and Composer recovery
 
 - **Omitted LLM temperature uses the provider default.** Common source and

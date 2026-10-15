@@ -75,6 +75,116 @@ class TestPreviewPipelineSemanticContracts:
 
 
 class TestPreviewPipeline:
+    @pytest.mark.parametrize("destination_kind", ["transform", "gate", "sink", "coalesce", "row_union"])
+    def test_fork_destination_guidance_matches_legal_consumers(self, destination_kind: str) -> None:
+        from elspeth.web.composer.tools.generation import build_validation_guidance
+
+        leaf = NodeSpec(
+            id="left",
+            node_type="transform",
+            plugin="passthrough",
+            input="left_branch",
+            on_success="left_out",
+            on_error="discard",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        fork = replace(
+            leaf,
+            id="fanout",
+            node_type="gate",
+            plugin=None,
+            input="inbound",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="True",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=("left_branch", "right_branch"),
+        )
+        state = _empty_state().with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="inbound",
+                on_validation_failure="discard",
+                options={"path": "/data/in.csv", "schema": {"mode": "fixed", "fields": ["text: str"]}},
+            )
+        )
+        state = state.with_node(fork)
+        output_names = ("left_out", "right_out")
+        if destination_kind == "sink":
+            output_names = ("left_branch", "right_branch")
+        elif destination_kind in ("transform", "gate"):
+            for side in ("left", "right"):
+                consumer = replace(leaf, id=side, input=f"{side}_branch", on_success=f"{side}_out")
+                if destination_kind == "gate":
+                    consumer = replace(
+                        consumer,
+                        node_type="gate",
+                        plugin=None,
+                        on_success=None,
+                        on_error=None,
+                        options={},
+                        condition="True",
+                        routes={"true": f"{side}_out", "false": f"{side}_out"},
+                    )
+                state = state.with_node(consumer)
+        else:
+            output_names = ("main",)
+            state = state.with_node(
+                replace(
+                    leaf,
+                    id="rejoin",
+                    node_type=destination_kind,
+                    plugin=None,
+                    on_success="main" if destination_kind == "coalesce" else "union_out",
+                    on_error=None,
+                    options={},
+                    branches={"left_branch": "left_branch", "right_branch": "right_branch"},
+                    policy="require_all" if destination_kind == "coalesce" else None,
+                    merge="union" if destination_kind == "coalesce" else None,
+                )
+            )
+            if destination_kind == "row_union":
+                state = state.with_node(replace(leaf, id="after_union", input="union_out", on_success="main"))
+        for name in output_names:
+            state = state.with_output(
+                OutputSpec(
+                    name=name,
+                    plugin="csv",
+                    options={"path": f"outputs/{name}.csv", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        validation = state.validate()
+        assert validation.is_valid, [entry.message for entry in validation.errors]
+        if destination_kind in ("transform", "gate", "sink"):
+            assert all(node.node_type not in ("coalesce", "row_union") for node in state.nodes)
+
+        # Control the validator predicate: an unconsumed branch really fails.
+        broken = state.with_node(replace(fork, fork_to=(*fork.fork_to, "unclaimed_branch")))
+        preview = execute_tool("preview_pipeline", {}, broken, _mock_catalog())
+        assert "fork_branch_no_destination" in {entry.error_code for entry in preview.validation.errors}
+        catalogue = build_validation_guidance(entry.error_code for entry in preview.validation.errors)
+        assert catalogue is not None
+        inline = catalogue["codes"]["fork_branch_no_destination"]
+        explained = execute_tool("explain_validation_error", {"error_text": "fork_branch_no_destination"}, broken, _mock_catalog())
+        assert explained.success is True
+        assert explained.updated_state is broken
+        assert {key: explained.data[key] for key in ("explanation", "suggested_fix")} == inline
+        guidance = f"{inline['explanation']} {inline['suggested_fix']}"
+        assert "transform/gate" in guidance
+        assert "row_union" in guidance
+        assert "coalesce" in guidance
+        assert "sink" in guidance
+        assert "does not require coalesce" in guidance
+        assert "input" in inline["suggested_fix"]
+
     def test_preview_empty_pipeline(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
@@ -107,6 +217,7 @@ class TestPreviewPipeline:
                 "plugin": "passthrough",
                 "input": "t1",
                 "on_success": "main",
+                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
             r1.updated_state,
@@ -118,6 +229,7 @@ class TestPreviewPipeline:
                 "sink_name": "main",
                 "plugin": "csv",
                 "options": {"path": "/data/outputs/test-session/output.csv", "schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
             },
             r2.updated_state,
             catalog,
@@ -1641,6 +1753,7 @@ class TestPrevalidatePluginOptions:
                 "plugin": "batch_stats",
                 "input": "source",
                 "on_success": "out",
+                "on_error": "discard",
                 "options": {
                     "schema": {"mode": "observed"},
                     "value_field": "amount",
@@ -1745,6 +1858,7 @@ class TestPrevalidatePluginOptions:
                 "plugin": "batch_stats",
                 "input": "source",
                 "on_success": "out",
+                "on_error": "discard",
                 "options": {
                     "schema": {"mode": "observed"},
                     "value_field": "amount",
@@ -1780,6 +1894,7 @@ class TestPrevalidatePluginOptions:
                 "plugin": "batch_stats",
                 "input": "source",
                 "on_success": "out",
+                "on_error": "discard",
                 "options": {
                     "schema": {"mode": "observed"},
                     "value_field": "amount",

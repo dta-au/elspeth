@@ -61,6 +61,7 @@ import type { CompositionState } from "@/types/index";
 import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
 import { GraphOutputs } from "./GraphOutputs";
+import { visibleGraphRoutes } from "@/lib/graphRouteVisibility";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 
 const NODE_WIDTH = 260;
@@ -882,6 +883,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   );
   const selectedNodeId = useSessionStore((s) => s.selectedNodeId);
   const [activeEdgeId, setActiveEdgeId] = useState<string | null>(null);
+  const [showFailureRoutes, setShowFailureRoutes] = useState(true);
   const selectNode = useSessionStore((s) => s.selectNode);
   const { resolvedTheme } = useTheme();
 
@@ -2027,14 +2029,25 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
     return { nodes: laidOut.nodes, edges: withFanInArrivals(laidOut.nodes, laidOut.edges) };
   }, [compositionState, nodeValidationMap, nodeMessageMap, selectedNodeId]);
 
-  const activeEdge = edges.find((edge) => edge.id === activeEdgeId);
-  const renderedEdges = edges.map((edge) => ({
+  const visibleGraph = useMemo(() => visibleGraphRoutes(
+    nodes, edges, new Set(compositionState?.outputs.map((output) => output.name)), showFailureRoutes,
+  ), [nodes, edges, compositionState, showFailureRoutes]);
+  const hiddenOutputNames = useMemo(() => {
+    const visibleIds = new Set(visibleGraph.nodes.map((node) => node.id));
+    return new Set(compositionState?.outputs.filter((output) => !visibleIds.has(output.name)).map((output) => output.name));
+  }, [visibleGraph.nodes, compositionState]);
+  useEffect(() => {
+    if (activeEdgeId && !visibleGraph.edges.some((edge) => edge.id === activeEdgeId)) setActiveEdgeId(null);
+    if (selectedNodeId && hiddenOutputNames.has(selectedNodeId)) selectNode(null);
+  }, [activeEdgeId, visibleGraph.edges, selectedNodeId, hiddenOutputNames, selectNode]);
+  const activeEdge = visibleGraph.edges.find((edge) => edge.id === activeEdgeId);
+  const renderedEdges = visibleGraph.edges.map((edge) => ({
     ...edge,
     selected: edge.id === activeEdge?.id,
     zIndex: edge.id === activeEdge?.id ? 10 : 0,
     style: edge.id === activeEdge?.id ? { ...edge.style, strokeWidth: 4 } : edge.style,
   }));
-  const renderedNodes = nodes.map((node) => activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
+  const renderedNodes = visibleGraph.nodes.map((node) => activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
     ? { ...node, style: { ...node.style, boxShadow: "0 0 0 3px var(--color-selected-ring)" } }
     : node);
 
@@ -2095,21 +2108,21 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       out.push(description);
     }
     for (const output of compositionState.outputs) {
-      out.push(describe(output.name, "sink", output.plugin));
+      if (!hiddenOutputNames.has(output.name)) out.push(describe(output.name, "sink", output.plugin));
     }
     return out;
-  }, [compositionState, nodeValidationMap, nodeMessageMap, validationResult]);
+  }, [compositionState, nodeValidationMap, nodeMessageMap, validationResult, hiddenOutputNames]);
 
   const accessibleEdges = useMemo(
     () =>
-      edges.map((edge) => ({
+      visibleGraph.edges.map((edge) => ({
         id: edge.id,
         label:
           `${edge.source} to ${edge.target}: ${
             typeof edge.label === "string" ? edge.label : "connection"
           } (${edge.data.flowType})`,
       })),
-    [edges],
+    [visibleGraph.edges],
   );
 
   // Empty state — must match the hasContent check above so that a
@@ -2137,7 +2150,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
     );
   }
 
-  const nodeCount = nodes.length;
+  const nodeCount = visibleGraph.nodes.length;
   // Deliberately row_union-only, not FAN_IN_NODE_TYPES. This clause exists to
   // gloss a kind whose name does not read as English (cf. humanNodeType); the
   // <ol> text alternative below already names each coalesce by its own
@@ -2162,6 +2175,11 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       <div
         className="graph-view-shell"
       >
+        <div className="graph-view-toolbar">
+          <Button compact aria-pressed={showFailureRoutes} onClick={() => setShowFailureRoutes((shown) => !shown)}>
+            Show quarantine and discard routes
+          </Button>
+        </div>
         {/* Accessible + keyboard-operable equivalent of the visual DAG.
             The diagram below stays role="img" (a visual diagram); THIS list is
             its text alternative (WCAG 1.1.1) and the keyboard path to node
@@ -2266,7 +2284,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
               </ControlButton>
             )}
           </Controls>
-          {nodes.length > MINIMAP_NODE_COUNT_THRESHOLD && (
+          {visibleGraph.nodes.length > MINIMAP_NODE_COUNT_THRESHOLD && (
             <MiniMap
               bgColor="var(--color-surface)"
               nodeColor={getMiniMapNodeColor}
@@ -2287,9 +2305,9 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
         </div>
         {compositionState && (
           <ErrorBoundary label="Wiring table">
-            <GraphOutputs state={compositionState}>
+            <GraphOutputs state={compositionState} showFailureRoutes={showFailureRoutes} hiddenOutputNames={hiddenOutputNames}>
               <ul className="graph-route-controls" aria-label="Inspect pipeline routes">
-                {edges.map((edge) => (
+                {visibleGraph.edges.map((edge) => (
                   <li key={edge.id}>
                     <Button variant="bare" type="button" aria-pressed={edge.id === activeEdge?.id}
                       onFocus={() => setActiveEdgeId(edge.id)} onClick={() => setActiveEdgeId(edge.id)}>
@@ -2302,7 +2320,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
             {activeEdge && <p className="graph-route-detail" role="status">Selected route: {activeEdge.source} → {activeEdge.target}: {String(activeEdge.label ?? activeEdge.data.flowType)} ({activeEdge.data.flowType})</p>}
           </ErrorBoundary>
         )}
-        {selectedConfig && (
+        {selectedConfig && !hiddenOutputNames.has(selectedNodeId ?? "") && (
           <NodeConfigPanel
             config={selectedConfig}
             onClose={() => selectNode(null)}

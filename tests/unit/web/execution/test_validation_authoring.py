@@ -540,6 +540,16 @@ def test_secret_phase_returns_typed_evidence() -> None:
     assert result.checks[0].outcome_code == "secret_refs.resolved"
 
 
+def test_secret_phase_preserves_validated_field_mapper_data_labels() -> None:
+    state = _state(
+        nodes=(_node(plugin="field_mapper", options={"schema": {"mode": "observed"}, "mapping": {"customer_key": "customer_id"}}),)
+    )
+    result = validate_secret_evidence(_policy(state), secret_service=_SecretService(frozenset()), user_id="alice")
+    assert isinstance(result, PhaseReport)
+    assert result.artifact.policy.state is state
+    assert state.nodes[0].options["mapping"] == {"customer_key": "customer_id"}
+
+
 def test_secret_phase_denies_unauthorized_wiring_by_default() -> None:
     """A wired secret with no allowlist rule fails closed — however the
     marker entered the composition (elspeth-f3c1aafd25)."""

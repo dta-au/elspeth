@@ -1548,7 +1548,7 @@ entries:
   kind: getattr
   occurrences: 2
   probe_shapes:
-  - 4f0c154b9df33835fbd9cb052a00c82a383a78873a2d8ed67770befbca97e7b0
+  - 1c4ed2b681fe11d2555d0b880f73507df1cc14a60f776a470d2246233582e146
   - ee41cba02edf969d1e4ba5c5ea13012e9000dd8b02e4e6617ca73f3877f743b8
   classification: approved-introspection
   justification: Reads AST generic metadata on the parsed registry ClassDef and deferred

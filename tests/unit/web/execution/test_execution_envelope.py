@@ -57,6 +57,49 @@ def snapshot() -> PluginAvailabilitySnapshot:
     )
 
 
+def test_envelope_preserves_field_mapper_labels_in_actual_generated_runtime_configs() -> None:
+    from elspeth.web.composer.state import CompositionState
+    from elspeth.web.composer.yaml_generator import generate_pipeline_dict
+    from elspeth.web.dependencies import create_catalog_service
+
+    state = CompositionState.from_dict(
+        {
+            "sources": {},
+            "nodes": [
+                {
+                    "id": "rename_customer",
+                    "node_type": "transform",
+                    "plugin": "field_mapper",
+                    "input": "rows",
+                    "on_success": "output",
+                    "on_error": "discard",
+                    "options": {"mapping": {"customer_key": "customer_id"}, "schema": {"mode": "observed"}},
+                }
+            ],
+            "edges": [],
+            "outputs": [],
+            "metadata": {"name": "synthetic", "description": ""},
+            "version": 1,
+        }
+    )
+    generated = generate_pipeline_dict(state)
+    assert generated["transforms"][0]["options"]["mapping"] == {"customer_key": "customer_id"}
+    frozen = FrozenRunSettings(PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service()), generated, generated)
+    before = deep_thaw(frozen.executable_config)
+    envelope = capture_execution_envelope(
+        frozen,
+        user_id="user",
+        auth_provider_type="local",
+        resolver=None,
+        env_ref_names=frozenset(),
+        implementation_fingerprint="d" * 64,
+        deployment_generation="image-1",
+    )
+    payload = json.loads(envelope.to_json())
+    assert payload["executable_config"] == payload["audit_safe_config"] == before == generated
+    assert deep_thaw(frozen.executable_config) == deep_thaw(frozen.audit_safe_config) == before
+
+
 def test_cancellation_reads_admission_without_secret_version_or_runtime() -> None:
     store = SecretStore()
     frozen = FrozenRunSettings(snapshot(), {"api_key": {"secret_ref": "ACCESS"}}, {"profile": {"aliases": ["safe"]}})

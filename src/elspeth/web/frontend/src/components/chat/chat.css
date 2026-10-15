@@ -1196,6 +1196,10 @@
   outline-offset: -2px;
 }
 
+.chat-panel-history-controls {
+  padding-inline: var(--space-lg);
+}
+
 
 /* =============================================================================
    Component-Specific Classes — Migrated from Inline Styles

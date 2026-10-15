@@ -804,6 +804,10 @@ allowed_dict_patterns:
   # ═══════════════════════════════════════════════════════════════════════════
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_model_turn:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_model_turn:tools (list)"
+  # Deep-copy the same selected SDK message/tool wires before dispatch and
+  # derive the exact cache-marked request digest; no internal evidence DTO.
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._prepare_primary_delivery:messages (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._prepare_primary_delivery:tools (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._dispatch_tool_batch:llm_messages (list)"
   # Extracted body of _dispatch_tool_batch: the verbatim move to the module-level
   # run_tool_batch (composer/service.py decomposition) carries the same OpenAI

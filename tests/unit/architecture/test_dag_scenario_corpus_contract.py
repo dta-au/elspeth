@@ -974,7 +974,9 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # other manifest byte and case field is unchanged after version normalization.
 # 0.8.5 version cut: the canonical loader confirms only those eight engine
 # version fields changed; normalized case semantics and every other byte match.
-EXPECTED_CASE_REGISTRY_SHA256 = "e910767698166aae63a071fdcc16653bee89ec423c4193fa0d0060a7b9591267"
+# 0.8.6 version cut: the same eight runtime-derived fields advance; canonical
+# cases and all other bytes match after engine-version-only normalization.
+EXPECTED_CASE_REGISTRY_SHA256 = "fd48b10a6ef48ac8a40d63654158c11dac2307733431e8791fa1f897fda33a13"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

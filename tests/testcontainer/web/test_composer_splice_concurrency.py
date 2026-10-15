@@ -21,7 +21,7 @@ from tests.unit.web.sessions.test_routes import _make_app
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
-from elspeth.web.composer.protocol import ComposerResult
+from elspeth.web.composer.protocol import ComposerResult, RetainedOperationContext
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import execute_tool
@@ -177,6 +177,7 @@ class _BlockingSpliceComposer:
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         recovery_context: GraphRecoveryContext | None = None,
+        retained_operation_context: RetainedOperationContext | None = None,
     ) -> ComposerResult:
         del (
             message,
@@ -192,6 +193,7 @@ class _BlockingSpliceComposer:
             required_work,
             provider_owner,
             recovery_context,
+            retained_operation_context,
         )
         result = execute_tool(
             "splice_transform",

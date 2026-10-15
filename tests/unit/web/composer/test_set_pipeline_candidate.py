@@ -30,6 +30,7 @@ from elspeth.web.blobs.service import BlobServiceImpl, content_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import (
@@ -114,30 +115,23 @@ def test_build_set_pipeline_candidate_constructs_without_publishing(tmp_path: Pa
     assert state == _empty_state()
 
 
-def test_omitted_on_error_defaults_to_discard_for_transform_and_aggregation_but_not_gate(
+def test_omitted_on_error_refuses_transform_and_aggregation_but_preserves_gate_fail_fast(
     tmp_path: Path,
 ) -> None:
-    """Pin the ``on_error`` defaulting expression at the set_pipeline boundary.
-
-    ``build_set_pipeline_candidate`` defaults an omitted ``on_error`` to
-    ``"discard"`` for exactly the node families the YAML generator refuses to
-    lower without one (transform, aggregation), and for no other family — a
-    gate's omitted ``on_error`` stays ``None`` (fail-fast, not discard).
-    Nothing else pinned this expression: every other node dict in this module
-    supplies ``on_error`` explicitly. Deleting the default, narrowing the
-    tuple to transform-only, or widening it to gates each fails one arm.
-    """
+    """Conditional admission requires ordinary choices without altering gates."""
     transform_args = _linear_args(tmp_path)
     del transform_args["nodes"][0]["on_error"]
     candidate = build_set_pipeline_candidate(transform_args, _empty_state(), _trained_context(data_dir=tmp_path))
-    assert candidate.acceptable is True
-    assert candidate.result.updated_state.nodes[0].on_error == "discard"
+    assert candidate.acceptable is False
+    assert not candidate.result.updated_state.nodes
+    assert candidate.result.validation.errors[0].error_code == "failure_route_required"
 
     aggregation_args = _aggregation_args(tmp_path)
     del aggregation_args["nodes"][0]["on_error"]
     candidate = build_set_pipeline_candidate(aggregation_args, _empty_state(), _trained_context(data_dir=tmp_path))
-    assert candidate.acceptable is True
-    assert candidate.result.updated_state.nodes[0].on_error == "discard"
+    assert candidate.acceptable is False
+    assert not candidate.result.updated_state.nodes
+    assert candidate.result.validation.errors[0].error_code == "failure_route_required"
 
     gate_args = _gate_args(tmp_path)
     assert "on_error" not in gate_args["nodes"][0]
@@ -1285,6 +1279,7 @@ def _named_multi_source_queue_args(tmp_path: Path) -> dict[str, Any]:
             "orders": {
                 "plugin": "csv",
                 "on_success": "inbound",
+                "on_validation_failure": "discard",
                 "options": {
                     "path": str(tmp_path / "blobs" / "test-session" / "orders.csv"),
                     "schema": {"mode": "observed"},
@@ -1293,6 +1288,7 @@ def _named_multi_source_queue_args(tmp_path: Path) -> dict[str, Any]:
             "refunds": {
                 "plugin": "csv",
                 "on_success": "inbound",
+                "on_validation_failure": "discard",
                 "options": {
                     "path": str(tmp_path / "blobs" / "test-session" / "refunds.csv"),
                     "schema": {"mode": "observed"},
@@ -1884,15 +1880,13 @@ def test_candidate_matches_executor_semantic_failures_without_side_effects(tmp_p
     assert state.to_dict() == before
 
 
-def test_set_pipeline_defaults_omitted_source_validation_routing_to_discard(tmp_path: Path) -> None:
-    """Composer's source wrapper supplies the option raw CSV config requires."""
+def test_set_pipeline_requires_source_validation_choice(tmp_path: Path) -> None:
+    """Full replacement never supplies a missing source policy."""
     args = _linear_args(tmp_path)
     del args["source"]["on_validation_failure"]
 
-    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
-
-    assert result.success is True
-    assert result.updated_state.sources["source"].on_validation_failure == "discard"
+    with pytest.raises(ToolArgumentError):
+        _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
 
 
 def test_current_executor_can_return_success_with_invalid_graph_candidate(tmp_path: Path) -> None:
@@ -2078,6 +2072,7 @@ def test_inline_blob_canonical_b_failure_precedes_blob_persistence(tmp_path: Pat
         "source": {
             "plugin": "csv",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": {
                 "schema": {"mode": "observed"},
                 INTERPRETATION_REQUIREMENTS_KEY: [
@@ -2162,6 +2157,7 @@ def test_inline_blob_replacement_preserves_trusted_existing_source_requirement_i
         "source": {
             "plugin": "csv",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": {
                 "schema": {"mode": "observed"},
                 INTERPRETATION_REQUIREMENTS_KEY: [
@@ -2247,6 +2243,7 @@ async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_pa
         "source": {
             "plugin": "csv",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": {"schema": {"mode": "observed"}},
             "inline_blob": {
                 "filename": "ada.csv",
@@ -3120,6 +3117,118 @@ def test_rejection_outside_a_component_loop_is_not_stamped(tmp_path: Path) -> No
     assert "rejected_component" not in result.to_dict()["validation"]["errors"][0]
 
 
+def _assert_required_choice_subjects(builder: ast.FunctionDef) -> None:
+    """Prove the component helper forwards its own typed argument and callers own it."""
+    helpers = [node for node in builder.body if isinstance(node, ast.FunctionDef) and node.name == "_required_choice"]
+    assert len(helpers) == 1
+    helper = helpers[0]
+    required = {arg.arg: (arg, default) for arg, default in zip(helper.args.kwonlyargs, helper.args.kw_defaults, strict=True)}
+    parameter, default = required["component"]
+    assert isinstance(parameter.annotation, ast.Name) and parameter.annotation.id == "str"
+    assert default is None
+    assert not any(isinstance(node, ast.Name) and node.id == "component" and isinstance(node.ctx, ast.Store) for node in ast.walk(helper))
+    assert not any(isinstance(node, (ast.Nonlocal, ast.Global)) and "component" in node.names for node in ast.walk(helper))
+    rejections = [
+        node
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_failure_result"
+    ]
+    assert len(rejections) == 1
+    forwarded = next(kw.value for kw in rejections[0].keywords if kw.arg == "rejected_component")
+    assert isinstance(forwarded, ast.Name) and forwarded.id == "component"
+
+    def expression(text: str) -> str:
+        return ast.dump(ast.parse(text, mode="eval").body)
+
+    owners = {
+        expression("validated.source.on_validation_failure"): ("on_validation_failure", "'source'", None, None),
+        expression("source_model.on_validation_failure"): (
+            "on_validation_failure",
+            "_source_component_id(name)",
+            "(name, source_model)",
+            "(validated.sources or {}).items()",
+        ),
+        expression("node.on_error"): ("on_error", "f'node:{node.id}'", "(index, node)", "enumerate(validated.nodes)"),
+        expression("output.on_write_failure"): (
+            "on_write_failure",
+            "f'output:{output.sink_name}'",
+            "(index, output)",
+            "enumerate(validated.outputs)",
+        ),
+    }
+    parents = {child: parent for parent in ast.walk(builder) for child in ast.iter_child_nodes(parent)}
+    for reference in ast.walk(builder):
+        if isinstance(reference, ast.Name) and reference.id == "_required_choice":
+            assert isinstance(reference.ctx, ast.Load)
+            parent = parents[reference]
+            assert isinstance(parent, ast.Call) and parent.func is reference
+    calls = [
+        node
+        for node in ast.walk(builder)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_required_choice"
+    ]
+    assert len(calls) == len(owners)
+    observed: set[str] = set()
+    for call in calls:
+        assert len(call.args) == 1
+        value = ast.dump(call.args[0])
+        assert value in owners and value not in observed
+        observed.add(value)
+        field, subject, target, iterable = owners[value]
+        keywords = {kw.arg: kw.value for kw in call.keywords}
+        assert ast.dump(keywords["field"]) == expression(repr(field))
+        assert ast.dump(keywords["component"]) == expression(subject)
+        base = call.args[0].value
+        assert ast.dump(keywords["supplied"]) == expression(f"{field!r} in {ast.unparse(base)}.model_fields_set")
+        if target is not None:
+            assert iterable is not None
+            ancestor = parents[call]
+            while not isinstance(ancestor, ast.For):
+                ancestor = parents[ancestor]
+            assert ast.unparse(ancestor.target) == ast.unparse(ast.parse(target, mode="eval").body)
+            assert ast.dump(ancestor.iter) == expression(iterable)
+            owned_names = {node.id for node in ast.walk(ancestor.target) if isinstance(node, ast.Name)}
+            assert not any(
+                isinstance(node, ast.Name) and node.id in owned_names and isinstance(node.ctx, ast.Store)
+                for statement in ancestor.body
+                for node in ast.walk(statement)
+            )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "none", "wrong", "stale", "captured", "optional_parameter"])
+def test_required_choice_subject_proof_rejects_misattribution(mutation: str) -> None:
+    tree = ast.parse(Path(sessions_tools.__file__).read_text(encoding="utf-8"))
+    builder = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "build_set_pipeline_candidate")
+    _assert_required_choice_subjects(builder)
+    helper = next(node for node in builder.body if isinstance(node, ast.FunctionDef) and node.name == "_required_choice")
+    call = next(
+        node
+        for node in ast.walk(builder)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_required_choice"
+    )
+    subject = next(kw for kw in call.keywords if kw.arg == "component")
+    if mutation == "missing":
+        call.keywords.remove(subject)
+    elif mutation == "none":
+        subject.value = ast.Constant(value=None)
+    elif mutation == "wrong":
+        subject.value = ast.Constant(value="node:unrelated")
+    elif mutation == "stale":
+        subject.value = ast.Name(id="previous_component", ctx=ast.Load())
+    elif mutation == "captured":
+        rejection = next(
+            node
+            for node in ast.walk(helper)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_failure_result"
+        )
+        next(kw for kw in rejection.keywords if kw.arg == "rejected_component").value = ast.Name(id="outer_component", ctx=ast.Load())
+    else:
+        index = next(i for i, arg in enumerate(helper.args.kwonlyargs) if arg.arg == "component")
+        helper.args.kw_defaults[index] = ast.Constant(value=None)
+    with pytest.raises((AssertionError, KeyError)):
+        _assert_required_choice_subjects(builder)
+
+
 def _builder_rejection_calls() -> list[tuple[str, ast.Call, bool]]:
     """Every rejection-constructor call in ``build_set_pipeline_candidate``.
 
@@ -3130,6 +3239,7 @@ def _builder_rejection_calls() -> list[tuple[str, ast.Call, bool]]:
     """
     tree = ast.parse(Path(sessions_tools.__file__).read_text(encoding="utf-8"))
     builder = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "build_set_pipeline_candidate")
+    _assert_required_choice_subjects(builder)
     calls: list[tuple[str, ast.Call, bool]] = []
 
     def visit(node: ast.AST, in_component: bool) -> None:
@@ -3137,7 +3247,7 @@ def _builder_rejection_calls() -> list[tuple[str, ast.Call, bool]]:
             child_in_component = in_component
             if isinstance(child, (ast.For, ast.AsyncFor)):
                 child_in_component = True
-            if isinstance(child, ast.FunctionDef) and child.name == "_legacy_source_rejection":
+            if isinstance(child, ast.FunctionDef) and child.name in {"_legacy_source_rejection", "_required_choice"}:
                 child_in_component = True
             if (
                 isinstance(child, ast.ExceptHandler)

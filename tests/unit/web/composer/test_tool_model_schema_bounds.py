@@ -36,8 +36,8 @@ def test_full_state_trigger_shape_admission_is_preserved(field: str, value: obje
     """Full-state semantic validation remains a separate downstream stage."""
     schema = next(item["parameters"] for item in get_tool_definitions() if item["name"] == "set_pipeline")
     payload = {
-        "source": {"plugin": "csv", "on_success": "rows"},
-        "nodes": [{"id": "n", "node_type": "aggregation", "input": "rows", "trigger": {field: value}}],
+        "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
+        "nodes": [{"id": "n", "node_type": "aggregation", "input": "rows", "on_error": "discard", "trigger": {field: value}}],
         "edges": [],
         "outputs": [],
     }

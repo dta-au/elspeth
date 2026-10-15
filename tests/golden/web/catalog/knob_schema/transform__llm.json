@@ -194,6 +194,24 @@
         }
       },
       {
+        "default": "upstream",
+        "description": "upstream reads the original row; ordered requires list-form queries and pool_size=1, and allows explicit bindings to earlier validated outputs. source_row and images always read the original row.",
+        "enum": [
+          "upstream",
+          "ordered"
+        ],
+        "kind": "enum",
+        "label": "Query Input Mode",
+        "name": "query_input_mode",
+        "nullable": false,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
         "default": null,
         "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "kind": "text",
@@ -722,6 +740,24 @@
         }
       },
       {
+        "default": "upstream",
+        "description": "upstream reads the original row; ordered requires list-form queries and pool_size=1, and allows explicit bindings to earlier validated outputs. source_row and images always read the original row.",
+        "enum": [
+          "upstream",
+          "ordered"
+        ],
+        "kind": "enum",
+        "label": "Query Input Mode",
+        "name": "query_input_mode",
+        "nullable": false,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
         "default": null,
         "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "kind": "text",
@@ -1230,6 +1266,24 @@
         "label": "Queries",
         "name": "queries",
         "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "upstream",
+        "description": "upstream reads the original row; ordered requires list-form queries and pool_size=1, and allows explicit bindings to earlier validated outputs. source_row and images always read the original row.",
+        "enum": [
+          "upstream",
+          "ordered"
+        ],
+        "kind": "enum",
+        "label": "Query Input Mode",
+        "name": "query_input_mode",
+        "nullable": false,
         "required": false,
         "tier": "common",
         "visible_when": {
@@ -1775,6 +1829,24 @@
         "label": "Queries",
         "name": "queries",
         "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "upstream",
+        "description": "upstream reads the original row; ordered requires list-form queries and pool_size=1, and allows explicit bindings to earlier validated outputs. source_row and images always read the original row.",
+        "enum": [
+          "upstream",
+          "ordered"
+        ],
+        "kind": "enum",
+        "label": "Query Input Mode",
+        "name": "query_input_mode",
+        "nullable": false,
         "required": false,
         "tier": "common",
         "visible_when": {

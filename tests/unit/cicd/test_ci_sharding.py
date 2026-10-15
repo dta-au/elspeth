@@ -1809,7 +1809,7 @@ def test_workflow_requires_all_shards_and_combined_unchanged_floors() -> None:
     jobs = _activation_workflow_jobs()
     matrix = jobs["test"]["strategy"]["matrix"]
     assert matrix["shard"] == list(range(8))
-    assert jobs["test"]["strategy"]["max-parallel"] == 2
+    assert jobs["test"]["strategy"]["max-parallel"] == 4
     assert jobs["test"]["env"]["PYTEST_WORKERS"] == "2"
     assert "matrix.shard" in jobs["test"]["env"]["CI_CHECKOUT_PATH"]
     aggregate = jobs["coverage"]

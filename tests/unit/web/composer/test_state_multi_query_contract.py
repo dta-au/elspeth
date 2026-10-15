@@ -30,6 +30,36 @@ from elspeth.web.composer.tools.generation import _CLOSED_VALIDATION_ERROR_CODES
 _CODE = "query_input_columns_undeclared"
 
 
+def test_ordered_prior_binding_is_admitted_by_stage_one() -> None:
+    from tests.unit.plugins.llm.test_ordered_query_contract import ordered_options
+
+    result = _state(ordered_options()).validate()
+    assert not [
+        entry for entry in result.errors if entry.error_code in {_CODE, "query_generated_fields_required", "plugin_options_invalid"}
+    ]
+
+
+def test_ordered_forward_binding_is_refused_by_stage_one_with_plugin_message() -> None:
+    from tests.unit.plugins.llm.test_ordered_query_contract import ordered_options
+
+    options = ordered_options()
+    options["queries"][0]["input_fields"] = {"text": "assess_answer"}
+    result = _state(options).validate()
+    with pytest.raises(ValidationError) as exc:
+        LLMConfig.model_validate(options)
+    assert any(entry.message in str(exc.value) for entry in result.errors)
+
+
+def test_ordered_malformed_options_do_not_echo_authored_values() -> None:
+    from tests.unit.plugins.llm.test_ordered_query_contract import ordered_options
+
+    options = ordered_options()
+    options["queries"][0]["input_fields"] = {"text": ["private-authored-marker"]}
+    errors = _validate_multi_query_generated_input_requirements(_state(options).nodes[0])
+    assert errors
+    assert all("private-authored-marker" not in entry.message for entry in errors)
+
+
 @pytest.mark.parametrize("list_form", [False, True])
 @pytest.mark.parametrize("consumer", ["required", "alias", "source_row", "schema", "image", "image_format"])
 def test_generated_input_conflict_has_same_stage_one_and_plugin_message(list_form: bool, consumer: str) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import inspect
 import json
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from fastapi import Request
 from sqlalchemy.exc import OperationalError
 from starlette.exceptions import HTTPException
+from structlog.testing import capture_logs
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
@@ -101,6 +103,22 @@ def test_nonretryable_permission_failure_is_safe_diagnostic() -> None:
     assert projected.failure_code == "operation_failed"
     assert projected.diagnostic_id is not None
     assert "PRIVATE" not in projected.model_dump_json()
+
+
+def test_failure_projection_does_not_log_before_atomic_terminal_audit() -> None:
+    with capture_logs() as logs:
+        projected = project_composer_operation_error(RuntimeError("PRIVATE failure"), request_id="submitted-id")
+    assert projected.failure_code == "operation_failed"
+    assert logs == [], "Projection cannot publish a diagnostic breadcrumb before its audit transaction commits"
+
+
+def test_explicit_canonical_diagnostic_identity_survives_projection_comparison() -> None:
+    assert "diagnostic_id" in inspect.signature(project_composer_operation_error).parameters
+    canonical_id = "11111111-1111-4111-8111-111111111111"
+    first = project_composer_operation_error(RuntimeError("PRIVATE first"), request_id="submitted-id", diagnostic_id=canonical_id)
+    second = project_composer_operation_error(PermissionError("PRIVATE second"), request_id="submitted-id", diagnostic_id=canonical_id)
+    assert first == second
+    assert first.diagnostic_id == first.body["detail"]["diagnostic_id"] == canonical_id
 
 
 def test_stop_has_reviewed_flat_body() -> None:

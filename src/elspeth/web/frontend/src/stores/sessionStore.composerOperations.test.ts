@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionStore } from "./sessionStore";
+import { useAuthStore } from "./authStore";
 import { COMPOSER_STOP_KEY, COMPOSER_CUSTODY_KEY, COMPOSER_CUSTODY_LIFETIME_MS, attachComposerObserver, settleComposerCustody, acquireComposerOperationCustody, authenticateComposerCustody, findComposerOperationCustody, purgeComposerCustody } from "./composerOperationCustody";
 import { detachComposerObservers } from "@/api/composerOperationObserver";
 import { advanceAuthGeneration } from "@/api/authSession";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
-import type { ComposerOperationSnapshot } from "@/types/composerOperations";
+import type { ComposerOperationSnapshot, ComposerOperationFailureOutcome, ComposerOperationFailurePage } from "@/types/composerOperations";
 import type { ChatMessage, CompositionState, CompositionProposal } from "@/types/index";
-vi.mock("@/api/client", () => ({ submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(), cancelComposerOperation: vi.fn(), fetchComposerOperationStream: vi.fn(), apiErrorFromBody: vi.fn(), composerActiveOperation: vi.fn(), isDefinitiveComposerRefusal: vi.fn(), fetchMessages: vi.fn(), fetchCompositionState: vi.fn(), fetchCompositionProposals: vi.fn(), fetchComposerPreferences: vi.fn(), revertToVersion: vi.fn(), fetchStateVersions: vi.fn(), fetchSessions: vi.fn(), fetchCurrentUser: vi.fn(), fetchAuthConfig: vi.fn(), listBlobs: vi.fn(), listInterpretationEvents: vi.fn() }));
+vi.mock("@/api/client", () => ({ submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(), fetchComposerOperationFailures: vi.fn(), cancelComposerOperation: vi.fn(), fetchComposerOperationStream: vi.fn(), apiErrorFromBody: vi.fn(), composerActiveOperation: vi.fn(), isDefinitiveComposerRefusal: vi.fn(), fetchMessages: vi.fn(), fetchCompositionState: vi.fn(), fetchCompositionProposals: vi.fn(), fetchComposerPreferences: vi.fn(), revertToVersion: vi.fn(), fetchStateVersions: vi.fn(), fetchSessions: vi.fn(), fetchCurrentUser: vi.fn(), fetchAuthConfig: vi.fn(), listBlobs: vi.fn(), listInterpretationEvents: vi.fn() }));
 vi.mock("./executionStore", () => ({ useExecutionStore: { getState: () => ({ clearValidation: vi.fn() }) } }));
 import * as api from "@/api/client";
 const sid = "11111111-1111-4111-8111-111111111111", userId = "22222222-2222-4222-8222-222222222222", assistantId = "33333333-3333-4333-8333-333333333333", stateId = "44444444-4444-4444-8444-444444444444";
@@ -20,12 +21,217 @@ beforeEach(() => {
   vi.mocked(api.submitComposerOperation).mockImplementation(async (descriptor) => ({ operation_id: descriptor.operationId, kind: descriptor.kind, status: "queued", poll_after_ms: 1000 }));
   vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => snapshot(operationId));
   vi.mocked(api.fetchComposerOperationStream).mockRejectedValue(new Error("stream unavailable"));
+  vi.mocked(api.fetchComposerOperationFailures).mockImplementation(async (sessionId) => ({ session_id: sessionId, items: [], next_cursor: null }));
   vi.mocked(api.composerActiveOperation).mockReturnValue(null); vi.mocked(api.isDefinitiveComposerRefusal).mockReturnValue(false);
   vi.mocked(api.fetchMessages).mockResolvedValue([]); vi.mocked(api.fetchCompositionState).mockResolvedValue(composition()); vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]); vi.mocked(api.fetchSessions).mockResolvedValue([]); vi.mocked(api.listBlobs).mockResolvedValue([]); vi.mocked(api.listInterpretationEvents).mockResolvedValue([]);
   vi.mocked(api.fetchComposerPreferences).mockImplementation(async (sessionId) => ({ session_id: sessionId, trust_mode: "explicit_approve", density_default: "medium", interpretation_review_disabled: false, updated_at: "2026-10-06T00:00:00Z" }));
   vi.mocked(api.fetchCurrentUser).mockResolvedValue({ user_id: scope.principalId, username: "principal", display_name: null, email: null, groups: [], dev_admin: false }); vi.mocked(api.fetchAuthConfig).mockResolvedValue({ provider: "local", registration_mode: "closed", sso_start_url: null });
 });
 afterEach(() => { detachComposerObservers(); vi.useRealTimers(); purgeComposerCustody(); });
+
+describe("authenticated retained operation outcomes", () => {
+  const outcome: ComposerOperationFailureOutcome = { session_id: sid, operation_id: userId, kind: "compose_message", user_message_id: userId, settled_at: "2026-10-14T08:00:00Z", failure_code: "worker_lost", error_type: "composer_operation_worker_lost", diagnostic_id: null, request_id: "request-reference", saved_revisions: { attribution: "fenced", count: 2, latest_state_id: stateId, latest_version: 7 } };
+
+  it("restores history with no browser custody, merges older pages, and retains a failure after a successful turn", async () => {
+    vi.mocked(api.fetchComposerOperationFailures)
+      .mockResolvedValueOnce({ session_id: sid, items: [outcome], next_cursor: "opaque-page" })
+      .mockResolvedValueOnce({ session_id: sid, items: [outcome, { ...outcome, operation_id: stateId, user_message_id: null, settled_at: "2026-10-13T08:00:00Z" }], next_cursor: null });
+    await useSessionStore.getState().resumeComposerOperation(sid);
+    await vi.waitFor(() => expect(useSessionStore.getState().composerFailureOutcomes).toEqual([outcome]));
+    expect(api.submitComposerOperation).not.toHaveBeenCalled();
+    await useSessionStore.getState().loadComposerFailureOutcomes(true);
+    expect(api.fetchComposerOperationFailures).toHaveBeenLastCalledWith(sid, { cursor: "opaque-page", signal: expect.any(AbortSignal) });
+    expect(useSessionStore.getState().composerFailureOutcomes.map((row) => row.operation_id)).toEqual([userId, stateId]);
+    await useSessionStore.getState().sendMessage("A later request");
+    expect(useSessionStore.getState().composerFailureOutcomes.map((row) => row.operation_id)).toEqual([userId, stateId]);
+    expect(useSessionStore.getState().messages.every((row) => row.role !== "system")).toBe(true);
+  });
+
+  it("reloads outcomes through actual same-principal login and clears them on a different principal", async () => {
+    vi.mocked(api.fetchComposerOperationFailures).mockResolvedValue({ session_id: sid, items: [outcome], next_cursor: null });
+    await useAuthStore.getState().loginWithToken("synthetic-same-principal-token");
+    await vi.waitFor(() => expect(useSessionStore.getState().composerFailureOutcomes).toEqual([outcome]));
+    vi.mocked(api.fetchCurrentUser).mockResolvedValue({ user_id: "other-principal", username: "other", display_name: null, email: null, groups: [], dev_admin: false });
+    await useAuthStore.getState().loginWithToken("synthetic-other-principal-token");
+    expect(useSessionStore.getState().activeSessionId).toBeNull();
+    expect(useSessionStore.getState().composerFailureOutcomes).toEqual([]);
+  });
+
+  it("enriches the known terminal by exact identity without duplicating the notice", async () => {
+    let resolve!: (page: ComposerOperationFailurePage) => void;
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 503, detail: "Server stopped", request_id: "request-reference" });
+    vi.mocked(api.fetchComposerOperation).mockImplementation(async (_sid, operationId) => ({ ...snapshot(operationId), status: "failed", result: null, error: { http_status: 503, failure_code: "worker_lost", error_type: "composer_operation_worker_lost", diagnostic_id: null, body: {} } }));
+    vi.mocked(api.fetchComposerOperationFailures).mockImplementationOnce(async () => await new Promise((done) => { resolve = done; }));
+    const sending = useSessionStore.getState().sendMessage("Synthetic request");
+    await vi.waitFor(() => expect(useSessionStore.getState().composerFailureOutcomes).toHaveLength(1));
+    const immediate = useSessionStore.getState().composerFailureOutcomes[0];
+    expect(immediate.saved_revisions.attribution).toBe("unavailable");
+    expect(api.fetchComposerOperationFailures).toHaveBeenCalledWith(sid, { operationId: immediate.operation_id, signal: expect.any(AbortSignal) });
+    const retained = { ...outcome, operation_id: immediate.operation_id };
+    resolve({ session_id: sid, items: [retained], next_cursor: null });
+    await sending;
+    expect(useSessionStore.getState().composerFailureOutcomes).toEqual([retained]);
+  });
+
+  it.each(["navigation", "auth"])("rejects a late history response after %s generation changes", async (change) => {
+    let resolve!: (page: ComposerOperationFailurePage) => void;
+    let signal!: AbortSignal;
+    vi.mocked(api.fetchComposerOperationFailures).mockImplementationOnce(async (_sid, options) => {
+      signal = options!.signal!;
+      return await new Promise((done) => { resolve = done; });
+    });
+    const loading = useSessionStore.getState().loadComposerFailureOutcomes();
+    if (change === "navigation") {
+      await useSessionStore.getState().selectSession(stateId);
+      await useSessionStore.getState().selectSession(sid); // Same-session ABA must still reject the old page.
+      expect(signal.aborted).toBe(true);
+    } else advanceAuthGeneration();
+    resolve({ session_id: sid, items: [outcome], next_cursor: null });
+    await loading;
+    expect(useSessionStore.getState().composerFailureOutcomes).toEqual([]);
+  });
+
+  it("bounds an uncooperative history read and preserves already known outcomes", async () => {
+    vi.useFakeTimers();
+    useSessionStore.setState({ composerFailureOutcomes: [outcome] });
+    let signal!: AbortSignal;
+    vi.mocked(api.fetchComposerOperationFailures).mockImplementationOnce(async (_sid, options) => {
+      signal = options!.signal!;
+      return await new Promise(() => {});
+    });
+    const loading = useSessionStore.getState().loadComposerFailureOutcomes();
+    await vi.advanceTimersByTimeAsync(15000);
+    await loading;
+    expect(signal.aborted).toBe(true);
+    expect(useSessionStore.getState().composerFailureHistoryLoading).toBe(false);
+    expect(useSessionStore.getState().composerFailureHistoryError).toContain("Could not load");
+    expect(useSessionStore.getState().composerFailureOutcomes).toEqual([outcome]);
+  });
+});
+
+describe("terminal publication before optional reads", () => {
+  it.each(["failed", "completed"] as const)("rejects a stale attached winner's %s terminal after navigation", async (status) => {
+    const winnerId = "66666666-6666-4666-8666-666666666666";
+    const refusal = { status: 409, error_type: "composer_operation_active", operation_id: winnerId, kind: "compose_message" };
+    vi.mocked(api.submitComposerOperation).mockRejectedValueOnce(refusal);
+    vi.mocked(api.composerActiveOperation).mockImplementation((error) => error === refusal ? { operation_id: winnerId, kind: "compose_message" } : null);
+    let resolve!: (snapshot: ComposerOperationSnapshot) => void;
+    vi.mocked(api.fetchComposerOperation).mockImplementationOnce(async () => await new Promise((done) => { resolve = done; }));
+    const sending = useSessionStore.getState().sendMessage("my unsent draft");
+    await vi.waitFor(() => expect(api.fetchComposerOperation).toHaveBeenCalledWith(sid, winnerId));
+    await useSessionStore.getState().selectSession(stateId);
+    const winner = snapshot(winnerId);
+    resolve(status === "completed" ? winner : { ...winner, status: "failed", result: null, error: { http_status: 503, failure_code: "worker_lost", error_type: "composer_operation_worker_lost", diagnostic_id: null, body: {} } });
+    await sending;
+    expect(useSessionStore.getState().activeSessionId).toBe(stateId);
+    expect(useSessionStore.getState().messages).toEqual([]);
+    expect(useSessionStore.getState().composerFailureOutcomes).toEqual([]);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+  });
+  it.each(["failed", "completed"] as const)("publishes the attached winner's %s terminal while preserving the unsent loser", async (status) => {
+    const winnerId = "66666666-6666-4666-8666-666666666666";
+    const refusal = { status: 409, error_type: "composer_operation_active", operation_id: winnerId, kind: "compose_message" };
+    vi.mocked(api.submitComposerOperation).mockRejectedValueOnce(refusal);
+    vi.mocked(api.composerActiveOperation).mockImplementation((error) => error === refusal ? { operation_id: winnerId, kind: "compose_message" } : null);
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 503, detail: "Server stopped" });
+    const completed = snapshot(winnerId);
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue(status === "completed" ? completed : { ...completed, status: "failed", result: null, error: { http_status: 503, failure_code: "worker_lost", error_type: "composer_operation_worker_lost", diagnostic_id: null, body: {} } });
+    const release: (() => void)[] = [];
+    vi.mocked(api.fetchMessages).mockImplementationOnce(async () => await new Promise((resolve) => { release.push(() => resolve([])); }));
+    vi.mocked(api.fetchCompositionState).mockImplementationOnce(async () => await new Promise((resolve) => { release.push(() => resolve(composition())); }));
+    vi.mocked(api.fetchCompositionProposals).mockImplementationOnce(async () => await new Promise((resolve) => { release.push(() => resolve([])); }));
+    vi.mocked(api.fetchComposerOperationFailures).mockImplementationOnce(async () => await new Promise((resolve) => { release.push(() => resolve({ session_id: sid, items: [], next_cursor: null })); }));
+    const sending = useSessionStore.getState().sendMessage("my unsent draft");
+    try {
+      await vi.waitFor(() => expect(useSessionStore.getState().isComposing).toBe(false));
+      const state = useSessionStore.getState();
+      const loser = state.messages.find((row) => row.content === "my unsent draft")!;
+      expect(loser.operation_id).not.toBe(winnerId);
+      expect(loser.local_status).toBe("failed");
+      expect(state.error).toContain("unsent content remains a draft");
+      expect(state.error).not.toContain("is active");
+      if (status === "failed") {
+        expect(state.composerFailureOutcomes).toEqual([expect.objectContaining({ operation_id: winnerId, failure_code: "worker_lost" })]);
+        expect(api.fetchComposerOperationFailures).toHaveBeenCalledWith(sid, { operationId: winnerId, signal: expect.any(AbortSignal) });
+      } else expect(state.messages).toContainEqual(completed.result!.message);
+      expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+      expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+    } finally { for (const finish of release) finish(); await sending; }
+  });
+
+  it.each([false, true])("keeps fresh same-ID tool projections; genuine intervening update=%s", async (intervening) => {
+    const tool = { id: userId, type: "function", function: { name: "set_metadata", arguments: "{}" } };
+    const old = { ...assistant, content: "older assistant", tool_calls: [tool] };
+    useSessionStore.setState({ messages: [old] });
+    const terminal = { ...assistant, id: stateId, content: "new terminal" };
+    vi.mocked(api.fetchComposerOperation).mockImplementation(async (_sid, operationId) => ({ ...snapshot(operationId), result: { message: terminal, state: composition(), proposals: [] } }));
+    let resolve!: (messages: ChatMessage[]) => void;
+    vi.mocked(api.fetchMessages).mockImplementationOnce(async () => await new Promise((done) => { resolve = done; }));
+    const sending = useSessionStore.getState().sendMessage("Synthetic request");
+    await vi.waitFor(() => expect(useSessionStore.getState().messages.some((row) => row.id === terminal.id)).toBe(true));
+    const fresh = { ...old, tool_calls: [{ ...tool, outcome: "applied" as const, applied_state_version: 7 }] };
+    const newer = { ...old, tool_calls: [{ ...tool, outcome: "rejected" as const, rejection: { error_code: "required_choice", guidance: ["Synthetic public guidance"] } }] };
+    if (intervening) useSessionStore.setState((state) => ({ messages: state.messages.map((row) => row.id === old.id ? newer : row) }));
+    resolve([fresh, terminal]);
+    await sending;
+    expect(useSessionStore.getState().messages.find((row) => row.id === old.id)).toEqual(intervening ? newer : fresh);
+  });
+
+  it("keeps fresh projections of the terminal reply and recovery notice", async () => {
+    const recovery: ChatMessage = { ...assistant, id: userId, operation_id: userId, role: "system", content: "Restored saved draft" };
+    vi.mocked(api.fetchComposerOperation).mockImplementation(async (_sid, operationId) => ({ ...snapshot(operationId), result: { message: assistant, state: composition(), proposals: [], recovery_notice: recovery } }));
+    const projectedReply = { ...assistant, composition_state_id: stateId };
+    const projectedRecovery = { ...recovery, composition_state_id: stateId };
+    vi.mocked(api.fetchMessages).mockResolvedValueOnce([projectedReply, projectedRecovery]);
+    await useSessionStore.getState().sendMessage("Synthetic request");
+    expect(useSessionStore.getState().messages.find((row) => row.id === assistant.id)).toEqual(projectedReply);
+    expect(useSessionStore.getState().messages.find((row) => row.id === recovery.id)).toEqual(projectedRecovery);
+  });
+  it("bounds all optional reads while preserving the completed reply", async () => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    vi.mocked(api.fetchMessages).mockImplementationOnce(async (_sid, signal) => { signals.push(signal!); return await new Promise(() => {}); });
+    vi.mocked(api.fetchCompositionState).mockImplementationOnce(async (_sid, signal) => { signals.push(signal!); return await new Promise(() => {}); });
+    vi.mocked(api.fetchCompositionProposals).mockImplementationOnce(async (_sid, signal) => { signals.push(signal!); return await new Promise(() => {}); });
+    const sending = useSessionStore.getState().sendMessage("Synthetic request");
+    await vi.waitFor(() => expect(useSessionStore.getState().isComposing).toBe(false));
+    await vi.advanceTimersByTimeAsync(15000);
+    await sending;
+    expect(signals).toHaveLength(3);
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    expect(useSessionStore.getState().messages.some((row) => row.id === assistantId)).toBe(true);
+  });
+  it.each(["messages", "graph", "proposals"])("publishes known failure while %s refresh is stalled", async (phase) => {
+    let release!: () => void;
+    if (phase === "messages") vi.mocked(api.fetchMessages).mockReturnValueOnce(new Promise((resolve) => { release = () => resolve([]); }));
+    if (phase === "graph") vi.mocked(api.fetchCompositionState).mockReturnValueOnce(new Promise((resolve) => { release = () => resolve(composition()); }));
+    if (phase === "proposals") vi.mocked(api.fetchCompositionProposals).mockReturnValueOnce(new Promise((resolve) => { release = () => resolve([]); }));
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 500, detail: "Composer action failed.", request_id: "request-reference" });
+    vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => ({ ...snapshot(operationId), status: "failed", result: null, error: { http_status: 500, failure_code: "operation_failed", error_type: "operation_failed", diagnostic_id: assistantId, body: { detail: "Composer action failed.", request_id: "request-reference" } } }));
+    const sending = useSessionStore.getState().sendMessage("Synthetic request");
+    try {
+      await vi.waitFor(() => expect(useSessionStore.getState().isComposing).toBe(false));
+      const state = useSessionStore.getState();
+      expect(state.error).toMatch(/failed/i);
+      expect(state.composerFailureOutcomes).toHaveLength(1);
+      expect(state.composerFailureOutcomes[0].diagnostic_id).toBe(assistantId);
+      expect(state.composerFailureOutcomes[0].saved_revisions.count).toBeNull();
+      expect(state.composerFailureOutcomes[0].saved_revisions.attribution).toBe("unavailable");
+    } finally { release(); await sending; }
+  });
+
+  it("publishes the completed reply before a stalled proposal refresh", async () => {
+    let release!: () => void;
+    vi.mocked(api.fetchCompositionProposals).mockReturnValueOnce(new Promise((resolve) => { release = () => resolve([]); }));
+    const sending = useSessionStore.getState().sendMessage("Synthetic request");
+    try {
+      await vi.waitFor(() => expect(useSessionStore.getState().messages.some((row) => row.id === assistantId)).toBe(true));
+      expect(useSessionStore.getState().isComposing).toBe(false);
+      expect(useSessionStore.getState().compositionState?.version).toBe(1);
+    } finally { release(); await sending; }
+  });
+});
+
 describe("unavailable graph recovery admission", () => {
   const unavailable = { status: 409, error_type: "composition_state_unavailable", detail: "Saved graph unavailable", unavailable_state_head: { state_id: stateId, version: 7 } };
 
@@ -297,7 +503,7 @@ describe("terminal proposal snapshot ordering", () => {
   });
 });
 
-it("older unresolved failed terminal hydrates saved state before reopening Send", async () => {
+it("publishes an older failed terminal without waiting for transcript refresh", async () => {
   const old = acquireComposerOperationCustody({ mode: "submitted", scope, sessionId: sid, operationId: userId, createdAt: Date.now(), kind: "compose_message", body: { operation_id: userId, content: "older", state_id: stateId } });
   const winner = attachComposerObserver(old, assistantId, "compose_message", true); settleComposerCustody(winner);
   useSessionStore.setState({ isComposing: true });
@@ -308,10 +514,10 @@ it("older unresolved failed terminal hydrates saved state before reopening Send"
   vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...snapshot(userId), status: "failed", result: null, error: { http_status: 499, failure_code: "request_cancelled", error_type: "request_cancelled", diagnostic_id: null, body: { detail: "stopped" } } });
   await useSessionStore.getState().resumeComposerOperation(sid);
   await vi.waitFor(() => expect(api.fetchMessages).toHaveBeenCalled());
-  expect(useSessionStore.getState().isComposing).toBe(true);
+  expect(useSessionStore.getState().isComposing).toBe(false);
   release([assistant]); await vi.waitFor(() => expect(useSessionStore.getState().isComposing).toBe(false));
   expect(useSessionStore.getState().compositionState?.version).toBe(2);
-  expect(api.fetchCompositionProposals).toHaveBeenCalledWith(sid); expect(api.submitComposerOperation).not.toHaveBeenCalled();
+  expect(api.fetchCompositionProposals).toHaveBeenCalledWith(sid, expect.any(AbortSignal)); expect(api.submitComposerOperation).not.toHaveBeenCalled();
 });
 it("failed graph refresh leaves authoring gated until authoritative refresh succeeds", async () => {
   vi.mocked(api.fetchCompositionState).mockRejectedValue(new Error("head unavailable"));

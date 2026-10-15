@@ -1,5 +1,7 @@
 """Tests for schema configuration types."""
 
+import re
+
 import pytest
 
 
@@ -110,6 +112,91 @@ class TestFieldDefinition:
 
         with pytest.raises(ValueError, match="Python keyword"):
             FieldDefinition.parse({"name": "class", "type": "int", "required": True, "nullable": False})
+
+    @pytest.mark.parametrize("dict_form", [False, True], ids=["string", "dict"])
+    @pytest.mark.parametrize(
+        ("name", "example"),
+        [
+            ("full name", "full_name"),
+            ("unit\tcost", "unit_cost"),
+            ("total/$", "total"),
+            ("amount (€)", "amount"),
+            ("a²b", "a_b"),
+            ("class!", "class_"),
+        ],
+    )
+    def test_invalid_field_name_suggests_parseable_example(self, name: str, example: str, dict_form: bool) -> None:
+        """Diagnostic examples repair invalid names without accepting the original."""
+        from elspeth.contracts.identifiers import is_valid_field_name, validate_field_name
+        from elspeth.contracts.schema import FieldDefinition
+
+        with pytest.raises(ValueError) as exc_info:
+            if dict_form:
+                FieldDefinition.parse({"name": name, "type": "str", "required": True, "nullable": False})
+            else:
+                FieldDefinition.parse(f"{name}: str")
+
+        suggestion = re.search(r"[Uu]se '([^']+)' instead", str(exc_info.value))
+        assert suggestion is not None
+        assert suggestion.group(1) == example
+        assert is_valid_field_name(example)
+        assert validate_field_name(example, "Suggested field") == example
+        assert FieldDefinition.parse(f"{example}: str").name == example
+
+    @pytest.mark.parametrize("dict_form", [False, True], ids=["string", "dict"])
+    @pytest.mark.parametrize("name", ["", " ", "!!!", "---"])
+    def test_empty_normalization_does_not_suggest_invalid_name(self, name: str, dict_form: bool) -> None:
+        """Names without a usable spelling receive guidance rather than an invalid example."""
+        from elspeth.contracts.schema import FieldDefinition
+
+        with pytest.raises(ValueError) as exc_info:
+            if dict_form:
+                FieldDefinition.parse({"name": name, "type": "str", "required": True, "nullable": False})
+            else:
+                FieldDefinition.parse(f"{name}: str")
+
+        message = str(exc_info.value)
+        assert re.search(r"[Uu]se '([^']*)' instead", message) is None
+        assert "non-empty" in message
+
+    @pytest.mark.parametrize("name", ["match", "case", "_", "café"])
+    def test_valid_identifier_is_preserved(self, name: str) -> None:
+        """Soft keywords, underscores and Unicode remain valid without renaming."""
+        from elspeth.contracts.schema import FieldDefinition
+
+        assert FieldDefinition.parse(f"{name}: str").name == name
+        assert FieldDefinition.parse({"name": name, "type": "str", "required": True, "nullable": False}).name == name
+
+    @pytest.mark.parametrize("dict_form", [False, True], ids=["string", "dict"])
+    def test_identifier_example_must_match_string_spec_grammar(self, dict_form: bool) -> None:
+        """A marked-script identifier is valid in dicts but cannot be a shared string example."""
+        from elspeth.contracts.identifiers import is_valid_field_name
+        from elspeth.contracts.schema import FieldDefinition
+
+        assert is_valid_field_name("नाम")
+        assert FieldDefinition.parse({"name": "नाम", "type": "str", "required": True, "nullable": False}).name == "नाम"
+        with pytest.raises(ValueError, match="Expected format"):
+            FieldDefinition.parse("नाम: str")
+        with pytest.raises(ValueError) as exc_info:
+            if dict_form:
+                FieldDefinition.parse({"name": "नाम!", "type": "str", "required": True, "nullable": False})
+            else:
+                FieldDefinition.parse("नाम!: str")
+
+        assert re.search(r"[Uu]se '([^']*)' instead", str(exc_info.value)) is None
+
+    def test_suggested_example_does_not_promise_schema_uniqueness(self) -> None:
+        """A valid example can collide with another declaration and still needs author choice."""
+        from elspeth.contracts.schema import SchemaConfig
+
+        with pytest.raises(ValueError) as exc_info:
+            SchemaConfig.from_dict({"mode": "fixed", "fields": ["full_name: str", "full name: str"]})
+
+        message = str(exc_info.value)
+        assert "example" in message
+        assert "unique" in message
+        with pytest.raises(ValueError, match="Duplicate field names"):
+            SchemaConfig.from_dict({"mode": "fixed", "fields": ["full_name: str", "full_name: str"]})
 
     def test_to_dict_includes_nullable(self) -> None:
         """to_dict() must include nullable for audit trail completeness (D4 fix).

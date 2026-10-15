@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from dataclasses import replace
 from uuid import UUID, uuid4
@@ -14,10 +15,12 @@ from sqlalchemy import event, select
 from sqlalchemy.sql.dml import Insert
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence, diagnostic_evidence_identity
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions import composer_turn
+from elspeth.web.sessions.composer_operations import ComposerOperationError
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, composition_states_table, session_operation_fences_table
 from elspeth.web.sessions.routes._helpers import _join_freeform_owned_task
@@ -340,7 +343,32 @@ async def test_response_projection_fault_cannot_publish_false_complete(
             records = await service.get_messages(UUID(session_id), limit=None)
             # Source34 runs before the atomic terminal commit: no assistant escapes rollback.
             assert sum(message.role == "assistant" for message in records) == 0
-            assert sum(message.role == "audit" for message in records) == 1
+            audits = [message for message in records if message.role == "audit"]
+            assert all(message.tool_calls is not None and len(message.tool_calls) == 1 for message in audits)
+            by_kind = {message.tool_calls[0]["_kind"]: message for message in audits}
+            assert set(by_kind) == {DIAGNOSTIC_EVIDENCE_KIND, "llm_call_audit"}
+            assert by_kind["llm_call_audit"].tool_calls[0]["call"]["call_id"] == _llm_call().call_id
+            assert len(audits) == len(by_kind)
+            job = app.state.composer_async_operation_authority.get(session_id=UUID(session_id), operation_id=body["operation_id"])
+            assert job is not None
+            private = by_kind[DIAGNOSTIC_EVIDENCE_KIND]
+            assert private.writer_principal == "compose_loop" and private.composition_state_id is None
+            evidence = ComposerDiagnosticEvidence.from_envelope(
+                private.tool_calls[0], expected_session_id=session_id, expected_operation_id=job.session_operation_id
+            )
+            correlation = "operation:" + body["operation_id"]
+            assert evidence.status == "operation_failure" and evidence.tool_name == "composer_failure"
+            assert evidence.tool_call_id == correlation
+            assert evidence.evidence_id == diagnostic_evidence_identity("operation-failure", correlation)
+            assert evidence.operation_epoch == job.session_operation_epoch
+            assert evidence.arguments.content is not None
+            assert json.loads(evidence.arguments.content) == {
+                "durable_operation_id": body["operation_id"],
+                "request_id": job.request_id,
+                "diagnostic_id": settled.final.json()["error"]["diagnostic_id"],
+                "failure_code": job.failure_code,
+                "correlation_kind": "internal_operation",
+            }
     finally:
         engine.dispose()
 
@@ -594,7 +622,32 @@ async def _actual_join_control(tmp_path, monkeypatch, *, site, route):
                 replay_record = app.state.composer_async_operation_authority.get(session_id=UUID(session_id), operation_id=key)
                 assert replay_record is not None and replay_record.user_message_id == messages[0].id
                 assert composer.calls == 0
-                assert [message.role for message in await service.get_messages(UUID(session_id), limit=None)] == ["user"]
+                assert roles == ["user", "audit"]
+                assert await service.get_messages(UUID(session_id), limit=None) == messages
+                assert messages[1].tool_calls is not None and len(messages[1].tool_calls) == 1
+                context = gate.leases[0].context
+                evidence = ComposerDiagnosticEvidence.from_envelope(
+                    messages[1].tool_calls[0],
+                    expected_session_id=session_id,
+                    expected_operation_id=context.fence.operation_id,
+                    expected_tool_call_id="operation:" + key,
+                )
+                assert evidence.operation_epoch == context.fence.operation_epoch
+                assert evidence.tool_name == "composer_failure" and evidence.status == "operation_failure"
+                selected = ComposerOperationError.model_validate_json(replay_record.result_json)
+                assert evidence.arguments.content is not None and evidence.result.content is not None
+                assert json.loads(evidence.arguments.content) == {
+                    "correlation_kind": "internal_operation",
+                    "durable_operation_id": key,
+                    "request_id": replay_record.request_id,
+                    "diagnostic_id": selected.diagnostic_id,
+                    "failure_code": selected.failure_code,
+                }
+                facts = json.loads(evidence.result.content)
+                assert facts["record_type"] == "failure_facts"
+                assert facts["nodes"][0]["class"] == "CancelledError"
+                assert facts["nodes"][0]["arguments"] == [{"disposition": "retained", "text": "first cancellation"}]
+                assert "first cancellation" not in final.text
                 status, error = observed.error()
                 assert status == 503, error
                 assert final.json()["cancel_requested"] is False

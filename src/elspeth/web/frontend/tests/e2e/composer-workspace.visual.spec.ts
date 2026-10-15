@@ -69,6 +69,9 @@ async function settleAuthoringScroll(
       }, position),
     )
     .toBe(true);
+  if (position === "bottom") {
+    await expect(owner.locator("..").getByRole("button", { name: "Scroll to bottom" })).toBeHidden();
+  }
 }
 
 async function openStableVisualScenario(

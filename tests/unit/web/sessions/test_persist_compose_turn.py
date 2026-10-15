@@ -128,6 +128,139 @@ def test_advisory_lock_sqlite_is_noop(service):
         service._acquire_session_advisory_lock(conn, "session_1")
 
 
+def test_compose_checkpoint_returns_committed_exact_row_witness_and_distinct_no_new_state(service):
+    from uuid import uuid4
+
+    from sqlalchemy import select
+
+    from elspeth.web.sessions._persist_payload import RedactedToolRow
+    from elspeth.web.sessions.models import composition_states_table
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    session_id = str(uuid4())
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id=session_id)
+    empty = service.persist_compose_turn(
+        session_id=session_id,
+        assistant_content="Empty reply",
+        redacted_assistant_tool_calls=(),
+        redacted_tool_rows=(),
+        parent_composition_state_id=None,
+        expected_current_state_id=None,
+        writer_principal="compose_loop",
+        plugin_crash_pending=False,
+    )
+    assert empty.checkpoint_disposition == "empty"
+    assert empty.checkpoint is None
+    data = CompositionStateData(sources={}, nodes=[], edges=[], outputs=[], metadata_={"name": "Witness", "description": None})
+    outcome = service.persist_compose_turn(
+        session_id=session_id,
+        assistant_content="Two revisions",
+        redacted_assistant_tool_calls=(
+            {"id": "witness_one", "function": {"name": "set_metadata"}},
+            {"id": "witness_two", "function": {"name": "set_metadata"}},
+        ),
+        redacted_tool_rows=(
+            RedactedToolRow(tool_call_id="witness_one", content="{}", composition_state_payload=StatePayload(data=data)),
+            RedactedToolRow(tool_call_id="witness_two", content="{}", composition_state_payload=StatePayload(data=data)),
+        ),
+        parent_composition_state_id=None,
+        expected_current_state_id=None,
+        writer_principal="compose_loop",
+        plugin_crash_pending=False,
+    )
+    assert outcome.checkpoint_disposition == "committed"
+    witness = outcome.checkpoint
+    assert witness is not None
+    assert str(witness.state.id) == outcome.current_state_id
+    assert witness.state.session_id == UUID(session_id)
+    assert witness.creator_operation_id == _test_compose_context(session_id).fence.operation_id
+    assert witness.state.version == 2
+    with service._engine.connect() as conn:
+        rows = conn.execute(
+            select(composition_states_table)
+            .where(composition_states_table.c.session_id == session_id)
+            .order_by(composition_states_table.c.version)
+        ).all()
+    assert witness.inserted_state_ids == tuple(UUID(row.id) for row in rows)
+    assert witness.state == service._row_to_state_record(rows[-1])
+    no_new = service.persist_compose_turn(
+        session_id=session_id,
+        assistant_content="Discovery only",
+        redacted_assistant_tool_calls=(),
+        redacted_tool_rows=(),
+        parent_composition_state_id=outcome.current_state_id,
+        expected_current_state_id=outcome.current_state_id,
+        writer_principal="compose_loop",
+        plugin_crash_pending=False,
+    )
+    assert no_new.current_state_id == outcome.current_state_id
+    assert no_new.checkpoint_disposition == "no_new_checkpoint"
+    assert no_new.checkpoint is None
+
+
+@pytest.mark.parametrize("tamper", ("id", "session", "commit"))
+def test_checkpoint_witness_identity_or_commit_failure_exposes_no_committed_witness(service, monkeypatch, tamper):
+    from dataclasses import replace
+    from uuid import uuid4
+
+    from sqlalchemy import event, func, select
+    from sqlalchemy.exc import OperationalError
+
+    from elspeth.web.sessions._persist_payload import RedactedToolRow
+    from elspeth.web.sessions.models import chat_messages_table, composition_states_table
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    session_id = str(uuid4())
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id=session_id)
+    actual_decoder = service._row_to_state_record
+
+    def altered_decoder(row):
+        state = actual_decoder(row)
+        return replace(state, **{"id" if tamper == "id" else "session_id": uuid4()})
+
+    def refuse_commit(_conn):
+        raise OperationalError("COMMIT", {}, RuntimeError("Synthetic commit refusal"))
+
+    if tamper == "commit":
+        event.listen(service._engine, "commit", refuse_commit)
+    else:
+        monkeypatch.setattr(service, "_row_to_state_record", altered_decoder)
+    try:
+        with pytest.raises(AuditIntegrityError):
+            service.persist_compose_turn(
+                session_id=session_id,
+                assistant_content="Uncommitted candidate",
+                redacted_assistant_tool_calls=({"id": "witness_failure", "function": {"name": "set_metadata"}},),
+                redacted_tool_rows=(
+                    RedactedToolRow(
+                        tool_call_id="witness_failure", content="{}", composition_state_payload=StatePayload(data=CompositionStateData())
+                    ),
+                ),
+                parent_composition_state_id=None,
+                expected_current_state_id=None,
+                writer_principal="compose_loop",
+                plugin_crash_pending=False,
+            )
+    finally:
+        if tamper == "commit":
+            event.remove(service._engine, "commit", refuse_commit)
+    with service._engine.connect() as conn:
+        assert (
+            conn.execute(
+                select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == session_id)
+            ).scalar_one()
+            == 0
+        )
+        assert (
+            conn.execute(
+                select(func.count()).select_from(chat_messages_table).where(chat_messages_table.c.session_id == session_id)
+            ).scalar_one()
+            == 0
+        )
+
+
 def test_advisory_lock_postgres_sql_is_pg_catalog_qualified(service, monkeypatch):
     """The Postgres branch must emit the two-argument advisory-lock form
     with every function ``pg_catalog``-qualified: an operator-set
@@ -1289,11 +1422,12 @@ def test_persist_compose_turn_happy_path(service):
     )
     from elspeth.web.sessions.protocol import CompositionStateData
 
+    session_id = str(uuid5(_TEST_FENCE_NAMESPACE, "happy-path"))
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="s6")
+        _make_session(conn, session_id=session_id)
 
     outcome = service.persist_compose_turn(
-        session_id="s6",
+        session_id=session_id,
         assistant_content="ok",
         redacted_assistant_tool_calls=({"id": "tc_1", "function": {"name": "set_source"}},),
         redacted_tool_rows=(
@@ -1326,7 +1460,8 @@ def test_persist_compose_turn_happy_path(service):
 
     with service._engine.begin() as conn:
         rows = conn.execute(
-            text("SELECT role, sequence_no, tool_call_id FROM chat_messages WHERE session_id='s6' ORDER BY sequence_no")
+            text("SELECT role, sequence_no, tool_call_id FROM chat_messages WHERE session_id=:session_id ORDER BY sequence_no"),
+            {"session_id": session_id},
         ).fetchall()
         assert [r.role for r in rows] == ["assistant", "tool", "audit"]
         assert rows[0].sequence_no == 1
@@ -1335,7 +1470,9 @@ def test_persist_compose_turn_happy_path(service):
         assert rows[2].sequence_no == 3
         assert rows[2].tool_call_id is None
 
-        states = conn.execute(text("SELECT version, provenance FROM composition_states WHERE session_id='s6'")).fetchall()
+        states = conn.execute(
+            text("SELECT version, provenance FROM composition_states WHERE session_id=:session_id"), {"session_id": session_id}
+        ).fetchall()
         assert len(states) == 1
         assert states[0].version == 1
         assert states[0].provenance == "tool_call"
@@ -1355,8 +1492,9 @@ def test_persist_compose_turn_rederives_predecessor_lineage(service):
     )
     from elspeth.web.sessions.protocol import CompositionStateData
 
+    session_id = str(uuid5(_TEST_FENCE_NAMESPACE, "lineage"))
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="s_lineage")
+        _make_session(conn, session_id=session_id)
 
     def _state_row(tool_call_id: str) -> RedactedToolRow:
         return RedactedToolRow(
@@ -1370,7 +1508,7 @@ def test_persist_compose_turn_rederives_predecessor_lineage(service):
 
     # Turn 1: two state-advancing tool calls in one turn, empty session.
     service.persist_compose_turn(
-        session_id="s_lineage",
+        session_id=session_id,
         assistant_content="turn 1",
         redacted_assistant_tool_calls=(
             {"id": "tc_1", "function": {"name": "set_source"}},
@@ -1385,7 +1523,8 @@ def test_persist_compose_turn_rederives_predecessor_lineage(service):
 
     with service._engine.begin() as conn:
         states = conn.execute(
-            text("SELECT id, version, derived_from_state_id FROM composition_states WHERE session_id='s_lineage' ORDER BY version")
+            text("SELECT id, version, derived_from_state_id FROM composition_states WHERE session_id=:session_id ORDER BY version"),
+            {"session_id": session_id},
         ).fetchall()
     assert [s.version for s in states] == [1, 2]
     # First revision of an empty session is a genuine root; the second
@@ -1396,7 +1535,7 @@ def test_persist_compose_turn_rederives_predecessor_lineage(service):
     # Turn 2: the next turn's revision derives from the persisted head —
     # the "original current state" seen by that turn.
     service.persist_compose_turn(
-        session_id="s_lineage",
+        session_id=session_id,
         assistant_content="turn 2",
         redacted_assistant_tool_calls=({"id": "tc_3", "function": {"name": "upsert_node"}},),
         redacted_tool_rows=(_state_row("tc_3"),),
@@ -1407,7 +1546,10 @@ def test_persist_compose_turn_rederives_predecessor_lineage(service):
     )
 
     with service._engine.begin() as conn:
-        turn2 = conn.execute(text("SELECT derived_from_state_id FROM composition_states WHERE session_id='s_lineage' AND version=3")).one()
+        turn2 = conn.execute(
+            text("SELECT derived_from_state_id FROM composition_states WHERE session_id=:session_id AND version=3"),
+            {"session_id": session_id},
+        ).one()
     assert turn2.derived_from_state_id == states[1].id
 
 
@@ -2235,13 +2377,14 @@ def test_persist_compose_turn_state_versions_do_not_collide(service):
     from elspeth.web.sessions.protocol import CompositionStateData
     from elspeth.web.sessions.telemetry import observed_value
 
+    session_id = str(uuid5(_TEST_FENCE_NAMESPACE, "state-versions"))
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="s_ver")
+        _make_session(conn, session_id=session_id)
 
     starting = observed_value(service._telemetry.tool_row_integrity_violation_total)
 
     service.persist_compose_turn(
-        session_id="s_ver",
+        session_id=session_id,
         assistant_content="",
         redacted_assistant_tool_calls=({"id": "tc_v1", "function": {"name": "f"}},),
         redacted_tool_rows=(
@@ -2262,7 +2405,8 @@ def test_persist_compose_turn_state_versions_do_not_collide(service):
 
     with service._engine.begin() as conn:
         first_state_id = conn.execute(
-            text("SELECT id FROM composition_states WHERE session_id='s_ver' ORDER BY version DESC LIMIT 1")
+            text("SELECT id FROM composition_states WHERE session_id=:session_id ORDER BY version DESC LIMIT 1"),
+            {"session_id": session_id},
         ).scalar_one()
 
     # Second turn — pre-B1 this would have collided on
@@ -2270,7 +2414,7 @@ def test_persist_compose_turn_state_versions_do_not_collide(service):
     # version=1 on both turns. Post-B1 the helper allocates
     # version=2 (COALESCE(MAX,0)+1 = 2), so the call succeeds.
     service.persist_compose_turn(
-        session_id="s_ver",
+        session_id=session_id,
         assistant_content="",
         redacted_assistant_tool_calls=({"id": "tc_v2", "function": {"name": "f"}},),
         redacted_tool_rows=(
@@ -2298,6 +2442,9 @@ def test_persist_compose_turn_state_versions_do_not_collide(service):
 
     with service._engine.begin() as conn:
         versions = [
-            r.version for r in conn.execute(text("SELECT version FROM composition_states WHERE session_id='s_ver' ORDER BY version"))
+            r.version
+            for r in conn.execute(
+                text("SELECT version FROM composition_states WHERE session_id=:session_id ORDER BY version"), {"session_id": session_id}
+            )
         ]
     assert versions == [1, 2], f"B1 regression: per-session version allocation broken; got {versions}"

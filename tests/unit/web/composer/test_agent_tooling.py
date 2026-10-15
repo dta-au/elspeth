@@ -1100,7 +1100,7 @@ class TestSetSourceFromBlob:
         blob_id = create_result.data["blob_id"]
         result = execute_tool(
             "set_source_from_blob",
-            {"blob_id": blob_id, "on_success": "step1", "options": {"schema": {"mode": "observed"}}},
+            {"blob_id": blob_id, "on_success": "step1", "on_validation_failure": "discard", "options": {"schema": {"mode": "observed"}}},
             state,
             catalog,
             data_dir=blob_env["data_dir"],
@@ -1164,7 +1164,7 @@ class TestSetSourceFromBlob:
         with pytest.raises(AuditIntegrityError, match=r"blobs\.mime_type is 'application/x-parquet'"):
             execute_tool(
                 "set_source_from_blob",
-                {"blob_id": exotic_blob_id, "on_success": "step1"},
+                {"blob_id": exotic_blob_id, "on_success": "step1", "on_validation_failure": "discard"},
                 state,
                 catalog,
                 data_dir=blob_env["data_dir"],
@@ -1201,7 +1201,12 @@ class TestCreateBlobToSetSourceEndToEnd:
         # Step 2: Wire the blob as the pipeline source
         source_result = execute_tool(
             "set_source_from_blob",
-            {"blob_id": blob_id, "on_success": "transform1", "options": {"schema": {"mode": "observed"}}},
+            {
+                "blob_id": blob_id,
+                "on_success": "transform1",
+                "on_validation_failure": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
             state,
             catalog,
             data_dir=blob_env["data_dir"],

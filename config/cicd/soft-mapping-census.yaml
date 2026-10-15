@@ -854,7 +854,7 @@ files:
   src/elspeth/web/composer/service.py:
     Mapping[str, Any]: 2
     Mapping[str, object]: 1
-    dict[str, Any]: 10
+    dict[str, Any]: 14
   src/elspeth/web/composer/session_tool.py:
     boundary: 1
     dict[str, Any]: 4
@@ -928,6 +928,8 @@ files:
   src/elspeth/web/composer/turn_audit.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 1
+  src/elspeth/web/composer/turn_effects.py:
+    Mapping[str, Any]: 2
   src/elspeth/web/composer/tutorial_models.py:
     dict[str, Any]: 1
   src/elspeth/web/composer/tutorial_service.py:
@@ -936,7 +938,7 @@ files:
     dict[str, Any]: 28
   src/elspeth/web/composer/yaml_importer.py:
     Mapping[str, Any]: 3
-    boundary: 4
+    boundary: 5
   src/elspeth/web/config.py:
     dict[str, object]: 1
   src/elspeth/web/coordination/membership_authority.py:
@@ -1060,10 +1062,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 755
+  Mapping[str, Any]: 757
   Mapping[str, object]: 315
   MutableMapping[str, Any]: 8
-  boundary: 59
-  dict[str, Any]: 1073
+  boundary: 60
+  dict[str, Any]: 1077
   dict[str, object]: 395
-  soft: 2546
+  soft: 2552

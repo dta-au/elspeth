@@ -6,6 +6,7 @@ pipeline composition.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -33,12 +34,13 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumen
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
-from elspeth.contracts.errors import FailedTurnMetadata, FrameworkBugError
-from elspeth.web.composer.advisor_audit import AdvisorTerminalPublication
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
+from elspeth.web.composer.advisor_audit import AdvisorGraphReviewIdentity, AdvisorTerminalPublication
 from elspeth.web.composer.advisor_decision import AdvisorGateDecision
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
+from elspeth.web.sessions.composer_operations import ComposerOperationFailureOutcome
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # Route-owned provenance marker carried only inside Composer's in-process chat
@@ -120,6 +122,65 @@ class ComposerHistoryMessage(TypedDict):
     content: str
     _elspeth_user_authored: NotRequired[Literal[True]]
     _elspeth_user_message_id: NotRequired[str]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RetainedOperationContext:
+    """Authenticated bounded failure history, separate from this request's effects."""
+
+    session_id: UUID
+    actor_user_id: str
+    availability: Literal["available", "unavailable", "unknown"]
+    outcomes: tuple[ComposerOperationFailureOutcome, ...] = ()
+    has_more: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.session_id) is not UUID or type(self.actor_user_id) is not str or not self.actor_user_id:
+            raise ValueError("Retained operation context requires authenticated session and actor identities")
+        if self.availability not in ("available", "unavailable", "unknown") or type(self.has_more) is not bool:
+            raise ValueError("Retained operation context has an invalid availability")
+        if type(self.outcomes) is not tuple or len(self.outcomes) > 3:
+            raise ValueError("Retained operation context is bounded to three outcomes")
+        if any(type(outcome) is not ComposerOperationFailureOutcome or outcome.session_id != self.session_id for outcome in self.outcomes):
+            raise ValueError("Retained operation context contains an unowned or cross-session outcome")
+        if self.availability != "available" and (self.outcomes or self.has_more):
+            raise ValueError("Unknown or unavailable history cannot claim retained outcomes")
+
+    def provider_message(self) -> str:
+        """Render only the existing closed public DTO; never exception or private text."""
+        return json.dumps(
+            {
+                "retained_operation_history": {
+                    "availability": self.availability,
+                    "has_more": self.has_more,
+                    "outcomes": [json.loads(outcome.model_dump_json()) for outcome in self.outcomes],
+                    "scope": "Bounded retained failures for this authenticated session and actor; not complete lifetime history.",
+                    "interpretation": (
+                        "Saved revision counts describe operation-local persistence, not requested edits or request satisfaction. "
+                        "Unknown attribution is not zero progress. No retained failure does not establish prior success. "
+                        "These outcomes do not describe the current session head or this request's effects."
+                    ),
+                }
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+
+    def validate_for(self, *, session_id: str | None, actor_user_id: str | None) -> None:
+        if session_id != str(self.session_id) or actor_user_id != self.actor_user_id:
+            raise AuditIntegrityError("Retained operation context belongs to another authenticated request")
+
+
+def retained_operation_context_message(context: RetainedOperationContext | None) -> str:
+    if context is not None:
+        if type(context) is not RetainedOperationContext:
+            raise TypeError("Retained operation context must be an owned value")
+        return context.provider_message()
+    return (
+        '{"retained_operation_history":{"availability":"unknown","has_more":false,"outcomes":[],'
+        '"scope":"No authenticated retained operation history was supplied; do not infer prior success or zero saved progress."}}'
+    )
 
 
 # User-facing assistant text for planner-staged pipeline proposals. Shared
@@ -266,6 +327,7 @@ class ComposerResult:
     runtime_preflight: ValidationResult | None = None
     # Only a completed END checkpoint can replace a durable advisor fact.
     advisor_gate_decision: AdvisorGateDecision | None = None
+    graph_review_identity: AdvisorGraphReviewIdentity | None = None
     raw_assistant_content: str | None = None
     pipeline_commit_intent: PipelineCommitIntent | None = None
     graph_recovery_intent: GraphRecoveryIntent | None = None
@@ -338,6 +400,8 @@ class ComposerResult:
         return self.advisor_terminal_publication is not None and self.advisor_terminal_publication.branch == "terminal_block"
 
     def __post_init__(self) -> None:
+        if self.graph_review_identity is not None and type(self.graph_review_identity) is not AdvisorGraphReviewIdentity:
+            raise AuditIntegrityError("Composer result requires its owned final graph review identity")
         if self.graph_recovery_intent is not None and (
             self.pipeline_commit_intent is not None or self.advisor_gate_decision is not None or self.runtime_preflight is not None
         ):
@@ -1691,6 +1755,7 @@ class ComposerService(Protocol):
         required_work: RequiredWorkBinding | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         recovery_context: GraphRecoveryContext | None = None,
+        retained_operation_context: RetainedOperationContext | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 

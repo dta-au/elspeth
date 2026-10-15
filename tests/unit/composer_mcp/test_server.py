@@ -27,6 +27,41 @@ from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 
 
+def test_field_mapper_patch_uses_owned_identity_through_real_mcp_dispatch(tmp_path: Path) -> None:
+    from elspeth.web.dependencies import create_catalog_service
+
+    state = CompositionState.from_dict(
+        {
+            "sources": {},
+            "nodes": [
+                {
+                    "id": "rename_customer",
+                    "node_type": "transform",
+                    "plugin": "field_mapper",
+                    "input": "rows",
+                    "on_success": "output",
+                    "on_error": "discard",
+                    "options": {"mapping": {"customer_code": "customer_id"}, "schema": {"mode": "observed"}},
+                }
+            ],
+            "edges": [],
+            "outputs": [],
+            "metadata": {"name": "synthetic", "description": ""},
+            "version": 1,
+        }
+    )
+    result = _dispatch_tool(
+        "patch_node_options",
+        {"node_id": "rename_customer", "patch": {"mapping": {"customer_key": "customer_id"}}},
+        state,
+        create_catalog_service(),
+        tmp_path,
+    )
+    assert result["success"] is True
+    assert result["state"]["nodes"][0]["options"]["mapping"] == {"customer_key": "customer_id"}
+    assert state.nodes[0].options["mapping"] == {"customer_code": "customer_id"}
+
+
 def _empty_state() -> CompositionState:
     return CompositionState(
         source=None,

@@ -431,8 +431,12 @@ def _reject_fabricated_secret_literals(
             violations[f"source:{source_name}"] = fields
     for node in state.nodes:
         node_plugin_fields = allowed_secret_ref_fields("transform", node.plugin) if node.plugin is not None else frozenset()
+        from elspeth.web.credential_guard import field_mapper_credential_options_projection
+
         fields = collect_credential_field_violations(
-            node.options,
+            field_mapper_credential_options_projection(node.options)
+            if node.node_type == "transform" and node.plugin == "field_mapper"
+            else node.options,
             env_ref_names,
             additional_credential_fields=node_plugin_fields,
         )

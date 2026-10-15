@@ -46,7 +46,6 @@ from elspeth.web.composer.state import (
     validate_composer_source_name,
 )
 from elspeth.web.composer.tools._common import (
-    _DEFAULT_SOURCE_VALIDATION_FAILURE,
     _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
     _SERVER_OWNED_SOURCE_OPTION_KEYS,
     _SOURCE_BLOB_REF_OPTION_KEY,
@@ -54,6 +53,7 @@ from elspeth.web.composer.tools._common import (
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
     EmptyToolArgumentsModel,
+    FailureRouteChoiceError,
     ToolContext,
     ToolResult,
     _apply_merge_patch,
@@ -76,7 +76,7 @@ from elspeth.web.composer.tools._common import (
     _validate_mutation_arguments,
     _validate_plugin_name,
     _validate_source_path,
-    canonicalize_source_validation_failure,
+    resolve_failure_route_choice,
     review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools.blobs import (
@@ -247,7 +247,7 @@ _SET_SOURCE_DECLARATION = ToolDeclaration(
                 "description": "Plugin-specific config." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
             },
             "on_validation_failure": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
             },
             "description": {
@@ -255,7 +255,7 @@ _SET_SOURCE_DECLARATION = ToolDeclaration(
                 "description": _STEP_DESCRIPTION_DESCRIPTION,
             },
         },
-        "required": ["plugin", "on_success", "options", "on_validation_failure"],
+        "required": ["plugin", "on_success", "options"],
         "additionalProperties": False,
     },
     augments_on_failure=True,
@@ -1094,11 +1094,15 @@ def _execute_set_source(
     if path_error is not None:
         return _failure_result(state, path_error)
 
-    # "" means no route and canonicalizes to 'discard' — one shared owner
-    # (elspeth-bcd7051143), so this seam agrees with set_pipeline and the
-    # auto-wire pass instead of deferring "" to the engine's plugin-config
-    # rejection.
-    on_vf = canonicalize_source_validation_failure(validated.on_validation_failure)
+    try:
+        on_vf = resolve_failure_route_choice(
+            validated.on_validation_failure,
+            supplied="on_validation_failure" in validated.model_fields_set,
+            field="on_validation_failure",
+            previous=state.sources[source_name].on_validation_failure if source_name in state.sources else None,
+        )
+    except FailureRouteChoiceError as exc:
+        return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=_source_component_id(source_name))
     prevalidation_error = _prevalidate_source_for_context(
         context,
         plugin,
@@ -1163,11 +1167,9 @@ def _execute_set_source_from_blob(
         ``arguments.get("options", {})``).
       * ``plugin`` and ``on_validation_failure`` remain ``str | None``
         so the handler can distinguish operator-omitted from
-        operator-specified.  ``on_validation_failure`` (both ``None``
-        and the unroutable ``""`` spelling) canonicalizes to "discard"
-        via ``canonicalize_source_validation_failure`` at the seam
-        below — the single owner shared by every source-authoring seam
-        (elspeth-bcd7051143).
+        operator-specified using model_fields_set. Omission preserves
+        an existing named source's choice; a new source requires an
+        explicit non-empty choice. Null and empty never select discard.
     """
     try:
         validated = SetSourceFromBlobArgumentsModel.model_validate(arguments)
@@ -1223,10 +1225,15 @@ def _execute_set_source_from_blob(
     if endpoint_policy_error is not None:
         return _failure_result(state, endpoint_policy_error)
 
-    # None and "" both mean 'discard' — one shared owner (elspeth-bcd7051143).
-    # The previous ``is not None`` seam preserved "" while set_pipeline
-    # coerced it, so the same authored value diverged by tool.
-    on_vf = canonicalize_source_validation_failure(validated.on_validation_failure)
+    try:
+        on_vf = resolve_failure_route_choice(
+            validated.on_validation_failure,
+            supplied="on_validation_failure" in validated.model_fields_set,
+            field="on_validation_failure",
+            previous=state.sources[source_name].on_validation_failure if source_name in state.sources else None,
+        )
+    except FailureRouteChoiceError as exc:
+        return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=_source_component_id(source_name))
     resolved = _resolve_source_blob(
         blob_id=validated.blob_id,
         explicit_plugin=validated.plugin,
@@ -1458,7 +1465,15 @@ def _execute_set_source_from_blobs(
     )
     if guarantee_stamp_error is not None:
         return _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required")
-    on_vf = canonicalize_source_validation_failure(validated.on_validation_failure)
+    try:
+        on_vf = resolve_failure_route_choice(
+            validated.on_validation_failure,
+            supplied="on_validation_failure" in validated.model_fields_set,
+            field="on_validation_failure",
+            previous=state.sources[source_name].on_validation_failure if source_name in state.sources else None,
+        )
+    except FailureRouteChoiceError as exc:
+        return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=_source_component_id(source_name))
     resolved = _resolve_source_blobs(
         blob_ids=validated.blob_ids,
         caller_options=caller_options,
@@ -1536,9 +1551,8 @@ _SET_SOURCE_FROM_BLOBS_DECLARATION = ToolDeclaration(
                 "examples": ["documents"],
             },
             "on_validation_failure": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
-                "default": _DEFAULT_SOURCE_VALIDATION_FAILURE,
             },
             "options": {
                 "type": "object",
@@ -1585,9 +1599,8 @@ _SET_SOURCE_FROM_BLOB_DECLARATION = ToolDeclaration(
                 "examples": ["raw_url_rows", "csv_rows", "fetched_text"],
             },
             "on_validation_failure": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
-                "default": _DEFAULT_SOURCE_VALIDATION_FAILURE,
             },
             "options": {
                 "type": "object",

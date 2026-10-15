@@ -19,10 +19,12 @@ from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog, exec
 
 def _pipeline_arguments() -> dict[str, Any]:
     return {
-        "source": {"plugin": "csv", "on_success": "rows", "options": {"path": "input.csv"}},
-        "nodes": [{"id": "classify_severity", "node_type": "transform", "input": "rows", "plugin": "llm_classifier"}],
+        "source": {"plugin": "csv", "on_success": "rows", "options": {"path": "input.csv"}, "on_validation_failure": "discard"},
+        "nodes": [
+            {"id": "classify_severity", "node_type": "transform", "input": "rows", "plugin": "llm_classifier", "on_error": "discard"}
+        ],
         "edges": [],
-        "outputs": [{"sink_name": "out", "plugin": "json", "options": {"path": "output.json"}}],
+        "outputs": [{"sink_name": "out", "plugin": "json", "options": {"path": "output.json"}, "on_write_failure": "discard"}],
     }
 
 
@@ -198,16 +200,19 @@ def test_named_inputs_and_mixed_processing_nodes() -> None:
     arguments = deep_freeze(
         {
             "sources": {
-                "first": {"plugin": "csv", "on_success": "first_rows"},
-                "second": {"plugin": "csv", "on_success": "second_rows"},
+                "first": {"plugin": "csv", "on_success": "first_rows", "on_validation_failure": "discard"},
+                "second": {"plugin": "csv", "on_success": "second_rows", "on_validation_failure": "discard"},
             },
             "nodes": [
-                {"id": "t", "node_type": "transform", "input": "first_rows"},
+                {"id": "t", "node_type": "transform", "input": "first_rows", "on_error": "discard"},
                 {"id": "g", "node_type": "gate", "input": "second_rows"},
                 {"id": "c", "node_type": "collector", "input": "union"},
             ],
             "edges": [],
-            "outputs": [{"sink_name": "out_a", "plugin": "json"}, {"sink_name": "out_b", "plugin": "json"}],
+            "outputs": [
+                {"sink_name": "out_a", "plugin": "json", "on_write_failure": "discard"},
+                {"sink_name": "out_b", "plugin": "json", "on_write_failure": "discard"},
+            ],
         }
     )
     SetPipelineArgumentsModel.model_validate(arguments)

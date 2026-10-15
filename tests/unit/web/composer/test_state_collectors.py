@@ -395,6 +395,7 @@ sources:
     plugin: csv
     on_success: rows
     options:
+      on_validation_failure: discard
       path: in.csv
       schema:
         mode: observed

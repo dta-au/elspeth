@@ -68,7 +68,7 @@ from elspeth.plugins.transforms.llm import (
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig, resolve_image_parts
 from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer, create_langfuse_tracer
-from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, QuerySpec, ResponseFormat, resolve_queries
+from elspeth.plugins.transforms.llm.multi_query import OrderedQueryPlan, OutputFieldConfig, QueryInputMode, QuerySpec, ResponseFormat
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
     LLMAuditParent,
@@ -527,6 +527,8 @@ class MultiQueryStrategy:
     max_images_per_call: int = 0
     executor: PooledExecutor | None = None
     max_capacity_retry_seconds: int = 3600
+    ordered_plan: OrderedQueryPlan | None = None
+    verify_intermediate: Callable[[PipelineRow, PipelineRow], None] | None = None
     _query_templates: Mapping[str, PromptTemplate] = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -605,6 +607,7 @@ class MultiQueryStrategy:
         payload_store: PayloadStore | None = None,
         *,
         audit_parent: LLMAuditParent,
+        binding_row: PipelineRow | None = None,
     ) -> _QuerySuccess | TransformResult:
         """Execute a single query within a multi-query row.
 
@@ -621,7 +624,7 @@ class MultiQueryStrategy:
 
         # Build template context from named input_fields
         try:
-            template_ctx = spec.build_template_context(row, self.row_projection)
+            template_ctx = spec.build_template_context(row if binding_row is None else binding_row, self.row_projection, original_row=row)
         except KeyError as e:
             return TransformResult.error(
                 {
@@ -921,6 +924,12 @@ class MultiQueryStrategy:
 
         for query_idx, spec in enumerate(self.query_specs):
             retry_delay = _SEQUENTIAL_RETRY_INITIAL_DELAY_SECONDS
+            prior_view = row
+            if self.ordered_plan is not None:
+                prior_output = {**row.to_dict(), **accumulated_outputs}
+                prior_contract = propagate_contract(input_contract=row.contract, output_row=prior_output, transform_adds_fields=True)
+                prior_contract = self.apply_declared_output_field_contracts(prior_contract)
+                prior_view = PipelineRow(prior_output, prior_contract)
 
             while True:
                 try:
@@ -935,6 +944,7 @@ class MultiQueryStrategy:
                         shutdown_event,
                         payload_store,
                         audit_parent=audit_parent,
+                        binding_row=prior_view if self.ordered_plan is not None else None,
                     )
                     break  # success or non-retryable error result - exit retry loop
                 except LLMClientError as e:
@@ -992,6 +1002,20 @@ class MultiQueryStrategy:
                     context_after=result.context_after,
                 )
 
+            if self.ordered_plan is not None:
+                expected = self.ordered_plan.generated_by_query[query_idx]
+                if frozenset(result.fields) != expected:
+                    raise FrameworkBugError(f"Ordered query '{spec.name}' produced a field set different from its compiled plan")
+                if set(result.fields) & set(prior_view.to_dict()):
+                    raise FrameworkBugError(f"Ordered query '{spec.name}' overwrote an existing field")
+                candidate_output = {**prior_view.to_dict(), **result.fields}
+                candidate_contract = propagate_contract(
+                    input_contract=prior_view.contract, output_row=candidate_output, transform_adds_fields=True
+                )
+                candidate_contract = self.apply_declared_output_field_contracts(candidate_contract)
+                if self.verify_intermediate is None:
+                    raise FrameworkBugError("Ordered query strategy has no intermediate verifier")
+                self.verify_intermediate(prior_view, PipelineRow(candidate_output, candidate_contract))
             accumulated_outputs.update(result.fields)
             accumulated_audit.update(result.audit_metadata)
 
@@ -1213,7 +1237,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:21f9061bf39be4d9"
+    source_file_hash: str | None = "sha256:705f5c0d4bb975a2"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1472,7 +1496,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         self._row_projection: RowProjection = declared_row_projection(self._config.required_input_fields)
         self._template = PromptTemplate(
             self._config.effective_template(
-                resolve_queries(self._config.queries)[0].template
+                self._config.resolved_queries()[0].template
                 if self._config.prompt_template is None and self._config.queries is not None
                 else None
             ),
@@ -1540,7 +1564,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
         # Strategy dispatch: queries is not None → multi-query
         if self._config.queries is not None:
-            query_specs = resolve_queries(self._config.queries)
+            query_specs = self._config.resolved_queries()
             self._strategy: SingleQueryStrategy | MultiQueryStrategy = MultiQueryStrategy(
                 query_specs=query_specs,
                 template=self._template,
@@ -1559,6 +1583,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 max_images_per_call=max_images_per_call,
                 executor=self._query_executor,
                 max_capacity_retry_seconds=self._max_capacity_retry_seconds,
+                ordered_plan=self._config.ordered_query_plan() if self._config.query_input_mode == QueryInputMode.ORDERED else None,
+                verify_intermediate=self._verify_intermediate_output,
             )
 
             # Multi-query emits prefixed fields — compute guaranteed field sets
@@ -1953,6 +1979,12 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         if blank_required_input is not None:
             return blank_required_input
 
+        if isinstance(self._strategy, MultiQueryStrategy) and self._strategy.ordered_plan is not None:
+            generated = self._strategy.ordered_plan.generated_fields
+            for field in row.contract.fields:
+                if field.normalized_name in generated or field.original_name in generated:
+                    return TransformResult.error({"reason": "field_collision", "field": field.normalized_name}, retryable=False)
+
         return self._strategy.execute(
             row,
             ctx,
@@ -1960,6 +1992,13 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             tracer=self._tracer,
             payload_store=self._payload_store,
         )
+
+    def _verify_intermediate_output(self, prior: PipelineRow, candidate: PipelineRow) -> None:
+        """Reuse ADR-050 value semantics before any dependent query is rendered."""
+        from elspeth.contracts.plugin_protocols import TransformProtocol
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+
+        verify_produced_output_types(transform=cast(TransformProtocol, self), input_row=prior, emitted_rows=(candidate,))
 
     def close(self) -> None:
         """Release resources."""
@@ -2094,7 +2133,11 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model — don't hand-add them.",
                     "required_input_fields names upstream columns and bounds template visibility (ADR-051). Never require this node's generated fields as upstream inputs. options.schema.fields may declare output types (ADR-050); it does not extract fields from the reply.",
                     "The plugin derives generated outputs from response_field and output_fields; pass-through guarantees come from upstream.",
-                    "In multi-query mode, input_fields maps template variables to upstream columns. Per-query output_fields generates <queryname>_<suffix>; downstream consumers use those exact names.",
+                    "Multi-query input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered needs list-form named queries, pool_size=1; allows exact bindings to earlier validated generated fields, never self/forward. Per-query output_fields: <queryname>_<suffix>.",
+                    "Ordered mode preserves original-only source_row/images and atomic final output. Later failure routes the original entry row; prior calls/charges remain. Node-level restart may repeat calls; no durable mid-node resume or exactly-once guarantee.",
+                    "Optional chain compaction is an operator choice. Inspect all consumers, exact output names/types, rendered prompts, effective provider/profile/settings, intermediate shields/gates/mappers/branches and failure policies.",
+                    "For optional chain compaction, independent entry-row queries can qualify; dependent queries require ordered mode. Never promise fewer calls/tokens. Disclose changed quarantine/audit/checkpoint boundaries.",
+                    "Before optional chain compaction, obtain the operator's choice before ordinary provider-authored node/edge mutations; decline changes nothing. Preserve interpretation tokens and prompt/semantics review.",
                     "For the colour example, require colour on the LLM and good_colour_pair_answer / approximate_hex_answer downstream.",
                     "Single-query LLM output is written to response_field as raw text. Prompt wording alone does not create separate JSON fields; preserve response_field through cleanup when no output_fields are configured.",
                     "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. The raw response_field and automatic usage/model fields remain available.",

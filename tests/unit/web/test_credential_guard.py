@@ -24,6 +24,189 @@ from elspeth.web.sessions.routes.workflow.reviews import AttestBody, RequestRevi
 from tests.unit.web.composer._helpers import _make_llm_response, _make_settings
 
 
+def _field_mapper_node(mapping: dict[str, str]) -> dict[str, Any]:
+    return {
+        "id": "rename_customer",
+        "node_type": "transform",
+        "plugin": "field_mapper",
+        "input": "rows",
+        "on_success": "output",
+        "on_error": "discard",
+        "options": {"mapping": mapping, "schema": {"mode": "observed"}},
+    }
+
+
+def _field_mapper_state() -> CompositionState:
+    return CompositionState.from_dict(
+        {
+            "sources": {},
+            "nodes": [_field_mapper_node({"customer_key": "customer_id"})],
+            "edges": [],
+            "outputs": [],
+            "metadata": {"name": "synthetic", "description": ""},
+            "version": 1,
+        }
+    )
+
+
+@pytest.mark.parametrize("surface", ("wire", "semantic", "state"))
+def test_owned_field_mapper_labels_are_not_credential_slots(surface: str) -> None:
+    from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
+
+    node = _field_mapper_node({"customer_key": "customer_id"})
+    assert FieldMapperConfig.model_validate(node["options"]).declared_input_fields == frozenset({"customer_key"})
+    if surface == "wire":
+        require_no_credential_material_in_tool_wire("upsert_node", json.dumps(node), surface="test")
+    elif surface == "semantic":
+        require_no_credential_material_for_tool("upsert_node", node, surface="test")
+    else:
+        require_no_credential_material_in_state(_field_mapper_state(), surface="test")
+
+
+def test_owned_field_mapper_patch_uses_actual_state_identity() -> None:
+    patch = {"node_id": "rename_customer", "patch": {"mapping": {"customer_key": "customer_id"}}}
+    require_no_credential_material_in_tool_wire(
+        "patch_node_options", json.dumps(patch), surface="test", credential_state=_field_mapper_state()
+    )
+    require_no_credential_material_for_tool("patch_node_options", patch, surface="test", credential_state=_field_mapper_state())
+
+
+@pytest.mark.parametrize("status", ("pending", "resolved"))
+@pytest.mark.parametrize("surface", ("wire", "semantic", "state", "patch"))
+def test_field_mapper_authoring_metadata_preserves_label_domain(status: str, surface: str) -> None:
+    import hashlib
+
+    from elspeth.web.interpretation_state import parse_interpretation_requirements
+
+    draft = "Rename the customer identifier."
+    node = _field_mapper_node({"customer_key": "customer_id"})
+    node["options"]["interpretation_requirements"] = [
+        {
+            "id": "rename-review",
+            "kind": "pipeline_decision",
+            "user_term": "customer identifier",
+            "status": status,
+            "draft": draft,
+            "event_id": "review-event" if status == "resolved" else None,
+            "accepted_value": draft if status == "resolved" else None,
+            "accepted_artifact_hash": hashlib.sha256(draft.encode()).hexdigest() if status == "resolved" else None,
+        }
+    ]
+    assert parse_interpretation_requirements(node["options"])[0]["status"] == status
+    data = _field_mapper_state().to_dict()
+    data["nodes"] = [node]
+    state = CompositionState.from_dict(data)
+    if surface == "wire":
+        require_no_credential_material_in_tool_wire("upsert_node", json.dumps(node), surface="test")
+    elif surface == "semantic":
+        require_no_credential_material_for_tool("upsert_node", node, surface="test")
+    elif surface == "state":
+        require_no_credential_material_in_state(state, surface="test")
+    else:
+        require_no_credential_material_for_tool(
+            "patch_node_options",
+            {"node_id": node["id"], "patch": {"mapping": {"customer_key": "customer_number"}}},
+            surface="test",
+            credential_state=state,
+        )
+
+
+@pytest.mark.parametrize("metadata", ({"api_key": "low-entropy-secret"}, {"draft": "sk-" + "a" * 24}))
+def test_field_mapper_authoring_metadata_is_still_credential_scanned(metadata: dict[str, str]) -> None:
+    node = _field_mapper_node({"customer_key": "customer_id"})
+    node["options"]["interpretation_requirements"] = [metadata]
+    with pytest.raises(CredentialMaterialRefused):
+        require_no_credential_material_in_tool_wire("upsert_node", json.dumps(node), surface="test")
+    with pytest.raises(CredentialMaterialRefused):
+        require_no_credential_material_for_tool("upsert_node", node, surface="test")
+
+
+@pytest.mark.parametrize("tool", ("set_pipeline", "emit_pipeline_proposal", "splice_transform"))
+def test_owned_field_mapper_labels_cover_identity_bearing_tool_domains(tool: str) -> None:
+    node = _field_mapper_node({"customer_key": "customer_id"})
+    arguments = (
+        {"predecessor_id": "source", "successor_id": "output", "node": {"plugin": node["plugin"], "options": node["options"]}}
+        if tool == "splice_transform"
+        else {"pipeline": {"nodes": [node]}}
+    )
+    require_no_credential_material_in_tool_wire(tool, json.dumps(arguments), surface="test")
+    require_no_credential_material_for_tool(tool, arguments, surface="test")
+
+
+@pytest.mark.parametrize(
+    "change", ("unknown_plugin", "unknown_tool", "wrong_kind", "extra_option", "nested_value", "token", "private_key", "url")
+)
+def test_field_mapper_domain_does_not_allow_credentials_or_unknown_shapes(change: str) -> None:
+    node = _field_mapper_node({"customer_key": "customer_id"})
+    tool = "upsert_node"
+    if change == "unknown_plugin":
+        node["plugin"] = "unknown_plugin"
+    elif change == "unknown_tool":
+        tool = "unknown_tool"
+    elif change == "wrong_kind":
+        node["node_type"] = "gate"
+    elif change == "extra_option":
+        node["options"]["password"] = "low-entropy-secret"
+    elif change == "nested_value":
+        node["options"]["mapping"]["customer_key"] = {"unknown": "NotAField"}
+    else:
+        node["options"]["mapping"]["customer_key"] = {
+            "token": "sk-" + "a" * 24,
+            "private_key": "-----BEGIN PRIVATE KEY-----",
+            "url": "https://synthetic:password@example.test",
+        }[change]
+    with pytest.raises(CredentialMaterialRefused):
+        require_no_credential_material_for_tool(tool, node, surface="test")
+
+
+@pytest.mark.parametrize("change", ("missing_context", "missing_node", "spoofed_plugin", "invalid_merged_schema"))
+def test_field_mapper_patch_refuses_ambiguous_or_invalid_identity(change: str) -> None:
+    state = _field_mapper_state()
+    patch = {"node_id": "rename_customer", "patch": {"mapping": {"customer_key": "customer_id"}}}
+    if change == "missing_context":
+        state = None
+    elif change == "missing_node":
+        patch["node_id"] = "new_node_not_in_snapshot"
+    elif change == "spoofed_plugin":
+        data = state.to_dict()
+        data["nodes"][0]["plugin"] = "llm"
+        state = CompositionState.from_dict(data)
+        patch["plugin"] = "field_mapper"
+    else:
+        patch["patch"]["schema"] = None
+    with pytest.raises(CredentialMaterialRefused):
+        require_no_credential_material_in_tool_wire("patch_node_options", json.dumps(patch), surface="test", credential_state=state)
+
+
+def test_field_mapper_projection_is_bounded_before_config_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
+
+    def forbidden_validation(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unbounded options reached plugin validation")
+
+    monkeypatch.setattr(FieldMapperConfig, "model_validate", forbidden_validation)
+    for mapping in ({f"customer_{index}_key": "field" for index in range(513)}, {"customer_key": "x" * 262_145}):
+        with pytest.raises(CredentialMaterialRefused):
+            require_no_credential_material_for_tool("upsert_node", _field_mapper_node(mapping), surface="test")
+
+
+@pytest.mark.asyncio
+async def test_gateway_patch_context_is_not_sent_to_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch = {"node_id": "rename_customer", "patch": {"mapping": {"customer_key": "customer_id"}}}
+    requests = []
+
+    async def completion(**kwargs: Any) -> object:
+        requests.append(kwargs)
+        return _make_llm_response(tool_calls=[{"id": "patch-call", "name": "patch_node_options", "arguments": patch}])
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", completion)
+    gateway = ProviderGateway(model="openai/test-model", settings=_make_settings(), endpoint_base_url=None, endpoint_api_key=None)
+    result = await gateway._call_llm([{"role": "user", "content": "synthetic"}], [], credential_state=_field_mapper_state())
+    assert result.tool_batch.calls[0].function.arguments == json.dumps(patch)
+    assert len(requests) == 1
+    assert "credential_state" not in requests[0]
+
+
 @pytest.mark.parametrize("component_type", ["source", "transform", "sink"])
 @pytest.mark.parametrize("plugin", [[], {}], ids=["list", "mapping"])
 @pytest.mark.parametrize("credential", [False, True], ids=["ordinary", "credential"])

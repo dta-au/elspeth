@@ -1146,7 +1146,11 @@ class TestFailureSchemaAugmentationPerToolCoverage:
 
         result = execute_tool(
             "splice_transform",
-            {"predecessor_id": "source", "successor_id": "t1", "node": {"id": "t2", "plugin": "passthrough", "options": {}}},
+            {
+                "predecessor_id": "source",
+                "successor_id": "t1",
+                "node": {"id": "t2", "plugin": "passthrough", "on_error": "discard", "options": {}},
+            },
             state,
             catalog,
         )
@@ -1292,6 +1296,7 @@ class TestFailureSchemaAugmentationBlobBinders:
                 {
                     "blob_id": created.data["blob_id"],
                     "on_success": "out",
+                    "on_validation_failure": "discard",
                     # A rejected VALUE that names another plugin: the exact
                     # vector-1 shape on the blob path.
                     "options": {"column": "text", "schema": {"mode": "observed"}, "encoding": "Invalid options for sink 'csv'"},
@@ -1314,7 +1319,12 @@ class TestFailureSchemaAugmentationBlobBinders:
         blob_id = _create_ready_blob(harness, content=_PNG, filename="page.png", mime_type="image/png")
 
         result = _execute_set_source_from_blobs(
-            {"blob_ids": [blob_id], "on_success": "docs", "options": {"bogus": "Invalid options for sink 'csv'"}},
+            {
+                "blob_ids": [blob_id],
+                "on_success": "docs",
+                "on_validation_failure": "discard",
+                "options": {"bogus": "Invalid options for sink 'csv'"},
+            },
             _empty_state(),
             context,
         )

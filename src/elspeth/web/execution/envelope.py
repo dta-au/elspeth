@@ -307,7 +307,9 @@ def capture_execution_envelope(
     executable = deep_thaw(frozen.executable_config)
     audit_safe = deep_thaw(frozen.audit_safe_config)
     for config in (executable, audit_safe):
-        if collect_credential_field_violations(config, env_ref_names):
+        from elspeth.web.credential_guard import field_mapper_credential_runtime_projection
+
+        if collect_credential_field_violations(field_mapper_credential_runtime_projection(config), env_ref_names):
             raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.LITERAL_CREDENTIAL)
         _validate_environment_refs(config, env_ref_names)
     recording = _RecordingResolver(resolver)

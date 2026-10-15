@@ -263,6 +263,54 @@ function makeState(overrides: Partial<CompositionState> = {}): CompositionState 
   };
 }
 
+it("toggles quarantine routes with the keyboard, retains shared sinks and restores the complete presentation", async () => {
+  resetStore(useSessionStore);
+  resetStore(useExecutionStore);
+  const state = makeState({
+    sources: { source: { plugin: "csv", options: {}, on_success: "rows", on_validation_failure: "quarantine" } },
+    nodes: [makeNode({ id: "step", input: "rows", on_success: "shared", on_error: "shared" })],
+    outputs: [
+      { name: "shared", plugin: "json", options: {}, on_write_failure: "quarantine" },
+      { name: "quarantine", plugin: "json", options: {}, on_write_failure: "discard" },
+    ],
+  });
+  useSessionStore.setState({ compositionState: state });
+  const before = JSON.stringify(useSessionStore.getState().compositionState);
+  const user = userEvent.setup();
+  const { container, unmount } = render(<GraphView />);
+  const originalEdges = [...container.querySelectorAll("[data-edge-source]")].map((edge) => ({
+    id: edge.getAttribute("data-testid"), source: edge.getAttribute("data-edge-source"), target: edge.getAttribute("data-edge-target"),
+    sourceHandle: edge.getAttribute("data-source-handle"), targetHandle: edge.getAttribute("data-target-handle"),
+  }));
+  const toggle = screen.getByRole("button", { name: "Show quarantine and discard routes" });
+  expect(toggle).toHaveAttribute("aria-pressed", "true");
+  await user.click(screen.getByText("Wiring (4)"));
+  const routeList = screen.getByRole("list", { name: "Inspect pipeline routes" });
+  await user.click(within(routeList).getAllByRole("button", { name: /\(error\)/ })[0]);
+  expect(screen.getByText(/Selected route:/)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /^sink: quarantine/ }));
+  expect(useSessionStore.getState().selectedNodeId).toBe("quarantine");
+  toggle.focus();
+  await user.keyboard(" ");
+  expect(toggle).toHaveAttribute("aria-pressed", "false");
+  expect(screen.getByTestId("node-shared")).toBeInTheDocument();
+  expect(screen.queryByTestId("node-quarantine")).not.toBeInTheDocument();
+  expect(useSessionStore.getState().selectedNodeId).toBeNull();
+  expect(screen.queryByText(/Selected route:/)).not.toBeInTheDocument();
+  expect(screen.getByRole("list", { name: "Pipeline branch connections" })).not.toHaveTextContent("(error)");
+  await user.keyboard("{Enter}");
+  expect(screen.getByTestId("node-quarantine")).toBeInTheDocument();
+  expect([...container.querySelectorAll("[data-edge-source]")].map((edge) => ({
+    id: edge.getAttribute("data-testid"), source: edge.getAttribute("data-edge-source"), target: edge.getAttribute("data-edge-target"),
+    sourceHandle: edge.getAttribute("data-source-handle"), targetHandle: edge.getAttribute("data-target-handle"),
+  }))).toEqual(originalEdges);
+  expect(JSON.stringify(useSessionStore.getState().compositionState)).toBe(before);
+  await user.click(toggle);
+  unmount();
+  render(<GraphView />);
+  expect(screen.getByRole("button", { name: "Show quarantine and discard routes" })).toHaveAttribute("aria-pressed", "true");
+});
+
 function makeProposal(
   overrides: Partial<CompositionProposal> = {},
 ): CompositionProposal {

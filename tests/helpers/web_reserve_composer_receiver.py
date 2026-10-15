@@ -20,6 +20,7 @@ FIELDS = (
     "plugin_snapshot_for_user_id",
     "progress_registry",
     "compose_locks",
+    "composer_operation_authority",
 )
 LOOKUP = {"__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__get__", "__set__", "__delete__"}
 
@@ -358,9 +359,39 @@ def receiver_transfer_prefix(statements):
     The deferred settlement body is a separate captured-function effect premise.
     """
     nodes = [n for n in statements if not isinstance(n, ast.Pass)]
-    if len(nodes) != 7:
+    if len(nodes) != 16:
         return False
-    imp, deferred, error, settled, budget, state, guard = nodes
+    imp, deferred = nodes[:2]
+    history = nodes[2:11]
+    expected_history = ast.parse(
+        "history_task = lease.create_task(\n"
+        "    _capture_retained_operation_read(_read_retained_operation_context(\n"
+        "        authority=services.composer_operation_authority, binding=provider_binding,\n"
+        "        session_id=turn.session_id, actor_user_id=turn.actor_user_id)),\n"
+        "    name='composer-retained-operation-history')\n"
+        "history_cancellations: list[asyncio.CancelledError] = []\n"
+        "history_outcome, _ = await _join_freeform_owned_task(history_task, cancellation_observations=history_cancellations)\n"
+        "if type(history_outcome) is not _RetainedOperationReadOutcome:\n"
+        "    raise AuditIntegrityError('Retained history child lost its actual outcome')\n"
+        "if history_outcome.original_error is not None:\n"
+        "    history_failure = history_outcome.original_error\n"
+        "    if history_cancellations:\n"
+        "        raise BaseExceptionGroup('Retained history failure and caller cancellation', [history_failure, *history_cancellations]) "
+        "from history_failure\n"
+        "    raise history_failure\n"
+        "if len(history_cancellations) == 1:\n"
+        "    raise history_cancellations[0]\n"
+        "if history_cancellations:\n"
+        "    raise BaseExceptionGroup('Retained history caller cancellations', history_cancellations)\n"
+        "retained_operation_context = history_outcome.context\n"
+        "if retained_operation_context is None:\n"
+        "    raise AuditIntegrityError('Retained history success lacks its actual projected context')\n"
+    )
+    if ast.dump(ast.Module(body=history, type_ignores=[]), include_attributes=False) != ast.dump(
+        expected_history, include_attributes=False
+    ):
+        return False
+    error, settled, budget, state, guard = nodes[11:]
     if not (
         isinstance(imp, ast.ImportFrom)
         and imp.module == "openai"
@@ -754,9 +785,12 @@ def composer_receiver_local_contracts(units):
         expected = [("app", "state", f) for f in FIELDS]
         expected[8] = ("app", "state", "plugin_snapshot_factory", "for_user_id")
         expected[9] = ("app", "state", "composer_progress_registry")
-        for k, path in zip(call.keywords[:-1], expected[:-1], strict=False):
+        expected[11] = ("app", "state", "composer_async_operation_authority")
+        for index, (k, path) in enumerate(zip(call.keywords, expected, strict=True)):
+            if index == 10:
+                continue
             require(chain(k.value) == path, "DTO fresh identity read " + k.arg)
-        last = call.keywords[-1].value
+        last = call.keywords[10].value
         require(
             isinstance(last, ast.Call)
             and name(last.func, "composer_session_lock_registry")
@@ -921,9 +955,14 @@ def composer_receiver_local_contracts(units):
                 bi = next(i for i, n in enumerate(owner.body) if n is bindings[0])
                 ci = next(i for i, n in enumerate(owner.body) if n is invoke)
                 oi = next(i for i, n in enumerate(turn.body) if n is owner)
-                active_path = bi < ci and not early_abrupt(owner.body[:ci]) and not early_abrupt(turn.body[:oi])
-                active_path = active_path and receiver_transfer_prefix(owner.body[bi + 1 : ci])
-                deferred = [n for n in owner.body[bi + 1 : ci] if isinstance(n, ast.AsyncFunctionDef) and n.name == "settle_post_provider"]
+                active_path = bi == 15 and ci == 21 and not early_abrupt(owner.body[:ci]) and not early_abrupt(turn.body[:oi])
+                # The exact import/deferred/history operations precede capture;
+                # only the five scalar/deadline statements follow it. Preserve
+                # all sixteen operation checks without admitting a suspended
+                # receiver interval.
+                prefix = owner.body[4:bi] + owner.body[bi + 1 : ci]
+                active_path = active_path and receiver_transfer_prefix(prefix)
+                deferred = [n for n in prefix if isinstance(n, ast.AsyncFunctionDef) and n.name == "settle_post_provider"]
                 deferred_valid = False
                 if len(deferred) == 1:
                     deferred_valid, record = invocation_kind(trees[TURN], [turn, deferred[0]], "NATIVE_COROUTINE")
@@ -943,7 +982,7 @@ def composer_receiver_local_contracts(units):
                     "recovery_call": (TURN, id(recovery_calls[0])),
                     "qualification": "ACTUAL_CLOSED_BRANCH_AWAIT_PATHS_SAME_RETAINED_BINDING",
                 }
-                receipt["receiver_transfer_prefix_nodes"] = [(TURN, id(n)) for n in owner.body[bi + 1 : ci]]
+                receipt["receiver_transfer_prefix_nodes"] = [(TURN, id(n)) for n in prefix]
     require(active_path, "actual direct awaited path and same-block receiver dominance")
     turn_scope = function_binding_scope(trees[TURN], turn)
     require(
@@ -1031,6 +1070,14 @@ def composer_receiver_local_contracts(units):
         (
             "elspeth.web.sessions.composer_turn._run_composer_turn.<locals>.settle_post_provider",
             "actual deferred local function body/capture effects; no body occurrence authorizes outer dispatch",
+        ),
+        (
+            "elspeth.web.sessions.composer_turn._read_retained_operation_context",
+            "exact authenticated authority and required-work binding, SQL/projection completion, original outcome custody and receiver stability",
+        ),
+        (
+            "elspeth.web.sessions.composer_turn._capture_retained_operation_read",
+            "exact owned outcome wrapper, registered lease child and join/cancellation effects before provider dispatch",
         ),
         (
             "elspeth.web.sessions.routes._helpers._publish_progress",

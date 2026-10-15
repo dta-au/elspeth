@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from typing import Annotated, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
@@ -36,9 +36,12 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationPreconditionRefused,
     ComposerOperationRecord,
     composer_operation_request_hash,
+    decode_composer_failure_cursor,
+    encode_composer_failure_cursor,
 )
 from elspeth.web.sessions.schemas import (
     ComposerOperationAcceptedResponse,
+    ComposerOperationFailurePageResponse,
     ComposerOperationStatusResponse,
     ComposerOperationStreamHeartbeatFrame,
     ComposerOperationStreamProgressFrame,
@@ -199,6 +202,44 @@ async def admit(
     request.app.state.composer_async_worker.notify_work()
     return ComposerOperationAcceptedResponse(
         operation_id=row.operation_id, kind=row.kind, status=row.status, poll_after_ms=settings.composer_async_poll_after_ms
+    )
+
+
+@router.get("/{session_id}/operations", response_model=ComposerOperationFailurePageResponse)
+async def list_composer_operation_failures(
+    session_id: UUID,
+    request: Request,
+    response: Response,
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
+    limit: Annotated[int | None, Query(ge=1, le=100)] = None,
+    cursor: Annotated[str | None, Query(max_length=512)] = None,
+    operation_id: UUID | None = None,
+) -> ComposerOperationFailurePageResponse:
+    try:
+        await _verify_session_ownership(session_id, user, request)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.detail, headers={**(exc.headers or {}), "Cache-Control": "no-store"}
+        ) from exc
+    if operation_id is not None and (cursor is not None or limit is not None):
+        raise HTTPException(status_code=422, detail="Exact operation lookup cannot be paginated", headers={"Cache-Control": "no-store"})
+    try:
+        position = decode_composer_failure_cursor(cursor) if cursor is not None else None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid operation history cursor", headers={"Cache-Control": "no-store"}) from exc
+    items, next_cursor = await run_sync_in_worker(
+        _authority(request).list_failure_outcomes,
+        session_id=session_id,
+        actor_user_id=user.user_id,
+        limit=limit if limit is not None else 50,
+        cursor=position,
+        operation_id=str(operation_id) if operation_id is not None else None,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return ComposerOperationFailurePageResponse(
+        session_id=session_id,
+        items=list(items),
+        next_cursor=encode_composer_failure_cursor(next_cursor) if next_cursor is not None else None,
     )
 
 

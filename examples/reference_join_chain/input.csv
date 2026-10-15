@@ -1,0 +1,6 @@
+ticket_id,customer_id,request
+T101,C100,Replace a failed office router
+T102,C200,Restore access to the customer portal
+T103,C300,Investigate a delayed warehouse feed
+T104,C999,Check the support agreement for a new account
+T105,C400,Arrange coverage for a newly opened branch

@@ -282,6 +282,9 @@ async def test_saved_validation_blocker_preserves_request_and_readiness(tmp_path
 @pytest.mark.asyncio
 @pytest.mark.parametrize("repair_authorized", [False, True], ids=["explain_without_changes", "repair_requested"])
 async def test_saved_advisor_findings_preserve_request_and_completion_gate(tmp_path: Path, repair_authorized: bool) -> None:
+    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+
     service, session_id = _composer_service_with_session(catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path))
     blob = await _upload(service, session_id, tmp_path)
     state = CompositionState(
@@ -331,25 +334,42 @@ async def test_saved_advisor_findings_preserve_request_and_completion_gate(tmp_p
     )
     primary = []
     advisor_calls = 0
+    reviews = []
 
     async def complete(**kwargs: Any):
         nonlocal advisor_calls
         if kwargs["model"] == service._settings.composer_advisor_model:
             advisor_calls += 1
-            if repair_authorized and advisor_calls > 1:
-                return _advisor_reply()
+            assert advisor_calls <= 2, "Only two END responses are supplied"
+            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            reviews.append(review)
+            assert review["current_request"] == message
+            repaired = repair_authorized and advisor_calls == 2
+            assert review["candidate_reply"] == (
+                "case_study is required in the CSV source contract." if repaired else "The CSV source feeds the report output."
+            )
+            assert review["saved_effects"]["saved_revision_count"] == int(repaired)
+            assert review["saved_effects"]["net_changed"] is repaired
+            if repaired:
+                current = await sessions.get_current_state(UUID(session_id))
+                assert current is not None and current.sources is not None
+                assert current.sources["source"]["options"]["schema"] == {"mode": "flexible", "fields": ("case_study: str",)}
             return _make_llm_response(
                 content=json.dumps(
                     {
-                        "verdict": "FLAGGED",
+                        "verdict": "CLEAN" if repaired else "FLAGGED",
                         "category": "other",
                         "steps": [],
-                        "findings": "The saved report has no explicit required case_study runtime contract.",
+                        "findings": "" if repaired else "The saved report has no explicit required case_study runtime contract.",
                         "note": None,
+                        "publication_verdict": "ADMIT" if repaired else "WITHHOLD",
                     }
                 )
             )
+        assert kwargs["model"] == service._model, "No response is supplied for another provider role"
         primary.append(deepcopy(kwargs["messages"]))
+        assert len(primary) <= (3 if repair_authorized else 2), "No additional primary response is supplied"
         if len(primary) == 2 and repair_authorized:
             return _make_llm_response(
                 tool_calls=[
@@ -360,12 +380,34 @@ async def test_saved_advisor_findings_preserve_request_and_completion_gate(tmp_p
                     }
                 ]
             )
-        return _make_llm_response(content="The CSV source feeds the report output.")
+        return _make_llm_response(
+            content=(
+                "case_study is required in the CSV source contract."
+                if repair_authorized and len(primary) == 3
+                else "The CSV source feeds the report output."
+            )
+        )
 
     with patch("litellm.acompletion", side_effect=complete):
         result = await service.compose(message, [], state, session_id=session_id, current_state_id=str(saved.id))
 
     assert advisor_calls == 2
+    assert len(primary) == (3 if repair_authorized else 2)
+    assert len(result.llm_calls) == len(primary) + advisor_calls
+    assert (reviews[0]["current_graph_hash"] != reviews[1]["current_graph_hash"]) is repair_authorized
+    stored = await sessions.get_messages(UUID(session_id), limit=None)
+    passes = [
+        row.tool_calls[0]["pass"]
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    ]
+    assert [(item["verdict"], item["publication_verdict"], item["provider_attempts"]) for item in passes] == [
+        ("flagged", "WITHHOLD", 1),
+        ("clean", "ADMIT", 1) if repair_authorized else ("flagged", "WITHHOLD", 1),
+    ]
+    assert all(item["phase"] == "end" and item["source"] == "model" and item["first_attempt_accepted"] is True for item in passes)
+    assert all(type(item["publication_binding"]) is str and len(item["publication_binding"]) == 64 for item in passes)
+    assert passes[0]["publication_binding"] != passes[1]["publication_binding"]
     repair_message = primary[1][-1]["content"]
     assert "Completion advisory review" in repair_message
     assert "active request authorizes" in repair_message
@@ -373,6 +415,8 @@ async def test_saved_advisor_findings_preserve_request_and_completion_gate(tmp_p
     assert any(item["role"] == "user" and item["content"] == message for item in primary[1])
     assert result.runtime_preflight is not None
     if repair_authorized:
+        assert result.message == "case_study is required in the CSV source contract."
+        assert result.state.sources["source"].options["schema"] == {"mode": "flexible", "fields": ("case_study: str",)}
         assert any(
             invocation.tool_name == "patch_source_options" and invocation.status.value == "success"
             for invocation in result.tool_invocations

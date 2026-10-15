@@ -41,7 +41,7 @@ _PIPELINE_USER_ROUTES: dict[str, frozenset[str]] = {
     ),
     "src/elspeth/web/sessions/routes/composer/compose.py": frozenset({"recompose"}),
     "src/elspeth/web/sessions/routes/composer/operations.py": frozenset(
-        {"get_composer_operation", "cancel_composer_operation", "stream_operation"}
+        {"get_composer_operation", "cancel_composer_operation", "stream_operation", "list_composer_operation_failures"}
     ),
     "src/elspeth/web/sessions/routes/composer/state.py": frozenset(
         {

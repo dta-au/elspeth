@@ -190,6 +190,7 @@ def test_set_source_from_blob_rejects_forged_resolved_invented_source() -> None:
         {
             "blob_id": "00000000-0000-0000-0000-000000000000",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": {INTERPRETATION_REQUIREMENTS_KEY: [_forged_resolved_invented_source_requirement()]},
         },
         state,
@@ -366,6 +367,7 @@ def test_public_dispatch_rejects_every_server_owned_root_on_every_source_writer(
         arguments = {
             "blob_id": "00000000-0000-0000-0000-000000000000",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": options,
         }
     elif writer == "set_source_from_blobs":
@@ -373,6 +375,7 @@ def test_public_dispatch_rejects_every_server_owned_root_on_every_source_writer(
         arguments = {
             "blob_ids": ["00000000-0000-0000-0000-000000000000"],
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "options": options,
         }
     else:

@@ -81,7 +81,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -434,27 +434,126 @@ class TestGatewayResponseShapeSatisfiesFreeformAttributeAccess:
 
 
 @pytest.mark.asyncio
-async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_base_url: str) -> None:
+async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_base_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Drive one real compose-loop turn (``_run_one_turn_for_test``, the
     dedicated test-only driver that still exercises the real
     ``_compose_loop`` body) with ``llm=None`` so the REAL ``self._call_llm``
     -> real ``litellm.acompletion`` -> live gateway path runs, end to end,
-    for a plain text turn."""
+    for a plain text turn. Only the independent END role's SDK response is
+    faked; its request construction, strict parser, binding, and audit run."""
+    import litellm
+
+    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+
     sessions_service = _build_sessions_service(tmp_path)
     session_id = str(uuid4())
     _insert_session_row(sessions_service, session_id)
     service = _build_service(tmp_path, gateway_base_url, sessions_service)
+    real_acompletion = litellm.acompletion
+    primary_requests: list[dict[str, Any]] = []
+    primary_replies: list[str] = []
+    end_requests: list[dict[str, Any]] = []
+    unexpected_models: list[str] = []
+
+    async def role_bound_acompletion(**kwargs: Any) -> Any:
+        model = kwargs["model"]
+        if model == _MODEL_ALIAS:
+            primary_requests.append(kwargs)
+            assert len(primary_requests) == 1, "Only one primary gateway dispatch is supplied"
+            assert kwargs["api_base"] == f"{gateway_base_url}/v1"
+            assert kwargs["api_key"] == _INBOUND_BEARER
+            messages = kwargs["messages"]
+            assert {"role": "user", "content": "hello composer-against-gateway"} in messages
+            assert messages[-1]["role"] == "system"
+            assert json.loads(messages[-1]["content"]) == {
+                "retained_operation_history": {
+                    "availability": "unknown",
+                    "has_more": False,
+                    "outcomes": [],
+                    "scope": (
+                        "No authenticated retained operation history was supplied; do not infer prior success or zero saved progress."
+                    ),
+                }
+            }
+            # The real mock upstream echoes the last transmitted content,
+            # including the role-independent retained-history tail.
+            response = await real_acompletion(**kwargs)
+            reply = response.choices[0].message.content
+            assert reply == "MOCK:" + messages[-1]["content"]
+            primary_replies.append(reply)
+            return response
+        if model == service._settings.composer_advisor_model:
+            end_requests.append(kwargs)
+            assert len(end_requests) == 1, "Only one END response is supplied"
+            # Primary endpoint configuration never selects the advisor route.
+            assert "api_base" not in kwargs
+            assert "api_key" not in kwargs
+            messages = kwargs["messages"]
+            assert [message["role"] for message in messages] == ["system", "user"]
+            review_json = messages[1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            assert len(primary_replies) == 1
+            assert review["candidate_reply"] == primary_replies[0]
+            assert review["current_request"] == "hello composer-against-gateway"
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
+            return litellm.ModelResponse(
+                id="gateway-text-end-review",
+                model=model,
+                choices=[
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "verdict": "CLEAN",
+                                    "category": "other",
+                                    "steps": [],
+                                    "findings": "",
+                                    "note": None,
+                                    "publication_verdict": "ADMIT",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 20},
+            )
+        unexpected_models.append(model)
+        raise AssertionError(f"No provider response is supplied for {model!r}")
+
+    monkeypatch.setattr(litellm, "acompletion", role_bound_acompletion)
 
     result = await service._run_one_turn_for_test(session_id=session_id, message="hello composer-against-gateway")
+    assert unexpected_models == []
+    assert len(primary_requests) == len(end_requests) == 1
 
     # ``raw_assistant_content`` is threaded through only for specific
     # handoff scenarios (interpretation-review repair prose); it is None on
     # this plain terminal path even though the provider's message.content
     # was a real string -- ``assistant_message`` is the field that carries
     # the final rendered text on this path, and IS asserted below.
-    assert result.assistant_message == "MOCK:hello composer-against-gateway"
+    assert result.assistant_message == primary_replies[0]
+    assert result.raw_assistant_content is None
     assert result.tool_outcomes == ()
     assert result.tool_invocations == ()
+    stored = await sessions_service.get_messages(UUID(session_id), limit=None)
+    passes = [
+        row.tool_calls[0]["pass"]
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    ]
+    assert len(passes) == 1
+    assert passes[0]["phase"] == "end"
+    assert passes[0]["source"] == "model"
+    assert passes[0]["verdict"] == "clean"
+    assert passes[0]["provider_attempts"] == 1
+    assert passes[0]["first_attempt_accepted"] is True
+    assert passes[0]["publication_verdict"] == "ADMIT"
+    assert re.fullmatch(r"[0-9a-f]{64}", passes[0]["publication_binding"])
 
 
 # ---------------------------------------------------------------------------
@@ -469,26 +568,113 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
 
 
 @pytest.mark.asyncio
-async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_base_url: str) -> None:
+async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_base_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Provider tool call -> admission -> dispatch -> tool result -> next turn.
 
-    The mock upstream keys on the LAST conversation entry, so this drives a
-    genuine two-turn exchange: turn 1's ``USE_TOOL list_sources {}`` yields a
-    real provider tool call, Composer admits and dispatches it, and turn 2
-    sees the tool result as the last entry and terminates with plain text.
-
-    Nothing here is stubbed on the provider side -- ``llm=None`` means the
-    real ``self._call_llm`` -> real ``litellm.acompletion`` -> live gateway
-    path runs, so the objects reaching ``_admit_tool_batch`` are genuine
-    ``litellm.types.utils.ChatCompletionMessageToolCall`` instances whose
-    fields resolve through ``__getattr__``.
+    A test-local upstream selector reads the actual user's trigger past the
+    retained-history system tail on turn one; turn two uses the original
+    mock's last-content echo of the real tool result. Both primary SDK calls
+    traverse the real gateway unchanged and return genuine LiteLLM objects.
+    Only the independent END SDK response is faked; its parser/audit run.
     """
+    import litellm
+    import mock.upstream as mock_upstream
+
+    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+
     sessions_service = _build_sessions_service(tmp_path)
     session_id = str(uuid4())
     _insert_session_row(sessions_service, session_id)
     service = _build_service(tmp_path, gateway_base_url, sessions_service)
+    original_last_text = mock_upstream._last_text
+    conversations: list[list[dict[str, Any]]] = []
+
+    def select_mock_trigger(conversation: list[dict[str, Any]]) -> str:
+        conversations.append(conversation)
+        assert len(conversations) <= 2, "Only two upstream primary turns are supplied"
+        if len(conversations) == 1:
+            trigger = {"speaker": "user", "text": "USE_TOOL list_sources {}"}
+            assert trigger in conversation
+            assert conversation[-1]["speaker"] == "system"
+            assert json.loads(original_last_text(conversation)) == {
+                "retained_operation_history": {
+                    "availability": "unknown",
+                    "has_more": False,
+                    "outcomes": [],
+                    "scope": (
+                        "No authenticated retained operation history was supplied; do not infer prior success or zero saved progress."
+                    ),
+                }
+            }
+            return conversation[conversation.index(trigger)]["text"]
+        assert conversation[-1]["speaker"] == "tool"
+        assert conversation[-1]["operation_ref"] == "mock-call-ref-1"
+        assert json.loads(original_last_text(conversation))["success"] is True
+        return original_last_text(conversation)
+
+    monkeypatch.setattr(mock_upstream, "_last_text", select_mock_trigger)
+    original_acompletion = litellm.acompletion
+    primary_calls: list[dict[str, Any]] = []
+    primary_replies: list[Any] = []
+    end_calls: list[dict[str, Any]] = []
+    unexpected_models: list[str] = []
+
+    async def role_bound_acompletion(**kwargs: Any) -> Any:
+        model = kwargs["model"]
+        if model == _MODEL_ALIAS:
+            primary_calls.append(kwargs)
+            assert len(primary_calls) <= 2, "Only two primary SDK calls are supplied"
+            assert kwargs["api_base"] == f"{gateway_base_url}/v1"
+            assert kwargs["api_key"] == _INBOUND_BEARER
+            response = await original_acompletion(**kwargs)
+            primary_replies.append(response)
+            return response
+        if model == service._settings.composer_advisor_model:
+            end_calls.append(kwargs)
+            assert len(end_calls) == 1, "Only one END SDK response is supplied"
+            assert "api_base" not in kwargs and "api_key" not in kwargs
+            assert len(primary_replies) == len(conversations) == 2
+            candidate = primary_replies[1].choices[0].message.content
+            assert candidate == "MOCK:" + original_last_text(conversations[1])
+            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            assert review["candidate_reply"] == candidate
+            assert review["current_request"] == "USE_TOOL list_sources {}"
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
+            return litellm.ModelResponse(
+                model=model,
+                choices=[
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "verdict": "CLEAN",
+                                    "category": "other",
+                                    "steps": [],
+                                    "findings": "",
+                                    "note": None,
+                                    "publication_verdict": "ADMIT",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 20},
+            )
+        unexpected_models.append(model)
+        raise AssertionError(f"No response is supplied for provider role {model!r}")
+
+    monkeypatch.setattr(litellm, "acompletion", role_bound_acompletion)
 
     result = await service._run_one_turn_for_test(session_id=session_id, message="USE_TOOL list_sources {}")
+    assert unexpected_models == []
+    assert len(primary_calls) == len(primary_replies) == len(conversations) == 2
+    assert len(end_calls) == 1
 
     # The tool call was admitted and dispatched -- the defect made this an
     # AuditIntegrityError before the first await, so an empty tuple here is
@@ -519,6 +705,17 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
     assert len(result.tool_invocations) == 1
     assert result.tool_invocations[0].tool_call_id == "mock-call-ref-1"
     assert result.tool_invocations[0].tool_name == "list_sources"
+    stored = await sessions_service.get_messages(UUID(session_id), limit=None)
+    passes = [
+        row.tool_calls[0]["pass"]
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    ]
+    assert len(passes) == 1
+    assert passes[0]["phase"] == "end" and passes[0]["source"] == "model"
+    assert passes[0]["verdict"] == "clean" and passes[0]["publication_verdict"] == "ADMIT"
+    assert passes[0]["provider_attempts"] == 1 and passes[0]["first_attempt_accepted"] is True
+    assert re.fullmatch(r"[0-9a-f]{64}", passes[0]["publication_binding"])
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +815,7 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
     tmp_path: Path,
     gateway_base_url: str,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Force a real gateway-side failure (a genuine HTTP 503 from the mock
     upstream, mapped by the gateway's own error envelope, surfaced to
@@ -625,13 +823,58 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
     gateway/agency internals leak into the persisted turn, the exception
     message, or anything logged during the attempt.
     """
+    import litellm
+    import mock.upstream as mock_upstream
     from litellm.exceptions import ServiceUnavailableError
+
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+    from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
 
     caplog.set_level(logging.DEBUG)
     sessions_service = _build_sessions_service(tmp_path)
     session_id = str(uuid4())
     _insert_session_row(sessions_service, session_id)
     service = _build_service(tmp_path, gateway_base_url, sessions_service)
+    trigger = "TRIGGER_FAULT overloaded"
+    conversations: list[list[dict[str, Any]]] = []
+    upstream_statuses: list[int] = []
+    primary_requests: list[dict[str, Any]] = []
+    sdk_failures: list[ServiceUnavailableError] = []
+    original_last_text = mock_upstream._last_text
+    original_transport = _HostRoutedTransport.handle_async_request
+    original_acompletion = litellm.acompletion
+
+    def select_mock_trigger(conversation: list[dict[str, Any]]) -> str:
+        conversations.append(conversation)
+        user_trigger = {"speaker": "user", "text": trigger}
+        assert user_trigger in conversation
+        assert conversation[-1]["speaker"] == "system"
+        assert "retained_operation_history" in json.loads(original_last_text(conversation))
+        # Select the real user trigger past the retained-history tail without
+        # changing the request Composer, LiteLLM, or the gateway transmitted.
+        return conversation[conversation.index(user_trigger)]["text"]
+
+    async def record_upstream_status(transport: _HostRoutedTransport, request: httpx.Request) -> httpx.Response:
+        response = await original_transport(transport, request)
+        if request.url.host == _UPSTREAM_HOST:
+            upstream_statuses.append(response.status_code)
+        return response
+
+    async def primary_gateway_acompletion(**kwargs: Any) -> Any:
+        assert kwargs["model"] == _MODEL_ALIAS, "No independent advisor response is supplied for this failed primary turn"
+        assert kwargs["api_base"] == f"{gateway_base_url}/v1"
+        assert kwargs["api_key"] == _INBOUND_BEARER
+        primary_requests.append(kwargs)
+        try:
+            return await original_acompletion(**kwargs)
+        except ServiceUnavailableError as exc:
+            sdk_failures.append(exc)
+            assert exc.response.status_code == 503
+            raise
+
+    monkeypatch.setattr(mock_upstream, "_last_text", select_mock_trigger)
+    monkeypatch.setattr(_HostRoutedTransport, "handle_async_request", record_upstream_status)
+    monkeypatch.setattr(litellm, "acompletion", primary_gateway_acompletion)
 
     # The exact exception class the mock upstream's 503 ("overloaded")
     # deterministically maps to, confirmed empirically. Narrowed
@@ -639,12 +882,29 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
     # turn must not satisfy this `raises` and cause the leak assertions
     # below to scan the wrong exception's message and pass vacuously.
     with pytest.raises(ServiceUnavailableError) as excinfo:
-        await service._run_one_turn_for_test(session_id=session_id, message="TRIGGER_FAULT overloaded")
+        await service._run_one_turn_for_test(session_id=session_id, message=trigger)
+
+    assert len(primary_requests) == len(conversations) == len(sdk_failures) == LLM_API_MAX_ATTEMPTS
+    assert upstream_statuses == [503] * LLM_API_MAX_ATTEMPTS
+    assert excinfo.value is sdk_failures[-1]
+    calls = excinfo.value.__dict__["llm_calls"]
+    assert len(calls) == LLM_API_MAX_ATTEMPTS
+    for call in calls:
+        assert call.status is ComposerLLMCallStatus.API_ERROR
+        assert call.error_class == call.error_message == "ServiceUnavailableError"
+        assert call.private_failure is not None
+        facts = json.loads(call.private_failure.canonical)
+        assert facts["nodes"][0]["class"] == "ServiceUnavailableError"
+        assert facts["edges"], "The genuine SDK failure's causal graph must survive private audit capture"
+        assert "private_failure" not in call.to_dict()
 
     exception_text = str(excinfo.value)
+    provider_history = json.dumps([request["messages"] for request in primary_requests])
     for marker in _LEAK_MARKERS:
         assert marker not in exception_text, f"leak marker found in exception message: {marker!r}"
         assert marker not in caplog.text, f"leak marker found in captured logs: {marker!r}"
+        assert marker not in provider_history, f"leak marker found in provider history: {marker!r}"
+        assert marker not in json.dumps([call.to_dict() for call in calls]), f"leak marker found in public call audit: {marker!r}"
 
     with sessions_service._engine.begin() as conn:
         rows = conn.execute(select(chat_messages_table.c.content).where(chat_messages_table.c.session_id == session_id)).fetchall()

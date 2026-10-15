@@ -128,11 +128,12 @@ def test_persist_compose_turn_persists_rejection_record(service):
 def test_rejection_record_links_to_state_current_at_rejection(service):
     """With a state committed earlier in the same turn, the rejection row
     links to it — the version the operator would inspect to reproduce."""
+    session_id = "00000000-0000-4000-8000-000000000002"
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="s_rej2")
+        _make_session(conn, session_id=session_id)
 
     service.persist_compose_turn(
-        session_id="s_rej2",
+        session_id=session_id,
         assistant_content="two calls: one commits, one is refused",
         redacted_assistant_tool_calls=(
             {"id": "tc_ok", "function": {"name": "set_pipeline"}},
@@ -158,12 +159,16 @@ def test_rejection_record_links_to_state_current_at_rejection(service):
         expected_current_state_id=None,
         writer_principal="compose_loop",
         plugin_crash_pending=False,
-        session_operation_context=_test_compose_context("s_rej2"),
+        session_operation_context=_test_compose_context(session_id),
     )
 
     with service._engine.begin() as conn:
-        state_id = conn.execute(text("SELECT id FROM composition_states WHERE session_id='s_rej2'")).scalar_one()
-        linked = conn.execute(text("SELECT composition_state_id FROM composition_rejection_events WHERE session_id='s_rej2'")).scalar_one()
+        state_id = conn.execute(
+            text("SELECT id FROM composition_states WHERE session_id=:session_id"), {"session_id": session_id}
+        ).scalar_one()
+        linked = conn.execute(
+            text("SELECT composition_state_id FROM composition_rejection_events WHERE session_id=:session_id"), {"session_id": session_id}
+        ).scalar_one()
 
     assert linked == state_id
 

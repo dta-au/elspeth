@@ -419,7 +419,7 @@ def test_queue_node_options_are_redacted_in_set_pipeline() -> None:
 
     canary = "SECRET-OPERATOR-QUEUE-NOTE"
     args = {
-        "source": {"plugin": "csv", "on_success": "inbound"},
+        "source": {"plugin": "csv", "on_success": "inbound", "on_validation_failure": "discard"},
         "nodes": [
             {
                 "id": "inbound",

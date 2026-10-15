@@ -231,24 +231,34 @@ def _source3_local_transfers(units):
     compose_calls = _calls(turn, compose_predicate)
     if len(compose_calls) != 2 or {call.func.attr for call in compose_calls} != {"compose", "compose_recovery"}:
         return ["composer turn compose call universe changed"], None
-    if not isinstance(turn.body[37], ast.Try) or len(turn.body[37].body) < 13:
+    if not isinstance(turn.body[37], ast.Try) or len(turn.body[37].body) < 22:
         return ["composer call executed path or preceding terminal changed"], None
-    dispatch = composer_dispatch_calls(turn.body[37].body[12])
+    dispatch = composer_dispatch_calls(turn.body[37].body[21])
     if dispatch is None or set(dispatch) != set(compose_calls) or _direct_prefix_has_terminal(turn, 37):
         return ["composer turn exact paired call arguments or closed branches changed"], None
     compose_call, recovery_call = dispatch
+    if _shape(_keyword(compose_call, "retained_operation_context")) != _shape(ast.Name(id="retained_operation_context", ctx=ast.Load())):
+        return ["composer retained operation context argument changed"], None
     for call, arm, index in ((compose_call, "orelse", 1), (recovery_call, "body", 0)):
         if _executed_path(turn, call) != (
             ("AsyncFunctionDef", "body", 37, "Try"),
-            ("Try", "body", 12, "Try"),
+            ("Try", "body", 21, "Try"),
             ("Try", "body", 1, "If"),
             ("If", arm, index, "Assign"),
             ("Assign", "value", None, "Await"),
             ("Await", "value", None, "Call"),
         ):
             return ["composer call executed path or preceding terminal changed"], None
-    if len(compose.body) < 5 or not _exact(
+    if len(compose.body) < 6 or not _exact(
         compose.body[1],
+        "if retained_operation_context is not None:\n"
+        "    if type(retained_operation_context) is not RetainedOperationContext:\n"
+        "        raise TypeError('Retained operation context must be an owned value')\n"
+        "    retained_operation_context.validate_for(session_id=session_id, actor_user_id=user_id)",
+    ):
+        return ["composer retained operation context admission changed"], None
+    if not _exact(
+        compose.body[2],
         "if (required_work is None) != (provider_owner is None):\n"
         "    raise AuditIntegrityError('Required Composer provider ownership must be supplied with its turn binding')",
     ):
@@ -259,10 +269,13 @@ def _source3_local_transfers(units):
         and type(compose.body[0].value.value) is str
     ):
         return ["composer pre-admission executable prefix changed"], None
-    if not all(_formal(compose, name, keyword_only=False) for name in ("required_work", "provider_owner", "session_operation_context")):
+    if not all(
+        _formal(compose, name, keyword_only=False)
+        for name in ("required_work", "provider_owner", "session_operation_context", "retained_operation_context")
+    ):
         return ["composer callee formal owner transfer changed"], None
     if not _exact(
-        compose.body[2],
+        compose.body[3],
         "if provider_owner is not None:\n"
         "    if type(provider_owner) is not ProviderInvocationOwner or provider_owner.service is not self._require_sessions_service():\n"
         "        raise AuditIntegrityError('Composer provider owner belongs to another exact service')\n"
@@ -372,8 +385,8 @@ def _source3_local_transfers(units):
 # hashes bind structural ASTs, not import identity or physical custody; those
 # remain explicit common-boundary obligations in the returned receipt.
 _REVIEWED_METHOD_SHAPES = {
-    TURN: "c5aa20dd714b7a4790157e8193626e753a4fb608f2ad7e7b40b004a6620886ae",
-    SERVICE: "c6a769e35aed5d75f8fa38d988fe501a23894fa3f1c759a84de41e1a42aa6049",
+    TURN: "ddba716849ec234e21d3cb68303918db24bb6130a99c0723ed55812fe9fefa89",
+    SERVICE: "3eea7cc61485bc73088c306cce73b9b33fb82170684d35a39fb81617e8317cbe",
     PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
     SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
 }

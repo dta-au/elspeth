@@ -89,8 +89,8 @@ def build_anti_anchor_hint(failures: FailureDeque) -> str:
     tool_name = failures[-1][0]
     return (
         f"[ELSPETH-SYSTEM-HINT] Your last {_RETRY_THRESHOLD} calls to `{tool_name}` "
-        "all failed with byte-identical arguments and the same error. "
-        "Retrying with the same payload will keep failing. "
+        "all failed with byte-identical arguments. "
+        "Inspect the reported issue before retrying the same payload. "
         "Before the next attempt, reason only about redacted structure. "
         "Do not repeat, quote, summarize, or otherwise reproduce any literal values from prior arguments or errors "
         "in assistant prose. Identify only: "

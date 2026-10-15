@@ -19,6 +19,44 @@ def _clean_payload() -> dict[str, object]:
     return {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}
 
 
+@pytest.mark.parametrize("graph_verdict", ("CLEAN", "FLAGGED"))
+@pytest.mark.parametrize("publication_verdict", ("ADMIT", "WITHHOLD"))
+def test_end_admission_preserves_independent_graph_and_publication_verdicts(graph_verdict, publication_verdict):
+    payload = _clean_payload() | {
+        "verdict": graph_verdict,
+        "publication_verdict": publication_verdict,
+        "findings": "Visible reason" if graph_verdict == "FLAGGED" or publication_verdict == "WITHHOLD" else "",
+    }
+    admission = parse_advisor_checkpoint_response(json.dumps(payload), phase="end")
+    assert admission.schema_valid
+    assert admission.response is not None
+    assert admission.response.verdict == graph_verdict
+    assert admission.response.publication_verdict == publication_verdict
+    early = parse_advisor_checkpoint_response(json.dumps(payload), phase="early")
+    assert not early.schema_valid
+    assert early.response is None
+
+
+@pytest.mark.parametrize("publication_verdict", (None, "", "admit", "CLEAN", True, 1))
+def test_end_cannot_admit_invalid_or_missing_publication_permission(publication_verdict):
+    payload = _clean_payload() | {"publication_verdict": publication_verdict}
+    admission = parse_advisor_checkpoint_response(json.dumps(payload), phase="end")
+    assert not admission.schema_valid
+    assert admission.response is None
+    missing = parse_advisor_checkpoint_response(json.dumps(_clean_payload()), phase="end")
+    assert not missing.schema_valid
+    assert missing.response is None
+
+
+def test_end_withhold_requires_a_reason_and_has_a_distinct_six_field_schema():
+    admission = parse_advisor_checkpoint_response(json.dumps(_clean_payload() | {"publication_verdict": "WITHHOLD"}), phase="end")
+    assert admission.schema_valid
+    assert admission.response is None
+    schema = advisor_response_format(phase="end")["json_schema"]["schema"]
+    assert set(schema["required"]) == {"verdict", "category", "steps", "findings", "note", "publication_verdict"}
+    assert schema["additionalProperties"] is False
+
+
 def test_valid_flagged_structured_response_is_admitted() -> None:
     admission = parse_advisor_checkpoint_response(
         json.dumps(
@@ -29,7 +67,8 @@ def test_valid_flagged_structured_response_is_admitted() -> None:
                 "findings": "Technical repair finding at https://technical.example.",
                 "note": "Change classify.template.",
             }
-        )
+        ),
+        phase="early",
     )
     assert admission.schema_valid is True
     assert admission.response is not None
@@ -40,7 +79,7 @@ def test_valid_flagged_structured_response_is_admitted() -> None:
 
 
 def test_valid_clean_structured_response_is_admitted() -> None:
-    admission = parse_advisor_checkpoint_response(json.dumps(_clean_payload()))
+    admission = parse_advisor_checkpoint_response(json.dumps(_clean_payload()), phase="early")
     assert admission.schema_valid is True
     assert admission.response is not None
     assert admission.response.model_dump() == _clean_payload()
@@ -50,7 +89,7 @@ def test_valid_clean_structured_response_is_admitted() -> None:
 def test_all_owned_categories_are_admitted(category: str) -> None:
     payload = _clean_payload()
     payload["category"] = category
-    admission = parse_advisor_checkpoint_response(json.dumps(payload))
+    admission = parse_advisor_checkpoint_response(json.dumps(payload), phase="early")
     assert admission.schema_valid is True
     assert admission.response is not None
     assert admission.response.category == category
@@ -60,7 +99,7 @@ def test_all_owned_categories_are_admitted(category: str) -> None:
 def test_each_schema_field_is_required(field: str) -> None:
     payload = _clean_payload()
     del payload[field]
-    admission = parse_advisor_checkpoint_response(json.dumps(payload))
+    admission = parse_advisor_checkpoint_response(json.dumps(payload), phase="early")
     assert admission.schema_valid is False
     assert admission.response is None
 
@@ -90,14 +129,14 @@ def test_each_schema_field_is_required(field: str) -> None:
 def test_schema_rejects_wrong_types_values_and_extra_fields(field: str, value: object) -> None:
     payload = _clean_payload()
     payload[field] = value
-    admission = parse_advisor_checkpoint_response(json.dumps(payload))
+    admission = parse_advisor_checkpoint_response(json.dumps(payload), phase="early")
     assert admission.schema_valid is False
     assert admission.response is None
 
 
 @pytest.mark.parametrize("text", ["", "CLEAN", "FLAGGED: fix classify", "{", "[]", "null", "42", '"CLEAN"'])
 def test_non_object_or_malformed_reply_is_not_schema_valid(text: str) -> None:
-    admission = parse_advisor_checkpoint_response(text)
+    admission = parse_advisor_checkpoint_response(text, phase="early")
     assert admission.schema_valid is False
     assert admission.response is None
 
@@ -115,7 +154,7 @@ def test_non_object_or_malformed_reply_is_not_schema_valid(text: str) -> None:
 )
 def test_duplicate_fields_never_overwrite_a_verdict(duplicate: str) -> None:
     text = "{" + duplicate + ',"category":"other","steps":[],"findings":"repair","note":null}'
-    admission = parse_advisor_checkpoint_response(text)
+    admission = parse_advisor_checkpoint_response(text, phase="early")
     assert admission.schema_valid is False
     assert admission.response is None
 
@@ -123,7 +162,7 @@ def test_duplicate_fields_never_overwrite_a_verdict(duplicate: str) -> None:
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity", "1e999"])
 def test_non_finite_json_values_are_rejected(constant: str) -> None:
     text = '{"verdict":"CLEAN","category":"other","steps":[],"findings":' + constant + ',"note":null}'
-    admission = parse_advisor_checkpoint_response(text)
+    admission = parse_advisor_checkpoint_response(text, phase="early")
     assert admission.schema_valid is False
     assert admission.response is None
 
@@ -140,7 +179,7 @@ def test_non_finite_json_values_are_rejected(constant: str) -> None:
 def test_escaped_unpaired_surrogates_are_rejected(field: str, value: object) -> None:
     payload = _clean_payload() | {"verdict": "FLAGGED", "findings": "Repair classify."}
     payload[field] = value
-    admission = parse_advisor_checkpoint_response(json.dumps(payload))
+    admission = parse_advisor_checkpoint_response(json.dumps(payload), phase="early")
     assert admission.schema_valid is False
     assert admission.response is None
 
@@ -152,7 +191,7 @@ def test_paired_surrogate_escapes_are_admitted_as_unicode_scalars() -> None:
         "note": "Change \U0001f600",
         "steps": ["classify\U0001f600"],
     }
-    admission = parse_advisor_checkpoint_response(json.dumps(payload))
+    admission = parse_advisor_checkpoint_response(json.dumps(payload), phase="early")
     assert admission.schema_valid is True
     assert admission.response is not None
     assert admission.response.model_dump() == payload
@@ -170,7 +209,7 @@ def test_paired_surrogate_escapes_are_admitted_as_unicode_scalars() -> None:
 )
 def test_semantic_failures_remain_distinguishable_from_schema_failures(changes: dict[str, object]) -> None:
     payload = _clean_payload() | changes
-    admission = parse_advisor_checkpoint_response(json.dumps(payload))
+    admission = parse_advisor_checkpoint_response(json.dumps(payload), phase="early")
     assert admission.schema_valid is True
     assert admission.response is None
 
@@ -182,7 +221,7 @@ def test_checkpoint_model_is_frozen() -> None:
 
 
 def test_response_format_uses_the_required_strict_owned_schema() -> None:
-    response_format = advisor_response_format()
+    response_format = advisor_response_format(phase="early")
     assert response_format == {
         "type": "json_schema",
         "json_schema": {

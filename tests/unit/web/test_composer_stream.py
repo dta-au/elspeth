@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
+from starlette.types import Message
 
 from elspeth.web.composer_stream import BoundedComposerStreamResponse, ComposerStreamCapacityError, ComposerStreamPermits
 
@@ -206,6 +208,8 @@ async def test_actual_default_read_auth_deadline_retains_pending_custody(phase: 
         assert messages == []
     else:
         await response({}, receive, send)
+        assert [message["type"] for message in messages] == ["http.response.start", "http.response.body"]
+        assert messages[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
     elapsed = asyncio.get_running_loop().time() - start
     assert 1.95 <= elapsed < 5.0
     assert permits.occupied == 1
@@ -237,6 +241,196 @@ async def test_expiry_at_actual_frame_invocation_prevents_new_data_send() -> Non
     response = BoundedComposerStreamResponse(frames=frames(), authorize=authorize, permits=permits, permit=permit, may_send=lambda: False)
     await response({}, receive, send)
     assert [message["body"] for message in messages if message["type"] == "http.response.body"] == [b""]
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert permits.occupied == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ["read", "authorization", "send"])
+async def test_writable_stream_closes_after_bounded_io_failure(failure_phase: str) -> None:
+    permits = ComposerStreamPermits()
+    permit = permits.acquire("op", "alice")
+    messages: list[Message] = []
+    checks = 0
+
+    async def authorize() -> bool:
+        nonlocal checks
+        checks += 1
+        if failure_phase == "authorization" and checks > 1:
+            raise SQLAlchemyError("synthetic unavailable read")
+        return True
+
+    async def frames():
+        if failure_phase == "read":
+            raise SQLAlchemyError("synthetic unavailable read")
+        yield b"data: progress\n\n"
+
+    async def send(message: Message) -> None:
+        if failure_phase == "send" and message["type"] == "http.response.body" and message["body"]:
+            raise TimeoutError
+        messages.append(message)
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    await BoundedComposerStreamResponse(frames=frames(), authorize=authorize, permits=permits, permit=permit)({}, receive, send)
+    assert messages == [
+        {"type": "http.response.start", "status": 200, "headers": messages[0]["headers"]},
+        {"type": "http.response.body", "body": b"", "more_body": False},
+    ]
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert permits.occupied == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_phase", ["headers", "frame", "final"])
+async def test_timed_out_resistant_send_never_overlaps_or_retries(blocked_phase: str) -> None:
+    permits = ComposerStreamPermits()
+    permit = permits.acquire("op", "alice")
+    release = asyncio.Event()
+    messages: list[Message] = []
+    active = False
+
+    async def authorize() -> bool:
+        return True
+
+    async def frames():
+        yield b"data: progress\n\n"
+
+    async def send(message: Message) -> None:
+        nonlocal active
+        assert not active, "ASGI sends must never overlap"
+        active = True
+        messages.append(message)
+        phase = "headers" if message["type"] == "http.response.start" else "frame" if message["body"] else "final"
+        try:
+            if phase == blocked_phase:
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        continue
+        finally:
+            active = False
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    await BoundedComposerStreamResponse(frames=frames(), authorize=authorize, permits=permits, permit=permit, send_deadline=0.01)(
+        {}, receive, send
+    )
+    assert active
+    assert permits.occupied == 1
+    assert len(messages) == {"headers": 1, "frame": 2, "final": 3}[blocked_phase]
+    release.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not active
+    assert permits.occupied == 0
+    assert len(messages) == {"headers": 1, "frame": 2, "final": 3}[blocked_phase]
+
+
+@pytest.mark.asyncio
+async def test_peer_disconnect_during_read_does_not_attempt_final_body() -> None:
+    permits = ComposerStreamPermits()
+    permit = permits.acquire("op", "alice")
+    release = asyncio.Event()
+    reading = asyncio.Event()
+    messages: list[Message] = []
+
+    async def authorize() -> bool:
+        return True
+
+    async def frames():
+        reading.set()
+        await release.wait()
+        yield b"data: private\n\n"
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    async def receive() -> Message:
+        await reading.wait()
+        return {"type": "http.disconnect"}
+
+    await BoundedComposerStreamResponse(frames=frames(), authorize=authorize, permits=permits, permit=permit)({}, receive, send)
+    assert [message["type"] for message in messages] == ["http.response.start"]
+    assert permits.occupied == 1
+    release.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert permits.occupied == 0
+    assert [message["type"] for message in messages] == ["http.response.start"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_failure", [False, True])
+@pytest.mark.parametrize("ending", ["normal", "revocation", "expiry", "read_failure"])
+async def test_stream_attempts_final_body_exactly_once(final_failure: bool, ending: str) -> None:
+    permits = ComposerStreamPermits()
+    permit = permits.acquire("op", "alice")
+    messages: list[Message] = []
+    checks = 0
+
+    async def authorize() -> bool:
+        nonlocal checks
+        checks += 1
+        return ending != "revocation" or checks == 1
+
+    async def frames():
+        if ending == "read_failure":
+            raise SQLAlchemyError("synthetic unavailable read")
+        yield b"data: progress\n\n"
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+        if final_failure and message["type"] == "http.response.body" and not message["more_body"]:
+            raise TimeoutError
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    response = BoundedComposerStreamResponse(
+        frames=frames(), authorize=authorize, permits=permits, permit=permit, may_send=lambda: ending != "expiry"
+    )
+    try:
+        await response({}, receive, send)
+    except TimeoutError:
+        pytest.fail("A failed closing send must remain a bounded transport failure")
+    assert [message["type"] for message in messages] == ["http.response.start"] + ["http.response.body"] * (2 if ending == "normal" else 1)
+    if ending == "normal":
+        assert messages[1] == {"type": "http.response.body", "body": b"data: progress\n\n", "more_body": True}
+    assert messages[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert permits.occupied == 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_frame_error_propagates_without_claiming_stream_completion() -> None:
+    permits = ComposerStreamPermits()
+    permit = permits.acquire("op", "alice")
+    messages: list[Message] = []
+
+    async def authorize() -> bool:
+        return True
+
+    async def frames():
+        yield b"data: progress\n\n"
+        raise ValueError("synthetic programming error")
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    with pytest.raises(ValueError, match="synthetic programming error"):
+        await BoundedComposerStreamResponse(frames=frames(), authorize=authorize, permits=permits, permit=permit)({}, receive, send)
+    assert [message["type"] for message in messages] == ["http.response.start", "http.response.body"]
+    assert messages[-1]["more_body"] is True
     for _ in range(5):
         await asyncio.sleep(0)
     assert permits.occupied == 0

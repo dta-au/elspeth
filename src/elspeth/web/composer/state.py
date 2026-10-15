@@ -103,7 +103,13 @@ from elspeth.plugins.transforms.llm.base import (
     multi_query_undeclared_columns_message,
 )
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
-from elspeth.plugins.transforms.llm.multi_query import QueryDefinition, resolve_queries
+from elspeth.plugins.transforms.llm.multi_query import (
+    OrderedQueryPlanError,
+    QueryDefinition,
+    QueryInputMode,
+    compile_ordered_query_plan,
+    resolve_queries,
+)
 from elspeth.web.composer._validation_probe import (
     DeferredBlobContractProbe,
     is_inline_content_reference,
@@ -4373,6 +4379,18 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
 
     declared_set = frozenset(declared_names)
     covering = set(declared_names)
+    if node.options.get("query_input_mode") == "ordered":
+        try:
+            definitions: dict[str, QueryDefinition] | list[QueryDefinition] = TypeAdapter(
+                dict[str, QueryDefinition] | list[QueryDefinition]
+            ).validate_python(LLMConfig._inject_mapping_query_names(deep_thaw(queries)))
+            specs = resolve_queries(definitions, allow_empty_inputs=True)
+            response_field = TypeAdapter(str).validate_python(node.options.get("response_field", "llm_response"))
+            plan = compile_ordered_query_plan(tuple(specs), response_field)
+            covering.update(plan.generated_fields)
+        except ValueError:
+            # The generated-input validation below owns this diagnostic.
+            return ()
     image_inputs = node.options.get("image_inputs")
     if isinstance(image_inputs, Sequence) and not isinstance(image_inputs, (str, bytes)):
         for image_spec in image_inputs:
@@ -4435,12 +4453,22 @@ def _validate_multi_query_generated_input_requirements(node: NodeSpec) -> tuple[
         return ()
     queries = node.options.get("queries")
     if queries is None:
+        if node.options.get("query_input_mode") == "ordered":
+            return (
+                ValidationEntry(
+                    component=f"node:{node.id}",
+                    message="ordered query_input_mode requires list-form queries",
+                    severity="high",
+                    error_code="plugin_options_invalid",
+                ),
+            )
         return ()
     try:
         definitions: dict[str, QueryDefinition] | list[QueryDefinition] = TypeAdapter(
             dict[str, QueryDefinition] | list[QueryDefinition]
         ).validate_python(LLMConfig._inject_mapping_query_names(deep_thaw(queries)))
-        specs = resolve_queries(definitions)
+        mode = TypeAdapter(QueryInputMode).validate_python(node.options.get("query_input_mode", "upstream"))
+        specs = resolve_queries(definitions, allow_empty_inputs=mode == QueryInputMode.ORDERED)
         required_names: list[str] | None = TypeAdapter(list[str] | None).validate_python(
             deep_thaw(node.options.get("required_input_fields"))
         )
@@ -4460,11 +4488,24 @@ def _validate_multi_query_generated_input_requirements(node: NodeSpec) -> tuple[
         for template in effective_templates:
             if template is not None:
                 required.update(multi_query_source_row_columns(INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)))
-    except (ValueError, TemplateSyntaxError):
+        if mode == QueryInputMode.ORDERED:
+            compile_ordered_query_plan(
+                tuple(specs),
+                response_field,
+                frozenset(required),
+                list_form=isinstance(definitions, list),
+                pool_size=TypeAdapter(int).validate_python(node.options.get("pool_size", 1)),
+            )
+            return ()
+    except (ValueError, TemplateSyntaxError) as exc:
         return (
             ValidationEntry(
                 component=f"node:{node.id}",
-                message="Invalid multi-query options. Check queries, input declarations, schema, image_inputs and prompt templates against the plugin schema.",
+                message=(
+                    str(exc)
+                    if isinstance(exc, OrderedQueryPlanError)
+                    else "Invalid multi-query options. Check queries, input declarations, schema, image_inputs and prompt templates against the plugin schema."
+                ),
                 severity="high",
                 error_code="plugin_options_invalid",
             ),

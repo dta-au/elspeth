@@ -6,16 +6,15 @@ material; it does not call an LLM or use OpenRouter or other API credentials.
 
 ## Prerequisite
 
-Install the RAG dependencies (or the complete optional dependency set) from
-the main checkout:
+ChromaDB is included in ELSPETH's base dependencies. Use the already-prepared
+environment, or install the locked base dependencies from the main checkout:
 
 ```bash
-uv pip install -e ".[rag]"
-# Alternatively: uv pip install -e ".[all]"
+uv sync --frozen
 ```
 
 Worktrees share the main checkout's `.venv`; use the already-prepared
-environment there rather than running either install command from a worktree.
+environment there rather than running the install command from a worktree.
 
 ## Run
 

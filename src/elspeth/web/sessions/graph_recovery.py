@@ -7,6 +7,7 @@ completion metadata never transfer execution permission to a restored draft.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import Connection, select
@@ -20,6 +21,9 @@ from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import composition_states_table
 from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
 from elspeth.web.sessions.state_envelope import unwrap_state_column
+
+if TYPE_CHECKING:
+    from elspeth.web.execution.completion_gates import CompletionGateFacts
 
 
 class GraphRecoveryTargetUnavailable(ValueError):
@@ -50,12 +54,14 @@ class CompositionGraphRead:
     head: CompositionStateHead
     record: CompositionStateRecord | None
     hydration_error: str | None = None
+    effective_completion_gates: CompletionGateFacts | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class GraphRecoveryAdmission:
     context: GraphRecoveryContext
     record: CompositionStateRecord | None
+    effective_completion_gates: CompletionGateFacts | None = None
 
 
 @dataclass(frozen=True, slots=True)

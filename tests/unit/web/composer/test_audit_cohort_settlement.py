@@ -214,7 +214,9 @@ async def _drive_turn_then_provider_timeout(
     """Turn 1 commits a tool turn inline; turn 2's provider call times out."""
     responses = [_metadata_tool_response("call_turn1_metadata", "Committed inline")]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         if responses:
             return responses.pop(0)
         raise TimeoutError
@@ -517,10 +519,25 @@ async def test_planner_decline_path_cohort_is_all_or_nothing_at_every_write_inde
 
     if fail_at is None:
         result = await _plan_and_stage_empty(service, result_session_id, recorder)
-        assert result.message == "I cannot build that from the available components."
+        assert "completion review could not run within the existing request limits" in result.message
+        assert "I cannot build that from the available components." not in result.message
         rows = _chat_rows(sessions_service, result_session_id)
         assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
-        assert injector.calls == 2 * len(_PLANNER_COHORT)
+        stored = await sessions_service.get_messages(UUID(result_session_id), limit=None)
+        withheld = [row for row in stored if _envelope_kind({"tool_calls": row.tool_calls}) == "composer_withheld_reply"]
+        assert len(withheld) == 1
+        assert withheld[0].role == "audit"
+        assert withheld[0].content == "I cannot build that from the available components."
+        assert withheld[0].tool_calls[0]["origin"] == "advisor_publication_withheld"
+        publications = [row for row in stored if _envelope_kind({"tool_calls": row.tool_calls}) == "advisor_terminal_publication_audit"]
+        assert len(publications) == 1 and publications[0].role == "audit"
+        assert publications[0].tool_calls[0]["publication"] == {
+            "branch": "terminal_block",
+            "reason": "budget_exhausted",
+            "preflight_shape": "absent",
+            "findings_backend_authored": False,
+        }
+        assert injector.calls == 2 * len(_PLANNER_COHORT) + len(withheld) + len(publications)
         return
 
     with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):

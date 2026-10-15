@@ -16,6 +16,8 @@ def test_audit_outcome_success_shape():
     outcome = AuditOutcome(
         assistant_id="abc",
         unwind_audit_failed=False,
+        checkpoint_disposition="empty",
+        checkpoint=None,
     )
     assert outcome.assistant_id == "abc"
     assert outcome.unwind_audit_failed is False
@@ -28,6 +30,8 @@ def test_audit_outcome_unwind_failure_shape():
     outcome = AuditOutcome(
         assistant_id=None,
         unwind_audit_failed=True,
+        checkpoint_disposition="unavailable",
+        checkpoint=None,
     )
     assert outcome.assistant_id is None
     assert outcome.unwind_audit_failed is True
@@ -43,6 +47,8 @@ def test_audit_outcome_rejects_ambiguous_shape():
         AuditOutcome(
             assistant_id="abc",  # produced by a successful path
             unwind_audit_failed=True,  # claimed by an unwind path
+            checkpoint_disposition="unavailable",
+            checkpoint=None,
         )
 
 
@@ -53,7 +59,7 @@ def test_audit_outcome_no_tier1_violation_field():
     import dataclasses
 
     fields = {f.name for f in dataclasses.fields(AuditOutcome)}
-    assert fields == {"assistant_id", "unwind_audit_failed", "current_state_id"}
+    assert fields == {"assistant_id", "unwind_audit_failed", "current_state_id", "checkpoint_disposition", "checkpoint"}
 
 
 def test_redacted_tool_row_with_state_advance():

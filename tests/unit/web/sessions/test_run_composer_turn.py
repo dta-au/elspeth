@@ -18,11 +18,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -33,6 +37,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.progress import ComposerProgressRegistry, ComposerRequestLease
 from elspeth.web.composer.protocol import (
@@ -40,7 +45,9 @@ from elspeth.web.composer.protocol import (
     ComposerResult,
     ComposerRuntimePreflightError,
     PipelineCommitIntent,
+    RetainedOperationContext,
 )
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost
@@ -222,6 +229,307 @@ async def _row(job: _Job) -> ComposerOperationRecord:
 
 def _user_and_assistant_roles(messages: Any) -> list[str]:
     return [message.role for message in messages if message.role in {"user", "assistant"}]
+
+
+@pytest.mark.asyncio
+async def test_required_retained_history_reads_existing_authority_and_reaches_compose(tmp_path: Path) -> None:
+    from elspeth.web.required_work import RequiredWorkSource
+
+    app, sessions = _make_app(tmp_path)
+    composer = _make_composer_mock("Explanation")
+    app.state.composer_service = composer
+    session = await sessions.create_session("alice", "Existing title", "local")
+    authority = app.state.composer_async_operation_authority
+    assert type(authority) is ComposerAsyncOperationAuthority
+    assert composer_app_services(app).composer_operation_authority is authority
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Explain") as job:
+        record = await _run(app, job)
+        assert record.status == "completed"
+        context = composer.compose.await_args.kwargs["retained_operation_context"]
+        assert type(context) is RetainedOperationContext
+        assert context.session_id == session.id and context.actor_user_id == "alice"
+        assert context.availability == "available" and context.outcomes == () and not context.has_more
+        tickets = [
+            ticket
+            for ticket in job.observation.required_work.tickets
+            if ticket.key.source in (RequiredWorkSource.RETAINED_OPERATION_READ_SQL, RequiredWorkSource.RETAINED_OPERATION_READ_PROJECTION)
+        ]
+        assert len(tickets) == 2
+        assert all(ticket.complete and not ticket.errors for ticket in tickets)
+
+
+@pytest.mark.asyncio
+async def test_required_retained_history_is_bounded_and_actor_session_scoped(tmp_path: Path) -> None:
+    app, sessions = _make_app(tmp_path)
+    composer = _make_composer_mock("Prior failures do not establish the current request's effects.")
+    app.state.composer_service = composer
+    session = await sessions.create_session("alice", "Existing title", "local")
+    other = await sessions.create_session("alice", "Other session", "local")
+    authority = app.state.composer_async_operation_authority
+    operation_ids = set()
+    for _ in range(4):
+        operation_id = str(uuid.uuid4())
+        request = SendMessageRequest(operation_id=operation_id, content="PRIVATE_HISTORY_CANARY")
+        await run_sync_in_worker(
+            authority.admit,
+            quota=app.state.rate_limiter.composer_admission,
+            session_id=session.id,
+            operation_id=operation_id,
+            kind="compose_message",
+            request_hash=composer_operation_request_hash(session_id=session.id, kind="compose_message", request=request),
+            actor_user_id="alice",
+            auth_provider_type="local",
+            request_id=None,
+            base_state_id=None,
+            request_json=request.model_dump_json(),
+            deadline_seconds=85.0,
+            max_nonterminal=64,
+        )
+        stopped = await run_sync_in_worker(
+            authority.request_cancel, session_id=session.id, operation_id=operation_id, cancelled_failure=request_cancelled_error
+        )
+        assert stopped.status == "failed"
+        operation_ids.add(operation_id)
+    for read_session, actor in ((other.id, "alice"), (session.id, "another-actor")):
+        outcomes, cursor = await run_sync_in_worker(authority.list_failure_outcomes, session_id=read_session, actor_user_id=actor, limit=3)
+        assert outcomes == () and cursor is None
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Explain earlier failures") as job:
+        await _run(app, job)
+        context = composer.compose.await_args.kwargs["retained_operation_context"]
+        assert len(context.outcomes) == 3 and context.has_more
+        assert {outcome.operation_id for outcome in context.outcomes} < operation_ids
+        assert all(outcome.failure_code == "request_cancelled" and outcome.saved_revisions.count == 0 for outcome in context.outcomes)
+        assert "PRIVATE_HISTORY_CANARY" not in context.provider_message()
+        assert job.turn.operation_id not in context.provider_message()
+
+
+@pytest.mark.asyncio
+async def test_retained_history_read_consumes_original_deadline_before_dispatch(tmp_path: Path, monkeypatch) -> None:
+    app, sessions = _make_app(tmp_path)
+    composer = _make_composer_mock("Must not dispatch")
+    app.state.composer_service = composer
+    session = await sessions.create_session("alice", "Existing title", "local")
+    authority = app.state.composer_async_operation_authority
+    original = authority.list_failure_outcomes
+    remaining_at_read = []
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Explain", budget_seconds=0.3) as job:
+
+        def delayed_read(**kwargs):
+            remaining_at_read.append(job.budget_anchor.remaining_seconds(monotonic_now=time.monotonic()))
+            time.sleep(0.35)
+            return original(**kwargs)
+
+        monkeypatch.setattr(authority, "list_failure_outcomes", delayed_read)
+        with pytest.raises(ComposerTurnDeadlineExpired):
+            await _run(app, job)
+        assert len(remaining_at_read) == 1 and remaining_at_read[0] > 0
+        composer.compose.assert_not_awaited()
+        assert job.observation.required_work.all_completed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["sql", "projection"])
+async def test_required_retained_history_failure_is_not_harmless_unavailability(tmp_path: Path, monkeypatch, phase: str) -> None:
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+
+    from elspeth.web.required_work import RequiredWorkSource, reduce_composer_failures
+
+    app, sessions = _make_app(tmp_path)
+    composer = _make_composer_mock("Must not dispatch")
+    app.state.composer_service = composer
+    session = await sessions.create_session("alice", "Existing title", "local")
+    failure = (
+        OperationalError("synthetic retained history SELECT", {}, RuntimeError("synthetic storage failure"))
+        if phase == "sql"
+        else AuditIntegrityError("synthetic history projection corruption")
+    )
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Explain") as job:
+        if phase == "sql":
+
+            def fail_select(conn, cursor, statement, parameters, context, executemany):
+                if statement.lstrip().upper().startswith("SELECT") and "composer_async_operations" in statement and "failed" in parameters:
+                    raise failure
+
+            event.listen(app.state.session_engine, "before_cursor_execute", fail_select)
+        else:
+            original = RetainedOperationContext.__post_init__
+
+            def fail_projection(context):
+                original(context)
+                raise failure
+
+            monkeypatch.setattr(RetainedOperationContext, "__post_init__", fail_projection)
+        try:
+            with pytest.raises(type(failure)) as raised:
+                await _run(app, job)
+        finally:
+            if phase == "sql":
+                event.remove(app.state.session_engine, "before_cursor_execute", fail_select)
+        assert raised.value is failure
+        composer.compose.assert_not_awaited()
+        required = job.observation.required_work
+        source = RequiredWorkSource.RETAINED_OPERATION_READ_SQL if phase == "sql" else RequiredWorkSource.RETAINED_OPERATION_READ_PROJECTION
+        (ticket,) = [ticket for ticket in required.tickets if ticket.key.source is source]
+        assert ticket.complete and ticket.errors == (failure,)
+        assert reduce_composer_failures(required.failure_receipts()).winner.original_root is failure
+
+
+@pytest.mark.asyncio
+async def test_retained_history_repeated_cancellation_waits_for_actual_sql(tmp_path: Path, monkeypatch) -> None:
+    app, sessions = _make_app(tmp_path)
+    composer = _make_composer_mock("Must not dispatch")
+    app.state.composer_service = composer
+    session = await sessions.create_session("alice", "Existing title", "local")
+    authority = app.state.composer_async_operation_authority
+    original = authority.list_failure_outcomes
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def blocked_read(**kwargs):
+        entered.set()
+        assert release.wait(5), "synthetic retained read was not released"
+        try:
+            return original(**kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(authority, "list_failure_outcomes", blocked_read)
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Explain") as job:
+        task = asyncio.create_task(_run(app, job))
+        try:
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert entered.is_set()
+            first, second = object(), object()
+            task.cancel(first)
+            await asyncio.sleep(0.02)
+            assert not task.done() and not finished.is_set()
+            task.cancel(second)
+            await asyncio.sleep(0.02)
+            assert not task.done() and not finished.is_set()
+        finally:
+            release.set()
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await task
+        assert finished.is_set()
+        assert [leaf.args[0] for leaf in raised.value.exceptions] == [first, second]
+        composer.compose.assert_not_awaited()
+        assert job.observation.required_work.all_completed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sql_fails", [False, True])
+async def test_retained_history_registered_child_cancel_hands_original_after_actual_sql(
+    tmp_path: Path, monkeypatch, sql_fails: bool
+) -> None:
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+
+    app, sessions = _make_app(tmp_path)
+    composer = _make_composer_mock("Must not dispatch")
+    app.state.composer_service = composer
+    session = await sessions.create_session("alice", "Existing title", "local")
+    authority = app.state.composer_async_operation_authority
+    original_finish = composer_turn.run_required_sql_finish_once
+    original_join = composer_turn._join_freeform_owned_task
+    child_cancellations = []
+    outer_cancellations = []
+
+    async def capture_finish(*args, **kwargs):
+        outcome = await original_finish(*args, **kwargs)
+        child_cancellations.extend(outcome.deferred_cancellations)
+        return outcome
+
+    async def capture_join(task, **kwargs):
+        result = await original_join(task, **kwargs)
+        if task.get_name() == "composer-retained-operation-history":
+            outer_cancellations.extend(kwargs["cancellation_observations"])
+        return result
+
+    monkeypatch.setattr(composer_turn, "run_required_sql_finish_once", capture_finish)
+    monkeypatch.setattr(composer_turn, "_join_freeform_owned_task", capture_join)
+    read = authority.list_failure_outcomes
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    sql_failure = OperationalError("synthetic retained SELECT", {}, RuntimeError("synthetic SQL failure"))
+
+    def blocked_read(**kwargs):
+        entered.set()
+        assert release.wait(5)
+        try:
+            return read(**kwargs)
+        finally:
+            finished.set()
+
+    def fail_select(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT") and "composer_async_operations" in statement and "failed" in parameters:
+            raise sql_failure
+
+    monkeypatch.setattr(authority, "list_failure_outcomes", blocked_read)
+    children = []
+    create_task = SessionOperationLease.create_task
+
+    def register(lease, coroutine, *, name):
+        child = create_task(lease, coroutine, name=name)
+        if name == "composer-retained-operation-history":
+            children.append(child)
+        return child
+
+    monkeypatch.setattr(SessionOperationLease, "create_task", register)
+    child_marker, first_outer, second_outer = object(), object(), object()
+    observed = None
+    close_error = None
+    try:
+        async with _running_job(app, sessions, session.id, kind="compose_message", content="Explain") as job:
+            if sql_fails:
+                event.listen(app.state.session_engine, "before_cursor_execute", fail_select)
+            task = asyncio.create_task(_run(app, job))
+            try:
+                for _ in range(200):
+                    if entered.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                assert entered.is_set() and len(children) == 1
+                children[0].cancel(child_marker)
+                await asyncio.sleep(0.02)
+                task.cancel(first_outer)
+                await asyncio.sleep(0.02)
+                task.cancel(second_outer)
+                await asyncio.sleep(0.02)
+                assert not finished.is_set() and not task.done()
+            finally:
+                release.set()
+            try:
+                await task
+            except BaseException as error:
+                observed = error
+            finally:
+                if sql_fails:
+                    event.remove(app.state.session_engine, "before_cursor_execute", fail_select)
+            assert finished.is_set()
+            assert children[0].done() and not children[0].cancelled()
+            assert children[0].exception() is None
+            assert job.observation.required_work.all_completed
+    except BaseException as error:
+        close_error = error
+    finally:
+        release.set()
+    assert close_error is None, "History child failures must not replay during lease close"
+    assert isinstance(observed, BaseExceptionGroup)
+
+    def leaves(error):
+        if isinstance(error, BaseExceptionGroup):
+            return [leaf for nested in error.exceptions for leaf in leaves(nested)]
+        return [error]
+
+    originals = leaves(observed)
+    cancellations = [leaf for leaf in originals if isinstance(leaf, asyncio.CancelledError)]
+    assert [leaf.args[0] for leaf in cancellations] == [child_marker, first_outer, second_outer]
+    assert len(child_cancellations) == 1 and len(outer_cancellations) == 2
+    assert all(actual is original for actual, original in zip(cancellations, [*child_cancellations, *outer_cancellations], strict=True))
+    assert [leaf for leaf in originals if isinstance(leaf, OperationalError)] == ([sql_failure] if sql_fails else [])
+    composer.compose.assert_not_awaited()
 
 
 def test_turn_input_refuses_a_kind_request_mismatch() -> None:
@@ -410,6 +718,898 @@ class _CancelCommittingComposer:
             raise self._raise_after
         assert self._result is not None
         return self._result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call_limit", "malformed_first", "expected_end_calls", "admitted", "cost_cap", "end_cost", "handoff"),
+    [
+        pytest.param(1, False, 0, False, "5", 0.001, "valid", id="no_call_headroom"),
+        pytest.param(2, False, 1, True, "5", 0.001, "valid", id="one_end_admit"),
+        pytest.param(2, True, 1, False, "5", 0.001, "valid", id="one_end_malformed"),
+        pytest.param(3, True, 2, True, "5", 0.001, "valid", id="two_end_format_retry"),
+        pytest.param(3, False, 0, False, "0.001", 0.001, "valid", id="cost_exhausted_before_end"),
+        pytest.param(3, False, 1, False, "0.01", 0.02, "valid", id="cost_overflow_end"),
+        pytest.param(3, False, 1, False, "0.01", None, "valid", id="cost_unknown_end"),
+        pytest.param(3, True, 1, False, "0.0015", 0.001, "valid", id="cost_malformed_consumed"),
+        pytest.param(3, False, 1, True, "0.002", 0.001, "valid", id="cost_exact_cap_admit"),
+        pytest.param(3, False, 0, False, "5", 0.001, "missing", id="missing_handoff_no_fresh_allowance"),
+        pytest.param(3, False, 0, False, "5", 0.001, "expired", id="expired_original_deadline"),
+        pytest.param(3, False, 0, False, "5", 0.001, "prior_unknown", id="prior_retry_cost_not_silently_zero"),
+    ],
+)
+async def test_actual_planner_decline_review_shares_call_budget_and_saved_terminal(
+    tmp_path: Path,
+    monkeypatch,
+    call_limit: int,
+    malformed_first: bool,
+    expected_end_calls: int,
+    admitted: bool,
+    cost_cap: str,
+    end_cost: float | None,
+    handoff: str,
+) -> None:
+    import litellm
+
+    from elspeth.web.composer import planning_application
+    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from elspeth.web.composer.pipeline_planner import PlannerDeclined
+    from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
+    from tests.unit.web.composer._helpers import _mock_catalog
+
+    app, sessions = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(
+        update={"composer_planner_max_provider_calls": call_limit, "composer_planner_max_cumulative_provider_cost": Decimal(cost_cap)}
+    )
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
+    )
+    # A small synthetic catalog has no omitted LLM catalog facts. It makes
+    # this ordinary DECLINE arm reachable without stubbing planner or END.
+    catalog = _mock_catalog()
+    catalog.list_transforms.return_value = []
+    composer = ComposerServiceImpl.for_trained_operator(
+        catalog=catalog, settings=app.state.settings, sessions_service=sessions, session_engine=app.state.session_engine
+    )
+    app.state.composer_service = composer
+    candidate = "REQUEST_DECLINE_CANARY: I cannot satisfy this request with the available components."
+    phases = []
+    actual_plan = planning_application.plan_pipeline
+
+    async def plan_with_handoff(**kwargs):
+        try:
+            return await actual_plan(**kwargs)
+        except PlannerDeclined as declined:
+            assert declined.continuation_budget is not None
+            if handoff == "missing":
+                declined.continuation_budget = None
+            elif handoff == "expired":
+                declined.continuation_budget.deadline = asyncio.get_running_loop().time() - 1.0
+            raise
+
+    if handoff != "valid":
+        monkeypatch.setattr(planning_application, "plan_pipeline", plan_with_handoff)
+
+    async def completion(**kwargs):
+        phase = "end" if "response_format" in kwargs else "planner"
+        phases.append(phase)
+        assert len(phases) <= call_limit, "Continuation dispatched beyond its original conservative attempt limit"
+        if phase == "planner":
+            if handoff == "prior_unknown" and len(phases) == 1:
+                raise litellm.ServiceUnavailableError("Synthetic provider retry", model=kwargs["model"], llm_provider="test")
+            assert phases == ["planner"] * (2 if handoff == "prior_unknown" else 1), "No new primary turn may repair declined final prose"
+            content = "DECLINE: " + candidate
+        else:
+            assert candidate in json.dumps(kwargs["messages"])
+            assert kwargs["max_tokens"] <= app.state.settings.composer_planner_max_completion_tokens
+            content = (
+                "not JSON"
+                if malformed_first and phases.count("end") == 1
+                else json.dumps(
+                    {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+                )
+            )
+        response = litellm.ModelResponse(
+            choices=[{"message": {"role": "assistant", "content": content, "tool_calls": None}, "index": 0, "finish_reason": "stop"}],
+            model=kwargs["model"],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001 if phase == "planner" else end_cost},
+        )
+        if phase == "end" and end_cost is None:
+            # The SDK constructor normalizes null counters to zero. Model an
+            # actually absent usage field; null cost with usable counters may
+            # legitimately be priced from the bundled catalog.
+            response.usage = None
+        return response
+
+    # This one explicit SDK replacement handles every planner AND END attempt.
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    session = await sessions.create_session("alice", "Existing title", "local")
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Build the requested pipeline.") as job:
+        record = await _run(app, job)
+    assert record.status == "completed"
+    response = MessageWithStateResponse.model_validate_json(record.result_json)
+    assert phases == [*(["planner"] * (2 if handoff == "prior_unknown" else 1)), *(["end"] * expected_end_calls)]
+    assert (candidate in response.message.content) is admitted
+    rows = await sessions.get_messages(session.id, limit=None)
+    calls = [envelope["call"] for _, envelope in _llm_call_audit_rows(rows)]
+    if end_cost is None:
+        assert calls[-1]["provider_cost"] is None
+        assert calls[-1]["provider_cost_source"] == "not_available"
+    public_rows = [row for row in rows if row.role == "assistant"]
+    assert any(candidate in row.content for row in public_rows) is admitted
+    private = [
+        envelope for row in rows if row.tool_calls for envelope in row.tool_calls if envelope.get("_kind") == COMPOSER_WITHHELD_REPLY_KIND
+    ]
+    assert bool(private) is (not admitted)
+    if private:
+        assert private[-1]["origin"] == "advisor_publication_withheld"
+        assert candidate not in json.dumps(_helpers._composer_chat_history(rows))
+    passes = [
+        envelope
+        for row in rows
+        if row.tool_calls
+        for envelope in row.tool_calls
+        if envelope.get("_kind") == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    ]
+    assert len(passes) == int(admitted)
+    assert not (await sessions.get_state_versions(session.id))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route,admit,read_all", (("primary", False, False), ("primary", True, False), ("planner", False, False), ("planner", False, True))
+)
+async def test_actual_inspection_review_controls_public_and_saved_equivalence_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, admit: bool, read_all: bool
+) -> None:
+    import litellm
+
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.composer.turn_effects import TurnEvidence
+    from tests.helpers.session_fences import fenced_operation_context
+    from tests.unit.web.composer._helpers import _mock_catalog
+
+    app, sessions = _make_app(tmp_path)
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
+    )
+    catalog = _mock_catalog()
+    catalog.list_transforms.return_value = []
+    composer = ComposerServiceImpl.for_trained_operator(
+        catalog=catalog, settings=app.state.settings, sessions_service=sessions, session_engine=app.state.session_engine
+    )
+    app.state.composer_service = composer
+    session = await sessions.create_session("alice", "Existing title", "local")
+    content = "name,score\n" + "ada,42\n" * 8_000
+    with fenced_operation_context(app.state.session_engine, str(session.id)) as context:
+        blob = await BlobServiceImpl(app.state.session_engine, app.state.settings.data_dir).create_blob(
+            session.id, "coverage.csv", content.encode(), "text/csv", session_operation_context=context
+        )
+    candidate = (
+        "PREFIX_SCOPE_CANARY: I inspected only the supplied prefix; the remainder is unreviewed."
+        if admit
+        else "UNSUPPORTED_EQUIVALENCE_CANARY: I inspected the entire file and verified that no rebuild is needed."
+    )
+    calls = []
+    selected_pages = []
+    reviews = []
+    actual_review = TurnEvidence.review_candidate
+
+    def capture_review(owner, **kwargs):
+        review = actual_review(owner, **kwargs)
+        reviews.append((kwargs.get("scope", "primary"), json.loads(review.payload_json)))
+        return review
+
+    async def complete(**kwargs):
+        calls.append(kwargs)
+        if "response_format" in kwargs:
+            assert candidate in json.dumps(kwargs["messages"])
+            body = json.dumps(
+                {
+                    "verdict": "FLAGGED",
+                    "category": "other",
+                    "steps": [],
+                    "findings": "Empty graph; inspection coverage alone cannot establish semantic whole-file equivalence.",
+                    "note": None,
+                    "publication_verdict": "ADMIT" if admit else "WITHHOLD",
+                }
+            )
+            tool_calls = None
+        else:
+            pages = [
+                json.loads(message["content"])["data"]
+                for message in kwargs["messages"]
+                if message["role"] == "tool" and message["tool_call_id"].startswith("inspect-page-")
+            ]
+            if not pages:
+                assert not selected_pages, "A later context lost its selected page; do not silently reread/replay"
+                body = None
+                tool_calls = [
+                    SimpleNamespace(
+                        id="inspect-page-1",
+                        function=SimpleNamespace(name="get_blob_content", arguments=json.dumps({"blob_id": str(blob.id)})),
+                    )
+                ]
+            else:
+                selected_pages.append(pages[-1])
+                if read_all and pages[-1]["next_offset_chars"] is not None:
+                    page = pages[-1]
+                    body = None
+                    tool_calls = [
+                        SimpleNamespace(
+                            id="inspect-page-2",
+                            function=SimpleNamespace(
+                                name="get_blob_content",
+                                arguments=json.dumps(
+                                    {
+                                        "blob_id": str(blob.id),
+                                        "offset_chars": page["next_offset_chars"],
+                                        "expected_content_hash": page["content_hash"],
+                                    }
+                                ),
+                            ),
+                        )
+                    ]
+                else:
+                    body = ("DECLINE: " if route == "planner" else "") + candidate
+                    tool_calls = None
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=body, tool_calls=tool_calls), finish_reason="tool_calls" if tool_calls else "stop"
+                )
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
+            model=kwargs["model"],
+        )
+
+    monkeypatch.setattr(TurnEvidence, "review_candidate", capture_review)
+    # Covers every reachable primary/planner/END SDK attempt in this test.
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    request = "Build the requested pipeline." if route == "planner" else f"Explain the inspection limits of blob {blob.id}."
+    async with _running_job(app, sessions, session.id, kind="compose_message", content=request) as job:
+        record = await _run(app, job)
+    assert record.status == "completed"
+    response = MessageWithStateResponse.model_validate_json(record.result_json)
+    rows = await sessions.get_messages(session.id, limit=None)
+    assert (candidate in response.message.content) is admit
+    assert any(candidate in row.content for row in rows if row.role == "assistant") is admit
+    # Checkpoints and gate facts can save revisions without an authored edit.
+    assert all(not row.sources and not row.nodes and not row.outputs for row in await sessions.get_state_versions(session.id))
+    assert selected_pages and reviews
+    prefix = selected_pages[0]
+    assert 0 < prefix["end_char"] < prefix["total_chars"] == len(content)
+    assert prefix["content"] == content[: prefix["end_char"]]
+    for scope, review in reviews:
+        inspection = review["inspection"]
+        assert scope == route
+        (coverage,) = inspection["currently_available"]
+        assert coverage["content_hash"] == prefix["content_hash"]
+        assert coverage["ranges"] == [[0, len(content) if read_all else prefix["end_char"]]]
+        assert coverage["complete"] is read_all
+        assert inspection["semantic_equivalence_established"] is False
+        assert review["saved_effects"]["net_changed"] is False
+        assert review["saved_effects"]["initial_authored_state_hash"] == review["saved_effects"]["latest_verified_authored_state_hash"]
+        assert review["saved_effects"]["changed_fields"] == []
+    assert len([call for call in calls if "response_format" in call]) == (1 if admit or route == "planner" else 2)
+    assert len([call for call in calls if "response_format" not in call]) == (3 if read_all or (not admit and route == "primary") else 2)
+    if read_all:
+        assert selected_pages[-1]["start_char"] == prefix["end_char"]
+        assert selected_pages[-1]["end_char"] == len(content)
+    if route == "primary":
+        canonical_results = [row.content for row in rows if row.role == "tool" and row.tool_call_id == "inspect-page-1"]
+    else:
+        canonical_results = [
+            envelope["invocation"]["result_canonical"]
+            for row in rows
+            for envelope in row.tool_calls or ()
+            if envelope.get("_kind") == "audit" and envelope["invocation"]["tool_name"] == "get_blob_content"
+        ]
+    assert len(canonical_results) == (2 if read_all else 1)
+    assert all("name,score" not in result for result in canonical_results)
+    retained_calls = [envelope["call"] for _, envelope in _llm_call_audit_rows(rows)]
+    for _, review in reviews:
+        call_id, messages_hash = review["inspection"]["current_candidate_call"]
+        matching_calls = [call for call in retained_calls if call["call_id"] == call_id]
+        assert len(matching_calls) == 1
+        assert matching_calls[0]["messages_hash"] == messages_hash
+        assert matching_calls[0]["status"] == "success"
+    if not admit:
+        assert "withheld" in response.message.content.lower()
+        assert candidate not in json.dumps(_helpers._composer_chat_history(rows))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("review_mode", ("clean_admit", "flagged_admit", "unavailable", "input_budget"))
+async def test_actual_proof_exhaustion_reviews_or_withholds_public_and_saved_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, review_mode: str
+) -> None:
+    import litellm
+
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.catalog.policy_view import PolicyCatalogView
+    from elspeth.web.composer.advisor_decision import AdvisorGatePassed
+    from elspeth.web.composer.tools import execute_tool
+    from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+    from tests.helpers.session_fences import fenced_operation_context
+    from tests.unit.web.composer._helpers import _mock_catalog
+
+    app, sessions = _make_app(tmp_path)
+    if review_mode == "input_budget":
+        app.state.settings = app.state.settings.model_copy(update={"composer_advisor_max_prompt_tokens": 1})
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
+    )
+    catalog = _mock_catalog()
+    catalog.list_transforms.return_value = []
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy_catalog = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    session = await sessions.create_session("alice", "Existing title", "local")
+    with fenced_operation_context(app.state.session_engine, str(session.id)) as context:
+        blob = await BlobServiceImpl(app.state.session_engine, app.state.settings.data_dir).create_blob(
+            session.id, "proof.csv", b"order_id,customer,price\nO-1,Alice,49.95\n", "text/csv", session_operation_context=context
+        )
+        state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+        for name, arguments in (
+            (
+                "set_source_from_blob",
+                {
+                    "blob_id": str(blob.id),
+                    "on_success": "out",
+                    "on_validation_failure": "discard",
+                    "options": {"schema": {"mode": "fixed", "fields": ["order_id: str"]}},
+                },
+            ),
+            (
+                "set_output",
+                {
+                    "sink_name": "out",
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {
+                        "path": "outputs/proof.json",
+                        "schema": {"mode": "observed"},
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                },
+            ),
+        ):
+            outcome = execute_tool(
+                name,
+                arguments,
+                state,
+                policy_catalog,
+                plugin_snapshot=snapshot,
+                data_dir=str(app.state.settings.data_dir),
+                session_engine=app.state.session_engine,
+                session_id=str(session.id),
+                session_operation_context=context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(app.state.session_engine),
+            )
+            assert outcome.success
+            state = outcome.updated_state
+        payload = state.to_dict()
+        await sessions.save_composition_state(
+            session.id,
+            CompositionStateData(
+                sources=payload["sources"],
+                nodes=payload["nodes"],
+                edges=payload["edges"],
+                outputs=payload["outputs"],
+                metadata_=payload["metadata"],
+                is_valid=True,
+            ),
+            provenance="session_seed",
+            session_operation_context=context,
+        )
+    composer = ComposerServiceImpl.for_trained_operator(
+        catalog=catalog, settings=app.state.settings, sessions_service=sessions, session_engine=app.state.session_engine
+    )
+    app.state.composer_service = composer
+    admitted = review_mode in ("clean_admit", "flagged_admit")
+    candidate = (
+        "PROOF_EXHAUSTED_EXPLANATION_CANARY: The name is saved, but the fixed schema still omits observed columns and execution remains blocked."
+        if admitted
+        else "PROOF_EXHAUSTED_UNREVIEWED_CANARY: Every requested change is complete and the pipeline is ready to run."
+    )
+    primary_calls = []
+    end_calls = []
+
+    async def complete(**kwargs):
+        if "response_format" in kwargs:
+            end_calls.append(kwargs)
+            assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
+            assert candidate in json.dumps(kwargs["messages"])
+            if review_mode == "unavailable":
+                raise ConnectionError("Synthetic unavailable proof END review")
+            assert review_mode != "input_budget", "No physical review fits the original configured input budget"
+            content = json.dumps(
+                {
+                    "verdict": "FLAGGED" if review_mode == "flagged_admit" else "CLEAN",
+                    "category": "other",
+                    "steps": [],
+                    "findings": "The proof remains blocked; the candidate explains that truthfully."
+                    if review_mode == "flagged_admit"
+                    else "",
+                    "note": None,
+                    "publication_verdict": "ADMIT",
+                }
+            )
+            calls = None
+        else:
+            primary_calls.append(kwargs)
+            assert len(primary_calls) <= 4, "Proof exhaustion must grant no extra repair allowance"
+            if len(primary_calls) == 1:
+                content = None
+                calls = [
+                    SimpleNamespace(
+                        id="saved-proof-name",
+                        function=SimpleNamespace(name="set_metadata", arguments=json.dumps({"patch": {"name": "Saved proof name"}})),
+                    )
+                ]
+            else:
+                content, calls = candidate, None
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=calls), finish_reason="tool_calls" if calls else "stop")
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
+            model=kwargs["model"],
+        )
+
+    # This finite seam covers every newly reachable primary and END SDK call.
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    async with _running_job(
+        app, sessions, session.id, kind="compose_message", content="Change the pipeline name and explain remaining blockers."
+    ) as job:
+        record = await _run(app, job)
+        result = job.observation.compose_result
+    assert record.status == "completed"
+    response = MessageWithStateResponse.model_validate_json(record.result_json)
+    assert result is not None and result.repair_turns_used == 2
+    assert not isinstance(result.advisor_gate_decision, AdvisorGatePassed)
+    assert result.state.metadata.name == "Saved proof name"
+    proof = result.runtime_preflight
+    assert proof is not None and not proof.is_valid
+    assert not proof.readiness.authoring_valid and not proof.readiness.completion_ready and not proof.readiness.execution_ready
+    assert {error.error_code for error in proof.errors} == {"proof_repair_exhausted"}
+    assert {blocker.code for blocker in proof.readiness.blockers} == {"proof_repair_exhausted"}
+    assert (candidate in response.message.content) is admitted
+    rows = await sessions.get_messages(session.id, limit=None)
+    assert any(candidate in row.content for row in rows if row.role == "assistant") is admitted
+    assert len(primary_calls) == 4
+    assert len(end_calls) == (1 if admitted else 4 if review_mode == "unavailable" else 0)
+    withheld = [
+        row
+        for row in rows
+        if row.role == "audit" and any(envelope.get("origin") == "advisor_publication_withheld" for envelope in row.tool_calls or ())
+    ]
+    assert bool(withheld) is (not admitted)
+    if not admitted:
+        assert "Saved" in response.message.content or "saved" in response.message.content
+        assert candidate not in json.dumps(_helpers._composer_chat_history(rows))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_site", ("end_transport", "end_cancel", "pass_audit"))
+async def test_actual_planner_decline_end_failure_preserves_audit_and_never_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_site: str
+) -> None:
+    import litellm
+
+    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from tests.unit.web.composer._helpers import _mock_catalog
+
+    app, sessions = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"composer_planner_max_provider_calls": 3})
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
+    )
+    catalog = _mock_catalog()
+    catalog.list_transforms.return_value = []
+    composer = ComposerServiceImpl.for_trained_operator(
+        catalog=catalog, settings=app.state.settings, sessions_service=sessions, session_engine=app.state.session_engine
+    )
+    app.state.composer_service = composer
+    candidate = "DECLINE_FAILURE_CANARY: I cannot satisfy this request."
+    original = (
+        asyncio.CancelledError("Synthetic END cancellation")
+        if failure_site == "end_cancel"
+        else AuditIntegrityError("Synthetic pass audit failure")
+        if failure_site == "pass_audit"
+        else ConnectionError("Synthetic END transport failure")
+    )
+    phases = []
+
+    async def completion(**kwargs):
+        phase = "end" if "response_format" in kwargs else "planner"
+        phases.append(phase)
+        assert phases in (["planner"], ["planner", "end"]), "Unknown failed-call cost must not grant a retry"
+        if phase == "end" and failure_site != "pass_audit":
+            raise original
+        content = (
+            "DECLINE: " + candidate
+            if phase == "planner"
+            else json.dumps(
+                {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+            )
+        )
+        return litellm.ModelResponse(
+            choices=[{"message": {"role": "assistant", "content": content, "tool_calls": None}, "index": 0, "finish_reason": "stop"}],
+            model=kwargs["model"],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
+        )
+
+    actual_add = sessions.add_message
+
+    async def add_message(*args, **kwargs):
+        if failure_site == "pass_audit" and any(
+            envelope.get("_kind") == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND for envelope in kwargs.get("tool_calls") or ()
+        ):
+            raise original
+        return await actual_add(*args, **kwargs)
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    monkeypatch.setattr(sessions, "add_message", add_message)
+    session = await sessions.create_session("alice", "Existing title", "local")
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Build the requested pipeline.") as job:
+        if failure_site == "end_transport":
+            record = await _run(app, job)
+            assert record.status == "completed"
+            assert candidate not in MessageWithStateResponse.model_validate_json(record.result_json).message.content
+        else:
+            with pytest.raises(asyncio.CancelledError if failure_site == "end_cancel" else AuditIntegrityError) as caught:
+                await _run(app, job)
+            assert caught.value is original
+            assert (await _row(job)).status == "running"
+            attached = composer_turn._llm_calls_from_exception(caught.value)
+            assert len(attached) == 1
+            assert attached[0].status.value == ("cancelled" if failure_site == "end_cancel" else "success")
+    assert phases == ["planner", "end"]
+    rows = await sessions.get_messages(session.id, limit=None)
+    assert all(candidate not in row.content for row in rows if row.role == "assistant")
+    assert all(envelope.get("_kind") != ADVISOR_CHECKPOINT_PASS_AUDIT_KIND for row in rows for envelope in row.tool_calls or ())
+    calls = [envelope["call"] for _, envelope in _llm_call_audit_rows(rows)]
+    assert len(calls) == 2
+    assert len({call["call_id"] for call in calls}) == len(calls)
+    if failure_site == "end_transport":
+        assert calls[-1]["provider_cost"] is None
+    assert not (await sessions.get_state_versions(session.id))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("graph_verdict", "publication_verdict", "stale_evidence"),
+    (
+        ("CLEAN", "ADMIT", False),
+        ("FLAGGED", "ADMIT", False),
+        ("CLEAN", "WITHHOLD", False),
+        ("FLAGGED", "WITHHOLD", False),
+        ("CLEAN", "ADMIT", True),
+    ),
+)
+@pytest.mark.parametrize("revoke_build", (False, True))
+async def test_actual_end_permission_controls_public_terminal_and_saved_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    graph_verdict: str,
+    publication_verdict: str,
+    stale_evidence: bool,
+    revoke_build: bool,
+) -> None:
+    import litellm
+
+    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from elspeth.web.composer.advisor_decision import AdvisorGatePassed
+    from elspeth.web.composer.turn_effects import TurnEvidence
+    from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
+
+    app, sessions = _make_app(tmp_path)
+    if stale_evidence:
+        app.state.settings = app.state.settings.model_copy(update={"composer_advisor_checkpoint_max_passes": 1})
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
+    )
+    composer = ComposerServiceImpl.for_trained_operator(
+        catalog=app.state.catalog_service,
+        settings=app.state.settings,
+        sessions_service=sessions,
+        session_engine=app.state.session_engine,
+    )
+    app.state.composer_service = composer
+    candidate = "EXACT_CANDIDATE_CANARY: ELSPETH transforms rows; this explanation makes no pipeline changes."
+    calls = []
+    reviews = []
+    owners = []
+    actual_review = TurnEvidence.review_candidate
+
+    def capture_review(owner, **kwargs):
+        review = actual_review(owner, **kwargs)
+        owners.append(owner)
+        reviews.append(review)
+        return review
+
+    monkeypatch.setattr(TurnEvidence, "review_candidate", capture_review)
+
+    async def complete(**kwargs):
+        calls.append(kwargs)
+        if "response_format" in kwargs:
+            schema = kwargs["response_format"]["json_schema"]
+            assert schema["name"] == "advisor_end_response"
+            assert "publication_verdict" in schema["schema"]["required"]
+            content = json.dumps(
+                {
+                    "verdict": graph_verdict,
+                    "category": "other",
+                    "steps": [],
+                    "findings": "Visible empty graph or unsupported prose"
+                    if graph_verdict == "FLAGGED" or publication_verdict == "WITHHOLD"
+                    else "",
+                    "note": None,
+                    "publication_verdict": publication_verdict,
+                }
+            )
+            assert candidate in json.dumps(kwargs["messages"])
+            if stale_evidence:
+                owners[-1].mark_verification_unavailable()
+        else:
+            content = candidate
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None), finish_reason="stop")],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
+            model=kwargs["model"],
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    session = await sessions.create_session("alice", "Existing session title", "local")
+    request = "Explain what ELSPETH does." + (" Do not build anything." if revoke_build else "")
+    async with _running_job(app, sessions, session.id, kind="compose_message", content=request) as job:
+        record = await _run(app, job)
+        result = job.observation.compose_result
+    assert record.status == "completed"
+    assert record.result_json is not None
+    response = MessageWithStateResponse.model_validate_json(record.result_json)
+    assert result is not None
+    assert not isinstance(result.advisor_gate_decision, AdvisorGatePassed)
+    assert not result.state.sources and not result.state.nodes
+    admitted = publication_verdict == "ADMIT" and not stale_evidence
+    assert (candidate in response.message.content) is admitted
+    messages = await sessions.get_messages(session.id, limit=None)
+    visible = [row for row in messages if row.role != "audit"]
+    assert (candidate in json.dumps([row.content for row in visible])) is admitted
+    passes = [
+        entry["pass"]
+        for row in messages
+        if row.role == "audit"
+        for entry in (row.tool_calls or ())
+        if entry["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    ]
+    assert passes
+    assert all(item["publication_verdict"] == publication_verdict and len(item["publication_binding"]) == 64 for item in passes)
+    expected_review_calls = 1 if admitted or stale_evidence else 2
+    assert len([call for call in calls if "response_format" in call]) == expected_review_calls
+    primary_calls = [call for call in calls if "response_format" not in call]
+    assert len(primary_calls) == expected_review_calls + int(revoke_build)
+    primary_audits = [call for call in result.llm_calls if call.model_requested == app.state.settings.composer_model]
+    assert all(call.call_id is not None for call in primary_audits)
+    assert json.loads(reviews[-1].payload_json)["inspection"]["current_candidate_call"][0] == primary_audits[-1].call_id
+    if revoke_build:
+        assert any(
+            message["role"] == "user" and message["content"].startswith("[composer-system] No tool has run this turn")
+            for message in primary_calls[1]["messages"]
+        )
+    withheld = [
+        entry
+        for row in messages
+        if row.role == "audit"
+        for entry in (row.tool_calls or ())
+        if entry["_kind"] == COMPOSER_WITHHELD_REPLY_KIND and entry["origin"] == "advisor_publication_withheld"
+    ]
+    assert bool(withheld) is not admitted
+    if not admitted:
+        assert "withheld" in response.message.content.lower()
+        assert candidate not in record.result_json
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("self_corrects", (False, True))
+async def test_actual_repeated_reply_review_stops_stalled_repair_without_reusing_permission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    self_corrects: bool,
+) -> None:
+    import litellm
+
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    app, sessions = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"composer_advisor_checkpoint_max_passes": 3})
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
+    )
+    composer = ComposerServiceImpl.for_trained_operator(
+        catalog=app.state.catalog_service,
+        settings=app.state.settings,
+        sessions_service=sessions,
+        session_engine=app.state.session_engine,
+    )
+    app.state.composer_service = composer
+    candidate = "REPEATED_CANDIDATE: ELSPETH transforms data."
+    calls = []
+    reviews = []
+    actual_review = TurnEvidence.review_candidate
+
+    def capture_review(owner, **kwargs):
+        review = actual_review(owner, **kwargs)
+        if not reviews or reviews[-1].binding != review.binding:
+            reviews.append(review)
+        return review
+
+    async def complete(**kwargs):
+        calls.append(kwargs)
+        if "response_format" in kwargs:
+            pass_number = len([call for call in calls if "response_format" in call])
+            admitted = self_corrects and pass_number == 2
+            content = json.dumps(
+                {
+                    "verdict": "CLEAN" if admitted else "FLAGGED",
+                    "category": "other",
+                    "steps": [],
+                    "findings": "" if admitted else "The candidate has an unsupported claim.",
+                    "note": None,
+                    "publication_verdict": "ADMIT" if admitted else "WITHHOLD",
+                }
+            )
+        else:
+            content = candidate
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None), finish_reason="stop")],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
+            model=kwargs["model"],
+        )
+
+    monkeypatch.setattr(TurnEvidence, "review_candidate", capture_review)
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    session = await sessions.create_session("alice", "Existing title", "local")
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Explain ELSPETH.") as job:
+        record = await _run(app, job)
+    assert record.status == "completed"
+    assert len([call for call in calls if "response_format" in call]) == 2
+    assert len([call for call in calls if "response_format" not in call]) == 2
+    assert len(reviews) == 2
+    assert reviews[0].binding != reviews[1].binding
+    assert reviews[0].semantic_repair_key == reviews[1].semantic_repair_key
+    assert (
+        json.loads(reviews[0].payload_json)["inspection"]["current_candidate_call"][0]
+        != json.loads(reviews[1].payload_json)["inspection"]["current_candidate_call"][0]
+    )
+    assert (candidate in record.result_json) is self_corrects
+    visible = [row.content for row in await sessions.get_messages(session.id, limit=None) if row.role != "audit"]
+    assert (candidate in json.dumps(visible)) is self_corrects
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verification_fails", (False, True))
+@pytest.mark.parametrize("mixed_group", (False, True))
+async def test_actual_early_failure_preserves_committed_checkpoint_and_owned_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verification_fails: bool,
+    mixed_group: bool,
+) -> None:
+    import litellm
+
+    from elspeth.web.composer.turn_effects import TurnEvidence
+    from elspeth.web.required_work import RequiredWorkSource, reduce_composer_failures
+
+    app, sessions = _make_app(tmp_path)
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
+    )
+    composer = ComposerServiceImpl.for_trained_operator(
+        catalog=app.state.catalog_service,
+        settings=app.state.settings,
+        sessions_service=sessions,
+        session_engine=app.state.session_engine,
+    )
+    app.state.composer_service = composer
+    original_leaves = (asyncio.CancelledError("Synthetic owned cancellation"), AuditIntegrityError("Synthetic owned integrity failure"))
+    original_failure = (
+        BaseExceptionGroup("Synthetic owned EARLY mixed failure", original_leaves)
+        if mixed_group
+        else ValueError("Synthetic owned EARLY failure")
+    )
+    comparison_failure = RuntimeError("Synthetic private comparison failure")
+    actual_accept = TurnEvidence.accept_checkpoint
+    actual_persist = sessions.persist_compose_turn_async
+    persisted = []
+    calls = []
+
+    async def persist(**kwargs):
+        result = await actual_persist(**kwargs)
+        persisted.append(result)
+        return result
+
+    def accept(owner, *args, **kwargs):
+        actual_accept(owner, *args, **kwargs)
+        if verification_fails:
+            raise comparison_failure
+
+    async def early(**kwargs):
+        raise original_failure
+
+    async def complete(**kwargs):
+        calls.append(kwargs)
+        assert "response_format" not in kwargs
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="owned-saved-metadata",
+                                function=SimpleNamespace(
+                                    name="set_metadata",
+                                    arguments=json.dumps({"patch": {"name": "Saved owned change"}}),
+                                ),
+                            ),
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
+            model=kwargs["model"],
+        )
+
+    monkeypatch.setattr(sessions, "persist_compose_turn_async", persist)
+    monkeypatch.setattr(TurnEvidence, "accept_checkpoint", accept)
+    monkeypatch.setattr(composer._advisor_checkpoint, "_maybe_run_early_checkpoint", early)
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    session = await sessions.create_session("alice", "Existing title", "local")
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Change the pipeline name.") as job:
+        with pytest.raises(BaseExceptionGroup if mixed_group else ValueError) as caught:
+            await _run(app, job)
+        assert caught.value is original_failure
+        if mixed_group:
+            assert caught.value.exceptions == original_leaves
+        assert (await _row(job)).status == "running"
+        assert len(calls) == 1
+        assert len(persisted) == 1
+        assert persisted[0].checkpoint_disposition == "committed"
+        required_work = job.observation.required_work
+        assert required_work is not None
+        (projection,) = tuple(
+            ticket for ticket in required_work.tickets if ticket.key.source is RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
+        )
+        assert projection.complete
+        if verification_fails:
+            (verification_error,) = projection.errors
+            assert isinstance(verification_error, AuditIntegrityError)
+            assert verification_error.__cause__ is comparison_failure
+            assert verification_error.failed_turn.assistant_message_id == persisted[0].assistant_id
+            assert isinstance(caught.value.__cause__, BaseExceptionGroup)
+            assert caught.value.__cause__.exceptions == (verification_error,)
+            reduction = reduce_composer_failures(required_work.failure_receipts())
+            assert reduction.winner.original_root is verification_error
+        else:
+            assert projection.errors == ()
+            assert caught.value.__cause__ is None
+        rows = await sessions.get_messages(session.id, limit=None)
+        assert len([row for row in rows if row.role == "tool"]) == 1
+        assert len([row for row in rows if row.role == "assistant" and row.tool_calls]) == 1
+        versions = await sessions.get_state_versions(session.id)
+        assert len(versions) == 1
+        assert str(versions[0].id) == persisted[0].current_state_id
 
 
 @pytest.mark.asyncio
@@ -1194,6 +2394,11 @@ async def test_detached_retry_preserves_partial_tool_prefix_without_replaying_to
 
     app, service = _make_app(tmp_path)
     composer = _make_composer_mock("Recovered reply.")
+
+    async def preserve_current_state(_message, _history, state: CompositionState, **_kwargs) -> ComposerResult:
+        return ComposerResult(message="Recovered reply.", state=state)
+
+    composer.compose.side_effect = preserve_current_state
     app.state.composer_service = composer
     session = await service.create_session("alice", "Partial tool retry", "local")
     user = await service.add_message(session.id, "user", "Set the name once", writer_principal="route_user_message")

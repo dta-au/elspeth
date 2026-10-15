@@ -8,7 +8,7 @@ dialect's wire schema W back into the flat semantic arguments S admits:
 * the set_pipeline ``{"pipeline": ...}`` envelope is unwrapped, and a
   malformed envelope is the one rejection (``ToolArgumentError``,
   category ``wire_envelope``);
-* on ``openai_strict`` only, a ``null`` at one of the 13 promoted positions
+* on ``openai_strict`` only, a ``null`` at one of the 15 promoted positions
   becomes the omission S expects. Nothing else is touched.
 
 ``encode_semantic_arguments`` is the inverse of the envelope only in S1; the
@@ -25,11 +25,13 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 from jsonschema import Draft202012Validator
+from pydantic import ValidationError
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.redaction import GetBlobContentArgumentsModel
 from elspeth.web.composer.state import NodeSpec
 from elspeth.web.composer.tools._dispatch import (
     _TOOL_SCHEMA_BY_NAME,
@@ -167,9 +169,13 @@ _SEEDS: dict[str, dict[str, Any]] = {
     "wire_secret_ref": {"name": "OPENROUTER_API_KEY", "target": "node", "option_key": "api_key"},
 }
 
-# A valid (non-null) value for each of the 13 promoted positions, valid under
+# A valid (non-null) value for each of the 15 promoted positions, valid under
 # both S and the strict W.
 _PROMOTED_VALUES: dict[tuple[str, tuple[str, ...]], Any] = {
+    # Offset zero keeps every independent presence combination valid; actual
+    # positive-offset continuation still requires the identity below.
+    ("get_blob_content", ("offset_chars",)): 0,
+    ("get_blob_content", ("expected_content_hash",)): "a" * 64,
     ("create_blob", ("description",)): "sample rows",
     ("wire_blob_inline_ref", ("encoding",)): "utf-16",
     ("clear_source", ("source_name",)): "source",
@@ -230,11 +236,12 @@ def _semantic(decoded: DecodedArguments) -> dict[str, Any]:
 # ---------------------------------------------------------------- the seeds
 
 
-def test_the_seeds_cover_exactly_the_32_strict_capable_tools_and_13_promoted_positions() -> None:
+def test_the_seeds_cover_exactly_the_32_strict_capable_tools_and_15_promoted_positions() -> None:
     assert set(_SEEDS) == _strict_capable_names()
+    assert len(_SEEDS) == 32
     promoted = {(name, path) for name in _SEEDS for path in _WIRE_TOOL_DEFS[STRICT][name].promoted_paths}
     assert set(_PROMOTED_VALUES) == promoted
-    assert len(promoted) == 13
+    assert len(promoted) == 15
 
 
 @pytest.mark.parametrize("tool", sorted(_SEEDS))
@@ -269,6 +276,7 @@ def test_a_null_at_a_promoted_position_becomes_absent(tool: str, path: tuple[str
         ("get_plugin_assistance", ("plugin_name",)),
         ("create_blob", ("content",)),
         ("request_interpretation_review", ("user_term",)),
+        ("get_blob_content", ("blob_id",)),
     ],
 )
 def test_a_null_at_a_non_promoted_position_is_left_for_s(tool: str, path: tuple[str, ...]) -> None:
@@ -289,6 +297,41 @@ def test_none_dialect_never_strips_a_null() -> None:
         _put(raw, path, None)
         decoded = decode_wire_arguments(tool, NONE, raw)
         assert _semantic(decoded) == raw
+
+
+@pytest.mark.parametrize("dialect", [NONE, STRICT])
+def test_blob_continuation_preserves_its_offset_and_identity_after_decode(dialect: ToolContractDialect) -> None:
+    raw = {**_full_call("get_blob_content"), "offset_chars": 7}
+    decoded = decode_wire_arguments("get_blob_content", dialect, raw)
+    assert decoded.wire_conformant is True
+    assert _semantic(decoded) == raw
+    admitted = GetBlobContentArgumentsModel.model_validate(_semantic(decoded))
+    assert admitted.offset_chars == 7
+    assert admitted.expected_content_hash == "a" * 64
+
+
+@pytest.mark.parametrize("dialect", [NONE, STRICT])
+@pytest.mark.parametrize("explicit_null", [False, True], ids=["missing-hash", "null-hash"])
+def test_blob_continuation_without_identity_is_rejected_after_decode(dialect: ToolContractDialect, explicit_null: bool) -> None:
+    raw = {**_full_call("get_blob_content"), "offset_chars": 7}
+    if explicit_null:
+        raw["expected_content_hash"] = None
+    else:
+        del raw["expected_content_hash"]
+    decoded = decode_wire_arguments("get_blob_content", dialect, raw)
+    # Wire classification does not replace the nominal cross-field guard.
+    assert decoded.wire_conformant is (dialect is NONE or explicit_null)
+    with pytest.raises(ValidationError, match="Continuation requires expected_content_hash"):
+        GetBlobContentArgumentsModel.model_validate(_semantic(decoded))
+
+
+def test_blob_first_page_strict_null_selectors_decode_to_the_admitted_defaults() -> None:
+    decoded = decode_wire_arguments("get_blob_content", STRICT, {"blob_id": "blob-1", "offset_chars": None, "expected_content_hash": None})
+    assert decoded.wire_conformant is True
+    assert _semantic(decoded) == {"blob_id": "blob-1"}
+    admitted = GetBlobContentArgumentsModel.model_validate(_semantic(decoded))
+    assert admitted.offset_chars == 0
+    assert admitted.expected_content_hash is None
 
 
 def test_decode_does_not_mutate_the_raw_arguments() -> None:
@@ -396,7 +439,7 @@ def test_decode_law_over_every_promoted_position(tool: str, data: st.DataObject)
 # ---------------------------------------------------------------- envelope
 
 _PIPELINE: dict[str, Any] = {
-    "source": {"plugin": "csv", "on_success": "rows", "options": {"path": "rows.csv"}},
+    "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard", "options": {"path": "rows.csv"}},
     "nodes": [],
     "edges": [],
     "outputs": [],

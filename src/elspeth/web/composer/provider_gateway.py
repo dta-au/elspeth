@@ -42,9 +42,11 @@ from elspeth.web.composer.provider_quota import (
     required_provider_audit_scope,
 )
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
 from elspeth.web.credential_guard import (
     CredentialMaterialRefused,
+    credential_state_for_tool_batch,
     require_no_credential_material,
     require_no_credential_material_in_llm_metadata,
     require_no_credential_material_in_tool_wire,
@@ -506,6 +508,7 @@ class ProviderGateway:
         tools: list[dict[str, Any]],
         *,
         provider_custody: ProviderCallCustody | None = None,
+        credential_state: CompositionState | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call LiteLLM and return only the admitted, owned completion."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
@@ -534,11 +537,15 @@ class ProviderGateway:
             response,
             pricing_model=self._settings.composer_pricing_model or self._model,
         )
+        batch_credential_state = credential_state_for_tool_batch(
+            credential_state, tuple(call.function.name for call in completion.tool_batch.calls)
+        )
         for call in completion.tool_batch.calls:
             require_no_credential_material_in_tool_wire(
                 call.function.name,
                 call.function.arguments,
                 surface="composer_provider_response",
+                credential_state=batch_credential_state,
             )
         _require_no_credential_material_in_completion(
             completion,
@@ -629,6 +636,7 @@ class ProviderGateway:
         timeout: float,
         recorder: BufferingRecorder | None,
         provider_custody: ProviderCallCustody | None = None,
+        credential_state: CompositionState | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call the primary model once and record the exact marked request."""
         wire_messages = [dict(message) for message in messages]
@@ -649,8 +657,8 @@ class ProviderGateway:
         recovery_batch: _AdmittedToolBatch | None = None
         try:
             completion = await asyncio.wait_for(
-                self._call_llm(wire_messages, wire_tools, provider_custody=provider_custody)
-                if provider_custody is not None
+                self._call_llm(wire_messages, wire_tools, provider_custody=provider_custody, credential_state=credential_state)
+                if provider_custody is not None or credential_state is not None
                 else self._call_llm(wire_messages, wire_tools),
                 timeout=timeout,
             )
@@ -943,8 +951,9 @@ class ProviderGateway:
         *,
         timeout: float,
         recorder: BufferingRecorder | None,
+        credential_state: CompositionState | None = None,
     ) -> _AdmittedLLMCompletion:
-        return await self._call_llm_with_audit_body(messages, tools, timeout=timeout, recorder=recorder)
+        return await self._call_llm_with_audit_body(messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state)
 
     async def _call_llm_with_audit(
         self,
@@ -954,12 +963,20 @@ class ProviderGateway:
         timeout: float,
         recorder: BufferingRecorder | None,
         provider_custody: ProviderCallCustody | None = None,
+        credential_state: CompositionState | None = None,
     ) -> _AdmittedLLMCompletion:
         if provider_custody is None:
-            return await self._call_llm_with_audit_legacy(messages, tools, timeout=timeout, recorder=recorder)
+            return await self._call_llm_with_audit_legacy(
+                messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state
+            )
         async with provider_call_scope(provider_custody):
             return await self._call_llm_with_audit_body(
-                messages, tools, timeout=timeout, recorder=recorder, provider_custody=provider_custody
+                messages,
+                tools,
+                timeout=timeout,
+                recorder=recorder,
+                provider_custody=provider_custody,
+                credential_state=credential_state,
             )
 
     @quota_provider_calls

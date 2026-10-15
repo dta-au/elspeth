@@ -1231,7 +1231,7 @@ def test_composition_gate_registry_covers_every_public_state_mutation() -> None:
     from elspeth.web.composer.tools.declarations import EffectDomain
 
     pipeline_arguments = {
-        "source": {"plugin": "csv", "on_success": "rows"},
+        "source": {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard"},
         "nodes": [],
         "edges": [],
         "outputs": [],

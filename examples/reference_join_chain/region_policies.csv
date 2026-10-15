@@ -1,0 +1,5 @@
+service_region,service_tier,support_queue,response_sla_hours
+APAC,silver,sydney-support,24
+EMEA,gold,dublin-support,8
+AMER,platinum,denver-support,4
+GLOBAL,basic,global-triage,72

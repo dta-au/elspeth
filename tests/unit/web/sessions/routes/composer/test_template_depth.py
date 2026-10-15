@@ -29,6 +29,7 @@ sources:
     plugin: csv
     on_success: score
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
 transforms:

@@ -10,7 +10,7 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.blobs.service import BlobServiceImpl
@@ -21,7 +21,7 @@ from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMet
 from elspeth.web.composer.tools import execute_tool
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-from elspeth.web.sessions.models import blobs_table, composition_rejection_events_table
+from elspeth.web.sessions.models import blobs_table, composition_rejection_events_table, composition_states_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import _composer_service_with_session, _make_llm_response, _make_settings
@@ -116,6 +116,9 @@ async def test_csv_schema_rejections_repair_without_replacing_prior_scaffold(
     Only the external model is scripted. Catalogue admission, source config
     validation, dispatch, state settlement and durable writes are production.
     """
+    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+    from elspeth.web.composer.turn_effects import authored_state_hash
 
     def available(*, model: str, **_kwargs: object) -> ComposerAvailability:
         return ComposerAvailability(available=True, model=model, provider="test")
@@ -214,14 +217,35 @@ async def test_csv_schema_rejections_repair_without_replacing_prior_scaffold(
     proposals = [invalid_name, unsupported_stamp, repaired]
     primary_calls = 0
     advisor_calls = 0
+    reviews = []
+    request = "Build an LLM quality assessment for the case-study CSV using the instructions, context, rubric, examples, report template and Column Guide."
+    candidate = "The assessment graph now reads case studies and evaluates each row; required reviews remain before execution."
 
     async def complete(**kwargs: Any):
         nonlocal primary_calls, advisor_calls
         if kwargs["model"] == service._settings.composer_advisor_model:
             advisor_calls += 1
+            assert advisor_calls == 1, "Only one independent terminal publication review is supplied"
+            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            reviews.append(review)
+            assert review["candidate_reply"] == candidate
+            assert review["current_request"] == request
+            with sessions._engine.connect() as conn:
+                saved_revision_count = conn.execute(
+                    select(func.count())
+                    .select_from(composition_states_table)
+                    .where(composition_states_table.c.session_id == session_id, composition_states_table.c.id != str(saved_scaffold.id))
+                ).scalar_one()
+            assert saved_revision_count > 0
+            assert review["saved_effects"]["saved_revision_count"] == saved_revision_count
+            assert review["saved_effects"]["net_changed"] is True
             return _make_llm_response(
-                content=json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None})
+                content=json.dumps(
+                    {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+                )
             )
+        assert kwargs["model"] == service._model, "No response is supplied for another provider role"
         messages = kwargs["messages"]
         if primary_calls in (1, 2):
             current = await sessions.get_current_state(UUID(session_id))
@@ -271,13 +295,11 @@ async def test_csv_schema_rejections_repair_without_replacing_prior_scaffold(
         assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["handoff_to_user", "restore_parked_graph"], (
             "A staged review permits only recovery controls while the provider prepares its reply"
         )
-        return _make_llm_response(
-            content="The assessment graph now reads case studies and evaluates each row; required reviews remain before execution."
-        )
+        return _make_llm_response(content=candidate)
 
     with patch("litellm.acompletion", side_effect=complete):
         result = await service.compose(
-            "Build an LLM quality assessment for the case-study CSV using the instructions, context, rubric, examples, report template and Column Guide.",
+            request,
             [],
             scaffold,
             session_id=session_id,
@@ -285,7 +307,10 @@ async def test_csv_schema_rejections_repair_without_replacing_prior_scaffold(
         )
 
     assert primary_calls == 5
-    assert advisor_calls == 0, "Model-choice acknowledgement precedes completion review"
+    assert advisor_calls == len(reviews) == 1
+    assert len(result.llm_calls) == primary_calls + advisor_calls
+    assert reviews[0]["current_graph_hash"] == authored_state_hash(result.state)
+    assert result.message.startswith(candidate)
     assert result.state.sources["source"].options["path"] == str(cases)
     assert result.state.sources["source"].options["schema"]["fields"] == ("case_study: str",)
     assert "guaranteed_fields" not in result.state.sources["source"].options["schema"]
@@ -310,6 +335,17 @@ async def test_csv_schema_rejections_repair_without_replacing_prior_scaffold(
     assert result.runtime_preflight is not None
     assert result.runtime_preflight.readiness.authoring_valid is True
     assert result.runtime_preflight.readiness.execution_ready is False
+    stored = await sessions.get_messages(UUID(session_id), limit=None)
+    passes = [
+        row.tool_calls[0]["pass"]
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    ]
+    assert len(passes) == 1
+    assert passes[0]["phase"] == "end" and passes[0]["source"] == "model"
+    assert passes[0]["publication_verdict"] == "ADMIT" and passes[0]["first_attempt_accepted"] is True
+    assert passes[0]["provider_attempts"] == 1
+    assert type(passes[0]["publication_binding"]) is str and len(passes[0]["publication_binding"]) == 64
 
 
 @pytest.mark.asyncio
@@ -339,6 +375,7 @@ async def test_template_scaffold_cannot_satisfy_assessment_completion(tmp_path: 
                 content=json.dumps(
                     {
                         "verdict": "FLAGGED",
+                        "publication_verdict": "WITHHOLD",
                         "category": "other",
                         "steps": [],
                         "findings": "The report scaffold has no assessment transforms and reads the report template instead of case studies.",
@@ -359,4 +396,12 @@ async def test_template_scaffold_cannot_satisfy_assessment_completion(tmp_path: 
     assert result.advisor_gate_decision.fact.note is not None
     assert "case-study" in result.advisor_gate_decision.fact.note
     assert "completion advisory review did not clear" in result.message.lower()
-    assert "assessment" in result.message.lower()
+    assert "The assessment pipeline is complete." not in result.message
+    assert service._sessions_service is not None
+    stored = await service._sessions_service.get_messages(UUID(session_id), limit=None)
+    withheld = [
+        row
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0].get("origin") == "advisor_publication_withheld"
+    ]
+    assert len(withheld) == 1 and withheld[0].content == "The assessment pipeline is complete."

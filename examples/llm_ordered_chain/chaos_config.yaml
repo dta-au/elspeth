@@ -1,0 +1,56 @@
+# Request-sensitive local provider fixture, not a pipeline implementation.
+# Every query still travels through ELSPETH's normal provider/HTTP/audit path.
+server:
+  host: "127.0.0.1"
+  port: 8199
+  workers: 1
+metrics:
+  database: "file:ordered-chain-metrics?mode=memory&cache=shared"
+response:
+  mode: template
+  template:
+    body: |
+      {%- set text = messages[-1]['content'] | string -%}
+      {%- set lower = text | lower -%}
+      {%- if 'EXTRACT_RECEIPT' in text -%}
+        {%- if 'faded' in lower -%}
+          {"amount_usd": "unreadable", "expense_type": "meals"}
+        {%- elif 'taxi' in lower -%}
+          {"amount_usd": 48.0, "expense_type": "transport"}
+        {%- elif 'lunch' in lower -%}
+          {"amount_usd": 82.0, "expense_type": "meals"}
+        {%- elif 'printer' in lower -%}
+          {"amount_usd": 126.5, "expense_type": "equipment"}
+        {%- else -%}
+          {"amount_usd": 0.0, "expense_type": "transport"}
+        {%- endif -%}
+      {%- elif 'APPLY_REIMBURSEMENT_POLICY' in text -%}
+        {%- if 'Extracted expense_type: equipment' in text -%}
+          {"decision": "manual_review", "reason": "Equipment requires a human review."}
+        {%- elif 'Extracted amount_usd: 82.0' in text -%}
+          {"decision": "manual_review", "reason": "The meal claim exceeds USD 25."}
+        {%- else -%}
+          {"decision": "approve", "reason": "The transport claim is within USD 75."}
+        {%- endif -%}
+      {%- else -%}
+        {"probe": "ready"}
+      {%- endif -%}
+latency:
+  base_ms: 10
+  jitter_ms: 0
+error_injection:
+  rate_limit_pct: 0.0
+  capacity_529_pct: 0.0
+  service_unavailable_pct: 0.0
+  internal_error_pct: 0.0
+  bad_gateway_pct: 0.0
+  gateway_timeout_pct: 0.0
+  timeout_pct: 0.0
+  connection_reset_pct: 0.0
+  slow_response_pct: 0.0
+  invalid_json_pct: 0.0
+  truncated_pct: 0.0
+  empty_body_pct: 0.0
+  missing_fields_pct: 0.0
+  burst:
+    enabled: false

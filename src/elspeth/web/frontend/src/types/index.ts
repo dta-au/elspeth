@@ -1180,6 +1180,10 @@ export interface ApiError {
   /** Server correlation id (RequestIdMiddleware). Present on fail-closed
    *  audit-integrity 500s so the banner can name a support reference. */
   request_id?: string;
+  /** Validated retained diagnostic support reference; never exception detail. */
+  diagnostic_id?: string;
+  /** Authenticated terminal identity/category, separate from application refusal codes. */
+  composer_operation?: { operation_id: string; kind: import("./composerOperations").OperationKind; failure_code: import("./composerOperations").ComposerOperationError["failure_code"] };
   /** Exact accepted send receipt, distinct from the server request correlation id. */
   failure_code?: string;
   /** Static provider or accounting guidance supplied by the Composer route. */

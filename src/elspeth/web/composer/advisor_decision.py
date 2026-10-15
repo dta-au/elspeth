@@ -9,6 +9,8 @@ class AdvisorBlockCause(StrEnum):
     UNAVAILABLE = "unavailable"
     MALFORMED = "malformed"
     MESSAGE_REJECTED = "message_rejected"
+    PUBLICATION_REJECTED = "publication_rejected"
+    BUDGET_EXHAUSTED = "budget_exhausted"
 
 
 @dataclass(frozen=True, slots=True)

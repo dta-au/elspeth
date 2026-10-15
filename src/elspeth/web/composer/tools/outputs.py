@@ -21,6 +21,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools._common import (
     _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _STEP_DESCRIPTION_DESCRIPTION,
+    FailureRouteChoiceError,
     ToolContext,
     ToolResult,
     _apply_merge_patch,
@@ -34,6 +35,7 @@ from elspeth.web.composer.tools._common import (
     _validate_mutation_arguments,
     _validate_plugin_name,
     _validate_sink_path,
+    resolve_failure_route_choice,
     validate_composer_file_sink_collision_policy,
 )
 from elspeth.web.composer.tools.declarations import (
@@ -47,7 +49,7 @@ class _SetOutputArgumentsModel(BaseModel):
     sink_name: str
     plugin: str
     options: dict[str, Any]
-    on_write_failure: str = "discard"
+    on_write_failure: str | None = None
     description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
@@ -93,9 +95,8 @@ _SET_OUTPUT_DECLARATION = ToolDeclaration(
                 ),
             },
             "on_write_failure": {
-                "type": "string",
-                "description": "Per-row write-failure policy: 'discard' drops with an audit record; a sink name diverts failed rows to that failsink.",
-                "default": "discard",
+                "type": ["string", "null"],
+                "description": "Explicit non-empty write-failure choice required for new sinks: 'discard' records the drop; an eligible sink name diverts failed rows. Omit only to preserve this existing sink's choice. Null/empty is invalid.",
             },
             "description": {
                 "type": ["string", "null"],
@@ -140,6 +141,16 @@ def _execute_set_output(
 ) -> ToolResult:
     """Add or replace a pipeline output (sink)."""
     validated = _validate_mutation_arguments(_SetOutputArgumentsModel, args, "set_output arguments")
+    existing = next((output for output in state.outputs if output.name == validated.sink_name), None)
+    try:
+        on_write_failure = resolve_failure_route_choice(
+            validated.on_write_failure,
+            supplied="on_write_failure" in validated.model_fields_set,
+            field="on_write_failure",
+            previous=existing.on_write_failure if existing is not None else None,
+        )
+    except FailureRouteChoiceError as exc:
+        return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=f"output:{validated.sink_name}")
     plugin = validated.plugin
     sink_options = validated.options
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(plugin, sink_options)
@@ -185,7 +196,7 @@ def _execute_set_output(
         name=validated.sink_name,
         plugin=plugin,
         options=sink_options,
-        on_write_failure=validated.on_write_failure,
+        on_write_failure=on_write_failure,
         description=validated.description,
     )
     new_state = state.with_output(output)

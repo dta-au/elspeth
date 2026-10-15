@@ -13,6 +13,7 @@ from typing import Any, Final, Literal
 
 from elspeth.web.composer import no_tool_policy as _no_tool_policy
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.execution.schemas import (
     ADVISOR_SIGNOFF_BLOCKED_CODE,
     CHECK_ADVISOR_SIGNOFF,
@@ -55,7 +56,7 @@ _ADVISOR_SIGNOFF_BLOCKED_CODE: Final[str] = ADVISOR_SIGNOFF_BLOCKED_CODE
 # Mirrors the orphan gate's check-name convention so the synthetic fail-closed
 # result names a stable check the UI/audit can key on.
 _ADVISOR_SIGNOFF_BLOCKED_CHECK_NAME: Final[ValidationCheckName] = CHECK_ADVISOR_SIGNOFF
-ADVISOR_UNAVAILABLE_USER_DETAIL: Final[str] = "advisor model was unavailable after retry"
+ADVISOR_UNAVAILABLE_USER_DETAIL: Final[str] = "advisor model was unavailable"
 # Fixed user-facing detail for a MALFORMED advisor failure (parse/shape error, or
 # any unclassified exception). Like the unavailable detail it carries NO provider
 # SDK text, exception class name, message, URL, or credential — the raw exception
@@ -376,6 +377,11 @@ def advisor_arguments_with_format_reprompt(arguments: Mapping[str, Any], *, sche
     Neither path echoes the rejected provider text.
     """
     reprompt = _ADVISOR_VERDICT_CONTRACT_REPROMPT if schema_valid else _ADVISOR_VERDICT_FORMAT_REPROMPT
+    if arguments["trigger"] == ADVISOR_TRIGGER_DETERMINISTIC_END:
+        reprompt += (
+            " END requires all six fields, including publication_verdict=ADMIT|WITHHOLD. "
+            "WITHHOLD requires nonempty findings even when graph verdict is CLEAN."
+        )
     retry = dict(arguments)
     retry["problem_summary"] = f"{arguments['problem_summary']} {reprompt}"
     return retry
@@ -434,6 +440,16 @@ def advisor_signoff_blocked_wording(
     backend-authored pre-scan finding keeps its existing wording and gets no
     header: it is not a reviewer's judgement about a step.
     """
+    if reason == "budget_exhausted":
+        return (
+            "The reply was withheld because the completion review could not run within the existing request limits.",
+            "Saved draft progress remains available; continue in a new message.",
+        )
+    if reason == "publication_withheld":
+        return (
+            "The completion review did not admit the reply's claims; the reply was withheld.",
+            "Review the saved draft and continue with a narrower request or supported explanation.",
+        )
     if reason == "flagged_unrepairable":
         # elspeth-25f7b757e7 (A1): the trigger is the user's own chat message,
         # so a pipeline-edit suggestion would be wrong — the one clearing
@@ -478,12 +494,12 @@ def advisor_signoff_blocked_wording(
     if reason == "unavailable":
         return (
             f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
-            "The advisor model was unavailable after retry; check the advisor model configuration. "
+            "The advisor model was unavailable; check the advisor model configuration. "
             "Validation and the advisory review run again on your next message.",
         )
     return (
         f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
-        "The advisor returned no usable verdict after a format retry; check the advisor model configuration. "
+        "The advisor returned no usable verdict; check the advisor model configuration. "
         "Validation and the advisory review run again on your next message.",
     )
 

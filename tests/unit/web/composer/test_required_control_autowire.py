@@ -439,38 +439,26 @@ class TestLLMSourceAutoWireSplicing:
         assert wire_required_controls(candidate, snapshot, view) is candidate
 
     @pytest.mark.parametrize("container", ["source", "sources"])
-    def test_empty_string_validation_failure_is_canonicalized_and_auto_wired(
+    def test_empty_string_validation_failure_is_not_auto_wired(
         self,
         tmp_path: Path,
         llm_source_policy_manager: PluginManager,
         container: str,
     ) -> None:
-        """elspeth-bcd7051143: "" on_validation_failure has ONE owner.
-
-        An empty string can never name a sink route, so the shared
-        canonicalizer folds it into 'discard' — auto-wiring must therefore
-        treat "" exactly as the persistence seams do (which already coerced
-        it) instead of refusing the candidate it will later be persisted as."""
+        """Projection cannot grant an absent ordinary failure choice."""
         view, snapshot = _guardrail_profile_view(tmp_path)
         candidate = _bare_llm_source_candidate(container=container, source_name="briefing", on_validation_failure="")
 
         wired = wire_required_controls(candidate, snapshot, view)
 
-        assert wired is not candidate
-        assert _nodes_by_id(dict(wired))["content_safety_auto_1"]["plugin"] == "aws_bedrock_content_safety"
+        assert wired is candidate
 
     def test_autowire_and_set_pipeline_agree_on_empty_string_validation_failure(
         self,
         tmp_path: Path,
         llm_source_policy_manager: PluginManager,
     ) -> None:
-        """End-to-end (elspeth-bcd7051143): one "" candidate, both seams agree.
-
-        The auto-wire pass splices Content Safety for the ""-routed LLM source
-        AND set_pipeline persists the same source as 'discard', so the
-        coverage gate credits the spliced control — no more accepted-then-
-        wedged states where persistence coerced "" but the wiring pass had
-        refused the whole candidate."""
+        """The projection refuses and ordinary admission rejects unchanged."""
         (tmp_path / "outputs").mkdir(exist_ok=True)
         view, snapshot = _guardrail_profile_view(tmp_path)
         context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
@@ -479,13 +467,11 @@ class TestLLMSourceAutoWireSplicing:
         wired = wire_required_controls(bare, snapshot, view)
         candidate = build_set_pipeline_candidate(wired, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
-        assert candidate.acceptable is True, f"wired candidate rejected: {rejection}"
-        state = candidate.result.updated_state
-        assert state.sources["source"].on_validation_failure == "discard"
-        result = view.validate_authored_state(state)
-        coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
-        assert coverage == [], [finding.message for finding in coverage]
+        assert wired is bare
+        assert candidate.acceptable is False
+        assert candidate.result.updated_state.version == 1
+        assert not candidate.result.updated_state.sources
+        assert candidate.result.validation.errors[0].error_code == "failure_route_required"
 
     def test_non_discard_source_refusal_is_scoped_to_that_source(
         self,
@@ -552,7 +538,7 @@ class TestLLMSourceAutoWireSplicing:
 
     @pytest.mark.parametrize("container", ["source", "sources"])
     @pytest.mark.parametrize("default_spelling", ["omitted", "null"])
-    def test_defaulted_discard_validation_failure_is_auto_wired(
+    def test_missing_or_null_validation_failure_cannot_gain_auto_wiring(
         self,
         tmp_path: Path,
         llm_source_policy_manager: PluginManager,
@@ -569,7 +555,7 @@ class TestLLMSourceAutoWireSplicing:
 
         wired = wire_required_controls(candidate, snapshot, view)
 
-        assert _nodes_by_id(dict(wired))["content_safety_auto_1"]["plugin"] == "aws_bedrock_content_safety"
+        assert wired is candidate
 
     def test_validation_failure_requires_an_exact_builtin_discard_string(
         self,
@@ -974,13 +960,13 @@ class TestAutoWireRefusals:
             candidate["outputs"][0]["on_write_failure"] = bad
             assert wire_required_controls(candidate, snapshot, view) is candidate
 
-    def test_absent_on_write_failure_defaults_and_still_wires(self, tmp_path: Path) -> None:
+    def test_absent_on_write_failure_cannot_gain_auto_wiring(self, tmp_path: Path) -> None:
         view, snapshot = _guardrail_profile_view(tmp_path)
         candidate = _bare_llm_candidate()
         del candidate["outputs"][0]["on_write_failure"]
         wired = wire_required_controls(candidate, snapshot, view)
-        assert wired is not candidate
-        assert "prompt_shield_auto_1" in _nodes_by_id(wired)
+        assert wired is candidate
+        assert "prompt_shield_auto_1" not in _nodes_by_id(wired)
 
     def test_deterministic_ids_skip_authored_collisions(self, tmp_path: Path) -> None:
         view, snapshot = _guardrail_profile_view(tmp_path)

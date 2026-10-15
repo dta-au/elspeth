@@ -82,7 +82,7 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
         "set_pipeline_explicit_null_inline_blob",
         "set_pipeline",
         {
-            "source": {"plugin": "csv", "on_success": "rows", "options": {}, "inline_blob": None},
+            "source": {"plugin": "csv", "on_success": "rows", "options": {}, "inline_blob": None, "on_validation_failure": "discard"},
             "nodes": [],
             "edges": [],
             "outputs": [],
@@ -100,6 +100,7 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
             "source": {
                 "plugin": "csv",
                 "on_success": "csv_rows",
+                "on_validation_failure": "discard",
                 "description": None,
                 "options": {},
                 "inline_blob": {
@@ -120,6 +121,7 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
             "source": {
                 "plugin": "csv",
                 "on_success": "csv_rows",
+                "on_validation_failure": "discard",
                 "options": {},
                 "inline_blob": {
                     "filename": "chat.csv",
@@ -140,6 +142,7 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
             "source": {
                 "plugin": "csv",
                 "on_success": "csv_rows",
+                "on_validation_failure": "discard",
                 "options": {"delimiter": ","},
                 "inline_blob": {
                     "filename": "chat.csv",
@@ -269,7 +272,7 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
                     "plugin": "field_mapper",
                     "input": "rows",
                     "on_success": "mapped",
-                    "on_error": None,
+                    "on_error": "discard",
                     "options": {"mappings": {"a": "b"}},
                 }
             ],
@@ -282,7 +285,7 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
                     "label": None,
                 }
             ],
-            "outputs": [{"sink_name": "results", "plugin": "json", "options": {"path": "out.json"}}],
+            "outputs": [{"sink_name": "results", "plugin": "json", "options": {"path": "out.json"}, "on_write_failure": "discard"}],
         },
     ),
     # --- a differing key AHEAD of `options`, with no node to rescue it -----
@@ -304,7 +307,7 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
             },
             "nodes": [],
             "edges": [],
-            "outputs": [{"sink_name": "results", "plugin": "csv", "options": {"path": "out.json"}}],
+            "outputs": [{"sink_name": "results", "plugin": "csv", "options": {"path": "out.json"}, "on_write_failure": "discard"}],
         },
     ),
 )
@@ -333,7 +336,7 @@ def build_fixture() -> dict[str, Any]:
     explicit_null = deepcopy(replay)
     explicit_null["source"]["description"] = None
     explicit_null["nodes"][0]["timeout_seconds"] = None
-    explicit_null["outputs"][0]["on_write_failure"] = None
+    explicit_null["outputs"][0]["description"] = None
     empty_options = deepcopy(replay)
     empty_options["source"]["options"] = {}
     empty_options["nodes"][0]["options"] = {}

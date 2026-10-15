@@ -20,7 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import structlog
@@ -199,11 +199,18 @@ _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES = 580
 # 219 bytes for the recovery instruction in the nested request JSON. Preserve
 # the prior ceiling/headroom and its negative padding control.
 _GRAPH_RECOVERY_CONTROLS_CANONICAL_BYTES = 1538
+# Operator ruling 2026-10-15 (John): main 9d7735c09 -> candidate 85e00d616
+# measured +4,944 canonical bytes: system guidance +3,502, revised blob/proposal
+# declarations +1,222, retained-operation history envelope +220. Add exactly
+# that growth, preserving the baseline, 10% band, 163 B live-case headroom and
+# existing overflow control. This test allowance changes no production limit.
+_RELEASE086_PLANNER_SCAFFOLD_CANONICAL_BYTES = 4944
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
     + _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES
     + _GRAPH_RECOVERY_CONTROLS_CANONICAL_BYTES
+    + _RELEASE086_PLANNER_SCAFFOLD_CANONICAL_BYTES
 )
 
 
@@ -729,6 +736,8 @@ async def _plan(
     mark_schema_loaded: Any = None,
     catalog_service: Any = None,
     policy_override: Any = None,
+    retained_operation_context: pipeline_planner.RetainedOperationContext | None = None,
+    turn_evidence: pipeline_planner.TurnEvidence | None = None,
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
@@ -775,6 +784,8 @@ async def _plan(
             schemas_loaded=schemas_loaded,
             mark_schema_loaded=mark_schema_loaded,
             conversation_context=conversation_context,
+            retained_operation_context=retained_operation_context,
+            turn_evidence=turn_evidence,
             policy_catalog=policy_catalog,
             plugin_snapshot=plugin_snapshot,
             originating_message=origin,
@@ -835,6 +846,29 @@ def test_planner_has_no_request_selected_terminal_contract() -> None:
     assert "terminal_contract" not in inspect.signature(plan_pipeline).parameters
     assert "terminal_contract" not in inspect.signature(planner_tool_definitions).parameters
     assert "terminal_contract" not in inspect.signature(pipeline_planner.planner_terminal_tool_definition).parameters
+
+
+@pytest.mark.asyncio
+async def test_retained_operation_context_reaches_selected_planner_wire(tmp_path: Path, tool_context: ToolContext) -> None:
+    from elspeth.web.composer.protocol import RetainedOperationContext
+
+    origin = _origin()
+    context = RetainedOperationContext(session_id=UUID(origin.session_id), actor_user_id="planner-user", availability="available")
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+    recorder = BufferingRecorder()
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        originating_message=origin,
+        retained_operation_context=context,
+    )
+    assert len(completion.requests) == 1
+    sent = completion.requests[0]
+    payload = json.loads(sent["messages"][1]["content"])
+    assert payload["retained_operation_history"] == json.loads(context.provider_message())["retained_operation_history"]
+    assert recorder.llm_calls[0].messages_hash == stable_hash(sent["messages"])
 
 
 @pytest.mark.asyncio
@@ -3100,43 +3134,168 @@ async def test_profile_rejection_keeps_diagnosis_through_feedback_and_attempt_au
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("in_place_finalizer", [False, True])
+async def test_progressive_coalesce_repairs_do_not_stop_on_repeated_withheld_classifiers(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    in_place_finalizer: bool,
+) -> None:
+    def candidate(x_type: str, y_type: str) -> dict[str, Any]:
+        pipeline = _pipeline(tmp_path)
+        pipeline["source"]["options"]["schema"] = {"mode": "fixed", "fields": ["x: int", "y: int"]}
+        pipeline["nodes"] = [
+            {
+                "id": "fork_rows",
+                "node_type": "gate",
+                "input": "rows",
+                "condition": "True",
+                "routes": {"true": "fork", "false": "fork"},
+                "fork_to": ["left", "right"],
+                "options": {},
+            },
+            {
+                "id": "right_rows",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "right",
+                "on_success": "right_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "fixed", "fields": [f"x: {x_type}", f"y: {y_type}"]}},
+            },
+            {
+                "id": "merge_rows",
+                "node_type": "coalesce",
+                "input": "left",
+                "on_success": "merged",
+                "branches": {"left": "left", "right": "right_done"},
+                "policy": "require_all",
+                "merge": "union",
+                "options": {},
+            },
+        ]
+        pipeline["outputs"][0]["sink_name"] = "merged"
+        return pipeline
+
+    private_path = "outputs/PRIVATE-UNRELATED-FINALIZER.jsonl"
+
+    def finalize(pipeline: Mapping[str, Any]) -> Mapping[str, Any]:
+        finalized = pipeline if in_place_finalizer else deepcopy(dict(pipeline))
+        assert type(finalized) is dict
+        finalized["outputs"][0]["options"]["path"] = private_path
+        return finalized
+
+    candidates = [candidate("str", "str"), candidate("int", "str"), candidate("int", "int")]
+    context, _, _ = _candidate_context(tmp_path, _TEST_SESSION_ID)
+    results = [build_set_pipeline_candidate(finalize(deepcopy(item)), _empty_state(), context).result for item in candidates]
+    conflicts = [
+        next(entry for entry in result.validation.errors if entry.error_code == "coalesce_union_type_incompatible")
+        for result in results[:2]
+    ]
+    assert [entry.coalesce_union_type.field for entry in conflicts] == ["x", "y"]
+    assert results[2].success and results[2].validation.is_valid, results[2].validation.errors
+    assert _rejection_fingerprint(results[0]) == _rejection_fingerprint(results[1])
+    for item, result in zip(candidates[:2], results[:2], strict=True):
+        owned = _derive_finalizer_owned_refs(item, finalize(deepcopy(item)))
+        assert owned.config == frozenset({"output:merged"})
+        assert pipeline_planner._rejection_facts_withheld(result, owned)
+
+    completion = _ScriptedCompletion(
+        *[
+            _response_with_call_id(f"coalesce-{index}", "emit_pipeline_proposal", {"pipeline": item})
+            for index, item in enumerate(candidates, start=1)
+        ]
+    )
+    recorder = BufferingRecorder()
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        repair_budget=2,
+        candidate_finalizer=finalize,
+        model_overrides={"escape_hatch_model": None},
+    )
+
+    assert len(completion.requests) == 3
+    assert len(recorder.llm_calls) == 3
+    assert proposal.proposal.repair_count == 2
+    assert deep_thaw(proposal.proposal.pipeline) == finalize(deepcopy(candidates[2]))
+    assert [attempt.repeated_fingerprint for attempt in recorder.planner_attempts] == [False, True, False]
+    assert len({attempt.candidate_shape_hash for attempt in recorder.planner_attempts}) == 1
+    authored_hashes = [stable_hash(pipeline_planner.project_composer_authority_payload(item)) for item in candidates]
+    assert len(set(authored_hashes)) == 3
+    assert all(digest not in canonical_json(completion.requests) for digest in authored_hashes)
+    assert all(item["outputs"][0]["options"]["path"] == "outputs/result.jsonl" for item in candidates)
+    private_rejections = recorder.private_candidates[:2]
+    assert [item.status for item in private_rejections] == ["rejected", "rejected"]
+    assert [
+        next(
+            entry["coalesce_union_type"]["field"]
+            for entry in json.loads(item.result_canonical)["validation"]["errors"]
+            if entry["error_code"] == "coalesce_union_type_incompatible"
+        )
+        for item in private_rejections
+    ] == ["x", "y"]
+    for request in completion.requests[1:]:
+        (feedback_message,) = [message for message in request["messages"][-1:] if message["role"] == "tool"]
+        feedback = json.loads(feedback_message["content"])
+        coalesce = next(entry for entry in feedback["validation"]["errors"] if entry["error_code"] == "coalesce_union_type_incompatible")
+        assert "coalesce_union_type" not in coalesce
+    second_feedback = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert second_feedback["repeat_notice"] == _REPEAT_NOTICE_WITHHELD
+    assert "cannot succeed" not in second_feedback["repeat_notice"]
+    assert "Only a structurally different" not in second_feedback["repeat_notice"]
+    assert private_path not in canonical_json(completion.requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vary_private_option", [False, True])
 async def test_repeated_rejection_with_withheld_facts_short_circuits_budget(
     tmp_path: Path,
     tool_context: ToolContext,
+    vary_private_option: bool,
 ) -> None:
-    """Repeat-while-blind fails fast to the terminal path (elspeth-5904b1683a).
-
-    When the finalizer's own (server-bound) configuration is what fails
-    validation, no candidate the model emits can converge — burning the rest
-    of the repair budget on near-identical candidates is deterministic waste.
-    """
+    """An unchanged authored rejection does not earn another blind retry."""
+    finalized_values = []
 
     def finalize(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        finalized = deepcopy(dict(candidate))
-        finalized["source"]["options"]["private_flag"] = True
-        return finalized
+        assert type(candidate) is dict
+        value = not vary_private_option or not finalized_values
+        candidate["source"]["options"]["private_flag"] = value
+        finalized_values.append(value)
+        return candidate
 
     candidate = _pipeline(tmp_path)
     completion = _ScriptedCompletion(
         _response_with_call_id("blind-first", "emit_pipeline_proposal", {"pipeline": deepcopy(candidate)}),
         _response_with_call_id("blind-repeat", "emit_pipeline_proposal", {"pipeline": deepcopy(candidate)}),
     )
+    recorder = BufferingRecorder()
 
     with pytest.raises(PipelinePlannerError) as excinfo:
         await _plan(
             tmp_path=tmp_path,
             tool_context=tool_context,
             completion=completion,
+            recorder=recorder,
             repair_budget=5,
             candidate_finalizer=finalize,
         )
 
     assert excinfo.value.code == "REPAIR_EXHAUSTED"
     assert "short-circuited" in str(excinfo.value)
+    assert "cannot converge" not in str(excinfo.value)
     # Exactly two provider calls: the first rejection buys ONE blind repair
     # turn; its identical rejection terminates instead of burning the
     # remaining budget of 5.
     assert len(completion.requests) == 2
+    assert finalized_values == ([True, False] if vary_private_option else [True, True])
+    assert "private_flag" not in candidate["source"]["options"]
+    assert recorder.planner_attempts[-1].planner_code.value == "REPAIR_BLIND_REPEAT"
+    assert [item.status for item in recorder.private_candidates] == ["rejected", "rejected"]
+    assert all("private_flag" in item.result_canonical for item in recorder.private_candidates)
+    assert "private_flag" not in canonical_json(completion.requests)
+    assert stable_hash(pipeline_planner.project_composer_authority_payload(candidate)) not in canonical_json(completion.requests)
     first_feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
     assert [entry["component"] for entry in first_feedback["validation"]["errors"]] == ["pipeline"]
     assert "detail" not in first_feedback["validation"]["errors"][0]
@@ -3484,6 +3643,7 @@ async def test_safe_candidate_argument_error_gets_closed_feedback_then_repairs_w
             "severity": "high",
             "error_code": "argument_error",
             "error_class": "ToolArgumentError",
+            "error_category": "semantic_rule",
         }
     ]
     assert raw_canary not in canonical_json(feedback)
@@ -3672,6 +3832,80 @@ async def test_structurally_invalid_terminal_draft_gets_located_schema_repair(
     # The rejected VALUE never rides along — jsonschema puts it in the
     # message, which this projection deliberately never reads.
     assert "123" not in completion.requests[1]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_missing_node_input_names_the_absent_owned_property(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    malformed = _pipeline(tmp_path)
+    malformed["nodes"] = [{"id": "clean", "node_type": "transform", "plugin": "field_mapper", "options": {}}]
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": malformed})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert proposal.proposal.repair_count == 1
+    assert len(completion.requests) == 2
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    entry = feedback["validation"]["errors"][0]
+    assert entry["error_code"] == "canonical_schema"
+    assert {"path": "nodes/index/input", "rule": "required"} in entry["schema_violations"]
+
+
+@pytest.mark.parametrize("case", ["unknown-root", "unknown-source-key"])
+def test_structural_schema_feedback_never_echoes_authored_keys_or_values(tmp_path: Path, case: str) -> None:
+    from jsonschema import Draft202012Validator
+
+    canary = "private_api_key_canary"
+    malformed = _pipeline(tmp_path)
+    if case == "unknown-root":
+        malformed[canary] = "PRIVATE_REJECTED_VALUE"
+        expected = {"path": "pipeline", "rule": "additionalProperties"}
+    else:
+        source = malformed.pop("source")
+        source["plugin"] = {"PRIVATE_REJECTED_VALUE": True}
+        malformed["sources"] = {canary: source}
+        expected = {"path": "sources/item/plugin", "rule": "type", "constraint": "string"}
+    errors = list(Draft202012Validator(canonical_set_pipeline_schema()).iter_errors(malformed))
+    assert errors
+    if case == "unknown-source-key":
+        assert any(canary in error.absolute_path for error in errors)
+
+    violations, withheld = pipeline_planner._structural_schema_violations(errors)
+
+    assert expected in violations
+    assert withheld == 0
+    encoded = canonical_json(violations)
+    assert canary not in encoded
+    assert "PRIVATE_REJECTED_VALUE" not in encoded
+
+
+def test_required_schema_feedback_deduplicates_missing_names_and_counts_omissions(tmp_path: Path) -> None:
+    from jsonschema import Draft202012Validator
+
+    malformed = _pipeline(tmp_path)
+    malformed["nodes"] = [{"node_type": "transform", "plugin": "field_mapper", "options": {}} for _ in range(5)]
+    errors = list(Draft202012Validator(canonical_set_pipeline_schema()).iter_errors(malformed))
+    assert len(errors) == 10
+    assert all(error.validator == "required" for error in errors)
+
+    violations, withheld = pipeline_planner._structural_schema_violations(errors)
+
+    assert (
+        violations
+        == [
+            {"path": "nodes/index/id", "rule": "required"},
+            {"path": "nodes/index/input", "rule": "required"},
+        ]
+        * 4
+    )
+    assert withheld == 2
+    feedback = pipeline_planner._canonical_schema_feedback(violations, violations_withheld=withheld)
+    assert feedback["validation"]["errors"][0]["schema_violations_withheld"] == 2
 
 
 _CANONICAL_SCHEMA_FEEDBACK = {
@@ -5261,7 +5495,117 @@ async def test_terminal_cannot_replace_server_base_and_proposal_is_created_once(
 
 
 @pytest.mark.asyncio
-async def test_blob_content_discovery_audit_projection_never_retains_content(
+@pytest.mark.parametrize("delivery", ("prefix", "complete", "cost_refused", "malformed"))
+async def test_legacy_planner_blob_pages_do_not_invent_owned_delivery(tmp_path: Path, tool_context: ToolContext, delivery: str) -> None:
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    engine, origin = await _session_context()
+    content = "name,score\n" + "ada,42\n" * 8_000
+    recorder = BufferingRecorder()
+    observed_pages = []
+
+    # Every dispatch is the explicitly injected local completion, including
+    # malformed-response repair attempts. No SDK fallback exists in _plan.
+    async def complete(**kwargs):
+        completion.requests.append(deepcopy(kwargs))
+        selected = [
+            json.loads(message["content"])["data"]
+            for message in kwargs["messages"]
+            if message["role"] == "tool" and message["tool_call_id"].startswith("read-page-")
+        ]
+        observed_pages.append(selected)
+        if not selected:
+            return _response_with_call_id("read-page-1", "get_blob_content", {"blob_id": str(blob.id)})
+        if delivery == "malformed":
+            return _Response(choices=[], usage=_planner_usage())
+        if delivery == "complete" and selected[-1]["next_offset_chars"] is not None:
+            page = selected[-1]
+            return _response_with_call_id(
+                "read-page-2",
+                "get_blob_content",
+                {"blob_id": str(blob.id), "offset_chars": page["next_offset_chars"], "expected_content_hash": page["content_hash"]},
+            )
+        pipeline = _inline_pipeline(tmp_path)
+        del pipeline["source"]["inline_blob"]
+        pipeline["source"]["blob_id"] = str(blob.id)
+        return _response_with_call_id("emit-checked", "emit_pipeline_proposal", {"pipeline": pipeline})
+
+    class _PageCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs):
+            return await complete(**kwargs)
+
+    completion = _PageCompletion()
+    try:
+        with fenced_operation_context(engine, origin.session_id) as context:
+            blob = await BlobServiceImpl(engine, tmp_path).create_blob(
+                UUID(origin.session_id), "coverage.csv", content.encode(), "text/csv", session_operation_context=context
+            )
+            state = _empty_state()
+            evidence = TurnEvidence(
+                session_id=origin.session_id,
+                session_operation_context=context,
+                request_id="actual-planner-pages",
+                request="Inspect the uploaded CSV.",
+                initial_state_id=None,
+                initial_state=state,
+            )
+            custody = replace(
+                _custody(tmp_path),
+                session_engine=engine,
+                session_operation_context=context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+            )
+            budget = _budget(
+                max_total_provider_calls=3 if delivery == "complete" else 2,
+                max_cumulative_provider_cost=Decimal("0.015") if delivery == "cost_refused" else Decimal("1"),
+            )
+            if delivery in ("cost_refused", "malformed"):
+                with pytest.raises(PipelinePlannerError):
+                    await _plan(
+                        tmp_path=tmp_path,
+                        tool_context=tool_context,
+                        completion=completion,
+                        recorder=recorder,
+                        originating_message=origin,
+                        custody_config=custody,
+                        budget=budget,
+                        turn_evidence=evidence,
+                    )
+            else:
+                await _plan(
+                    tmp_path=tmp_path,
+                    tool_context=tool_context,
+                    completion=completion,
+                    recorder=recorder,
+                    originating_message=origin,
+                    custody_config=custody,
+                    budget=budget,
+                    turn_evidence=evidence,
+                )
+            assert len(completion.requests) == (3 if delivery == "complete" else 2)
+            prefix = observed_pages[1][0]
+            assert prefix["start_char"] == 0 < prefix["end_char"] < prefix["total_chars"] == len(content)
+            assert prefix["content"] == content[: prefix["end_char"]]
+            assert prefix["next_offset_chars"] == prefix["end_char"]
+            if delivery == "complete":
+                suffix = observed_pages[2][-1]
+                assert suffix["start_char"] == prefix["end_char"]
+                assert suffix["end_char"] == suffix["total_chars"] == len(content)
+                assert suffix["content_hash"] == prefix["content_hash"]
+            # This legacy direct planner harness has no physical provider owner.
+            # Real selected pages cannot manufacture the missing owned call IDs.
+            assert all(call.call_id is None for call in recorder.llm_calls)
+            assert evidence.inspection_coverage("planner") == evidence.historical_inspection_coverage() == ()
+            # A later primary candidate seeing only a planner summary cannot
+            # borrow nested delivery, even when planner coverage is complete.
+            assert evidence.inspection_coverage("primary") == ()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_blob_content_discovery_buffers_admitted_result_and_redacts_persistence(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
@@ -5302,8 +5646,13 @@ async def test_blob_content_discovery_audit_projection_never_retains_content(
     )
     invocation = recorder.invocations[0]
     assert invocation.tool_name == "get_blob_content"
-    assert "name,score" not in (invocation.result_canonical or "")
-    assert set(json.loads(invocation.result_canonical or "{}")) == {"success", "validation", "version"}
+    buffered = json.loads(invocation.result_canonical or "{}")
+    assert buffered["data"]["content"] == "name,score\nada,42\n"
+    assert "affected_nodes" in buffered and "errors" in buffered["validation"]
+    from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+
+    summary, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+    assert "name,score" not in json.dumps(envelope) and "name,score" not in summary
 
 
 def _text_response(text: str, *, cost: object = 0.01) -> _Response:
@@ -6640,6 +6989,7 @@ _INJECTED_CLAUSE = f"Invalid options for transform '{_INJECTED_PLUGIN}'"
                     "plugin": "field_mapper",
                     "input": "clean",
                     "on_success": "out",
+                    "on_error": "discard",
                     "options": {"bogus_option": True},
                 }
             ],
@@ -6651,7 +7001,7 @@ _INJECTED_CLAUSE = f"Invalid options for transform '{_INJECTED_PLUGIN}'"
             "output",
             None,
             [],
-            [{"sink_name": "out", "plugin": "json", "options": {}}],
+            [{"sink_name": "out", "plugin": "json", "options": {}, "on_write_failure": "discard"}],
             [("source", "csv"), ("sink", "json")],
             id="producer-output",
         ),
@@ -6681,7 +7031,14 @@ def test_every_producer_records_the_identity_it_resolved(
         "edges": [],
         "outputs": outputs
         if outputs is not None
-        else [{"sink_name": "out", "plugin": "json", "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}}}],
+        else [
+            {
+                "sink_name": "out",
+                "plugin": "json",
+                "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
+            }
+        ],
         "metadata": {"name": "p"},
     }
     if sources is None:
@@ -6712,7 +7069,14 @@ def test_the_secret_ref_placement_producer_records_its_identity_too(tmp_path: Pa
             "source": _bad_source(blobs, **{"schema": {"mode": "observed"}, _INJECTED_CLAUSE: {"secret_ref": "N"}}),
             "nodes": [],
             "edges": [],
-            "outputs": [{"sink_name": "out", "plugin": "json", "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}}}],
+            "outputs": [
+                {
+                    "sink_name": "out",
+                    "plugin": "json",
+                    "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}},
+                    "on_write_failure": "discard",
+                }
+            ],
             "metadata": {"name": "p"},
         },
         _empty_state(),
@@ -6781,11 +7145,19 @@ def test_no_model_authored_text_can_inject_an_identity_into_the_contract_attach(
                     "plugin": "field_mapper",
                     "input": "clean",
                     "on_success": "out",
+                    "on_error": "discard",
                     "options": {"bogus_option": True},
                 }
             ],
             "edges": [],
-            "outputs": [{"sink_name": "out", "plugin": "json", "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}}}],
+            "outputs": [
+                {
+                    "sink_name": "out",
+                    "plugin": "json",
+                    "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}},
+                    "on_write_failure": "discard",
+                }
+            ],
             "metadata": {"name": "p"},
         },
         _empty_state(),
@@ -8099,6 +8471,14 @@ async def test_discovery_argument_error_is_recoverable_not_fatal(
     assert len(tool_messages) == 1
     payload = json.loads(tool_messages[0]["content"])
     assert payload["success"] is False
+    argument_error = payload["data"]["argument_error"]
+    assert argument_error["error_category"] == "schema_shape"
+    assert argument_error["validation_errors"] == [
+        {"loc": ["plugin_type"], "msg": "Value is not an allowed choice", "type": "invalid_choice"}
+    ]
+    assert "node" not in json.dumps(argument_error)
+    assert set(payload["data"]) == {"argument_error"}
+    assert {entry["error_code"] for entry in payload["validation"]["errors"]} == {"no_source_configured", "no_sinks_configured"}
     repaired_messages = [m for m in completion.requests[2]["messages"] if m["role"] == "tool"]
     assert len(repaired_messages) == 2
     repaired_payload = json.loads(repaired_messages[-1]["content"])
@@ -8108,6 +8488,37 @@ async def test_discovery_argument_error_is_recoverable_not_fatal(
     assert not any(message.get("content") == closure_notice for message in completion.requests[1]["messages"])
     assert sum(message.get("content") == closure_notice for message in completion.requests[2]["messages"]) == 1
     # The invocation is still audited as an argument error.
+    assert recorder.invocations[0].status.value == "arg_error"
+
+
+@pytest.mark.asyncio
+async def test_discovery_wire_wrapper_repair_keeps_its_owned_instruction(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        model_overrides={"tool_contract_dialect": ToolContractDialect.OPENAI_STRICT},
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 2
+    (tool_message,) = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
+    assert tool_message["tool_call_id"] == "call-1"
+    feedback = json.loads(tool_message["content"])
+    assert feedback["success"] is False
+    assert feedback["data"]["argument_error"]["error_category"] == "wire_envelope"
+    assert "validation_errors" not in feedback["data"]["argument_error"]
+    assert feedback["message"] == "Tool 'list_sources' takes no semantic arguments. Call it with {\"_elspeth_no_arguments\": true} exactly."
     assert recorder.invocations[0].status.value == "arg_error"
 
 
@@ -9367,7 +9778,7 @@ def test_argument_rejection_projections_split_by_surface() -> None:
     """
     error = ToolArgumentError(argument="plugin_type", expected="a plugin kind", actual_type="str", code="DISCOVERY_ONLY")
     entry = pipeline_planner._allowlisted_argument_error_entry(error)
-    assert tuple(entry) == ("component", "severity", "error_code", "error_class")
+    assert tuple(entry) == ("component", "severity", "error_code", "error_class", "error_category")
     assert entry == {
         # ``plugin_type`` is not in the closed schema-owned label vocabulary,
         # so ToolArgumentError canonicalizes it: what the projection carries is
@@ -9376,6 +9787,7 @@ def test_argument_rejection_projections_split_by_surface() -> None:
         "severity": "high",
         "error_code": "DISCOVERY_ONLY",
         "error_class": "ToolArgumentError",
+        "error_category": "discovery_only",
     }
 
     payload = pipeline_planner.argument_error_response(error).to_wire()

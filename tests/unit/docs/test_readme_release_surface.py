@@ -26,10 +26,15 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     current_section = readme.split(heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     text = " ".join(current_section.split())
 
-    assert f"session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH}." in text
-    assert "preserve them unchanged and configure explicitly new compatible databases" in text
-    assert "does not migrate either store in place or authorize downgrading these stores" in text
-    assert "compatibility policy has no fixed expiry" in text
+    assert f"Session epoch {SESSION_SCHEMA_EPOCH} replaces session epoch 75" in text
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} is unchanged." in text
+    assert "Preserve epoch 75 session stores" in text
+    assert f"use a separately provisioned epoch {SESSION_SCHEMA_EPOCH} session store" in text
+    assert "Keep old workers isolated from the new store" in text
+    assert "Compatible stores still require exact schema admission" in text
+    assert "unsupported stores are preserved and refused before incompatible writes" in text
+    assert "Backwards compatibility is permitted and considered from 0.8.5 within explicitly supported boundaries" in text
+    assert "authorizes no in-place migration, reset or downgrade" in text
     assert f"Package metadata is {version};" in text
     assert "the package version alone does not establish qualification or image publication" in text
     assert "Automatic image publication from main is held" in text

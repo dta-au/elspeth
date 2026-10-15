@@ -19,10 +19,10 @@ COMPLETE = "complete_composer_async_operation"
 FAIL = "fail_composer_async_operation"
 GRAMMARS = {
     TERMINAL: "a10083507d0d46ac9dae642785ff99692edad99350d2917862c2f9ff045c4300",
-    COMPLETE: "49548265ff2c89d58d894482543d04b6b8e6b7717efda8f83e64eb6a79061c94",
-    FAIL: "c25306f67d7c37f4d473e445392f25edcb88751639f0069b67dfe64ebae09ff0",
+    COMPLETE: "4947b18fec56b611b18c552727355de19b281da98f24f27f207e109f27cddd0a",
+    FAIL: "722ac4ab6f9aee7a02e7750b20ca7fe9ef5e2113799beb1891fbeac045dc2644",
 }
-NAMESPACE_GRAMMAR = "5489f3c8762fae3c242e8609aaba9cc56760acc55bf2e646a5fe05b2f50fd106"
+NAMESPACE_GRAMMAR = "58e64107f0a28ec8e1f832994517b743e68dd9f2562ec387287dbf9e57614621"
 MASK = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
 SUPPLIERS = (
     ("RequiredWorkCoordinator", "elspeth.web.required_work", REQUIRED),
@@ -451,7 +451,7 @@ def terminal_sql_local_contracts(units):
     loop = terminal.body[4]
     witnessed = loop.body[3]
     callbacks = [(TERMINAL, terminal, witnessed)]
-    for name, positions in ((COMPLETE, (12, 13)), (FAIL, (7, 8))):
+    for name, positions in ((COMPLETE, (12, 13)), (FAIL, (11, 12))):
         callbacks.extend((name, selected[name], selected[name].body[pos]) for pos in positions)
     for name, method, callback in callbacks:
         code, reason = code_for(tree, [cls, method, callback])

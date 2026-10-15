@@ -2,6 +2,7 @@
 
 import json
 import warnings
+from itertools import pairwise
 from uuid import UUID
 
 import pytest
@@ -339,6 +340,175 @@ def test_failure_facts_filter_credentials_and_preserve_errno_topology():
     assert value["nodes"][1]["relation"] == "cause"
     failure.__cause__ = failure
     assert json.loads(capture_failure_facts(failure).canonical)["termination"] == "cycle"
+
+
+def test_failure_graph_retains_cause_and_suppressed_context():
+    failure = RuntimeError("outer operation")
+    failure.__cause__ = ValueError("primary cause")
+    failure.__context__ = LookupError("suppressed context")
+    failure.__suppress_context__ = True
+    facts = json.loads(capture_failure_facts(failure).canonical)
+    assert [node["class"] for node in facts["nodes"]] == ["RuntimeError", "ValueError", "LookupError"]
+    assert facts["nodes"][0]["suppressed_context"] is True
+    assert facts["edges"] == [
+        {"from": 0, "to": 1, "relation": "cause", "disposition": "captured"},
+        {"from": 0, "to": 2, "relation": "context", "disposition": "captured"},
+    ]
+    assert facts["termination"] == "complete"
+
+
+def test_failure_graph_distinguishes_group_shared_nodes_from_cycles():
+    shared = ValueError("shared leaf")
+    branch = RuntimeError("branch")
+    group = ExceptionGroup("group", [branch, shared, shared])
+    branch.__cause__ = group
+    facts = json.loads(capture_failure_facts(group).canonical)
+    assert [node["class"] for node in facts["nodes"]] == ["ExceptionGroup", "RuntimeError", "ValueError"]
+    assert [(edge["relation"], edge["from"], edge["to"], edge["disposition"]) for edge in facts["edges"]] == [
+        ("group_member", 0, 1, "captured"),
+        ("cause", 1, 0, "cycle"),
+        ("group_member", 0, 2, "captured"),
+        ("group_member", 0, 2, "shared"),
+    ]
+    assert [edge["member_index"] for edge in facts["edges"] if edge["relation"] == "group_member"] == [0, 1, 2]
+    assert facts["termination"] == "cycle"
+    shared_only = json.loads(capture_failure_facts(ExceptionGroup("shared", [shared, shared])).canonical)
+    assert shared_only["termination"] == "complete"
+    independent = ValueError("shared leaf")
+    assert json.loads(capture_failure_facts(ExceptionGroup("shared", [independent, independent])).canonical) == shared_only
+
+
+@pytest.mark.parametrize("message", ["\x01" * 2048, "a" * 2048, "😀" * 512], ids=["escaped", "ascii", "nonbmp"])
+def test_failure_graph_survives_argument_serialization_bounds(message):
+    failure = ValueError(message, message, message, "password=graph-private-canary")
+    failure.__cause__ = LookupError(message, message, message, "essential root cause")
+    captured = capture_failure_facts(failure)
+    facts = json.loads(captured.canonical)
+    assert len(captured.canonical.encode("utf-8")) <= 8192
+    assert facts["record_type"] == "failure_facts"
+    assert [node["class"] for node in facts["nodes"]] == ["ValueError", "LookupError"]
+    assert facts["edges"][0]["to"] == 1
+    assert facts["nodes"][0]["arguments"][3]["disposition"] == "filtered"
+    assert "graph-private-canary" not in captured.canonical
+    assert facts["trimmed_arguments"] > 0
+    assert sum(slot.get("text_omitted", False) for node in facts["nodes"] for slot in node["arguments"]) == facts["trimmed_arguments"]
+    assert capture_failure_facts(failure).canonical == captured.canonical
+
+
+def test_failure_graph_caps_depth_nodes_members_and_edges_explicitly():
+    chain = [ValueError(f"level {index}") for index in range(9)]
+    for parent, child in pairwise(chain):
+        parent.__cause__ = child
+    deep = json.loads(capture_failure_facts(chain[0]).canonical)
+    assert len(deep["nodes"]) == 5
+    assert deep["edges"][-1]["to"] is None
+    assert deep["edges"][-1]["disposition"] == "depth_limit"
+    assert deep["termination"] == "node_limit"
+    assert "depth_limit" in deep["termination_reasons"]
+
+    members = [ValueError(f"member {index}") for index in range(12)]
+    wide = json.loads(capture_failure_facts(ExceptionGroup("wide", members)).canonical)
+    assert len(wide["nodes"]) == 8
+    assert wide["nodes"][0]["omitted_members"] == 4
+    assert len(wide["edges"]) == 8
+    assert wide["edges"][-1]["disposition"] == "node_limit"
+    assert set(wide["termination_reasons"]) == {"node_limit", "group_member_limit"}
+
+    dense = ExceptionGroup("dense", [members[0]] * 8)
+    members[0].__cause__ = members[0]
+    members[0].__context__ = ExceptionGroup("nested", [members[0]] * 8)
+    bounded = json.loads(capture_failure_facts(dense).canonical)
+    assert len(bounded["edges"]) == 16
+    assert bounded["omitted_edges"] > 0
+    assert "edge_limit" in bounded["termination_reasons"]
+    assert sum(sum(node.get("omitted_relations", {}).values()) for node in bounded["nodes"]) == bounded["omitted_edges"]
+
+
+def test_failure_graph_existing_targets_survive_depth_and_node_caps():
+    chain = [ValueError(f"level {index}") for index in range(5)]
+    for parent, child in pairwise(chain):
+        parent.__cause__ = child
+    chain[-1].__cause__ = chain[0]
+    chain[0].__context__ = chain[-1]
+    facts = json.loads(capture_failure_facts(chain[0]).canonical)
+    assert facts["edges"][-2]["disposition"] == "cycle"
+    assert facts["edges"][-1]["disposition"] == "shared"
+    assert "depth_limit" not in facts["termination_reasons"]
+
+    members = [ValueError(f"member {index}") for index in range(7)]
+    capped = json.loads(capture_failure_facts(ExceptionGroup("full", [*members, members[-1]])).canonical)
+    assert len(capped["nodes"]) == 8
+    assert capped["edges"][-1]["disposition"] == "shared"
+    assert capped["termination"] == "complete"
+
+
+def test_failure_graph_bounds_escaped_classes_and_maximal_disposition_skeleton():
+    import errno
+
+    # Legal class labels can expand in canonical JSON independently of UTF8.
+    label = "\x01" * 20 + "a" * 36
+    failure_type = type(label, (OSError,), {})
+    group_type = type(label, (ExceptionGroup,), {})
+    leaves = [failure_type(errno.ENOENT, "ordinary reference") for _ in range(7)]
+    group = group_type("group", leaves)
+    for leaf in leaves:
+        BaseException.__dict__["args"].__set__(leaf, ("\x01" * 2048,) * 4)
+        leaf.__cause__ = group
+        leaf.__context__ = group
+    BaseException.__dict__["args"].__set__(group, ("\x01" * 2048,) * 4)
+    captured = capture_failure_facts(group)
+    facts = json.loads(captured.canonical)
+    assert len(captured.canonical.encode("utf-8")) <= 8192
+    assert facts["nodes"]
+    assert all(node["class"] == label for node in facts["nodes"])
+    assert facts["trimmed_arguments"] == 4 * len(facts["nodes"])
+    assert all(slot["text_omitted"] is True for node in facts["nodes"] for slot in node["arguments"])
+    assert all(node["errno_name"] == "ENOENT" for node in facts["nodes"][1:])
+    unbounded_label = type("\x01" * 128, (ValueError,), {})
+    assert json.loads(capture_failure_facts(unbounded_label()).canonical)["nodes"][0]["class"] == "unavailable"
+
+
+def test_failure_graph_base_exception_members_and_snapshot_are_private_and_immutable():
+    import asyncio
+
+    failure = ValueError("ordinary private reference")
+    group = BaseExceptionGroup("joined outcomes", [failure, asyncio.CancelledError()])
+    captured = capture_failure_facts(group)
+    before = captured.canonical
+    failure.__cause__ = RuntimeError("later replacement")
+    facts = json.loads(before)
+    assert [node["class"] for node in facts["nodes"]] == ["BaseExceptionGroup", "ValueError", "CancelledError"]
+    assert captured.canonical == before
+    assert capture_failure_facts(group).canonical != before
+    assert "ordinary private reference" not in repr(captured)
+    assert "later replacement" not in before
+
+
+def test_failure_graph_uses_builtin_storage_for_hostile_group_and_exception():
+    class HostileGroup(ExceptionGroup):
+        @property
+        def exceptions(self):
+            raise AssertionError("group property executed")
+
+        @property
+        def __class__(self):
+            raise AssertionError("class property executed")
+
+        def __str__(self):
+            raise AssertionError("str executed")
+
+        def __repr__(self):
+            raise AssertionError("repr executed")
+
+    class HostileFailure(Exception):
+        def __getattribute__(self, name):
+            raise AssertionError("exception attribute executed")
+
+    leaf = HostileFailure("ordinary private detail")
+    group = HostileGroup("group", [leaf])
+    facts = json.loads(capture_failure_facts(group).canonical)
+    assert [node["class"] for node in facts["nodes"]] == ["HostileGroup", "HostileFailure"]
+    assert facts["edges"][0]["relation"] == "group_member"
 
 
 @pytest.mark.parametrize("message", ["\ud800", "a" * 2049])

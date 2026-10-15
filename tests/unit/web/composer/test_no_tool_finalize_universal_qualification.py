@@ -237,7 +237,14 @@ class _ScriptedLLM:
     def __init__(self, responses: list[Any]) -> None:
         self._responses = list(responses)
 
-    async def __call__(self, _messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def __call__(
+        self,
+        _messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+    ) -> Any:
         if not self._responses:
             return _admit_composer_llm_completion(_fake_text_response("Done."))
         return _admit_composer_llm_completion(self._responses.pop(0))
@@ -278,7 +285,7 @@ def _set_pipeline_without_interpretation_sites() -> dict[str, Any]:
     recompute the preflight rather than pass ``None`` through.
     """
     return {
-        "source": {"plugin": "null", "on_success": "rows", "options": {}},
+        "source": {"plugin": "null", "on_success": "rows", "options": {}, "on_validation_failure": "discard"},
         "nodes": [
             {
                 "id": "map_node",
@@ -658,9 +665,7 @@ class TestAdvisorBlockedTerminalPreservesPendingHandoff:
         A fix scoped to the ``flagged_*`` reasons only would fail here.
         """
         advisor = _RecordingAdvisor(
-            AdvisorCheckpointVerdict(
-                ok=False, blocking=False, findings_text="advisor model was unavailable after retry", failure_class="unavailable"
-            )
+            AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="advisor model was unavailable", failure_class="unavailable")
         )
         fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_valid_result())
         result = await _run_no_tool_turn(tmp_path, sessions_service, monkeypatch, fake=fake, max_composition_turns=1, advisor=advisor)
@@ -671,7 +676,7 @@ class TestAdvisorBlockedTerminalPreservesPendingHandoff:
         # the fixed backend classification naming the class, not advisor-model
         # prose — so the pending-specific wording must not have dropped it.
         detail = next(check.detail for check in result.runtime_preflight.checks if check.name == CHECK_ADVISOR_SIGNOFF)
-        assert "advisor model was unavailable after retry" in detail
+        assert "advisor model was unavailable" in detail
         assert detail.startswith("The evidence-scoped completion advisory review could not be obtained.")
 
     @pytest.mark.asyncio

@@ -323,11 +323,12 @@ async def test_transition_instrument_rejects_primary_provider_bypass(tmp_path: P
         tools: object,
         *,
         provider_custody: ProviderCallCustody | None = None,
+        credential_state: object | None = None,
     ) -> _AdmittedLLMCompletion:
         nonlocal calls
         calls += 1
         if calls == 1:
-            return await physical_call(self, messages, tools, provider_custody=provider_custody)
+            return await physical_call(self, messages, tools, provider_custody=provider_custody, credential_state=credential_state)
         # First transition dispatches normally. Counterfeit the second path
         # while leaving accounting real: a positive per-walk total misses it.
         assert type(provider_custody) is ProviderCallCustody

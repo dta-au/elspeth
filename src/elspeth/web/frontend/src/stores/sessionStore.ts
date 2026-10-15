@@ -1,7 +1,7 @@
 import { currentAuthGeneration, isCurrentAuthGeneration } from "@/api/authSession";
-import { observeComposerOperation, submitAndObserveComposerOperation, cancelObservedComposerOperation, detachComposerObservers, ComposerObservationDetached, ComposerSessionMissing } from "@/api/composerOperationObserver";
+import { observeComposerOperation, submitAndObserveComposerOperation, cancelObservedComposerOperation, detachComposerObservers, ComposerActiveAttachment, ComposerObservationDetached, ComposerSessionMissing } from "@/api/composerOperationObserver";
 import { composerCustodySessionIds, composerCustodyRecoveryNotice, composerStopPersistenceLimited, composerCustodyScope, findComposerOperationCustody, samePrincipal } from "./composerOperationCustody";
-import type { OperationCustody, SubmittedCustody } from "@/types/composerOperations";
+import type { OperationCustody, SubmittedCustody, ComposerOperationFailureNotice } from "@/types/composerOperations";
 // src/stores/sessionStore.ts
 import { create } from "zustand";
 import type {
@@ -55,12 +55,12 @@ const GRAPH_UNAVAILABLE_MESSAGE =
 
 type UnavailableCompositionHead = { sessionId: string; state_id: string; version: number };
 
-async function readCompositionSnapshot(sessionId: string): Promise<{
+async function readCompositionSnapshot(sessionId: string, signal?: AbortSignal): Promise<{
   compositionState: CompositionState | null;
   unavailableCompositionHead: UnavailableCompositionHead | null;
 }> {
   try {
-    return { compositionState: await api.fetchCompositionState(sessionId), unavailableCompositionHead: null };
+    return { compositionState: await api.fetchCompositionState(sessionId, signal), unavailableCompositionHead: null };
   } catch (error) {
     const apiError = error as ApiError;
     if (apiError.status !== 409 || apiError.error_type !== "composition_state_unavailable" || !apiError.unavailable_state_head) throw error;
@@ -250,8 +250,31 @@ let composerProgressAppliedTicket = 0;
 let inflightMessagesReadTicket = 0;
 let inflightMessagesAppliedTicket = 0;
 let sessionPublicationGeneration = 0;
+let composerFailureHistoryRead = 0;
+const composerReadControllers = new Set<AbortController>();
+const COMPOSER_REFRESH_DEADLINE_MS = 15000;
+
+async function boundedComposerRead<T>(read: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  composerReadControllers.add(controller);
+  const timer = setTimeout(() => controller.abort(), COMPOSER_REFRESH_DEADLINE_MS);
+  let rejectAborted!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAborted = () => reject(new DOMException("Composer refresh stopped", "AbortError"));
+    controller.signal.addEventListener("abort", rejectAborted, { once: true });
+  });
+  try { return await Promise.race([read(controller.signal), aborted]); }
+  finally {
+    clearTimeout(timer);
+    controller.signal.removeEventListener("abort", rejectAborted);
+    composerReadControllers.delete(controller);
+  }
+}
 
 function advanceSessionPublicationGeneration(): number {
+  for (const controller of composerReadControllers) controller.abort();
+  composerFailureHistoryRead += 1;
+  useSessionStore.setState({ composerFailureOutcomes: [], composerFailureNextCursor: null, composerFailureHistoryLoading: false, composerFailureHistoryError: null });
   sessionPublicationGeneration += 1;
   proposalSnapshotSequence += 1;
   return sessionPublicationGeneration;
@@ -408,6 +431,19 @@ function composerSessionHasCustody(sessionId: string): boolean {
   return record.foreground !== null || record.unresolvedSubmissions.size > 0;
 }
 
+function mergeComposerFailureOutcomes(existing: ComposerOperationFailureNotice[], incoming: ComposerOperationFailureNotice[]): ComposerOperationFailureNotice[] {
+  const byOperation = new Map(existing.map((item) => [`${item.session_id}:${item.operation_id}`, item]));
+  for (const item of incoming) {
+    const key = `${item.session_id}:${item.operation_id}`;
+    const previous = byOperation.get(key);
+    if (previous === undefined || item.settled_at !== null || previous.settled_at === null) byOperation.set(key, item);
+  }
+  return [...byOperation.values()].sort((a, b) => {
+    if (a.settled_at === null || b.settled_at === null) return a.settled_at === b.settled_at ? b.operation_id.localeCompare(a.operation_id) : a.settled_at === null ? -1 : 1;
+    return Date.parse(b.settled_at) - Date.parse(a.settled_at) || b.operation_id.localeCompare(a.operation_id);
+  });
+}
+
 async function runDurableComposerTurn(descriptor: OperationCustody, localMessageId: string | null, signal: AbortSignal | undefined, submit: boolean, reconciliationOnly = false): Promise<void> {
   const sessionId = descriptor.sessionId;
   const generation = sessionPublicationGeneration;
@@ -435,29 +471,30 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   } catch (error) {
     if (!current() || error instanceof ComposerObservationDetached) return;
     if (error instanceof ComposerSessionMissing) { useSessionStore.getState().unbindMissingSession(sessionId); return; }
+    if (error instanceof ComposerActiveAttachment && error.terminal.status === "completed") result = error.terminal.result;
     failure = error;
   }
   if (!current()) return;
-  const messagesAtReadDispatch = useSessionStore.getState().messages;
+  let messagesAtReadDispatch = useSessionStore.getState().messages;
   const proposalSnapshot = beginProposalSnapshot();
   let authoritativeMessages: ChatMessage[] | null = null;
   let authoritativeState: CompositionState | null | undefined;
   let unavailableHead: UnavailableCompositionHead | null | undefined;
   let proposals: CompositionProposal[] | null = null;
   let refreshed = false;
-  const [messagesRead, stateRead, proposalsRead] = await Promise.allSettled([
-    api.fetchMessages(sessionId), readCompositionSnapshot(sessionId), api.fetchCompositionProposals(sessionId),
-  ]);
-  if (messagesRead.status === "fulfilled") authoritativeMessages = messagesRead.value;
-  if (proposalsRead.status === "fulfilled") proposals = proposalsRead.value;
-  if (stateRead.status === "fulfilled") {
-    authoritativeState = stateRead.value.compositionState;
-    unavailableHead = stateRead.value.unavailableCompositionHead;
-    refreshed = true;
-  }
-  if (!current()) return;
   const error = failure as ApiError | null;
   const errorText = error === null ? null : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
+  const terminalFailure = failure instanceof ComposerActiveAttachment ? failure.terminal.status === "failed" ? failure.terminal.error : null : error;
+  const terminalIdentity = terminalFailure?.composer_operation;
+  const observedFailure: ComposerOperationFailureNotice | null = terminalFailure === null || terminalIdentity === undefined ? null : {
+    session_id: sessionId, operation_id: terminalIdentity.operation_id, kind: terminalIdentity.kind, user_message_id: null,
+    settled_at: null, failure_code: terminalIdentity.failure_code, error_type: null,
+    diagnostic_id: terminalFailure.diagnostic_id ?? null,
+    request_id: terminalFailure.request_id !== undefined && terminalFailure.request_id.length > 0 && terminalFailure.request_id.length <= 128 ? terminalFailure.request_id : null,
+    saved_revisions: { attribution: "unavailable", count: null, latest_state_id: null, latest_version: null },
+  };
+  function publish(surface: "terminal" | "messages" | "state" | "proposals"): void {
+  if (!current()) return;
   useSessionStore.setState((state) => {
     const local = localMessageId === null ? undefined : state.messages.find((row) => row.id === localMessageId);
     let messages = authoritativeMessages ?? state.messages;
@@ -471,15 +508,15 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
       messages = [...byId.values()].sort((a, b) => a.sequence_no != null && b.sequence_no != null ? a.sequence_no - b.sequence_no : 0);
     }
     if (local && !messages.some((row) => row.id === local.id || (row.operation_id != null && row.operation_id === local.operation_id))) messages = [...messages, local];
-    if (result) messages = messages.some((row) => row.id === result!.message.id) ? messages.map((row) => row.id === result!.message.id ? result!.message : row) : [...messages, result.message];
+    if (result && (surface === "terminal" || !messages.some((row) => row.id === result!.message.id))) messages = messages.some((row) => row.id === result!.message.id) ? messages.map((row) => row.id === result!.message.id ? result!.message : row) : [...messages, result.message];
     if (result?.recovery_notice) {
       const receipt = result.recovery_notice;
-      messages = messages.some((row) => row.id === receipt.id) ? messages.map((row) => row.id === receipt.id ? receipt : row) : [...messages, receipt];
+      if (surface === "terminal" || !messages.some((row) => row.id === receipt.id)) messages = messages.some((row) => row.id === receipt.id) ? messages.map((row) => row.id === receipt.id ? receipt : row) : [...messages, receipt];
       messages = [...messages].sort((a, b) => a.sequence_no != null && b.sequence_no != null ? a.sequence_no - b.sequence_no : 0);
     }
     messages = messages.map((row, index) => {
       if (!(row.id === localMessageId || (row.role === "user" && row.operation_id === descriptor.operationId))) return row;
-      if (error && error.error_type !== "audit_integrity_error" && !hasGenuineReplyForUser(messages, index)) return { ...row, local_status: "failed", local_error: errorText ?? undefined, local_failure_code: error.error_type === "stale_compose_state" ? "stale_compose_state" : error.failure_code ?? error.error_type };
+      if (error && error.error_type !== "audit_integrity_error" && (failure instanceof ComposerActiveAttachment || !hasGenuineReplyForUser(messages, index))) return { ...row, local_status: "failed", local_error: errorText ?? undefined, local_failure_code: error.error_type === "stale_compose_state" ? "stale_compose_state" : error.failure_code ?? error.error_type };
       return { ...row, local_status: undefined, local_error: undefined, local_failure_code: undefined };
     });
     const savedPartial = error?.partial_state_save_failed !== true ? error?.partial_state : null;
@@ -489,17 +526,35 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
     const nextUnavailableHead = retainedHead?.sessionId === sessionId && (latestState === null || retainedHead.version >= latestState.version) ? retainedHead : null;
     const nextState = nextUnavailableHead === null ? latestState : null;
     const changed = nextState?.version !== beforeVersion && nextState !== null;
-    const savedChanges = nextState !== null && beforeVersion !== null ? Math.max(0, nextState.version - beforeVersion) : 0;
     const terminalErrorText = error?.error_type === "request_cancelled"
-      ? savedChanges > 0
-        ? `Composition stopped — ${savedChanges} pipeline ${savedChanges === 1 ? "change had" : "changes had"} already been saved (now at version ${nextState!.version}). Your next message continues from the saved draft.`
-        : "Composition stopped. Your next message continues from the current draft."
+      ? "Composition stopped. Review the current draft before deciding what to do next."
       : errorText;
-    if (changed) getExecutionStore().clearValidation();
+    if (changed && (surface === "terminal" || surface === "state")) getExecutionStore().clearValidation();
     const recovery = error && isComposerRecoveryError(error) ? { recoveryError: error, recoveryStartedCompositionVersion: nextState?.id === error.partial_state.id ? nextState.version : beforeVersion } : {};
     const confirmedRecovery = result?.recovery_notice != null && result.state != null && nextState !== null;
-    return { messages, compositionState: nextState, unavailableCompositionHead: nextUnavailableHead, compositionStateLoaded: refreshed || confirmedRecovery, compositionProposals: proposals !== null ? proposalSnapshot.reconcile(state.compositionProposals, mergeCompositionProposals(proposals, result?.proposals ?? [])) : proposalSnapshot.isCurrent() ? mergeCompositionProposals(state.compositionProposals, result?.proposals ?? []) : state.compositionProposals, isComposing: composerSessionHasCustody(sessionId), error: composerCustodyRecoveryNotice() ?? (reconciliationOnly ? state.error : terminalErrorText ?? (nextUnavailableHead === null ? null : GRAPH_UNAVAILABLE_MESSAGE)), lastComposeChangedPipeline: reconciliationOnly ? state.lastComposeChangedPipeline : failure === null ? changed : null, ...(state.selectedNodeId && !nextState?.nodes.some((node) => node.id === state.selectedNodeId) ? { selectedNodeId: null } : {}), ...recovery };
+    const nextProposals = proposals !== null ? proposalSnapshot.reconcile(state.compositionProposals, mergeCompositionProposals(proposals, result?.proposals ?? [])) : proposalSnapshot.isCurrent() ? mergeCompositionProposals(state.compositionProposals, result?.proposals ?? []) : state.compositionProposals;
+    const head = { compositionState: nextState, unavailableCompositionHead: nextUnavailableHead, compositionStateLoaded: refreshed || confirmedRecovery, ...(state.selectedNodeId && !nextState?.nodes.some((node) => node.id === state.selectedNodeId) ? { selectedNodeId: null } : {}) };
+    if (surface === "messages") return { messages };
+    if (surface === "state") return { ...head, ...(nextUnavailableHead !== null && state.error === null ? { error: GRAPH_UNAVAILABLE_MESSAGE } : {}) };
+    if (surface === "proposals") return { compositionProposals: nextProposals };
+    return { messages, ...head, compositionProposals: nextProposals, composerFailureOutcomes: observedFailure === null ? state.composerFailureOutcomes : mergeComposerFailureOutcomes(state.composerFailureOutcomes, [observedFailure]), isComposing: composerSessionHasCustody(sessionId), error: composerCustodyRecoveryNotice() ?? (reconciliationOnly ? state.error : terminalErrorText ?? (nextUnavailableHead === null ? null : GRAPH_UNAVAILABLE_MESSAGE)), lastComposeChangedPipeline: reconciliationOnly ? state.lastComposeChangedPipeline : failure === null ? changed : null, ...recovery };
   });
+  }
+  // An authenticated terminal is already known. Optional reads may enrich it,
+  // but neither a slow graph nor a proposal fetch can postpone its publication.
+  publish("terminal");
+  // Only changes after this publication compete with the newly dispatched read.
+  messagesAtReadDispatch = useSessionStore.getState().messages;
+  const refreshes: Promise<unknown>[] = [
+    boundedComposerRead((readSignal) => api.fetchMessages(sessionId, readSignal)).then((messages) => { authoritativeMessages = messages; publish("messages"); }),
+    boundedComposerRead((readSignal) => readCompositionSnapshot(sessionId, readSignal)).then((snapshot) => { authoritativeState = snapshot.compositionState; unavailableHead = snapshot.unavailableCompositionHead; refreshed = true; publish("state"); }),
+    boundedComposerRead((readSignal) => api.fetchCompositionProposals(sessionId, readSignal)).then((rows) => { proposals = rows; publish("proposals"); }),
+  ];
+  if (observedFailure !== null) refreshes.push(boundedComposerRead((readSignal) => api.fetchComposerOperationFailures(sessionId, { operationId: observedFailure.operation_id, signal: readSignal })).then((page) => {
+    if (current()) useSessionStore.setState((state) => ({ composerFailureOutcomes: mergeComposerFailureOutcomes(state.composerFailureOutcomes, page.items) }));
+  }));
+  await Promise.allSettled(refreshes);
+  if (!current()) return;
   const pendingScope = composerCustodyScope();
   if (!reconciliationOnly && pendingScope !== null) {
     const pending = findComposerOperationCustody(pendingScope, sessionId);
@@ -644,6 +699,11 @@ interface SessionState {
   sessionsLoaded: boolean;
   activeSessionId: string | null;
   messages: ChatMessage[];
+  composerFailureOutcomes: ComposerOperationFailureNotice[];
+  composerFailureNextCursor: string | null;
+  composerFailureHistoryLoading: boolean;
+  composerFailureHistoryError: string | null;
+  loadComposerFailureOutcomes: (earlier?: boolean) => Promise<void>;
   compositionState: CompositionState | null;
   /** Known scalar head when graph hydration failed; enables fenced recovery chat. */
   unavailableCompositionHead: UnavailableCompositionHead | null;
@@ -814,6 +874,10 @@ const initialState = {
   sessionsLoaded: false,
   activeSessionId: null as string | null,
   messages: [] as ChatMessage[],
+  composerFailureOutcomes: [] as ComposerOperationFailureNotice[],
+  composerFailureNextCursor: null as string | null,
+  composerFailureHistoryLoading: false,
+  composerFailureHistoryError: null as string | null,
   compositionState: null as CompositionState | null,
   lastComposeChangedPipeline: null as boolean | null,
   compositionStateLoaded: false,
@@ -838,6 +902,25 @@ const initialState = {
 
 export const useSessionStore = create<SessionState>((set, get) => ({
   ...initialState,
+
+  async loadComposerFailureOutcomes(earlier = false) {
+    const sessionId = get().activeSessionId;
+    if (sessionId === null) return;
+    const cursor = earlier ? get().composerFailureNextCursor : null;
+    if (earlier && cursor === null) return;
+    const generation = sessionPublicationGeneration;
+    const authGeneration = currentAuthGeneration();
+    const ticket = ++composerFailureHistoryRead;
+    const current = () => ticket === composerFailureHistoryRead && isCurrentAuthGeneration(authGeneration) && sessionPublicationIsCurrent(sessionId, generation);
+    set({ composerFailureHistoryLoading: true, composerFailureHistoryError: null });
+    try {
+      const page = await boundedComposerRead((signal) => api.fetchComposerOperationFailures(sessionId, { ...(cursor === null ? {} : { cursor }), signal }));
+      if (!current()) return;
+      set((state) => ({ composerFailureOutcomes: mergeComposerFailureOutcomes(state.composerFailureOutcomes, page.items), composerFailureNextCursor: page.next_cursor, composerFailureHistoryLoading: false }));
+    } catch {
+      if (current()) set({ composerFailureHistoryLoading: false, composerFailureHistoryError: "Could not load saved operation outcomes." });
+    }
+  },
 
   async composeRequest(kind, value) {
     const { activeSessionId, isComposing, composeRequests } = get();
@@ -1072,6 +1155,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       ...clearedRecoveryState(),
     });
 
+    // Operation outcomes restore independently of transcript/graph hydration.
+    void get().loadComposerFailureOutcomes();
+
     try {
       const [messages, snapshot, compositionProposals, composerPreferences] =
         await Promise.all([
@@ -1195,6 +1281,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       const [user, config] = await Promise.all([api.fetchCurrentUser({ logoutOnUnauthorized: false }), api.fetchAuthConfig()]);
       if (!isCurrentAuthGeneration(authGeneration) || !sessionPublicationIsCurrent(sessionId, generation) || !samePrincipal(scope, { principalId: user.user_id, authProvider: config.provider })) return;
     } catch { return; }
+    void get().loadComposerFailureOutcomes();
     const record = findComposerOperationCustody(scope, sessionId);
     if (record.foreground !== null) {
       set({ isComposing: true });

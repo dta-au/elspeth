@@ -64,6 +64,8 @@ def test_review_draft_bounds_have_owned_safe_recovery(draft):
     payload = arg_error_payload(caught.value, "request_interpretation_review")
     assert "1 to 8192" in payload["repair_instruction"]
     assert "Omit llm_draft to use the exact staged draft" in payload["repair_instruction"]
+    assert "nonempty review draft within these bounds" in payload["repair_instruction"]
+    assert "shorter" not in payload["repair_instruction"]
     assert "LEGITIMATE_DOCUMENT_TEXT" not in json.dumps(payload)
 
 
@@ -105,7 +107,9 @@ class _RecordingComposeLLM(_FakeComposeLLM):
         super().__init__(responses)
         self.tool_messages: list[dict[str, Any]] = []
 
-    async def __call__(self, _messages: Any, _tools: Any) -> Any:
+    async def __call__(
+        self, _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         for message in _messages:
             if type(message) is dict and message["role"] == "tool":
                 self.tool_messages.append(dict(message))
@@ -305,6 +309,7 @@ def test_undeclared_path_segment_becomes_generic(source_key: str) -> None:
     assert json.loads(rendered)["validation_errors"] == [
         {"loc": ["sources", "item", "plugin"], "msg": _MSG_MISSING, "type": "missing"},
         {"loc": ["sources", "item", "on_success"], "msg": _MSG_MISSING, "type": "missing"},
+        {"loc": ["sources", "item", "on_validation_failure"], "msg": _MSG_MISSING, "type": "missing"},
     ]
     if source_key == "my key!":
         assert source_key not in rendered
@@ -603,12 +608,14 @@ async def test_mcp_error_text_is_unchanged(name: str, arguments: dict[str, Any],
     assert await _mcp_error_text(name, arguments) == expected
 
 
-def test_planner_discovery_argument_error_body_is_unchanged() -> None:
-    """Characterization: planner discovery projects the error without its message or violations."""
+def test_planner_discovery_argument_error_preserves_closed_schema_facts() -> None:
+    """Discovery preserves bounded schema facts without the raw input or message."""
     with pytest.raises(ToolArgumentError) as caught:
         require_schema_valid_arguments("list_models", {"limit": 0})
     assert caught.value.schema_violations  # the exception does carry them
     assert json.dumps(argument_error_response(caught.value).to_wire()) == (
         '{"argument_error": {"component": "tool arguments", "severity": "high", '
-        '"error_code": "SCHEMA_VALIDATION", "error_class": "ToolArgumentError"}}'
+        '"error_code": "SCHEMA_VALIDATION", "error_class": "ToolArgumentError", '
+        '"error_category": "schema_shape", "validation_errors": [{"loc": ["limit"], '
+        '"msg": "Value is outside allowed bounds", "type": "out_of_bounds"}]}}'
     )

@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.5](https://img.shields.io/badge/status-0.8.5-green.svg)
+![Status: 0.8.6](https://img.shields.io/badge/status-0.8.6-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -98,20 +98,21 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.5
+## What changed in 0.8.6
 
-0.8.5 improves LLM sampling compatibility, ordinary
-execution ownership for the tutorial, document-review recovery, and graph
-route inspection at shared sinks. Omitted sampling now leaves the provider
-default; explicit numbers retain their authored meaning. Composer accepts
-legitimate long review lines and gives actionable feedback for remaining
-constraints. See the [release notes](CHANGELOG.md).
+0.8.6 strengthens Composer final-reply review, retained operation outcomes,
+and bounded blob inspection. Replies are reviewed against the current request,
+saved changes and delivered inspection evidence, or withheld when admission
+cannot be established within existing limits. Reply admission does not clear
+graph or execution blockers. See the [release notes](CHANGELOG.md).
 
-This version requires session epoch 75 and Landscape epoch 49. Existing
-unsupported stores are refused before writes: preserve them unchanged and
-configure explicitly new compatible databases. ELSPETH does not migrate either
-store in place or authorize downgrading these stores. This pre-release
-compatibility policy has no fixed expiry. Package metadata is 0.8.5;
+Session epoch 76 replaces session epoch 75; Landscape epoch 49 is unchanged.
+Preserve epoch 75 session stores and use a separately provisioned epoch 76
+session store. Keep old workers isolated from the new store. Compatible stores
+still require exact schema admission; unsupported stores are preserved and
+refused before incompatible writes. Backwards compatibility is permitted and
+considered from 0.8.5 within explicitly supported boundaries. This candidate
+authorizes no in-place migration, reset or downgrade. Package metadata is 0.8.6;
 the package version alone does not establish qualification or image publication.
 Automatic image publication from main is held; verify the release tag and image
 digest before installing a published image. See the

@@ -10,6 +10,7 @@ import pytest
 from fastapi import Request
 from sqlalchemy import func, select
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
+from tests.unit.web.composer.test_explicit_failure_choices import _ordinary_failure_yaml
 from tests.unit.web.sessions.test_routes import _make_app
 
 from elspeth.contracts.freeze import deep_thaw
@@ -36,6 +37,26 @@ sinks:
 """
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plugin", ["csv", "null"])
+async def test_public_yaml_missing_failure_choice_is_private_safe_and_atomic(tmp_path: Path, plugin: str) -> None:
+    app, service = _make_app(tmp_path)
+    session = await service.create_session("alice", "Import refused", "local")
+    client = SyncASGITestClient(app)
+    document = (
+        _YAML.replace("    on_validation_failure: discard\n", "")
+        .replace("  source:\n", "  PRIVATE_SOURCE_MARKER:\n")
+        .replace("plugin: csv", f'plugin: "{plugin}"', 1)
+    )
+    response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": document})
+    assert response.status_code == 400
+    assert "on_validation_failure" in response.text
+    assert "PRIVATE_SOURCE_MARKER" not in response.text
+    assert await service.get_current_state(session.id) is None
+    with app.state.session_engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
+
+
 async def _pass_preflight(_state: object, **_context: object) -> ValidationResult:
     return ValidationResult(
         is_valid=True,
@@ -43,6 +64,42 @@ async def _pass_preflight(_state: object, **_context: object) -> ValidationResul
         errors=[],
         readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["transforms", "aggregations", "sinks"])
+@pytest.mark.parametrize("route", [None, "", "   "])
+async def test_public_ordinary_yaml_failure_choice_refuses_without_save(tmp_path: Path, kind: str, route: object) -> None:
+    app, service = _make_app(tmp_path)
+    session = await service.create_session("alice", "Import refused", "local")
+    client = SyncASGITestClient(app)
+    response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": _ordinary_failure_yaml(kind, route)})
+    assert response.status_code == 400
+    assert "explicit non-empty" in response.text
+    assert "PRIVATE_" not in response.text
+    assert await service.get_current_state(session.id) is None
+    with app.state.session_engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["transforms", "aggregations", "sinks"])
+@pytest.mark.parametrize("route", ["discard", " discard "])
+async def test_public_ordinary_yaml_explicit_trimmed_choice_is_saved(tmp_path: Path, kind: str, route: str) -> None:
+    app, service = _make_app(tmp_path)
+    session = await service.create_session("alice", "Explicit import", "local")
+    client = SyncASGITestClient(app)
+    with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": _ordinary_failure_yaml(kind, route)})
+    assert response.status_code == 200, response.text
+    state = await service.get_current_state(session.id)
+    assert state is not None
+    if kind == "sinks":
+        assert state.outputs is not None
+        assert state.outputs[0]["on_write_failure"] == "discard"
+    else:
+        assert state.nodes is not None
+        assert state.nodes[0]["on_error"] == "discard"
 
 
 @pytest.mark.asyncio

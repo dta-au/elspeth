@@ -7746,6 +7746,7 @@ class TestCsvBindGuaranteeRuntimeAgreement:
                 {
                     "blob_id": create_result.data["blob_id"],
                     "on_success": "classify",
+                    "on_validation_failure": "discard",
                     "options": {"schema": {"mode": "observed"}},
                 },
                 empty,

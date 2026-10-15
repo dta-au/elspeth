@@ -14,7 +14,7 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditWriter
 from elspeth.web.auth.middleware import get_current_user, require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+from elspeth.web.composer.yaml_importer import RuntimeYamlImportError, composition_state_from_runtime_yaml
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.library_authority import (
@@ -453,7 +453,13 @@ def create_library_router() -> APIRouter:
             )
         except LibraryAuthorityRefusal as exc:
             raise _refused(exc) from exc
-        source_state = composition_state_from_runtime_yaml(source.payload_yaml)
+        try:
+            source_state = composition_state_from_runtime_yaml(source.payload_yaml)
+        except RuntimeYamlImportError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Workflow YAML could not be imported. Supply explicit non-empty failure choices and valid pipeline structure.",
+            ) from exc
         secret_service = request.app.state.scoped_secret_resolver
         env_ref_names = (
             frozenset(item.name for item in secret_service.list_refs(user.user_id)) if secret_service is not None else frozenset()

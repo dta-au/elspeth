@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -19,12 +19,13 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.library_authority import RepositoryLibraryAuthority
-from elspeth.web.sessions.models import identities_table, identity_roles_table, library_entries_table
+from elspeth.web.sessions.models import identities_table, identity_roles_table, library_entries_table, sessions_table
 from elspeth.web.sessions.protocol import SessionNotFoundError, SessionRecord
 from elspeth.web.sessions.routes.workflow.library import create_library_router
 from tests.fixtures.identities import ensure_test_identity
 from tests.integration.web.conftest import _seed_session_with_state
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
+from tests.unit.web.composer.test_explicit_failure_choices import _ordinary_failure_yaml
 
 
 @dataclass
@@ -221,6 +222,42 @@ def test_publish_without_compartment_returns_named_refusal(
     assert events == []
 
 
+@pytest.mark.parametrize(
+    "document",
+    [
+        "sources:\n  PRIVATE_SOURCE_MARKER:\n    plugin: csv\n    on_success: out\n    options: {}\n",
+        'sources:\n  PRIVATE_SOURCE_MARKER:\n    plugin: "null"\n    on_success: out\n    options: {}\n',
+        "sources: [PRIVATE_YAML_MARKER]\n",
+        *[_ordinary_failure_yaml(kind, route) for kind in ("transforms", "aggregations", "sinks") for route in (None, "", "   ")],
+    ],
+)
+def test_fork_invalid_yaml_refuses_before_session_creation_without_private_echo(library_client, monkeypatch, document):
+    client, actor, _events = library_client
+    _, published = _publish(client)
+    actor.identity_id = "carol"
+    accepted = client.post(f"/api/library/{published['entry_id']}/accept", json={})
+    assert accepted.status_code == 200
+    actor.identity_id = "bob"
+    authority = client.app.state.library_authority
+    authorize = authority.authorize_fork_source
+
+    def historical_source(self, **kwargs):
+        # Exercise the real authority read, then supply the older authored
+        # payload at its owned return seam. Authorization is not bypassed.
+        return replace(authorize(**kwargs), payload_yaml=document)
+
+    monkeypatch.setattr(RepositoryLibraryAuthority, "authorize_fork_source", historical_source)
+    engine = client.app.state.session_engine
+    with engine.connect() as conn:
+        before = conn.execute(select(func.count()).select_from(sessions_table)).scalar_one()
+    response = client.post(f"/api/library/{published['entry_id']}/fork")
+    assert response.status_code == 400
+    assert "explicit non-empty failure choices" in response.text
+    assert "PRIVATE_" not in response.text
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(sessions_table)).scalar_one() == before
+
+
 def test_fork_passes_exact_frozen_yaml_and_provenance_to_seed_seam(
     library_client: tuple[SyncASGITestClient, _Actor, list[str]],
 ) -> None:
@@ -255,6 +292,39 @@ def test_fork_passes_exact_frozen_yaml_and_provenance_to_seed_seam(
             "version": 1,
         }
     }
+
+
+@pytest.mark.parametrize("kind", ["transforms", "aggregations", "sinks"])
+@pytest.mark.parametrize("route", ["discard", " discard "])
+def test_fork_accepts_explicit_trimmed_ordinary_failure_choices(library_client, monkeypatch, kind, route):
+    client, actor, _events = library_client
+    _, published = _publish(client)
+    actor.identity_id = "carol"
+    assert client.post(f"/api/library/{published['entry_id']}/accept", json={}).status_code == 200
+    actor.identity_id = "bob"
+    authorize = client.app.state.library_authority.authorize_fork_source
+    document = _ordinary_failure_yaml(kind, route)
+
+    def historical_source(self, **kwargs):
+        return replace(authorize(**kwargs), payload_yaml=document)
+
+    monkeypatch.setattr(RepositoryLibraryAuthority, "authorize_fork_source", historical_source)
+    received = []
+
+    async def seed(**kwargs):
+        received.append(kwargs)
+        return SimpleNamespace(id="seeded-state-id")
+
+    client.app.state.library_state_seeder = seed
+    engine = client.app.state.session_engine
+    with engine.connect() as conn:
+        before = conn.execute(select(func.count()).select_from(sessions_table)).scalar_one()
+    response = client.post(f"/api/library/{published['entry_id']}/fork")
+    assert response.status_code == 201, response.text
+    assert len(received) == 1
+    assert received[0]["body"].yaml == document
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(sessions_table)).scalar_one() == before + 1
 
 
 def test_fork_archives_new_session_if_seed_raises_internal_error(

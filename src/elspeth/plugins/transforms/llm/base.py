@@ -21,7 +21,16 @@ from elspeth.plugins.infrastructure.pooling import PoolConfig
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES, _llm_created_output_fields
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
-from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, QueryDefinition, QuerySpec, ResponseFormat, resolve_queries
+from elspeth.plugins.transforms.llm.multi_query import (
+    OrderedQueryPlan,
+    OutputFieldConfig,
+    QueryDefinition,
+    QueryInputMode,
+    QuerySpec,
+    ResponseFormat,
+    compile_ordered_query_plan,
+    resolve_queries,
+)
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
 # The names PromptTemplate.render actually supplies (templates.py builds the
@@ -253,6 +262,10 @@ class LLMConfig(TransformDataConfig):
         None,
         description="Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
     )
+    query_input_mode: QueryInputMode = Field(
+        QueryInputMode.UPSTREAM,
+        description="upstream reads the original row; ordered requires list-form queries and pool_size=1, and allows explicit bindings to earlier validated outputs. source_row and images always read the original row.",
+    )
     prompt_template: str | None = Field(None, description="Jinja2 fallback prompt template; required unless every query has a template")
     system_prompt: str | None = Field(None, description="Optional system prompt")
     temperature: float | None = Field(
@@ -470,7 +483,7 @@ class LLMConfig(TransformDataConfig):
     @model_validator(mode="after")
     def _validate_approved_prompt_artifact(self) -> LLMConfig:
         """Refuse runtime configs whose interpretation hash anchor drifted."""
-        queries = tuple((spec.name, spec.template) for spec in resolve_queries(self.queries)) if self.queries is not None else None
+        queries = tuple((spec.name, spec.template) for spec in self.resolved_queries()) if self.queries is not None else None
         if self.prompt_template is None and (queries is None or any(template is None for _, template in queries)):
             # Attribute this prerequisite to the absent field. Composer may
             # have withheld a provisioned inline blob at authoring time; its
@@ -519,15 +532,20 @@ class LLMConfig(TransformDataConfig):
         """
         if self.queries is None:
             return self
-        resolve_queries(self.queries)
+        self.resolved_queries()
         return self
 
     @model_validator(mode="after")
     def _validate_generated_input_requirements(self) -> LLMConfig:
         """Reject self-consumption before suggesting upstream declarations."""
+        if self.query_input_mode == QueryInputMode.ORDERED:
+            if not isinstance(self.queries, list):
+                raise ValueError("ordered query_input_mode requires list-form queries")
+            self.ordered_query_plan()
+            return self
         if self.queries is None:
             return self
-        specs = resolve_queries(self.queries)
+        specs = self.resolved_queries()
         required = set(self.declared_input_fields)
         required.update(self.schema_config.required_fields or ())
         source_row_columns = _memoized_per_template(multi_query_source_row_columns)
@@ -537,6 +555,29 @@ class LLMConfig(TransformDataConfig):
         if conflicts:
             raise ValueError(multi_query_generated_input_message(conflicts))
         return self
+
+    def resolved_queries(self) -> list[QuerySpec]:
+        """Resolve the configured query representation under its explicit mode."""
+        if self.queries is None:
+            raise ValueError("No multi-query configuration")
+        return resolve_queries(self.queries, allow_empty_inputs=self.query_input_mode == QueryInputMode.ORDERED)
+
+    def ordered_query_plan(self) -> OrderedQueryPlan:
+        """One dependency definition shared by authoring validation and runtime."""
+        specs = tuple(self.resolved_queries())
+        original_only = set(self.declared_input_fields) | set(self.schema_config.required_fields or ()) | set(self.image_input_fields)
+        for spec in specs:
+            original_only.update(multi_query_source_row_columns(self.effective_template(spec.template)))
+        return compile_ordered_query_plan(
+            specs, self.response_field, frozenset(original_only), list_form=isinstance(self.queries, list), pool_size=self.pool_size
+        )
+
+    def external_query_inputs(self, spec: QuerySpec) -> frozenset[str]:
+        """Bindings supplied at node entry, excluding ordered internal edges."""
+        if self.query_input_mode == QueryInputMode.UPSTREAM:
+            return frozenset(spec.input_fields.values())
+        plan = self.ordered_query_plan()
+        return plan.external_by_query[tuple(item.name for item in plan.specs).index(spec.name)]
 
     @model_validator(mode="after")
     def _validate_single_mode_structured_output(self) -> LLMConfig:
@@ -606,7 +647,7 @@ class LLMConfig(TransformDataConfig):
         else:
             written = tuple(
                 definition
-                for spec in resolve_queries(self.queries)
+                for spec in self.resolved_queries()
                 for definition in _llm_created_output_fields(
                     f"{spec.name}_{self.response_field}", f"{spec.name}_", spec.output_fields or ()
                 )
@@ -653,7 +694,7 @@ class LLMConfig(TransformDataConfig):
         """Return (label, template) for every LLM Jinja2 template that can interpolate row data."""
         templates = [("prompt_template", self.prompt_template)] if self.prompt_template is not None else []
         if self.queries is not None:
-            for spec in resolve_queries(self.queries):
+            for spec in self.resolved_queries():
                 if spec.template:
                     templates.append((f"query {spec.name!r} template", spec.template))
         return tuple(templates)
@@ -748,8 +789,8 @@ class LLMConfig(TransformDataConfig):
                 # names: those are the query's own bindings.
                 extracted: set[str] = set()
                 source_row_columns = _memoized_per_template(multi_query_source_row_columns)
-                for spec in resolve_queries(self.queries):
-                    extracted.update(spec.input_fields.values())
+                for spec in self.resolved_queries():
+                    extracted.update(self.external_query_inputs(spec))
                     effective_template = self.effective_template(spec.template)
                     extracted.update(source_row_columns(effective_template))
             else:
@@ -953,7 +994,7 @@ class LLMConfig(TransformDataConfig):
 
         node_template_specs: list[str] = []
         context_names = _memoized_per_template(multi_query_context_names)
-        for spec in resolve_queries(self.queries):
+        for spec in self.resolved_queries():
             if spec.template is not None:
                 template = spec.template
                 source_desc = f"query '{spec.name}' template"
@@ -1017,12 +1058,12 @@ class LLMConfig(TransformDataConfig):
         # documented opt-out.
         if self.required_input_fields:
             source_row_columns = _memoized_per_template(multi_query_source_row_columns)
-            for spec in resolve_queries(self.queries):
+            for spec in self.resolved_queries():
                 effective_template = self.effective_template(spec.template)
                 undeclared_columns = tuple(
                     sorted(
                         {
-                            *undeclared_row_fields(spec.input_fields.values(), self.declared_input_fields),
+                            *undeclared_row_fields(self.external_query_inputs(spec), self.declared_input_fields),
                             *undeclared_row_fields(source_row_columns(effective_template), self.required_input_fields),
                         }
                     )
@@ -1077,8 +1118,8 @@ class LLMConfig(TransformDataConfig):
             return header_spelled_row_lookups(extract_jinja2_field_usage(self.effective_template()).fields, self.required_input_fields)
         lookups: dict[str, str] = {}
         source_row_columns = _memoized_per_template(multi_query_source_row_columns)
-        for spec in resolve_queries(self.queries):
-            lookups.update(header_spelled_row_lookups(spec.input_fields.values(), self.declared_input_fields))
+        for spec in self.resolved_queries():
+            lookups.update(header_spelled_row_lookups(self.external_query_inputs(spec), self.declared_input_fields))
             lookups.update(
                 header_spelled_row_lookups(source_row_columns(self.effective_template(spec.template)), self.required_input_fields)
             )

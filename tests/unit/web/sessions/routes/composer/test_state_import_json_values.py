@@ -25,6 +25,7 @@ sources:
     plugin: csv
     on_success: main
     options:
+      on_validation_failure: discard
       schema:
         mode: observed
       note: {value}

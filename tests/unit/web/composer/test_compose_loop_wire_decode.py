@@ -129,7 +129,9 @@ class _Turn:
         assert service._planner_dialect is self.dialect
         responses = [_raw_response(*self.calls), _text_response()]
 
-        async def _llm(messages: Any, tools: Any) -> _AdmittedLLMCompletion:
+        async def _llm(
+            messages: Any, tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        ) -> _AdmittedLLMCompletion:
             self.sent_tool_lists.append(tools)
             return responses.pop(0) if responses else _text_response()
 

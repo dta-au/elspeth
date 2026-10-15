@@ -247,7 +247,8 @@ def test_current_session_schema_epoch() -> None:
     # 68: ordinary proposal checkpoint rebase reasons are persisted.
     # 69: freeform message ingress receipts bind retry UUIDs to accepted user rows.
     # 71: ordinary fork/revert receipts move to a mode-neutral durable ledger.
-    assert SESSION_SCHEMA_EPOCH == 75
+    # Epoch 76 makes atomic terminal graph-review facts part of read semantics.
+    assert SESSION_SCHEMA_EPOCH == 76
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

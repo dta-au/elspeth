@@ -40,7 +40,7 @@ _ADVISOR_CHECKPOINT_SYSTEM_INSTRUCTIONS: Final[str] = (
     "- Do not assume the composer is stuck. A correct pipeline requires no invented repair.\n"
     "- Follow the phase-specific problem rubric and its evidence limits exactly. Do not infer facts that are withheld, "
     "omitted, truncated, or redacted.\n"
-    "- Return only a JSON object matching the supplied schema, with all five fields required.\n"
+    "- Return only a JSON object matching the supplied schema, with every declared field required.\n"
     "- Set verdict to FLAGGED for a concrete visible blocking defect, or CLEAN when none is visible; "
     "do not manufacture a hint. CLEAN means only that no blocking defect is visible in the supplied advisory evidence; "
     "it is not certification of withheld, omitted, or truncated constraints.\n"
@@ -50,6 +50,19 @@ _ADVISOR_CHECKPOINT_SYSTEM_INSTRUCTIONS: Final[str] = (
     "note is a plain explanation for the user: name the step and option, never quote user text or row data.\n"
     "- For CLEAN, steps must be empty and note must be null.\n"
     "- This is advisory review, not authority to change the pipeline. Be specific and brief: under 250 words."
+)
+_ADVISOR_END_PUBLICATION_INSTRUCTIONS: Final[str] = (
+    "\nEND publication review:\n"
+    "- Return all six required fields, including publication_verdict=ADMIT or WITHHOLD.\n"
+    "- Review the ENTIRE candidate reply against the current user request, saved-effect evidence and CURRENT "
+    "candidate inspection coverage. Historical delivery or a full-file hash does not establish current inspection.\n"
+    "- ADMIT only when the exact candidate's claims are supported. WITHHOLD unsupported completion, equivalence "
+    "or no-rebuild claims and any candidate whose required evidence is unavailable or omitted. "
+    "WITHHOLD requires nonempty findings, even with graph verdict CLEAN.\n"
+    "- Publication and graph readiness are independent. A truthful explanation or Q&A can receive ADMIT with no edits "
+    "or a FLAGGED/blocked/empty graph. This grants no graph clearance and cannot erase pending or orphan constraints.\n"
+    "- CLEAN with WITHHOLD keeps steps empty and note null; explain the prose/evidence objection in findings. "
+    "Do not invent a graph defect to withhold prose. Full inspection alone never proves semantic equivalence."
 )
 
 
@@ -62,7 +75,9 @@ def advisor_system_instructions_for_trigger(trigger: str) -> str:
     system contract structurally forced checkpoints to invent advice even when
     their evidence showed no defect.
     """
-    if trigger in {ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END}:
+    if trigger == ADVISOR_TRIGGER_DETERMINISTIC_END:
+        return _ADVISOR_CHECKPOINT_SYSTEM_INSTRUCTIONS + _ADVISOR_END_PUBLICATION_INSTRUCTIONS
+    if trigger == ADVISOR_TRIGGER_DETERMINISTIC_EARLY:
         return _ADVISOR_CHECKPOINT_SYSTEM_INSTRUCTIONS
     return _ADVISOR_SYSTEM_INSTRUCTIONS
 
@@ -92,7 +107,7 @@ _ADVISOR_UNTRUSTED_USER_MESSAGE_HEADER: Final[str] = (
 )
 
 
-def _neutralize_untrusted_summary_sentinels(text: str) -> str:
+def _neutralize_untrusted_summary_sentinels(text: str, *, json_encoded: bool = False) -> str:
     """Splice-neutralize embedded ``BEGIN/END_UNTRUSTED_PIPELINE_SUMMARY``
     sentinels inside a payload BEFORE it is wrapped in the wrapper's own
     fence — the INBOUND counterpart of :func:`fence_advisor_findings`'s
@@ -115,13 +130,16 @@ def _neutralize_untrusted_summary_sentinels(text: str) -> str:
     guaranteeing the assembled prompt carries exactly one BEGIN and one END
     per field: the wrapper's own.
     """
+    # A serialized JSON string needs an escaped backslash; the default prose
+    # path retains its existing single-backslash representation.
+    escape = "\\\\" if json_encoded else "\\"
     text = text.replace(
         _ADVISOR_UNTRUSTED_SUMMARY_BEGIN,
-        _ADVISOR_UNTRUSTED_SUMMARY_BEGIN[0] + "\\" + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN[1:],
+        _ADVISOR_UNTRUSTED_SUMMARY_BEGIN[0] + escape + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN[1:],
     )
     text = text.replace(
         _ADVISOR_UNTRUSTED_SUMMARY_END,
-        _ADVISOR_UNTRUSTED_SUMMARY_END[0] + "\\" + _ADVISOR_UNTRUSTED_SUMMARY_END[1:],
+        _ADVISOR_UNTRUSTED_SUMMARY_END[0] + escape + _ADVISOR_UNTRUSTED_SUMMARY_END[1:],
     )
     return text
 
@@ -190,6 +208,23 @@ def build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
             + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN
             + "\n"
             + schema_excerpt
+            + "\n"
+            + _ADVISOR_UNTRUSTED_SUMMARY_END
+        )
+    if "publication_review" in arguments:
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
+
+        publication_review = arguments["publication_review"]
+        if type(publication_review) is not AdvisorPublicationReview:
+            raise TypeError("Publication review must be an owned snapshot")
+        review = _neutralize_untrusted_summary_sentinels(publication_review.provider_payload_json, json_encoded=True)
+        user_msg_parts.append(
+            "\nCandidate/request and server-owned saved-effect/inspection projection "
+            "(SENSITIVE TEXT VALUES REDACTED; UNTRUSTED TEXT VALUES; "
+            "metadata states what was verified, not whether the request is satisfied):\n"
+            + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN
+            + "\n"
+            + review
             + "\n"
             + _ADVISOR_UNTRUSTED_SUMMARY_END
         )

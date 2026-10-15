@@ -39,6 +39,11 @@ _CONTENT = {
     "size_bytes": 8,
     "created_by": "assistant",
     "creation_modality": "verbatim",
+    "content_hash": "a" * 64,
+    "total_chars": 6,
+    "start_char": 0,
+    "end_char": 6,
+    "next_offset_chars": None,
 }
 _METADATA = {key: _RECORD[key] for key in ("id", "filename", "mime_type", "size_bytes", "content_hash", "status")}
 _INVENTORY = {key: _RECORD[key] for key in ("id", "filename", "mime_type", "size_bytes", "created_by", "creation_modality", "status")}
@@ -205,7 +210,16 @@ def test_actual_content_producer_preserves_truncation_and_origin_pair(large: boo
     contract = blobs._GET_BLOB_CONTENT_DECLARATION.response_contract
     assert contract is blobs._BLOB_CONTENT_RESPONSE
     wire = contract.admit(result.data).to_wire()
-    assert wire == {**_CONTENT, "content": text[:50000], "truncated": large, "created_by": created_by, "size_bytes": len(text.encode())}
+    assert wire == {
+        **_CONTENT,
+        "content": text[:50000],
+        "truncated": large,
+        "created_by": created_by,
+        "size_bytes": len(text.encode()),
+        "total_chars": len(text),
+        "end_char": min(50000, len(text)),
+        "next_offset_chars": 50000 if large else None,
+    }
     assert json.dumps(wire) == json.dumps(deep_thaw(result.data))
 
 
@@ -233,3 +247,43 @@ def test_ready_null_hash_producer_retains_integrity_exception() -> None:
         pytest.raises(AuditIntegrityError, match="null content_hash"),
     ):
         blobs._sync_list_ready_blob_inline_descriptors(engine, "response")
+
+
+@pytest.mark.parametrize("filename_chars", [0, 1_000, 6_000])
+def test_complete_selected_page_bound_includes_variable_metadata(filename_chars: int) -> None:
+    from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+
+    context = _trained_context(
+        data_dir=Path("/tmp/blob-response"), session_id="response", session_engine=create_session_engine("sqlite://")
+    )
+    record = {**_RECORD, "filename": "🙂" * filename_chars}
+    with patch.object(blobs, "_locked_read_ready_blob", autospec=True, return_value=(record, b"x" * 50_001)):
+        result = blobs._execute_get_blob_content({"blob_id": _ID}, _empty_state(), context)
+    if filename_chars == 6_000:
+        assert not result.success
+        assert result.data is None
+        assert "no content was returned" in result.validation.errors[0].message
+    else:
+        assert result.success
+        encoded = serialize_admitted_discovery_result(admit_discovery_result("get_blob_content", result))
+        assert len(encoded.encode("utf-8")) <= 65_536
+        assert 0 < result.data["end_char"] < result.data["total_chars"]
+        assert result.data["next_offset_chars"] == result.data["end_char"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("content_hash", "A" * 64),
+        ("total_chars", True),
+        ("start_char", -1),
+        ("end_char", 7),
+        ("end_char", 3),
+        ("next_offset_chars", 3),
+        ("truncated", True),
+        ("unknown", 1),
+    ],
+)
+def test_selected_content_metadata_rejects_invalid_or_untrue_ranges(field: str, value: object) -> None:
+    with pytest.raises(FrameworkBugError, match="Blob discovery producer returned an invalid response"):
+        blobs._BLOB_CONTENT_RESPONSE.admit({**_CONTENT, field: value})

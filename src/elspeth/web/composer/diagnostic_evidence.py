@@ -32,6 +32,7 @@ from elspeth.web.composer.bounded_json import (
     JsonBoundaryError,
     bounded_json_loads,
 )
+from elspeth.web.credential_guard import field_mapper_credential_options_projection
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 DIAGNOSTIC_EVIDENCE_KIND: Final = "composer_diagnostic_evidence"
@@ -327,11 +328,30 @@ def _project(
     reasons: set[str],
     root: bool = False,
     path: tuple[str | int, ...] = (),
+    field_mapper_options: bool = False,
+    field_labels: bool = False,
 ) -> JsonValue:
     """Preserve semantic JSON and remove classified leaf/credential values."""
     if type(value) is dict:
         projected: dict[str, JsonValue] = {}
         plugin = value["plugin"] if "plugin" in value else None
+        node_component = (
+            (root and tool_name == "upsert_node")
+            or (tool_name == "splice_transform" and path == ("node",))
+            or (
+                len(path) >= 2
+                and path[-2] == "nodes"
+                and path[:-2] in {(), ("pipeline",), ("data",), ("data", "pipeline"), ("state",), ("data", "state")}
+                and tool_name in {"set_pipeline", "emit_pipeline_proposal", "upsert_node", "splice_transform", "patch_node_options"}
+            )
+        )
+        mapper = (
+            node_component
+            and plugin == "field_mapper"
+            and (("node_type" in value and value["node_type"] == "transform") or (tool_name == "splice_transform" and path == ("node",)))
+            and "options" in value
+            and field_mapper_credential_options_projection(value["options"]) is not value["options"]
+        )
         sink_component = (root and tool_name == "set_output") or (
             len(path) >= 2
             and path[-2] == "outputs"
@@ -356,7 +376,7 @@ def _project(
             if find_credential_material(key, _POLICY) is not None:
                 reasons.add("recognized_credential")
                 continue
-            structural = root and tool_name == "wire_secret_ref" and key == "option_key"
+            structural = field_labels or (root and tool_name == "wire_secret_ref" and key == "option_key")
             if not structural and is_secret_field(key, option_fields):
                 policy = CredentialTraversalPolicy(
                     additional_credential_fields=option_fields,
@@ -379,6 +399,8 @@ def _project(
                     else (),
                     reasons=reasons,
                     path=(*path, key),
+                    field_mapper_options=mapper and key == "options",
+                    field_labels=field_mapper_options and key == "mapping",
                 )
         return projected
     if type(value) is list:
@@ -411,7 +433,7 @@ def _canonical_payload(
 
 def diagnostic_evidence_identity(domain: str, correlation: str) -> str:
     """Keep owned evidence domains disjoint from arbitrary provider call IDs."""
-    if domain not in {"tool-authoring", "tool-failure", "provider-failure", "provider-request", "planner-candidate"}:
+    if domain not in {"tool-authoring", "tool-failure", "provider-failure", "provider-request", "planner-candidate", "operation-failure"}:
         raise AuditIntegrityError("Unknown private evidence identity domain")
     return f"{domain}:{hashlib.sha256(correlation.encode('utf-8')).hexdigest()}"
 

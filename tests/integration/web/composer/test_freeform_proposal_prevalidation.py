@@ -86,7 +86,9 @@ class _ScriptedLLM:
         self._responses = list(responses)
         self.message_snapshots: list[list[dict[str, Any]]] = []
 
-    async def __call__(self, messages: list[dict[str, Any]], _tools: Any) -> _AdmittedLLMCompletion:
+    async def __call__(
+        self, messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> _AdmittedLLMCompletion:
         self.message_snapshots.append(deepcopy(messages))
         if not self._responses:
             return _fake_llm_response(content="Done.")
@@ -99,7 +101,14 @@ def _fake_llm_response(*, content: str | None = None, tool_calls: tuple[dict[str
 
 async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
     """Keep proposal-prevalidation tests independent of the real advisor."""
+    if _kwargs["phase"] == "end":
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 
+        review = _kwargs["publication_review"]
+        assert type(review) is AdvisorPublicationReview
+        return AdvisorCheckpointVerdict(
+            ok=True, blocking=False, findings_text="CLEAN", publication_verdict="ADMIT", publication_binding=review.binding
+        )
     return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
 
 
@@ -403,7 +412,9 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
         failures.append((tool_name, arguments_hash))
         original_record_failure(tracker, tool_name, arguments_hash)
 
-    async def _llm(messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def _llm(
+        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         message_snapshots.append(deepcopy(messages))
         if len(message_snapshots) == 2:
             assert _count_rows(harness.engine, composition_proposals_table) == 0
@@ -894,7 +905,9 @@ async def test_inline_candidate_argument_error_is_audited_once_and_repairable(
     message_snapshots: list[list[dict[str, Any]]] = []
     invalid_turn_outcomes: list[Any] = []
 
-    async def _llm(messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def _llm(
+        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         message_snapshots.append(deepcopy(messages))
         if len(message_snapshots) == 2:
             invalid_turn_outcomes.extend(outcome_batches[0])
@@ -1044,7 +1057,9 @@ async def test_surrogate_inline_content_fails_closed_at_canonicalization_and_is_
     message_snapshots: list[list[dict[str, Any]]] = []
     invalid_turn_outcomes: list[Any] = []
 
-    async def _llm(messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def _llm(
+        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         message_snapshots.append(deepcopy(messages))
         if len(message_snapshots) == 2:
             invalid_turn_outcomes.extend(outcome_batches[0])
@@ -1267,7 +1282,9 @@ async def test_candidate_prior_validation_runtime_error_uses_plugin_crash_audit_
             raise failure
         return original_validate(candidate_state)
 
-    async def _llm(messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def _llm(
+        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         nonlocal armed, llm_calls
         assert messages
         llm_calls += 1
@@ -1336,7 +1353,9 @@ async def test_candidate_prior_validation_base_exception_is_audited_once_and_pro
             raise signal
         return original_validate(candidate_state)
 
-    async def _llm(messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def _llm(
+        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         nonlocal armed, llm_calls
         assert messages
         llm_calls += 1

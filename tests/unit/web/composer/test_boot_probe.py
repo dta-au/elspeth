@@ -32,7 +32,7 @@ from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.recovery_controls import recovery_tool_definitions
 from elspeth.web.config import WebSettings
 
-_CLEAN = '{"verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null}'
+_CLEAN = '{"verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null,"publication_verdict":"ADMIT"}'
 _PROBE_PROMPT = "This is a composer boot-time configuration smoke test. Please reply with ok."
 
 
@@ -285,9 +285,11 @@ def test_advisor_request_uses_production_request_options(settings_factory: Any) 
         api_base="https://openrouter.ai/api/v1",
         api_key="test-token",  # secret-scan: allow-this-line
         structured_output=True,
+        checkpoint_phase="end",
     )
-    assert all(field not in json.dumps(messages).lower() for field in ("verdict", "findings", "note", "steps", "category"))
-    assert "reply with ok" in messages[0]["content"].lower()
+    assert "six-field END JSON schema" in messages[0]["content"]
+    assert "not a pipeline or user-reply approval" in messages[0]["content"]
+    assert "publication_verdict" in messages[0]["content"]
 
 
 def test_anthropic_routes_mirror_the_production_cache_markers(settings_factory: Any) -> None:
@@ -555,6 +557,7 @@ async def test_probe_sends_a_copy_and_leaves_the_request_unchanged(monkeypatch: 
     "content",
     [
         "ok",
+        '{"verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null}',
         f"```json\n{_CLEAN}\n```",
         "",
         '{"verdict":',
@@ -562,7 +565,7 @@ async def test_probe_sends_a_copy_and_leaves_the_request_unchanged(monkeypatch: 
         None,
         4,
     ],
-    ids=["prose", "fenced-json", "empty", "truncated", "duplicate", "reasoning-only", "wrong-type"],
+    ids=["prose", "old-five-fields", "fenced-json", "empty", "truncated", "duplicate", "reasoning-only", "wrong-type"],
 )
 async def test_advisor_probe_rejects_nonconforming_content(monkeypatch: pytest.MonkeyPatch, settings_factory: Any, content: object) -> None:
     async def complete(**_kwargs: object) -> object:
@@ -611,9 +614,13 @@ async def test_advisor_probe_rejects_excessively_nested_json(monkeypatch: pytest
     "content",
     [
         _CLEAN,
-        json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": "ok"}),
-        json.dumps({"verdict": "CLEAN", "category": "other", "steps": ["step"], "findings": "", "note": None}),
-        json.dumps({"verdict": "FLAGGED", "category": "other", "steps": [], "findings": " ", "note": None}),
+        json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": "ok", "publication_verdict": "ADMIT"}),
+        json.dumps(
+            {"verdict": "CLEAN", "category": "other", "steps": ["step"], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+        ),
+        json.dumps(
+            {"verdict": "FLAGGED", "category": "other", "steps": [], "findings": " ", "note": None, "publication_verdict": "WITHHOLD"}
+        ),
     ],
     ids=["accepted-clean", "clean-note", "clean-steps", "flagged-empty"],
 )

@@ -9,11 +9,11 @@ from __future__ import annotations
 import math
 import secrets
 from datetime import datetime, timedelta
-from typing import Any, Literal, NotRequired, TypedDict, final
+from typing import Any, Literal, NotRequired, TypedDict, cast, final
 from uuid import UUID
 
 from pydantic import JsonValue, ValidationError
-from sqlalchemy import Connection, Engine, Row, func, insert, or_, select, update
+from sqlalchemy import Connection, Engine, Row, and_, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -23,6 +23,7 @@ from elspeth.web.coordination.contracts import SessionOperationContext, SessionO
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission
 from elspeth.web.sessions.composer_operations import (
+    COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES,
     COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH,
     COMPOSER_OPERATION_RESULT_SCHEMA_ERROR,
     COMPOSER_OPERATION_RESULT_SCHEMA_SUCCESS,
@@ -34,11 +35,15 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationClaim,
     ComposerOperationConflictError,
     ComposerOperationError,
+    ComposerOperationFailureCursor,
+    ComposerOperationFailureOutcome,
     ComposerOperationFenceLost,
     ComposerOperationKind,
     ComposerOperationPreconditionRefused,
+    ComposerOperationPublicFailureType,
     ComposerOperationRecord,
     ComposerOperationRunning,
+    ComposerOperationSavedRevisions,
     ComposerOperationSettledBy,
     ComposerTurnDeadlineExpired,
     composer_operation_request_hash,
@@ -118,6 +123,64 @@ def _record_from_row(row: Row[Any], *, request_json: str | None = None) -> Compo
 def _read(conn: Connection, session_id: UUID, operation_id: str, *, body: bool = False) -> Row[Any] | None:
     columns = tuple(jobs.c) if body else tuple(c for c in jobs.c if c.name != "request_json")
     return conn.execute(select(*columns).where(*_key(session_id, operation_id)).limit(1)).one_or_none()
+
+
+def _saved_failure_revisions(
+    conn: Connection, session_id: UUID, records: tuple[ComposerOperationRecord, ...]
+) -> dict[str, ComposerOperationSavedRevisions]:
+    """Aggregate only the returned operations' own fences, never later session edits."""
+    operation_fences = tuple(record.session_operation_id for record in records if record.session_operation_id is not None)
+    if not operation_fences:
+        return {}
+    states = composition_states_table
+    progress = (
+        select(
+            states.c.creator_operation_id.label("fence_id"),
+            func.count().label("saved_count"),
+            func.max(states.c.version).label("latest_version"),
+        )
+        .where(states.c.session_id == str(session_id), states.c.creator_operation_id.in_(operation_fences))
+        .group_by(states.c.creator_operation_id)
+        .subquery()
+    )
+    rows = conn.execute(
+        select(progress.c.fence_id, progress.c.saved_count, progress.c.latest_version, states.c.id)
+        .join(
+            states,
+            and_(states.c.creator_operation_id == progress.c.fence_id, states.c.version == progress.c.latest_version),
+        )
+        .where(states.c.session_id == str(session_id))
+    ).all()
+    try:
+        return {
+            row.fence_id: ComposerOperationSavedRevisions(
+                attribution="fenced", count=row.saved_count, latest_state_id=UUID(row.id), latest_version=row.latest_version
+            )
+            for row in rows
+        }
+    except ValueError as exc:
+        raise AuditIntegrityError("Invalid operation-owned saved revision projection") from exc
+
+
+def _failure_outcome(record: ComposerOperationRecord, saved: ComposerOperationSavedRevisions) -> ComposerOperationFailureOutcome:
+    if record.status != "failed" or record.settled_at is None or record.result_json is None:
+        raise AuditIntegrityError("Failure projection requires a sealed failed operation")
+    error = ComposerOperationError.model_validate_json(record.result_json, strict=True)
+    category = (
+        cast(ComposerOperationPublicFailureType, error.error_type) if error.error_type in COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES else None
+    )
+    return ComposerOperationFailureOutcome(
+        session_id=record.session_id,
+        operation_id=record.operation_id,
+        kind=record.kind,
+        user_message_id=record.user_message_id,
+        settled_at=record.settled_at,
+        failure_code=error.failure_code,
+        error_type=category,
+        diagnostic_id=error.diagnostic_id,
+        request_id=record.request_id,
+        saved_revisions=saved,
+    )
 
 
 def get_composer_operation_for_start_on_connection(conn: Connection, claim: ComposerOperationClaim) -> ComposerOperationRecord:
@@ -359,6 +422,60 @@ class ComposerAsyncOperationAuthority:
         with self._engine.connect() as conn:
             row = _read(conn, session_id, operation_id, body=True)
             return _record_from_row(row, request_json=row.request_json) if row is not None else None
+
+    def list_failure_outcomes(
+        self,
+        *,
+        session_id: UUID,
+        actor_user_id: str,
+        limit: int = 50,
+        cursor: ComposerOperationFailureCursor | None = None,
+        operation_id: str | None = None,
+    ) -> tuple[tuple[ComposerOperationFailureOutcome, ...], ComposerOperationFailureCursor | None]:
+        """Read a bounded authenticated projection; cursors never confer authority."""
+        if type(session_id) is not UUID or type(actor_user_id) is not str or not actor_user_id:
+            raise ValueError("Failure history requires session and actor identities")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Failure history limit must be between 1 and 100")
+        if operation_id is not None:
+            _identity(session_id, operation_id)
+            if cursor is not None:
+                raise ValueError("Exact operation lookup cannot be paginated")
+        if cursor is not None and type(cursor) is not ComposerOperationFailureCursor:
+            raise TypeError("Failure history cursor must be an owned cursor")
+        query = select(*(column for column in jobs.c if column.name != "request_json")).where(
+            jobs.c.session_id == str(session_id), jobs.c.actor_user_id == actor_user_id, jobs.c.status == "failed"
+        )
+        if operation_id is not None:
+            query = query.where(jobs.c.operation_id == operation_id)
+        if cursor is not None:
+            query = query.where(
+                or_(
+                    jobs.c.settled_at < cursor.settled_at,
+                    and_(jobs.c.settled_at == cursor.settled_at, jobs.c.operation_id < cursor.operation_id),
+                )
+            )
+        query = query.order_by(jobs.c.settled_at.desc(), jobs.c.operation_id.desc()).limit(limit + 1)
+        with self._engine.connect() as conn:
+            records = tuple(_record_from_row(row) for row in conn.execute(query))
+            selected = records[:limit]
+            progress = _saved_failure_revisions(conn, session_id, selected)
+            outcomes = []
+            for record in selected:
+                if record.session_operation_id is None:
+                    saved = ComposerOperationSavedRevisions(attribution="unstarted", count=0, latest_state_id=None, latest_version=None)
+                elif record.session_operation_id in progress:
+                    saved = progress[record.session_operation_id]
+                else:
+                    saved = ComposerOperationSavedRevisions(attribution="fenced", count=0, latest_state_id=None, latest_version=None)
+                outcomes.append(_failure_outcome(record, saved))
+            next_cursor = None
+            if len(records) > limit:
+                last = selected[-1]
+                if last.settled_at is None:
+                    raise AuditIntegrityError("Failed operation has no settlement time")
+                next_cursor = ComposerOperationFailureCursor(settled_at=last.settled_at, operation_id=last.operation_id)
+            return tuple(outcomes), next_cursor
 
     def claim_next(self, *, limit: int) -> tuple[ComposerOperationClaim, ...]:
         _bounded(limit)

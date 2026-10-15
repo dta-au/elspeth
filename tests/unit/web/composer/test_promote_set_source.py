@@ -15,6 +15,7 @@ the routing.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -129,20 +130,30 @@ class TestPromoteSetSourceArgErrorRouting:
         )
         assert result.success is True
         assert result.updated_state.sources["source"].plugin == "csv"
+        assert result.updated_state.sources["source"].on_validation_failure == "discard"
 
-    def test_empty_on_validation_failure_canonicalizes_to_discard(self) -> None:
-        """elspeth-bcd7051143: "" names no route (sink names are non-empty),
-        so the shared canonicalizer folds it into 'discard' at this seam —
-        the same owner every other source-authoring seam routes through."""
+    @pytest.mark.parametrize("choice", ["", " ", "\t\n"], ids=["empty", "space", "whitespace"])
+    def test_blank_on_validation_failure_is_refused_without_mutation(self, choice: str) -> None:
+        """A blank choice is a recoverable refusal, never an implicit discard."""
+        state = _empty_state()
+        private_path = "/tmp/source-choice-private-canary.csv"
         result = _execute_set_source(
             {
                 "plugin": "csv",
-                "options": {"path": "/tmp/x.csv", "schema": {"mode": "observed"}},
+                "options": {"path": private_path, "schema": {"mode": "observed"}},
                 "on_success": "rows",
-                "on_validation_failure": "",
+                "on_validation_failure": choice,
             },
-            _empty_state(),
+            state,
             ToolContext(catalog=_mock_catalog()),
         )
-        assert result.success is True
-        assert result.updated_state.sources["source"].on_validation_failure == "discard"
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.sources == {}
+        assert result.affected_nodes == ()
+        rejection = result.validation.errors[0]
+        assert rejection.component == "rejected_mutation"
+        assert rejection.error_code == "failure_route_required"
+        assert rejection.rejected_component == "source"
+        assert "on_validation_failure requires an explicit non-empty failure choice" in rejection.message
+        assert private_path not in json.dumps(result.to_dict())

@@ -53,6 +53,7 @@ from elspeth.web.composer.protocol import (
     ComposerRuntimePreflightError,
     ComposerServiceError,
     PipelineCommitIntent,
+    RetainedOperationContext,
     ToolArgumentError,
 )
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
@@ -110,6 +111,65 @@ from tests.unit.web.sessions.session_test_authority import FencedSessionServiceH
 _REAL_RUN_ADVISOR_CHECKPOINT = AdvisorCheckpointOwner._run_advisor_checkpoint
 
 
+@pytest.mark.parametrize("availability", ["available", "unavailable", "unknown"])
+def test_retained_operation_context_distinguishes_empty_unknown_and_unavailable(
+    availability: Literal["available", "unavailable", "unknown"],
+) -> None:
+    context = RetainedOperationContext(session_id=uuid4(), actor_user_id="test-user", availability=availability)
+    projected = json.loads(context.provider_message())["retained_operation_history"]
+    assert projected["availability"] == availability
+    assert projected["outcomes"] == [] and projected["has_more"] is False
+    assert "not requested edits" in projected["interpretation"]
+    assert "Unknown attribution is not zero" in projected["interpretation"]
+    with pytest.raises(AuditIntegrityError):
+        context.validate_for(session_id=str(uuid4()), actor_user_id="test-user")
+    with pytest.raises(AuditIntegrityError):
+        context.validate_for(session_id=str(context.session_id), actor_user_id="another-user")
+
+
+@pytest.mark.asyncio
+async def test_retained_operation_context_reaches_real_primary_and_reviewed_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+
+    service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
+    context = RetainedOperationContext(session_id=UUID(session_id), actor_user_id="test-user", availability="unavailable")
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(deepcopy(kwargs))
+        content = (
+            json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"})
+            if "response_format" in kwargs
+            else "Prior operation history is unavailable; I cannot establish what happened."
+        )
+        return litellm.ModelResponse(
+            choices=[{"message": {"content": content, "tool_calls": None, "role": "assistant"}, "finish_reason": "stop", "index": 0}],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
+            model=kwargs["model"],
+        )
+
+    # Both primary and the newly reachable END use this explicit finite SDK seam.
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _REAL_RUN_ADVISOR_CHECKPOINT)
+    with fenced_operation_context(service._session_engine, session_id) as authority:
+        result = await service.compose(
+            "What happened to the earlier action?",
+            [],
+            _empty_state(),
+            session_id=session_id,
+            user_id="test-user",
+            session_operation_context=authority,
+            retained_operation_context=context,
+        )
+    primary = [call for call in calls if "response_format" not in call]
+    reviews = [call for call in calls if "response_format" in call]
+    assert len(primary) == len(reviews) == 1
+    assert any(row["content"] == context.provider_message() for row in primary[0]["messages"])
+    assert "retained_operation_history" in json.dumps(reviews[0]["messages"])
+    assert "unavailable" in json.dumps(reviews[0]["messages"])
+    assert result.message == "Prior operation history is unavailable; I cannot establish what happened."
+
+
 def _make_llm_response(
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
@@ -130,7 +190,14 @@ class _ReconciliationLLMScript:
         self._responses = iter(responses)
         self.prompts: list[list[dict[str, Any]]] = []
 
-    async def respond(self, messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> _AdmittedLLMCompletion:
+    async def respond(
+        self,
+        messages: list[dict[str, Any]],
+        _tools: list[dict[str, Any]],
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+    ) -> _AdmittedLLMCompletion:
         self.prompts.append(deepcopy(messages))
         return next(self._responses)
 
@@ -403,6 +470,7 @@ def test_effect_resolution_and_summaries_never_write_seeded_blob_storage(tmp_pat
         "source": {
             "plugin": "csv",
             "on_success": "rows",
+            "on_validation_failure": "discard",
             "inline_blob": {"filename": "input.csv", "mime_type": "text/csv", "content": "SECRET_SENTINEL_RAW"},
         },
         "nodes": [],
@@ -1048,7 +1116,9 @@ class TestComposerSingleToolCall:
         done = _make_llm_response(content="Update is pending approval.")
         responses = [turn, done]
 
-        async def _llm(_messages: Any, _tools: Any) -> Any:
+        async def _llm(
+            _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        ) -> Any:
             return responses.pop(0)
 
         await service._run_one_turn_for_test(
@@ -1107,7 +1177,9 @@ class TestComposerSingleToolCall:
         done = _make_llm_response(content="Delete is pending approval.")
         responses = [turn, done]
 
-        async def _llm(_messages: Any, _tools: Any) -> Any:
+        async def _llm(
+            _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        ) -> Any:
             return responses.pop(0)
 
         await service._run_one_turn_for_test(
@@ -1297,6 +1369,10 @@ class TestComposerSingleToolCall:
     @pytest.mark.asyncio
     async def test_inline_complete_pipeline_incremental_replay_uses_atomic_tool_shape(self, tmp_path: Path) -> None:
         """Incremental inline full replacement retains the atomic tool shape."""
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+        from elspeth.web.composer.turn_effects import authored_state_hash
+
         catalog = _mock_catalog()
         engine, session_id = _session_engine_with_session()
         settings = _make_settings(data_dir=tmp_path)
@@ -1307,14 +1383,6 @@ class TestComposerSingleToolCall:
             session_engine=engine,
         )
 
-        # Stub the EARLY advisory checkpoint (fires on the empty->non-empty
-        # transition this test drives) so it makes no advisor LLM call — this
-        # test is about the atomic tool shape and its `llm_calls == 3`
-        # bookkeeping, not the advisor pass.
-        async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
-            return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
-
-        service._advisor_checkpoint._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
@@ -1394,9 +1462,36 @@ class TestComposerSingleToolCall:
         )
         preview_turn = _make_raw_llm_response(tool_calls=[{"id": "call_preview", "name": "preview_pipeline", "arguments": {}}])
         final_turn = _make_raw_llm_response(content="Pipeline configured.")
+        primary_requests = []
+        reviews = []
+
+        async def completion(**kwargs: Any):
+            if kwargs["model"] == service._model:
+                primary_requests.append(deepcopy(kwargs))
+                assert len(primary_requests) <= 3, "Only the original build/preview/final primary responses are supplied"
+                return (build_turn, preview_turn, final_turn)[len(primary_requests) - 1]
+            assert kwargs["model"] == settings.composer_advisor_model, "No response is supplied for another role"
+            assert not reviews, "Only one independent END SDK response is supplied"
+            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            reviews.append(review)
+            assert review["candidate_reply"] == "Pipeline configured."
+            assert review["current_request"] == user_message_content
+            assert review["saved_effects"]["saved_revision_count"] == 1
+            assert review["saved_effects"]["net_changed"] is True
+            return _make_raw_llm_response(
+                content=json.dumps(
+                    {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+                )
+            )
 
         with (
-            patch("litellm.acompletion", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", side_effect=completion) as mock_llm,
+            patch.object(
+                service._advisor_checkpoint,
+                "_run_advisor_checkpoint",
+                new=_REAL_RUN_ADVISOR_CHECKPOINT.__get__(service._advisor_checkpoint, AdvisorCheckpointOwner),
+            ),
             patch.object(
                 service._preflight,
                 "cached_runtime_preflight",
@@ -1404,7 +1499,6 @@ class TestComposerSingleToolCall:
                 return_value=ValidationResult(is_valid=True, checks=[], errors=[]),
             ),
         ):
-            mock_llm.side_effect = [build_turn, preview_turn, final_turn]
             result = await service.compose(
                 user_message_content,
                 [],
@@ -1414,16 +1508,29 @@ class TestComposerSingleToolCall:
             )
 
         assert result.message == "Pipeline configured."
-        assert mock_llm.call_count == 3
+        assert len(primary_requests) == 3 and len(reviews) == 1
+        assert mock_llm.call_count == 4
+        assert reviews[0]["current_graph_hash"] == authored_state_hash(result.state)
         tool_names = [inv.tool_name for inv in result.tool_invocations]
         assert tool_names == ["set_pipeline", "preview_pipeline"]
         assert "create_blob" not in tool_names
         assert "set_source_from_blob" not in tool_names
         assert "upsert_node" not in tool_names
         assert "set_output" not in tool_names
-        assert len(result.llm_calls) == 3
+        assert len(result.llm_calls) == 4
         assert result.state.sources["source"] is not None
         assert "blob_ref" in result.state.sources["source"].options
+        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
+        passes = [
+            row.tool_calls[0]["pass"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert len(passes) == 1
+        assert passes[0]["phase"] == "end" and passes[0]["source"] == "model"
+        assert passes[0]["publication_verdict"] == "ADMIT" and passes[0]["first_attempt_accepted"] is True
+        assert passes[0]["provider_attempts"] == 1
+        assert type(passes[0]["publication_binding"]) is str and len(passes[0]["publication_binding"]) == 64
 
 
 class TestComposerMultiTurnToolCalls:
@@ -1487,6 +1594,8 @@ class TestComposerMultiTurnToolCalls:
         otherwise that reply can anchor on (quote/rebut) text the real user
         never saw. The repair turn's own tool-call/tool-result messages
         (which carry the real state change) must NOT be elided."""
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
+
         catalog = _mock_catalog()
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
@@ -1511,22 +1620,34 @@ class TestComposerMultiTurnToolCalls:
             tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
         )
         # Turn 3: no tool calls again -> END advisor gate re-runs, CLEAN -> finalize.
-        turn3 = _make_llm_response(content="Pipeline is ready.")
+        turn3 = _make_llm_response(content="The pipeline name is now Repaired.")
+        reviews: list[AdvisorPublicationReview] = []
 
-        verdicts = iter(
-            [
-                AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating"),
-                AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
-            ]
-        )
-
-        async def _fake_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
-            return next(verdicts)
+        async def _fake_advisor_checkpoint(*_args: object, **kwargs: Any) -> AdvisorCheckpointVerdict:
+            assert kwargs["phase"] == "end"
+            review = kwargs["publication_review"]
+            assert type(review) is AdvisorPublicationReview
+            reviews.append(review)
+            assert len(reviews) <= 2, "No additional review allowance is supplied by this fixture"
+            flagged = len(reviews) == 1
+            return AdvisorCheckpointVerdict(
+                ok=True,
+                blocking=flagged,
+                findings_text="FLAGGED: sink omits rating" if flagged else "CLEAN",
+                publication_verdict="WITHHOLD" if flagged else "ADMIT",
+                publication_binding=review.binding,
+            )
 
         responses = iter([turn1, turn2, turn3])
         captured_messages: list[list[dict[str, Any]]] = []
 
-        async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
+        async def _fake_call_llm(
+            messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]],
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+        ) -> Any:
             captured_messages.append(list(messages))
             return next(responses)
 
@@ -1534,12 +1655,15 @@ class TestComposerMultiTurnToolCalls:
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
-            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True, side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
-        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
+        assert len(reviews) == 2 and reviews[0].binding != reviews[1].binding
+        assert result.state.metadata.name == "Repaired"
+        assert result.message == "The pipeline name is now Repaired."
+        assert result.raw_assistant_content is None
         assert len(captured_messages) == 3
         # Turn 2 (the repair call) saw the injected advisor findings.
         assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
@@ -1579,6 +1703,7 @@ class TestComposerMultiTurnToolCalls:
         still land, but no human/transcript field may retain model-authored
         prose produced from the advisor repair context.
         """
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
         from elspeth.web.composer.advisor_context import (
             _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN,
             _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END,
@@ -1589,6 +1714,8 @@ class TestComposerMultiTurnToolCalls:
             _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
             _ADVISOR_FINDINGS_UNTRUSTED_END,
         )
+        from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
+        from elspeth.web.sessions.routes._helpers import _composer_conversation_or_tool_messages
 
         service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
         service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
@@ -1628,19 +1755,43 @@ class TestComposerMultiTurnToolCalls:
             _make_llm_response(content=echoed_primary_prose),
         ]
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        reviews: list[dict[str, Any]] = []
+
+        async def review_echo(
+            arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
+        ) -> tuple[str, dict[str, object]]:
+            review = json.loads(arguments["publication_review"].payload_json)
+            reviews.append(review)
+            assert len(reviews) <= 2, "Only two END responses are supplied"
+            assert review["current_request"] == "Review this pipeline"
+            assert review["candidate_reply"] == ("The pipeline is ready.", echoed_primary_prose)[len(reviews) - 1]
+            assert review["saved_effects"]["saved_revision_count"] == len(reviews) - 1
+            assert review["saved_effects"]["net_changed"] is (len(reviews) == 2)
+            if on_provider_dispatch is not None:
+                on_provider_dispatch()
+            flagged = len(reviews) == 1
+            return json.dumps(
+                {
+                    "verdict": "FLAGGED" if flagged else "CLEAN",
+                    "category": "other",
+                    "steps": [],
+                    "findings": findings if flagged else "Candidate repeats unsupported advisor findings and internal sentinel markers.",
+                    "note": "Review the configured source options." if flagged else None,
+                    # A CLEAN graph judgment cannot authorize false quoted
+                    # findings and internal sentinels in the candidate reply.
+                    "publication_verdict": "WITHHOLD",
+                }
+            ), {}
 
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as primary_call,
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=_advisor_checkpoint_responses(
-                    _advisor_checkpoint_reply(verdict="FLAGGED", findings=findings, note="Review the configured source options."),
-                    _advisor_checkpoint_reply(verdict="CLEAN", findings="", note=None),
-                ),
-            ),
+                side_effect=review_echo,
+            ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
@@ -1659,13 +1810,46 @@ class TestComposerMultiTurnToolCalls:
                 .all()
             )
 
-        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
-        assert result.raw_assistant_content is None
+        assert primary_call.await_count == 3 and advisor_call.await_count == len(reviews) == 2
+        assert reviews[0]["current_graph_hash"] != reviews[1]["current_graph_hash"]
+        saved_scope = (
+            "This request saved 1 draft revisions with verified changes. "
+            "Saved changes do not establish that the requested task is complete."
+        )
+        assert result.message.startswith(saved_scope)
+        assert result.raw_assistant_content == saved_scope
         assert result.state.metadata.name == "Repaired"
         assert len(persisted_assistant_rows) == 1
         assert persisted_assistant_rows[0]["content"] == "ELSPETH is applying a pipeline correction."
         assert persisted_assistant_rows[0]["raw_content"] is None
         assert persisted_assistant_rows[0]["tool_calls"] is not None
+        sessions = service._require_sessions_service()
+        stored = await sessions.get_messages(UUID(session_id), limit=None)
+        withheld = [
+            (row.tool_calls[0]["origin"], row.content)
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == COMPOSER_WITHHELD_REPLY_KIND
+        ]
+        assert withheld == [
+            ("repair_gate_superseded", "The pipeline is ready."),
+            ("advisor_repair_tool_turn", echoed_primary_prose),
+            ("advisor_publication_withheld", echoed_primary_prose),
+        ]
+        passes = [
+            row.tool_calls[0]["pass"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert [(item["verdict"], item["publication_verdict"], item["provider_attempts"]) for item in passes] == [
+            ("flagged", "WITHHOLD", 1),
+            ("clean", "WITHHOLD", 1),
+        ]
+        assert all(item["first_attempt_accepted"] is True for item in passes)
+        assert all(type(item["publication_binding"]) is str and len(item["publication_binding"]) == 64 for item in passes)
+        assert passes[0]["publication_binding"] != passes[1]["publication_binding"]
+        public_rows = _composer_conversation_or_tool_messages(
+            await sessions.get_messages(UUID(session_id), limit=None, include_private_evidence=False)
+        )
 
         runtime_preflight = result.runtime_preflight
         assert runtime_preflight is not None
@@ -1674,6 +1858,8 @@ class TestComposerMultiTurnToolCalls:
             result.raw_assistant_content or "",
             *(row["content"] for row in persisted_assistant_rows),
             *((row["raw_content"] or "") for row in persisted_assistant_rows),
+            *(row.content or "" for row in public_rows),
+            *(row.raw_content or "" for row in public_rows),
             *(check.detail for check in runtime_preflight.checks),
             *(error.message for error in runtime_preflight.errors),
             *((error.suggestion or "") for error in runtime_preflight.errors),
@@ -1688,6 +1874,8 @@ class TestComposerMultiTurnToolCalls:
 
     @pytest.mark.asyncio
     async def test_advisor_rereview_carries_prior_finding_mutation_and_current_evidence(self) -> None:
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+
         catalog = _mock_catalog()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
         state = CompositionState(
@@ -1706,30 +1894,56 @@ class TestComposerMultiTurnToolCalls:
         llm_responses = [
             _make_llm_response(content="Looks ready."),
             _make_llm_response(tool_calls=[{"id": "repair-1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}]),
-            _make_llm_response(content="Ready after repair."),
+            _make_llm_response(content="The pipeline name is now Repaired."),
         ]
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         prior_finding = "FLAGGED: sink omits rating"
         service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
             service._advisor_checkpoint, AdvisorCheckpointOwner
         )  # type: ignore[method-assign]
+        reviews = []
+
+        async def rereview(
+            arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
+        ) -> tuple[str, dict[str, object]]:
+            review = json.loads(arguments["publication_review"].payload_json)
+            reviews.append(review)
+            assert len(reviews) <= 2, "Only the original two review responses are supplied"
+            assert review["current_request"] == "Review this pipeline"
+            assert review["candidate_reply"] == ("Looks ready.", "The pipeline name is now Repaired.")[len(reviews) - 1]
+            assert review["saved_effects"]["saved_revision_count"] == len(reviews) - 1
+            assert review["saved_effects"]["net_changed"] is (len(reviews) == 2)
+            if on_provider_dispatch is not None:
+                on_provider_dispatch()
+            flagged = len(reviews) == 1
+            return json.dumps(
+                {
+                    "verdict": "FLAGGED" if flagged else "CLEAN",
+                    "category": "other",
+                    "steps": [],
+                    "findings": prior_finding if flagged else "",
+                    "note": "Add the rating field to the sink output." if flagged else None,
+                    "publication_verdict": "WITHHOLD" if flagged else "ADMIT",
+                }
+            ), {}
 
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=llm_responses),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=llm_responses) as primary_call,
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=_advisor_checkpoint_responses(
-                    _advisor_checkpoint_reply(verdict="FLAGGED", findings=prior_finding, note="Add the rating field to the sink output."),
-                    _advisor_checkpoint_reply(verdict="CLEAN", findings="", note=None),
-                ),
+                side_effect=rereview,
             ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
         assert result.runtime_preflight is None or result.runtime_preflight.is_valid
+        assert primary_call.await_count == 3 and advisor_call.await_count == len(reviews) == 2
+        assert result.state.metadata.name == "Repaired"
+        assert result.message == "The pipeline name is now Repaired."
+        assert reviews[0]["current_graph_hash"] != reviews[1]["current_graph_hash"]
         first_arguments = advisor_call.await_args_list[0].args[0]
         second_arguments = advisor_call.await_args_list[1].args[0]
         assert first_arguments["recent_errors"] == []
@@ -1739,9 +1953,24 @@ class TestComposerMultiTurnToolCalls:
         assert "review pass 2" in second_arguments["problem_summary"].lower()
         assert "assess the current evidence independently" in second_arguments["problem_summary"].lower()
         assert "Pipeline: Repaired" in second_arguments["schema_excerpt"]
+        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
+        passes = [
+            row.tool_calls[0]["pass"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert [(item["verdict"], item["publication_verdict"], item["provider_attempts"]) for item in passes] == [
+            ("flagged", "WITHHOLD", 1),
+            ("clean", "ADMIT", 1),
+        ]
+        assert all(item["first_attempt_accepted"] is True for item in passes)
+        assert all(type(item["publication_binding"]) is str and len(item["publication_binding"]) == 64 for item in passes)
+        assert passes[0]["publication_binding"] != passes[1]["publication_binding"]
 
     @pytest.mark.asyncio
     async def test_advisor_rereview_without_mutation_is_explicit_not_a_blind_replay(self) -> None:
+        from elspeth.web.composer.advisor_decision import AdvisorGateBlocked
+
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         state = CompositionState(
             source=SourceSpec(
@@ -1759,33 +1988,63 @@ class TestComposerMultiTurnToolCalls:
         service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
             service._advisor_checkpoint, AdvisorCheckpointOwner
         )  # type: ignore[method-assign]
+        reviewed: list[dict[str, Any]] = []
+
+        async def rereview(
+            arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
+        ) -> tuple[str, dict[str, object]]:
+            review = json.loads(arguments["publication_review"].payload_json)
+            reviewed.append(review)
+            assert len(reviewed) <= 2, "Only two END responses are supplied"
+            assert review["current_request"] == "Review this pipeline"
+            assert review["candidate_reply"] == ("Looks ready.", "The pipeline has no configured output.")[len(reviewed) - 1]
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
+            if on_provider_dispatch is not None:
+                on_provider_dispatch()
+            return json.dumps(
+                {
+                    "verdict": "FLAGGED",
+                    "category": "other",
+                    "steps": [],
+                    "findings": "FLAGGED: missing output",
+                    "note": "Configure a pipeline output.",
+                    "publication_verdict": "WITHHOLD",
+                }
+            ), {}
 
         with (
             patch.object(
                 service._provider_gateway,
                 "_call_llm",
                 new_callable=AsyncMock,
-                side_effect=[_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")],
-            ),
+                side_effect=[
+                    _make_llm_response(content="Looks ready."),
+                    _make_llm_response(content="The pipeline has no configured output."),
+                ],
+            ) as primary_call,
             patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=_advisor_checkpoint_responses(
-                    _advisor_checkpoint_reply(verdict="FLAGGED", findings="FLAGGED: missing output", note="Configure a pipeline output."),
-                    _advisor_checkpoint_reply(verdict="CLEAN", findings="", note=None),
-                ),
+                side_effect=rereview,
             ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
-        assert result.runtime_preflight is None or result.runtime_preflight.is_valid
+        assert primary_call.await_count == advisor_call.await_count == len(reviewed) == 2
+        assert reviewed[0]["current_graph_hash"] == reviewed[1]["current_graph_hash"]
+        assert result.state == state
+        assert result.tool_invocations == ()
+        assert isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
+        assert "Looks ready." not in result.message
+        assert "The pipeline has no configured output." not in result.message
         second_arguments = advisor_call.await_args_list[1].args[0]
         assert any("FLAGGED: missing output" in item for item in second_arguments["recent_errors"])
         assert second_arguments["attempted_actions"] == ["No successful pipeline mutation occurred since the prior advisor pass."]
         assert "current evidence identity" in second_arguments["problem_summary"].lower()
-        assert "prior evidence identity" in second_arguments["problem_summary"].lower()
+        assert "prior semantic repair evidence identity" in second_arguments["problem_summary"].lower()
 
     @staticmethod
     def _wired_source_only_state() -> CompositionState:
@@ -1812,7 +2071,13 @@ class TestComposerMultiTurnToolCalls:
         replies = [_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")]
         provider_contexts: list[list[dict[str, Any]]] = []
 
-        async def scripted_call_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+        async def scripted_call_llm(
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+        ) -> Any:
             provider_contexts.append([dict(item) for item in messages])
             return replies[len(provider_contexts) - 1]
 
@@ -1881,24 +2146,51 @@ class TestComposerMultiTurnToolCalls:
 
     @pytest.mark.asyncio
     async def test_advisor_outage_on_the_first_pass_does_not_delete_the_models_reply(self) -> None:
-        """Whole loop, real driver wiring: the advisor never rendered a verdict,
-        so nothing hidden entered the model's context and the reply is the
-        model's own. The block is reported beside it."""
+        """An unreviewed reply survives privately while public copy states saved facts."""
+        from hashlib import sha256
+
+        from elspeth.web.composer.advisor_audit import ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
+        from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
+        from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND, COMPOSER_WITHHELD_REPLY_SCHEMA
+        from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_or_tool_messages
+
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         outage = AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="advisor unavailable", failure_class="unavailable")
+        state = self._wired_source_only_state()
 
         with (
             patch.object(
                 service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=[_make_llm_response(content="Looks ready.")]
-            ),
-            patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
-            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", new_callable=AsyncMock, return_value=outage),
+            ) as primary_call,
+            patch.object(
+                service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])
+            ) as preflight,
+            patch.object(
+                service._advisor_checkpoint, "_run_advisor_checkpoint", new_callable=AsyncMock, return_value=outage
+            ) as advisor_call,
         ):
-            result = await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
+            result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
-        assert result.raw_assistant_content == "Looks ready."
+        assert primary_call.await_count == 1
+        assert advisor_call.await_count == service._settings.composer_advisor_checkpoint_max_passes == 2
+        assert [call.kwargs["pass_index"] for call in advisor_call.await_args_list] == [1, 2]
+        reviews = [call.kwargs["publication_review"] for call in advisor_call.await_args_list]
+        assert type(reviews[0]) is AdvisorPublicationReview and reviews[1] is reviews[0]
+        evidence = json.loads(reviews[0].payload_json)
+        assert evidence["candidate_reply"] == "Looks ready."
+        assert evidence["current_request"] == "Review this pipeline"
+        assert evidence["saved_effects"]["saved_revision_count"] == 0
+        assert evidence["saved_effects"]["net_changed"] is False
+        preflight.assert_not_called()
+        assert result.state == state
+        assert result.tool_invocations == ()
+        saved_scope = "No pipeline changes were saved in this request."
+        assert result.raw_assistant_content == saved_scope
+        assert result.message == saved_scope + _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+        assert "Looks ready." not in result.message
         assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
-            _no_tool_policy_module.AssistantTextSegment("Looks ready."),
+            _no_tool_policy_module.AssistantTextSegment(saved_scope),
             # No mutation this turn, so no preflight ran: the absent-shape twin.
             _no_tool_policy_module.TrustedSystemNoticeSegment(
                 _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE
@@ -1906,12 +2198,47 @@ class TestComposerMultiTurnToolCalls:
         )
         assert result.runtime_preflight is not None
         assert result.runtime_preflight.readiness.completion_ready is False
+        assert isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
+        assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.UNAVAILABLE
+        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
+        withheld = [
+            row for row in stored if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == COMPOSER_WITHHELD_REPLY_KIND
+        ]
+        assert len(withheld) == 1
+        assert withheld[0].session_id == UUID(session_id) and withheld[0].writer_principal == "compose_loop"
+        assert withheld[0].content == "Looks ready."
+        assert len(withheld[0].tool_calls) == 1
+        assert withheld[0].tool_calls[0] == {
+            "_kind": COMPOSER_WITHHELD_REPLY_KIND,
+            "schema": COMPOSER_WITHHELD_REPLY_SCHEMA,
+            "origin": "advisor_publication_withheld",
+            "content_hash": sha256(b"Looks ready.").hexdigest(),
+        }
+        public_rows = _composer_conversation_or_tool_messages(stored)
+        assert withheld[0] not in public_rows
+        assert all(row.content != "Looks ready." and row.raw_content != "Looks ready." for row in public_rows)
+        assert all(item["content"] != "Looks ready." for item in _composer_chat_history(stored))
+        terminal = [
+            row
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
+        ]
+        assert len(terminal) == 1
+        assert terminal[0].tool_calls[0] == {
+            "_kind": ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND,
+            "publication": {
+                "branch": "terminal_block",
+                "reason": "unavailable",
+                "preflight_shape": "absent",
+                "findings_backend_authored": False,
+            },
+        }
+        assert json.loads(terminal[0].content) == terminal[0].tool_calls[0]
 
     @pytest.mark.asyncio
     async def test_advisor_cohort_keeps_every_replaced_reply_recoverable(self) -> None:
-        """The advisor-repair cohort publishes fixed copy in place of the
-        model's prose on the repair tool turn and on the terminal. What the
-        user sees is unchanged; the replaced words must still exist somewhere."""
+        """Verified request effects replace completion prose without losing any private reply."""
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
         from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
@@ -1921,8 +2248,24 @@ class TestComposerMultiTurnToolCalls:
                 content="Renaming it as the review asked.",
                 tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
             ),
-            _make_llm_response(content="Pipeline is ready."),
+            _make_llm_response(content="The pipeline name is now Repaired."),
         ]
+        reviews: list[AdvisorPublicationReview] = []
+
+        async def review_reply(*_args, **kwargs):
+            assert kwargs["phase"] == "end"
+            review = kwargs["publication_review"]
+            assert type(review) is AdvisorPublicationReview
+            reviews.append(review)
+            assert len(reviews) <= 2, "No additional review allowance is supplied by this fixture"
+            flagged = len(reviews) == 1
+            return AdvisorCheckpointVerdict(
+                ok=True,
+                blocking=flagged,
+                findings_text="FLAGGED: sink omits rating" if flagged else "CLEAN",
+                publication_verdict="WITHHOLD" if flagged else "ADMIT",
+                publication_binding=review.binding,
+            )
 
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
@@ -1930,17 +2273,14 @@ class TestComposerMultiTurnToolCalls:
             patch.object(
                 service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
-                new_callable=AsyncMock,
-                side_effect=[
-                    AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating"),
-                    AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
-                ],
+                autospec=True,
+                side_effect=review_reply,
             ),
         ):
             result = await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
 
-        # Published behaviour is untouched: fixed copy, prose withheld.
-        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
+        assert len(reviews) == 2 and reviews[0].binding != reviews[1].binding
+        assert result.message == "The pipeline name is now Repaired."
         assert result.raw_assistant_content is None
 
         assert service._sessions_service is not None
@@ -1953,20 +2293,27 @@ class TestComposerMultiTurnToolCalls:
         assert withheld == [
             ("repair_gate_superseded", "Looks ready to me."),
             ("advisor_repair_tool_turn", "Renaming it as the review asked."),
-            ("advisor_repair_terminal", "Pipeline is ready."),
         ]
         assert all(row.content != "Renaming it as the review asked." for row in stored if row.role == "assistant")
 
     @pytest.mark.asyncio
-    async def test_flagged_discovery_only_tool_call_does_not_elide_advisor_message(self) -> None:
-        """R2-F12 Step 3 non-regression (review finding 1): a discovery-only
-        tool call (list_sources — no mutation) following a FLAGGED advisor
-        pass must NOT drain the injected advisor message. If it did, the
-        model's NEXT no-tool reply would be asked to "fix" findings it can
-        no longer see, the END gate would re-flag on unchanged state, and
-        the run would needlessly block. The advisor message must survive
-        into the discovery turn's own context and into whatever follows it,
-        right up until a turn that actually mutates state."""
+    @pytest.mark.parametrize("mutate_after_discovery", [True, False], ids=["rename_after_discovery", "discovery_only"])
+    async def test_flagged_discovery_only_tool_call_does_not_elide_advisor_message(self, mutate_after_discovery: bool) -> None:
+        """Discovery neither saves a revision nor drains a FLAGGED exchange.
+
+        A later metadata rename saves one revision and drains the exchange;
+        it does not repair the missing output or authorize completion prose.
+        """
+        import litellm
+
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
+        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+        from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
+        from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
+        from elspeth.web.sessions.models import composition_states_table
+        from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_or_tool_messages
+        from elspeth.web.sessions.state_envelope import unwrap_state_column
+
         catalog = _mock_catalog()
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
@@ -1987,49 +2334,192 @@ class TestComposerMultiTurnToolCalls:
         turn1 = _make_llm_response(content="Looks ready to me.")
         # Turn 2: discovery only — no mutation. Must NOT drain.
         turn2 = _make_llm_response(tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}])
-        # Turn 3: the genuine repair — this mutates. Drain fires HERE.
+        # Turn 3: a metadata mutation drains the exchange, but cannot repair
+        # the missing output or authorize a completion claim.
         turn3 = _make_llm_response(
             tool_calls=[{"id": "c2", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
         )
-        # Turn 4: no tool calls -> END advisor gate re-runs, CLEAN -> finalize.
+        # The final no-tool reply requires a new independent END review.
         turn4 = _make_llm_response(content="Pipeline is ready.")
-
-        verdicts = iter(
-            [
-                AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating"),
-                AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
-            ]
-        )
-
-        async def _fake_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
-            return next(verdicts)
-
-        responses = iter([turn1, turn2, turn3, turn4])
+        replies = [turn1, turn2, *([turn3] if mutate_after_discovery else []), turn4]
+        responses = iter(replies)
         captured_messages: list[list[dict[str, Any]]] = []
+        sessions = service._require_sessions_service()
+        reviews: list[dict[str, Any]] = []
+        revision_snapshots: list[tuple[tuple[str, int, dict[str, Any]], ...]] = []
 
-        async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
-            captured_messages.append(list(messages))
+        def saved_revisions() -> tuple[tuple[str, int, dict[str, Any]], ...]:
+            with sessions._engine.connect() as conn:
+                return tuple(
+                    (row.id, row.version, unwrap_state_column(row.metadata_))
+                    for row in conn.execute(
+                        select(composition_states_table.c.id, composition_states_table.c.version, composition_states_table.c.metadata_)
+                        .where(composition_states_table.c.session_id == session_id)
+                        .order_by(composition_states_table.c.version)
+                    )
+                )
+
+        async def _fake_call_llm(
+            messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]],
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+        ) -> Any:
+            assert len(captured_messages) < len(replies), "Only the original finite primary responses are supplied"
+            captured_messages.append(deepcopy(messages))
+            revision_snapshots.append(saved_revisions())
             return next(responses)
+
+        async def review_completion(**kwargs: Any) -> Any:
+            assert kwargs["model"] == settings.composer_advisor_model
+            assert len(reviews) < 2, "Only the original two independent END responses are supplied"
+            assert "tools" not in kwargs and kwargs["num_retries"] == kwargs["max_retries"] == 0
+            assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
+            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            reviews.append(review)
+            assert review["current_request"] == "Review this pipeline"
+            assert review["candidate_reply"] == ("Looks ready to me.", "Pipeline is ready.")[len(reviews) - 1]
+            saved_count = int(mutate_after_discovery and len(reviews) == 2)
+            assert review["saved_effects"]["saved_revision_count"] == saved_count == len(saved_revisions())
+            assert review["saved_effects"]["net_changed"] is bool(saved_count)
+            if saved_count:
+                assert review["saved_effects"]["latest_committed_state_id"] == saved_revisions()[0][0]
+                # This fixture has no seeded durable state: SQL allocates its
+                # first version as 1, independently of the in-memory version.
+                assert saved_revisions()[0][1:] == (1, {"name": "Repaired", "description": ""})
+            return litellm.ModelResponse(
+                model=kwargs["model"],
+                choices=[
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "verdict": "FLAGGED",
+                                    "category": "request_not_met",
+                                    "steps": [],
+                                    "findings": "The pipeline has no configured output. The completion claim is unsupported.",
+                                    "note": None,
+                                    "publication_verdict": "WITHHOLD",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 20},
+            )
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
-            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight) as preflight,
+            patch.object(
+                service._advisor_checkpoint,
+                "_run_advisor_checkpoint",
+                side_effect=_REAL_RUN_ADVISOR_CHECKPOINT.__get__(service._advisor_checkpoint, AdvisorCheckpointOwner),
+            ) as checkpoints,
+            patch.object(litellm, "acompletion", side_effect=review_completion) as advisor_sdk,
         ):
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
-        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
-        assert len(captured_messages) == 4
+        assert len(captured_messages) == mock_llm.await_count == 3 + int(mutate_after_discovery)
+        assert checkpoints.await_count == advisor_sdk.await_count == len(reviews) == settings.composer_advisor_checkpoint_max_passes == 2
+        bindings = [call.kwargs["publication_review"].binding for call in checkpoints.await_args_list]
+        assert all(call.kwargs["phase"] == "end" for call in checkpoints.await_args_list)
+        owned_reviews = [json.loads(call.kwargs["publication_review"].payload_json) for call in checkpoints.await_args_list]
+        # Provider text is scrubbed without changing owned metadata identities.
+        assert [json.loads(call.kwargs["publication_review"].provider_payload_json) for call in checkpoints.await_args_list] == reviews
+        assert [review["current_graph_hash"] for review in reviews] == [review["current_graph_hash"] for review in owned_reviews]
+        assert (owned_reviews[0]["current_graph_hash"] != owned_reviews[1]["current_graph_hash"]) is mutate_after_discovery
+        assert revision_snapshots[:3] == [(), (), ()], "Neither initial review nor list_sources saves a revision"
+        assert result.state.outputs == ()
+        assert result.state.metadata.name == ("Repaired" if mutate_after_discovery else state.metadata.name)
+        assert result.state.version == state.version + int(mutate_after_discovery)
+        if mutate_after_discovery:
+            assert revision_snapshots[3] == saved_revisions() and len(saved_revisions()) == 1
+            preflight.assert_called_once()
+        else:
+            assert saved_revisions() == () and result.state == state
+            preflight.assert_not_called()
+        saved_scope = (
+            "This request saved 1 draft revisions with verified changes. Saved changes do not establish that the requested task is complete."
+            if mutate_after_discovery
+            else "No pipeline changes were saved in this request."
+        )
+        suffix = (
+            _no_tool_policy_module._ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX
+            if mutate_after_discovery
+            else _no_tool_policy_module._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+        )
+        assert result.raw_assistant_content == saved_scope and result.message == saved_scope + suffix
+        assert result.runtime_preflight is not None and result.runtime_preflight.readiness.completion_ready is False
+        assert isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
+        assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.GRAPH_REJECTED
         # Turn 2 (discovery-only) still sees it — not drained by a non-mutating turn.
         assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
-        # Turn 3 (the mutating repair call) STILL sees it — the discovery
-        # turn must not have consumed it early.
+        # The next primary call (metadata mutation or final reply) still sees
+        # the finding: discovery cannot consume the injected exchange.
         assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[2])
-        # Turn 4 (the finalize call, after the mutating repair) must NOT —
-        # drained only once a real mutation landed.
-        assert not any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[3])
+        assert [m for m in captured_messages[1] if "Completion advisory review" in (m.get("content") or "")] == [
+            m for m in captured_messages[2] if "Completion advisory review" in (m.get("content") or "")
+        ]
+        # The final call drains that exchange only after the real rename.
+        assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[-1]) is not mutate_after_discovery
+        assert [inv.tool_name for inv in result.tool_invocations] == ["list_sources", *(["set_metadata"] if mutate_after_discovery else [])]
+        assert all(inv.status == "success" for inv in result.tool_invocations)
+        assert {m["tool_call_id"] for m in captured_messages[-1] if m["role"] == "tool"} == {
+            "c1",
+            *(["c2"] if mutate_after_discovery else []),
+        }
+        assert result.tool_invocations[0].version_before == result.tool_invocations[0].version_after == state.version
+        if mutate_after_discovery:
+            assert result.tool_invocations[1].version_before == state.version
+            assert result.tool_invocations[1].version_after == state.version + 1
+        stored = await sessions.get_messages(UUID(session_id), limit=None)
+        withheld = [
+            row for row in stored if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == COMPOSER_WITHHELD_REPLY_KIND
+        ]
+        assert [(row.tool_calls[0]["origin"], row.content) for row in withheld] == [
+            ("repair_gate_superseded", "Looks ready to me."),
+            ("advisor_publication_withheld", "Pipeline is ready."),
+        ]
+        public_rows = _composer_conversation_or_tool_messages(stored)
+        assert all(row not in public_rows for row in withheld)
+        for candidate in ("Looks ready to me.", "Pipeline is ready."):
+            assert candidate not in result.message
+            assert all(row.content != candidate and row.raw_content != candidate for row in public_rows)
+            assert all(item["content"] != candidate for item in _composer_chat_history(stored))
+        passes = [
+            row.tool_calls[0]["pass"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert [(item["verdict"], item["publication_verdict"], item["provider_attempts"]) for item in passes] == [
+            ("flagged", "WITHHOLD", 1),
+            ("flagged", "WITHHOLD", 1),
+        ]
+        assert all(item["first_attempt_accepted"] is True for item in passes)
+        assert all(type(item["publication_binding"]) is str and len(item["publication_binding"]) == 64 for item in passes)
+        assert [item["publication_binding"] for item in passes] == bindings
+        assert passes[0]["publication_binding"] != passes[1]["publication_binding"]
+        terminal = [
+            row.tool_calls[0]["publication"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
+        ]
+        assert terminal == [
+            {
+                "branch": "terminal_block",
+                "reason": "flagged_final_pass",
+                "preflight_shape": "green" if mutate_after_discovery else "absent",
+                "findings_backend_authored": False,
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_irrelevant_mutation_does_not_clear_a_fresh_final_flag(self) -> None:
@@ -2070,7 +2560,13 @@ class TestComposerMultiTurnToolCalls:
         responses = iter([turn1, turn2, turn3])
         captured_messages: list[list[dict[str, Any]]] = []
 
-        async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
+        async def _fake_call_llm(
+            messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]],
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+        ) -> Any:
             captured_messages.append(list(messages))
             return next(responses)
 
@@ -2462,6 +2958,11 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        supplied_arguments = {"plugin": "csv"}
+        declared_required = tuple(tool_registry._DECLARATIONS_BY_NAME["set_source"].json_schema["required"])
+        missing = tuple(name for name in declared_required if name not in supplied_arguments)
+        assert missing == ("on_success", "options")
+        missing_detail = ", ".join(missing)
 
         # Turn 1: set_source with missing required field
         bad_call = _make_llm_response(
@@ -2469,12 +2970,12 @@ class TestComposerErrorHandling:
                 {
                     "id": "call_bad",
                     "name": "set_source",
-                    "arguments": {"plugin": "csv"},  # missing on_success
+                    "arguments": supplied_arguments,
                 }
             ],
         )
         # Turn 2: text
-        text = _make_llm_response(content="Fixed.")
+        text = _make_llm_response(content="No pipeline changes were saved.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             script = _ReconciliationLLMScript(bad_call, text, text)
@@ -2486,7 +2987,15 @@ class TestComposerErrorHandling:
         _assert_no_mutation_empty_state_blocker(
             result,
             tool_name="set_source",
-            expected_detail="on_success, options, on_validation_failure",
+            expected_detail=missing_detail,
+        )
+        assert len(result.tool_invocations) == 1
+        invocation = result.tool_invocations[0]
+        assert invocation.error_class == "ToolArgumentError"
+        assert invocation.error_message == f"missing: {missing_detail}"
+        assert result.runtime_preflight.checks[0].detail == (
+            "No composition-state mutation completed successfully; state_exists=false. Blocking result: "
+            f"set_source failed before mutation (ToolArgumentError: missing: {missing_detail})."
         )
 
     @pytest.mark.asyncio
@@ -2648,6 +3157,7 @@ class TestComposerErrorHandling:
                             "primary": {
                                 "plugin": "csv",
                                 "on_success": "t1",
+                                "on_validation_failure": "discard",
                                 "options": {"path": "/data/blobs/in.csv", "schema": {"mode": "observed"}},
                             }
                         },
@@ -2658,6 +3168,7 @@ class TestComposerErrorHandling:
                                 "plugin": "passthrough",
                                 "input": "main",
                                 "on_success": "main",
+                                "on_error": "discard",
                                 "options": {},
                             }
                         ],
@@ -2673,6 +3184,7 @@ class TestComposerErrorHandling:
                             {
                                 "sink_name": "main",
                                 "plugin": "csv",
+                                "on_write_failure": "discard",
                                 "options": {"path": "/data/out.csv", "schema": {"mode": "observed"}},
                             }
                         ],
@@ -2680,7 +3192,7 @@ class TestComposerErrorHandling:
                 }
             ],
         )
-        text = _make_llm_response(content="Pipeline ready.")
+        text = _make_llm_response(content="No pipeline changes were saved.")
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
 
         with (
@@ -2689,7 +3201,7 @@ class TestComposerErrorHandling:
         ):
             script = _ReconciliationLLMScript(good_call, text, text)
             mock_llm.side_effect = script.respond
-            await service.compose("Setup", [], state, session_id=session_id)
+            result = await service.compose("Setup", [], state, session_id=session_id)
 
         _assert_reconciliation_turn(mock_llm, script)
 
@@ -2701,13 +3213,15 @@ class TestComposerErrorHandling:
         # regardless of what the tool handler returns afterwards.
         tool_msg = script.prompts[1][-1]
         assert tool_msg["role"] == "tool"
-        try:
-            error_content = json.loads(tool_msg["content"])
-            error_text = error_content.get("error", "") if isinstance(error_content, dict) else ""
-        except json.JSONDecodeError:
-            error_text = ""
+        error_content = json.loads(tool_msg["content"])
+        assert type(error_content) is dict
+        error_text = error_content.get("error", "")
+        assert type(error_text) is str
         assert "missing required argument" not in error_text.lower()
         assert "inline_blob" not in error_text
+        assert len(result.tool_invocations) == 1
+        assert result.tool_invocations[0].tool_call_id == "call_ok"
+        assert result.tool_invocations[0].error_category is not ToolArgumentErrorCategory.MISSING_REQUIRED_PATH
 
     @pytest.mark.asyncio
     async def test_set_pipeline_with_partial_inline_blob_returns_tier3_arg_error(self) -> None:
@@ -3772,7 +4286,7 @@ class TestComposeTimeout:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("error_class", "expected_failure_class", "expected_attempts"),
-        (("ServiceUnavailableError", "unavailable", 2), ("Timeout", "unavailable", 1), ("APIError", "malformed", 2)),
+        (("ServiceUnavailableError", "unavailable", 2), ("Timeout", "unavailable", 1), ("APIError", "unavailable", 2)),
     )
     async def test_end_advisor_classifies_real_sdk_failure_by_type(
         self, monkeypatch: pytest.MonkeyPatch, error_class: str, expected_failure_class: str, expected_attempts: int
@@ -3806,7 +4320,7 @@ class TestComposeTimeout:
         assert physical_calls == expected_attempts
         assert verdict.failure_class == expected_failure_class
         assert verdict.findings_text == (
-            "advisor model was unavailable after retry" if expected_failure_class == "unavailable" else "advisor response was malformed"
+            "advisor model was unavailable" if expected_failure_class == "unavailable" else "advisor response was malformed"
         )
         assert "provider secret" not in repr(verdict)
         assert checkpoint_persist.await_count == 1
@@ -3832,8 +4346,8 @@ class TestComposeTimeout:
         checkpoint_persist.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_end_advisor_generic_api_error_with_outage_name_remains_malformed(self) -> None:
-        """An SDK subclass name cannot override the generic APIError disposition."""
+    async def test_end_advisor_generic_api_error_with_outage_name_reports_unavailable(self) -> None:
+        """A provider API failure establishes unavailability, without response evidence."""
         service, _ = _composer_service_with_session(_mock_catalog(), _make_settings())
         named_generic_api_error = type("ServiceUnavailableError", (LiteLLMAPIError,), {})
         failure = named_generic_api_error(status_code=503, message="provider secret", llm_provider="test", model="test/advisor")
@@ -3843,8 +4357,8 @@ class TestComposeTimeout:
                 service._advisor_checkpoint, phase="end", state=_empty_state(), session_id=None, recorder=None
             )
 
-        assert verdict.failure_class == "malformed"
-        assert verdict.findings_text == "advisor response was malformed"
+        assert verdict.failure_class == "unavailable"
+        assert verdict.findings_text == "advisor model was unavailable"
         assert "provider secret" not in repr(verdict)
 
     @pytest.mark.asyncio
@@ -9384,6 +9898,12 @@ class TestComposeLoopForcedRepair:
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch.object(
+                self.service._advisor_checkpoint,
+                "_run_advisor_checkpoint",
+                autospec=True,
+                return_value=AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="", failure_class="unavailable"),
+            ),
         ):
             mock_llm.side_effect = turns
             result = await self.service.compose(
@@ -9406,8 +9926,8 @@ class TestComposeLoopForcedRepair:
         assert result.state.metadata.name == "attempt-2"
         # The model's final claim is preserved for audit, but a backend-owned
         # blocker prevents ordinary successful finalisation.
-        assert result.raw_assistant_content == "final"
-        assert result.message.startswith("final")
+        assert result.raw_assistant_content != "final"
+        assert not result.message.startswith("final")
         assert result.runtime_preflight is not None
         assert result.runtime_preflight.is_valid is False
         assert result.runtime_preflight.readiness.authoring_valid is False
@@ -9446,6 +9966,12 @@ class TestComposeLoopForcedRepair:
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch.object(
+                self.service._advisor_checkpoint,
+                "_run_advisor_checkpoint",
+                autospec=True,
+                return_value=AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="", failure_class="unavailable"),
+            ),
         ):
             mock_llm.side_effect = turns
             result = await self.service.compose(
@@ -9460,6 +9986,8 @@ class TestComposeLoopForcedRepair:
         # claim-completes fire repair injection, the third is final).
         assert mock_llm.call_count == 4
         assert result.repair_turns_used == _MAX_REPAIR_TURNS
+        assert result.raw_assistant_content != "final"
+        assert not result.message.startswith("final")
         # The model never applied a fix → schema still 'fixed' with the
         # original blocker config; runtime_preflight may still be valid
         # (it was patched to return is_valid=True), but the runtime gate

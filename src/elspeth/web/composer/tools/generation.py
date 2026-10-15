@@ -1069,8 +1069,14 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"fork_branch_no_destination|fork branch '(.+)' with no destination",
-        "Every gate fork_to branch name must land somewhere: as a KEY in a coalesce 'branches' mapping, or as an exact sink name.",
-        "Key the coalesce branches by the gate's fork branch names — e.g. fork_to=['branch_a','branch_b'] pairs with branches={'branch_a': '<connection arriving from that branch>', 'branch_b': '<connection>'} — where each value is the connection reaching the coalesce after any per-branch transforms (the transform's on_success).",
+        "Every gate fork_to branch name must match one downstream transform/gate input, an exact sink name, or a KEY in a "
+        "coalesce/row_union branches mapping. Pure fan-out to independent outputs does not require coalesce.",
+        "For independent branches, set each downstream transform/gate input to its gate fork_to name exactly, or use an "
+        "exact sink name. Rename a branch and its consumer input together if needed. Use a barrier only when reconvergence "
+        "is intended: key coalesce/row_union branches by the gate's fork branch names, with each value naming the connection "
+        "arriving after that branch's transforms (their on_success), or the fork name when there are no transforms. Choose "
+        "coalesce to merge branch fields into one row, or row_union to release every original branch row; row_union input "
+        "repeats the first branches value and on_success names downstream processing.",
     ),
     (
         r"coalesce_policy_invalid|coalesce_merge_invalid|coalesce_policy_quorum_unsupported|coalesce_merge_select_unsupported|coalesce_best_effort_requires_timeout",
@@ -1574,6 +1580,13 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "and the candidate's sink names as 'declared_sinks'.",
         "Set the aggregation's on_error='discard', or copy one of the connectivity facts' declared_sinks exactly. It "
         "cannot name a coalesce, row_union or collector: an aggregation never sits inside a bound region.",
+    ),
+    DirectValidationGuidance(
+        "failure_route_required",
+        "This ordinary component has no explicit non-empty failure choice. Composer does not choose a route for it.",
+        "Supply the component's failure field with 'discard' or an eligible named route. Existing sink and required-control "
+        "restrictions still apply. Null/empty is invalid. Omit the field only when updating the same component to preserve "
+        "its existing choice; full replacement and new components require an explicit choice.",
     ),
     DirectValidationGuidance(
         "aggregation_expected_output_count_mode_invalid",

@@ -1,10 +1,39 @@
 import producerFixtures from "@/test/composerRecoveryProducerFixtures.json";
 import { describe, expect, it } from "vitest";
-import { ComposerSseDecoder, decodeComposerOperationAck, decodeComposerOperationFrame, decodeComposerOperationSnapshot } from "./composerOperationDecoder";
+import { ComposerSseDecoder, decodeComposerOperationAck, decodeComposerOperationFrame, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
 const sid = "11111111-1111-4111-8111-111111111111";
 const id = "22222222-2222-4222-8222-222222222222";
 const heartbeat = { schema_version: "composer-operation-stream.v1", session_id: sid, operation_id: id, sequence: 0, event: "heartbeat" };
 const encode = new TextEncoder();
+
+describe("retained failure page admission", () => {
+  const outcome = { session_id: sid, operation_id: id, kind: "compose_message", user_message_id: null, settled_at: "2026-10-14T08:00:00Z", failure_code: "operation_failed", error_type: "operation_failed", diagnostic_id: id, request_id: "request-reference", saved_revisions: { attribution: "fenced", count: 2, latest_state_id: id, latest_version: 7 } };
+  const page = { session_id: sid, items: [outcome], next_cursor: null };
+  it("admits closed saved facts and distinguishes unavailable progress from zero", () => {
+    expect(decodeComposerOperationFailurePage(page, sid, id)).toEqual(page);
+    for (const saved of [
+      { attribution: "unavailable", count: null, latest_state_id: null, latest_version: null },
+      { attribution: "unstarted", count: 0, latest_state_id: null, latest_version: null },
+      { attribution: "fenced", count: 0, latest_state_id: null, latest_version: null },
+    ]) expect(decodeComposerOperationFailurePage({ ...page, items: [{ ...outcome, saved_revisions: saved }] }, sid).items[0].saved_revisions).toEqual(saved);
+  });
+  it("rejects private fields, mixed scope, forged identifiers and inconsistent saved facts", () => {
+    for (const changes of [
+      { body: { detail: "private canary" } }, { error_type: "private exception class" }, { session_id: id },
+      { operation_id: "invalid" }, { diagnostic_id: null }, { failure_code: "worker_lost" },
+      { settled_at: "2026-10-14" }, { request_id: "" },
+      ...[
+        { attribution: "unavailable", count: 0, latest_state_id: null, latest_version: null },
+        { attribution: "unstarted", count: 2, latest_state_id: id, latest_version: 7 },
+        { attribution: "fenced", count: true, latest_state_id: id, latest_version: 7 },
+        { attribution: "fenced", count: 0, latest_state_id: id, latest_version: 7 },
+        { attribution: "fenced", count: 2, latest_state_id: null, latest_version: 7 },
+      ].map((saved_revisions) => ({ saved_revisions })),
+    ]) expect(() => decodeComposerOperationFailurePage({ ...page, items: [{ ...outcome, ...changes }] }, sid)).toThrow();
+    for (const changes of [{ body: "private" }, { session_id: id }, { items: [outcome, outcome] }, { items: Array(101).fill(outcome) }, { next_cursor: "" }]) expect(() => decodeComposerOperationFailurePage({ ...page, ...changes }, sid)).toThrow();
+    expect(() => decodeComposerOperationFailurePage(page, sid, sid)).toThrow();
+  });
+});
 describe("composer operation external admission", () => {
   it("admits each UTF-8 byte split and split CRLF with coalesced frames", () => {
     const value = { ...heartbeat, event: "terminal", payload: { status: "completed" }, label: "€🐈" };

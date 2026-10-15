@@ -26,6 +26,11 @@ from tests.helpers.session_fences import FencedComposeTurnHarness
 # ``FencedComposeTurnHarness`` on the session's first turn.
 from .conftest import _make_session
 
+_POPULATED_SESSION_ID = "00000000-0000-4000-8000-000000000001"
+_SUCCESS_SESSION_ID = "00000000-0000-4000-8000-000000000002"
+_ROLLBACK_SESSION_ID = "00000000-0000-4000-8000-000000000003"
+_DIVERGENCE_SESSION_ID = "00000000-0000-4000-8000-000000000004"
+
 
 @pytest.fixture
 def service(tmp_path):
@@ -66,9 +71,9 @@ def populated_audit_db(service):
     from sqlalchemy.exc import IntegrityError
 
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="populated_audit")
+        _make_session(conn, session_id=_POPULATED_SESSION_ID)
     service.persist_compose_turn(
-        session_id="populated_audit",
+        session_id=_POPULATED_SESSION_ID,
         assistant_content="ok",
         redacted_assistant_tool_calls=({"id": "tc_populated_a", "function": {"name": "f"}},),
         redacted_tool_rows=(
@@ -88,7 +93,8 @@ def populated_audit_db(service):
     )
     with service._engine.begin() as conn:
         first_state_id = conn.execute(
-            text("SELECT id FROM composition_states WHERE session_id='populated_audit' ORDER BY version DESC LIMIT 1")
+            text("SELECT id FROM composition_states WHERE session_id=:session_id ORDER BY version DESC LIMIT 1"),
+            {"session_id": _POPULATED_SESSION_ID},
         ).scalar_one()
     with pytest.raises(
         IntegrityError,
@@ -98,7 +104,7 @@ def populated_audit_db(service):
         ),
     ):
         service.persist_compose_turn(
-            session_id="populated_audit",
+            session_id=_POPULATED_SESSION_ID,
             assistant_content="duplicate",
             redacted_assistant_tool_calls=({"id": "tc_populated_a", "function": {"name": "f"}},),
             redacted_tool_rows=(
@@ -129,9 +135,9 @@ def test_no_state_row_without_tool_row(populated_audit_db):
 
 def test_backward_direction_holds_after_successful_persist(service):
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="b1")
+        _make_session(conn, session_id=_SUCCESS_SESSION_ID)
     service.persist_compose_turn(
-        session_id="b1",
+        session_id=_SUCCESS_SESSION_ID,
         assistant_content="ok",
         redacted_assistant_tool_calls=({"id": "tc_a", "function": {"name": "f"}},),
         redacted_tool_rows=(
@@ -162,10 +168,10 @@ def test_backward_direction_holds_after_integrity_error_rollback(service):
     from sqlalchemy.exc import IntegrityError
 
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="b2")
+        _make_session(conn, session_id=_ROLLBACK_SESSION_ID)
     # First successful turn.
     service.persist_compose_turn(
-        session_id="b2",
+        session_id=_ROLLBACK_SESSION_ID,
         assistant_content="",
         redacted_assistant_tool_calls=({"id": "tc_x", "function": {"name": "f"}},),
         redacted_tool_rows=(
@@ -186,7 +192,8 @@ def test_backward_direction_holds_after_integrity_error_rollback(service):
     )
     with service._engine.begin() as conn:
         first_state_id = conn.execute(
-            text("SELECT id FROM composition_states WHERE session_id='b2' ORDER BY version DESC LIMIT 1")
+            text("SELECT id FROM composition_states WHERE session_id=:session_id ORDER BY version DESC LIMIT 1"),
+            {"session_id": _ROLLBACK_SESSION_ID},
         ).scalar_one()
     # Second turn deliberately reuses tc_x to trigger the partial
     # unique index ``uq_chat_messages_tool_call_id`` (added in Task 2).
@@ -198,7 +205,7 @@ def test_backward_direction_holds_after_integrity_error_rollback(service):
         ),
     ):
         service.persist_compose_turn(
-            session_id="b2",
+            session_id=_ROLLBACK_SESSION_ID,
             assistant_content="",
             redacted_assistant_tool_calls=({"id": "tc_x", "function": {"name": "f"}},),
             redacted_tool_rows=(
@@ -222,7 +229,8 @@ def test_backward_direction_holds_after_integrity_error_rollback(service):
         assert violations == []
         # And exactly one tool_call provenance row from the first (successful) turn.
         state_count = conn.execute(
-            text("SELECT COUNT(*) AS c FROM composition_states WHERE session_id='b2' AND provenance='tool_call'")
+            text("SELECT COUNT(*) AS c FROM composition_states WHERE session_id=:session_id AND provenance='tool_call'"),
+            {"session_id": _ROLLBACK_SESSION_ID},
         ).scalar()
         assert state_count == 1
 
@@ -244,10 +252,10 @@ def test_turn_assistant_row_state_diverges_from_post_turn_settlement_state(servi
     either behaviour.
     """
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="divergence1")
+        _make_session(conn, session_id=_DIVERGENCE_SESSION_ID)
     # Turn 1 establishes the pre-turn state the second turn hangs off.
     service.persist_compose_turn(
-        session_id="divergence1",
+        session_id=_DIVERGENCE_SESSION_ID,
         assistant_content="ok",
         redacted_assistant_tool_calls=({"id": "tc_d1", "function": {"name": "f"}},),
         redacted_tool_rows=(
@@ -264,10 +272,11 @@ def test_turn_assistant_row_state_diverges_from_post_turn_settlement_state(servi
     )
     with service._engine.begin() as conn:
         pre_turn_state_id = conn.execute(
-            text("SELECT id FROM composition_states WHERE session_id='divergence1' ORDER BY version DESC LIMIT 1")
+            text("SELECT id FROM composition_states WHERE session_id=:session_id ORDER BY version DESC LIMIT 1"),
+            {"session_id": _DIVERGENCE_SESSION_ID},
         ).scalar_one()
     outcome = service.persist_compose_turn(
-        session_id="divergence1",
+        session_id=_DIVERGENCE_SESSION_ID,
         assistant_content="turn 2",
         redacted_assistant_tool_calls=({"id": "tc_d2", "function": {"name": "f"}},),
         redacted_tool_rows=(
@@ -284,10 +293,12 @@ def test_turn_assistant_row_state_diverges_from_post_turn_settlement_state(servi
     )
     with service._engine.begin() as conn:
         assistant_state_id = conn.execute(
-            text("SELECT composition_state_id FROM chat_messages WHERE session_id='divergence1' AND role='assistant' AND content='turn 2'")
+            text("SELECT composition_state_id FROM chat_messages WHERE session_id=:session_id AND role='assistant' AND content='turn 2'"),
+            {"session_id": _DIVERGENCE_SESSION_ID},
         ).scalar_one()
         tool_state_id = conn.execute(
-            text("SELECT composition_state_id FROM chat_messages WHERE session_id='divergence1' AND role='tool' AND tool_call_id='tc_d2'")
+            text("SELECT composition_state_id FROM chat_messages WHERE session_id=:session_id AND role='tool' AND tool_call_id='tc_d2'"),
+            {"session_id": _DIVERGENCE_SESSION_ID},
         ).scalar_one()
     # The assistant row carries the PRE-turn state...
     assert assistant_state_id == pre_turn_state_id

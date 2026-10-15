@@ -24,10 +24,12 @@ and this fixture; that gate owns frontend dispatch inventory parity.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from scripts.cicd import composer_frontend_wire as frontend
 
 from elspeth.web.composer.proposals import build_tool_proposal_summary
@@ -53,6 +55,38 @@ def test_inline_proposal_generic_review_preserves_the_authored_presence() -> Non
     summary = build_tool_proposal_summary(tool_name=case["tool"], arguments=arguments, redacted_arguments=actual)
     assert summary.summary == case["proposal_summary"]
     assert summary.summary == "Replace the pipeline with 1 input, 0 processing nodes, and 0 outputs."
+
+
+@pytest.mark.parametrize("carrier,field", [("source", "on_validation_failure"), ("outputs", "on_write_failure")])
+@pytest.mark.parametrize("explicit_null", [False, True], ids=["omitted", "null"])
+def test_live_fixture_requires_authored_source_and_sink_failure_choices(carrier: str, field: str, explicit_null: bool) -> None:
+    case = frontend.fixture_cases()["set_pipeline_replaying_current_state"]
+    # Prove the positive producer input before removing its required choice.
+    redact_tool_call_arguments(case["tool"], case["arguments"], telemetry=NoopRedactionTelemetry())
+    arguments = deepcopy(case["arguments"])
+    component = arguments["source"] if carrier == "source" else arguments["outputs"][0]
+    if explicit_null:
+        component[field] = None
+    else:
+        del component[field]
+    with pytest.raises(ValidationError) as error:
+        redact_tool_call_arguments(case["tool"], arguments, telemetry=NoopRedactionTelemetry())
+    assert error.value.errors()[0]["loc"][-1] == field
+
+
+def test_live_null_fixture_uses_optional_fields_without_clearing_failure_choices() -> None:
+    cases = frontend.fixture_cases()
+    omitted = cases["set_pipeline_presence_omitted"]["arguments"]
+    explicit = cases["set_pipeline_presence_null"]["arguments"]
+    for before, after, field in (
+        (omitted["source"], explicit["source"], "description"),
+        (omitted["nodes"][0], explicit["nodes"][0], "timeout_seconds"),
+        (omitted["outputs"][0], explicit["outputs"][0], "description"),
+    ):
+        assert field not in before
+        assert after[field] is None
+    assert explicit["source"]["on_validation_failure"] == omitted["source"]["on_validation_failure"] == "discard"
+    assert explicit["outputs"][0]["on_write_failure"] == omitted["outputs"][0]["on_write_failure"] == "discard"
 
 
 @pytest.mark.parametrize("case_name", sorted(frontend.fixture_cases()))

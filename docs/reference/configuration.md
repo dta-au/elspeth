@@ -1124,7 +1124,7 @@ Transforms can declare which fields they require, enabling the DAG to catch miss
 
 ```yaml
 transforms:
-  - plugin: llm_classifier
+  - plugin: llm
     options:
       required_input_fields: [customer_id, message_text]
       # ... other options
@@ -1158,15 +1158,16 @@ Options common to all providers:
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
-| `provider` | `azure` \| `openrouter` \| `bedrock` | **Yes** | — | Provider variant |
-| `prompt_template` | string | **Yes** | — | Jinja2 prompt template |
-| `model` | string | provider-dependent | — | Model identifier; required for `openrouter` and `bedrock`, defaulted from `deployment_name` for `azure` |
+| `provider` | `azure` \| `openrouter` \| `bedrock` \| `gateway` | **Yes** | — | Provider variant |
+| `prompt_template` | string or null | Conditional | (none) | Jinja2 prompt template; required for single-query mode and whenever a query omits its own `template`. May be omitted when every query supplies a template |
+| `model` | string | provider-dependent | — | Model identifier; required for `openrouter`, `bedrock`, and `gateway` (a logical gateway alias), defaulted from `deployment_name` for `azure` |
 | `pricing_model` | string or null | No | (none) | LiteLLM catalogue identity used for cost calculation without changing the routed model. For profile-bound nodes, configure this in the operator's `llm_profiles` entry; it cannot be overridden in node options |
 | `system_prompt` | string | No | (none) | Optional system message |
 | `temperature` | float or null | No | `null` | Sampling temperature, `0.0`–`2.0`. Omitted or `null` leaves the provider default. Explicit numbers are sent unchanged and must be supported by the model and reasoning mode. Before 0.8.5, non-Azure providers implicitly sent `0.0`; set `temperature: 0.0` explicitly to retain that request behavior where supported. |
 | `max_tokens` | int | No | (provider default) | Maximum response tokens; must be > 0. The `azure` provider sends it as `max_completion_tokens`, which also counts reasoning tokens |
 | `response_field` | string | No | `llm_response` | Row field for the model response; must be a valid Python identifier |
 | `queries` | list or mapping | No | (none) | Multi-query specs; omit for single-query mode |
+| `query_input_mode` | `upstream` \| `ordered` | No | `upstream` | Query input binding mode; `ordered` requires uniquely named list-form queries and `pool_size: 1`, and permits explicit bindings to earlier validated outputs |
 | `lookup` | mapping | No | (none) | Lookup data made available to the template |
 | `prompt_template_source` | string | No | (none) | Prompt-template file path recorded for audit; `null` when the template is inline |
 | `system_prompt_source` | string | No | (none) | System-prompt file path recorded for audit |
@@ -1415,6 +1416,22 @@ Supplying `queries` runs several questions per row against the one provider
 binding. Two authoring forms are accepted: a **mapping** keyed by query name, or
 a **list** in which each entry carries its own `name`.
 
+The default `query_input_mode: upstream` binds every query to the original input
+row. Use `query_input_mode: ordered` with uniquely named list-form queries and
+`pool_size: 1` when a later query needs an earlier result. Its `input_fields`
+must explicitly bind the exact generated output name; self/forward references
+and generated-name collisions are rejected. Declare only original input fields
+in `required_input_fields` and the input schema. `row.source_row` and image
+inputs continue to read the original entry row.
+
+Each query still makes a provider call. The node publishes one complete row
+only after all queries succeed; terminal failure routes the original entry row
+through `on_error`. Earlier calls remain audited and can incur charges. Recovery
+is at the node boundary and can repeat earlier calls; there is no durable
+mid-node resume or exactly-once provider guarantee. See
+[Ordered LLM queries](../guides/ordered-llm-queries.md) for binding, retry and
+recovery details.
+
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `name` | string | List form: **Yes**. Mapping form: no — the key supplies it | — | Query identifier; prefixes this query's output fields |
@@ -1461,7 +1478,7 @@ transforms:
       provider: openrouter
       model: anthropic/claude-sonnet-4.6
       api_key: ${OPENROUTER_API_KEY}
-      prompt_template: "Assess this review: {{ review }}"
+      prompt_template: "Assess this review: {{ row.review }}"
       max_capacity_retry_seconds: 30
       required_input_fields: [review_text]
       schema:
@@ -1482,7 +1499,7 @@ transforms:
         - name: topic
           input_fields:
             review: review_text
-          template: "Name the single main topic of: {{ review }}"
+          template: "Name the single main topic of: {{ row.review }}"
           max_tokens: 40
 ```
 

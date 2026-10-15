@@ -53,18 +53,29 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_heading = f"\n## {CURRENT_VERSION} - "
     assert changelog.count(current_heading) == 1
     current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_085 = changelog.split("\n## 0.8.5 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_084 = changelog.split("\n## 0.8.4 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_082 = changelog.split("\n## 0.8.2 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_081 = changelog.split("\n## 0.8.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_080 = changelog.split("\n## 0.8.0 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_071 = changelog.split("\n## 0.7.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
 
-    assert f"Session epoch {SESSION_SCHEMA_EPOCH}" in current_release
-    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_release
-    assert "are unchanged" in current_release
-    assert "Existing unsupported\nstores remain preserved and refused" in current_release
-    assert "LLM compatibility and Composer recovery" in current_release
-    assert "Omitted LLM temperature uses the provider default" in current_release
+    assert f"Session epoch advances from 75 to {SESSION_SCHEMA_EPOCH}" in current_release
+    assert f"Landscape remains at epoch {SQLITE_SCHEMA_EPOCH}" in current_release
+    assert "immutable graph snapshots" in current_release
+    assert "0.8.5 and 0.8.6 cannot share session stores or replicas" in current_release
+    assert "Preserve epoch-75 stores" in current_release
+    assert "explicitly new epoch-76 target" in current_release
+    assert "Drain and isolate old/new deployments" in current_release
+    assert "no migration,\nreset, restamping or downgrade" in current_release
+    assert "Composer correctness and recovery" in current_release
+    assert "Reply admission does not clear graph" in current_release
+    assert "Automatic image publication from main remains held" in " ".join(current_release.split())
+    assert "The 0.8.6 tag and container publication follow successful required checks and the protected merge" in " ".join(
+        current_release.split()
+    )
+    assert "LLM compatibility and Composer recovery" in release_085
+    assert "Omitted LLM temperature uses the provider default" in release_085
     assert "Session epoch 72 adds durable Composer jobs" in release_084
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in release_084
     assert "A Landscape database already at epoch 49 remains usable" in " ".join(release_084.split())
@@ -186,6 +197,10 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert "preserved and refused before incompatible writes" in current_text
     assert "Do not recreate, delete, restamp or migrate them" in current_text
     assert "ordinary freeform composition" in current_text
+    assert "older readers ignore those completion blockers" in current_text
+    assert "Preserve epoch-75 stores" in current_text
+    assert "explicitly new epoch-76 target" in current_text
+    assert "do not share session stores" in current_text
     release_082 = soup.select('[data-release="0.8.2"]')
     assert len(release_082) == 1
     historical_082_text = release_082[0].get_text(" ", strip=True)

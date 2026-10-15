@@ -67,6 +67,8 @@ def _pass_record() -> AdvisorCheckpointPassRecord:
         note_present=True,
         url_redactions=2,
         email_redactions=1,
+        publication_verdict="WITHHOLD",
+        publication_binding=stable_hash({"candidate": "synthetic", "evidence": "synthetic"}),
     )
 
 
@@ -74,6 +76,13 @@ def _publication() -> AdvisorTerminalPublication:
     return AdvisorTerminalPublication(
         branch="repair_review", reason=None, preflight_shape="pending_handoff", findings_backend_authored=False
     )
+
+
+def _telemetry_data(record: AdvisorCheckpointPassRecord) -> dict[str, Any]:
+    payload: dict[str, Any] = dict(record.to_dict())
+    del payload["publication_verdict"]
+    del payload["publication_binding"]
+    return payload
 
 
 class _OrderedSink:
@@ -95,6 +104,22 @@ class _OrderedSink:
 
 
 class TestRecords:
+    @pytest.mark.parametrize("publication_verdict", ("ADMIT", "WITHHOLD"))
+    def test_end_publication_decision_and_exact_binding_are_private_audit_facts(self, publication_verdict):
+        record = replace(_pass_record(), publication_verdict=publication_verdict, publication_binding="a" * 64)
+        assert advisor_checkpoint_pass_audit_envelope(record)["pass"]["publication_verdict"] == publication_verdict
+        assert advisor_checkpoint_pass_audit_envelope(record)["pass"]["publication_binding"] == "a" * 64
+        for fields in (
+            {"publication_verdict": None},
+            {"publication_binding": None},
+            {"publication_binding": "A" * 64},
+            {"publication_verdict": "CLEAN"},
+            {"phase": "early"},
+            {"source": "prescan"},
+        ):
+            with pytest.raises(AuditIntegrityError):
+                replace(record, **fields)
+
     def test_checkpoint_pass_serialization_requires_explicit_conformance(self) -> None:
         assert set(_pass_record().to_dict()) == {
             "phase",
@@ -111,6 +136,8 @@ class TestRecords:
             "note_present",
             "url_redactions",
             "email_redactions",
+            "publication_verdict",
+            "publication_binding",
         }
 
     def test_checkpoint_pass_factory_rejects_missing_conformance(self) -> None:
@@ -243,6 +270,8 @@ class TestRecords:
             note_present=True if has_final else None,
             url_redactions=2 if has_final else None,
             email_redactions=1 if has_final else None,
+            publication_verdict="WITHHOLD" if has_final else None,
+            publication_binding="a" * 64 if has_final else None,
         )
         assert record.to_dict()["provider_attempts"] == attempts
 
@@ -266,6 +295,8 @@ class TestRecords:
             note_present=None,
             url_redactions=None,
             email_redactions=None,
+            publication_verdict=None,
+            publication_binding=None,
         )
         assert record.to_dict() == {
             "phase": "end",
@@ -282,6 +313,8 @@ class TestRecords:
             "note_present": None,
             "url_redactions": None,
             "email_redactions": None,
+            "publication_verdict": None,
+            "publication_binding": None,
         }
 
     @pytest.mark.parametrize(
@@ -312,6 +345,8 @@ class TestRecords:
             note_present=None,
             url_redactions=None,
             email_redactions=None,
+            publication_verdict=None,
+            publication_binding=None,
         )
         with pytest.raises(AuditIntegrityError):
             replace(undispatched, **changes)
@@ -362,6 +397,8 @@ class TestRecords:
                 "note_present": True,
                 "url_redactions": 2,
                 "email_redactions": 1,
+                "publication_verdict": "WITHHOLD",
+                "publication_binding": stable_hash({"candidate": "synthetic", "evidence": "synthetic"}),
             },
         }
         assert publication_envelope == {
@@ -397,7 +434,9 @@ class TestAuditPrimacy:
         assert row["tool_calls"] == [envelope]
         assert json.loads(row["content"]) == envelope
         assert row["session_operation_context"].fence.session_id == session_id
-        assert sink.events[1][1] == {"session_id": session_id, **record.to_dict()}
+        assert sink.events[1][1] == {"session_id": session_id, **_telemetry_data(record)}
+        assert "publication_binding" not in sink.events[1][1]
+        assert "publication_verdict" not in sink.events[1][1]
 
     @pytest.mark.asyncio
     async def test_terminal_publication_row_commits_before_its_event(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -577,6 +616,6 @@ def test_checkpoint_event_mirrors_exact_counts_without_unbounded_metric_dimensio
     monkeypatch.setattr(telemetry, "_ADVISOR_CHECKPOINT_PASSES_COUNTER", counter)
     monkeypatch.setattr(telemetry, "slog", logger)
     record = replace(_pass_record(), step_ids_offered=5001, url_redactions=3003, email_redactions=2002)
-    telemetry.record_advisor_checkpoint_pass(session_id="session-canary", **record.to_dict())
-    logger.info.assert_called_once_with("composer.advisor_checkpoint_pass", session_id="session-canary", **record.to_dict())
+    telemetry.record_advisor_checkpoint_pass(session_id="session-canary", **_telemetry_data(record))
+    logger.info.assert_called_once_with("composer.advisor_checkpoint_pass", session_id="session-canary", **_telemetry_data(record))
     counter.add.assert_called_once_with(1, {"phase": "end", "verdict": "flagged", "source": "model"})
