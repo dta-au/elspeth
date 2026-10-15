@@ -1,5 +1,10 @@
 import { useEffect, useRef } from "react";
 import { useSessionStore } from "@/stores/sessionStore";
+import { isAuthCallbackHash, isNavigationDestination, POST_LOGIN_REDIRECT_KEY } from "@/utils/hashRoutes";
+
+function hasArrivalLink(hash: string): boolean {
+  return /^#\/.+/.test(hash) && !isAuthCallbackHash(hash);
+}
 
 /**
  * Returning-user auto-resume (elspeth-e69642fede).
@@ -18,19 +23,40 @@ import { useSessionStore } from "@/stores/sessionStore";
  * - there is nothing to resume (App renders the empty landing instead).
  */
 export function useAutoResumeSession(enabled: boolean): void {
-  const attempted = useRef(false);
+  // Capture arrival intent during render, before the router/auth/bootstrap
+  // effects can remove a rejected fragment. A private deep link is never an
+  // invitation to substitute the recipient's most recent session.
+  const attempted = useRef(
+    hasArrivalLink(window.location.hash) ||
+    isNavigationDestination(window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY) ?? ""),
+  );
   const sessionsLoaded = useSessionStore((s) => s.sessionsLoaded);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
 
   useEffect(() => {
-    if (!enabled || attempted.current || !sessionsLoaded) return;
+    const rememberNavigation = () => {
+      if (hasArrivalLink(window.location.hash)) attempted.current = true;
+    };
+    // Capture before the regular router can canonicalize or clear the hash.
+    // This also covers a same-batch selection and refusal with no render in
+    // between, including while auth/preferences/session bootstrap is pending.
+    window.addEventListener("hashchange", rememberNavigation, true);
+    window.addEventListener("popstate", rememberNavigation, true);
+    return () => {
+      window.removeEventListener("hashchange", rememberNavigation, true);
+      window.removeEventListener("popstate", rememberNavigation, true);
+    };
+  }, []);
+
+  useEffect(() => {
     // A session-shaped hash (#/{id} or #/{id}/verb) is the hash router's
     // jurisdiction; if the id turns out to be stale the router clears it
     // and the user lands on the switcher-driven flow, not a surprise resume.
-    if (/^#\/.+/.test(window.location.hash)) {
+    if (hasArrivalLink(window.location.hash)) {
       attempted.current = true;
       return;
     }
+    if (!enabled || attempted.current || !sessionsLoaded) return;
     if (activeSessionId !== null) {
       attempted.current = true;
       return;

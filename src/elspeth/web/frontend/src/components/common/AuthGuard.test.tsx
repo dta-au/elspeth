@@ -142,8 +142,22 @@ describe("AuthGuard", () => {
     expect(window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY)).toBeNull();
   });
 
-  it("does not save non-shared hashes to sessionStorage", async () => {
-    window.location.hash = "#/some-session-id";
+  it("preserves a private session destination through an authentication remount", async () => {
+    const hash = "#/11111111-1111-4111-8111-111111111111";
+    window.history.replaceState(null, "", hash);
+    _seedUnauthenticated();
+    const initial = render(<AuthGuard><div data-testid="children">protected</div></AuthGuard>);
+    expect(window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY)).toBe(hash);
+    initial.unmount();
+    // The callback is scrubbed before the fresh authenticated render.
+    window.history.replaceState(null, "", "/");
+    _seedAuthenticated();
+    render(<AuthGuard><div data-testid="children">protected</div></AuthGuard>);
+    await waitFor(() => expect(window.location.hash).toBe(hash));
+  });
+
+  it("does not save non-navigation hashes to sessionStorage", async () => {
+    window.location.hash = "#composer-main";
     _seedUnauthenticated();
     render(
       <AuthGuard>
@@ -155,7 +169,7 @@ describe("AuthGuard", () => {
     expect(window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY)).toBeNull();
   });
 
-  it("does not overwrite a pre-existing saved redirect on re-render", async () => {
+  it("replaces a stale pending redirect with the current explicit destination", async () => {
     window.location.hash = "#/shared/tk-second";
     window.sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, "#/shared/tk-first");
     _seedUnauthenticated();
@@ -165,10 +179,48 @@ describe("AuthGuard", () => {
       </AuthGuard>,
     );
     await new Promise((r) => setTimeout(r, 10));
-    // The earlier-saved value must be preserved — first-write wins.
+    // Current user navigation owns the destination, not an abandoned login.
     expect(window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY)).toBe(
-      "#/shared/tk-first",
+      "#/shared/tk-second",
     );
+  });
+
+  it.each(["hashchange", "popstate"])("remembers new shared/private destinations on %s and disarms explicit root navigation", (event) => {
+    window.history.replaceState(null, "", "#/shared/alice-token");
+    _seedUnauthenticated();
+    render(<AuthGuard><div data-testid="children">protected</div></AuthGuard>);
+    for (const hash of ["#/shared/charlie-token", "#/11111111-1111-4111-8111-111111111111"]) {
+      act(() => {
+        window.history.replaceState(null, "", hash);
+        window.dispatchEvent(new Event(event));
+      });
+      expect(window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY)).toBe(hash);
+    }
+    act(() => {
+      window.history.replaceState(null, "", "/");
+      window.dispatchEvent(new Event(event));
+    });
+    expect(window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY)).toBeNull();
+  });
+
+  it.each(["#/shared/charlie-token", "#/11111111-1111-4111-8111-111111111111"])("preserves current destination %s over stale storage on authentication", async (hash) => {
+    window.history.replaceState(null, "", hash);
+    _seedUnauthenticated();
+    render(<AuthGuard><div data-testid="children">protected</div></AuthGuard>);
+    window.sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, "#/shared/alice-token");
+    act(_seedAuthenticated);
+    await screen.findByTestId("children");
+    expect(window.location.hash).toBe(hash);
+    expect(window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY)).toBeNull();
+  });
+
+  it("does not restore an auth callback stored as a destination", () => {
+    window.history.replaceState(null, "", "/");
+    window.sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, "#/auth/callback?code=synthetic");
+    _seedAuthenticated();
+    render(<AuthGuard><div data-testid="children">protected</div></AuthGuard>);
+    expect(window.location.hash).toBe("");
+    expect(window.sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY)).toBeNull();
   });
 
   it("does not re-fire the restore effect when staying authenticated across renders", async () => {

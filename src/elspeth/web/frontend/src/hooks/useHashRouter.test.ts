@@ -1,4 +1,4 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -10,6 +10,7 @@ import * as apiClient from "@/api/client";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useHashRouter } from "./useHashRouter";
+import { useAutoResumeSession } from "./useAutoResumeSession";
 
 vi.mock("@/api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/api/client")>();
@@ -34,12 +35,14 @@ function nonEmptyCompositionState() {
   };
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason: unknown) => void } {
   let resolve: (value: T) => void = () => undefined;
-  const promise = new Promise<T>((resolvePromise) => {
+  let reject: (reason: unknown) => void = () => undefined;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 describe("useHashRouter Phase 3B fragment migration", () => {
@@ -54,6 +57,76 @@ describe("useHashRouter Phase 3B fragment migration", () => {
       selectSession: vi.fn(),
     } as never);
   });
+
+  it("reports an unavailable incoming session without revealing its ownership", () => {
+    window.history.replaceState(null, "", "#/private-session");
+    useSessionStore.setState({
+      selectSession: vi.fn((id: string) => useSessionStore.setState({ activeSessionId: id })),
+    } as never);
+    const { result } = renderHook(() => useHashRouter());
+    act(() => useSessionStore.setState({ activeSessionId: null }));
+    expect(result.current.redirectToast?.message).toBe(
+      "This session link is unavailable. Ask the sender for a Share for review link.",
+    );
+    expect(window.location.hash).toBe("");
+    act(() => result.current.redirectToast?.dismiss());
+    expect(result.current.redirectToast).toBeNull();
+  });
+
+  it("does not report a stale link refusal after explicit selection of another session", () => {
+    window.history.replaceState(null, "", "#/private-session");
+    useSessionStore.setState({
+      selectSession: vi.fn((id: string) => useSessionStore.setState({ activeSessionId: id })),
+    } as never);
+    const { result } = renderHook(() => useHashRouter());
+    act(() => useSessionStore.setState({ activeSessionId: "recipient-session", compositionStateLoaded: true }));
+    act(() => useSessionStore.getState().unbindMissingSession("private-session"));
+    expect(result.current.redirectToast).toBeNull();
+    expect(useSessionStore.getState().activeSessionId).toBe("recipient-session");
+  });
+
+  it.each(["refusal-first", "list-first"])(
+    "does not auto-resume the recipient after a private link fails (%s)",
+    async (order) => {
+      const missing = deferred<never>();
+      const realSelect = useSessionStore.getInitialState().selectSession;
+      const selected: string[] = [];
+      const readers = [
+        vi.spyOn(apiClient, "fetchMessages").mockReturnValue(missing.promise),
+        vi.spyOn(apiClient, "fetchCompositionState").mockReturnValue(missing.promise),
+        vi.spyOn(apiClient, "fetchCompositionProposals").mockReturnValue(missing.promise),
+        vi.spyOn(apiClient, "fetchComposerPreferences").mockReturnValue(missing.promise),
+      ];
+      try {
+        useSessionStore.setState({
+          sessions: [], sessionsLoaded: false, activeSessionId: null,
+          selectSession: async (id: string) => {
+            selected.push(id);
+            await realSelect(id);
+          },
+        });
+        window.history.replaceState(null, "", "#/private-session");
+        const { result } = renderHook(() => {
+          const router = useHashRouter();
+          useAutoResumeSession(true);
+          return router;
+        });
+        const loadRecipientList = () => useSessionStore.setState({
+          sessions: [{ id: "recipient-session", title: "Recipient", updated_at: "2026-10-15T00:00:00Z" } as never],
+          sessionsLoaded: true,
+        });
+        if (order === "list-first") act(loadRecipientList);
+        await act(async () => missing.reject({ status: 404 }));
+        await waitFor(() => expect(useSessionStore.getState().activeSessionId).toBeNull());
+        if (order === "refusal-first") act(loadRecipientList);
+        expect(selected).toEqual(["private-session"]);
+        expect(window.location.hash).toBe("");
+        expect(result.current.redirectToast?.message).toContain("This session link is unavailable");
+      } finally {
+        for (const reader of readers) reader.mockRestore();
+      }
+    },
+  );
 
   it("rewrites #/{id}/spec to #/{id}", () => {
     window.history.replaceState(null, "", "#/sess-1/spec");
