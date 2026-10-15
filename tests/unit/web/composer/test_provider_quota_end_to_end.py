@@ -6,14 +6,19 @@ import asyncio
 import dataclasses
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+import httpx
 import pytest
+import pytest_asyncio
 import structlog
 from litellm.exceptions import APIError, ServiceUnavailableError
+from litellm.litellm_core_utils import logging_worker
+from litellm.llms.openai.openai import OpenAIChatCompletion
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
@@ -28,12 +33,26 @@ from elspeth.web.composer.diagnostic_evidence import (
 )
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
-from elspeth.web.composer.provider_quota import admit_provider_attempt, composer_quota_scope, quota_provider_calls
+from elspeth.web.composer.provider_quota import (
+    ProviderInvocationFamily,
+    ProviderInvocationOwner,
+    admit_provider_attempt,
+    composer_quota_scope,
+    quota_provider_calls,
+)
 from elspeth.web.coordination import chargeable_admission_authority, quota_authority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.quota_authority import QuotaExceeded
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
+from elspeth.web.sessions._auto_title import maybe_auto_title_session
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, quota_provider_attempts_table, token_usage_ledger_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -393,3 +412,94 @@ async def test_utc_midnight_reopens_daily_allowance_without_retiming_old_usage(q
     assert usage[0].recorded_at.replace(tzinfo=UTC) == before_midnight
     assert usage[1].recorded_at.replace(tzinfo=UTC) == before_midnight + timedelta(seconds=1)
     assert dispatches == ["sent", "sent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required", [False, True])
+@pytest.mark.parametrize("retryable_failure", [False, True])
+async def test_auto_title_physical_transport_attempt_has_one_quota_outcome(
+    quota_service, title_logging_worker, monkeypatch: pytest.MonkeyPatch, required: bool, retryable_failure: bool
+) -> None:
+    """An SDK retry must not spend again below a single admitted title call."""
+    engine, service, _ = quota_service
+    session = await service.create_session(user_id="alice", title="Untitled", auth_provider_type="local")
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if retryable_failure and len(requests) == 1:
+            return httpx.Response(503, json={"error": {"message": "Synthetic outage", "type": "server_error"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "synthetic-title-completion",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-mini",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "CSV Pipeline"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http_client:
+
+        def synthetic_http_client(shared_session: object = None) -> httpx.AsyncClient:
+            return http_client
+
+        monkeypatch.setattr(OpenAIChatCompletion, "_get_async_http_client", staticmethod(synthetic_http_client))
+        async with await _lease(service, session.id) as lease:
+            coordinator = None
+            custody = None
+            if required:
+                coordinator = RequiredWorkCoordinator(
+                    RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, lease.context, invocation_id=str(uuid4()))
+                )
+                owner = ProviderInvocationOwner(
+                    service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+                )
+                custody = owner.mint(ProviderInvocationFamily.TITLE)
+            await maybe_auto_title_session(
+                service=service,
+                session_id=session.id,
+                user_message="Build a CSV pipeline",
+                model="openai/gpt-4o-mini",
+                temperature=None,
+                seed=None,
+                session_operation_context=lease.context,
+                api_base=f"https://title-{uuid4()}.example.test/v1",
+                api_key="synthetic-title-key",
+                provider_custody=custody,
+            )
+            assert len(requests) == 1
+            if coordinator is not None:
+                assert coordinator.all_completed
+            with engine.connect() as connection:
+                attempt = connection.execute(select(quota_provider_attempts_table)).one()
+                usage = connection.execute(select(token_usage_ledger_table)).one()
+            assert attempt.source == usage.source == "auto_title"
+            assert attempt.settled_at is not None and attempt.ledger_entry_id == usage.entry_id
+            updated = await service.get_session(session.id)
+            if retryable_failure:
+                assert (usage.prompt_tokens, usage.completion_tokens) == (None, None)
+                assert updated.title == "Untitled"
+                # A midnight rollover legitimately opens a new allowance.
+                charged_at = usage.recorded_at.replace(tzinfo=UTC)
+                monkeypatch.setattr(chargeable_admission_authority, "database_now", lambda _: charged_at)
+                with pytest.raises(ChargeableAdmissionRefused) as caught:
+                    await service.begin_provider_attempt(session_operation_context=lease.context, source="auto_title")
+                assert caught.value.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
+                assert len(requests) == 1
+            else:
+                assert (usage.prompt_tokens, usage.completion_tokens) == (11, 3)
+                assert updated.title == "CSV Pipeline"
+
+
+@pytest_asyncio.fixture
+async def title_logging_worker(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
+    """Keep real provider callbacks owned by, and bounded to, this test loop."""
+    worker = logging_worker.LoggingWorker(timeout=1)
+    monkeypatch.setattr(logging_worker, "GLOBAL_LOGGING_WORKER", worker)
+    try:
+        yield
+    finally:
+        await worker.stop()
