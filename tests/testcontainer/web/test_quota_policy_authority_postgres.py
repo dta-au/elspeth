@@ -7,15 +7,21 @@ import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Barrier
 
 import pytest
 from sqlalchemy import Engine, func, insert, select, text, update
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.identity_authority import IdentityAdminActor
-from elspeth.web.coordination.quota_policy_authority import QuotaSetterNotAdmin, RepositoryQuotaPolicyAuthority
+from elspeth.web.coordination.quota_policy_authority import (
+    ContainerQuotaPolicyConflict,
+    QuotaSetterNotAdmin,
+    RepositoryQuotaPolicyAuthority,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, identity_roles_table, quota_policies_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -118,6 +124,51 @@ def test_policy_replace_then_revoke_keeps_single_live_row_and_audits(pg_engine: 
         rows = conn.execute(select(quota_policies_table).where(quota_policies_table.c.identity_id == "alice")).all()
     assert len(rows) == 2 and all(row.revoked_at is not None for row in rows)
     assert changes == [first, second, revoked]
+
+
+@pytest.mark.parametrize("second_cap", [500, 600])
+def test_competing_replicas_create_once_or_refuse_configuration_drift(pg_engine: Engine, second_cap: int) -> None:
+    authority = RepositoryQuotaPolicyAuthority(pg_engine)
+    ready = Barrier(2)
+    recorded = []
+
+    def provision(cap: int) -> object:
+        ready.wait(timeout=10)
+        try:
+            return authority.ensure_container_token_policy(tokens_per_day=cap, record=recorded.append)
+        except ContainerQuotaPolicyConflict:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(provision, 500)
+        second = pool.submit(provision, second_cap)
+        outcomes = [first.result(timeout=30), second.result(timeout=30)]
+    assert len(recorded) == 1 and recorded[0].storage_bytes is None
+    if second_cap == 500:
+        assert outcomes == [recorded[0], recorded[0]]
+    else:
+        assert outcomes.count("conflict") == 1 and recorded[0] in outcomes
+    with pg_engine.connect() as conn:
+        (row,) = conn.execute(select(quota_policies_table).where(quota_policies_table.c.identity_id.is_(None))).all()
+    assert row.policy_id == recorded[0].policy_id and row.tokens_per_day == recorded[0].tokens_per_day
+
+
+def test_container_singleton_and_identity_storage_constraints_on_postgres(pg_engine: Engine) -> None:
+    authority = RepositoryQuotaPolicyAuthority(pg_engine)
+    authority.ensure_container_token_policy(tokens_per_day=500, record=lambda _policy: None)
+    for identity_id, storage, slot in ((None, 800, 1), ("alice", None, 1), (None, 800, 2), (None, 800, None)):
+        with pytest.raises(IntegrityError), pg_engine.begin() as conn:
+            conn.execute(
+                insert(quota_policies_table).values(
+                    policy_id=str(uuid.uuid4()),
+                    identity_id=identity_id,
+                    tokens_per_day=500,
+                    storage_bytes=storage,
+                    container_slot=slot,
+                    set_by_actor="operator",
+                    set_at=database_now(conn),
+                )
+            )
 
 
 @pytest.mark.parametrize("action", ["set", "revoke"])

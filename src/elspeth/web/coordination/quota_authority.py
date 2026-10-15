@@ -107,11 +107,19 @@ class QuotaPolicyRow:
 
 @final
 @dataclass(frozen=True, slots=True)
+class ContainerQuotaPolicyRow:
+    policy_id: str
+    tokens_per_day: int
+    storage_bytes: int | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class ActiveQuotaPolicies:
     """The identity's unrevoked policy row and the unrevoked container ceiling row, either possibly absent."""
 
     identity: QuotaPolicyRow | None
-    container: QuotaPolicyRow | None
+    container: ContainerQuotaPolicyRow | None
 
 
 @final
@@ -713,7 +721,9 @@ def _active_policy_rows(connection: Connection, *, identity_id: str, for_update:
         else QuotaPolicyRow(policy_id=identity.policy_id, tokens_per_day=identity.tokens_per_day, storage_bytes=identity.storage_bytes),
         container=None
         if container is None
-        else QuotaPolicyRow(policy_id=container.policy_id, tokens_per_day=container.tokens_per_day, storage_bytes=container.storage_bytes),
+        else ContainerQuotaPolicyRow(
+            policy_id=container.policy_id, tokens_per_day=container.tokens_per_day, storage_bytes=container.storage_bytes
+        ),
     )
 
 
@@ -751,7 +761,7 @@ def admit_storage_bytes_on_connection(
             ).first()
             if previously_issued is not None:
                 raise StorageAccountingUnavailableError(session_id)
-        if policies.identity is None and policies.container is None:
+        if policies.identity is None and (policies.container is None or policies.container.storage_bytes is None):
             return StorageAdmission(identity_id=owner.user_id, additional_bytes=additional_bytes, usage=None, cap=None, ceiling=None)
         usage = connection.execute(
             select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0))

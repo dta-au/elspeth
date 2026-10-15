@@ -371,7 +371,9 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # different shapes. Epoch 74 adds recovery bookmarks and checkpoint owners.
     # Epoch 75 adds auth families and ticket bindings without removing recovery.
     # Epoch 76 requires committed terminal graph-review facts on effective reads.
-    assert SESSION_SCHEMA_EPOCH == 76
+    # Epoch 77 retains that authority, makes container storage optional and
+    # enforces its singleton across actors; neither epoch-76 predecessor suffices.
+    assert SESSION_SCHEMA_EPOCH == 77
     assert "composition_graph_parks" in inspector.get_table_names()
     assert "creator_operation_id" in {column["name"] for column in inspector.get_columns("composition_states")}
     expected_tables = frozenset(

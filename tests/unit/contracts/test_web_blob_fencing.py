@@ -3235,7 +3235,7 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     # Epoch 68 adds proposal checkpoint rebase reasons.
     # Epoch 75 combines graph recovery with durable authentication families and bound tickets.
     # Epoch 76 requires effective graph-review facts from committed terminal cohorts.
-    assert SESSION_SCHEMA_EPOCH == 76
+    assert SESSION_SCHEMA_EPOCH == 77
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

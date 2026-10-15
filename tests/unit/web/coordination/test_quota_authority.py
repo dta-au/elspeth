@@ -30,6 +30,7 @@ from elspeth.web.coordination.chargeable_admission_authority import RepositoryCh
 from elspeth.web.coordination.mutation_connection_registry import _resolve_mutation_connection
 from elspeth.web.coordination.quota_authority import (
     ActiveQuotaPolicies,
+    ContainerQuotaPolicyRow,
     QuotaPolicyRow,
     RepositoryQuotaAuthority,
     TokenUsageEntry,
@@ -334,7 +335,9 @@ def test_active_policy_returns_only_unrevoked_rows(fenced_session_with_policy: F
     fenced = fenced_session_with_policy
     assert RepositoryQuotaAuthority.active_policy(fenced.connection_token, identity_id=fenced.identity_id) == ActiveQuotaPolicies(
         identity=QuotaPolicyRow(policy_id=fenced.identity_policy_id, tokens_per_day=IDENTITY_TOKENS_PER_DAY, storage_bytes=1_000_000),
-        container=QuotaPolicyRow(policy_id=fenced.container_policy_id, tokens_per_day=CONTAINER_TOKENS_PER_DAY, storage_bytes=10_000_000),
+        container=ContainerQuotaPolicyRow(
+            policy_id=fenced.container_policy_id, tokens_per_day=CONTAINER_TOKENS_PER_DAY, storage_bytes=10_000_000
+        ),
     )
     _resolve_mutation_connection(fenced.connection_token).execute(
         update(quota_policies_table).where(quota_policies_table.c.policy_id == fenced.identity_policy_id).values(revoked_at=DAY)

@@ -183,6 +183,57 @@ def test_empty_identity_storage_is_measured_zero(fenced_session: FencedSession) 
     assert recorded == []
 
 
+@pytest.mark.parametrize("identity_state", ["absent", "active", "revoked"])
+def test_token_only_container_does_not_invent_storage_bound(fenced_session: FencedSession, identity_state: str) -> None:
+    conn = _resolve_mutation_connection(fenced_session.connection_token)
+    conn.execute(
+        insert(quota_policies_table).values(
+            policy_id="token-only", identity_id=None, tokens_per_day=1000, storage_bytes=None, set_by_actor="config", set_at=SET_AT
+        )
+    )
+    if identity_state != "absent":
+        conn.execute(
+            insert(quota_policies_table).values(
+                policy_id="identity",
+                identity_id=fenced_session.identity_id,
+                tokens_per_day=1000,
+                storage_bytes=10,
+                set_by_actor="system",
+                set_at=SET_AT,
+                revoked_at=SET_AT if identity_state == "revoked" else None,
+            )
+        )
+    recorded: list[QuotaExceeded] = []
+    if identity_state == "revoked":
+        with pytest.raises(StorageAccountingUnavailableError):
+            RepositoryQuotaAuthority.admit_storage_bytes(
+                fenced_session.connection_token,
+                session_id=fenced_session.session_id,
+                additional_bytes=11,
+                operation="blob_create",
+                record=recorded.append,
+            )
+    elif identity_state == "active":
+        with pytest.raises(IdentityStorageQuotaExceededError) as caught:
+            RepositoryQuotaAuthority.admit_storage_bytes(
+                fenced_session.connection_token,
+                session_id=fenced_session.session_id,
+                additional_bytes=11,
+                operation="blob_create",
+                record=recorded.append,
+            )
+        assert (caught.value.cap, caught.value.ceiling) == (10, None)
+    else:
+        admitted = RepositoryQuotaAuthority.admit_storage_bytes(
+            fenced_session.connection_token,
+            session_id=fenced_session.session_id,
+            additional_bytes=11,
+            operation="blob_create",
+            record=recorded.append,
+        )
+        assert (admitted.cap, admitted.ceiling, admitted.usage) == (None, None, None)
+
+
 def test_accounting_sql_failure_refuses_without_claiming_measured_usage(fenced_session: FencedSession) -> None:
     recorded: list[QuotaExceeded] = []
 

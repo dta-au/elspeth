@@ -4,6 +4,45 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.7 - Unreleased (Composer refusal and quota fixes)
+
+- **Refusals retain the correct graph context.** Full-replacement candidate
+  refusals exclude errors from the old saved graph; incremental output refusals
+  retain standing validation and the original version. Producer-owned codes,
+  output subjects, admitted plugin schemas and credential repair payloads remain
+  distinct. Candidate and output path-policy refusals use safe static messages.
+  Bounded inline CSV inspection distinguishes failed inspection, incomplete
+  comparison and a larger upload with matching headers without claiming verified
+  data rows. No other incremental producer family is claimed migrated.
+- **Shared-link failures preserve the requested link.** Malformed fragments and
+  unavailable private sender links remain link failures rather than falling
+  through to the recipient's workspace. Ordinary root-URL SSO resume is retained.
+- **Configured container token policy is provisioned before serving.** Startup
+  creates or verifies the token ceiling without activating container storage.
+  Identity storage allowances remain mandatory; explicit numeric container
+  storage and policy precedence are preserved. A cross-actor singleton prevents
+  duplicate active container policies. Startup joins provisioning through
+  cancellation before finalizing its database owners. Daily accounting,
+  overshoot and token reservation semantics are unchanged.
+- **Automatic titles disable adapter and SDK retries.** Both existing title
+  custody modes supply zero retry settings. This does not claim universal
+  physical-dispatch accounting under arbitrary dependency fallback settings.
+
+Session epoch advances from 76 to 77; Landscape remains at epoch 49. The combined
+contract retains committed graph-review authority over immutable graph snapshots
+and adds optional container storage with mandatory identity storage and the
+active-container singleton. Preserve epoch-75 stores and both distinct epoch-76
+predecessors with compatible prior application access; configure an explicitly
+new epoch-77 target. Older readers ignore those completion blockers or cannot
+admit the new quota shape. This authorizes no migration,
+reset, restamping or downgrade. Drain and isolate old/new deployments; they
+cannot share session stores or replicas.
+
+These unreleased notes describe implemented source changes, not completed
+integrated qualification. Automatic image publication from main remains held.
+The 0.8.7 tag and container publication follow successful required checks and
+the protected merge; operator signing and deployment remain separate.
+
 ## 0.8.6 - Candidate (Composer correctness and recovery)
 
 - **Dependent queries can run in one LLM node.** `query_input_mode: ordered`
