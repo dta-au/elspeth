@@ -162,7 +162,7 @@ from elspeth.web.composer.tools import (
     is_session_aware_tool,
     normalize_tool_result_validation,
 )
-from elspeth.web.composer.tools._common import _failure_result
+from elspeth.web.composer.tools._common import _candidate_rejection_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
@@ -1797,10 +1797,11 @@ async def run_tool_batch(
                             if custody_outcome == "quota_exceeded":
                                 proposal_acceptable = False
                                 finalized_candidate_result = finalize_tool_result(
-                                    _failure_result(
+                                    _candidate_rejection_result(
                                         state,
                                         "Session blob quota exceeded while reserving inline proposal custody.",
                                         error_code="BLOB_QUOTA_EXCEEDED",
+                                        rejected_component="source",
                                     ),
                                     tool_name=tool_name,
                                     catalog=ctx.policy_catalog,

@@ -391,6 +391,51 @@ async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_on
 
 
 @pytest.mark.asyncio
+async def test_postbuilder_inline_custody_quota_refusal_preserves_state_and_candidate_feedback(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    state = _incremental_base_state(tmp_path)
+    assert state.validate().errors
+    arguments = _inline_pipeline_args(tmp_path)
+    llm = _ScriptedLLM(
+        _tool_turn("call_quota", "set_pipeline", arguments),
+        _fake_llm_response(content="The inline candidate needs available session storage before retrying."),
+    )
+    files_before = tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()))
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        patch("elspeth.web.composer.tool_batch._try_finalize_proposal_custody", autospec=True, return_value="quota_exceeded") as settle,
+    ):
+        result = await harness.service.compose(
+            "Build a reviewed inline pipeline.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    settle.assert_awaited_once()
+    assert result.state is state
+    assert result.state.version == state.version
+    assert _count_rows(harness.engine, composition_proposals_table) == 0
+    assert _count_rows(harness.engine, composition_states_table) == 0
+    assert _count_rows(harness.engine, blobs_table) == 0
+    assert tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file())) == files_before
+    assert len(llm.message_snapshots) == 2
+    message = next(message for message in llm.message_snapshots[1] if message.get("tool_call_id") == "call_quota")
+    payload = json.loads(message["content"])
+    assert payload["success"] is False
+    assert payload["version"] == state.version
+    assert payload["affected_nodes"] == []
+    assert "validation_delta" not in payload
+    assert [(entry["error_code"], entry["rejected_component"]) for entry in payload["validation"]["errors"]] == [
+        ("BLOB_QUOTA_EXCEEDED", "source")
+    ]
+    assert payload["data"]["status"] == "PREVALIDATION_REJECTED"
+    persisted = json.loads(_persisted_tool_content(harness, "call_quota"))
+    assert persisted["validation"]["errors"][0]["error_code"] == "BLOB_QUOTA_EXCEEDED"
+
+
+@pytest.mark.asyncio
 async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
     state = _incremental_base_state(tmp_path)

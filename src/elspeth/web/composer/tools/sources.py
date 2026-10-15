@@ -9,7 +9,7 @@ import io
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Final, TypedDict
+from typing import Any, Final, Literal, TypedDict
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -69,8 +69,10 @@ from elspeth.web.composer.tools._common import (
     _options_with_pending_requirement,
     _pending_interpretation_requirement,
     _plugin_policy_failure,
+    _plugin_selection_violation,
     _prevalidate_source_for_context,
     _prohibited_section,
+    _RejectionOperation,
     _resolver_owned_interpretation_requirement_error,
     _source_review_requirement_id,
     _validate_mutation_arguments,
@@ -794,6 +796,7 @@ def _resolve_source_blob(
     blob_id: str,
     explicit_plugin: str | None,
     caller_options: Mapping[str, Any],
+    rejection_operation: _RejectionOperation,
     on_validation_failure: str,
     state: CompositionState,
     context: ToolContext,
@@ -804,26 +807,44 @@ def _resolve_source_blob(
     existing_options: Mapping[str, Any] | None = None,
 ) -> _ResolvedSourceBlob | ToolResult:
     """Resolve an existing ready blob into authoritative source options."""
+    if type(rejection_operation) is not _RejectionOperation:
+        raise AuditIntegrityError("Source blob resolution requires an owned rejection operation")
+
+    def _failure_result(
+        rejected_state: CompositionState,
+        message: str,
+        *,
+        error_code: str,
+        plugin_identity: tuple[str, str] | None = None,
+    ) -> ToolResult:
+        return rejection_operation.reject(
+            rejected_state,
+            message,
+            error_code=error_code,
+            rejected_component=_source_component_id(source_name),
+            plugin_identity=plugin_identity,
+        )
+
     manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name=tool_name)
     if manual_authoring_error is not None:
-        return _failure_result(state, manual_authoring_error)
+        return _failure_result(state, manual_authoring_error, error_code="interpretation_requirements_invalid")
     manual_blob_ref_error = _reject_manual_source_blob_ref(caller_options, tool_name=tool_name)
     if manual_blob_ref_error is not None:
-        return _failure_result(state, manual_blob_ref_error)
+        return _failure_result(state, manual_blob_ref_error, error_code="plugin_options_invalid")
     manual_blobs_error = _reject_manual_source_blobs(caller_options, tool_name=tool_name)
     if manual_blobs_error is not None:
-        return _failure_result(state, manual_blobs_error)
+        return _failure_result(state, manual_blobs_error, error_code="plugin_options_invalid")
     if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", error_code="source_binding_context_unavailable")
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+        return _failure_result(state, blob_id_error, error_code="source_blob_identity_invalid")
     blob = _sync_get_blob(session_engine, blob_id, session_id)
     if blob is None:
-        return _failure_result(state, f"Blob '{blob_id}' not found.")
+        return _failure_result(state, f"Blob '{blob_id}' not found.", error_code="source_blob_unavailable")
 
     if blob["status"] != "ready":
-        return _failure_result(state, f"Blob is not ready (status: {blob['status']}).")
+        return _failure_result(state, f"Blob is not ready (status: {blob['status']}).", error_code="source_blob_unavailable")
 
     mime_extra: dict[str, str] = {}
     if explicit_plugin:
@@ -832,6 +853,7 @@ def _resolve_source_blob(
         return _failure_result(
             state,
             f"Cannot infer source plugin for MIME type '{blob['mime_type']}'. Please specify the 'plugin' parameter explicitly.",
+            error_code="source_blob_plugin_required",
         )
     else:
         plugin, mime_extra = _MIME_TO_SOURCE[blob["mime_type"]]
@@ -868,11 +890,11 @@ def _resolve_source_blob(
             session_operation_authority=context.session_operation_authority,
         )
         if fresh_blob is None:
-            return _failure_result(state, f"Blob '{blob_id}' not found.")
+            return _failure_result(state, f"Blob '{blob_id}' not found.", error_code="source_blob_unavailable")
         if fresh_blob["status"] != "ready":
-            return _failure_result(state, f"Blob is not ready (status: {fresh_blob['status']}).")
+            return _failure_result(state, f"Blob is not ready (status: {fresh_blob['status']}).", error_code="source_blob_unavailable")
         if data is None:
-            return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
+            return _failure_result(state, f"Blob storage file missing for '{blob_id}'.", error_code="source_blob_unavailable")
         if fresh_blob["content_hash"] != blob["content_hash"]:
             # A full update committed between the metadata fetch that pinned
             # ``merged_options`` (content_hash / authoring metadata) and this
@@ -881,6 +903,7 @@ def _resolve_source_blob(
             return _failure_result(
                 state,
                 f"Blob '{blob_id}' content changed while binding the source; retry the tool call.",
+                error_code="source_blob_changed",
             )
         try:
             content = data.decode("utf-8")
@@ -888,6 +911,7 @@ def _resolve_source_blob(
             return _failure_result(
                 state,
                 f"Blob '{blob_id}' is not valid UTF-8 text ({exc.reason} at byte offset {exc.start}).",
+                error_code="source_blob_encoding_invalid",
             )
         merged_options = _options_with_source_blob_review(
             merged_options,
@@ -911,10 +935,10 @@ def _resolve_source_blob(
             canonical_error,
             error_code="interpretation_requirements_invalid",
         )
-    try:
-        context.catalog.get_schema("source", plugin)
-    except (ValueError, KeyError) as exc:
-        return _failure_result(state, f"Unknown source plugin '{plugin}': {exc}")
+    plugin_error = _plugin_selection_violation(context, "source", plugin)
+    if plugin_error is not None:
+        return _failure_result(state, plugin_error.message, error_code=plugin_error.error_code.value)
+    context.catalog.get_schema("source", plugin)
     prevalidation_error = _prevalidate_source_for_context(
         context,
         plugin,
@@ -1236,6 +1260,7 @@ def _execute_set_source_from_blob(
         return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=_source_component_id(source_name))
     resolved = _resolve_source_blob(
         blob_id=validated.blob_id,
+        rejection_operation=_RejectionOperation.SAVED_GRAPH,
         explicit_plugin=validated.plugin,
         caller_options=caller_options,
         on_validation_failure=on_vf,
@@ -1697,19 +1722,28 @@ def _read_inspection_prefix_and_hash(path: Path) -> tuple[bytes, str]:
     return bytes(prefix), digest.hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class _InlineCsvSourceRefusal:
+    error_code: Literal["inline_source_csv_inspection_failed", "inline_source_comparison_incomplete", "inline_source_content_conflict"]
+    message: str
+
+
 def _header_only_inline_csv_conflict(
     prepared: _PreparedBlobCreate,
     *,
     session_engine: Engine,
     session_id: str,
-) -> str | None:
-    """Reject schema-only CSV blobs when a matching uploaded CSV is ready."""
+) -> _InlineCsvSourceRefusal | None:
+    """Distinguish inspection/comparison refusals from a matching uploaded CSV."""
     if prepared.mime_type != "text/csv":
         return None
     try:
         header = _is_header_only_csv(prepared.content_bytes.decode("utf-8"))
     except _CsvContentBoundaryError:
-        return "Refusing inline CSV because it exceeds bounded CSV inspection limits."
+        return _InlineCsvSourceRefusal(
+            error_code="inline_source_csv_inspection_failed",
+            message="Refusing inline CSV because it exceeds bounded CSV inspection limits.",
+        )
     if header is None:
         return None
 
@@ -1727,9 +1761,12 @@ def _header_only_inline_csv_conflict(
         ).fetchall()
 
     if len(rows) > _INLINE_CSV_CANDIDATE_SCAN_LIMIT:
-        return (
-            "Refusing header-only inline CSV because the ready uploaded CSV candidate scan limit was exceeded. "
-            "Bind the intended uploaded file with source.blob_id or call list_blobs then set_source_from_blob."
+        return _InlineCsvSourceRefusal(
+            error_code="inline_source_comparison_incomplete",
+            message=(
+                "Refusing header-only inline CSV because the ready uploaded CSV candidate scan limit was exceeded. "
+                "Bind the intended uploaded file with source.blob_id or call list_blobs then set_source_from_blob."
+            ),
         )
 
     matches: list[BlobToolRecord] = []
@@ -1756,10 +1793,13 @@ def _header_only_inline_csv_conflict(
         return None
 
     choices = ", ".join(f"{blob['filename']} ({blob['id']}, {blob['size_bytes']} bytes)" for blob in matches)
-    return (
-        "Refusing header-only inline CSV for set_pipeline because ready uploaded CSV blob(s) "
-        f"with matching headers already exist in this session: {choices}. "
-        "Bind the uploaded file with source.blob_id or call list_blobs then set_source_from_blob."
+    return _InlineCsvSourceRefusal(
+        error_code="inline_source_content_conflict",
+        message=(
+            "Refusing header-only inline CSV for set_pipeline because ready uploaded CSV blob(s) "
+            f"with matching headers already exist in this session: {choices}. "
+            "Bind the uploaded file with source.blob_id or call list_blobs then set_source_from_blob."
+        ),
     )
 
 

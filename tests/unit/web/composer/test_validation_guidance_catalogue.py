@@ -249,6 +249,19 @@ def test_direct_exact_and_noisy_lookup_and_help_derive_from_records() -> None:
         assert "known_codes" not in help_result.data
 
 
+@pytest.mark.parametrize("noisy", ["LOG BLOB_QUOTA_EXCEEDED END", "log blob_quota_exceeded end", "Log Blob_Quota_Exceeded End"])
+def test_noisy_uppercase_canonical_code_retains_its_owned_guidance(noisy: str) -> None:
+    code = "BLOB_QUOTA_EXCEEDED"
+    expected = generation.explain_validation_code(code)
+    assert expected is not None
+    exact = execute_tool("explain_validation_error", {"error_text": code}, _empty_state(), _mock_catalog())
+    assert (exact.data["explanation"], exact.data["suggested_fix"]) == expected
+    result = execute_tool("explain_validation_error", {"error_text": noisy}, _empty_state(), _mock_catalog())
+    assert "error_code" in result.data
+    assert result.data["error_code"] == code
+    assert (result.data["explanation"], result.data["suggested_fix"]) == expected
+
+
 def test_public_prose_retains_first_match_and_expected_hint() -> None:
     text = "unknown_node_type coalesce_policy_invalid. Expected a declared node kind."
     matching = [row for row in generation._VALIDATION_ERROR_PATTERNS if re.search(row[0], text)]

@@ -25,6 +25,7 @@ import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from types import MappingProxyType
 from typing import Any, Final, Literal, NotRequired, TypedDict, cast
 
@@ -1285,6 +1286,114 @@ def _discovery_result(state: CompositionState, data: Any) -> ToolResult:
     )
 
 
+class _RejectionOperation(Enum):
+    """The state whose findings belong to one refused operation."""
+
+    CANDIDATE = "candidate"
+    SAVED_GRAPH = "saved_graph"
+
+    def reject(
+        self,
+        state: CompositionState,
+        error_msg: str,
+        *,
+        error_code: str,
+        rejected_component: str | None,
+        plugin_identity: tuple[str, str] | None = None,
+        review_reference: CandidateReviewReferenceFacts | None = None,
+    ) -> ToolResult:
+        if type(error_code) is not str or not error_code.strip():
+            raise AuditIntegrityError("Rejection operation requires a nonempty producer-owned error code")
+        return _build_rejection_result(
+            state,
+            error_msg,
+            operation=self,
+            error_code=error_code,
+            rejected_component=rejected_component,
+            plugin_identity=plugin_identity,
+            review_reference=review_reference,
+        )
+
+
+def _candidate_rejection_result(
+    state: CompositionState,
+    error_msg: str,
+    *,
+    error_code: str,
+    rejected_component: str | None,
+    plugin_identity: tuple[str, str] | None = None,
+    review_reference: CandidateReviewReferenceFacts | None = None,
+) -> ToolResult:
+    """Refuse a candidate without attaching findings from the saved graph."""
+    return _RejectionOperation.CANDIDATE.reject(
+        state,
+        error_msg,
+        error_code=error_code,
+        rejected_component=rejected_component,
+        plugin_identity=plugin_identity,
+        review_reference=review_reference,
+    )
+
+
+def _saved_graph_rejection_result(
+    state: CompositionState,
+    error_msg: str,
+    *,
+    error_code: str,
+    rejected_component: str | None,
+    plugin_identity: tuple[str, str] | None = None,
+    review_reference: CandidateReviewReferenceFacts | None = None,
+) -> ToolResult:
+    """Refuse work on the saved graph while retaining its standing findings."""
+    return _RejectionOperation.SAVED_GRAPH.reject(
+        state,
+        error_msg,
+        error_code=error_code,
+        rejected_component=rejected_component,
+        plugin_identity=plugin_identity,
+        review_reference=review_reference,
+    )
+
+
+def _build_rejection_result(
+    state: CompositionState,
+    error_msg: str,
+    *,
+    operation: _RejectionOperation,
+    error_code: str | None,
+    rejected_component: str | None,
+    plugin_identity: tuple[str, str] | None,
+    review_reference: CandidateReviewReferenceFacts | None,
+) -> ToolResult:
+    match operation:
+        case _RejectionOperation.SAVED_GRAPH:
+            validation = _prepend_rejection_entry(
+                state.validate(),
+                error_msg,
+                error_code=error_code,
+                plugin_identity=plugin_identity,
+                rejected_component=rejected_component,
+                review_reference=review_reference,
+            )
+        case _RejectionOperation.CANDIDATE:
+            validation = _rejection_only_validation(
+                error_msg,
+                error_code=error_code,
+                plugin_identity=plugin_identity,
+                rejected_component=rejected_component,
+                review_reference=review_reference,
+            )
+        case _:
+            raise AuditIntegrityError("Unknown rejection operation")
+    return ToolResult(
+        success=False,
+        updated_state=state,
+        validation=validation,
+        affected_nodes=(),
+        _state_validation_withheld=operation is _RejectionOperation.CANDIDATE,
+    )
+
+
 def _failure_result(
     state: CompositionState,
     error_msg: str,
@@ -1319,29 +1428,15 @@ def _failure_result(
     request's policy view — the caller knows; the message does not, and cannot
     be made to. Omitting it costs an enrichment, never correctness.
     """
-    if with_state_validation:
-        validation = _prepend_rejection_entry(
-            state.validate(),
-            error_msg,
-            error_code=error_code,
-            plugin_identity=plugin_identity,
-            rejected_component=rejected_component,
-            review_reference=review_reference,
-        )
-    else:
-        validation = _rejection_only_validation(
-            error_msg,
-            error_code=error_code,
-            plugin_identity=plugin_identity,
-            rejected_component=rejected_component,
-            review_reference=review_reference,
-        )
-    return ToolResult(
-        success=False,
-        updated_state=state,
-        validation=validation,
-        affected_nodes=(),
-        _state_validation_withheld=not with_state_validation,
+    # Legacy producer families are migrated in subsequent bounded packets.
+    return _build_rejection_result(
+        state,
+        error_msg,
+        operation=_RejectionOperation.SAVED_GRAPH if with_state_validation else _RejectionOperation.CANDIDATE,
+        error_code=error_code,
+        rejected_component=rejected_component,
+        plugin_identity=plugin_identity,
+        review_reference=review_reference,
     )
 
 
@@ -1828,15 +1923,16 @@ def resolve_failure_route_choice(
     return route.strip()
 
 
-def _credential_wiring_contract_failure(
+def _build_credential_wiring_contract_failure(
     state: CompositionState,
     *,
     component_id: str,
     component_type: str,
+    operation: _RejectionOperation,
+    error_code: str | None,
     plugin_type: PluginKind | None = None,
     plugin_name: str | None = None,
     options: Any,
-    with_state_validation: bool = True,
 ) -> ToolResult | None:
     """Reject literal credentials before a mutation writes them into state.
 
@@ -1895,25 +1991,22 @@ def _credential_wiring_contract_failure(
         f"Literal credential values were not stored. {inline_instruction} "
         f"{post_hoc_instruction}"
     )
-    # Symmetric with _failure_result: the rejection reason leads
-    # validation.errors; with_state_validation decides whether the unchanged
-    # state's errors follow it (False for full-replacement set_pipeline,
-    # elspeth-e89e6bf47a).
     # The builder already receives the subject structurally (``component_type``
     # + ``component_id``), so it stamps ``rejected_component`` itself — every
     # caller, incremental tools included, gets attribution with no edit
     # (elspeth-e405ad7cd2, F10 round 2).
     subject = rejected_component_ref(component_type, component_id)
-    if with_state_validation:
-        validation = _prepend_rejection_entry(state.validate(), error_msg, rejected_component=subject)
-    else:
-        validation = _rejection_only_validation(error_msg, rejected_component=subject)
-    return ToolResult(
-        success=False,
-        updated_state=state,
-        validation=validation,
-        affected_nodes=(),
-        _state_validation_withheld=not with_state_validation,
+    result = _build_rejection_result(
+        state,
+        error_msg,
+        operation=operation,
+        error_code=error_code,
+        rejected_component=subject,
+        plugin_identity=None,
+        review_reference=None,
+    )
+    return replace(
+        result,
         data={
             "credential_fields": credential_fields,
             "components": (
@@ -1934,6 +2027,51 @@ def _credential_wiring_contract_failure(
                 },
             },
         },
+    )
+
+
+def _candidate_credential_wiring_contract_failure(
+    state: CompositionState,
+    *,
+    component_id: str,
+    component_type: str,
+    plugin_type: PluginKind | None = None,
+    plugin_name: str | None = None,
+    options: Any,
+) -> ToolResult | None:
+    """Refuse a candidate's literal credentials before storing any effect."""
+    return _build_credential_wiring_contract_failure(
+        state,
+        component_id=component_id,
+        component_type=component_type,
+        operation=_RejectionOperation.CANDIDATE,
+        error_code="credential_literal_forbidden",
+        plugin_type=plugin_type,
+        plugin_name=plugin_name,
+        options=options,
+    )
+
+
+def _credential_wiring_contract_failure(
+    state: CompositionState,
+    *,
+    component_id: str,
+    component_type: str,
+    plugin_type: PluginKind | None = None,
+    plugin_name: str | None = None,
+    options: Any,
+    with_state_validation: bool = True,
+) -> ToolResult | None:
+    """Legacy credential operation for producer families awaiting migration."""
+    return _build_credential_wiring_contract_failure(
+        state,
+        component_id=component_id,
+        component_type=component_type,
+        operation=_RejectionOperation.SAVED_GRAPH if with_state_validation else _RejectionOperation.CANDIDATE,
+        error_code=None,
+        plugin_type=plugin_type,
+        plugin_name=plugin_name,
+        options=options,
     )
 
 
@@ -2025,7 +2163,7 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
 }
 
 
-def _validate_plugin_name(
+def _plugin_selection_violation(
     context: ToolContext,
     plugin_type: PluginKind,
     name: object,
@@ -2060,6 +2198,19 @@ def _validate_plugin_name(
             error_code=reason,
             message=_plugin_unavailable_message(plugin_type, reason),
         )
+    return None
+
+
+def _validate_plugin_name(
+    context: ToolContext,
+    plugin_type: PluginKind,
+    name: object,
+) -> PluginPolicyViolation | None:
+    """Legacy selection plus schema probe for producer families not yet migrated."""
+    violation = _plugin_selection_violation(context, plugin_type, name)
+    if violation is not None:
+        return violation
+    assert type(name) is str
     try:
         context.catalog.get_schema(plugin_type, name)
     except (ValueError, KeyError):
@@ -2084,6 +2235,22 @@ def _plugin_policy_failure(
         message,
         error_code=violation.error_code.value,
         with_state_validation=with_state_validation,
+        rejected_component=rejected_component,
+    )
+
+
+def _candidate_plugin_policy_failure(
+    state: CompositionState,
+    violation: PluginPolicyViolation,
+    *,
+    component: str | None,
+    rejected_component: str | None,
+) -> ToolResult:
+    message = violation.message if component is None else f"{component}: {violation.message}"
+    return _candidate_rejection_result(
+        state,
+        message,
+        error_code=violation.error_code.value,
         rejected_component=rejected_component,
     )
 

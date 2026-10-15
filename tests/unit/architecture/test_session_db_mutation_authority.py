@@ -4987,10 +4987,10 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         symbol="_header_only_inline_csv_conflict",
         table="<sessions-write-connection>",
         operation="write_connection",
-        fingerprint="fb67c26da4e42b98",
+        fingerprint="cb9dd966393cab1d",
         ordinal=1,
         authority=None,
-        line=1703,
+        line=1750,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -13004,6 +13004,54 @@ def test_atomic_blob_deletion_retirement_facet_identity_is_exact_and_bidirection
     assert inventory_drift(live, reviewed) == ([], [])
     assert authority_policy_violations(live, _TABLE_POLICIES) == ([], [])
     assert connection_authority_violations(live) == []
+
+
+def test_inline_csv_comparison_read_admission_is_exact() -> None:
+    root = _repo_root()
+    relative = "src/elspeth/web/composer/tools/sources.py"
+    symbol = "_header_only_inline_csv_conflict"
+    live = [site for site in scan_production_writers([root / relative], anchor=root) if site.symbol == symbol]
+    reviewed = [site for site in _REVIEWED_READ_CONNECTIONS if site.path == relative and site.symbol == symbol]
+    assert len(live) == len(reviewed) == 1
+    assert subtract_reviewed_read_identities(live, reviewed) == ([], [])
+    assert reviewed_read_connection_policy_violations(reviewed) == []
+    assert _authority_for(relative, symbol) is None
+    assert _contained_connection_authority_for(relative, symbol) is None
+
+
+@pytest.mark.parametrize("effect", ["conn.execute(blobs_table.delete())", "leak(conn)"], ids=["dml", "connection_escape"])
+def test_inline_csv_comparison_read_admission_refuses_injected_mutation_and_escape(tmp_path: Path, effect: str) -> None:
+    root = _repo_root()
+    relative = "src/elspeth/web/composer/tools/sources.py"
+    symbol = "_header_only_inline_csv_conflict"
+    reviewed = [site for site in _REVIEWED_READ_CONNECTIONS if site.path == relative and site.symbol == symbol]
+    tree = ast.parse((root / relative).read_text())
+    owners = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == symbol]
+    assert len(owners) == 1
+    connections = [
+        node
+        for node in ast.walk(owners[0])
+        if isinstance(node, ast.With) and any(ast.unparse(item.context_expr) == "session_engine.connect()" for item in node.items)
+    ]
+    assert len(connections) == 1
+    connections[0].body.insert(0, ast.parse(effect).body[0])
+    source = tmp_path / relative
+    source.parent.mkdir(parents=True)
+    source.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+    injected = [site for site in scan_production_writers([source], anchor=tmp_path) if site.symbol == symbol]
+    remaining, stale = subtract_reviewed_read_identities(injected, reviewed)
+    assert stale == reviewed
+    assert remaining
+    if effect == "conn.execute(blobs_table.delete())":
+        mutations = [site for site in injected if site.table == "blobs" and site.operation == "delete"]
+        assert len(mutations) == 1
+        assert all(site in remaining for site in mutations)
+        assert authority_policy_violations(mutations, _TABLE_POLICIES) == (mutations, [])
+    else:
+        escapes = [site for site in injected if site.operation == "write_connection" and site.connection_escape]
+        assert escapes
+        assert all(site in remaining for site in escapes)
+        assert connection_authority_violations(escapes) == escapes
 
 
 def test_blob_custody_read_connection_admissions_are_exact_and_not_mutation_authorities() -> None:

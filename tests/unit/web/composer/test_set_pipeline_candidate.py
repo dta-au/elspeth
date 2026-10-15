@@ -14,7 +14,7 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -29,7 +29,10 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.blobs.service import BlobServiceImpl, content_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
+from elspeth.web.composer.discovery_cache import serialize_tool_result
+from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
+from elspeth.web.composer.planner_authoring_aids import planner_plugin_contract
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
@@ -41,8 +44,14 @@ from elspeth.web.composer.tools import (
     execute_tool,
 )
 from elspeth.web.composer.tools import sessions as sessions_tools
-from elspeth.web.composer.tools._common import normalize_tool_result_validation
-from elspeth.web.composer.tools.sources import _options_with_source_blob_review
+from elspeth.web.composer.tools._common import (
+    _RejectionOperation,
+    _validate_sink_path,
+    _validate_source_path,
+    _validate_transform_provider_config_path,
+    normalize_tool_result_validation,
+)
+from elspeth.web.composer.tools.sources import _options_with_source_blob_review, _resolve_source_blob
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
@@ -176,6 +185,247 @@ def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path
     assert result.validation.errors[0].error_code == "plugin_options_invalid"
     assert [entry.component for entry in result.validation.errors] == ["rejected_mutation"]
     assert [entry.error_code for entry in result.validation.errors] == ["plugin_options_invalid"]
+
+
+def test_blob_binding_context_refusal_does_not_report_saved_graph_errors(tmp_path: Path) -> None:
+    args = _linear_args(tmp_path)
+    args["source"]["blob_id"] = "11111111-1111-4111-8111-111111111111"
+    state = _empty_state()
+    result = build_set_pipeline_candidate(args, state, _trained_context(data_dir=tmp_path)).result
+    assert result.updated_state is state
+    assert result.affected_nodes == ()
+    assert result.prior_validation is None
+    assert [(entry.error_code, entry.rejected_component) for entry in result.validation.errors] == [
+        ("source_binding_context_unavailable", "source")
+    ]
+    assert "validation_delta" not in result.to_dict()
+
+
+@pytest.mark.parametrize("surface", ["source", "named_source", "sink", "provider"])
+def test_candidate_path_refusals_keep_server_roots_out_of_tool_history_and_planner(tmp_path: Path, surface: str) -> None:
+    private_root = tmp_path / "NON-AUTHORED-SERVER-ROOT-CANARY"
+    args = _linear_args(private_root)
+    args["source"]["options"]["path"] = "blobs/test-session/input.csv"
+    escaped_path = "/outside-session/authored-path"
+    if surface in {"source", "named_source"}:
+        args["source"]["options"]["path"] = escaped_path
+        raw_message = _validate_source_path(args["source"]["options"], str(private_root), session_id="test-session")
+        code, subject = "source_path_policy_invalid", "source"
+        if surface == "named_source":
+            args["sources"] = {"primary": args.pop("source")}
+            args["edges"][0]["from_node"] = "source:primary"
+            subject = "source:primary"
+    elif surface == "sink":
+        args["outputs"][0]["options"]["path"] = escaped_path
+        raw_message = _validate_sink_path(args["outputs"][0]["options"], str(private_root), session_id="test-session")
+        code, subject = "sink_path_policy_invalid", "output:main"
+    else:
+        args["nodes"][0]["plugin"] = "rag_retrieval"
+        args["nodes"][0]["options"] = {
+            "output_prefix": "rag_",
+            "query_field": "text",
+            "provider": "chroma",
+            "provider_config": {"collection": "docs", "mode": "persistent", "persist_directory": escaped_path},
+            "schema": {"mode": "observed"},
+        }
+        raw_message = _validate_transform_provider_config_path(args["nodes"][0]["options"], str(private_root), session_id="test-session")
+        code, subject = "provider_config_path_policy_invalid", "node:copy"
+    # The underlying validator really contains the server-owned root: this is
+    # a disclosure canary, not a test that happens to supply harmless messages.
+    assert raw_message is not None and str(private_root) in raw_message
+    assert "NON-AUTHORED-SERVER-ROOT-CANARY" not in str(args)
+    state = _empty_state()
+    result = build_set_pipeline_candidate(args, state, _trained_context(data_dir=private_root)).result
+    assert result.updated_state is state
+    assert result.affected_nodes == ()
+    assert [(entry.error_code, entry.rejected_component) for entry in result.validation.errors] == [(code, subject)]
+    ordinary_response = result.to_dict()
+    ordinary_history_content = serialize_tool_result(result)
+    assert "NON-AUTHORED-SERVER-ROOT-CANARY" not in str(ordinary_response)
+    assert "NON-AUTHORED-SERVER-ROOT-CANARY" not in ordinary_history_content
+    assert "session" in result.validation.errors[0].message
+    assert "Use" in result.validation.errors[0].message
+    feedback = _allowlisted_candidate_feedback(result)
+    projected = feedback["validation"]["errors"][0]
+    assert projected["error_code"] == code
+    assert "detail" not in projected
+    assert projected["suggested_fix"]
+    assert "NON-AUTHORED-SERVER-ROOT-CANARY" not in str(feedback)
+
+
+def test_authored_plugin_option_detail_remains_useful(tmp_path: Path) -> None:
+    args = _linear_args(tmp_path)
+    args["nodes"][0]["options"]["AUTHORED-OPTION-CANARY"] = "unsupported"
+    context = _trained_context(data_dir=tmp_path)
+    result = build_set_pipeline_candidate(args, _empty_state(), context).result
+    projected = _allowlisted_candidate_feedback(
+        result,
+        plugin_contract_resolver=lambda kind, name: planner_plugin_contract(context.catalog.get_schema(kind, name)).to_dict(),
+    )["validation"]["errors"][0]
+    assert projected["error_code"] == "plugin_options_invalid"
+    assert "AUTHORED-OPTION-CANARY" in projected["detail"]
+    assert projected["plugin_contracts"]
+
+
+@pytest.mark.parametrize(
+    ("queries", "pool_size", "retry_seconds", "accepted"),
+    [(True, 1, None, False), (True, 1, 30, True), (True, 1, 31, False), (True, 2, None, True), (False, 1, 31, True)],
+)
+def test_candidate_retry_policy_classifies_only_unbounded_sequential_queries(
+    tmp_path: Path, queries: bool, pool_size: int, retry_seconds: int | None, accepted: bool
+) -> None:
+    args = _structured_llm_args(tmp_path)
+    options = args["nodes"][0]["options"]
+    options["pool_size"] = pool_size
+    if not queries:
+        del options["queries"]
+    if retry_seconds is not None:
+        options["max_capacity_retry_seconds"] = retry_seconds
+    state = _empty_state()
+    result = build_set_pipeline_candidate(args, state, _trained_context(data_dir=tmp_path)).result
+    assert result.success is accepted, result.validation.errors
+    if not accepted:
+        assert result.updated_state is state
+        assert result.affected_nodes == ()
+        assert [(entry.error_code, entry.rejected_component) for entry in result.validation.errors] == [
+            ("llm_retry_budget_policy", "node:classify")
+        ]
+        feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"][0]
+        assert "detail" not in feedback
+        assert "30 seconds" in feedback["suggested_fix"]
+        assert "pool_size > 1" in feedback["suggested_fix"]
+
+
+def test_bound_source_refusal_keeps_the_actual_request_policy_reason(tmp_path: Path) -> None:
+    engine, session_id, _message_id = _session_with_user_message()
+    service = BlobServiceImpl(engine, tmp_path)
+    with fenced_operation_context(engine, session_id, operation_kind=SessionOperationKind.CREATE) as operation_context:
+        blob = asyncio.run(
+            service.create_blob(UUID(session_id), "input.csv", b"name\nAda\n", "text/csv", session_operation_context=operation_context)
+        )
+    context = replace(_blocked_context(PluginId("source", "csv"), data_dir=tmp_path), session_engine=engine, session_id=session_id)
+    args = _linear_args(tmp_path)
+    args["source"]["blob_id"] = str(blob.id)
+    state = _empty_state()
+    result = build_set_pipeline_candidate(args, state, context).result
+    assert result.updated_state is state
+    assert [(entry.error_code, entry.rejected_component, entry.plugin_identity) for entry in result.validation.errors] == [
+        ("plugin_not_enabled", "source", None)
+    ]
+    assert "not turned on" in result.validation.errors[0].message
+
+
+@pytest.mark.parametrize("operation", [_RejectionOperation.CANDIDATE, _RejectionOperation.SAVED_GRAPH])
+def test_blob_resolver_policy_unavailability_does_not_probe_schema(tmp_path: Path, operation: _RejectionOperation) -> None:
+    engine, session_id, _message_id = _session_with_user_message()
+    service = BlobServiceImpl(engine, tmp_path)
+    with fenced_operation_context(engine, session_id, operation_kind=SessionOperationKind.CREATE) as operation_context:
+        blob = asyncio.run(
+            service.create_blob(UUID(session_id), "input.csv", b"name\nAda\n", "text/csv", session_operation_context=operation_context)
+        )
+    context = _blocked_context(PluginId("source", "csv"), data_dir=tmp_path)
+    snapshot = replace(
+        context.plugin_snapshot,
+        unavailable=(PluginAvailability(PluginId("source", "csv"), PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING),),
+    )
+    context = replace(
+        context,
+        catalog=PolicyCatalogView(create_catalog_service(), snapshot, MagicMock(spec=OperatorProfileRegistry)),
+        plugin_snapshot=snapshot,
+        session_engine=engine,
+        session_id=session_id,
+    )
+    state = _empty_state()
+    with patch.object(PolicyCatalogView, "get_schema", autospec=True, side_effect=AssertionError("policy must precede schema")) as schema:
+        result = _resolve_source_blob(
+            blob_id=str(blob.id),
+            explicit_plugin="csv",
+            caller_options={"schema": {"mode": "observed"}},
+            rejection_operation=operation,
+            on_validation_failure="discard",
+            state=state,
+            context=context,
+            session_engine=engine,
+            session_id=session_id,
+        )
+    schema.assert_not_called()
+    assert result.updated_state is state
+    assert result.affected_nodes == ()
+    assert result.validation.errors[0].error_code == "plugin_unavailable"
+    assert result.validation.errors[0].plugin_identity is None
+    if operation is _RejectionOperation.SAVED_GRAPH:
+        assert result.validation.errors[1:] == state.validate().errors
+    else:
+        assert len(result.validation.errors) == 1
+    assert Path(blob.storage_path).read_bytes() == b"name\nAda\n"
+
+
+@pytest.mark.parametrize("operation", [_RejectionOperation.CANDIDATE, _RejectionOperation.SAVED_GRAPH])
+@pytest.mark.parametrize("failure_type", [ValueError, KeyError])
+def test_admitted_blob_source_schema_failure_propagates_without_effects(
+    tmp_path: Path, operation: _RejectionOperation, failure_type: type[Exception]
+) -> None:
+    engine, session_id, _message_id = _session_with_user_message()
+    service = BlobServiceImpl(engine, tmp_path)
+    with fenced_operation_context(engine, session_id, operation_kind=SessionOperationKind.CREATE) as operation_context:
+        blob = asyncio.run(
+            service.create_blob(UUID(session_id), "input.csv", b"name\nAda\n", "text/csv", session_operation_context=operation_context)
+        )
+    context = _trained_context(data_dir=tmp_path, session_engine=engine, session_id=session_id)
+    state = _empty_state()
+    before = state.to_dict()
+    failure = failure_type("admitted schema owner failure")
+    with (
+        patch.object(PolicyCatalogView, "get_schema", autospec=True, side_effect=failure) as schema,
+        pytest.raises(failure_type, match="admitted schema owner failure") as raised,
+    ):
+        _resolve_source_blob(
+            blob_id=str(blob.id),
+            explicit_plugin="csv",
+            caller_options={"schema": {"mode": "observed"}},
+            rejection_operation=operation,
+            on_validation_failure="discard",
+            state=state,
+            context=context,
+            session_engine=engine,
+            session_id=session_id,
+        )
+    assert raised.value is failure
+    schema.assert_called_once_with(context.catalog, "source", "csv")
+    assert state.to_dict() == before
+    assert Path(blob.storage_path).read_bytes() == b"name\nAda\n"
+
+
+def test_postbuilder_inline_quota_refusal_has_no_candidate_effects(tmp_path: Path) -> None:
+    engine, session_id, message_id = _session_with_user_message()
+    args = _linear_args(tmp_path)
+    args["source"]["options"] = {"schema": {"mode": "observed"}}
+    args["source"]["inline_blob"] = {"filename": "data.csv", "mime_type": "text/csv", "content": "name,score\nada,42\n"}
+    args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "result.json")
+    state = _empty_state()
+    context = _trained_context(
+        data_dir=tmp_path,
+        session_engine=engine,
+        session_id=session_id,
+        user_message_id=message_id,
+        user_message_content="Use this CSV: name,score\nada,42\n",
+        composer_model_identifier="test-model",
+        composer_model_version="test-model-version",
+        composer_provider="test-provider",
+        composer_skill_hash="a" * 64,
+        tool_arguments_hash="b" * 64,
+    )
+    with patch.object(
+        sessions_tools, "_persist_prepared_blob_create", autospec=True, return_value="Session blob quota exceeded."
+    ) as settle:
+        result = _execute_set_pipeline(args, state, context)
+    settle.assert_called_once()
+    assert result.updated_state is state
+    assert result.updated_state.version == state.version
+    assert result.affected_nodes == ()
+    assert result.prior_validation is None
+    assert [(entry.error_code, entry.rejected_component) for entry in result.validation.errors] == [("BLOB_QUOTA_EXCEEDED", "source")]
+    assert "validation_delta" not in result.to_dict()
 
 
 @pytest.mark.parametrize(
@@ -1802,17 +2052,16 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             "escaping_path",
             escaping_path,
             _trained_context(data_dir=tmp_path),
-            "Output 'main': Path violation (S2): 'path' value '/etc/candidate-escape.json' is outside the allowed "
-            f"directories. Sink output paths must be under this session's {tmp_path / 'outputs'}/<session>/ or "
-            f"{tmp_path / 'blobs'}/<session>/ subtree.",
-            None,
+            "Output 'main': Output path options (path, file or persist_directory) must use this session's permitted destinations. "
+            "Use an authorized session-local output path.",
+            "sink_path_policy_invalid",
         ),
         (
             "invalid_gate",
             invalid_gate,
             _trained_context(data_dir=tmp_path),
             "Node 'threshold': Invalid gate condition syntax: Invalid syntax: '[' was never closed",
-            None,
+            "gate_condition_invalid",
         ),
         (
             "manual_blob_ref",
@@ -1821,14 +2070,14 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             "Source 'source': Use set_source_from_blob, source.blob_id, or source.inline_blob to bind a blob to the source. set_pipeline "
             "must not be called with 'blob_ref' in source.options because it cannot enforce that 'path' equals the "
             "blob's canonical storage_path.",
-            None,
+            "plugin_options_invalid",
         ),
         (
             "credential_policy",
             literal_credential,
             _trained_context(data_dir=tmp_path),
             credential_error,
-            None,
+            "credential_literal_forbidden",
         ),
         (
             "resolver_owned_interpretation_review",
