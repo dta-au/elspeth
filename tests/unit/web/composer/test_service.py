@@ -4251,7 +4251,7 @@ class TestComposeTimeout:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("error_class", "expected_failure_class", "expected_attempts"),
-        (("ServiceUnavailableError", "unavailable", 2), ("Timeout", "unavailable", 1), ("APIError", "malformed", 2)),
+        (("ServiceUnavailableError", "unavailable", 2), ("Timeout", "unavailable", 1), ("APIError", "unavailable", 2)),
     )
     async def test_end_advisor_classifies_real_sdk_failure_by_type(
         self, monkeypatch: pytest.MonkeyPatch, error_class: str, expected_failure_class: str, expected_attempts: int

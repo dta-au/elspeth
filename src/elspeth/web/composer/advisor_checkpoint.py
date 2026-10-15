@@ -1292,46 +1292,17 @@ class AdvisorCheckpointOwner:
                 ),
                 source="model",
             )
-        # Bounded retry exhausted. The call core re-raises typed LLM errors, so
-        # classify the LAST exception into a failure CLASS (D13/P5.3): a
-        # timeout/transport/auth/rate-limit outage is UNAVAILABLE, while a
-        # admitted malformed response or other declared provider failure is
-        # MALFORMED. Both classes terminal-block identically — the class is
-        # read only to pick honest user-facing WORDING at the END gate and the
-        # telemetry verdict label (elspeth-25f7b757e7 A4: an earlier design's
-        # audited unavailable "escape" at budget exhaustion no longer exists).
-        # Ambiguous provider failures -> MALFORMED keeps the wording conservative — a
-        # goal-pressured model emitting garbage is described as malformed, not
-        # as an outage. The raw exception is classified ONLY into
-        # ``failure_class`` (an enum-ish literal): ``findings_text`` carries no
-        # provider SDK text, exception class name, message, URL, or credential, so
-        # the route-level provider-error redaction policy is preserved (the END
-        # gate folds findings_text into a ValidationError and the assistant
-        # message).
-        #
-        # Keep the END gate's narrower wording policy while using the shared
-        # SDK classifier as its provenance check. Generic APIError and bad
-        # requests remain MALFORMED here, even when their status is 503; they
-        # do not establish which side produced an invalid exchange. Concrete
-        # transport, timeout, auth, rate-limit and service-unavailable types
-        # establish an unavailable advisor. Builtin deadline and connection
-        # failures retain their existing unavailable wording.
-        from litellm.exceptions import ServiceUnavailableError as LiteLLMServiceUnavailableError
-        from openai import APIConnectionError, APITimeoutError, AuthenticationError, RateLimitError
-
+        # A declared provider/request failure supplies no evidence that the
+        # advisor returned malformed content. Reserve that diagnosis for an
+        # observed invalid response frame/content at the owned call boundary;
+        # parsed-but-unusable text was handled above. Other failures mean no
+        # usable review was obtained. Both classes still block completion, and
+        # neither fixed detail exposes raw provider diagnostics.
         failure_class: Literal["none", "unavailable", "malformed"]
-        sdk_failure = classify_provider_failure(last_exc) if last_exc is not None else None
-        sdk_unavailable = sdk_failure is not None and isinstance(
-            last_exc,
-            (APITimeoutError, APIConnectionError, AuthenticationError, RateLimitError, LiteLLMServiceUnavailableError),
-        )
-        if last_exc is not None and (isinstance(last_exc, (TimeoutError, ConnectionError)) or sdk_unavailable):
-            failure_class = "unavailable"
-        else:
-            # Malformed responses and other admitted provider exception classes
-            # (including last_exc is None, which should be unreachable after a
-            # bounded-retry loop) fail closed as MALFORMED.
+        if isinstance(last_exc, _MalformedLLMResponseError):
             failure_class = "malformed"
+        else:
+            failure_class = "unavailable"
         findings_text = (
             _advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL
             if failure_class == "unavailable"

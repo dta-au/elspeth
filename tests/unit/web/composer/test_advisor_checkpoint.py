@@ -2285,6 +2285,72 @@ async def test_exhausted_litellm_timeout_classified_unavailable(make_service, si
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "failure_class", "attempts", "audit_status"),
+    [
+        ("bad_request", "unavailable", 1, "BAD_REQUEST_ERROR"),
+        ("api_error", "unavailable", 2, "API_ERROR"),
+        ("outage", "unavailable", 2, "API_ERROR"),
+        ("malformed_text", "malformed", 2, "SUCCESS"),
+        ("malformed_frame", "malformed", 2, "MALFORMED_RESPONSE"),
+    ],
+)
+async def test_checkpoint_sdk_failure_requires_response_evidence_for_malformed(
+    monkeypatch, make_service, simple_state, outcome, failure_class, attempts, audit_status
+):
+    """Request rejection is not evidence that the advisor returned bad content."""
+    import litellm
+    from litellm.exceptions import APIError, BadRequestError, ServiceUnavailableError
+
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+
+    private_detail = "PRIVATE_PROVIDER_DIAGNOSTIC"
+    failures = {
+        "bad_request": BadRequestError(private_detail, model="advisor", llm_provider="openai"),
+        "api_error": APIError(status_code=503, message=private_detail, model="advisor", llm_provider="openai"),
+        "outage": ServiceUnavailableError(private_detail, model="advisor", llm_provider="openai"),
+    }
+    calls = 0
+
+    async def sdk_fake(**kwargs):
+        nonlocal calls
+        calls += 1
+        assert calls <= attempts, "Unexpected extra advisor SDK dispatch"
+        assert kwargs["response_format"]["type"] == "json_schema"
+        if outcome in failures:
+            raise failures[outcome]
+        # Both malformed cases supply an actual SDK response object. Empty
+        # choices prove an observed invalid frame, without inventing model text.
+        return SimpleNamespace(
+            model="advisor-test-model",
+            choices=[]
+            if outcome == "malformed_frame"
+            else [SimpleNamespace(message=SimpleNamespace(content="not a JSON verdict", tool_calls=None))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=4, total_tokens=14),
+        )
+
+    service = make_service()
+    monkeypatch.setattr(litellm, "acompletion", sdk_fake)
+    recorder = make_recorder()
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, **_fenced_session(service, review_state=simple_state), recorder=recorder
+    )
+
+    assert calls == attempts
+    assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus[audit_status]] * attempts
+    assert verdict.ok is False and verdict.publication_verdict is None
+    assert verdict.failure_class == failure_class
+    assert verdict.findings_text == (ADVISOR_UNAVAILABLE_USER_DETAIL if failure_class == "unavailable" else ADVISOR_MALFORMED_USER_DETAIL)
+    assert private_detail not in repr(verdict)
+    writes = service._sessions_service.add_message.calls
+    assert len(writes) == 1
+    envelope = writes[0].kwargs["tool_calls"][0]
+    assert envelope["pass"]["verdict"] == failure_class
+    assert envelope["pass"]["provider_attempts"] == attempts
+    assert private_detail not in json.dumps(envelope)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure_kind", ["auth", "bad_request", "rate_limit", "unavailable", "connection"])
 async def test_advisor_respects_existing_provider_retryability(make_service, simple_state, failure_kind):
     from litellm.exceptions import AuthenticationError, BadRequestError, RateLimitError, ServiceUnavailableError
@@ -4240,6 +4306,47 @@ async def test_end_gate_malformed_is_not_labelled_unavailable(make_service, clea
     # parenthetical contradicting a "response was malformed" tail.
     assert ADVISOR_MALFORMED_USER_DETAIL in detail
     assert "(malformed)" not in detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["bad_request", "api_error"])
+async def test_end_gate_sdk_request_failure_withholds_without_malformed_claim(
+    monkeypatch, make_service, clean_runnable_state, failure_kind
+):
+    import litellm
+    from litellm.exceptions import APIError, BadRequestError
+
+    private_detail = "PRIVATE_PROVIDER_DIAGNOSTIC"
+    failure = (
+        BadRequestError(private_detail, model="advisor", llm_provider="openai")
+        if failure_kind == "bad_request"
+        else APIError(status_code=503, message=private_detail, model="advisor", llm_provider="openai")
+    )
+    expected_calls = 2 if failure_kind == "bad_request" else 4
+    calls = 0
+
+    async def sdk_fake(**_kwargs):
+        nonlocal calls
+        calls += 1
+        assert calls <= expected_calls, "Unexpected extra advisor SDK dispatch"
+        raise failure
+
+    service = make_service()
+    monkeypatch.setattr(litellm, "acompletion", sdk_fake)
+    candidate = "UNREVIEWED_COMPLETION_CANDIDATE"
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0, candidate=candidate)
+
+    assert calls == expected_calls  # F3's outer retry policy is unchanged here.
+    assert outcome.action == "return" and outcome.advisor_passes_delta == 2
+    result = outcome.result
+    assert result.runtime_preflight.readiness.completion_ready is False
+    assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.UNAVAILABLE
+    assert result.graph_review_identity.source == "unavailable"
+    exposed = result.message + result.runtime_preflight.model_dump_json()
+    assert ADVISOR_UNAVAILABLE_USER_DETAIL in exposed
+    assert "malformed" not in exposed
+    assert private_detail not in exposed and candidate not in exposed
+    assert "advisor_publication_withheld" in _audit_row_origins(service)
 
 
 @pytest.mark.asyncio
