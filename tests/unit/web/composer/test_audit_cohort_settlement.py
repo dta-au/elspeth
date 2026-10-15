@@ -214,7 +214,9 @@ async def _drive_turn_then_provider_timeout(
     """Turn 1 commits a tool turn inline; turn 2's provider call times out."""
     responses = [_metadata_tool_response("call_turn1_metadata", "Committed inline")]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_llm(
+        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         if responses:
             return responses.pop(0)
         raise TimeoutError

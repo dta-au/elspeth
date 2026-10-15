@@ -174,7 +174,9 @@ class _RecordingLLM(_FakeComposeLLM):
         super().__init__(responses)
         self.seen: list[list[dict[str, Any]]] = []
 
-    async def __call__(self, messages: Any, tools: Any) -> Any:
+    async def __call__(
+        self, messages: Any, tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         self.seen.append(copy.deepcopy(list(messages)))
         return await super().__call__(messages, tools)
 

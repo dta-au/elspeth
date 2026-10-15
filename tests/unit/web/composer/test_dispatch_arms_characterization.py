@@ -339,7 +339,9 @@ async def test_invalid_json_arg_error_sends_replayable_tool_call_history(
             super().__init__((first, _fake_llm_response(content="Done.")))
             self.requests: list[list[dict[str, Any]]] = []
 
-        async def __call__(self, messages: Any, tools: Any) -> Any:
+        async def __call__(
+            self, messages: Any, tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        ) -> Any:
             self.requests.append(deepcopy(messages))
             return await super().__call__(messages, tools)
 

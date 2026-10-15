@@ -237,7 +237,14 @@ class _ScriptedLLM:
     def __init__(self, responses: list[Any]) -> None:
         self._responses = list(responses)
 
-    async def __call__(self, _messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def __call__(
+        self,
+        _messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+    ) -> Any:
         if not self._responses:
             return _admit_composer_llm_completion(_fake_text_response("Done."))
         return _admit_composer_llm_completion(self._responses.pop(0))

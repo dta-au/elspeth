@@ -94,7 +94,9 @@ class _ReplayLLM:
     def __init__(self, responses: tuple[_AdmittedLLMCompletion, ...]) -> None:
         self._responses = list(responses)
 
-    async def __call__(self, _messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+    async def __call__(
+        self, _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> _AdmittedLLMCompletion:
         assert self._responses, "No further primary response is supplied by this trace"
         return self._responses.pop(0)
 
@@ -104,7 +106,9 @@ class _BlockingLLM:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def __call__(self, _messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+    async def __call__(
+        self, _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> _AdmittedLLMCompletion:
         self.entered.set()
         await self.release.wait()
         return _make_llm_response(content="Done.")

@@ -190,7 +190,14 @@ class _ReconciliationLLMScript:
         self._responses = iter(responses)
         self.prompts: list[list[dict[str, Any]]] = []
 
-    async def respond(self, messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> _AdmittedLLMCompletion:
+    async def respond(
+        self,
+        messages: list[dict[str, Any]],
+        _tools: list[dict[str, Any]],
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+    ) -> _AdmittedLLMCompletion:
         self.prompts.append(deepcopy(messages))
         return next(self._responses)
 
@@ -1109,7 +1116,9 @@ class TestComposerSingleToolCall:
         done = _make_llm_response(content="Update is pending approval.")
         responses = [turn, done]
 
-        async def _llm(_messages: Any, _tools: Any) -> Any:
+        async def _llm(
+            _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        ) -> Any:
             return responses.pop(0)
 
         await service._run_one_turn_for_test(
@@ -1168,7 +1177,9 @@ class TestComposerSingleToolCall:
         done = _make_llm_response(content="Delete is pending approval.")
         responses = [turn, done]
 
-        async def _llm(_messages: Any, _tools: Any) -> Any:
+        async def _llm(
+            _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        ) -> Any:
             return responses.pop(0)
 
         await service._run_one_turn_for_test(
@@ -2060,7 +2071,13 @@ class TestComposerMultiTurnToolCalls:
         replies = [_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")]
         provider_contexts: list[list[dict[str, Any]]] = []
 
-        async def scripted_call_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+        async def scripted_call_llm(
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+        ) -> Any:
             provider_contexts.append([dict(item) for item in messages])
             return replies[len(provider_contexts) - 1]
 

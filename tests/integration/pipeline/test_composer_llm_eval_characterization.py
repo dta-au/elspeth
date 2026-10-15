@@ -131,7 +131,9 @@ class _ReplayLLM:
     def __init__(self, responses: tuple[_AdmittedLLMCompletion, ...]) -> None:
         self._responses = list(responses)
 
-    async def __call__(self, _messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+    async def __call__(
+        self, _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> _AdmittedLLMCompletion:
         if not self._responses:
             return _make_llm_response(content="Done.")
         return self._responses.pop(0)

@@ -219,7 +219,14 @@ class _ScriptedLLM:
         self.messages: list[list[dict[str, Any]]] = []
         self.tools: list[Any] = []
 
-    async def __call__(self, _messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def __call__(
+        self,
+        _messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+    ) -> Any:
         self.messages.append(_messages)
         self.tools.append(_tools)
         if not self._responses:
@@ -4517,7 +4524,13 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
         ]
     )
 
-    async def observed_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+    async def observed_llm(
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+    ) -> Any:
         if {tool["function"]["name"] for tool in tools} == {"handoff_to_user", "restore_parked_graph"}:
             snapshot = await progress_registry.get_latest("reply-progress")
             assert snapshot.phase == "calling_model"
@@ -4882,7 +4895,13 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
     )
     reply_calls = 0
 
-    async def reply(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+    async def reply(
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+    ) -> Any:
         nonlocal reply_calls
         if {tool["function"]["name"] for tool in tools} != {"handoff_to_user", "restore_parked_graph"}:
             return await prefix(messages, tools)

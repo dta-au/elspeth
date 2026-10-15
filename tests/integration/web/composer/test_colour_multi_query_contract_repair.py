@@ -246,7 +246,9 @@ async def _author(harness: _Harness, tmp_path: Path, content: str) -> Compositio
     ]
     snapshots: list[list[dict[str, Any]]] = []
 
-    async def planner(messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def planner(
+        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+    ) -> Any:
         snapshots.append(deepcopy(messages))
         assert responses, messages[-1]["content"]
         return _admit_composer_llm_completion(responses.pop(0))
