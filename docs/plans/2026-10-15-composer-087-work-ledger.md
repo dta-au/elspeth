@@ -4,6 +4,12 @@ This is the working implementation ledger for the approved Composer 0.8.7
 plan. It records source reconciliation and later behavioral evidence; it is
 ordinary project documentation, not a release approval or immutable plan.
 
+**Execution active after verified continuation.** The 00:06 UTC checkpoint
+reprocessed the superseded 19:08 UTC pause; no newer direct stop was identified.
+The verified chronology, current continuation and exact next step are in
+[the status report](2026-10-16-composer-087-paused-status.md). Preserve completed
+evidence and obey any actually newer direct stop.
+
 ## Baseline and boundaries
 
 - Target branch: `codex/composer087-contracts-20261015`.
@@ -53,7 +59,7 @@ packet; it does not mean merged, signed, released or deployed.
 | Planned work | Current status |
 |---|---|
 | 0. Baseline inventories and ownership | Complete; live registry/profile and direct-call inventories recorded. |
-| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement, output and source groups accepted locally in `620231a`, `208bf8d` and `41348ede`. Transform/splice, blob, secret, discovery and remaining dispatch migrations remain pending. |
+| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement, output and source groups accepted locally in `620231a`, `208bf8d`, `41348ede` and output schema follow-up `3f2db4f0`. Transform/splice has final bounded acceptance from both reviewers and completed runtime evidence; normal local integration is next. Graph wiring, blob, secret, discovery and remaining dispatch migrations remain pending. |
 | 2. Saved-but-blocked persistence/reload/UI | Pending joined behavioral evidence; inherited .6 teaching retained. |
 | 3. Model-catalog provenance | Fixed in .6; .7 regression closure pending. |
 | 4. Explicit CSV failure choice | Runtime refusal already exists. False assistance claim that omission defaults to discard still needs correction and its provenance checks. |
@@ -95,7 +101,7 @@ Additional defects and controls found during this work:
 | SL2: unavailable private link loses intent and resumes recipient workspace | Fixed and accepted locally in `9d8b43b`, including navigation and authentication remount. |
 | SL3: stale authentication destination A overrides explicit B | Fixed and accepted locally in the same shared-link packet. |
 | SL4: previous shared snapshot remains under a new token | Fixed and accepted locally in the same packet using route identity. |
-| SL5: shared-view global keyboard shortcuts act on recipient workspace | Open, outside the narrowed fallback patch. New-session shortcut reproduced; validation shortcut source-supported only. No sender mutation or cross-user access established. |
+| SL5: shared-view global keyboard shortcuts act on recipient workspace | Deferred, outside the narrowed fallback patch. The relay's claimed new authorization was retracted as historical. New-session shortcut reproduced; validation shortcut source-supported only. No sender mutation or cross-user access established. |
 | Ready plural source blob with NULL hash is treated as repairable | Corrected locally in `41348ede`; real corruption and laundering controls preserve the owned integrity failure. |
 | Invalid stored MIME has a redundant recoverable branch; MIME DB-CHECK comment is false | Corrected in source1c; the real row reader retains MIME integrity ownership, and the comment names the actual write/read guards. No constraint or epoch change. |
 | Source policy refusal occurs after schema access | Corrected in source1c with pure policy admission before direct schema access. Actual unavailable reasons and admitted ValueError/KeyError propagation are qualified separately. |
@@ -105,14 +111,19 @@ Additional defects and controls found during this work:
 | Source unavailability reaches completion too late or becomes false budget exhaustion | Included in approved item-8 design; implementation pending across preview/completion/review entrances. |
 | Per-query scoring override does not inherit node criterion references | Actual boundary identified; teaching/characterization pending. No new override mechanism approved. |
 | LiteLLM conditional parameter repair/fallback can differ from ordinary retries | Separate documented limitation; title retry pins do not universally qualify provider behavior. |
-| Output admitted-schema ValueError/KeyError becomes availability repair | Two-caller migration accepted by independent correctness/security and systems reviews for local integration. Actual handler/dispatch/turn positives, relevant gates, three witnessed controls, focused PostgreSQL and fresh keyless comparison complete; broader gates remain due. |
-| Aggregation output-count refusal hides standing saved findings | Source-confirmed `with_state_validation=False` in upsert; systems-reviewed transform/splice correction pending. |
-| Transform provider-path refusal exposes private path/root text | Source-confirmed in upsert, patch and splice preparation; static producer projection and privacy controls pending in the reviewed transform group. |
-| Node refusals omit codes/subjects or mask admitted schema faults | Systems source design complete for upsert, patch and splice plus existing helpers; implementation and discriminating controls pending. |
+| Output admitted-schema ValueError/KeyError becomes availability repair | Two-caller migration accepted locally as `3f2db4f0` after both reviews and normal hooks. Actual handler/dispatch/turn positives, relevant gates, three witnessed controls, focused PostgreSQL and fresh keyless comparison complete; broader gates remain due. |
+| Aggregation output-count refusal hides standing saved findings | Corrected in the reviewed draft; real saved-findings behavior and witnessed regression control are accepted. Local integration is next. |
+| Transform provider-path refusal exposes private path/root text | Static safe projection is qualified on actual upsert, patch and splice-preparation paths; the private-path control fails at its intended canary assertion. |
+| Node refusals omit codes/subjects or mask admitted schema faults | Both final reviews accept actual producer/consumer behavior, precise subjects/codes, admitted fault propagation and the completed deliberate controls. |
 | New predecessor test bypasses the required session-engine factory | Normal hook exposed it; repaired with the existing read-only inspection factory. All39 epoch cases plus masquerade gate pass, and actual initializer-admission mutation still fails as intended. Normal hooks now pass. |
 | Credential-envelope census still names the legacy adapter instead of its payload builder | Corrected at the real builder with explicit per-row constructor ownership. The complete affected gate and witnessed key/missing-payload/owner controls pass their intended checks; no wire expansion. |
 | Source contract tests contain invalid fixture and outer-fault assumptions | Repaired with real owner premises and accurate outer/endpoint oracles; all104 affected cases pass. The original46 failures and2 teardown errors remain historical red evidence, not new product defects. |
 | Source/output turn tests use unspecced provider mocks | Repaired with autospec of the actual bound provider method. All four affected source turn cases and the output turn cases pass, along with the owning mock-discipline gate. Earlier source1c receipts retain their original scope; no new production defect established. |
+| Replay tests use invalid empty fixed schemas and stop before replay comparison | New strict and inherited generic-refusal fixtures repaired with real admitted divergent options. All three replay cases pass freshly; original 293-pass/2-failure receipt remains red. |
+| Count-guidance test assumes one raw error from a saved-graph refusal | Repaired to require exact standing findings as well as precise planner guidance. Focused case and complete 568-case owning gate selection pass. |
+| Legacy full-replacement test expects an invented code from a codeless saved-graph helper | Repaired to use the owned candidate-only boundary, actual sink-policy diagnostic, precise code/subject and normalized consumer checks. Ordinary-state fallback and candidate integrity refusal remain intact. |
+| Root negative selector reads only the last digit of multi-digit controls | Corrected in the ignored runner and controlled with real function AST. All 13 transform controls executed their intended modes; earlier single-digit receipts remain valid. |
+| Commit secret scanner flags the deliberate credential canary | Added its documented per-line marker with formatting only. Complete-module AST is unchanged; scoped Ruff check/format pass. Original failed preflight is preserved and normal preflight will be rechecked. |
 
 The earlier title custody stall was an execution-environment investigation,
 not a confirmed additional product defect. The deployed shared-link incident
@@ -912,8 +923,9 @@ Only set_output and patch_output_options change production behavior: pure
 policy admission precedes direct schema access. Actual denied reasons retain
 saved-state refusals; admitted ValueError/KeyError propagates instead of
 becoming availability repair. Shared helpers, source production, public shapes
-and epochs are unchanged. Both independent reviewers accept local integration;
-root Git integration is the next step, not a completed claim here.
+and epochs are unchanged. Both independent reviewers accepted local integration.
+Commit `3f2db4f0` completed with normal hooks and unchanged reviewed bytes;
+post-commit verification confirmed all five committed blobs and a clean tree.
 
 Root completed85 affected behavior cases,448 scanned-input gate cases and18
 focused PostgreSQL rejection cases, each with zero failures/errors/skips. The
@@ -933,3 +945,61 @@ and owning mock gate now have fresh passing evidence; historical source1c
 receipts retain their original scope. Runtime evidence and reviews are under
 output-schema-root-* and reviews/astra-output-schema-*.md in the ignored lane.
 Full plan0–15 continues,16–18 conditional; broader gates and release are open.
+
+### Bounded transform/splice acceptance
+
+At HEAD `3f2db4f0`, both independent correctness/security and systems reviews
+accept the transform/splice packet for normal local integration. Production
+changes remain the six selected declarations and six closed code/guidance
+additions: explicit saved-graph refusals, exact policy/profile reason and admitted
+identity, admitted schema-fault propagation, static safe path guidance, complete
+credential repair payload, and attributed splice counterfactual findings alongside
+standing saved findings. Topology, atomicity, identical/divergent replay, queue
+incomplete-draft success, public shapes, subject grammar and epochs are preserved.
+
+Original positive1 remains red:295 cases,293 passes,2 replay failures. Both
+replay fixtures used an invalid empty fixed schema; the inherited generic
+atomicity test passed before reaching the intended comparison. The narrow repair
+uses admitted divergent options and proves actual prevalidation succeeds. All
+three affected replay cases passed freshly. Exactly292 untouched historical
+passes retain bounded evidence under complete-module and production-input proofs;
+there is no newly executed295-pass aggregate.
+
+Original gates1 also remains red:568 cases,566 passes,2 stale test contracts.
+The repaired count test requires complete standing findings; the renamed
+full-replacement test uses the explicit candidate owner and actual precise sink
+policy diagnostic/code/subject. Both repaired cases pass freshly. The full
+affected gate selection then passed568 cases, with zero failures/errors/skips.
+All13 deliberate families produced147 intended leaf failures with real activation
+witnesses and exact original passing counterpart multisets; missing witnesses,
+setup errors, unrelated failures, missing cases and wrong mutants are rejected.
+Explicit serial focused PostgreSQL passed18 cases, zero failures/errors/skips.
+
+All16 fresh freeze4 runs have6644 identical before/after/current project input
+records, SHA `2eb81fabdc4239421b865ca25ca2a76454e7bb52aac93e9cd9d3f6d3de6c02a7`.
+The final runtime proof recorded all128 matching stopped bindings. Scoped
+Ruff/format, production mypy/contracts and frozen keyless evidence retain exact
+scope; all1968 production/lint/config/project inputs are unchanged by test repairs.
+Keyless remains3277 to3277, zero semantic additions/removals, without operator
+signature clearance. Source/runtime evidence is under transform-splice-* and
+the two final astra-transform-splice review files in the ignored lane.
+
+The combined denied identity/schema control discriminates identity first; it
+does not claim independent schema-only discrimination. The codeless splice test
+injects an explicit helper-boundary input, preserving the planner integrity
+refusal; no naturally occurring codeless producer or public repair trajectory
+was established. Whole-branch/full PostgreSQL, protected CI, signing and release
+remain open. Normal hooks/Git integration are the next step; graph wiring follows.
+
+The current priority remains .7 delivery. John's two .8 messages permit bounded
+exploration/thinking only; the initial streaming/advisor note is preserved in
+the ignored lane and its agent is stopped. No .8 implementation starts from it.
+
+Normal commit preflight caught the deliberate credential literal in the new
+public-guard test. Its documented per-line secret-scan marker changes comments
+and layout only: complete-module AST matches the exact executed original,
+a planted AST change is rejected, and scoped Ruff check/format both exit0.
+The original source611879... and failed preflight are preserved. Historical
+runtime/negative leaf-line evidence remains bound to that exact source; current
+test execution semantics are unchanged. No production change or new runtime
+result is claimed by this housekeeping adjustment.

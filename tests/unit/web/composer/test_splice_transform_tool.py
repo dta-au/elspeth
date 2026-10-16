@@ -17,7 +17,7 @@ from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import MANIFEST, SpliceTransformArgumentsModel, redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
-from elspeth.web.composer.tools._common import ToolContext
+from elspeth.web.composer.tools._common import ToolContext, _prevalidate_transform_for_context
 from elspeth.web.composer.tools._dispatch import execute_tool, get_tool_definitions
 from elspeth.web.composer.tools.transforms import _execute_splice_transform
 from elspeth.web.composer.yaml_generator import generate_public_yaml
@@ -450,13 +450,16 @@ def test_splice_transform_identical_replay_rejects_noncanonical_retained_require
 
 
 def test_splice_transform_same_id_divergent_retry_is_atomic() -> None:
-    first = _execute_splice_transform(_arguments(), _state(), _context())
+    context = _context()
+    first = _execute_splice_transform(_arguments(), _state(), context)
     assert first.success
-    divergent = _arguments(options={"schema": {"mode": "fixed", "fields": []}})
+    divergent = _arguments(options={"schema": {"mode": "observed"}, "required_input_fields": ["text"]})
+    assert _prevalidate_transform_for_context(context, "passthrough", divergent["node"]["options"]) is None
 
-    replay = _execute_splice_transform(divergent, first.updated_state, _context())
+    replay = _execute_splice_transform(divergent, first.updated_state, context)
 
     assert not replay.success
+    assert replay.validation.errors[0].error_code == "splice_replay_conflict"
     assert replay.updated_state is first.updated_state
     assert replay.updated_state.version == first.updated_state.version
 
