@@ -620,16 +620,25 @@ cross-checks every replica name against `az containerapp replica list`.
 Both runtime roles need write access to `web_instances`. Each replica registers
 itself in that table at boot, so a role holding only `SELECT` fails startup with
 `permission denied for table web_instances` and P3 never gets a row to expire.
-The minimum on the session database is read on every table plus two verbs on
-this one:
+From 0.8.7, startup also needs `UPDATE` on `quota_policies` to authorize its
+population lock, even when no container ceiling is configured. For a startup
+proof with no configured quota, the session-database minimum is:
 
 ```sql
 GRANT USAGE ON SCHEMA public TO elspeth_runtime_a;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO elspeth_runtime_a;
 GRANT INSERT, UPDATE ON web_instances TO elspeth_runtime_a;
+GRANT UPDATE ON quota_policies TO elspeth_runtime_a;
 ```
 
-Repeat for `elspeth_runtime_b`. Grant it when you provision the roles: the app
+Repeat for `elspeth_runtime_b`. Existing restricted roles following the older
+minimum need the quota-table grant before upgrading to 0.8.7. These grants do
+not grant DDL or the full DML needed for normal application use. In particular,
+creating a configured policy additionally needs `INSERT` on `quota_policies`
+and the normal Landscape audit-write permissions. Use the maintained bootstrap
+grants for a general runtime role.
+
+Grant these permissions when you provision the roles: the app
 does not fall back to a single-process mode when the role cannot write, because
 a PostgreSQL deployment silently running without membership is the failure this
 table exists to prevent. The AWS ECS Terraform path covers the same requirement
