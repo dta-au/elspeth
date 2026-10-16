@@ -952,35 +952,54 @@ class TestPlannerFeedbackCarriesStructuralFacts:
         assert RAW_HTML_CLEANUP_USER_TERM in suggested_fix
         assert RAW_HTML_CLEANUP_REVIEW_DRAFT in suggested_fix
 
-    def test_rejected_mutation_gates_stale_state_errors_out_of_feedback_and_trail(self) -> None:
-        """A pre-application rejection must not carry the unchanged state's errors.
+    def test_full_replacement_rejection_excludes_saved_findings_from_feedback_and_trail(self) -> None:
+        """The owned full-replacement boundary withholds surviving saved findings.
 
-        Tutorial session 38e3e7f8 (op 1152d7e3, 2026-07-22): every semantic
-        set_pipeline rejection on the empty-seed surface reached the planner
-        as ``['no_sinks_configured', 'no_source_configured', 'validation_error']``
-        — the real reason reduced to a bare placeholder and two red herrings
-        describing a state the planner was not editing (it authors a full
-        replacement pipeline). The planner "converged" by dropping every node.
-        When a ``rejected_mutation`` entry is present, feedback and trail must
-        carry ONLY the rejection entries.
+        Use the actual file-write-policy diagnostic with the candidate helper;
+        this qualifies that boundary and its consumers, not a full set_pipeline
+        producer invocation. Saved-graph mutations retain their standing findings.
         """
         from elspeth.web.composer.pipeline_planner import (
             _allowlisted_candidate_feedback,
             _candidate_rejection_codes,
         )
-        from elspeth.web.composer.tools._common import _failure_result
-
-        result = _failure_result(
-            _empty_state(),
-            "File sink 'json' must set mode explicitly. Use 'write' or 'append'.",
+        from elspeth.web.composer.tools._common import (
+            _candidate_rejection_result,
+            normalize_tool_result_validation,
+            validate_composer_file_sink_collision_policy,
         )
-        # The empty state contributes no_source_configured/no_sinks_configured
-        # to validation.errors — stale-state noise for a full-replacement tool.
-        assert {entry.error_code for entry in result.validation.errors} >= {"no_source_configured", "no_sinks_configured"}
+        from tests.unit.web.composer.test_set_pipeline_candidate import _trained_context
 
-        feedback = _allowlisted_candidate_feedback(result)
-        assert [entry["component"] for entry in feedback["validation"]["errors"]] == ["rejected_mutation"]
-        assert _candidate_rejection_codes(result) == ("validation_error",)
+        state = _empty_state()
+        before = state.to_dict()
+        saved_errors = state.validate().errors
+        assert {entry.error_code for entry in saved_errors} >= {"no_source_configured", "no_sinks_configured"}
+        diagnostic = validate_composer_file_sink_collision_policy("json", {"collision_policy": "auto_increment"}, require_explicit=True)
+        assert diagnostic is not None and "must set mode explicitly" in diagnostic
+        code = "file_sink_write_policy_invalid"
+        result = _candidate_rejection_result(
+            state,
+            diagnostic,
+            error_code=code,
+            rejected_component="output:main",
+        )
+        normalized = normalize_tool_result_validation(result, _trained_context().catalog)
+        assert normalized.validation == result.validation
+        for candidate in (result, normalized):
+            assert not candidate.success and candidate.updated_state is state
+            assert candidate.updated_state.version == state.version and state.to_dict() == before
+            assert candidate.affected_nodes == () and candidate.data is None
+            (entry,) = candidate.validation.errors
+            assert (entry.component, entry.error_code, entry.rejected_component) == ("rejected_mutation", code, "output:main")
+            assert entry.message == diagnostic
+            assert not any(entry in saved_errors for entry in candidate.validation.errors)
+            feedback = _allowlisted_candidate_feedback(candidate)
+            (reported,) = feedback["validation"]["errors"]
+            assert (reported["component"], reported["error_code"]) == ("output:main", code)
+            assert (reported["explanation"], reported["suggested_fix"]) == explain_validation_code(code)
+            assert "message" not in reported and "detail" not in reported
+            assert diagnostic not in repr(feedback)
+            assert _candidate_rejection_codes(candidate) == (code,)
 
     def test_validated_candidate_rejections_pass_through_ungated(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Without a rejected_mutation entry, every real error must survive.

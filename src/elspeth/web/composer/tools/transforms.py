@@ -51,23 +51,24 @@ from elspeth.web.composer.tools._common import (
     _canonical_interpretation_requirement_error,
     _canonicalize_authored_interpretation_requirements,
     _composition_canonical_interpretation_requirement_error,
-    _credential_wiring_contract_failure,
     _discovery_result,
     _echoed_metadata_note,
     _failure_result,
     _mutation_result,
     _normalize_echoed_interpretation_requirements,
     _options_with_default_llm_reviews,
-    _plugin_policy_failure,
+    _plugin_selection_violation,
     _post_mutation_invariant_error,
     _prevalidate_transform_for_context,
     _prohibited_section,
     _reserved_connection_names,
     _row_union_node_contract_error,
     _runtime_owned_llm_option_error,
+    _saved_graph_credential_wiring_contract_failure,
+    _saved_graph_plugin_policy_failure,
+    _saved_graph_rejection_result,
     _validate_aggregation_trigger,
     _validate_mutation_arguments,
-    _validate_plugin_name,
     _validate_transform_provider_config_path,
     _validate_transform_provider_config_policy,
     resolve_failure_route_choice,
@@ -588,7 +589,7 @@ def _execute_upsert_queue_node(
     intrinsic ``queue_node_contract_error`` guard, and mutate (``with_node``)
     only after that check passes. A malformed queue (id != input, any
     forbidden field, unknown/typed option) returns an ordinary
-    ``_failure_result`` and leaves the exact prior state/version unchanged —
+    saved-graph refusal and leaves the exact prior state/version unchanged —
     ``with_node`` is never reached, so the mutation is atomic. A canonical
     queue succeeds and persists even when the resulting pipeline is
     incomplete (missing producers/downstream); completeness is validation
@@ -623,7 +624,9 @@ def _execute_upsert_queue_node(
     )
     contract_error = queue_node_contract_error(node)
     if contract_error is not None:
-        return _failure_result(state, contract_error)
+        return _saved_graph_rejection_result(
+            state, contract_error, error_code="queue_config_invalid", rejected_component=f"node:{validated.id}"
+        )
 
     new_state = state.with_node(node)
     affected = {validated.id}
@@ -641,16 +644,16 @@ def _execute_upsert_node(
 ) -> ToolResult:
     """Add or update a pipeline node."""
     validated = _validate_mutation_arguments(_UpsertNodeArgumentsModel, args, "upsert_node arguments")
+    node_ref = f"node:{validated.id}"
     if validated.node_type == "aggregation" and (validated.output_mode is None or validated.output_mode in OutputMode):
         mode = OutputMode.TRANSFORM if validated.output_mode is None else OutputMode(validated.output_mode)
         count_error = mode.expected_output_count_error(validated.expected_output_count)
         if count_error is not None:
-            return _failure_result(
+            return _saved_graph_rejection_result(
                 state,
                 count_error,
                 error_code="aggregation_expected_output_count_mode_invalid",
-                rejected_component=f"node:{validated.id}",
-                with_state_validation=False,
+                rejected_component=node_ref,
             )
     node_id = validated.id
     node_type = validated.node_type
@@ -668,7 +671,7 @@ def _execute_upsert_node(
                 previous=prior_node.on_error if prior_node is not None else None,
             )
         except FailureRouteChoiceError as exc:
-            return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=f"node:{node_id}")
+            return _saved_graph_rejection_result(state, str(exc), error_code="failure_route_required", rejected_component=node_ref)
     elif node_type == "gate" and "on_error" not in validated.model_fields_set and prior_node is not None:
         on_error = prior_node.on_error
     # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
@@ -685,8 +688,10 @@ def _execute_upsert_node(
         component_id=node_id,
     )
     if runtime_owned_error is not None:
-        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in node_options else None
-        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
+        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in node_options else "plugin_options_invalid"
+        return _saved_graph_rejection_result(
+            state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code, rejected_component=node_ref
+        )
     node_options = _canonicalize_authored_interpretation_requirements(
         node_options,
         component_id=node_id,
@@ -703,10 +708,11 @@ def _execute_upsert_node(
         tool_name="upsert_node",
     )
     if canonical_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             f"Node '{node_id}': {canonical_error}",
             error_code="interpretation_requirements_invalid",
+            rejected_component=node_ref,
         )
     if node_type == "queue":
         # Canonical invariant B applies to structural queues too; the queue
@@ -715,7 +721,7 @@ def _execute_upsert_node(
             validated.model_copy(update={"options": dict(review_options)}),
             state,
         )
-    credential_error = _credential_wiring_contract_failure(
+    credential_error = _saved_graph_credential_wiring_contract_failure(
         state,
         component_id=node_id,
         component_type="node",
@@ -733,17 +739,22 @@ def _execute_upsert_node(
     # Collectors reuse the batch-transform plugin contract, so their plugin
     # runs the same policy/prevalidation gates (barrier-scopes spec §3).
     if node_type in ("transform", "aggregation", "collector") and plugin is not None:
-        plugin_error = _validate_plugin_name(context, "transform", plugin)
+        plugin_error = _plugin_selection_violation(context, "transform", plugin)
         if plugin_error is not None:
-            return _plugin_policy_failure(state, plugin_error)
+            return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=node_ref)
+        context.catalog.get_schema("transform", plugin)
 
         batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, validated.output_mode)
         if batch_placement_error is not None:
-            return _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced")
+            return _saved_graph_rejection_result(
+                state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref
+            )
 
         batch_required_error = _batch_aware_required_input_fields_error(node_id, plugin, node_options)
         if batch_required_error is not None:
-            return _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid")
+            return _saved_graph_rejection_result(
+                state, batch_required_error, error_code="batch_required_fields_invalid", rejected_component=node_ref
+            )
 
         # Before prevalidation, which withholds a top-level inline_content marker
         # as a deferred value: an LLM-authored blob in an llm prompt surface or
@@ -756,14 +767,17 @@ def _execute_upsert_node(
             options=review_options,
         )
         if prompt_surface_error is not None:
-            return _failure_result(state, prompt_surface_error)
+            return _saved_graph_rejection_result(
+                state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref
+            )
 
         prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
         if prevalidation_error is not None:
-            return _failure_result(
+            return _saved_graph_rejection_result(
                 state,
                 prevalidation_error[0],
                 error_code=prevalidation_error[1],
+                rejected_component=node_ref,
                 plugin_identity=("transform", plugin),
             )
 
@@ -776,26 +790,39 @@ def _execute_upsert_node(
         if "profile" not in review_options:
             provider_policy_error = _validate_transform_provider_config_policy(review_options, plugin=plugin)
             if provider_policy_error is not None:
-                return _failure_result(state, f"Node '{node_id}': {provider_policy_error}")
+                return _saved_graph_rejection_result(
+                    state, f"Node '{node_id}': {provider_policy_error}", error_code="llm_retry_budget_policy", rejected_component=node_ref
+                )
 
         provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
         if provider_path_error is not None:
-            return _failure_result(state, f"Node '{node_id}': {provider_path_error}")
+            return _saved_graph_rejection_result(
+                state,
+                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                error_code="provider_config_path_policy_invalid",
+                rejected_component=node_ref,
+            )
 
     condition = validated.condition
     if node_type == "gate" and condition is not None:
         expr_error = _validate_gate_expression(condition)
         if expr_error is not None:
-            return _failure_result(state, f"Node '{node_id}': {expr_error}")
+            return _saved_graph_rejection_result(
+                state, f"Node '{node_id}': {expr_error}", error_code="gate_condition_invalid", rejected_component=node_ref
+            )
         parity_error = _validate_gate_route_parity(condition, validated.routes)
         if parity_error is not None:
-            return _failure_result(state, f"Node '{node_id}': {parity_error}", error_code="gate_route_labels_mismatch")
+            return _saved_graph_rejection_result(
+                state, f"Node '{node_id}': {parity_error}", error_code="gate_route_labels_mismatch", rejected_component=node_ref
+            )
     if node_type == "aggregation":
         trigger_error = _validate_aggregation_trigger(
             validated.trigger.model_dump(exclude_unset=True) if validated.trigger is not None else None
         )
         if trigger_error is not None:
-            return _failure_result(state, f"Node '{node_id}': {trigger_error}")
+            return _saved_graph_rejection_result(
+                state, f"Node '{node_id}': {trigger_error}", error_code="aggregation_trigger_invalid", rejected_component=node_ref
+            )
 
     fork_to: tuple[str, ...] | None = tuple(validated.fork_to) if validated.fork_to is not None else None
 
@@ -835,7 +862,7 @@ def _execute_upsert_node(
     )
     if row_union_contract_error is not None:
         message, error_code = row_union_contract_error
-        return _failure_result(state, message, error_code=error_code)
+        return _saved_graph_rejection_result(state, message, error_code=error_code, rejected_component=node_ref)
 
     proposed_state = state.with_node(node)
     # Scalar routes committed here are the runtime authority; any visual edge
@@ -845,18 +872,21 @@ def _execute_upsert_node(
     invariant_error = _post_mutation_invariant_error(proposed_state)
     if invariant_error is not None:
         message, error_code = invariant_error
-        return _failure_result(state, message, error_code=error_code)
+        return _saved_graph_rejection_result(state, message, error_code=error_code, rejected_component=None)
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+            rejected_component=None,
         )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
-        return _failure_result(state, review_contract_error)
+        return _saved_graph_rejection_result(
+            state, review_contract_error, error_code="interpretation_review_contract_unsatisfied", rejected_component=None
+        )
 
     # Affected: the node itself plus nodes with edges referencing it
     affected = {node_id}
@@ -1173,15 +1203,30 @@ def _execute_splice_transform(
     predecessor_id = validated.predecessor_id
     successor_id = validated.successor_id
     node_args = validated.node
+    node_ref = f"node:{node_args.id}"
     if predecessor_id == successor_id or node_args.id in {predecessor_id, successor_id}:
-        return _failure_result(state, "Splice predecessor, successor, and inserted node IDs must be distinct.")
+        return _saved_graph_rejection_result(
+            state,
+            "Splice predecessor, successor, and inserted node IDs must be distinct.",
+            error_code="splice_ids_not_distinct",
+            rejected_component=None,
+        )
     if len({node.id for node in state.nodes}) != len(state.nodes):
-        return _failure_result(state, "splice_transform refuses a state with duplicate node IDs.")
+        return _saved_graph_rejection_result(
+            state, "splice_transform refuses a state with duplicate node IDs.", error_code="duplicate_node_id", rejected_component=None
+        )
     if len({edge.id for edge in state.edges}) != len(state.edges):
-        return _failure_result(state, "splice_transform refuses a state with duplicate edge IDs.")
+        return _saved_graph_rejection_result(
+            state, "splice_transform refuses a state with duplicate edge IDs.", error_code="duplicate_edge_id", rejected_component=None
+        )
     successor = next((node for node in state.nodes if node.id == successor_id), None)
     if successor is None:
-        return _failure_result(state, f"Splice successor '{successor_id}' not found or is not a transform.")
+        return _saved_graph_rejection_result(
+            state,
+            f"Splice successor '{successor_id}' not found or is not a transform.",
+            error_code="node_not_found",
+            rejected_component=f"node:{successor_id}",
+        )
 
     existing = next((node for node in state.nodes if node.id == node_args.id), None)
     if existing is not None:
@@ -1192,7 +1237,7 @@ def _execute_splice_transform(
             inserted=existing,
         )
         if topology_error is not None:
-            return _failure_result(state, topology_error)
+            return _saved_graph_rejection_result(state, topology_error, error_code="splice_topology_unsupported", rejected_component=None)
         prepared_replay = _prepare_transform_candidate(
             state=state,
             context=context,
@@ -1213,18 +1258,29 @@ def _execute_splice_transform(
         try:
             identical = _normalized_splice_node_projection(replay_node) == _normalized_splice_node_projection(existing)
         except (KeyError, TypeError, ValueError):
-            return _failure_result(state, f"Node '{node_args.id}' already exists with a divergent splice definition.")
+            return _saved_graph_rejection_result(
+                state,
+                f"Node '{node_args.id}' already exists with a divergent splice definition.",
+                error_code="splice_replay_conflict",
+                rejected_component=node_ref,
+            )
         if not identical:
-            return _failure_result(state, f"Node '{node_args.id}' already exists with a divergent splice definition.")
+            return _saved_graph_rejection_result(
+                state,
+                f"Node '{node_args.id}' already exists with a divergent splice definition.",
+                error_code="splice_replay_conflict",
+                rejected_component=node_ref,
+            )
         canonical_error = _composition_canonical_interpretation_requirement_error(
             state,
             tool_name="splice_transform",
         )
         if canonical_error is not None:
-            return _failure_result(
+            return _saved_graph_rejection_result(
                 state,
                 canonical_error,
                 error_code="interpretation_requirements_invalid",
+                rejected_component=None,
             )
         return _mutation_result(
             state,
@@ -1239,10 +1295,15 @@ def _execute_splice_transform(
         )
 
     if node_args.id in state.sources or node_args.id in {output.name for output in state.outputs}:
-        return _failure_result(state, f"Inserted node ID '{node_args.id}' collides with an existing source or sink.")
+        return _saved_graph_rejection_result(
+            state,
+            f"Inserted node ID '{node_args.id}' collides with an existing source or sink.",
+            error_code="node_id_collides_with_source_or_sink",
+            rejected_component=node_ref,
+        )
     topology_error = _splice_topology_error(state, predecessor_id=predecessor_id, successor=successor)
     if topology_error is not None:
-        return _failure_result(state, topology_error)
+        return _saved_graph_rejection_result(state, topology_error, error_code="splice_topology_unsupported", rejected_component=None)
     predecessor = _splice_predecessor(state, predecessor_id)
     assert predecessor is not None
     predecessor_output = predecessor.on_success
@@ -1254,10 +1315,20 @@ def _execute_splice_transform(
     )
     connection_name = _splice_connection_name(node_args.id, state)
     if connection_name is None:
-        return _failure_result(state, "No bounded collision-free splice connection name is available.")
+        return _saved_graph_rejection_result(
+            state,
+            "No bounded collision-free splice connection name is available.",
+            error_code="splice_derivation_conflict",
+            rejected_component=node_ref,
+        )
     new_edge_id = _splice_edge_id(direct_edge.id, node_args.id)
     if new_edge_id in {edge.id for edge in state.edges}:
-        return _failure_result(state, f"Derived splice edge ID '{new_edge_id}' collides with an existing edge.")
+        return _saved_graph_rejection_result(
+            state,
+            f"Derived splice edge ID '{new_edge_id}' collides with an existing edge.",
+            error_code="splice_derivation_conflict",
+            rejected_component=node_ref,
+        )
     prepared = _prepare_transform_candidate(
         state=state,
         context=context,
@@ -1300,32 +1371,37 @@ def _execute_splice_transform(
         tool_name="splice_transform",
     )
     if canonical_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             canonical_error,
             error_code="interpretation_requirements_invalid",
+            rejected_component=None,
         )
     try:
         reconciled = reconcile_authoritative_reviews(state, proposed)
     except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+            rejected_component=None,
         )
     canonical_error = _composition_canonical_interpretation_requirement_error(
         reconciled,
         tool_name="splice_transform",
     )
     if canonical_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             canonical_error,
             error_code="interpretation_requirements_invalid",
+            rejected_component=None,
         )
     review_contract_error = composition_review_contract_error(reconciled)
     if review_contract_error is not None:
-        return _failure_result(state, review_contract_error)
+        return _saved_graph_rejection_result(
+            state, review_contract_error, error_code="interpretation_review_contract_unsatisfied", rejected_component=None
+        )
     profile_validation = context.catalog.validate_composition_state(reconciled)
     if not profile_validation.validation.is_valid:
         return _splice_validation_rejection(
@@ -1398,7 +1474,9 @@ def _splice_validation_rejection(
         for entry in candidate_errors
         if (entry.component, entry.error_code, entry.message) not in prior_keys
     )
-    rejection = _failure_result(state, _SPLICE_VALIDATION_FAILED_MESSAGE, error_code="splice_validation_failed")
+    rejection = _saved_graph_rejection_result(
+        state, _SPLICE_VALIDATION_FAILED_MESSAGE, error_code="splice_validation_failed", rejected_component=None
+    )
     leading, *standing = rejection.validation.errors
     return replace(
         rejection,
@@ -1653,13 +1731,18 @@ def _execute_patch_node_options(
             category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
     node_id = validated.node_id
+    node_ref = f"node:{node_id}"
     patch: Mapping[str, Any] = validated.patch
     current = next((n for n in state.nodes if n.id == node_id), None)
     if current is None:
-        return _failure_result(state, f"Node '{node_id}' not found.")
+        return _saved_graph_rejection_result(
+            state, f"Node '{node_id}' not found.", error_code="node_not_found", rejected_component=node_ref
+        )
     routing_patch_error = _node_routing_option_patch_error(patch, node_type=current.node_type)
     if routing_patch_error is not None:
-        return _failure_result(state, routing_patch_error)
+        return _saved_graph_rejection_result(
+            state, routing_patch_error, error_code="node_routing_patch_invalid", rejected_component=node_ref
+        )
     # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
     # from the stored node reduce to author shells; the reconciliation pass
     # below restores the server rows. Non-matching values still reject.
@@ -1674,8 +1757,10 @@ def _execute_patch_node_options(
         component_id=node_id,
     )
     if runtime_owned_error is not None:
-        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in patch else None
-        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
+        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in patch else "plugin_options_invalid"
+        return _saved_graph_rejection_result(
+            state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code, rejected_component=node_ref
+        )
     if (
         current.plugin == "llm"
         and current.options.get(PROMPT_TEMPLATE_PARTS_KEY) is not None
@@ -1683,11 +1768,12 @@ def _execute_patch_node_options(
         and patch["prompt_template"] != current.options.get("prompt_template")
         and PROMPT_TEMPLATE_PARTS_KEY not in patch
     ):
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             f"Node '{node_id}': edit prompt_template_parts to change this structured prompt, "
             "preserving its interpretation_ref entries; prompt_template is compiled from those parts.",
             error_code="prompt_template_parts_required",
+            rejected_component=node_ref,
         )
     patch = _canonicalize_authored_interpretation_requirements(
         patch,
@@ -1706,12 +1792,13 @@ def _execute_patch_node_options(
         tool_name="patch_node_options",
     )
     if canonical_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             f"Node '{node_id}': {canonical_error}",
             error_code="interpretation_requirements_invalid",
+            rejected_component=node_ref,
         )
-    credential_error = _credential_wiring_contract_failure(
+    credential_error = _saved_graph_credential_wiring_contract_failure(
         state,
         component_id=node_id,
         component_type="node",
@@ -1725,19 +1812,24 @@ def _execute_patch_node_options(
     if current.node_type in ("transform", "aggregation", "collector") and current.plugin is not None:
         # State-held plugin: resolve it through the request's policy view
         # before prevalidation stamps it (see _execute_patch_source_options).
-        plugin_error = _validate_plugin_name(context, "transform", current.plugin)
+        plugin_error = _plugin_selection_violation(context, "transform", current.plugin)
         if plugin_error is not None:
-            return _plugin_policy_failure(state, plugin_error)
+            return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=node_ref)
+        context.catalog.get_schema("transform", current.plugin)
         # The batch-aware guards upsert_node, splice_transform and set_pipeline
         # run, in the same order. Without them a required_input_fields patch
         # on a batch-aware node reached plugin construction, whose fail-closed
         # FrameworkBugError escaped the tool and ended the turn as a 500.
         batch_placement_error = _batch_aware_placement_error(node_id, current.node_type, current.plugin, current.output_mode)
         if batch_placement_error is not None:
-            return _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced")
+            return _saved_graph_rejection_result(
+                state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref
+            )
         batch_required_error = _batch_aware_required_input_fields_error(node_id, current.plugin, new_options)
         if batch_required_error is not None:
-            return _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid")
+            return _saved_graph_rejection_result(
+                state, batch_required_error, error_code="batch_required_fields_invalid", rejected_component=node_ref
+            )
 
         # Same refusal upsert_node and splice_transform apply, on the merged options.
         prompt_surface_error = _llm_authored_inline_prompt_surface_error(
@@ -1748,19 +1840,21 @@ def _execute_patch_node_options(
             options=new_options,
         )
         if prompt_surface_error is not None:
-            return _failure_result(state, prompt_surface_error)
+            return _saved_graph_rejection_result(
+                state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref
+            )
 
     new_node = replace(current, options=new_options)
     # Third canonical mutation boundary: a patch that would break a queue's
     # intrinsic contract is rejected before creating the candidate state.
     queue_contract_error = queue_node_contract_error(new_node)
     if queue_contract_error is not None:
-        return _failure_result(state, queue_contract_error)
+        return _saved_graph_rejection_result(state, queue_contract_error, error_code="queue_config_invalid", rejected_component=node_ref)
     proposed_state = state.with_node(new_node)
     invariant_error = _post_mutation_invariant_error(proposed_state)
     if invariant_error is not None:
         message, error_code = invariant_error
-        return _failure_result(state, message, error_code=error_code)
+        return _saved_graph_rejection_result(state, message, error_code=error_code, rejected_component=None)
     try:
         # Reconciliation invalidates inherited approval and renders structured
         # prompts. Verify the stored evidence first so an unrelated patch cannot
@@ -1773,20 +1867,22 @@ def _execute_patch_node_options(
             raise ValueError("Stored approved_prompt_artifact_hash does not match the current prompt artifact")
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+            rejected_component=None,
         )
     reconciled_node = next(node for node in new_state.nodes if node.id == node_id)
     reconciled_options = reconciled_node.options
     if current.node_type in ("transform", "aggregation", "collector") and current.plugin is not None:
         prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, reconciled_options)
         if prevalidation_error is not None:
-            return _failure_result(
+            return _saved_graph_rejection_result(
                 state,
                 prevalidation_error[0],
                 error_code=prevalidation_error[1],
+                rejected_component=node_ref,
                 plugin_identity=("transform", current.plugin),
             )
 
@@ -1798,17 +1894,26 @@ def _execute_patch_node_options(
         if "profile" not in reconciled_options:
             provider_policy_error = _validate_transform_provider_config_policy(reconciled_options, plugin=current.plugin)
             if provider_policy_error is not None:
-                return _failure_result(state, f"Node '{node_id}': {provider_policy_error}")
+                return _saved_graph_rejection_result(
+                    state, f"Node '{node_id}': {provider_policy_error}", error_code="llm_retry_budget_policy", rejected_component=node_ref
+                )
 
         # S2: confine nested provider_config persist_directory (RAG retrieval).
         # A merge-patch can introduce an escaping path just as upsert_node can.
         provider_path_error = _validate_transform_provider_config_path(reconciled_options, context.data_dir, session_id=context.session_id)
         if provider_path_error is not None:
-            return _failure_result(state, f"Node '{node_id}': {provider_path_error}")
+            return _saved_graph_rejection_result(
+                state,
+                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                error_code="provider_config_path_policy_invalid",
+                rejected_component=node_ref,
+            )
 
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
-        return _failure_result(state, review_contract_error)
+        return _saved_graph_rejection_result(
+            state, review_contract_error, error_code="interpretation_review_contract_unsatisfied", rejected_component=None
+        )
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
     return _mutation_result(
         new_state,
@@ -1913,12 +2018,15 @@ def _prepare_transform_candidate(
     description: str | None = None,
 ) -> NodeSpec | ToolResult:
     """Validate and prepare one transform candidate without mutating state."""
+    node_ref = f"node:{node_id}"
     try:
         on_error = resolve_failure_route_choice(on_error, supplied=True, field="on_error")
     except FailureRouteChoiceError as exc:
-        return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=f"node:{node_id}")
+        return _saved_graph_rejection_result(state, str(exc), error_code="failure_route_required", rejected_component=node_ref)
     if plugin is None:
-        return _failure_result(state, f"Node '{node_id}': transform plugin is required.")
+        return _saved_graph_rejection_result(
+            state, f"Node '{node_id}': transform plugin is required.", error_code="transform_missing_plugin", rejected_component=node_ref
+        )
     runtime_owned_error = _runtime_owned_llm_option_error(
         plugin,
         options,
@@ -1926,8 +2034,10 @@ def _prepare_transform_candidate(
         component_id=node_id,
     )
     if runtime_owned_error is not None:
-        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in options else None
-        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
+        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in options else "plugin_options_invalid"
+        return _saved_graph_rejection_result(
+            state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code, rejected_component=node_ref
+        )
     options = _canonicalize_authored_interpretation_requirements(
         options,
         component_id=node_id,
@@ -1944,12 +2054,13 @@ def _prepare_transform_candidate(
         tool_name=tool_name,
     )
     if canonical_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             f"Node '{node_id}': {canonical_error}",
             error_code="interpretation_requirements_invalid",
+            rejected_component=node_ref,
         )
-    credential_error = _credential_wiring_contract_failure(
+    credential_error = _saved_graph_credential_wiring_contract_failure(
         state,
         component_id=node_id,
         component_type="node",
@@ -1959,15 +2070,20 @@ def _prepare_transform_candidate(
     )
     if credential_error is not None:
         return credential_error
-    plugin_error = _validate_plugin_name(context, "transform", plugin)
+    plugin_error = _plugin_selection_violation(context, "transform", plugin)
     if plugin_error is not None:
-        return _plugin_policy_failure(state, plugin_error)
+        return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=node_ref)
+    context.catalog.get_schema("transform", plugin)
     batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, output_mode)
     if batch_placement_error is not None:
-        return _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced")
+        return _saved_graph_rejection_result(
+            state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref
+        )
     batch_required_error = _batch_aware_required_input_fields_error(node_id, plugin, review_options)
     if batch_required_error is not None:
-        return _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid")
+        return _saved_graph_rejection_result(
+            state, batch_required_error, error_code="batch_required_fields_invalid", rejected_component=node_ref
+        )
 
     # Same refusal upsert_node and patch_node_options apply (both splice arms).
     prompt_surface_error = _llm_authored_inline_prompt_surface_error(
@@ -1978,14 +2094,17 @@ def _prepare_transform_candidate(
         options=review_options,
     )
     if prompt_surface_error is not None:
-        return _failure_result(state, prompt_surface_error)
+        return _saved_graph_rejection_result(
+            state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref
+        )
 
     prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
     if prevalidation_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             prevalidation_error[0],
             error_code=prevalidation_error[1],
+            rejected_component=node_ref,
             plugin_identity=("transform", plugin),
         )
     # Operator-profiled nodes carry their private provider config (retry budget /
@@ -1996,14 +2115,23 @@ def _prepare_transform_candidate(
     if "profile" not in review_options:
         provider_policy_error = _validate_transform_provider_config_policy(review_options, plugin=plugin)
         if provider_policy_error is not None:
-            return _failure_result(state, f"Node '{node_id}': {provider_policy_error}")
+            return _saved_graph_rejection_result(
+                state, f"Node '{node_id}': {provider_policy_error}", error_code="llm_retry_budget_policy", rejected_component=node_ref
+            )
     provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
     if provider_path_error is not None:
-        return _failure_result(state, f"Node '{node_id}': {provider_path_error}")
+        return _saved_graph_rejection_result(
+            state,
+            "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+            error_code="provider_config_path_policy_invalid",
+            rejected_component=node_ref,
+        )
     if node_type == "aggregation":
         trigger_error = _validate_aggregation_trigger(dict(trigger) if trigger is not None else None)
         if trigger_error is not None:
-            return _failure_result(state, f"Node '{node_id}': {trigger_error}")
+            return _saved_graph_rejection_result(
+                state, f"Node '{node_id}': {trigger_error}", error_code="aggregation_trigger_invalid", rejected_component=node_ref
+            )
 
     return NodeSpec(
         id=node_id,

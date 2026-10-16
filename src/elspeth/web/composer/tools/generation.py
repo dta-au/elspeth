@@ -1616,6 +1616,36 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "Remove the named keys from the gate's options. Express the routing decision in the gate's condition and "
         "routes (plus fork_to and on_error where needed), not in options.",
     ),
+    DirectValidationGuidance(
+        "node_not_found",
+        "The requested saved node is not present in this composition.",
+        "Inspect the current pipeline and select the intended existing node ID. If a new node is intended, author it explicitly with upsert_node before referring to it.",
+    ),
+    DirectValidationGuidance(
+        "node_routing_patch_invalid",
+        "The options patch contains node routing fields, which are not plugin options.",
+        "Use upsert_node to edit input, on_success, on_error, routes or fork_to while retaining the intended node options. Preserve the user's failure choice; gates use on_error only for their supported error route.",
+    ),
+    DirectValidationGuidance(
+        "splice_ids_not_distinct",
+        "A splice needs distinct predecessor, successor and inserted-node IDs.",
+        "Inspect the intended path and name its existing predecessor and successor separately. Choose a distinct inserted-node ID without replacing either endpoint.",
+    ),
+    DirectValidationGuidance(
+        "splice_topology_unsupported",
+        "The requested splice is not an unambiguous direct source-or-transform to transform path, or its replay topology is not canonical.",
+        "Inspect the current nodes, scalar routes and visual edges. Select an existing direct linear path supported by splice_transform, preserving intentional branches and error routes; do not delete unrelated graph objects to force a splice.",
+    ),
+    DirectValidationGuidance(
+        "splice_replay_conflict",
+        "The inserted-node ID already names a different splice definition. Only an identical splice can be replayed without advancing the version.",
+        "Inspect the existing inserted node and retry its identical definition if replay is intended. For a different transform, choose an intentional distinct ID and path; do not overwrite the existing splice implicitly.",
+    ),
+    DirectValidationGuidance(
+        "splice_derivation_conflict",
+        "The splice cannot derive a bounded nonconflicting connection or visual edge identifier for the proposed inserted node.",
+        "Inspect the existing graph and choose an intentional nonconflicting inserted-node ID, then retry the same intended path. Preserve existing nodes, connections and edges.",
+    ),
     # Leading entry of a splice_transform rejection; the planner's redacted
     # repair feedback resolves it by code like every other entry.
     DirectValidationGuidance(
