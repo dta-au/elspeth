@@ -371,6 +371,9 @@ class AdvisorCheckpointOwner:
         # only optional field — we test "in arguments" rather than .get() to
         # keep the Tier-3 trust-boundary rules clean.
         user_msg = _advisor_context.build_advisor_user_message(arguments)
+        char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
+        if len(user_msg) > char_cap:
+            raise InvariantError("Advisor input exceeded its admitted complete-message budget")
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_msg},
@@ -634,20 +637,11 @@ class AdvisorCheckpointOwner:
         topology/field-contract coherence because it receives no user intent.
         """
         pipeline_summary = _advisor_context.summarize_pipeline_for_advisor(state)
-        # The checkpoint path bypasses ``_validate_advisor_arguments`` (Tier-1
-        # backend-produced arguments), so the per-value budgets inside the
-        # summary were previously its ONLY size control and nothing bounded
-        # their sum across a whole pipeline. Bound the published excerpt to the
-        # same figure the tool path caps its whole message at; the evidence
-        # IDENTITY hashes (here and the loop-invariant one in the gate) stay
-        # over the complete summary so a repair to a withheld line still moves
-        # the identity.
-        schema_excerpt = _advisor_context.bound_advisor_pipeline_summary(
-            pipeline_summary,
-            self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN,
-        )
+        # Keep identity over complete evidence. Only its optional published
+        # prefix is fitted, after every mandatory phase field is assembled.
+        char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
         if phase == "early":
-            return {
+            early_arguments = {
                 "trigger": ADVISOR_TRIGGER_DETERMINISTIC_EARLY,
                 "problem_summary": (
                     "Review this pipeline APPROACH early (it was just established). "
@@ -657,8 +651,10 @@ class AdvisorCheckpointOwner:
                 ),
                 "recent_errors": [],
                 "attempted_actions": [],
-                "schema_excerpt": schema_excerpt,
+                "schema_excerpt": pipeline_summary,
             }
+            early_arguments["schema_excerpt"] = _advisor_context.bound_advisor_checkpoint_summary(early_arguments, char_cap)
+            return early_arguments
         review_state = advisor_review_state or _AdvisorReviewState()
         current_evidence_hash = stable_hash({"advisor_evidence": pipeline_summary})
         pass_context = ""
@@ -720,7 +716,7 @@ class AdvisorCheckpointOwner:
             ),
             "recent_errors": recent_errors,
             "attempted_actions": attempted_actions,
-            "schema_excerpt": schema_excerpt,
+            "schema_excerpt": pipeline_summary,
         }
         if user_message is not None and user_message.strip():
             end_arguments["user_message"] = _advisor_context.truncate_advisor_text(user_message, _ADVISOR_USER_MESSAGE_MAX_CHARS)
@@ -728,6 +724,7 @@ class AdvisorCheckpointOwner:
             if type(publication_review) is not AdvisorPublicationReview:
                 raise TypeError("END publication review must be an owned snapshot")
             end_arguments["publication_review"] = publication_review
+        end_arguments["schema_excerpt"] = _advisor_context.bound_advisor_checkpoint_summary(end_arguments, char_cap)
         return end_arguments
 
     def _advisor_blocked_result(
@@ -1165,23 +1162,14 @@ class AdvisorCheckpointOwner:
             advisor_review_state=advisor_review_state,
             publication_review=publication_review,
         )
-        if phase == "end" and publication_review is not None:
-            char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
-            if len(_advisor_context.build_advisor_user_message(arguments)) > char_cap:
-                # No dispatch and no completed-pass record: the complete reply
-                # cannot be reviewed under this request's existing bound.
-                return AdvisorCheckpointVerdict(
-                    ok=False,
-                    blocking=False,
-                    findings_text="Review input exceeds the existing advisor budget.",
-                    failure_class="budget_exhausted",
-                )
+        char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
         attempts = 2  # bounded retry; the underlying call wraps its own timeout
         provider_failures: tuple[type[Exception], ...] = (TimeoutError, ConnectionError, *advisor_provider_failure_types())
         last_exc: Exception | None = None
         last_response_unparseable = False
         last_failure_retryable = True
         call_arguments: dict[str, Any] = arguments
+        format_reprompt_pending = False
 
         def provider_dispatched() -> None:
             nonlocal provider_attempts, format_reprompt_sent
@@ -1190,9 +1178,24 @@ class AdvisorCheckpointOwner:
             # Quota admission is awaited before the physical provider call.
             # A timeout there must not fabricate a call or a sent re-prompt.
             provider_attempts += 1
-            format_reprompt_sent = format_reprompt_sent or call_arguments is not arguments
+            format_reprompt_sent = format_reprompt_sent or format_reprompt_pending
 
         for _ in range(attempts):
+            if format_reprompt_pending:
+                # Refit the ORIGINAL evidence, not a prefix whose omission
+                # marker would be mistaken for an original evidence line.
+                call_arguments = {**call_arguments, "schema_excerpt": _advisor_context.summarize_pipeline_for_advisor(state)}
+                call_arguments["schema_excerpt"] = _advisor_context.bound_advisor_checkpoint_summary(call_arguments, char_cap)
+            if len(_advisor_context.build_advisor_user_message(call_arguments)) > char_cap:
+                # Expected size exhaustion is not a completed model review.
+                # Preserve any prior actual call, but spend no further attempt.
+                return AdvisorCheckpointVerdict(
+                    ok=False,
+                    blocking=False,
+                    findings_text="Review input exceeds the existing advisor budget.",
+                    failure_class="budget_exhausted",
+                    retryable=False,
+                )
             if continuation_budget is not None and not continuation_budget.reserve_attempt(now=_compose_deadline_time()):
                 return continuation_withheld()
             remaining: float | None = None
@@ -1244,8 +1247,10 @@ class AdvisorCheckpointOwner:
                         first_attempt_schema_valid = False
                         first_attempt_accepted = False
                     call_arguments = _advisor_policy.advisor_arguments_with_format_reprompt(arguments, schema_valid=False)
+                    format_reprompt_pending = True
                 else:
                     call_arguments = arguments
+                    format_reprompt_pending = False
                 continue
             except provider_failures as exc:
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
@@ -1256,6 +1261,7 @@ class AdvisorCheckpointOwner:
                 last_exc = exc
                 last_response_unparseable = False
                 call_arguments = arguments
+                format_reprompt_pending = False
                 failure = classify_provider_failure(exc)
                 last_failure_retryable = failure is None or failure.retryable
                 if not last_failure_retryable:
@@ -1285,6 +1291,7 @@ class AdvisorCheckpointOwner:
             call_arguments = _advisor_policy.advisor_arguments_with_format_reprompt(
                 arguments, schema_valid=verdict.response_schema_valid is True
             )
+            format_reprompt_pending = True
         if last_response_unparseable:
             # The advisor was REACHABLE on the final attempt and still returned
             # no verdict. That is MALFORMED, not unavailable — the distinction
