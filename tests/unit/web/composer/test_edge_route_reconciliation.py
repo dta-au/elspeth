@@ -14,8 +14,16 @@ one runtime routing decision. This module pins the reconciliation contract:
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import replace
+from typing import Any, Literal
 
+import pytest
+
+from elspeth.web.composer.discovery_cache import serialize_tool_result
+from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
+from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+from elspeth.web.composer.redaction import redact_tool_call_response
+from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
@@ -24,9 +32,19 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.composer.tools import transforms
+from elspeth.web.composer.tools._common import ToolContext, ToolResult, normalize_tool_result_validation
+from elspeth.web.composer.tools._dispatch import execute_tool as dispatch_tool
+from elspeth.web.composer.tools.generation import explain_validation_code, validation_guidance_items
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.interpretation_state import pending_execution_interpretation_sites
+from elspeth.web.plugin_policy.models import PluginId, PluginUnavailableReason
+from tests.unit.web.composer import test_transform_rejection_contracts as rejection_fixtures
+from tests.unit.web.composer import test_transform_tools_review_and_guard_parity as review_fixtures
 from tests.unit.web.composer.test_tools import (
     _empty_state,
     _mock_catalog,
+    _restricted_policy_pair,
     execute_tool,
 )
 
@@ -700,3 +718,228 @@ def test_coalesce_on_error_rejection_names_the_supported_alternatives() -> None:
     # ``'best_effort'`` and ``'quorum'`` and is described on its own.
     assert "'first' merges on the first arrival" in message
     assert "ask the user" in message
+
+
+GraphSurface = Literal["handler", "dispatch"]
+
+
+def _invoke_graph(surface: GraphSurface, tool: str, args: dict[str, Any], state: CompositionState, context: ToolContext) -> ToolResult:
+    if surface == "handler":
+        return {
+            "upsert_edge": transforms._handle_upsert_edge,
+            "remove_node": transforms._handle_remove_node,
+            "remove_edge": transforms._handle_remove_edge,
+        }[tool](args, state, context)
+    return dispatch_tool(tool, args, state, context.catalog, plugin_snapshot=context.plugin_snapshot)
+
+
+def _assert_graph_refusal(
+    result: ToolResult, state: CompositionState, context: ToolContext, surface: GraphSurface, code: str, subject: str | None
+) -> None:
+    standing = state.validate() if surface == "handler" else context.catalog.validate_composition_state(state).validation
+    rejection_fixtures._assert_refusal(result, state, code, subject, standing)
+    assert result.validation.errors[0].plugin_identity is None and result.plugin_schemas is None
+    # The established policy fixture uses the canonical snapshot constructor;
+    # denying a referenced installed plugin changes actual standing validation,
+    # rather than changing only an otherwise equivalent snapshot hash.
+    if state.outputs:
+        output = state.outputs[0]
+        plugin_id, component = PluginId("sink", output.plugin), f"output:{output.name}"
+    else:
+        # The existing shield-review fixture intentionally has no sinks.
+        node = next(node for node in state.nodes if node.plugin is not None)
+        plugin_id, component = PluginId("transform", node.plugin), f"node:{node.id}"
+    assert context.catalog.unavailable_reason(plugin_id) is None
+    other_view, other_snapshot = _restricted_policy_pair(create_catalog_service(), plugin_id)
+    assert other_snapshot.snapshot_hash != context.plugin_snapshot.snapshot_hash
+    assert other_view.unavailable_reason(plugin_id) is PluginUnavailableReason.NOT_AUTHORIZED
+    other_standing = other_view.validate_composition_state(state).validation
+    assert other_standing != context.catalog.validate_composition_state(state).validation
+    assert any(
+        (entry.component, entry.error_code) == (component, PluginUnavailableReason.NOT_AUTHORIZED.value) for entry in other_standing.errors
+    )
+    normalized = normalize_tool_result_validation(result, other_view)
+    rejection_fixtures._assert_refusal(normalized, state, code, subject, other_standing)
+    feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"]
+    assert len(feedback) == 1
+    assert feedback[0]["error_code"] == code and feedback[0]["component"] == (subject or "rejected_mutation")
+    assert "detail" not in feedback[0]
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+@pytest.mark.parametrize("case", ["lowering", "slot", "missing-node", "missing-edge"])
+def test_graph_refusal_retains_saved_findings_identity_and_static_guidance(surface: GraphSurface, case: str) -> None:
+    state, context = rejection_fixtures._saved_state(), rejection_fixtures._context()
+    tool, args, code, subject = "upsert_edge", _edge_args("bad", "before", "after", "on_error"), "edge_not_lowerable", None
+    if case == "slot":
+        # errors already has live producers; leave main genuinely unreferenced
+        # so the independent saved warning survives the successful slot setup.
+        applied = transforms._execute_upsert_edge(_edge_args("route", "after", "errors", "on_error"), state, context)
+        assert applied.success and _node(applied.updated_state, "after").on_error == "errors"
+        assert _edge(applied.updated_state, "route").to_node == "errors"
+        state = applied.updated_state
+        args, code = _edge_args("competing", "after", "errors", "on_error"), "edge_route_conflict"
+    elif case == "missing-node":
+        tool, args, code, subject = "remove_node", {"id": "absent"}, "node_not_found", "node:absent"
+    elif case == "missing-edge":
+        tool, args, code = "remove_edge", {"id": "PRIVATE-GRAPH-EDGE-CANARY"}, "edge_not_found"
+    before = state.to_dict()
+    raw, catalog = state.validate(), context.catalog.validate_composition_state(state).validation
+    assert raw.errors and raw.warnings and raw.edge_contracts and raw.semantic_contracts
+    assert catalog.errors and catalog.warnings and catalog.edge_contracts and catalog.semantic_contracts
+    if case == "slot":
+        assert any(entry.component == "output:main" and "not referenced" in entry.message for entry in raw.warnings)
+    result = _invoke_graph(surface, tool, args, state, context)
+    _assert_graph_refusal(result, state, context, surface, code, subject)
+    guidance = explain_validation_code(code)
+    assert guidance is not None
+    feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"][0]
+    assert (feedback["explanation"], feedback["suggested_fix"]) == guidance
+    if surface == "dispatch":
+        assert result.validation_guidance is not None and code in result.validation_guidance["codes"]
+    redacted = redact_tool_call_response(tool, result.to_dict(), telemetry=NoopRedactionTelemetry())
+    assert redacted["validation"]["errors"][0]["error_code"] == code
+    if case == "missing-edge":
+        assert "PRIVATE-GRAPH-EDGE-CANARY" in result.validation.errors[0].message
+        assert "PRIVATE-GRAPH-EDGE-CANARY" not in repr(feedback) + repr(redacted)
+    assert code in serialize_tool_result(result)
+    assert state.to_dict() == before
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+def test_graph_existing_edge_without_edge_none_guard_is_explicit_boundary_only(
+    monkeypatch: pytest.MonkeyPatch, surface: GraphSurface
+) -> None:
+    # Immutable owned state cannot naturally lose this edge between the two
+    # lookups. Force only the retained second guard; do not claim a real race.
+    state, context = rejection_fixtures._saved_state(), rejection_fixtures._context()
+    existing = state.edges[0]
+    before, calls = state.to_dict(), []
+
+    def without_edge(previous: CompositionState, edge_id: str) -> None:
+        assert previous is state and edge_id == existing.id
+        assert any(edge.id == edge_id for edge in previous.edges)
+        calls.append(edge_id)
+        return None
+
+    monkeypatch.setattr(CompositionState, "without_edge", without_edge)
+    result = _invoke_graph(surface, "remove_edge", {"id": existing.id}, state, context)
+    assert calls == [existing.id]
+    _assert_graph_refusal(result, state, context, surface, "edge_not_found", None)
+    assert state.to_dict() == before
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+def test_graph_late_real_invariant_refuses_private_edge_and_scalar_together(monkeypatch: pytest.MonkeyPatch, surface: GraphSurface) -> None:
+    state = rejection_fixtures._saved_state()
+    # A stored intrinsic defect is real validation input, not an invented
+    # invariant return. Incomplete topology remains otherwise admissible.
+    state = replace(state, nodes=tuple(replace(node, timeout_seconds=1) if node.id == "before" else node for node in state.nodes))
+    context, before = rejection_fixtures._context(), state.to_dict()
+    expected = next(entry for entry in state.validate().errors if entry.error_code == "node_timeout_unsupported")
+    original, observed = transforms._post_mutation_invariant_error, []
+
+    def invariant(proposed: CompositionState) -> tuple[str, str] | None:
+        assert proposed is not state and proposed.version > state.version
+        assert _edge(proposed, "private-route").to_node == "main"
+        assert _node(proposed, "after").on_error == "main" and _node(state, "after").on_error == "discard"
+        outcome = original(proposed)
+        assert outcome == (expected.message, expected.error_code)
+        observed.append(proposed)
+        return outcome
+
+    monkeypatch.setattr(transforms, "_post_mutation_invariant_error", invariant)
+    result = _invoke_graph(surface, "upsert_edge", _edge_args("private-route", "after", "main", "on_error"), state, context)
+    assert len(observed) == 1 and state.to_dict() == before
+    _assert_graph_refusal(result, state, context, surface, "node_timeout_unsupported", None)
+    assert result.validation.errors[0].message == expected.message
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+@pytest.mark.parametrize(
+    ("tool", "build_state", "handler", "args", "reviewed_node"),
+    review_fixtures._GRAPH_MUTATION_CASES,
+    ids=[case[0] for case in review_fixtures._GRAPH_MUTATION_CASES],
+)
+def test_graph_late_review_refusal_preserves_private_changes_and_saved_review_anchors(
+    monkeypatch: pytest.MonkeyPatch, surface: GraphSurface, tool, build_state, handler, args, reviewed_node
+) -> None:
+    del handler
+    state, context = build_state(), review_fixtures._context()
+    assert pending_execution_interpretation_sites(state) == ()
+    anchors, before = _node(state, reviewed_node).options, state.to_dict()
+    observed = []
+
+    def reconcile(previous: CompositionState, proposed: CompositionState) -> CompositionState:
+        assert previous is state and proposed is not previous and proposed.version > previous.version
+        assert proposed.nodes != previous.nodes or proposed.edges != previous.edges
+        if tool == "upsert_edge":
+            assert _edge(proposed, args["id"]).to_node == "rejected_rows"
+            assert _node(proposed, reviewed_node).routes["true"] == "rejected_rows"
+        elif tool == "remove_edge":
+            assert all(edge.id != args["id"] for edge in proposed.edges)
+            assert "true" not in _node(proposed, reviewed_node).routes
+        else:
+            assert all(node.id != args["id"] for node in proposed.nodes)
+            assert all(edge.from_node != args["id"] and edge.to_node != args["id"] for edge in proposed.edges)
+        assert _node(previous, reviewed_node).options == anchors
+        observed.append(proposed)
+        raise ValueError("duplicate review identity 'gate_condition_authored:x'")
+
+    monkeypatch.setattr(transforms, "reconcile_authoritative_reviews", reconcile)
+    result = _invoke_graph(surface, tool, args, state, context)
+    assert len(observed) == 1
+    _assert_graph_refusal(result, state, context, surface, "review_reconciliation_failed", None)
+    assert "duplicate review identity" in result.validation.errors[0].message
+    assert state.to_dict() == before and _node(state, reviewed_node).options == anchors
+    assert pending_execution_interpretation_sites(state) == ()
+
+
+@pytest.mark.parametrize("source_name", ["source", "lookups"])
+def test_graph_remove_source_sink_edge_clears_only_its_named_mirror(source_name: str) -> None:
+    state, context = rejection_fixtures._saved_state(), rejection_fixtures._context()
+    source = state.sources["source"]
+    state = replace(state, sources={source_name: source, "unrelated": replace(source, on_success="unrelated_rows")})
+    routed = transforms._execute_upsert_edge(_edge_args("source-route", source_name, "main", "on_success"), state, context)
+    assert routed.success and routed.updated_state.sources[source_name].on_success == "main"
+    result = transforms._execute_remove_edge({"id": "source-route"}, routed.updated_state, context)
+    assert result.success and result.updated_state.version > routed.updated_state.version
+    assert result.updated_state.sources[source_name].on_success == "discard"
+    assert result.updated_state.sources["unrelated"] == state.sources["unrelated"]
+    assert all(edge.id != "source-route" for edge in result.updated_state.edges)
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+@pytest.mark.parametrize("producer", ["before", "not_yet_authored"])
+def test_graph_advisory_and_unresolved_edges_still_succeed_without_scalar_rewrite(surface: GraphSurface, producer: str) -> None:
+    state, context = rejection_fixtures._saved_state(), rejection_fixtures._context()
+    before = state.to_dict()
+    result = _invoke_graph(surface, "upsert_edge", _edge_args("advisory", producer, "future_node", "on_success"), state, context)
+    assert result.success and result.updated_state.version > state.version
+    assert result.updated_state.nodes == state.nodes and result.updated_state.sources == state.sources
+    assert _edge(result.updated_state, "advisory").from_node == producer
+    assert result.validation.errors and state.to_dict() == before
+
+
+@pytest.mark.parametrize("code", ["edge_not_found", "edge_not_lowerable", "edge_route_conflict"])
+def test_graph_direct_guidance_is_served_by_actual_catalogue_with_controls(code: str) -> None:
+    assert explain_validation_code("node_not_found") is not None
+    assert explain_validation_code("not_a_registered_graph_code") is None
+    assert code in REGISTERED_ERROR_CODES
+    served = dict(validation_guidance_items())
+    guidance = explain_validation_code(code)
+    assert guidance is not None and served[code] == guidance
+    assert all(guidance)
+    explanation, fix = guidance
+    if code == "edge_not_found":
+        assert "saved composition" in explanation and "exact edge ID" in fix and "unrelated" in fix
+    elif code == "edge_not_lowerable":
+        assert "supported runtime route" in explanation and "advisory" in fix and "gate and coalesce policies" in fix
+    else:
+        assert "same sink-routing slot" in explanation and "existing intended slot edge" in fix and "fork destinations" in fix
+    context, state = rejection_fixtures._context(), rejection_fixtures._saved_state()
+    result = dispatch_tool(
+        "explain_validation_error", {"error_text": code}, state, context.catalog, plugin_snapshot=context.plugin_snapshot
+    )
+    assert result.success and result.updated_state is state
+    assert (result.data["explanation"], result.data["suggested_fix"]) == guidance
