@@ -7,7 +7,7 @@ do not start a competing ledger. It is ordinary editable project documentation.
 The full per-fix inventory is [master issue #315](https://github.com/dta-au/elspeth/issues/315)
 and its [repository snapshot](2026-10-16-composer-087-master-defect-list.md).
 
-## Current operating record — 16 October 2026, after local qualification
+## Current operating record — 17 October 2026, 03:53 AEDT, locally green repair integrated
 
 Work is active. John has not requested a new pause. The [one-time independent
 Astra governance review](../reviews/2026-10-16-composer-087-governance-review.md)
@@ -24,32 +24,42 @@ the live record is subsequently maintained normally, with no second audit.
 | Surface or owner | Current identity and boundary |
 |---|---|
 | Host / operator | `nyx.foundryside.dev`, Unix user `john`, UID 1000; sole device/checkout custody authorized by John. |
-| LOCAL release target | `codex/composer087-contracts-20261015`, HEAD `f3f9734b1264c9000c9ec1b01b252d2144774412`, root's assigned d66a ELSPETH worktree. This integrates DEP-01/CIQ-01 above governance `4d3362dc` and SMK-12A `444fc144`. Resolve the absolute root with `git rev-parse --show-toplevel`; do not switch a different shared checkout. |
-| SHARED / PR | [PR #316](https://github.com/dta-au/elspeth/pull/316), published head `e91bd01deee7ed743f4358eb590b7c0d05ca37ff`, base `main`; open, mergeable but blocked at 11:47:13 UTC. Root is the sole publisher/integrator. |
+| LOCAL release target | `codex/composer087-contracts-20261015`, implementation HEAD `125e40044fa80682b7e3f63dead08de566adcd6d`, root's assigned d66a worktree. Normal hooks passed; all eight committed repair blobs match the frozen qualified candidate. This adds SMK-12B, its exact-wire fixture and CIQ-02 to the preceding package. Resolve the absolute root with `git rev-parse --show-toplevel`; do not switch another shared checkout. |
+| SHARED / PR | [PR #316](https://github.com/dta-au/elspeth/pull/316), published head `beefb44576b3ae2c7c16ff3180c40adeac326da8`, base `main`; open/unmerged at14:06:32 UTC, terminal37success/3failure/1skip. Shard3 is the direct failure; native logs show consequent coverage prerequisite refusal and CI Success refusal. Root is sole publisher/integrator. Existing CI effort owns repair; preserve normal protected merge priority when green, independent of SMK-12B. |
 | MAIN | `ac7e5aac43b4f20bd10dd420b43dd439f5371f55` at that API check. No main merge of this package is claimed. |
 | Root | This task, ID `01a140e3-fc15-7900-b0c5-cc80ebc95fb2`; owns release qualification, capacity, integration, one batch PR update and protected merge. |
 | Direction relay | Emmy's authorized thread `01a12334-35ad-748b-99eb-2d3a16598084`, host `durable`. John recognizes its authority. Direct current John instructions supersede older relay/time rules. Delivery errors are not acknowledgments. |
-| Finished development owner | Sol 6.1 `/root/dep01_repair` has frozen the final five-file patch and relinquished writer/test custody. Private standalone checkout `/tmp/elspeth087-dep01-20261016`, branch `codex/dep01-ciq01-20261016`, base `444fc144`. No pushes or PRs. Root now owns its canonical qualification; do not reactivate the writer against live frozen inputs. |
-| Independent reviewer | Actual Astra `/root/dep01_astra` accepted exact final repair patch `958a4b8b...` for integration/canonical qualification and completed the one-time governance review. Its reports are recorded below. It owns no source edits, tests, publication or integration; no recurring review lane is active. |
+| Finished SMK-12B development owner | Sol 6.1 `/root/smk12b_repair` relinquished the exact six-file artifact at 12:53 UTC; unchanged-input receipt refreshed 12:55. Private standalone `/tmp/elspeth087-smk12b-20261016`, branch `codex/smk12b-20261016`, base `beefb445`; its partial `.venv` is not qualified. Source/tests frozen, no commit/push. Root owns full qualification/integration/publication. |
+| Finished SMK-12B reviewer | Actual Astra `/root/smk12b_astra` accepted exact patch `62a203c8...531b667`, completed full untruncated touched-file context review at 13:04 UTC, no source edits/tests. `smk12b/final-review-astra.md` and its full-file addendum preserve bounded coverage and the one nominal R5 adjudication item. No recurring governance audit. |
+| CI repair owner | `/root/ci_beef_shard3` relinquished the one-file repair; root owns integration/publication. Integrated in `125e40044` after full local PASS. The accepted patch retains 15-second setup, the 28-second sum of unchanged proof waits, finite 43-second outer cap, all 32 child assertions and exact reaping. Astra's late-checkpoint race is corrected; fake-clock admission controls, revised real six-case/delayed lifecycle selections and 257 AST/reaping checks pass; the final child-failure control remains red as intended. Historical CI phase remains unknown; CIQ-02 awaits fresh protected evidence. |
+| SMK-12B associated qualification repair | Fixture artifact `33f83fa1...ecd125` is integrated in `125e40044` after independent acceptance and full local PASS. Root verified its 26-character single-case delta, unchanged six reviewed files, native 141-pass selection and intended old-byte failure. Original TLS/recovery initiating causes remain unresolved; matched repair/base trials and their unchanged cases in the new full gate pass. No timing/product repair is claimed. |
+| Next fix-lane package | John's latest correction allows the next package after full LOCAL green, while CI qualifies the current package. The existing `/root/smk12b_repair` owner completed read-only local-live preparation (`live-local-preparation.md`); no provider call, credential access, server or source edit yet. Root's integrated baseline is `125e40044`. Preserve the previously queued local Composer smoke/repair scope and exactly two efforts. |
+| Finished dependency owner/reviewer | Sol `/root/dep01_repair` relinquished five-file patch custody; Astra `/root/dep01_astra` accepted its exact artifact and completed the one-time governance review. Private `/tmp/elspeth087-dep01-20261016` remains stopped evidence with completed gate/focused receipts. Do not reactivate either old assignment or mutate its corrected environment. |
 | Finished SMK-12 owner | `/root/implementation` relinquished custody. Its stopped `/tmp/elspeth087-smk12-projection-20261016` checkout still has eight dirty paths based on `e91bd01d`; these bytes are already committed as LOCAL `444fc144`. Preserve as evidence; do not replay that patch or resume its writer. |
 | Other old lanes | No other development owner is authorized. `/root/astra_obligations` was `pending_init`, not an active writer; do not repair shared daemons or activate stale assignments to work around it. Query actual agent status before dispatch. |
 
-The root checkout was clean after native source commit `f3f9734b`, before this
-later status update. Root-owned uncommitted documentation is this ledger and
-the master list; the governance review is already committed in `4d3362dc`.
+The root checkout was clean at native `beefb445` startup verification, before
+this status update. Root-owned uncommitted documentation is this ledger and
+the master list; the governance review is committed and published in `4d3362dc`.
 The private frozen candidate's five uncommitted paths are:
 `pyproject.toml`, `uv.lock`, `scripts/ci_test_shards.py`,
 `tests/unit/test_runtime_dependency_contract.py`, and
 `tests/unit/cicd/test_ci_sharding.py`. Do not stash, clean or restore any owner.
 
-Fourteen accepted implementation commits are explicitly listed and
-ancestor-checked: twelve are SHARED, SMK-12A `444fc144` and DEP-01/CIQ-01
-`f3f9734b` are LOCAL only. The master rows are overlapping views, not additive completion
+Fifteen accepted implementation commits are explicitly listed and native
+ancestor-checked on LOCAL `125e40044`; fourteen are SHARED within `beefb445`.
+`implementation-registry-current.json` records each native ancestry exit.
+The master rows are overlapping
+views, not additive completion
 counts. Numbered items 0–18, all smoke/system/UI/shared-link findings and
-conditional work remain there. The current package is the approved coupled
-DEP-01 (P1 dependency ownership) / CIQ-01 (P2 terminal evidence) repair.
-Broader SMK-12B dependent-batch semantics remain not started. No other fix
-starts until this development custody is relinquished and root selects one.
+conditional work remain there. DEP-01/CIQ-01 is finished and locally qualified;
+the new SMK-12B/CIQ-02 batch is locally qualified and integrated, awaiting one
+publication and fresh protected CI. John's latest correction permits the next
+fix-lane package after LOCAL green; queued live local Composer testing/repair
+is now in preparation on the integrated target. Keep the two-effort limit.
+Startup agent registry had only
+root; the returned 50-thread app view showed no other active ELSPETH project
+task. Completed receipts confirmed the previous owner's work had ended.
 
 ### Current rules and decisions
 
@@ -62,17 +72,27 @@ starts until this development custody is relinquished and root selects one.
   another broad owner. Short focused work may use the assigned capacity.
 - Integrate a locally green fix, then send **one batch PR update/CI cycle**.
   Several completed local updates may share that update. Keep a fresh green
-  point ready to merge while preparing the next serial fix. Do not repeatedly
+  point ready to merge while preparing the next serial fix. John's latest
+  correction makes full LOCAL green the next-package trigger; do not wait for
+  CI green to begin the next package in the same fix lane. Do not repeatedly
   push partial work, rerun unchanged failures, or cancel useful existing CI.
 - John's latest scope threshold is **60 minutes of remaining implementation,
   focused checks, integration and review, excluding full-suite time**. Report
   full-suite time separately. This replaces the old total 120-minute rule.
-  John explicitly approved both DEP-01 and CIQ-01. Implementation, integration
-  and local qualification are complete; documentation/preflight/batch publication
-  remain, estimated 15–25 minutes. The completed full default stage took
-  43 minutes 25 seconds and PostgreSQL 26 minutes 16 seconds, accounted
-  separately. Refresh estimates if new work changes them; do not count
-  completed work again on resume.
+  John approved DEP-01/CIQ-01; its implementation, qualification and publication
+  are complete. SMK-12B implementation, 428-case final focused qualification and
+  independent/full-file review are complete within the initial **45–60 minute**
+  non-full-suite estimate. The later default gate failed three cases; the former
+  **5–10 minutes integration-only** estimate no longer covers the work required.
+  Associated fixture and CI repairs passed fresh frozen full qualification and
+  are committed as `125e40044`. Remaining record/publication and ordinary
+  key-free staging are estimated at **10–20 active minutes**. Surface any
+  smallest real repair above 60 non-full-suite minutes. Measured new default
+  test time is **43m58s**, plus **26m23s serial PG**, excluded from that limit.
+  PG was selected because the branch persists audit outcomes despite unchanged
+  SQL/schema. Surface any smallest real fix
+  exceeding 60 non-full-suite minutes; do not substitute a cosmetic repair.
+  Refresh remaining estimates without counting completed work again.
 - Any change in `src/`, a fixture or shared test infrastructure requires a full
   suite. The purpose is to catch formerly green tests becoming silently red.
   John's specific exception for the ten missing-frontend-dependency failures
@@ -93,14 +113,120 @@ starts until this development custody is relinquished and root selects one.
   **retain the basic dynamic upgrade framework**. No unrelated .6 fix or
   security/integrity guard removal, user-store migration/reset/wipe or downgrade
   is authorized. Document refusal/reinspection and actual reconstruction limits.
-- No deployment, paid provider call, operator HMAC custody/signing, credential
-  change, Unix ownership/permission change, shared daemon kill/reconfiguration,
+- No deployment, operator HMAC custody/signing, unrelated credential change,
+  Unix ownership/permission change, shared daemon kill/reconfiguration,
   branch-protection bypass or destructive shared-state cleanup is authorized.
-  Use the normal account and hooks. Failed runner stores remain protected;
+  Provider calls remain forbidden in this repair's automated tests; John's
+  subsequent bounded local live-provider smoke authorization below is the
+  specific next-phase exception. Use the normal account and hooks. Failed runner stores remain protected;
   exact failed-host dependency bytes have not been recovered.
 - The LLM authors graph structure; ordinary/tutorial paths share the backend.
   Preserve validation, privacy and audit authority. Streaming/advisor-return
   exploration remains analysis only and stopped; no .8 implementation lane.
+- John queued **local testing** configuration: direct Anthropic Composer using
+  requested Sonnet 5.5 and reviewer using requested Opus 5.5. Verify actual
+  available model IDs and supported local configuration before applying them;
+  no fallback model has been selected. The credential was supplied separately
+  and must never enter tracked files, reports, logs or messages. John's latest
+  correction permits starting the next package after required LOCAL testing
+  passes. Keep the queued live local testing/repair on the integrated release
+  target, one coherent repair at a time, while CI qualifies this batch. CI qualification
+  remains the other line; do not start a third line. This does not authorize a
+  deployment or shared daemon reconfiguration.
+  Keep the local smoke bounded: graph opening/navigation, Composer request and
+  stream/error presentation, a bounded edit and its resulting graph, using safe
+  fixtures. No new-merge-branch smoke has run yet. Local automated, exact-head
+  CI, local live-provider/browser smoke and deployed evidence stay distinct.
+
+### R5 ownership and next action
+
+The one new R5 is an **ordinary operator-workflow item**, with code handling
+already accepted under existing policy; it is not an open request for a new
+John policy decision or a protected-merge prerequisite. `CONTRIBUTING.md`
+permits nominal checks of owned types and explicitly retains `isinstance`
+where union narrowing/subclasses matter; ADR-032 likewise requires nominal
+owned-type admission. Astra reviewed this exact use in
+`run_tool_batch._append_tool_outcome` and accepted it. Retain the clear code and
+the disclosed raw finding rather than shaping code to silence the scanner.
+
+**Root owns the next action:** after the qualification repairs and target
+integration establish a stable committed candidate, verify that the judge MCP
+is bound to that checkout, stage the key-free exact-source worklist, annotate
+this finding with the site-specific rationale and reviewed test symbols, and
+return the generated status/scope and paste-ready operator command. Staging
+now would target the wrong root HEAD, omit the still-untracked new helper, or
+become stale through the upcoming repairs/integration. No bundle has yet been
+staged for this candidate. This is a concrete dependency on settling actual
+code, not an indefinite policy hold.
+
+Draft rationale: the dispatcher has heterogeneous owned outcomes.
+`_append_tool_outcome` reads `response.success` only after nominal admission as
+the owned `ToolResult`, or records a separately classified error. It retains
+factual still-absent resources from the captured pre-call state as refused
+prerequisites. This is discriminated result handling, not structural probing
+of an owned invariant or hiding a failure. The regression symbols
+`test_refused_reviewed_route_does_not_admit_dependent_successor`,
+`test_existing_connection_and_same_component_remain_independently_editable`
+and `test_independent_producer_can_restore_failed_promise_within_same_batch`
+pin refusal, independent work and restored-resource behavior.
+
+**John owns the trusted operator step:** inspect the staged scope, run the
+generated `sign-bundle` dry-run, then fire the authoritative read-only judge/sign
+workflow with the operator-held key after code churn has settled. Existing
+authorization and Astra's review satisfy the source-work decision; they do not
+mint a cryptographic signature or an authoritative judge verdict. [O1] says
+an agent never holds the key. CI does not verify signed allowlist metadata or
+gate merges on it. See the repository
+[judge-signature workflow](../../.agents/skills/judge-signature-workflow/SKILL.md)
+and [handoff](../judge-signature-handoff.md). Do not ask John for a hypothetical
+override, bypass protection, hand-edit a signature or claim signed clearance.
+If the real authoritative judge later blocks, report its actual ruling then.
+
+### Eventual one-user-turn benchmark
+
+John's exact authority, conveyed through Emmy's authorized relay:
+
+> "the ultimate aim is for the composer to be able to 'one shot' the complex prompt, even if we don't get their with the current quota"
+
+Interpretation: the original complex real-user request, with safe synthetic data,
+and meaning-preserving variants should eventually produce a correct executable
+workflow from **one user turn**. Internal provider/tool/repair cycles are allowed;
+completion evidence must truthfully distinguish composition, validation,
+required human review and execution. This does not bypass review authority or
+require executing a graph to claim composition. The current bounded local
+regression smoke and 0.8.7 release are incremental progress; neither establishes
+that this eventual target is achieved. This acceptance record adds no paid
+evaluation-call authority, implementation scope, deployment or extra lane.
+
+John/Emmy's clarification applies the one-shot target to a **sufficiently
+specified** complex request. When essential ambiguity prevents faithful
+composition, ask a clear clarification promptly or park with an honest
+explanation; do not repeat ineffective calls until the 300-second limit.
+John notes that an explanation escape was historically unavailable and now
+exists. This is acceptance/history context, not independently verified closure
+of a defect and not authorization for a new repair. Existing current-request,
+review and terminal-evidence authority still governs the outcome.
+
+Provenance inspected read-only in the preserved private
+`elspeth-diagnostics-20261016.zip`, SHA256
+`f29ec5b1e3ad23816aa4e9876b9f810693700042f5267482ab876165e62d64bf`.
+Paths below are archive members relative to `elspeth-diagnostics-20261016/`;
+the private archive location is in the existing diagnostics handoff. No user
+database was restored and no archive code or provider evaluation was run.
+
+| Retained source | Exact revision/hash and limitation |
+|---|---|
+| Original complex request | **Identification remains unresolved.** Do not substitute an inferred prompt. The historical `evidence/ops-local/tom-session-review-20261011/messages-with-raw.json` has SHA256 `509fec555a037b362193b13a37109ca5c6136b331ffa60eea9327064c7a5f7ca`; its first user request is only 123 characters, not an established match for the intended complex benchmark. |
+| Later full reconstruction candidate | `evidence/ops-local/main-deploy-086-20261015/telemetry-20261016/original-replay-messages.json`, member SHA256 `ec52cd8e88d4c7ade91b415f038b2c5d6d38f9175f2dfbafcca1e6ab14fe37ab`, matches the archive manifest. First user message `064ae194-b7c3-400c-9027-76e847344986`, sequence1, timestamp `2026-10-16T00:02:55.567578Z`: 4221 characters, UTF-8 content SHA256 `b5cfa0a2532c7610788b4858da89ff41d8560ea55f530486259ae49fc263fa04`. It explicitly describes a fresh reconstruction of an earlier design; original wording/equivalence is unproved. |
+| Existing synthetic playback | `smoke-test-playback/README.md`, SHA256 `59347b326a9195b2d94fc8608af05b56fcdb72a572b248732a8a07a5c5f1dd75`. The archive manifest identifies its source checkout as `deploy-main-0.8.6-ac7e5aac4`; this is a source label, not proof of an exact committed README revision. Its six batched prompts and improved 26-request sequence intentionally reconstruct graph shape, not original runtime prompt/calculation fidelity. First source-only prompt `smoke-test-playback/prompts/01-source.txt`, SHA256 `898f5aa59386e3a5ca42b24f366b182e4ccf1c1faff34f7d62dc7ea36b190369`, matches the first synthetic replay request; it is not a full one-turn benchmark or an equivalent replacement. |
+| Meaning-preserving variants | No one-turn variant has been authored, approved as equivalent or evaluated in this phase. Preserve each later variant's parent prompt hash, exact content hash, changed wording and meaning-preservation review. Recover/identify the original request and its fixture/reference-document bindings before asserting equivalence. Existing incremental playback remains a separate regression aid. |
+
+Open acceptance gaps include original-prompt identification, fixture/reference
+fidelity, equivalent variants, end-to-end semantic correctness, executability,
+truthful terminal evidence and eventual single-turn success within applicable
+resource policy. The existing smoke findings and aspirational master list
+remain open at their recorded boundaries; a valid reconstructed topology alone
+does not close them or establish runtime output fidelity.
 
 ### Evidence and remaining gates
 
@@ -118,10 +244,23 @@ The public master contains safe summaries, not diagnostic archives or secrets.
 | Coupled focused evidence | Final `review-final312.log` and `review-final313.log` each show 27 passing cases; `completed-command-exit-history.json` preserves exact commands and observed shell exits 0 from owner tool history, explicitly retrospective rather than original native sidecars. Real collection-child `.exit`/manifest receipts directly show exit2, no coverage/digest and false no-call proof. Shadow, competing-owner and changed-byte controls fail at intended assertions; CLI consumers pass 496. The earlier 929-case selection had disclosed test edits and is not final frozen evidence. PermissionError/IsADirectoryError propagation is source-supported, not separately executed; do not claim otherwise. |
 | Actual reserve proof | Completed Python 3.13 reserve proof: one passed in 321.63 seconds, observed shell exit0 preserved in the same retrospective tool-history receipt and reviewed by Astra. `reserve-inputs.json` records unchanged production/proof inputs; test-only guard edits during the run mean it is not a whole-tree frozen receipt. Root's completed composite local qualification covers the finished tree. |
 | Independent patch review | Root-lane `reviews/dep01-ciq01-final-owner-report.md` and `reviews/dep01-ciq01-final-review-astra.md` record owner closure and independent ACCEPT of the exact final patch. Plan-only review remains historical. Actual failed CI-host bytes remain unknown; no particular installer interleaving is proved. |
+| SMK-12B witness and frozen packet | Owner `final-report.md`, `final-manifest.json` and `final.patch` in private `.claude/lanes/smk12b/`; exact six-file patch SHA256 `62a203c8fd018d6a1dd342a67e9f559a73e16af7e422430303b10337a531b667`. Fresh repro4 shows an absent refused producer's connection admitted downstream, independent metadata retained, initial accepted semantics intact. Original exit1 is in tool history, no fabricated original sidecar. Final frozen selection exits0: 428 passed, zero failure/error/skip, 86.151 seconds; before/after full input maps match. Three final deliberate guard/barrier/transitive controls fail at intended assertions with legitimate passing counterparts. Earlier 408-case and repair/harness results remain historical. |
+| SMK-12B independent review and scope | Final Astra ACCEPT and full-file addendum verify exact six hashes and untruncated context. Guard only factual absent input/identity prerequisites; independent work, available/restored resources, canonical echo and actual semantic review remain valid. Ambiguous routing-as-sink intent is deliberately not inferred. Candidate versus saved-graph refusal and canonical guidance/audit are retained. One new nominal R5 is adjudication work, not signed clearance. |
+| Associated characterization test repair | The owning dispatch-characterization module omitted the existing automatic advisor stub and attempted unavailable advisory dispatch during a focused run. A completed paid call is unestablished; no blanket no-provider-attempt claim. The isolated fixture registration preserves manual advisor arms. Final frozen selection includes all 19 owning cases and fail-on-use actual provider/advisor sentinels. The new regression module also isolates both boundaries. This is the same six-file packet, not another lane. |
+| Original SMK-12B full gate — TERMINAL | Separate stopped `/tmp/elspeth087-smk12b-qualification-20261016`, base `beefb445` plus accepted6file artifact. Canonical run `/tmp/elspeth087-smk12b-gates/20261016T125609Z-elspeth087-smk12b-qualification-20261016-3151816` has `.done`, driver1/`RESULT=FAIL`, final frozen=yes. Before/after both `beefb44576b3ae2c7c16ff3180c40adeac326da8 d891953e45b3e93f`, all6watchers healthy, no movement/error. Ruff/mypy/contracts0; keyless lints1/nonfatal3313. Default1:68866pass/3fail/113skip/2xfail,3173.88s. SerialPG0:1042pass/one optional skip,1683.16s. Native JUnit PG1043cases/0fail/0error/1skip. `smk12b/original-canonical-terminal-receipt.json` preserves raw receipts/counts. This original result remains RED; preserve the stopped tree/environment. No target integration. New combined qualification is the distinct run below. |
+| New combined full gate — TERMINAL PASS | Separate stopped combined clone, based on `beefb445` plus exactly the eight paths now committed as `125e40044`; `combined-final-input-manifest.json` and `combined-implementation-commit-result.json` prove byte identity. Six-stage run `/tmp/elspeth087-combined-gates/20261016T150545Z-elspeth087-combined-qualification-20261017-3623165` completed 17 October 03:19:57 AEDT: `.done`, driver0/observed0, `RESULT=PASS`, before/after both `beefb44576b3ae2c7c16ff3180c40adeac326da8 fbf45e1d4ddbaf86`, frozen=yes, all six watchers healthy, no movement/error. Ruff/mypy/contracts0; lints1/nonfatal3313. Default0:68869pass/113skip/2xfail in2638.85s; JUnit68984cases/0fail/0error/115skip. PG0:1042pass/one optional ddtrace skip in1583.58s; JUnit1043cases/0fail/0error/1skip. Fresh locked Python/frontend/Chromium/Caddy/Docker prerequisites verified; the corrected npm path and original failed setup invocation remain recorded. Root owned the sole ELSPETH broad suite; unrelated existing Keisei processes were not signalled. Original failed runs remain failed; new green does not establish their historical causes. Current local implementation is qualified/integrated; one publication and fresh protected CI remain. |
+| Three original SMK-12B default failures | `smk12b/full-default-failures.json` preserves exact native cases: the producer/readmission oracle differs at `explain_none` after the intentional closed-catalogue addition; recovery child is alive at 15.026s in `spawn/import pending`; healthy TLS completes the response/progress but lacks the expected heartbeat, with server `peer_disconnect`. The fixture has a private accepted correction, native 141-pass selection and intended old-byte failure. One matched serial repair/base trial per timing selection passes (TLS three modes; recovery 33 ready/33 exit per trial). Initiating timing causes remain unknown; no flakiness or product-defect conclusion, timing repair or historical clearance is claimed. Root will observe these unchanged cases in the required new full qualification; a recurrence requires evidence-led diagnosis within the existing efforts. |
+| Associated fixture and timing closure | Root verified patchSHA256 `33f83fa1b742fa0845a2dbc5ca4ffb5daee29aad402e998973a3758029ecd125`, fixture `9776f792ce5d824b239010480b9a203bba5ad48a8b135e60a3c56ab35608b3e3`, exactly `explain_none`'s registered26-character addition, every other case/metadata equal and all6reviewed files unchanged. Native focused141pass/0skip/exit0; original-byte control1fail/exit1 at owning assertion, plus final frozen2case control with unrelated explanation passing. Matched serial TLS3modes each pass; exact recovery repair/base1pass each in240.676/236.994s, retained actual child phase/exit evidence. Original browser peer_disconnect and bootstrap-pending causes remain unresolved; these are counterexamples, not flakiness/product-fix claims. Root-reviewed source receipt `associated-fixture-root-verification.json`; final native paths/limits in `associated-repair/final-report.md`. |
+| Current keyless comparison | Canonical raw total3277→3313: 35 new `R_TB_SUPPRESSED` parser notes and one new unresolved nominal R5 at `tool_batch.py:1118:43`, zero removed. `smk12b/canonical-lint-corpus-comparison.json` normalizes only explicit checkout prefixes and maps identical source lines; positive/negative parser and same-total changed-message controls pass. No zero-drift or operator-signature-clearance claim. Helper valid/broken controls independently give 35 notes/zero unresolved versus35 R1 errors. |
 | Root full gate | Completed on `/tmp/elspeth087-dep01-20261016`, base `444fc144` plus final patch above. Private Python 3.13.15, effective/metadata Typer 0.25.1, Slim 0.24.0; both import roots verified. Run `/tmp/elspeth087-dep01-gates/20261016T102631Z-elspeth087-dep01-20261016-2594051` began 10:26:31 UTC. Ruff/mypy/contracts exit0; default exit1: 68844 passed, ten failed, 113 skipped, two xfailed. All ten failed before browser behavior because checkout-local esbuild/Playwright dependencies were absent. Serial PostgreSQL exit0: 1042 passed, one optional ddtrace skip. Terminal `.done` and driver exit1 preserve `RESULT=FAIL`; before/after state `444fc144f211b3437e71051813f639c2460a32cd b968db325b4eeca1`, frozen=yes, six healthy watchers. `dep01-canonical-terminal-receipt.json` records native results. |
 | Missing frontend prerequisites / composite local green | Pinned `npm ci` exited0 without changing any tracked input or lockfile. Existing Chromium launches in the authorized host context. `/tmp/elspeth087-dep01-ten-20261016/inputs.json`, `pytest.exit`, `junit.xml` and `summary.json` record the exact ten original failed identities rerun serially: ten passed, zero skips, native exit0, 82 seconds, tracked inputs continuously frozen over 15 samples. The controlled fingerprint detects changed bytes. `dep01-frontend-restoration-scope.json` records zero source/fixture/shared-infrastructure changes; no formerly green test was changed by this repair. John's explicit ruling accepts these receipts together with the original frozen full run and passing PG as local green, without another full suite. The original canonical result remains FAIL. |
 | Keyless trust tier | Current canonical scan exit1, 3277 standing findings. Controlled relative-path/line/column/rule/message multiset comparison against final SMK-12 scan gives zero added/removed; `dep01-keyless-semantic-comparison.json` also proves same-count mutation detection. This is diagnostic, not operator signature clearance. Operator verifies/signs after churn; never hand-edit signatures. |
-| Current CI | At 11:47:13 UTC, original PR `e91bd01d` run is terminal: 36 successful checks, four failures, one skipped. Run [38874373133](https://github.com/dta-au/elspeth/actions/runs/38874373133); reserve job [116885751657](https://github.com/dta-au/elspeth/actions/runs/38874373133/job/116885751657) failed collection before proof execution. Ordinary3.13 shard6 native JUnit has 8510 cases, 30 failures, 72 errors, nine skips; 100 bad events directly show Typer import collision and two fixture errors report missing `elspeth.cli`. Both corresponding bootstrap-preflight cases pass in the corrected full run. Combined coverage stopped at prerequisite refusal before aggregation; CI Success failed consequently. Source classification/artifacts live under `ci-shard313-6-*`; API snapshot `release-pr-latest-checks.json` is head-pinned. CodeQL/cohort/redaction pass. One qualified batch update remains; no retries/cancellations performed. |
+| Current CI / published batch | Native push/preflight exit0 and fresh branch/PR API readback verify SHARED `beefb445`; immediate API lag is retained, no second push. At14:06:32 UTC native exact-head checks are terminal37success/3failure/1skip; direct shard3 failure, consequent coverage guard and CI Success refusals. `ci-beef-shard3/combined-coverage-job.log` shows failed shard prerequisite before aggregation; `ci-success-job.log` says Test job failed. No new coverage defect established. CodeQL/cohort/redaction, PG and all exhaustive proofs pass. Root owns the existing CI repair line in parallel with SMK-12B; normal protected merge priority remains, with no current merge opportunity. |
+| New CIQ-02 shutdown-child checkpoint failure | Python3.13 shard3, run38896756665/job116958957905: native JUnit8633 cases, one failure, zero errors,14 skipped. `test_shutdown_preserves_completed_lease_failure_and_joins_peer[False-AuditIntegrityError]` reaches the15-second parent deadline with neither success/failure checkpoint and empty child log. Original job/JUnit/ordinary artifact receipts are preserved under `ci-beef-shard3/`; no retry/cancellation. The exact local DEP counterpart passed, and current nonterminal SMK run records an individual pass; neither establishes CI root cause or whole-suite green. Source diagnosis is in the existing CI line. Failed-host child state is not recovered; do not infer a product bug or flakiness yet. |
+| CIQ-02 source diagnosis and accepted repair | `ci-beef-shard3/source-diagnosis.md` establishes that the old aggregate 15-second parent budget includes imports/setup plus child waits whose configured allowances sum to 28 seconds, without identifying the historical failed phase. Tested merge `a1a896d1` and published `beefb445` share tree `906ac3611dab20e3cf22d0b5d4dfebe6ddee9273`. The accepted revised test-local patch `328591d9` separates factual setup/proof phases while retaining individual waits, failure-first projection and exact reaping. `combined-review-astra.md` records full-file review and resolution of its late-checkpoint finding. No production change, target commit or fresh protected evidence yet. |
+| CIQ-02 controlled runtime diagnosis | Historical `ci-beef-shard3/controlled-diagnosis.md`: one instrumented normal exact node exits0, proof publishes~3.54s, actual child waited; one16-second pre-import delay exits1 at the original missing-checkpoint assertion with live child at15s and original exact reaping. Native logs/exits/JUnit/maps preserve unchanged bytes and diagnostic deviations (serial/no coverage/host, AST marker overhead). This proves the outer harness mechanism, not the historical failed phase, load causation or production defect. The accepted correction's final native receipts are separately measured in `ci-beef-shard3/repair/root-final-native-verification.json`; no weakened custody assertions or unqualified CI closure. |
+| CIQ-02 supplemental owning-module interruption | The earlier serial module run stopped advancing at the unchanged queued-worker takeover case; that run has no terminal pytest/JUnit success. Ctrl-C returned130 but the host driver survived; root verified its exact identity, sent SIGTERM and measured it absent (`root-driver-term.json`). No unrelated process was signalled. Cause remains unknown; unchanged bytes do not prove independence. The new frozen normal full suite covers this owning module and passes; retain the earlier interrupted receipt and do not relabel it successful. |
+| Historical CI failure | Old PR `e91bd01d` run [38874373133](https://github.com/dta-au/elspeth/actions/runs/38874373133) remains terminal red: 36 successes, four failures, one skip. Reserve job failed collection before proof; ordinary3.13 shard6 native JUnit has 8510 cases, 30 failures, 72 errors, nine skips. One hundred bad events directly show Typer import; both missing-CLI bootstrap-preflight counterparts pass in the corrected local full run. Combined coverage correctly stopped at prerequisite refusal before aggregation and CI Success failed consequently. `ci-shard313-6-*` preserves classification/artifacts. No unchanged-head retry/cancellation performed. |
 | Protected merge | Re-fetch current main/base and exact published head; required checks are CI Success, CodeQL, cohort-attribution and redaction, with strict branch protection. Root performs normal branch-safety before push/merge, no bypass. Green focused/local tests alone never imply protected merge, signatures, deployment or live acceptance. |
 
 For every test invocation, set BOTH source roots and verify both import paths.
@@ -221,17 +360,22 @@ On an explicit pause or engine-restart request:
    it. If completed, inspect actual terminal receipts before allocating any
    missing check. Repeat only invalidated or failed evidence; never silently
    convert interrupted/historical runs into passes.
-4. DEP-01/CIQ-01 is already integrated as `f3f9734b`; do not reapply it or rerun
-   completed focused work. Verify the completed full/PG and exact-ten receipts
-   and unchanged source equivalence. Local green follows John's explicit
-   prerequisite-only exception; do not relabel the original red run. Any later
-   `src/`, fixture or shared-test-infrastructure change requires a full suite.
-   Preserve source equivalence when maintaining root documentation separately.
+4. DEP-01/CIQ-01 is integrated/published within `beefb445`; do not replay it.
+   Its completed full/PG and exact-ten receipts establish local green under
+   John's explicit prerequisite-only exception, without relabeling the red run.
+   The current source owner is Sol's SMK-12B private clone: contact that owner,
+   inspect native witness/focused receipts and freeze before integration.
+   Require independent Astra final review and root full suite for its source
+   changes; serial PG additionally when schema/persistence/locking is touched.
+   Preserve available existing resources, independent partial success and review
+   authority. Surface if the smallest real fix exceeds 60 non-full-suite minutes.
 5. When the combined package is locally green, update master statuses with
    verified commits, then perform one batch PR update. Record new SHARED head
    and required exact-head checks; preserve current failure disclosure as history.
-   Reconcile a moved main before final merge. Protected green and normal merge
-   remain required. No additional PR is authorized merely to add test capacity.
+   Reconcile a moved main before final merge. The already-published `beefb445`
+   must merge normally when protected green, independently of unfinished
+   SMK-12B. Keep unfinished next-source work isolated. No additional PR is
+   authorized merely to add test capacity.
 6. If quota reaches zero or deadline/cutoff is directed, start no new defect.
    Package completed, reviewed, locally qualified work; keep incomplete work
    isolated and explicit. A package is ready only with coherent reviewed source,
