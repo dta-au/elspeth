@@ -1561,6 +1561,21 @@ def _direct_plugin_policy_guidance() -> tuple[DirectValidationGuidance, ...]:
 
 _DIRECT_VALIDATION_GUIDANCE: Final = (
     DirectValidationGuidance(
+        "edge_not_found",
+        "The requested edge is not present in the saved composition. No removal was applied.",
+        "Inspect the current edges and retry the intended exact edge ID. Preserve unrelated nodes, routes and edges; do not remove a different edge to silence this refusal.",
+    ),
+    DirectValidationGuidance(
+        "edge_not_lowerable",
+        "The proposed producer kind, edge type and destination kind do not express a supported runtime route.",
+        "Inspect the producer, destination and route kind, then choose the supported route that preserves the intended pipeline behavior. Edges between processing nodes are advisory; they do not replace scalar input or output connections. Preserve intentional gate and coalesce policies.",
+    ),
+    DirectValidationGuidance(
+        "edge_route_conflict",
+        "Another edge already expresses the same sink-routing slot. The new competing edge was not applied.",
+        "Inspect the current routing edges and update the existing intended slot edge instead of adding a competing edge ID. Preserve unrelated edges and the user's route choices; different fork destinations may occupy distinct slots.",
+    ),
+    DirectValidationGuidance(
         "edge_field_type_incompatible",
         "A consumer's required or optional field type cannot be satisfied by the producer's declared type. An int satisfies float, and an LLM number binds float; other types do not widen automatically.",
         "Match the actual producer type or convert upstream on a field every arriving row carries. A type_coerce input declares the old arriving type; its conversion determines the output type consumed downstream. A declaration alone does not convert a value.",

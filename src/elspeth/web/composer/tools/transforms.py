@@ -53,7 +53,6 @@ from elspeth.web.composer.tools._common import (
     _composition_canonical_interpretation_requirement_error,
     _discovery_result,
     _echoed_metadata_note,
-    _failure_result,
     _mutation_result,
     _normalize_echoed_interpretation_requirements,
     _options_with_default_llm_reviews,
@@ -1516,7 +1515,7 @@ def _execute_upsert_edge(
     to_kind = composer_component_kind(to_node, state.sources, state.nodes, state.outputs)
     lowering_error = edge_lowering_error(edge, from_kind=from_kind, to_kind=to_kind)
     if lowering_error is not None:
-        return _failure_result(state, lowering_error, error_code="edge_not_lowerable")
+        return _saved_graph_rejection_result(state, lowering_error, error_code="edge_not_lowerable", rejected_component=None)
 
     # Slot uniqueness: one sink-routing slot, one edge. A second edge id
     # claiming the same slot would make removal ambiguous and let the graph
@@ -1531,11 +1530,12 @@ def _execute_upsert_edge(
             else:
                 conflict = existing.edge_type == edge_type
             if conflict:
-                return _failure_result(
+                return _saved_graph_rejection_result(
                     state,
                     f"Edge '{existing.id}' already expresses the '{edge_type}' sink route of '{from_node}'. "
                     f"Update or remove edge '{existing.id}' instead of adding '{edge.id}'.",
                     error_code="edge_route_conflict",
+                    rejected_component=None,
                 )
 
     # Atomic commit: the visual edge and its scalar mirror derive from one
@@ -1560,7 +1560,7 @@ def _execute_upsert_edge(
     invariant_error = _post_mutation_invariant_error(new_state)
     if invariant_error is not None:
         message, error_code = invariant_error
-        return _failure_result(state, message, error_code=error_code)
+        return _saved_graph_rejection_result(state, message, error_code=error_code, rejected_component=None)
     reconciled = _reconcile_graph_mutation_reviews(state, new_state)
     if type(reconciled) is ToolResult:
         return reconciled
@@ -1584,10 +1584,11 @@ def _reconcile_graph_mutation_reviews(
     try:
         return reconcile_authoritative_reviews(state, proposed)
     except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+            rejected_component=None,
         )
 
 
@@ -1610,7 +1611,9 @@ def _execute_remove_node(
 
     new_state = state.without_node(node_id)
     if new_state is None:
-        return _failure_result(state, f"Node '{node_id}' not found.")
+        return _saved_graph_rejection_result(
+            state, f"Node '{node_id}' not found.", error_code="node_not_found", rejected_component=f"node:{node_id}"
+        )
 
     reconciled = _reconcile_graph_mutation_reviews(state, new_state)
     if type(reconciled) is ToolResult:
@@ -1631,12 +1634,12 @@ def _execute_remove_edge(
     # Find the edge to get affected nodes
     edge = next((e for e in state.edges if e.id == edge_id), None)
     if edge is None:
-        return _failure_result(state, f"Edge '{edge_id}' not found.")
+        return _saved_graph_rejection_result(state, f"Edge '{edge_id}' not found.", error_code="edge_not_found", rejected_component=None)
 
     affected = (edge.from_node, edge.to_node)
     new_state = state.without_edge(edge_id)
     if new_state is None:
-        return _failure_result(state, f"Edge '{edge_id}' not found.")
+        return _saved_graph_rejection_result(state, f"Edge '{edge_id}' not found.", error_code="edge_not_found", rejected_component=None)
     if not _sink_route_still_expressed(new_state, edge):
         new_state = _clear_removed_sink_edge_route(new_state, edge)
 

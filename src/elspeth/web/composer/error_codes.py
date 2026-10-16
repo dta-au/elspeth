@@ -83,6 +83,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "duplicate_node_id",
         "duplicate_output_name",
         "edge_field_type_incompatible",
+        "edge_not_found",
         "edge_not_lowerable",
         "edge_route_conflict",
         "edge_route_mismatch",

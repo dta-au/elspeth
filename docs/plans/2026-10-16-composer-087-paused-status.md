@@ -1,6 +1,16 @@
 # Composer 0.8.7 — current status and continuation point
 
 **Active after verified continuation. Preserve the current checkout and evidence.**
+Current local integration is `44d03a2c45a4446b04a2a433c7611434f0ba4a6d`:
+transform/splice passed both final reviews, normal preflight/hooks and committed
+blob verification, with no hook byte changes and a clean post-commit tree.
+Graph wiring has passed both final reviews and focused qualification:98 positives,
+568 affected gates,18 focused PostgreSQL passes and36 witnessed intended failures
+across nine controls; keyless semantic drift is zero over3277 existing findings.
+Its original96-pass/2-test-premise-failure run remains red, with the narrow repair
+freshly checked. Normal local integration is next. The older checkpoint
+measurements below remain historical.
+
 The 00:06 UTC checkpoint reprocessed the original pause after compaction; it was
 not evidence of a new direct instruction. Its original text is preserved in
 the ignored lane file `pause-checkpoint-20261016T0006.md`.
@@ -67,11 +77,12 @@ Raw `git --no-optional-locks status --short` at the checkpoint:
 ?? tests/unit/web/composer/test_transform_rejection_contracts.py
 ```
 
-That historical snapshot has two root documentation paths and five packet paths.
-The two later gate-test repairs add `test_validation_guidance_catalogue.py` and
-`test_validation_error_codes.py`, making nine currently owned paths. The new
-contract test remains untracked until staging. Preserve all nine; do not stash,
-restore, clean or stage unrelated state.
+That historical snapshot had two root documentation paths and five packet paths.
+Two later gate-test repairs made nine owned paths. All nine are now committed
+in44d03a2c and post-commit verification was clean. The subsequent graph packet
+currently changes three production paths alongside the two root documents;
+the same writer is proceeding with tests after both source verdicts. Do not
+stash, restore, clean or stage unrelated state.
 
 ## Completed local integrations
 
@@ -110,11 +121,12 @@ Both the output and transform keyless comparisons retain a nonzero 3277-finding
 corpus with zero semantic additions/removals; exit `1` is recorded. This is not
 operator signature clearance.
 
-## Transform/splice: bounded acceptance, local integration next
+## Transform/splice: bounded acceptance and local integration complete
 
 Both final independent reviews accept freeze4 for the bounded packet. All128
-bindings match before this root documentation update. Normal hooks and local Git
-integration are next; whole-plan, broad gates, signing and release remain open.
+bindings matched before root documentation and the comment-only overlay.
+Normal preflight/hooks and local integration completed as44d03a2c; whole-plan,
+broad gates, signing and release remain open.
 
 - Original positive run remains **red: exit 1, 293 passed, 2 failed, 0 errors or
   skips, frozen**. Both strict replay tests received `plugin_options_invalid`
@@ -190,7 +202,7 @@ and discovered fixes remain active in the approved scope; 16–18 remain conditi
 | Planned work | Current status |
 |---|---|
 | 0. Baseline inventories and ownership | Complete; live registry/profile and direct-call inventories recorded. |
-| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement, output and source groups accepted locally in `620231a`, `208bf8d`, `41348ede` and output schema follow-up `3f2db4f0`. Transform/splice has final bounded acceptance from both reviewers and completed runtime evidence; normal local integration is next. Graph wiring, blob, secret, discovery and remaining dispatch migrations remain pending. |
+| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement, output, source and transform/splice groups accepted locally in `620231a`, `208bf8d`, `41348ede`, `3f2db4f0` and `44d03a2c`. Graph wiring is next; blob, secret, discovery and remaining dispatch migrations remain pending. |
 | 2. Saved-but-blocked persistence/reload/UI | Pending joined behavioral evidence; inherited .6 teaching retained. |
 | 3. Model-catalog provenance | Fixed in .6; .7 regression closure pending. |
 | 4. Explicit CSV failure choice | Runtime refusal already exists. False assistance claim that omission defaults to discard still needs correction and its provenance checks. |
@@ -246,7 +258,7 @@ output schema integration corrected to its current committed state.
 | Per-query scoring override does not inherit node criterion references | Actual boundary identified; teaching/characterization pending. No new override mechanism approved. |
 | LiteLLM conditional parameter repair/fallback can differ from ordinary retries | Separate documented limitation; title retry pins do not universally qualify provider behavior. |
 | Output admitted-schema ValueError/KeyError becomes availability repair | Two-caller migration accepted locally as `3f2db4f0` after both reviews and normal hooks. Actual handler/dispatch/turn positives, relevant gates, three witnessed controls, focused PostgreSQL and fresh keyless comparison complete; broader gates remain due. |
-| Aggregation output-count refusal hides standing saved findings | Actual saved-findings behavior, complete consumer guidance and deliberate regression control are accepted; local integration is next. |
+| Aggregation output-count refusal hides standing saved findings | Accepted locally in44d03a2c, with actual saved findings, precise planner guidance and deliberate regression control. |
 | Transform provider-path refusal exposes private path/root text | Static safe projection and actual private-path canary control accepted across upsert, patch and splice preparation. |
 | Node refusals omit codes/subjects or mask admitted schema faults | Final source/runtime reviews accept precise code/subject, admitted identity and fault propagation with the completed controls. |
 | New predecessor test bypasses the required session-engine factory | Normal hook exposed it; repaired with the existing read-only inspection factory. All39 epoch cases plus masquerade gate pass, and actual initializer-admission mutation still fails as intended. Normal hooks now pass. |
@@ -256,7 +268,7 @@ output schema integration corrected to its current committed state.
 | New and inherited replay fixtures fail before replay comparison | Both functions repaired; all three affected cases passed freshly. Exactly292 untouched historical passes have controlled reuse; original red receipt retained. |
 | Count-guidance and legacy full-replacement gate fixtures encode stale contracts | Both functions repaired with real operation owners and exact assertions. Focused2 and owning568 cases pass; original566-pass/2-failure receipt remains red. |
 | Negative-control runner reads only the final digit of multi-digit selections | Corrected in the ignored root runner. Controlled proof and all13 actual transform selections succeed as intended; prior single-digit receipts remain valid. |
-| Secret scanner flags the deliberate credential canary | Documented per-line marker/formatting only; full-module AST unchanged and scoped Ruff/format pass. Historical exact-source receipts retained. Normal preflight recheck is next. |
+| Secret scanner flags the deliberate credential canary | Documented marker/formatting only; full-module AST unchanged and both reviews extended. Normal preflight/hooks pass; historical exact-source receipts retained. |
 
 The broader profile `ValueError` boundary, residual service advisor-context
 elision comment and global Sessions writer expected failure remain observations
@@ -286,12 +298,12 @@ Concurrent disk changes must not be attributed entirely to that cleanup.
 3. Both final reviews, repaired replay/gate checks, owning gates,13 exact negative
    families, focused PostgreSQL and unchanged-input/reuse verification are complete.
    Preserve all original red and passing receipts; do not duplicate these runs.
-4. Verify the two intentional root-document changes and all other frozen bytes,
-   stage only the nine owned paths, run normal branch preflight/hooks and integrate.
-5. Reverify the actual new HEAD/committed blobs and update current status. Then
-   dispatch the same writer on the existing graph-wiring brief/design, after
-   revalidating its selected declaration hashes against the integrated source.
-   Continue the remaining approved plan;16–18 remain conditional and SL5 deferred.
+4. Local integration and exact committed-blob verification are complete at44d03a2c.
+   Preserve `transform-splice-postcommit-verification.json` and the original
+   runtime/comment-overlay proofs. Do not repeat completed checks without a change.
+5. Dispatch the same writer on the existing graph-wiring brief/design, after
+   revalidating selected declarations against the integrated source. Continue
+   the remaining approved plan;16–18 remain conditional and SL5 deferred.
 6. .7 delivery is the priority. The .8 streaming/advisor initial note is bounded
    exploration only, preserved under `streaming-evaluation/report.md` in the
    ignored lane. Its agent is stopped; no .8 implementation is authorized.

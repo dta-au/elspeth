@@ -59,7 +59,7 @@ packet; it does not mean merged, signed, released or deployed.
 | Planned work | Current status |
 |---|---|
 | 0. Baseline inventories and ownership | Complete; live registry/profile and direct-call inventories recorded. |
-| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement, output and source groups accepted locally in `620231a`, `208bf8d`, `41348ede` and output schema follow-up `3f2db4f0`. Transform/splice has final bounded acceptance from both reviewers and completed runtime evidence; normal local integration is next. Graph wiring, blob, secret, discovery and remaining dispatch migrations remain pending. |
+| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement, output, source and transform/splice groups accepted locally in `620231a`, `208bf8d`, `41348ede`, `3f2db4f0` and `44d03a2c`. Graph wiring passed both final reviews and focused qualification; normal local integration is next. Blob, secret, discovery and remaining dispatch migrations remain pending. |
 | 2. Saved-but-blocked persistence/reload/UI | Pending joined behavioral evidence; inherited .6 teaching retained. |
 | 3. Model-catalog provenance | Fixed in .6; .7 regression closure pending. |
 | 4. Explicit CSV failure choice | Runtime refusal already exists. False assistance claim that omission defaults to discard still needs correction and its provenance checks. |
@@ -112,7 +112,7 @@ Additional defects and controls found during this work:
 | Per-query scoring override does not inherit node criterion references | Actual boundary identified; teaching/characterization pending. No new override mechanism approved. |
 | LiteLLM conditional parameter repair/fallback can differ from ordinary retries | Separate documented limitation; title retry pins do not universally qualify provider behavior. |
 | Output admitted-schema ValueError/KeyError becomes availability repair | Two-caller migration accepted locally as `3f2db4f0` after both reviews and normal hooks. Actual handler/dispatch/turn positives, relevant gates, three witnessed controls, focused PostgreSQL and fresh keyless comparison complete; broader gates remain due. |
-| Aggregation output-count refusal hides standing saved findings | Corrected in the reviewed draft; real saved-findings behavior and witnessed regression control are accepted. Local integration is next. |
+| Aggregation output-count refusal hides standing saved findings | Accepted locally in `44d03a2c`, with real saved-findings behavior and witnessed regression control. |
 | Transform provider-path refusal exposes private path/root text | Static safe projection is qualified on actual upsert, patch and splice-preparation paths; the private-path control fails at its intended canary assertion. |
 | Node refusals omit codes/subjects or mask admitted schema faults | Both final reviews accept actual producer/consumer behavior, precise subjects/codes, admitted fault propagation and the completed deliberate controls. |
 | New predecessor test bypasses the required session-engine factory | Normal hook exposed it; repaired with the existing read-only inspection factory. All39 epoch cases plus masquerade gate pass, and actual initializer-admission mutation still fails as intended. Normal hooks now pass. |
@@ -123,7 +123,8 @@ Additional defects and controls found during this work:
 | Count-guidance test assumes one raw error from a saved-graph refusal | Repaired to require exact standing findings as well as precise planner guidance. Focused case and complete 568-case owning gate selection pass. |
 | Legacy full-replacement test expects an invented code from a codeless saved-graph helper | Repaired to use the owned candidate-only boundary, actual sink-policy diagnostic, precise code/subject and normalized consumer checks. Ordinary-state fallback and candidate integrity refusal remain intact. |
 | Root negative selector reads only the last digit of multi-digit controls | Corrected in the ignored runner and controlled with real function AST. All 13 transform controls executed their intended modes; earlier single-digit receipts remain valid. |
-| Commit secret scanner flags the deliberate credential canary | Added its documented per-line marker with formatting only. Complete-module AST is unchanged; scoped Ruff check/format pass. Original failed preflight is preserved and normal preflight will be rechecked. |
+| Commit secret scanner flags the deliberate credential canary | Documented marker/formatting only; complete-module AST unchanged and both reviews extended. Normal preflight and hooks pass; original failed preflight preserved. |
+| Graph slot-refusal fixture clears its required standing warning during setup | Narrow real-fixture repair accepted by both reviewers; all98 affected cases now pass freshly. Original96-pass/2-failure run remains red. No production defect is established by those precondition failures. |
 
 The earlier title custody stall was an execution-environment investigation,
 not a confirmed additional product defect. The deployed shared-link incident
@@ -948,8 +949,11 @@ Full plan0–15 continues,16–18 conditional; broader gates and release are ope
 
 ### Bounded transform/splice acceptance
 
-At HEAD `3f2db4f0`, both independent correctness/security and systems reviews
-accept the transform/splice packet for normal local integration. Production
+Qualified against parent `3f2db4f0`, then committed locally as
+`44d03a2c45a4446b04a2a433c7611434f0ba4a6d` with normal preflight/hooks exiting0.
+Post-commit verification matched all nine committed blobs to reviewed staging,
+found no hook byte changes and confirmed a clean tree. Both independent
+correctness/security and systems reviews accept the bounded packet. Production
 changes remain the six selected declarations and six closed code/guidance
 additions: explicit saved-graph refusals, exact policy/profile reason and admitted
 identity, admitted schema-fault propagation, static safe path guidance, complete
@@ -989,7 +993,7 @@ does not claim independent schema-only discrimination. The codeless splice test
 injects an explicit helper-boundary input, preserving the planner integrity
 refusal; no naturally occurring codeless producer or public repair trajectory
 was established. Whole-branch/full PostgreSQL, protected CI, signing and release
-remain open. Normal hooks/Git integration are the next step; graph wiring follows.
+remain open. Local integration is complete; graph wiring follows.
 
 The current priority remains .7 delivery. John's two .8 messages permit bounded
 exploration/thinking only; the initial streaming/advisor note is preserved in
@@ -1003,3 +1007,44 @@ The original source611879... and failed preflight are preserved. Historical
 runtime/negative leaf-line evidence remains bound to that exact source; current
 test execution semantics are unchanged. No production change or new runtime
 result is claimed by this housekeeping adjustment.
+
+## Graph wiring: focused acceptance complete, local integration next
+
+Both independent reviewers accept the bounded production draft after44d03a2c.
+Seven refusal calls in four existing graph handlers now use the saved-graph
+adapter, preserving the actual invariant/reconciliation codes and original
+state. Missing nodes use the precise requested node subject; edge-wide
+refusals explicitly have no component subject. The draft adds edge_not_found
+and three direct guidance entries. The unused legacy import was removed after
+a controlled whole-module caller/load census.
+
+Full-module comparisons retain routing/mirror helpers, private proposal order,
+review reopening, incomplete/advisory admission and successful effects. These
+were separately qualified by completed focused runtime evidence. Both final
+independent reviews accept freeze3:98 positive cases,568 affected gates and18
+focused PostgreSQL cases pass with zero failures/errors/skips. Nine deliberate
+controls produce36 intended assertion failures with actual owner witnesses and
+exact passing counterparts, no errors/skips/unintended passes. The keyless scan
+retains3277 findings, zero semantic additions/removals; no operator clearance.
+
+All13 fresh runs have identical before/after/current maps of6636 records,
+input digest `8334b152791eb2a63e2d07fd753e460604ac5e1f3ef1a183b83cba10115a9f67`.
+All126 stopped bindings matched before this root documentation update. PostgreSQL
+URL absence is root launch-transcript observation, not enforcement by its
+capacity JSON or runner. Normal preflight/hooks and local integration are next;
+no graph packet commit or whole-plan completion is claimed here.
+
+The first focused run completed on frozen inputs:98 cases,96 passes,2 failures,
+zero errors/skips. Both slot cases fail the nonempty-warning premise after a
+successful on_error setup removes that warning, before the competing edge is
+attempted. The repaired setup targets the already referenced errors sink,
+preserving main's independent real warning and every strict findings assertion.
+Original executed source, freeze2 and the red receipt remain preserved; no
+production repair follows from that evidence. The fresh98-case run supplies all
+negative counterparts; no historical pass reuse is needed.
+
+The second missing-edge guard remains forced boundary characterization; review
+faults are narrow injected owner failures after real changed proposals, and the
+unsupported timeout is a real saved defect. Controls qualify their first failing
+assertions, not every possible serializer or warning-only mutation. Broader
+default/full PostgreSQL, protected CI, operator signing and release remain open.
