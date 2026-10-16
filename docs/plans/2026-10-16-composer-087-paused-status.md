@@ -1,15 +1,51 @@
 # Composer 0.8.7 — current status and continuation point
 
-**Active after verified continuation. Preserve the current checkout and evidence.**
-Current local integration is `44d03a2c45a4446b04a2a433c7611434f0ba4a6d`:
-transform/splice passed both final reviews, normal preflight/hooks and committed
+**Current authority: exactly two efforts, superseding the older continuation and
+hold instructions below.** John's direct messages authorize target-branch
+qualification and one development effort, with up to 12 test workers and sole
+device/checkout custody. PRs and merges are authorized when checks and reviews
+pass. The canonical target is `codex/composer087-contracts-20261015`; the fixes
+comprise the new 0.8.7 release rather than an existing release branch.
+
+1. Qualify the combined accepted target in an isolated clean checkout. The old
+   wrong-environment full run and diagnosed failure replay remain nonqualifying
+   historical receipts. The repaired combined focused gate passed on an unchanged
+   tree: 1325 passed, one optional collection skip, zero failures/errors. Full
+   default and full serial PostgreSQL qualification of the resulting target remain.
+2. Continue serially with SMK-06 advisor complete-input budgeting. Source
+   investigation/plan has started; implementation is pending. Discovery Group A
+   and its associated repairs passed both final reviews, normal hooks and exact
+   twelve-blob verification, and are committed as `f0c8a597e`.
+
+No second development lane is authorized. Incomplete work may continue serially
+after each ready packet. At John's explicit 20-percent
+quota signal, stop development and concentrate on landing completed work.
+Preserve the checkout and all historical evidence. The measurements and older
+instructions below are historical wherever this current boundary supersedes them.
+
+Current implementation integration is `f0c8a597e655b4a04f21ca055a7d57072418db87`.
+The full aspirational scope and live statuses are in
+[master issue #315](https://github.com/dta-au/elspeth/issues/315) and its
+[repository snapshot](2026-10-16-composer-087-master-defect-list.md).
+
+The preceding graph integration was `696db482b3057b9a5d600b14ee448f12215ad6ff`:
+graph wiring passed both final reviews, normal preflight/hooks and committed
 blob verification, with no hook byte changes and a clean post-commit tree.
 Graph wiring has passed both final reviews and focused qualification:98 positives,
 568 affected gates,18 focused PostgreSQL passes and36 witnessed intended failures
 across nine controls; keyless semantic drift is zero over3277 existing findings.
 Its original96-pass/2-test-premise-failure run remains red, with the narrow repair
-freshly checked. Normal local integration is next. The older checkpoint
+freshly checked. Normal local graph integration is complete. The older checkpoint
 measurements below remain historical.
+
+The three-handler Discovery Group A and nine associated qualification repairs
+are committed in `f0c8a597e`. Focused qualification includes the combined gate,
+18 PostgreSQL passes, four new witnessed negatives and zero keyless semantic
+drift across 3277 findings. The earlier 215-pass/one-failure Group A run remains
+red; all its cases pass in the fresh gate. Target qualification uses an isolated
+committed checkout. The earlier full-version status inventory
+is [saved separately](2026-10-16-composer-087-fix-status-inventory.md) as a dated
+snapshot, with local integration distinguished from remote merge and release.
 
 The 00:06 UTC checkpoint reprocessed the original pause after compaction; it was
 not evidence of a new direct instruction. Its original text is preserved in
@@ -78,15 +114,15 @@ Raw `git --no-optional-locks status --short` at the checkpoint:
 ```
 
 That historical snapshot had two root documentation paths and five packet paths.
-Two later gate-test repairs made nine owned paths. All nine are now committed
-in44d03a2c and post-commit verification was clean. The subsequent graph packet
-currently changes three production paths alongside the two root documents;
-the same writer is proceeding with tests after both source verdicts. Do not
-stash, restore, clean or stage unrelated state.
+Two later gate-test repairs made nine owned paths, committed in44d03a2c.
+The subsequent graph packet's six owned paths are committed in696db482, with
+normal hooks and committed-blob verification complete. Root status documents
+and the requested inventory are now being refreshed; production/test bytes
+are committed. Do not stash, restore, clean or stage unrelated state.
 
 ## Completed local integrations
 
-Current `git log -8` verifies this ancestry. These are local integrations;
+Current `git log -9` verifies this ancestry. These are local integrations;
 remote merge, protected CI, signing, release and deployment are separate gates.
 
 | Commit | Completed scope |
@@ -98,6 +134,8 @@ remote merge, protected CI, signing, release and deployment are separate gates.
 | `9d6533fe07ef0cdb5270611cc4f1b343cc39de5f` | Combined quota provisioning and Sessions epoch 77, including predecessor refusal and cancellation ownership. |
 | `41348ede3c667bf337ab6597a59df0f9e02dc5a5` | Source refusal/integrity ownership, pure policy admission, plural resolver and census repairs. |
 | `3f2db4f0e92958ecf40afd58fcc6383f2c90521f` | Preserve admitted output schema faults and repair source/output provider doubles with real-method autospec. |
+| `44d03a2c45a4446b04a2a433c7611434f0ba4a6d` | Transform/node/splice saved refusals, precise identity/code/privacy and attributed counterfactual findings. |
+| `696db482b3057b9a5d600b14ee448f12215ad6ff` | Graph wiring/removal saved refusals, precise missing targets and direct edge guidance, with unchanged routing/review ownership. |
 
 Existing completed receipts were read, not rerun. Direct XML parsing and exit
 files produced the following raw measurements; all apply to their recorded

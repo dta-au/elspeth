@@ -4,11 +4,21 @@ This is the working implementation ledger for the approved Composer 0.8.7
 plan. It records source reconciliation and later behavioral evidence; it is
 ordinary project documentation, not a release approval or immutable plan.
 
-**Execution active after verified continuation.** The 00:06 UTC checkpoint
-reprocessed the superseded 19:08 UTC pause; no newer direct stop was identified.
-The verified chronology, current continuation and exact next step are in
-[the status report](2026-10-16-composer-087-paused-status.md). Preserve completed
-evidence and obey any actually newer direct stop.
+**Exactly two efforts are authorized by John's latest direct instructions:**
+qualify the target for merge, and prepare one serial development package.
+Discovery Group A is now committed as `f0c8a597e`; SMK-06 advisor input budgeting
+is the next package, with source investigation started and implementation pending.
+The canonical target is the existing
+`codex/composer087-contracts-20261015` branch; these fixes comprise the new 0.8.7
+release. Up to 12 concurrent test workers and sole device/checkout custody are
+authorized. PRs and merges may proceed when required checks and reviews pass.
+Earlier read-only and ready-and-hold restrictions are superseded for these two
+efforts. No other development lane is active. John monitors quota; an explicit
+20-percent signal stops development and redirects effort to landing completed work.
+See [the current status report](2026-10-16-composer-087-paused-status.md).
+The full aspirational scope and current delivery statuses are maintained in
+[master issue #315](https://github.com/dta-au/elspeth/issues/315), with a
+[repository snapshot](2026-10-16-composer-087-master-defect-list.md).
 
 ## Baseline and boundaries
 
@@ -59,7 +69,7 @@ packet; it does not mean merged, signed, released or deployed.
 | Planned work | Current status |
 |---|---|
 | 0. Baseline inventories and ownership | Complete; live registry/profile and direct-call inventories recorded. |
-| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement, output, source and transform/splice groups accepted locally in `620231a`, `208bf8d`, `41348ede`, `3f2db4f0` and `44d03a2c`. Graph wiring passed both final reviews and focused qualification; normal local integration is next. Blob, secret, discovery and remaining dispatch migrations remain pending. |
+| 1. Rejection identity, operation meaning and closed feedback | Candidate/full-replacement, output, source, transform/splice, graph and Discovery Group A accepted locally in `620231a`, `208bf8d`, `41348ede`, `3f2db4f0`, `44d03a2c`, `696db482` and `f0c8a597e`. Blob, secret and remaining dispatch migrations remain pending. |
 | 2. Saved-but-blocked persistence/reload/UI | Pending joined behavioral evidence; inherited .6 teaching retained. |
 | 3. Model-catalog provenance | Fixed in .6; .7 regression closure pending. |
 | 4. Explicit CSV failure choice | Runtime refusal already exists. False assistance claim that omission defaults to discard still needs correction and its provenance checks. |
@@ -1008,7 +1018,7 @@ runtime/negative leaf-line evidence remains bound to that exact source; current
 test execution semantics are unchanged. No production change or new runtime
 result is claimed by this housekeeping adjustment.
 
-## Graph wiring: focused acceptance complete, local integration next
+## Graph wiring: accepted locally as `696db482`
 
 Both independent reviewers accept the bounded production draft after44d03a2c.
 Seven refusal calls in four existing graph handlers now use the saved-graph
@@ -1031,8 +1041,10 @@ All13 fresh runs have identical before/after/current maps of6636 records,
 input digest `8334b152791eb2a63e2d07fd753e460604ac5e1f3ef1a183b83cba10115a9f67`.
 All126 stopped bindings matched before this root documentation update. PostgreSQL
 URL absence is root launch-transcript observation, not enforcement by its
-capacity JSON or runner. Normal preflight/hooks and local integration are next;
-no graph packet commit or whole-plan completion is claimed here.
+capacity JSON or runner. Normal preflight and hooks exited zero; commit
+`696db482b3057b9a5d600b14ee448f12215ad6ff` contains exactly the six owned paths.
+Post-commit verification found all six blobs equal reviewed staged and worktree
+bytes, no hook changes and a clean tree. Whole-plan completion is not claimed.
 
 The first focused run completed on frozen inputs:98 cases,96 passes,2 failures,
 zero errors/skips. Both slot cases fail the nonempty-warning premise after a
@@ -1048,3 +1060,36 @@ faults are narrow injected owner failures after real changed proposals, and the
 unsupported timeout is a real saved defect. Controls qualify their first failing
 assertions, not every possible serializer or warning-only mutation. Broader
 default/full PostgreSQL, protected CI, operator signing and release remain open.
+
+## Discovery Group A: production draft in progress
+
+The next bounded 0.8.7 packet starts from696db482 and changes only schema,
+assistance and missing-baseline discovery refusals in tools/generation.py.
+The reviewed source plan separates actual policy denial from an admitted
+schema/manager fault, preserves successful/no-assistance discovery and diff
+custody, and retains exact saved findings with honest no-component attribution.
+It requires no new public field, code, argument model, policy or async owner.
+
+The same writer is preparing production first; both independent placement
+verdicts precede test/control edits. Runtime remains root-owned and unallocated.
+Generic dispatch and secret/blob handlers are separate later packets. The
+requested status inventory is saved as an explicit 13:02 AEDT snapshot; this
+later dispatch does not rewrite its earlier as-of statuses.
+
+## Discovery Group A: bounded integration complete
+
+Both final reviewers accepted the unchanged three-handler candidate and nine
+associated qualification repairs. The fresh canonical affected selection exited
+zero on an unchanged tree: 1325 passed, one optional Datadog collection skip,
+zero failures/errors. Every one of the 32 original target failures and all 216
+earlier Group A positive cases passed in that selection. Its 561 earlier gate
+cases and five repair-control counterparts also passed; these populations overlap.
+Four fresh repair negatives failed at their intended witnessed assertions.
+Focused PostgreSQL passed 18 cases; keyless semantic findings stayed 3277 with
+zero additions/removals. Historical failed receipts remain red.
+
+Normal hooks passed. Commit `f0c8a597e655b4a04f21ca055a7d57072418db87` contains
+exactly the twelve reviewed paths, and every committed blob equals the reviewed
+and worktree bytes. Whole default/full serial PostgreSQL qualification, protected
+CI and operator clearance remain separate. Source investigation of SMK-06 is
+the sole next development work; no other new fix is active.
