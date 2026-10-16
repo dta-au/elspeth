@@ -1054,6 +1054,11 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
     ),
     AuthoritySymbol(
         "src/elspeth/web/coordination/quota_policy_authority.py",
+        "RepositoryQuotaPolicyAuthority.ensure_container_token_policy",
+        "QuotaAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/quota_policy_authority.py",
         "RepositoryQuotaPolicyAuthority._set_identity_policy_on_connection",
         "QuotaAuthority",
     ),
@@ -1437,6 +1442,11 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
     AuthoritySymbol(
         "src/elspeth/web/coordination/quota_policy_authority.py",
         "RepositoryQuotaPolicyAuthority.revoke_identity_policy",
+        "QuotaAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/quota_policy_authority.py",
+        "RepositoryQuotaPolicyAuthority.ensure_container_token_policy",
         "QuotaAuthority",
     ),
     AuthoritySymbol(
@@ -2939,7 +2949,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="0f7437b34c5461ed",
         ordinal=1,
         authority="QuotaAuthority",
-        line=169,
+        line=177,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2950,7 +2960,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="00b0b61322fe7af1",
         ordinal=1,
         authority="QuotaAuthority",
-        line=369,
+        line=377,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2961,7 +2971,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="a78f71b01aa1d2d2",
         ordinal=1,
         authority="QuotaAuthority",
-        line=354,
+        line=362,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2972,7 +2982,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="9838424af10b663c",
         ordinal=1,
         authority="QuotaAuthority",
-        line=579,
+        line=587,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2983,7 +2993,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="1463fd51b854c37f",
         ordinal=1,
         authority="QuotaAuthority",
-        line=240,
+        line=248,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2994,7 +3004,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="8c9956b9782cefa0",
         ordinal=1,
         authority="QuotaAuthority",
-        line=225,
+        line=233,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3005,7 +3015,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="10050ea6a0b8cacb",
         ordinal=1,
         authority="QuotaAuthority",
-        line=320,
+        line=386,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3016,7 +3026,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="237ea48d83d9cf37",
         ordinal=1,
         authority="QuotaAuthority",
-        line=262,
+        line=328,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3027,7 +3037,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="7dbb450913ed841e",
         ordinal=1,
         authority="QuotaAuthority",
-        line=259,
+        line=325,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3038,7 +3048,29 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="dceb76e38470da07",
         ordinal=1,
         authority="QuotaAuthority",
-        line=300,
+        line=366,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/quota_policy_authority.py",
+        symbol="RepositoryQuotaPolicyAuthority.ensure_container_token_policy",
+        table="quota_policies",
+        operation="insert",
+        fingerprint="76f57f65f3d7f0e2",
+        ordinal=1,
+        authority="QuotaAuthority",
+        line=240,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/quota_policy_authority.py",
+        symbol="RepositoryQuotaPolicyAuthority.ensure_container_token_policy",
+        table="<sessions-write-connection>",
+        operation="write_connection",
+        fingerprint="35ff151addb87f75",
+        ordinal=1,
+        authority="QuotaAuthority",
+        line=216,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3049,7 +3081,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="312e6193316eb448",
         ordinal=1,
         authority="QuotaAuthority",
-        line=217,
+        line=283,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4523,7 +4555,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="dc1da0e98009a36e",
         ordinal=1,
         authority="SessionSchemaAuthority",
-        line=307,
+        line=310,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4534,7 +4566,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="ae6f27adb45e82ea",
         ordinal=1,
         authority="SessionSchemaAuthority",
-        line=303,
+        line=306,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4545,7 +4577,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="ae6f27adb45e82ea",
         ordinal=2,
         authority="SessionSchemaAuthority",
-        line=304,
+        line=307,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4556,7 +4588,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="730473cf9d5628ab",
         ordinal=1,
         authority="SessionSchemaAuthority",
-        line=285,
+        line=288,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4794,7 +4826,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="0f0d2bcbf88ed81a",
         ordinal=1,
         authority=None,
-        line=186,
+        line=189,
         connection_escape=False,
     ),
     # Occupancy and epoch probes execute catalog/header reads only. Their
@@ -4987,10 +5019,10 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         symbol="_header_only_inline_csv_conflict",
         table="<sessions-write-connection>",
         operation="write_connection",
-        fingerprint="fb67c26da4e42b98",
+        fingerprint="cb9dd966393cab1d",
         ordinal=1,
         authority=None,
-        line=1703,
+        line=1822,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5353,7 +5385,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="9c1026073d2af782",
         ordinal=1,
         authority=None,
-        line=191,
+        line=257,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5518,7 +5550,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="d7ac5811a7ee7916",
         ordinal=1,
         authority="SessionSchemaAuthority",
-        line=320,
+        line=323,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5529,7 +5561,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="983f117ba847fe0d",
         ordinal=1,
         authority="SessionSchemaAuthority",
-        line=434,
+        line=437,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -13006,6 +13038,54 @@ def test_atomic_blob_deletion_retirement_facet_identity_is_exact_and_bidirection
     assert connection_authority_violations(live) == []
 
 
+def test_inline_csv_comparison_read_admission_is_exact() -> None:
+    root = _repo_root()
+    relative = "src/elspeth/web/composer/tools/sources.py"
+    symbol = "_header_only_inline_csv_conflict"
+    live = [site for site in scan_production_writers([root / relative], anchor=root) if site.symbol == symbol]
+    reviewed = [site for site in _REVIEWED_READ_CONNECTIONS if site.path == relative and site.symbol == symbol]
+    assert len(live) == len(reviewed) == 1
+    assert subtract_reviewed_read_identities(live, reviewed) == ([], [])
+    assert reviewed_read_connection_policy_violations(reviewed) == []
+    assert _authority_for(relative, symbol) is None
+    assert _contained_connection_authority_for(relative, symbol) is None
+
+
+@pytest.mark.parametrize("effect", ["conn.execute(blobs_table.delete())", "leak(conn)"], ids=["dml", "connection_escape"])
+def test_inline_csv_comparison_read_admission_refuses_injected_mutation_and_escape(tmp_path: Path, effect: str) -> None:
+    root = _repo_root()
+    relative = "src/elspeth/web/composer/tools/sources.py"
+    symbol = "_header_only_inline_csv_conflict"
+    reviewed = [site for site in _REVIEWED_READ_CONNECTIONS if site.path == relative and site.symbol == symbol]
+    tree = ast.parse((root / relative).read_text())
+    owners = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == symbol]
+    assert len(owners) == 1
+    connections = [
+        node
+        for node in ast.walk(owners[0])
+        if isinstance(node, ast.With) and any(ast.unparse(item.context_expr) == "session_engine.connect()" for item in node.items)
+    ]
+    assert len(connections) == 1
+    connections[0].body.insert(0, ast.parse(effect).body[0])
+    source = tmp_path / relative
+    source.parent.mkdir(parents=True)
+    source.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+    injected = [site for site in scan_production_writers([source], anchor=tmp_path) if site.symbol == symbol]
+    remaining, stale = subtract_reviewed_read_identities(injected, reviewed)
+    assert stale == reviewed
+    assert remaining
+    if effect == "conn.execute(blobs_table.delete())":
+        mutations = [site for site in injected if site.table == "blobs" and site.operation == "delete"]
+        assert len(mutations) == 1
+        assert all(site in remaining for site in mutations)
+        assert authority_policy_violations(mutations, _TABLE_POLICIES) == (mutations, [])
+    else:
+        escapes = [site for site in injected if site.operation == "write_connection" and site.connection_escape]
+        assert escapes
+        assert all(site in remaining for site in escapes)
+        assert connection_authority_violations(escapes) == escapes
+
+
 def test_blob_custody_read_connection_admissions_are_exact_and_not_mutation_authorities() -> None:
     root = _repo_root()
     path = "src/elspeth/web/blobs/service.py"
@@ -20448,7 +20528,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "0f0d2bcbf88ed81a",
             1,
             None,
-            line=186,
+            line=189,
         ),
         # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,
         # so it poisons the otherwise-proven Landscape origin of this
@@ -20593,7 +20673,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "730473cf9d5628ab",
             1,
             "SessionSchemaAuthority",
-            line=285,
+            line=288,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -20603,7 +20683,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "d7ac5811a7ee7916",
             1,
             "SessionSchemaAuthority",
-            line=320,
+            line=323,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -20613,7 +20693,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "983f117ba847fe0d",
             1,
             "SessionSchemaAuthority",
-            line=434,
+            line=437,
         ),
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",

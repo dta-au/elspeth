@@ -14,7 +14,7 @@ for (const { count, secondSink } of [{ count: 1, secondSink: false }, { count: 3
     const state: CompositionStateSeed = {
       version: 1,
       metadata: { name: "Synthetic shared sink", description: "Rendering fixture; never executed" },
-      sources: { source: { plugin: "csv", on_success: "input_0", on_validation_failure: "discard", options: { path: join(dataDir, "blobs", session.id, `${blob.id}_synthetic.csv`), blob_ref: blob.id, schema: { mode: "observed" } } } },
+      sources: { source: { plugin: "csv", on_success: "input_0", on_validation_failure: "quarantine", options: { path: join(dataDir, "blobs", session.id, `${blob.id}_synthetic.csv`), blob_ref: blob.id, schema: { mode: "observed" } } } },
       nodes: Array.from({ length: count }, (_, index) => {
         const last = index === count - 1;
         const gate = index % 3 === 1 && !last;
@@ -30,7 +30,7 @@ for (const { count, secondSink } of [{ count: 1, secondSink: false }, { count: 3
         };
       }),
       edges: [],
-      outputs: (secondSink ? ["shared_sink", "shared_other"] : ["shared_sink"]).map((name) => ({ name, plugin: "json", on_write_failure: "discard", options: { path: `outputs/${name}.json`, schema: { mode: "observed" } } })),
+      outputs: [...(secondSink ? ["shared_sink", "shared_other"] : ["shared_sink"]), "quarantine"].map((name) => ({ name, plugin: "json", on_write_failure: "discard", options: { path: `outputs/${name}.json`, schema: { mode: "observed" } } })),
     };
     try {
       await seedCompositionState(ctx, session.id, state);
@@ -40,6 +40,12 @@ for (const { count, secondSink } of [{ count: 1, secondSink: false }, { count: 3
       await composer.waitForChatReady();
       const sink = page.locator('.react-flow__node[data-id="shared_sink"]');
       await expect(sink).toBeVisible();
+      const viewport = page.locator(".react-flow__viewport");
+      const readZoom = () => viewport.evaluate((element) => new DOMMatrixReadOnly(getComputedStyle(element).transform).a);
+      if (count === 15 && !secondSink) {
+        await expect.poll(readZoom).toBeLessThan(0.3);
+        expect(await readZoom()).toBeGreaterThanOrEqual(0.15);
+      }
       const paths = page.locator('.react-flow__edge[data-testid]');
       const before = await paths.count();
       expect(before).toBeGreaterThan(count);
@@ -99,6 +105,40 @@ for (const { count, secondSink } of [{ count: 1, secondSink: false }, { count: 3
       await page.mouse.click(clickPoint.x, clickPoint.y);
       await expect(page.getByRole("status").filter({ hasText: "Selected route:" })).toHaveText(selectedText);
       await page.locator(".graph-view-shell").screenshot({ path: testInfo.outputPath(`shared-sink-${count}${secondSink ? "-two" : ""}.png`) });
+      if (count === 1) {
+        const quarantine = page.locator('.react-flow__node[data-id="quarantine"]');
+        await expect(quarantine).toBeVisible();
+        const retainedGeometry = () => page.locator('.react-flow__node:not([data-id="quarantine"])').evaluateAll((elements) => elements.map((element) => ({
+          id: element.getAttribute("data-id"), transform: (element as HTMLElement).style.transform,
+        })).sort((left, right) => (left.id ?? "").localeCompare(right.id ?? "")));
+        const originalGeometry = await retainedGeometry();
+        const originalViewport = await viewport.evaluate((element) => getComputedStyle(element).transform);
+        const hide = page.getByRole("button", { name: "Hide quarantine and discard routes" });
+        await hide.focus();
+        await page.keyboard.press("Space");
+        await expect(page.getByRole("button", { name: "Show quarantine and discard routes" })).toHaveAttribute("aria-pressed", "false");
+        await expect(quarantine).toHaveCount(0);
+        await expect(sink).toBeVisible();
+        await expect.poll(retainedGeometry).not.toEqual(originalGeometry);
+        expect(await viewport.evaluate((element) => getComputedStyle(element).transform)).toBe(originalViewport);
+        await page.keyboard.press("Enter");
+        await expect(page.getByRole("button", { name: "Hide quarantine and discard routes" })).toHaveAttribute("aria-pressed", "true");
+        await expect(quarantine).toBeVisible();
+        await expect.poll(retainedGeometry).toEqual(originalGeometry);
+        expect(await viewport.evaluate((element) => getComputedStyle(element).transform)).toBe(originalViewport);
+        expect(await paths.evaluateAll((elements) => elements.map((element) => element.getAttribute("data-testid")).sort())).toEqual(topology);
+      }
+      if (count === 15 && !secondSink) {
+        const zoomOut = page.locator(".react-flow__controls-zoomout");
+        for (let step = 0; step < 20 && await zoomOut.isEnabled(); step++) await zoomOut.click();
+        await expect(zoomOut).toBeDisabled();
+        await expect.poll(readZoom).toBeCloseTo(0.15, 5);
+        for (let step = 0; step < 5; step++) await page.locator(".react-flow__controls-zoomin").click();
+        await expect.poll(readZoom).toBeGreaterThan(0.3);
+        await page.locator(".react-flow__controls-fitview").click();
+        await expect.poll(readZoom).toBeLessThan(0.3);
+        expect(await readZoom()).toBeGreaterThanOrEqual(0.15);
+      }
       await page.reload();
       await composer.waitForChatReady();
       await expect(sink).toBeVisible();

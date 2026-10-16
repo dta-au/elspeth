@@ -6397,7 +6397,7 @@ def _pathological_multi_query_state(simple_state: CompositionState, node_count: 
 def test_checkpoint_excerpt_is_bounded_by_whole_lines_with_a_withheld_count(make_service, simple_state):
     """A pipeline of near-cap multi-query nodes yields an excerpt at or under the
     budget, made of exact summary lines plus one rubric-legible withheld marker."""
-    from elspeth.web.composer.advisor_context import ADVISOR_CHARS_PER_TOKEN, summarize_pipeline_for_advisor
+    from elspeth.web.composer.advisor_context import ADVISOR_CHARS_PER_TOKEN, build_advisor_user_message, summarize_pipeline_for_advisor
 
     service = make_service()
     state = _pathological_multi_query_state(simple_state)
@@ -6406,7 +6406,9 @@ def test_checkpoint_excerpt_is_bounded_by_whole_lines_with_a_withheld_count(make
     assert len(full_summary) > char_cap, "fixture must exceed the budget or the test proves nothing"
 
     for phase in ("early", "end"):
-        excerpt = service._advisor_checkpoint._build_checkpoint_arguments(phase=phase, state=state)["schema_excerpt"]
+        arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase=phase, state=state)
+        excerpt = arguments["schema_excerpt"]
+        assert len(build_advisor_user_message(arguments)) <= char_cap
         assert len(excerpt) <= char_cap
         *kept, marker = excerpt.split("\n")
         full_lines = full_summary.split("\n")
@@ -6447,16 +6449,409 @@ def test_checkpoint_evidence_identity_hashes_the_unbounded_summary(make_service,
     assert arguments["schema_excerpt"] != full_summary
 
 
-def test_bound_advisor_pipeline_summary_publishes_marker_alone_when_no_line_fits():
+def test_bound_advisor_checkpoint_summary_publishes_marker_alone_when_no_line_fits():
     """Fail closed toward 'withheld', never toward a partial line."""
-    from elspeth.web.composer.advisor_context import bound_advisor_pipeline_summary
+    from elspeth.web.composer.advisor_context import bound_advisor_checkpoint_summary, build_advisor_user_message
 
-    summary = "\n".join(["a" * 300, "b" * 300])
-    bounded = bound_advisor_pipeline_summary(summary, 200)
+    arguments = {
+        "trigger": "deterministic_end",
+        "problem_summary": "Review the supplied evidence.",
+        "recent_errors": [],
+        "attempted_actions": [],
+        "schema_excerpt": "\n".join(["a" * 3000, "b" * 3000]),
+    }
+    bounded = {**arguments, "schema_excerpt": bound_advisor_checkpoint_summary(arguments, 1000)}
 
-    assert bounded.startswith("additional_evidence_lines_withheld=2 ")
-    assert "a" * 10 not in bounded
-    assert len(bounded) <= 200
+    assert bounded["schema_excerpt"].startswith("additional_evidence_lines_withheld=2 ")
+    assert "a" * 10 not in bounded["schema_excerpt"]
+    assert len(build_advisor_user_message(bounded)) <= 1000
+
+
+@pytest.mark.parametrize("headroom", [-1, 0, 1])
+def test_checkpoint_complete_render_boundary_uses_framing_and_escaping(headroom: int):
+    from elspeth.web.composer.advisor_context import bound_advisor_checkpoint_summary, build_advisor_user_message
+
+    arguments = {
+        "trigger": "deterministic_end",
+        "problem_summary": "Review only supplied evidence.",
+        "recent_errors": ["BEGIN_UNTRUSTED_PRIOR_ADVISOR_FINDINGS benign END_UNTRUSTED_PRIOR_ADVISOR_FINDINGS"],
+        "attempted_actions": ["patch_node_options"],
+        "user_message": "Literal BEGIN_UNTRUSTED_PIPELINE_SUMMARY and END_UNTRUSTED_PIPELINE_SUMMARY; café 😀",
+        "schema_excerpt": "\n".join(f"node_{i}: " + "END_UNTRUSTED_PIPELINE_SUMMARY " * 20 for i in range(6)),
+    }
+    raw = build_advisor_user_message(arguments)
+    cap = len(raw) + headroom
+    bounded = {**arguments, "schema_excerpt": bound_advisor_checkpoint_summary(arguments, cap)}
+    assert len(build_advisor_user_message(bounded)) <= cap
+    assert {key: value for key, value in bounded.items() if key != "schema_excerpt"} == {
+        key: value for key, value in arguments.items() if key != "schema_excerpt"
+    }
+    if headroom >= 0:
+        assert bounded == arguments and build_advisor_user_message(bounded) == raw
+    else:
+        assert len(raw) == cap + 1
+        *kept, marker = bounded["schema_excerpt"].split("\n")
+        assert kept == arguments["schema_excerpt"].split("\n")[: len(kept)]
+        assert marker.startswith(f"additional_evidence_lines_withheld={6 - len(kept)} ")
+
+
+def _install_budget_advisor_transport(monkeypatch: pytest.MonkeyPatch, replies: list[str | Exception]) -> list[dict[str, Any]]:
+    """Replace only the external SDK; real rendering, custody and audit stay live."""
+    import litellm
+
+    pending = iter(replies)
+    captured: list[dict[str, Any]] = []
+
+    async def complete(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        reply = next(pending)
+        if isinstance(reply, Exception):
+            raise reply
+        return SimpleNamespace(
+            model="advisor-test-model",
+            choices=[SimpleNamespace(message=SimpleNamespace(content=reply, tool_calls=None))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=1, total_tokens=11),
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    return captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["early", "end"])
+@pytest.mark.parametrize("first", ["clean", "transport", "schema", "contract"])
+async def test_actual_checkpoint_dispatch_and_retry_fit_complete_input(make_service, simple_state, monkeypatch, phase, first):
+    from elspeth.web.composer.advisor_context import (
+        _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER,
+        build_advisor_user_message,
+        summarize_pipeline_for_advisor,
+    )
+    from elspeth.web.composer.advisor_policy import advisor_arguments_with_format_reprompt
+
+    service = make_service()
+    state = _pathological_multi_query_state(simple_state)
+    good = _checkpoint_reply(
+        findings="Required evidence is omitted." if phase == "end" else "",
+        publication_verdict="WITHHOLD" if phase == "end" else None,
+    )
+    bad = _checkpoint_reply(steps=("rate",), publication_verdict="ADMIT" if phase == "end" else None)
+    initial = {"clean": good, "transport": TimeoutError(), "schema": "not JSON", "contract": bad}[first]
+    calls = _install_budget_advisor_transport(monkeypatch, [initial, good])
+    recorder = make_recorder()
+    full = summarize_pipeline_for_advisor(state)
+    fenced = _fenced_session(service, review_state=state if phase == "end" else None)
+    build_kwargs = {"phase": phase, "state": state}
+    if phase == "end":
+        build_kwargs["publication_review"] = fenced["publication_review"]
+    if first in {"schema", "contract"}:
+        # End the first input immediately after a real whole-line boundary.
+        # The same owned review is mandatory in both this premise and dispatch.
+        probe = service._advisor_checkpoint._build_checkpoint_arguments(**build_kwargs)
+        lines = full.split("\n")
+        kept = lines[: next(index for index, line in enumerate(lines, 1) if "node_00" in line)]
+        cap = service._settings.composer_advisor_max_prompt_tokens * 4
+        for _ in range(3):
+            marker = _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(count=len(lines) - len(kept), limit=cap)
+            prefix = "\n".join([*kept, marker])
+            measured = len(build_advisor_user_message({**probe, "schema_excerpt": prefix}))
+            cap = ((measured + 3) // 4) * 4
+        service._advisor_checkpoint._settings = _make_settings(composer_advisor_max_prompt_tokens=cap // 4)
+    cap = service._advisor_checkpoint._settings.composer_advisor_max_prompt_tokens * 4
+    arguments = service._advisor_checkpoint._build_checkpoint_arguments(**build_kwargs)
+    assert len(build_advisor_user_message(arguments)) <= cap
+    assert len(build_advisor_user_message({**arguments, "schema_excerpt": full})) > cap
+    if first in {"schema", "contract"}:
+        unfitted_retry = advisor_arguments_with_format_reprompt(arguments, schema_valid=first == "contract")
+        assert len(build_advisor_user_message(unfitted_retry)) > cap
+        minimum_retry = {
+            **unfitted_retry,
+            "schema_excerpt": _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(count=len(full.split("\n")), limit=cap),
+        }
+        assert len(build_advisor_user_message(minimum_retry)) <= cap
+
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=state, recorder=recorder, **fenced)
+
+    assert verdict.ok and not verdict.blocking
+    assert len(calls) == (1 if first == "clean" else 2)
+    assert all(len(call["messages"][1]["content"]) <= cap for call in calls)
+    assert calls[0]["messages"][1]["content"] == build_advisor_user_message(arguments)
+    assert len(recorder.llm_calls) == len(calls)
+    record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
+    assert record["provider_attempts"] == len(calls)
+    assert record["format_reprompt_sent"] is (first in {"schema", "contract"})
+    if first == "transport":
+        assert calls[0]["messages"] == calls[1]["messages"]
+    elif first in {"schema", "contract"}:
+        assert "The previous reply" not in calls[0]["messages"][1]["content"]
+        assert "The previous reply" in calls[1]["messages"][1]["content"]
+    if phase == "end":
+        # A scoped CLEAN is not permission to publish claims needing omitted values.
+        assert verdict.publication_verdict == "WITHHOLD"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["early", "end"])
+async def test_large_sessionless_checkpoint_body_without_publication_fits_real_wire(make_service, simple_state, monkeypatch, phase):
+    service = make_service()
+    reply = _checkpoint_reply(publication_verdict="WITHHOLD", findings="Omitted evidence.") if phase == "end" else _checkpoint_reply()
+    calls = _install_budget_advisor_transport(monkeypatch, [reply])
+    arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase=phase, state=_pathological_multi_query_state(simple_state))
+    assert "user_message" not in arguments and "publication_review" not in arguments
+    recorder = make_recorder()
+    guidance, _ = await service._advisor_checkpoint._call_advisor_with_audit(arguments, recorder=recorder, structured_output=True)
+    assert guidance == reply and len(calls) == 1 and len(recorder.llm_calls) == 1
+    assert len(calls[0]["messages"][1]["content"]) <= 16000
+    # This qualifies wire budgeting, not the separately defective unbound
+    # public END wrapper's completed-pass publication contract.
+
+
+@pytest.mark.asyncio
+async def test_unsent_format_retry_keeps_first_actual_call_without_completed_review(make_service, simple_state, monkeypatch):
+    from elspeth.web.composer.advisor_context import (
+        _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER,
+        build_advisor_user_message,
+        summarize_pipeline_for_advisor,
+    )
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    service = make_service()
+    fenced = _fenced_session(service)
+    evidence = TurnEvidence(
+        session_id=fenced["session_id"],
+        session_operation_context=fenced["session_operation_context"],
+        request_id="smk06-unsent",
+        request="Review this graph",
+        initial_state_id=None,
+        initial_state=simple_state,
+    )
+    blank = evidence.review_candidate(candidate="", request="Review this graph", current_state=simple_state)
+    arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=simple_state, publication_review=blank)
+    marker = _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(count=len(summarize_pipeline_for_advisor(simple_state).split("\n")), limit=16000)
+    mandatory_size = len(build_advisor_user_message({**arguments, "schema_excerpt": marker}))
+    assert mandatory_size < 16000
+    review = evidence.review_candidate(
+        candidate="x" * (16000 - mandatory_size - 1), request="Review this graph", current_state=simple_state
+    )
+    calls = _install_budget_advisor_transport(monkeypatch, ["not JSON"])
+    recorder = make_recorder()
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end",
+        state=simple_state,
+        publication_review=review,
+        recorder=recorder,
+        **fenced,
+    )
+    assert verdict.failure_class == "budget_exhausted" and not verdict.retryable
+    assert len(calls) == 1 and len(recorder.llm_calls) == 1
+    assert len(calls[0]["messages"][1]["content"]) == 15999
+    assert "The previous reply" not in calls[0]["messages"][1]["content"]
+    service._sessions_service.add_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["early", "end"])
+async def test_mandatory_checkpoint_overflow_is_not_a_completed_review(make_service, simple_state, monkeypatch, phase):
+    service = make_service()
+    service._advisor_checkpoint._settings = _make_settings(composer_advisor_max_prompt_tokens=1)
+    calls = _install_budget_advisor_transport(monkeypatch, [])
+    recorder = make_recorder()
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase=phase, state=simple_state, recorder=recorder, **_fenced_session(service)
+    )
+    assert (verdict.ok, verdict.blocking, verdict.failure_class, verdict.retryable) == (False, False, "budget_exhausted", False)
+    assert verdict.publication_verdict is None and verdict.publication_binding is None
+    assert calls == [] and recorder.llm_calls == ()
+    service._sessions_service.add_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mandatory_publication_overflow_preserves_continuation_reservation(make_service, simple_state, monkeypatch):
+    from decimal import Decimal
+
+    from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerContinuationBudget
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    service = make_service()
+    fenced = _fenced_session(service)
+    request = "Explain this graph. " + "a" * 17000
+    evidence = TurnEvidence(
+        session_id=fenced["session_id"],
+        session_operation_context=fenced["session_operation_context"],
+        request_id="smk06-continuation",
+        request=request,
+        initial_state_id=None,
+        initial_state=simple_state,
+    )
+    review = evidence.review_candidate(candidate="A concise reply", request=request, current_state=simple_state)
+    budget = PlannerContinuationBudget(
+        policy=PlannerBudgetPolicy(2, 1_000_000, 100, Decimal("1")),
+        session_id=fenced["session_id"],
+        request_id="smk06-continuation",
+        request_hash=stable_hash(request),
+        provider_owner=None,
+        evidence_owner=evidence,
+        deadline=asyncio.get_running_loop().time() + 60,
+        reserved_calls=0,
+        validated_cost=Decimal("0"),
+        cost_known=True,
+    )
+    budget.validate_for(
+        session_id=fenced["session_id"],
+        request_id="smk06-continuation",
+        request=request,
+        provider_owner=None,
+        evidence_owner=evidence,
+    )
+    budget.bind_publication(review)
+    calls = _install_budget_advisor_transport(monkeypatch, [])
+    recorder = make_recorder()
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end",
+        state=simple_state,
+        user_message=request,
+        publication_review=review,
+        continuation_budget=budget,
+        recorder=recorder,
+        **fenced,
+    )
+    assert verdict.failure_class == "budget_exhausted" and not verdict.retryable
+    assert budget.reserved_calls == 0 and budget.validated_cost == Decimal("0")
+    assert calls == [] and recorder.llm_calls == ()
+    service._sessions_service.add_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required_scope", [False, True])
+async def test_final_advisor_dispatch_guard_precedes_provider_and_audit(make_service, simple_state, monkeypatch, required_scope):
+    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+    from elspeth.web.required_work import (
+        RequiredAuthorityKind,
+        RequiredWorkAuthority,
+        RequiredWorkBinding,
+        RequiredWorkCoordinator,
+        RequiredWorkRole,
+    )
+
+    service = make_service()
+    fenced = _fenced_session(service)
+    context = dataclass_replace(
+        fenced["session_operation_context"],
+        fence=dataclass_replace(fenced["session_operation_context"].fence, operation_id=str(uuid.uuid4())),
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(
+            RequiredAuthorityKind.SYNCHRONOUS_COMPOSE,
+            context,
+            invocation_id=str(uuid.uuid4()),
+        )
+    )
+    owner = ProviderInvocationOwner(
+        service=service._sessions_service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+    )
+    arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase="early", state=simple_state)
+    arguments["problem_summary"] = "x" * 16001
+    calls = _install_budget_advisor_transport(monkeypatch, [_checkpoint_reply()])
+    recorder = make_recorder()
+    with pytest.raises(InvariantError, match="complete-message budget"):
+        await service._advisor_checkpoint._call_advisor_with_audit(
+            arguments,
+            recorder=recorder,
+            provider_owner=owner if required_scope else None,
+        )
+    assert calls == [] and recorder.llm_calls == () and coordinator.tickets == ()
+    service._sessions_service.add_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_signoff_refuses_mandatory_overflow_before_dispatch(make_service, simple_state, monkeypatch):
+    from elspeth.contracts.chargeable_admission import AdmissionPolicyEvidence, ChargeableAdmissionDecision, QuotaDisposition
+    from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
+
+    service = make_service()
+    fenced = _fenced_session(service)
+    service._sessions_service.assess_chargeable_operation = _AsyncRecorder(
+        return_value=ChargeableAdmissionDecision(
+            refusal_reason=None,
+            evidence=AdmissionPolicyEvidence(quota_disposition=QuotaDisposition.NOT_CONFIGURED, secret_wiring_hash="a" * 64),
+        )
+    )
+    service._advisor_checkpoint._chargeable_admission = ComposerChargeableAdmission(service._sessions_service)
+    service._advisor_checkpoint._settings = _make_settings(composer_advisor_max_prompt_tokens=1)
+    calls = _install_budget_advisor_transport(monkeypatch, [])
+    verdict = await service._advisor_checkpoint.run_signoff_checkpoint(
+        state=simple_state,
+        recorder=make_recorder(),
+        user_message="Review supplied evidence.",
+        **fenced,
+    )
+    assert verdict.failure_class == "budget_exhausted" and not verdict.retryable
+    assert calls == []
+    assert service._sessions_service.assess_chargeable_operation.await_count == 1
+    service._sessions_service.begin_provider_attempt.assert_not_called()
+    service._sessions_service.add_message.assert_not_awaited()
+
+
+def test_budgeted_end_retains_mandatory_context_and_exposes_tail_visibility_limit(make_service, simple_state):
+    from elspeth.web.composer._compose_loop_carriers import _AdvisorReviewState
+    from elspeth.web.composer.advisor_context import build_advisor_user_message, summarize_pipeline_for_advisor
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    service = make_service()
+    state = _pathological_multi_query_state(simple_state)
+    tail = dataclass_replace(state.nodes[-1], id="late_reviewed_node", options={**state.nodes[-1].options, "model": "late_model_canary"})
+    sink = dataclass_replace(
+        state.outputs[0],
+        plugin="json",
+        options={
+            "path": "outputs/tail.jsonl",
+            "schema": {"mode": "fixed", "fields": ["late_sink_field_canary: str"]},
+            "format": "jsonl",
+            "mode": "write",
+            "collision_policy": "auto_increment",
+        },
+    )
+    state = dataclass_replace(state, nodes=(*state.nodes[:-1], tail), outputs=(sink,))
+    request = "Preserve intended input and output. " * 50
+    evidence = TurnEvidence(
+        session_id=None,
+        session_operation_context=None,
+        request_id="smk06-visibility",
+        request=request,
+        initial_state_id=None,
+        initial_state=simple_state,
+    )
+    review = evidence.review_candidate(candidate="Explain only the supplied evidence.", request=request, current_state=state)
+    previous = _AdvisorReviewState(
+        completed_passes=2,
+        previous_findings=("Prior finding " + "x" * 900,) * 5,
+        previous_evidence_hash="prior_evidence",
+        successful_mutating_actions=("patch_node_options", "set_output"),
+    )
+    arguments = service._advisor_checkpoint._build_checkpoint_arguments(
+        phase="end",
+        state=state,
+        user_message=request,
+        advisor_review_state=previous,
+        publication_review=review,
+    )
+    full = summarize_pipeline_for_advisor(state)
+    *kept, marker = arguments["schema_excerpt"].split("\n")
+    assert kept == full.split("\n")[: len(kept)]
+    assert marker.startswith(f"additional_evidence_lines_withheld={len(full.split(chr(10))) - len(kept)} ")
+    assert "late_model_canary" in full and "late_sink_field_canary" in full
+    assert "late_model_canary" not in arguments["schema_excerpt"] and "late_sink_field_canary" not in arguments["schema_excerpt"]
+    assert f"Current evidence identity: {stable_hash({'advisor_evidence': full})}." in arguments["problem_summary"]
+    assert "prior_evidence" in arguments["problem_summary"] and len(arguments["recent_errors"]) == 5
+    assert arguments["attempted_actions"] == [
+        f"Successful pipeline mutation since the prior review: {name}" for name in previous.successful_mutating_actions
+    ]
+    assert arguments["user_message"] == request and arguments["publication_review"] is review
+    prompt = build_advisor_user_message(arguments)
+    assert len(prompt) <= 16000 and review.provider_payload_json in prompt
+    assert "late_model_canary" not in review.provider_payload_json and "late_sink_field_canary" not in review.provider_payload_json
+    fitting = dataclass_replace(state, nodes=(tail,))
+    visible = service._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=fitting)["schema_excerpt"]
+    assert "late_model_canary" in visible and "late_sink_field_canary" in visible
 
 
 def test_all_end_gate_call_sites_pass_the_durable_gate_fact_and_owned_evidence():

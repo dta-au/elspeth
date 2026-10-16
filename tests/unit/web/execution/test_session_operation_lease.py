@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import faulthandler
 import inspect
 import json
 import operator
@@ -107,6 +108,10 @@ execution_fixture = execution_custody.execution_fixture
 
 
 _USER_ID = "execution-lease-user"
+_FAILED_SHUTDOWN_STARTUP_SECONDS = 15
+# These are the existing sequential wait allowances in the proof coroutine.
+_FAILED_SHUTDOWN_PHASE_SECONDS = (5, 2, 3, 3, 3, 5, 2, 5)
+_FAILED_SHUTDOWN_PROOF_SECONDS = sum(_FAILED_SHUTDOWN_PHASE_SECONDS)
 
 
 def _context(
@@ -979,6 +984,12 @@ def _run_failed_shutdown_release_child(root: Path, error_type: type[Exception], 
     }
     command = [
         sys.executable,
+        "-c",
+        "import faulthandler, pathlib, runpy, sys; "
+        f"faulthandler.dump_traceback_later({_FAILED_SHUTDOWN_STARTUP_SECONDS - 1}, file=sys.stderr); "
+        "sys.argv = sys.argv[1:]; "
+        "sys.path[0] = str(pathlib.Path(sys.argv[0]).parent); "
+        "runpy.run_path(sys.argv[0], run_name='__main__')",
         str(Path(__file__).resolve()),
         "--failed-shutdown-release-child",
         str(root),
@@ -989,11 +1000,33 @@ def _run_failed_shutdown_release_child(root: Path, error_type: type[Exception], 
     log = root / "failed-shutdown-release-child.log"
     with log.open("wb") as stream:
         process = subprocess.Popen(command, cwd=repo, env=environment, stdout=stream, stderr=subprocess.STDOUT)
+        started = time.monotonic()
+        startup_deadline = started + _FAILED_SHUTDOWN_STARTUP_SECONDS
+        outer_deadline = startup_deadline + _FAILED_SHUTDOWN_PROOF_SECONDS
+        proof_started: float | None = None
+        phase = "startup"
+        returncode = None
         try:
             checkpoint = root / "checkpoint.json"
             failure = root / "failure.json"
-            deadline = time.monotonic() + 15
-            while not checkpoint.exists() and not failure.exists() and process.poll() is None and time.monotonic() < deadline:
+            proof_start = root / "proof-start.json"
+            while True:
+                returncode = process.poll()
+                if failure.exists():
+                    phase = "proof" if proof_start.exists() else "startup"
+                    break
+                if proof_started is None and proof_start.exists():
+                    proof_started = json.loads(proof_start.read_text())["started_at"]
+                    assert isinstance(proof_started, float)
+                    assert started <= proof_started <= startup_deadline, "child setup exceeded its startup allowance"
+                    phase = "proof"
+                deadline = (
+                    startup_deadline if proof_started is None else min(proof_started + _FAILED_SHUTDOWN_PROOF_SECONDS, outer_deadline)
+                )
+                if checkpoint.exists():
+                    break
+                if returncode is not None or time.monotonic() >= deadline:
+                    break
                 time.sleep(0.01)
             assert _assert_child_checkpoint_or_failure(checkpoint, failure, log) == {
                 "exact_failed_completion_original": True,
@@ -1003,9 +1036,20 @@ def _run_failed_shutdown_release_child(root: Path, error_type: type[Exception], 
                 "shutdown_pending_and_complete_refused": True,
                 "watchdog_completion_unsent": True,
             }
-            assert process.poll() is None, "failed release silently reported completed custody"
+            assert proof_started is not None, "child checkpoint lacks its proof-start receipt"
+            assert time.monotonic() <= deadline, "child proof exceeded its bounded allowance"
+            returncode = process.poll()
+            assert returncode is None, "failed release silently reported completed custody"
         except BaseException as original:
             primary = original
+            original.add_note(
+                f"shutdown child phase={phase}; elapsed={time.monotonic() - started:.3f}s; "
+                f"proof_elapsed={None if proof_started is None else round(time.monotonic() - proof_started, 3)}; "
+                f"observed_alive={returncode is None}; returncode={returncode}; "
+                f"startup_limit={_FAILED_SHUTDOWN_STARTUP_SECONDS}s; "
+                f"proof_limit={_FAILED_SHUTDOWN_PROOF_SECONDS}s; "
+                f"outer_limit={_FAILED_SHUTDOWN_STARTUP_SECONDS + _FAILED_SHUTDOWN_PROOF_SECONDS}s"
+            )
             raise
         finally:
             originals = _reap_owned_child(process)
@@ -1404,6 +1448,16 @@ async def _await_owned_thread_signal(signal: threading.Event, *, name: str, time
 
 
 async def _failed_shutdown_release_child(root: Path, error_type: type[Exception], peer_fails: bool) -> None:
+    (
+        completion_start_seconds,
+        failed_completion_seconds,
+        drain_seconds,
+        peer_release_seconds,
+        executor_shutdown_seconds,
+        executor_join_seconds,
+        peer_completion_seconds,
+        peer_observation_seconds,
+    ) = _FAILED_SHUTDOWN_PHASE_SECONDS
     custody = ExecutionTestCustody(asyncio.get_running_loop(), root)
     service, _session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=custody)
     failed_lease, failed_authority = await _canonical_execute_lease(service, custody, session_id=uuid4())
@@ -1424,36 +1478,43 @@ async def _failed_shutdown_release_child(root: Path, error_type: type[Exception]
     executor.future = PhysicalPipelineCompletionControl(custody)
     peer_physical = executor.future
     service._submit_owned_pipeline(peer_obligation, peer_lease, peer_watcher, partial(lambda: None))
+    proof_start = root / "proof-start.json"
+    staged_start = proof_start.with_suffix(".pending")
+    staged_start.write_text(json.dumps({"started_at": time.monotonic()}))
+    staged_start.replace(proof_start)
+    faulthandler.dump_traceback_later(_FAILED_SHUTDOWN_PROOF_SECONDS - 1, file=sys.stderr)
     failed_physical.set_result(None)
-    deadline = asyncio.get_running_loop().time() + 5
+    deadline = asyncio.get_running_loop().time() + completion_start_seconds
     while failed_obligation.completion is None and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.01)
     failed_completion = failed_obligation.completion
     assert failed_completion is not None
-    completed, _ = await asyncio.wait({asyncio.wrap_future(failed_completion)}, timeout=2)
+    completed, _ = await asyncio.wait({asyncio.wrap_future(failed_completion)}, timeout=failed_completion_seconds)
     assert completed, "actual failed completion did not finish"
     with pytest.raises(error_type) as completed_failure:
         failed_completion.result()
     assert completed_failure.value is cleanup_error
     assert async_workers._INSTANCE_DRAINING is custody.recovery.instance_draining
-    await _await_owned_thread_signal(custody.recovery.instance_draining, name="selected process drain", timeout=3)
+    await _await_owned_thread_signal(custody.recovery.instance_draining, name="selected process drain", timeout=drain_seconds)
     peer_physical.set_result(None)
     try:
-        await _await_owned_thread_signal(peer_authority.release_called, name="peer SQL release entry", timeout=3)
+        await _await_owned_thread_signal(peer_authority.release_called, name="peer SQL release entry", timeout=peer_release_seconds)
         shutdown = asyncio.create_task(custody.shutdown_service(service))
-        await _await_owned_thread_signal(executor.shutdown_started, name="private executor shutdown entry", timeout=3)
+        await _await_owned_thread_signal(
+            executor.shutdown_started, name="private executor shutdown entry", timeout=executor_shutdown_seconds
+        )
         assert not shutdown.done(), "failed release cannot produce registry completion"
     finally:
         peer_authority.release_allowed.set()
     registry = service.execution_lease_release_registry
-    deadline = asyncio.get_running_loop().time() + 5
+    deadline = asyncio.get_running_loop().time() + executor_join_seconds
     while not registry.executor_join_succeeded and asyncio.get_running_loop().time() < deadline:
         registry.observe_ready()
         await asyncio.sleep(0.01)
     assert registry.executor_join_succeeded
     peer_completion = peer_obligation.completion
     assert peer_completion is not None
-    peer_completed, _ = await asyncio.wait({asyncio.wrap_future(peer_completion)}, timeout=2)
+    peer_completed, _ = await asyncio.wait({asyncio.wrap_future(peer_completion)}, timeout=peer_completion_seconds)
     assert peer_completed, "actual peer completion did not finish"
     if peer_fails:
         with pytest.raises(OSError) as completed_peer_failure:
@@ -1461,7 +1522,7 @@ async def _failed_shutdown_release_child(root: Path, error_type: type[Exception]
         assert completed_peer_failure.value is peer_error
     else:
         assert peer_completion.result() is None
-    deadline = asyncio.get_running_loop().time() + 5
+    deadline = asyncio.get_running_loop().time() + peer_observation_seconds
     while asyncio.get_running_loop().time() < deadline:
         registry.observe_ready()
         observed_peer_release = peer_obligation.release_submission

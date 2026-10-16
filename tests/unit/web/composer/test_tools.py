@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Literal, cast
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -208,17 +208,21 @@ def _assert_aws_s3_endpoint_url_rejected(
     *,
     forbidden_value: str = _AWS_S3_ENDPOINT_SENTINEL,
     rejected_component: str | None = None,
+    rejection_operation: Literal["candidate", "saved_graph"] = "candidate",
 ) -> None:
     assert result.success is False
     assert result.updated_state is original_state
     assert result.updated_state.version == original_state.version
     assert result.data is None
-    # A set_pipeline component rejection names its subject both structurally
-    # and as the minted message prefix; an incremental tool's rejection is
-    # about the component it was called with and carries neither.
-    expected_prefix = "" if rejected_component is None else rejected_component_prefix(rejected_component)
+    # Candidate component rejection mints a display prefix; saved-graph
+    # source rejection retains the exact policy message and structural subject.
+    expected_prefix = (
+        rejected_component_prefix(rejected_component) if rejection_operation == "candidate" and rejected_component is not None else ""
+    )
     assert result.validation.errors[0].message == f"{expected_prefix}{AWS_S3_ENDPOINT_URL_POLICY_ERROR}"
     assert result.validation.errors[0].rejected_component == rejected_component
+    if rejected_component is not None:
+        assert result.validation.errors[0].error_code == "aws_s3_endpoint_url_not_allowed"
     assert forbidden_value not in repr(result.data)
     assert forbidden_value not in repr(result.validation)
 

@@ -88,7 +88,7 @@ _RESULT_CONSTRUCTORS = frozenset({"_discovery_result", "_mutation_result", "Tool
 _DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
     ("_common.py", "_discovery_result"): "generic constructor: ships the payload its caller passed, counted at that call",
     ("_common.py", "_mutation_result"): "generic constructor: ships the payload its caller passed, counted at that call",
-    ("_common.py", "_credential_wiring_contract_failure"): "_FAILURE_DATA_HELPERS row: inline data={...}",
+    ("_common.py", "_build_credential_wiring_contract_failure"): "_FAILURE_DATA_HELPERS row: inline replace(result, data={...})",
     ("_common.py", "_merged_component_rejection_result"): (
         "merges two already-censused payloads; the one key the merge adds is yielded explicitly by _failure_data_sites"
     ),
@@ -1873,13 +1873,13 @@ def _plugin_schema_sites() -> Iterator[ShippedKey]:
         yield ShippedKey("plugin-schema", SHARED, key, site)
 
 
-# (file, function, the local dict the payload is assembled in) for the shared failure helpers.
-# ``None`` means the payload is passed inline at ``data=`` — as a dict literal, or as a call to
+# (file, function, local payload dict, inline constructor) for the shared failure helpers.
+# A ``None`` local means the payload is passed inline at ``data=`` — as a dict literal, or as a call to
 # an owned TypedDict, which is the form that leaves no local for a later store to travel through.
-_FAILURE_DATA_HELPERS: tuple[tuple[Path, str, str | None], ...] = (
-    (COMMON, "_credential_wiring_contract_failure", None),  # passed inline as data={...}
-    (TOOL_BATCH, "run_tool_batch", None),  # passed inline as data=_ProposalPayload(...)
-    (TOOL_BATCH, "run_tool_batch", "feedback_data"),
+_FAILURE_DATA_HELPERS: tuple[tuple[Path, str, str | None, str | None], ...] = (
+    (COMMON, "_build_credential_wiring_contract_failure", None, "replace"),
+    (TOOL_BATCH, "run_tool_batch", None, "ToolResult"),  # inline data=_ProposalPayload(...)
+    (TOOL_BATCH, "run_tool_batch", "feedback_data", None),
 )
 
 
@@ -1951,13 +1951,14 @@ def _owner_assignment_keys(fn: ast.AST, owner: str, site: str, constants: dict[s
 
 
 def _failure_data_sites() -> Iterator[ShippedKey]:
-    for path, fn_name, owner in _FAILURE_DATA_HELPERS:
+    for path, fn_name, owner, constructor in _FAILURE_DATA_HELPERS:
         tree = _parse(path)
         constants = _module_str_constants(tree, path)
         fn = _function(tree, fn_name)
         site = f"{_display(path)}:{fn.lineno}"
         found = False
         if owner is not None:
+            assert constructor is None, f"{site}: a named payload cannot also claim an inline constructor"
             owned = _owner_assignment_keys(fn, owner, site, constants, prefix="data.")
             found = bool(owned.bindings)
             for key, lineno in owned.keys:
@@ -1966,8 +1967,9 @@ def _failure_data_sites() -> Iterator[ShippedKey]:
                 found = True
                 yield ShippedKey("failure-data", SHARED, f"data.{key}", f"{_display(path)}:{lineno}")
         else:
+            assert constructor in {"ToolResult", "replace"}, f"{site}: inline constructor ownership is missing"
             for node in ast.walk(fn):
-                if isinstance(node, ast.Call) and _call_name(node) == "ToolResult":
+                if isinstance(node, ast.Call) and _call_name(node) == constructor:
                     for kw in node.keywords:
                         if kw.arg != "data":
                             continue
@@ -2633,6 +2635,98 @@ def test_review_blocked_census_rejects_unadmitted_preflight(monkeypatch: pytest.
     monkeypatch.setattr(importlib.import_module(__name__), "admitted_keys", lambda: original)
     with pytest.raises(AssertionError, match=r"request_interpretation_review.*runtime_preflight"):
         test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool()
+
+
+def _credential_builder_payload(tree: ast.Module) -> ast.Dict:
+    fn = _function(tree, "_build_credential_wiring_contract_failure")
+    payloads = [
+        _data_expr(node)
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and _call_name(node) == "replace" and isinstance(_data_expr(node), ast.Dict)
+    ]
+    assert len(payloads) == 1, "the actual credential builder must own exactly one inline replacement payload"
+    payload = payloads[0]
+    assert isinstance(payload, ast.Dict)
+    return payload
+
+
+def test_credential_builder_payload_is_censused_at_its_actual_owner() -> None:
+    tree = _parse(COMMON)
+    fn = _function(tree, "_build_credential_wiring_contract_failure")
+    payload = _credential_builder_payload(tree)
+    assert [key.value for key in payload.keys if isinstance(key, ast.Constant)] == ["credential_fields", "components", "repair"]
+    call = next(node for node in ast.walk(fn) if isinstance(node, ast.Call) and _data_expr(node) is payload)
+    rows = [row for row in _failure_data_sites() if row.site == f"{_display(COMMON)}:{call.lineno}"]
+    assert {"data.credential_fields", "data.components", "data.repair", "data.repair.inline_form", "data.repair.post_hoc_form"} <= {
+        row.key for row in rows
+    }
+    assert rows and all(row.surface == "failure-data" and row.tool == SHARED for row in rows)
+
+
+def test_failure_data_helpers_keep_constructor_ownership_distinct() -> None:
+    assert _FAILURE_DATA_HELPERS == (
+        (COMMON, "_build_credential_wiring_contract_failure", None, "replace"),
+        (TOOL_BATCH, "run_tool_batch", None, "ToolResult"),
+        (TOOL_BATCH, "run_tool_batch", "feedback_data", None),
+    )
+    # The real batch already contains replace(data=feedback_data). Reading it
+    # as an inline proposal would hit the strict unreadable-Name refusal;
+    # constructor ownership keeps it with its named assignment row instead.
+    assert list(_failure_data_sites())
+
+
+def test_credential_builder_census_rejects_an_untaught_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_credential_builder_payload_is_censused_at_its_actual_owner()
+    original = _parse
+
+    def with_extra_key(path: Path) -> ast.Module:
+        tree = original(path)
+        if path == COMMON:
+            payload = _credential_builder_payload(tree)
+            payload.keys.append(ast.Constant(value="unexplained_credential_probe"))
+            payload.values.append(ast.Constant(value=True))
+        return tree
+
+    monkeypatch.setattr(importlib.import_module(__name__), "_parse", with_extra_key)
+    assert any(row.key == "data.unexplained_credential_probe" for row in _failure_data_sites())
+    with pytest.raises(AssertionError, match="unexplained_credential_probe"):
+        test_every_shipped_envelope_key_is_taught_or_fenced()
+
+
+@pytest.mark.parametrize("shape", ["missing-data", "unreadable-data"])
+def test_credential_builder_census_refuses_missing_or_unreadable_payload(monkeypatch: pytest.MonkeyPatch, shape: str) -> None:
+    test_credential_builder_payload_is_censused_at_its_actual_owner()
+    original = _parse
+
+    def with_bad_payload(path: Path) -> ast.Module:
+        tree = original(path)
+        if path == COMMON:
+            fn = _function(tree, "_build_credential_wiring_contract_failure")
+            payload = _credential_builder_payload(tree)
+            call = next(node for node in ast.walk(fn) if isinstance(node, ast.Call) and _data_expr(node) is payload)
+            if shape == "missing-data":
+                call.keywords = [kw for kw in call.keywords if kw.arg != "data"]
+            else:
+                next(kw for kw in call.keywords if kw.arg == "data").value = ast.Name(id="unreadable_payload", ctx=ast.Load())
+        return tree
+
+    monkeypatch.setattr(importlib.import_module(__name__), "_parse", with_bad_payload)
+    message = "no readable data payload for _build_credential_wiring_contract_failure" if shape == "missing-data" else "inline data=Name"
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        list(_failure_data_sites())
+
+
+def test_credential_builder_owner_classification_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_every_result_constructor_site_is_attributed()
+    owner = ("_common.py", "_build_credential_wiring_contract_failure")
+    assert owner in _DATA_SITES_COUNTED_AT_THEIR_PRODUCER
+    monkeypatch.setattr(
+        importlib.import_module(__name__),
+        "_DATA_SITES_COUNTED_AT_THEIR_PRODUCER",
+        {key: reason for key, reason in _DATA_SITES_COUNTED_AT_THEIR_PRODUCER.items() if key != owner},
+    )
+    with pytest.raises(AssertionError, match="_build_credential_wiring_contract_failure ships a data="):
+        test_every_result_constructor_site_is_attributed()
 
 
 def _assert_unique_container_producers() -> None:

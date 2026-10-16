@@ -69,7 +69,7 @@ def _assert_recovery_catalog_contract(engine: Engine) -> None:
 
 
 def test_epoch_74_recovery_schema_matches_independent_catalog_contract(schema_engine: Engine) -> None:
-    assert SESSION_SCHEMA_EPOCH == 76
+    assert SESSION_SCHEMA_EPOCH == 77
     initialize_session_schema(schema_engine)
     _assert_recovery_catalog_contract(schema_engine)
 

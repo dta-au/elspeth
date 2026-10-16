@@ -8,7 +8,7 @@
  *         #/{sessionId}/runs            -> select Run artifact, then rewrite
  *         #/{sessionId}/{anything-else} -> silently strip the verb
  *         #composer-main                -> IGNORED — owned by App's skip link
- *         #/shared/{token}              -> IGNORED — owned by useSharedToken
+ *         #/shared/{token}              -> IGNORED — owned by useSharedRoute
  *                                          (Phase 6B Task 8); the hook below
  *                                          short-circuits without touching the
  *                                          hash so SharedInspectView keeps
@@ -26,12 +26,8 @@ import {
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 import { hasCompositionContent } from "@/utils/compositionState";
+import { isSharedRouteHash, parseSessionHash, type SessionHashState } from "@/utils/hashRoutes";
 import type { ArtifactTab } from "@/components/workspace/workspaceTypes";
-
-interface HashState {
-  sessionId: string | null;
-  verb: string | null;
-}
 
 interface RedirectToast {
   message: string;
@@ -54,26 +50,17 @@ const RETIRED_VERBS: Record<string, string> = {};
 
 const TOAST_DISMISSED_KEY = "elspeth_redirect_toast_dismissed";
 
-const SHARED_HASH_PREFIX = "#/shared/";
 const COMPOSER_MAIN_HASH = "#composer-main";
 
 /** True when the current hash is a Phase 6B shared-inspect route. The
  *  session router short-circuits on this so SharedInspectView keeps
  *  control of the URL and the session store is not mutated. */
-function _isSharedRoute(hash: string): boolean {
-  return hash.startsWith(SHARED_HASH_PREFIX);
-}
-
 function _isNonRoutingHash(hash: string): boolean {
-  return hash === COMPOSER_MAIN_HASH || _isSharedRoute(hash);
+  return hash === COMPOSER_MAIN_HASH || isSharedRouteHash(hash);
 }
 
-function parseHash(): HashState {
-  const hash = window.location.hash;
-  if (_isNonRoutingHash(hash)) return { sessionId: null, verb: null };
-  const match = hash.match(/^#\/([^/]+?)(?:\/([a-z]+))?$/);
-  if (!match) return { sessionId: null, verb: null };
-  return { sessionId: match[1], verb: match[2] ?? null };
+function parseHash(): SessionHashState {
+  return parseSessionHash(window.location.hash);
 }
 
 function buildCanonicalHash(sessionId: string | null): string {
@@ -90,6 +77,7 @@ export function useHashRouter(
   const enabled = options.enabled ?? true;
   const lastWrittenHash = useRef<string>("");
   const applying = useRef(false);
+  const incomingSessionLink = useRef<string | null>(null);
   const pendingArtifactIntent = useRef<{
     sessionId: string;
     tab: "spec" | "yaml";
@@ -177,7 +165,7 @@ export function useHashRouter(
     null,
   );
 
-  const applyHash = useCallback((state: HashState) => {
+  const applyHash = useCallback((state: SessionHashState) => {
     // Shared inspection and the App-owned skip target are non-routing hashes.
     // Their owners keep control of navigation/focus, so applying either is a
     // no-op and cannot unbind the active Composer session.
@@ -188,6 +176,10 @@ export function useHashRouter(
     try {
       const { sessionId, verb } = state;
       const store = useSessionStore.getState();
+      incomingSessionLink.current = sessionId && (
+        sessionId !== store.activeSessionId || !store.compositionStateLoaded
+      ) ? sessionId : null;
+      setRedirectToast(null);
 
       if (sessionId && sessionId !== store.activeSessionId) {
         store.selectSession(sessionId);
@@ -286,6 +278,23 @@ export function useHashRouter(
     if (!enabled) return;
     const unsub = useSessionStore.subscribe((state, prevState) => {
       if (applying.current) return;
+      const incoming = incomingSessionLink.current;
+      if (incoming !== null) {
+        if (state.activeSessionId === incoming && state.compositionStateLoaded) {
+          incomingSessionLink.current = null;
+        } else if (
+          prevState.activeSessionId === incoming &&
+          state.activeSessionId !== incoming
+        ) {
+          incomingSessionLink.current = null;
+          if (state.activeSessionId === null && !_isNonRoutingHash(window.location.hash)) {
+            setRedirectToast({
+              message: "This session link is unavailable. Ask the sender for a Share for review link.",
+              dismiss: () => setRedirectToast(null),
+            });
+          }
+        }
+      }
       if (state.activeSessionId === prevState.activeSessionId) return;
       // Non-routing hashes remain owned by their view/focus surface. The
       // session store may legitimately change activeSessionId via background

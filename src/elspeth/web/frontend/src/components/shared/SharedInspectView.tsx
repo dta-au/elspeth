@@ -69,7 +69,7 @@ import { GraphMiniView } from "@/components/sidebar/GraphMiniView";
 import type { ApiError, SharedInspectResponse } from "@/types/api";
 
 interface SharedInspectViewProps {
-  token: string;
+  token: string | null;
 }
 
 /**
@@ -188,6 +188,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
   const [state, setState] = useState<LoadState>({ kind: "loading" });
 
   useEffect(() => {
+    if (token === null) return;
     let cancelled = false;
     const controller = new AbortController();
     setState({ kind: "loading" });
@@ -207,7 +208,15 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
     };
   }, [token]);
 
-  if (state.kind === "loading") {
+  const displayState: LoadState = token === null
+    ? {
+        kind: "error",
+        status: null,
+        message: "This share link is malformed. Ask the sender for a fresh Share for review link.",
+      }
+    : state;
+
+  if (displayState.kind === "loading") {
     return (
       <main
         role="main"
@@ -221,7 +230,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
     );
   }
 
-  if (state.kind === "error") {
+  if (displayState.kind === "error") {
     return (
       <main
         role="main"
@@ -230,7 +239,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
         style={MAIN_STYLE}
       >
         <h1 style={H1_STYLE}>Shared link unavailable</h1>
-        <p role="alert">{state.message}</p>
+        <p role="alert">{displayState.message}</p>
         <p>
           <a href={_returnToWorkspaceUrl()} data-testid="shared-inspect-return-link">
             Return to my workspace
@@ -240,7 +249,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
     );
   }
 
-  const { response } = state;
+  const { response } = displayState;
   // pipeline_metadata is now typed `PipelineMetadata` with `name` /
   // `description` as `string | null`. Render an empty string when the
   // owner left the description blank; surface "Untitled pipeline" for a

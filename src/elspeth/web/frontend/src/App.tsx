@@ -53,7 +53,7 @@ import {
   usePreferencesStore,
 } from "./stores/preferencesStore";
 import { useHashRouter } from "./hooks/useHashRouter";
-import { useSharedToken } from "./hooks/useSharedToken";
+import { useSharedRoute } from "./hooks/useSharedRoute";
 import { useAuth } from "./hooks/useAuth";
 import { useAutoResumeSession } from "./hooks/useAutoResumeSession";
 import {
@@ -168,15 +168,16 @@ function App() {
   // Phase 6B Task 8: shared-inspect route detection. When the URL hash is
   // `#/shared/{token}`, render the read-only inspect view and short-circuit
   // the regular composer UI. The session router's URL-writes are dormant
-  // in this mode (see useHashRouter._isSharedRoute), so the hash is
+  // in this mode (see useHashRouter's shared-route guard), so the hash is
   // preserved across the entire shared-view lifecycle.
-  const sharedToken = useSharedToken();
+  const sharedRoute = useSharedRoute();
+  const isSharedRoute = sharedRoute.kind !== "none";
   const { isAuthenticated } = useAuth();
 
   useEffect(() => {
-    if (!isAuthenticated || sharedToken !== null) return;
+    if (!isAuthenticated || isSharedRoute) return;
     return useMailboxStore.getState().startPolling();
-  }, [isAuthenticated, sharedToken]);
+  }, [isAuthenticated, isSharedRoute]);
 
   useEffect(() => {
     if (isAuthenticated) return;
@@ -189,7 +190,7 @@ function App() {
 
   // Sync URL hash ↔ session/tab state for deep linking & back/forward
   const { redirectToast } = useHashRouter({
-    enabled: isAuthenticated && sharedToken === null,
+    enabled: isAuthenticated && !isSharedRoute,
   });
   useSessionLifecycle();
 
@@ -238,7 +239,7 @@ function App() {
     preferencesLoaded || preferencesUnavailableForRole || preferencesError !== null;
   useAutoResumeSession(
     isAuthenticated &&
-      sharedToken === null &&
+      !isSharedRoute &&
       preferencesSettled &&
       !showTutorial,
   );
@@ -247,7 +248,7 @@ function App() {
   // Session rename and the first-message auto-title both update the
   // sessions list, so the tab follows without extra plumbing.
   useDocumentTitle(
-    formatDocumentTitle(sharedToken === null ? activeSessionTitle : null),
+    formatDocumentTitle(isSharedRoute ? null : activeSessionTitle),
   );
 
   // Real empty state (elspeth-e69642fede): the account has no live sessions,
@@ -261,7 +262,7 @@ function App() {
   // fact used to mount that owner, so shortcuts and the command palette can
   // never dispatch into a zero-listener surface.
   const runAdmissionAvailable =
-    sharedToken === null &&
+    !isSharedRoute &&
     !showTutorial &&
     !showEmptyLanding;
   const catalogAvailable = true;
@@ -698,11 +699,14 @@ function App() {
   // CAPABILITY, not an authenticator — the recipient must still be logged
   // in. AuthGuard preserves the hash through the login redirect, so the
   // reviewer lands back here after authenticating.
-  if (sharedToken !== null) {
+  if (sharedRoute.kind !== "none") {
     return (
       <AuthGuard>
         <div className="app-root app-root--shared-inspect">
-          <SharedInspectView token={sharedToken} />
+          <SharedInspectView
+            key={sharedRoute.kind === "valid" ? `valid:${sharedRoute.token}` : "invalid"}
+            token={sharedRoute.kind === "valid" ? sharedRoute.token : null}
+          />
         </div>
       </AuthGuard>
     );

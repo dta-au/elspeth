@@ -105,6 +105,7 @@ from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
 from elspeth.web.sessions.models import sessions_table
+from tests.unit.web.composer import _helpers as composer_helpers
 
 from .conftest import (
     _fake_llm_response,
@@ -118,6 +119,8 @@ from .conftest import (
     _mock_catalog,
     build_test_sessions_service,
 )
+
+_stub_advisor_end_gate_clean = composer_helpers._stub_advisor_end_gate_clean
 
 
 def _raw_tool_call_llm(*, name: str, raw_arguments: str) -> _FakeComposeLLM:

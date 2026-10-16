@@ -1371,6 +1371,28 @@ def test_prevalidation_tripwire_controls(message: str, code: str, local: str | N
     assert _prevalidation_code_matches(message_node, None) is False
 
 
+def _is_rejection_builder_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"_failure_result", "_saved_graph_rejection_result"}
+    )
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("_failure_result(state, prevalidation_error)", True),
+        ("_saved_graph_rejection_result(state, prevalidation_error)", True),
+        ("_mutation_result(state, ())", False),
+        ("other._saved_graph_rejection_result(state, prevalidation_error)", False),
+        ("'_saved_graph_rejection_result(state, prevalidation_error)'", False),
+    ],
+)
+def test_rejection_builder_instrument_recognizes_only_the_owned_direct_operations(expression: str, expected: bool) -> None:
+    assert _is_rejection_builder_call(ast.parse(expression, mode="eval").body) is expected
+
+
 def _prevalidation_rejection_calls() -> list[tuple[str, ast.Call]]:
     """Every rejection whose message is a prevalidation local or its tuple item.
 
@@ -1385,8 +1407,9 @@ def _prevalidation_rejection_calls() -> list[tuple[str, ast.Call]]:
     for module in (sources_tools, outputs_tools, transforms_tools, sessions_tools):
         tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_failure_result"):
+            if not _is_rejection_builder_call(node):
                 continue
+            assert isinstance(node, ast.Call)
             if len(node.args) < 2 or _prevalidation_message_local(node.args[1]) is None:
                 continue
             calls.append((module.__name__, node))
@@ -1442,9 +1465,9 @@ def _stamped_identity(call: ast.Call) -> tuple[str, str] | None:
 def _resolved_before(function: ast.FunctionDef, lineno: int) -> set[tuple[str, str]]:
     """Every ``(kind, name expression)`` the function resolves through the policy view above ``lineno``.
 
-    Two resolution idioms exist: ``_validate_plugin_name(context, <kind>,
-    <name>)`` (rejecting on its violation) and the blob binders' guarded
-    ``context.catalog.get_schema(<kind>, <name>)``. Both go through
+    Selection uses ``_plugin_selection_violation`` or the legacy
+    ``_validate_plugin_name`` (rejecting on its violation); schema admission
+    uses ``context.catalog.get_schema(<kind>, <name>)``. All go through
     ``ToolContext.catalog`` — the request's ``PolicyCatalogView`` — which is
     the only authority ``_failure_result``'s contract admits.
     """
@@ -1452,7 +1475,11 @@ def _resolved_before(function: ast.FunctionDef, lineno: int) -> set[tuple[str, s
     for node in ast.walk(function):
         if not isinstance(node, ast.Call) or node.lineno >= lineno:
             continue
-        if isinstance(node.func, ast.Name) and node.func.id == "_validate_plugin_name" and len(node.args) == 3:
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in {"_validate_plugin_name", "_plugin_selection_violation"}
+            and len(node.args) == 3
+        ):
             kind, name = node.args[1], node.args[2]
         elif (
             isinstance(node.func, ast.Attribute)
@@ -1468,6 +1495,19 @@ def _resolved_before(function: ast.FunctionDef, lineno: int) -> set[tuple[str, s
     return resolved
 
 
+@pytest.mark.parametrize("helper", ["_validate_plugin_name", "_plugin_selection_violation"])
+def test_policy_resolution_instrument_pins_identity_and_order(helper: str) -> None:
+    function = ast.parse(
+        f"def f(context, plugin, other):\n    {helper}(context, 'source', plugin)\n    marker()\n    {helper}(context, 'sink', other)\n"
+    ).body[0]
+    assert isinstance(function, ast.FunctionDef)
+    resolved = _resolved_before(function, 3)
+    assert ("source", "plugin") in resolved
+    assert ("source", "other") not in resolved
+    assert ("sink", "other") not in resolved
+    assert _resolved_before(function, 2) == set()
+
+
 def test_every_stamped_plugin_identity_was_resolved_through_the_policy_view_first() -> None:
     """A stamp names only a plugin the SAME function already resolved (elspeth-e405ad7cd2 R8-fix1).
 
@@ -1478,7 +1518,7 @@ def test_every_stamped_plugin_identity_was_resolved_through_the_policy_view_firs
     the plugin read from persisted state, and a plugin the current view did
     not admit raised ``ValueError("plugin_not_enabled")`` out of
     ``execute_tool``. This pins the order at the source for every stamped
-    ``_failure_result`` in the tool modules: the enclosing function must
+    rejection builder in the tool modules: the enclosing function must
     call ``_validate_plugin_name(context, <same kind>, <same name expr>)``
     or ``context.catalog.get_schema(<same kind>, <same name expr>)`` on an
     earlier line. Textual equality of the name expression is deliberate —
@@ -1491,8 +1531,9 @@ def test_every_stamped_plugin_identity_was_resolved_through_the_policy_view_firs
         functions = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
         for function in functions:
             for call in ast.walk(function):
-                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "_failure_result"):
+                if not _is_rejection_builder_call(call):
                     continue
+                assert isinstance(call, ast.Call)
                 identity = _stamped_identity(call)
                 if identity is None:
                     continue

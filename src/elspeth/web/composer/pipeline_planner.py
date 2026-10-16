@@ -28,7 +28,7 @@ from uuid import UUID, uuid4
 
 import structlog
 from jsonschema import Draft202012Validator
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
 
@@ -55,7 +55,13 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
-from elspeth.web.composer.audit import BufferingRecorder, PrivatePlannerCandidate, begin_dispatch, dispatch_with_audit
+from elspeth.web.composer.audit import (
+    BufferingRecorder,
+    PrivatePlannerCandidate,
+    begin_dispatch,
+    canonicalize_schema_violations,
+    dispatch_with_audit,
+)
 from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads, require_bounded_text
 from elspeth.web.composer.capability_skill import (
@@ -134,8 +140,13 @@ from elspeth.web.composer.response_contracts import AdmittedResponse
 from elspeth.web.composer.state import (
     COMPOSER_NODE_TYPES,
     CoalesceReachabilityFactDict,
+    CoalesceUnionTypeDetailDict,
     CompositionState,
     RouteDestinationFactDict,
+    RowUnionSchemaDetailDict,
+    SchemaContractDetail,
+    SchemaContractDetailDict,
+    Severity,
     ValidationEntry,
     ValidationSummary,
     coalesce_reachability_facts,
@@ -1959,11 +1970,9 @@ def _assistant_tool_calls_message(message: Any, calls: tuple[_ParsedToolCall, ..
     }
 
 
-def _feedback_error_codes(feedback: Mapping[str, Any]) -> tuple[str, ...]:
+def _feedback_error_codes(feedback: _PlannerFeedbackWire) -> tuple[str, ...]:
     """Extract the closed error codes from a structural feedback envelope."""
-    validation = cast(Mapping[str, Any], feedback["validation"])
-    errors = cast(list[Mapping[str, Any]], validation["errors"])
-    return tuple(cast(str, entry["error_code"]) for entry in errors)
+    return tuple(entry["error_code"] for entry in feedback["validation"]["errors"])
 
 
 # A stated routing threshold: a comparison operator, or comparison wording,
@@ -2178,7 +2187,7 @@ def _missing_source_rejection(state: CompositionState) -> ToolResult:
     )
 
 
-def _rejection_entries(result: ToolResult) -> tuple[Any, ...]:
+def _rejection_entries(result: ToolResult) -> tuple[ValidationEntry, ...]:
     """Return the entries the planner should actually repair against.
 
     A pre-application semantic rejection leads with a ``rejected_mutation``
@@ -2195,9 +2204,10 @@ def _rejection_entries(result: ToolResult) -> tuple[Any, ...]:
 def _candidate_rejection_codes(result: ToolResult) -> tuple[str, ...]:
     """Name every rejection entry for the per-attempt trail, coded or not.
 
-    A codeless entry surfaces as the ``"validation_error"`` placeholder —
-    the same fallback ``_allowlisted_candidate_feedback`` projects — rather
-    than silently vanishing from the attempt trail.
+    The attempt trail retains a ``"validation_error"`` placeholder for a
+    codeless entry. Feedback permits that fallback only for ordinary checked
+    state findings; an explicit codeless candidate refusal fails its producer
+    contract in the feedback compiler.
     """
     return tuple(entry.error_code or "validation_error" for entry in _rejection_entries(result))
 
@@ -2296,7 +2306,7 @@ _REPEAT_NOTICE_TERMINAL = (
 )
 
 
-def _entry_component_ref(entry: Any) -> str | None:
+def _entry_component_ref(entry: ValidationEntry) -> str | None:
     """Canonical validation-component ref a rejection entry is about.
 
     State-validation entries already carry the canonical vocabulary
@@ -2315,7 +2325,7 @@ def _entry_component_ref(entry: Any) -> str | None:
     """
     component = entry.component
     if component != "rejected_mutation":
-        return cast(str, component)
+        return component
     ref = entry.rejected_component
     return ref if type(ref) is str and ref else None
 
@@ -2361,7 +2371,7 @@ _ENTRY_DISCLOSED: Final[_EntryWithholding] = _EntryWithholding(
 )
 
 
-def _contract_participant_refs(contract: Any) -> tuple[str, ...]:
+def _contract_participant_refs(contract: SchemaContractDetail) -> tuple[str, ...]:
     """Validation-component refs of a contract fact's producer and consumer.
 
     ``SchemaContractDetail`` carries producer/consumer in the producer-id
@@ -2381,7 +2391,7 @@ def _contract_participant_refs(contract: Any) -> tuple[str, ...]:
     return tuple(refs)
 
 
-def _entry_withholding(entry: Any, finalizer_owned: _FinalizerOwnedRefs) -> _EntryWithholding:
+def _entry_withholding(entry: ValidationEntry, finalizer_owned: _FinalizerOwnedRefs) -> _EntryWithholding:
     """Withholding decision for one rejection entry.
 
     Entry-scoped custody (elspeth-5904b1683a): withhold exactly the entries
@@ -2456,7 +2466,7 @@ def _withheld_component_count(result: ToolResult) -> int:
 _EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = EXPLAIN_VALIDATION_ERROR_GUIDANCE
 
 
-def _explain_tool_advertisement_earns_its_turn(errors: Sequence[Mapping[str, Any]]) -> bool:
+def _explain_tool_advertisement_earns_its_turn(errors: Sequence[_PlannerFeedbackError]) -> bool:
     """Whether pointing at ``explain_validation_error`` can still tell the model anything.
 
     The tool and this projection read the SAME closed catalogue, so for an
@@ -2477,7 +2487,13 @@ def _allowlisted_candidate_feedback(
     finalizer_owned: _FinalizerOwnedRefs = _FINALIZER_OWNS_NOTHING,
     components_withheld: int = 0,
     plugin_contract_resolver: Callable[[PluginKind, str], Mapping[str, Any] | None] | None = None,
-) -> dict[str, Any]:
+) -> _PlannerFeedbackWire:
+    return _compile_planner_feedback(
+        _CandidateFeedback(result, repeated_fingerprint, finalizer_owned, components_withheld, plugin_contract_resolver)
+    )
+
+
+def _compile_candidate_feedback(feedback: _CandidateFeedback) -> _PlannerFeedbackWire:
     """Project only structured validation fields already safe for tool output.
 
     Raw validation messages are withheld — they can quote plugin names, option
@@ -2534,27 +2550,32 @@ def _allowlisted_candidate_feedback(
     contract win the budget over a later speculative ``get_plugin_schema``;
     nothing already sent is ever evicted to make room.
     """
+    result = feedback.result
+    repeated_fingerprint = feedback.repeated_fingerprint
+    finalizer_owned = feedback.finalizer_owned
+    components_withheld = feedback.components_withheld
+    plugin_contract_resolver = feedback.plugin_contract_resolver
     validation = result.validation
-    errors: list[dict[str, Any]] = []
+    errors: list[_PlannerFeedbackError] = []
     reachability_facts: dict[str, CoalesceReachabilityFactDict] | None = None
     destination_facts: dict[str, RouteDestinationFactDict] | None = None
     any_facts_withheld = False
     for entry in _rejection_entries(result):
-        code = entry.error_code or "validation_error"
+        code = _candidate_feedback_finding(entry).error_code
         withholding = _entry_withholding(entry, finalizer_owned)
         withhold_candidate_facts = withholding.config
         any_facts_withheld = any_facts_withheld or withholding.withheld
         # A pre-application rejection entry is filed under the literal
-        # component ``rejected_mutation`` and names its subject only in the
-        # message prefix — which this projection withholds. One rejection can
+        # component ``rejected_mutation`` and names its subject in the
+        # producer-owned rejected_component field. One rejection can
         # now carry several such entries (elspeth-4fad98a453), so projecting
         # the raw component would give the model N indistinguishable entries.
-        # ``_entry_component_ref`` resolves the prefix into the same canonical
+        # ``_entry_component_ref`` reads that field in the same canonical
         # vocabulary state-validation entries already use; the name inside it
         # is one the planner authored in the candidate being answered.
         attributed_component = _entry_component_ref(entry)
         component = "pipeline" if withhold_candidate_facts else entry.component if attributed_component is None else attributed_component
-        projected: dict[str, Any] = {
+        projected: _PlannerFeedbackError = {
             "component": component,
             "severity": entry.severity,
             "error_code": code,
@@ -2607,7 +2628,16 @@ def _allowlisted_candidate_feedback(
             # the entries that lack it.
             contract = None
             if entry.plugin_identity is not None:
-                contract = plugin_contract_resolver(*entry.plugin_identity)
+                kind, name = entry.plugin_identity
+                match kind:
+                    case "source":
+                        contract = plugin_contract_resolver("source", name)
+                    case "transform":
+                        contract = plugin_contract_resolver("transform", name)
+                    case "sink":
+                        contract = plugin_contract_resolver("sink", name)
+                    case _:
+                        raise AuditIntegrityError("Rejected plugin identity has an invalid kind")
             if contract is not None:
                 # A list because attribution belongs to the entry, not the
                 # message: every collected entry carries its own subject, and
@@ -2628,7 +2658,7 @@ def _allowlisted_candidate_feedback(
             # The facts are keyed by component and merge both routing fields;
             # this entry is about ONE field, so ship only that field's keys.
             allowed_keys = route_destination_fact_keys(code)
-            projected["connectivity"] = {key: value for key, value in destination_facts[entry.component].items() if key in allowed_keys}
+            projected["connectivity"] = _route_feedback_facts(destination_facts[entry.component], allowed_keys)
         if code == "coalesce_branch_unreachable" and not withholding.connectivity:
             # Instance wiring facts derived from the REJECTED state the result
             # carries — same redaction class as the contract facts below (node
@@ -2677,7 +2707,7 @@ def _allowlisted_candidate_feedback(
             # contributed the field as a computed output (elspeth-85f3cc3022).
             projected["coalesce_union_type"] = entry.coalesce_union_type.to_dict()
         errors.append(projected)
-    feedback: dict[str, Any] = {
+    wire: _PlannerFeedbackWire = {
         "success": False,
         "validation": {
             "is_valid": validation.is_valid,
@@ -2685,12 +2715,12 @@ def _allowlisted_candidate_feedback(
         },
     }
     if _explain_tool_advertisement_earns_its_turn(errors):
-        feedback["guidance"] = _EXPLAIN_VALIDATION_ERROR_GUIDANCE
+        wire["guidance"] = _EXPLAIN_VALIDATION_ERROR_GUIDANCE
     if components_withheld:
         # Never silent: the candidate builder caps how many defective
         # components one rejection lists, and the model must be able to tell
         # "these are all of them" from "these are the first of them".
-        feedback["truncation_notice"] = (
+        wire["truncation_notice"] = (
             f"{components_withheld} further component(s) of this candidate also failed validation and are not "
             "listed here. Repair every component named above and re-emit; the remaining failures are reported "
             "on the next turn."
@@ -2700,8 +2730,8 @@ def _allowlisted_candidate_feedback(
         # cannot see on its own (it has no attempt counter). Matching visible
         # classifiers do not establish unchanged causes; the withheld variant
         # must also avoid instructing a repair using facts it did not disclose.
-        feedback["repeat_notice"] = _REPEAT_NOTICE_WITHHELD if any_facts_withheld else _REPEAT_NOTICE
-    return feedback
+        wire["repeat_notice"] = _REPEAT_NOTICE_WITHHELD if any_facts_withheld else _REPEAT_NOTICE
+    return wire
 
 
 # How many schema violations one canonical-schema rejection names. A bare
@@ -2719,6 +2749,118 @@ class _SchemaViolation(TypedDict):
     rule: str
     constraint: NotRequired[str | int]
     detail: NotRequired[str]
+
+
+class _ReviewReferenceFeedback(TypedDict):
+    unknown_requirement_id: str
+    valid_requirement_ids: list[str]
+
+
+class _PlannerFeedbackError(TypedDict):
+    """Owned output fields, after the variant's custody projection."""
+
+    component: str
+    severity: Severity
+    error_code: str
+    error_class: str
+    explanation: NotRequired[str]
+    suggested_fix: NotRequired[str]
+    detail: NotRequired[str]
+    review_reference: NotRequired[_ReviewReferenceFeedback]
+    plugin_contracts: NotRequired[list[Mapping[str, Any]]]
+    connectivity: NotRequired[RouteDestinationFactDict | CoalesceReachabilityFactDict]
+    contract: NotRequired[SchemaContractDetailDict]
+    row_union_schema: NotRequired[RowUnionSchemaDetailDict]
+    coalesce_union_type: NotRequired[CoalesceUnionTypeDetailDict]
+    schema_violations: NotRequired[list[_SchemaViolation]]
+    schema_violations_withheld: NotRequired[int]
+    error_category: NotRequired[str]
+    validation_errors: NotRequired[list[dict[str, Any]]]
+
+
+class _PlannerValidationFeedback(TypedDict):
+    is_valid: bool
+    errors: list[_PlannerFeedbackError]
+
+
+class _PlannerFeedbackWire(TypedDict):
+    success: Literal[False]
+    validation: _PlannerValidationFeedback
+    guidance: NotRequired[str]
+    truncation_notice: NotRequired[str]
+    repeat_notice: NotRequired[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _SchemaFeedback:
+    violations: tuple[_SchemaViolation, ...]
+    violations_withheld: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ArgumentFeedback:
+    error: ToolArgumentError
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateFeedback:
+    result: ToolResult
+    repeated_fingerprint: bool
+    finalizer_owned: _FinalizerOwnedRefs
+    components_withheld: int
+    plugin_contract_resolver: Callable[[PluginKind, str], Mapping[str, Any] | None] | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.result, ToolResult):
+            raise AuditIntegrityError("Candidate feedback requires an owned ToolResult")
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateFeedbackFinding:
+    entry: ValidationEntry
+    error_code: str
+
+
+def _candidate_feedback_finding(entry: ValidationEntry) -> _CandidateFeedbackFinding:
+    """Adapt checked state findings without hiding a codeless candidate refusal."""
+    if entry.component == "rejected_mutation":
+        if not entry.error_code:
+            raise AuditIntegrityError("Candidate rejection requires a producer-owned error code")
+        return _CandidateFeedbackFinding(entry, entry.error_code)
+    # Ordinary checked-state findings predate the required rejection operation.
+    return _CandidateFeedbackFinding(entry, entry.error_code or "validation_error")
+
+
+def _route_feedback_facts(facts: RouteDestinationFactDict, allowed_keys: frozenset[str]) -> RouteDestinationFactDict:
+    projected = RouteDestinationFactDict(declared_sinks=facts["declared_sinks"])
+    if "dangling_on_success" in allowed_keys and "dangling_on_success" in facts:
+        projected["dangling_on_success"] = facts["dangling_on_success"]
+    if "dangling_on_error" in allowed_keys and "dangling_on_error" in facts:
+        projected["dangling_on_error"] = facts["dangling_on_error"]
+    if "consumable_connections" in allowed_keys and "consumable_connections" in facts:
+        projected["consumable_connections"] = facts["consumable_connections"]
+    return projected
+
+
+def _compile_planner_feedback(feedback: _SchemaFeedback | _ArgumentFeedback | _CandidateFeedback) -> _PlannerFeedbackWire:
+    """Compile exactly one owned operation; no mapping/shape fallback exists."""
+    if type(feedback) is _SchemaFeedback:
+        entry: _PlannerFeedbackError = {
+            "component": "pipeline",
+            "severity": "high",
+            "error_code": "canonical_schema",
+            "error_class": "SchemaValidationError",
+        }
+        if feedback.violations:
+            entry["schema_violations"] = list(feedback.violations)
+            if feedback.violations_withheld:
+                entry["schema_violations_withheld"] = feedback.violations_withheld
+        return {"success": False, "validation": {"is_valid": False, "errors": [entry]}}
+    if type(feedback) is _ArgumentFeedback:
+        return {"success": False, "validation": {"is_valid": False, "errors": [_allowlisted_argument_error_entry(feedback.error)]}}
+    if type(feedback) is _CandidateFeedback:
+        return _compile_candidate_feedback(feedback)
+    raise AuditIntegrityError("Unknown planner feedback operation")
 
 
 def _schema_violation_path(parts: Sequence[Any]) -> str:
@@ -2866,27 +3008,11 @@ def _canonical_schema_feedback(
     violations: Sequence[_SchemaViolation] = (),
     *,
     violations_withheld: int = 0,
-) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "component": "pipeline",
-        "severity": "high",
-        "error_code": "canonical_schema",
-        "error_class": "SchemaValidationError",
-    }
-    if violations:
-        entry["schema_violations"] = list(violations)
-        if violations_withheld:
-            entry["schema_violations_withheld"] = violations_withheld
-    return {
-        "success": False,
-        "validation": {
-            "is_valid": False,
-            "errors": [entry],
-        },
-    }
+) -> _PlannerFeedbackWire:
+    return _compile_planner_feedback(_SchemaFeedback(tuple(violations), violations_withheld))
 
 
-def _validate_terminal_payload(payload: dict[str, Any]) -> Mapping[str, Any] | None:
+def _validate_terminal_payload(payload: dict[str, Any]) -> _PlannerFeedbackWire | None:
     """Validate the provider-authored document without changing its structure."""
     try:
         SetPipelineArgumentsModel.model_validate(payload)
@@ -2899,30 +3025,22 @@ def _validate_terminal_payload(payload: dict[str, Any]) -> Mapping[str, Any] | N
     return None
 
 
-class _AllowlistedArgumentErrorEntry(TypedDict):
-    """One argument rejection, projected without its message or its input.
-
-    ``ToolArgumentError`` canonicalizes ``argument`` to a closed schema-owned
-    label and ``code`` to a closed dispatch discriminant, so every member here
-    is operator-owned; the LLM-supplied value never reaches this projection.
-    """
-
-    component: str
-    severity: str
-    error_code: str
-    error_class: str
-    error_category: str
-    validation_errors: NotRequired[JsonValue]
-
-
-def _allowlisted_argument_error_entry(error: ToolArgumentError) -> _AllowlistedArgumentErrorEntry:
+def _allowlisted_argument_error_entry(error: ToolArgumentError) -> _PlannerFeedbackError:
     """Project a semantic argument failure without its message or input."""
-    payload = argument_error_response(error).to_wire()
-    assert isinstance(payload, dict)
-    return cast(_AllowlistedArgumentErrorEntry, payload["argument_error"])
+    entry: _PlannerFeedbackError = {
+        "component": error.argument,
+        "severity": "high",
+        "error_code": error.code or "argument_error",
+        "error_class": "ToolArgumentError",
+        "error_category": error.category.value,
+    }
+    violations = canonicalize_schema_violations(error.schema_violations)
+    if violations is not None:
+        entry["validation_errors"] = violations
+    return entry
 
 
-def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any]:
+def _allowlisted_argument_feedback(error: ToolArgumentError) -> _PlannerFeedbackWire:
     """The whole tool-message content for an argument rejection on the repair loop.
 
     This is a tool message the planner reads on its own, with no envelope
@@ -2932,13 +3050,7 @@ def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any
     payload beside an envelope that already carries both. The discovery arm
     uses the immutable ``argument_error_response`` carrier.
     """
-    return {
-        "success": False,
-        "validation": {
-            "is_valid": False,
-            "errors": [_allowlisted_argument_error_entry(error)],
-        },
-    }
+    return _compile_planner_feedback(_ArgumentFeedback(error))
 
 
 @dataclass(frozen=True, slots=True)
@@ -4350,7 +4462,7 @@ async def _plan_pipeline_inner(
                 "planner-candidate", f"{private_response_namespace}:{audited_call.planner_call_ordinal}:{call.call_id}"
             )
             recorder.settle_private_candidate(candidate_evidence_id, status="candidate_evaluation_started")
-            terminal_feedback: Mapping[str, Any] | None = None
+            terminal_feedback: _PlannerFeedbackWire | None = None
             # Only fingerprinted feedback kinds can repeat; schema feedback
             # carries no rejection identity to compare.
             repeated_terminal_fingerprint = False

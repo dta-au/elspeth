@@ -71,6 +71,7 @@ const MINIMAP_NODE_STROKE_COLOR_VAR = "--color-border-strong";
 // Interim UX threshold: avoid MiniMap noise on small graphs until we can
 // promote this to a viewport-overflow heuristic or an explicit user toggle.
 const MINIMAP_NODE_COUNT_THRESHOLD = 8;
+const GRAPH_MIN_ZOOM = 0.15;
 // One options object for ALL THREE fit-view surfaces, each of which reads its
 // options from a DIFFERENT place and none of which falls back to another:
 //   1. handleInit's imperative instance.fitView(...) — takes them as an argument;
@@ -87,7 +88,7 @@ const MINIMAP_NODE_COUNT_THRESHOLD = 8;
 const GRAPH_FIT_VIEW_OPTIONS: FitViewOptions = {
   padding: 0.15,
   maxZoom: 1.5,
-  minZoom: 0.3,
+  minZoom: GRAPH_MIN_ZOOM,
 };
 const PIPELINE_NODE_TYPE = "pipeline-component";
 const PARALLEL_EDGE_TYPE = "parallel-lane";
@@ -1073,7 +1074,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   const { nodes, edges } = useMemo(() => {
     if (!hasCompositionContent(compositionState)) {
       return {
-        nodes: [] as Node[],
+        nodes: [] as PipelineGraphNodeModel[],
         edges: [] as PipelineGraphEdgeModel[],
       };
     }
@@ -2021,17 +2022,20 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
     // now-redundant inferred copy; distinct labels or flow types remain
     // independent lanes.
     const semanticallyDistinctEdges = deduplicateSemanticEdges(rfEdges);
+    return { nodes: rfNodes, edges: withDirectionMarkers(semanticallyDistinctEdges) };
+  }, [compositionState, nodeValidationMap, nodeMessageMap, selectedNodeId]);
+
+  const visibleGraph = useMemo(() => {
+    const visible = visibleGraphRoutes(
+      nodes, edges, new Set(compositionState?.outputs.map((output) => output.name)), showFailureRoutes,
+    );
     const parallelGeometry = assignParallelEdgeLanes(
-      rfNodes,
-      withDirectionMarkers(semanticallyDistinctEdges),
+      visible.nodes,
+      visible.edges,
     );
     const laidOut = layoutGraph(parallelGeometry.nodes, parallelGeometry.edges);
     return { nodes: laidOut.nodes, edges: withFanInArrivals(laidOut.nodes, laidOut.edges) };
-  }, [compositionState, nodeValidationMap, nodeMessageMap, selectedNodeId]);
-
-  const visibleGraph = useMemo(() => visibleGraphRoutes(
-    nodes, edges, new Set(compositionState?.outputs.map((output) => output.name)), showFailureRoutes,
-  ), [nodes, edges, compositionState, showFailureRoutes]);
+  }, [nodes, edges, compositionState, showFailureRoutes]);
   const hiddenOutputNames = useMemo(() => {
     const visibleIds = new Set(visibleGraph.nodes.map((node) => node.id));
     return new Set(compositionState?.outputs.filter((output) => !visibleIds.has(output.name)).map((output) => output.name));
@@ -2177,7 +2181,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       >
         <div className="graph-view-toolbar">
           <Button compact aria-pressed={showFailureRoutes} onClick={() => setShowFailureRoutes((shown) => !shown)}>
-            Show quarantine and discard routes
+            {showFailureRoutes ? "Hide" : "Show"} quarantine and discard routes
           </Button>
         </div>
         {/* Accessible + keyboard-operable equivalent of the visual DAG.
@@ -2263,6 +2267,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
               onPaneClick={onPaneClick}
               colorMode={resolvedTheme}
               onInit={handleInit}
+              minZoom={GRAPH_MIN_ZOOM}
               fitViewOptions={GRAPH_FIT_VIEW_OPTIONS}
               proOptions={{ hideAttribution: true }}
             >

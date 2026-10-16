@@ -17,7 +17,6 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -2568,6 +2567,10 @@ async def test_missing_source_candidate_fails_closed_before_full_candidate_is_ac
     ]
 
 
+def _feedback_result(validation: ValidationSummary, state: CompositionState | None = None) -> ToolResult:
+    return ToolResult(success=False, updated_state=_empty_state() if state is None else state, validation=validation, affected_nodes=())
+
+
 def test_allowlisted_candidate_feedback_enriches_node_shape_codes() -> None:
     """A rejected candidate's bare closed codes carry their fix guidance.
 
@@ -2604,7 +2607,7 @@ def test_allowlisted_candidate_feedback_enriches_node_shape_codes() -> None:
         ),
     )
 
-    feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=summary)))
+    feedback = _allowlisted_candidate_feedback(_feedback_result(summary))
 
     assert feedback["success"] is False
     assert feedback["validation"]["is_valid"] is False
@@ -2666,7 +2669,7 @@ def test_allowlisted_candidate_feedback_carries_plugin_options_detail() -> None:
         ),
     )
 
-    feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=summary)))
+    feedback = _allowlisted_candidate_feedback(_feedback_result(summary))
 
     entries = feedback["validation"]["errors"]
     options_entry = next(e for e in entries if e["error_code"] == "plugin_options_invalid")
@@ -2709,15 +2712,7 @@ def test_coalesce_feedback_rejects_missing_internal_reachability_fact(monkeypatc
     monkeypatch.setattr(planner_module, "coalesce_reachability_facts", lambda _state: {})
 
     with pytest.raises(KeyError, match="coalesce_missing"):
-        _allowlisted_candidate_feedback(
-            cast(
-                Any,
-                SimpleNamespace(
-                    validation=summary,
-                    updated_state=object(),
-                ),
-            )
-        )
+        _allowlisted_candidate_feedback(_feedback_result(summary))
 
 
 def test_derive_finalizer_owned_refs_splits_config_from_routing_ownership(tmp_path: Path) -> None:
@@ -2803,7 +2798,7 @@ def test_allowlisted_candidate_feedback_scopes_withholding_per_entry() -> None:
     owned = _FinalizerOwnedRefs(config=frozenset({"output:rows"}), routing=frozenset({"source"}))
 
     feedback = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        _feedback_result(summary),
         repeated_fingerprint=True,
         finalizer_owned=owned,
     )
@@ -2831,7 +2826,7 @@ def test_allowlisted_candidate_feedback_scopes_withholding_per_entry() -> None:
 
     # The same rejection with no finalizer ownership discloses everything.
     open_feedback = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=summary, updated_state=_dangling_destination_state())),
+        _feedback_result(summary, _dangling_destination_state()),
         repeated_fingerprint=True,
     )
     assert [entry["component"] for entry in open_feedback["validation"]["errors"]] == [
@@ -2880,7 +2875,7 @@ def test_allowlisted_candidate_feedback_projects_coalesce_union_type_facts() -> 
     summary = ValidationSummary(is_valid=False, errors=(entry,))
 
     disclosed = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        _feedback_result(summary),
     )
     projected = disclosed["validation"]["errors"][0]
     assert projected["error_code"] == "coalesce_union_type_incompatible"
@@ -2897,7 +2892,7 @@ def test_allowlisted_candidate_feedback_projects_coalesce_union_type_facts() -> 
     assert "detail" not in projected
 
     withheld = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        _feedback_result(summary),
         finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"upstream_source"})),
     )
     assert "coalesce_union_type" not in withheld["validation"]["errors"][0]
@@ -2943,7 +2938,7 @@ def test_allowlisted_candidate_feedback_withholds_cross_component_fact_payloads(
     owned = _FinalizerOwnedRefs(config=frozenset({"source"}))
 
     feedback = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        _feedback_result(summary),
         finalizer_owned=owned,
     )
     contract_projected, union_projected = feedback["validation"]["errors"]
@@ -2959,7 +2954,7 @@ def test_allowlisted_candidate_feedback_withholds_cross_component_fact_payloads(
 
     # The same rejection with no finalizer ownership discloses both payloads.
     open_feedback = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        _feedback_result(summary),
     )
     assert open_feedback["validation"]["errors"][0]["contract"]["extra_fields"] == ["PRIVATE-BOUND-COLUMN"]
     assert open_feedback["validation"]["errors"][1]["row_union_schema"]["conflicting_fields"] == ["PRIVATE-UPSTREAM-FIELD"]
@@ -2975,12 +2970,12 @@ def test_allowlisted_candidate_feedback_withholds_cross_component_fact_payloads(
     )
     node_summary = ValidationSummary(is_valid=False, errors=(node_contract,))
     kept = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=node_summary, updated_state=object())),
+        _feedback_result(node_summary),
         finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"output:rows"})),
     )
     assert kept["validation"]["errors"][0]["contract"]["missing_fields"] == ["needed"]
     suppressed = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=node_summary, updated_state=object())),
+        _feedback_result(node_summary),
         finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"node:producer_node"})),
     )
     assert "contract" not in suppressed["validation"]["errors"][0]
@@ -3410,7 +3405,7 @@ def test_allowlisted_candidate_feedback_carries_route_destination_facts() -> Non
         ),
     )
 
-    feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=summary, updated_state=state)))
+    feedback = _allowlisted_candidate_feedback(_feedback_result(summary, state))
 
     entries = feedback["validation"]["errors"]
     source_entry = next(e for e in entries if e["error_code"] == "source_on_success_dangling")
@@ -3536,7 +3531,7 @@ def test_route_destination_feedback_rejects_missing_internal_fact(monkeypatch: p
     monkeypatch.setattr(planner_module, "route_destination_facts", lambda _state: {})
 
     with pytest.raises(KeyError, match="source"):
-        _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=summary, updated_state=object())))
+        _allowlisted_candidate_feedback(_feedback_result(summary))
 
 
 @pytest.mark.asyncio
@@ -3560,16 +3555,28 @@ async def test_mutation_or_unknown_tool_is_rejected_without_dispatch_or_retry(
 async def test_invalid_candidate_gets_allowlisted_feedback_then_repairs(
     tmp_path: Path,
     tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Lowercase because sink names are: the advertised terminal schema now
-    # discloses that rule, so an upper-cased name is intercepted by the
-    # structural pre-check and this test would never reach the Stage-1
-    # allowlist it exists to pin (elspeth-2e9df07c69). The canary's job is to
-    # ride along in the candidate and prove no raw validator text escapes.
+    # Preserve valid non-inline source/output custody so the real Stage-1
+    # edge validator, rather than an earlier binding-context refusal, owns
+    # the raw diagnostic whose private text must not reach feedback or audit.
     raw_canary = "raw_validation_exception_canary"
+    valid = _pipeline(tmp_path)
+    invalid = deepcopy(valid)
+    invalid["edges"] = [{"id": "invalid_edge", "from_node": "source", "to_node": raw_canary, "edge_type": "on_success"}]
+    assert invalid["source"] == valid["source"] and invalid["outputs"] == valid["outputs"]
+    actual_validate = CompositionState.validate
+    raw_validations: list[ValidationSummary] = []
+
+    def observe_validate(state: CompositionState) -> ValidationSummary:
+        validation = actual_validate(state)
+        raw_validations.append(validation)
+        return validation
+
+    monkeypatch.setattr(CompositionState, "validate", observe_validate)
     completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path, output_name=raw_canary)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": invalid})),
+        _response(("emit_pipeline_proposal", {"pipeline": valid})),
     )
     recorder = BufferingRecorder()
 
@@ -3582,13 +3589,17 @@ async def test_invalid_candidate_gets_allowlisted_feedback_then_repairs(
     )
 
     assert proposal.proposal.repair_count == 1
+    assert len(completion.requests) == 2
+    raw_errors = [entry for validation in raw_validations for entry in validation.errors if entry.error_code == "edge_unknown_node"]
+    assert raw_errors
+    assert all(entry.component == "edge:invalid_edge" and raw_canary in entry.message for entry in raw_errors)
     feedback = completion.requests[1]["messages"][-1]
     assert feedback["role"] == "tool"
-    # "guidance" is a static usage line (how to expand a code via
-    # explain_validation_error) — never per-request data, so it does not
-    # widen the redaction boundary this allowlist protects.
-    assert set(json.loads(feedback["content"])) == {"success", "validation", "guidance"}
     feedback_payload = json.loads(feedback["content"])
+    # Every entry is enriched with its static catalogue pair, so the generic
+    # top-level explain-tool usage line is unnecessary and must be absent.
+    assert set(feedback_payload) == {"success", "validation"}
+    assert feedback_payload["success"] is False and feedback_payload["validation"]["is_valid"] is False
     assert set(feedback_payload["validation"]) == {"is_valid", "errors"}
     # Closed codes may additionally carry the STATIC catalogue enrichment
     # (explanation/suggested_fix, always paired) and schema-contract entries
@@ -3600,6 +3611,18 @@ async def test_invalid_candidate_gets_allowlisted_feedback_then_repairs(
         assert ("explanation" in item) == ("suggested_fix" in item), item
     assert raw_canary not in feedback["content"]
     assert raw_canary not in canonical_json([call.to_dict() for call in recorder.llm_calls])
+    guidance = explain_validation_code("edge_unknown_node")
+    assert guidance is not None
+    assert feedback_payload["validation"]["errors"] == [
+        {
+            "component": "edge:invalid_edge",
+            "severity": "high",
+            "error_code": "edge_unknown_node",
+            "error_class": "ValidationError",
+            "explanation": guidance[0],
+            "suggested_fix": guidance[1],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -6640,7 +6663,7 @@ def test_violated_plugin_contract_is_withheld_for_a_config_owned_component() -> 
             ),
         ),
     )
-    result = cast(Any, SimpleNamespace(validation=summary))
+    result = _feedback_result(summary)
     resolved: list[tuple[str, str]] = []
 
     def _resolver(kind: Any, plugin_name: str) -> Mapping[str, Any]:
@@ -6722,7 +6745,7 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     # Both ends model-authored: the planner already holds every name in the
     # payload, so the repair turn gets the fields it must act on.
     between_transforms = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "node:field_mapper_1"))),
+        _feedback_result(_summary("llm_1", "field_mapper_1", "node:field_mapper_1")),
         finalizer_owned=finalizer_owns_reviewed_ends,
     )
     assert between_transforms["validation"]["errors"][0]["contract"] == {
@@ -6738,7 +6761,7 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     # ``_contract_participant_refs`` to return no refs makes exactly this
     # assertion fail, and it is the only one that fails.
     from_reviewed_source = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=_summary("source", "web_scrape_1", "node:web_scrape_1"))),
+        _feedback_result(_summary("source", "web_scrape_1", "node:web_scrape_1")),
         finalizer_owned=finalizer_owns_reviewed_ends,
     )
     assert "contract" not in from_reviewed_source["validation"]["errors"][0]
@@ -6750,7 +6773,7 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     # redundant from a sink-consumer example and is not — do not treat this
     # assertion as coverage of the cross-reference.
     into_reviewed_sink = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=_summary("llm_1", "output:json_out", "output:json_out"))),
+        _feedback_result(_summary("llm_1", "output:json_out", "output:json_out")),
         finalizer_owned=finalizer_owns_reviewed_ends,
     )
     assert "contract" not in into_reviewed_sink["validation"]["errors"][0]
@@ -6773,14 +6796,14 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     # this test claimed coverage it did not add, and the same claim was nearly
     # made again here.
     unattributable = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "rejected_mutation"))),
+        _feedback_result(_summary("llm_1", "field_mapper_1", "rejected_mutation")),
         finalizer_owned=finalizer_owns_reviewed_ends,
     )
     assert "contract" not in unattributable["validation"]["errors"][0]
 
     # Freeform baseline: no finalizer ownership, nothing to withhold against.
     freeform = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "node:field_mapper_1"))),
+        _feedback_result(_summary("llm_1", "field_mapper_1", "node:field_mapper_1")),
     )
     assert freeform["validation"]["errors"][0]["contract"]["extra_fields"] == ["content", "fingerprint"]
 
@@ -6829,7 +6852,7 @@ def test_connectivity_facts_are_withheld_per_change_kind_not_per_component(monke
             ),
         ),
     )
-    result = cast(Any, SimpleNamespace(validation=summary, updated_state=object()))
+    result = _feedback_result(summary)
 
     def entry_for(owned: _FinalizerOwnedRefs | None) -> Mapping[str, Any]:
         feedback = (
@@ -6889,7 +6912,7 @@ def test_an_entry_without_a_carried_identity_attaches_nothing() -> None:
         return {"plugin_id": f"{kind}/{plugin_name}"}
 
     feedback = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=summary)),
+        _feedback_result(summary),
         plugin_contract_resolver=_resolver,
     )
 
@@ -6921,7 +6944,7 @@ def test_violated_plugin_contract_omitted_when_the_budget_cannot_seat_it() -> No
     )
 
     feedback = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=summary)),
+        _feedback_result(summary),
         plugin_contract_resolver=lambda _kind, _plugin: None,
     )
 
@@ -9310,7 +9333,7 @@ def test_explain_tool_advertisement_is_dropped_once_every_code_is_enriched() -> 
         ),
     )
 
-    feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=enriched_only)))
+    feedback = _allowlisted_candidate_feedback(_feedback_result(enriched_only))
 
     (entry,) = feedback["validation"]["errors"]
     assert entry["explanation"] and entry["suggested_fix"]
@@ -9324,7 +9347,7 @@ def test_explain_tool_advertisement_is_dropped_once_every_code_is_enriched() -> 
         ),
     )
 
-    mixed_feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=with_bare_code)))
+    mixed_feedback = _allowlisted_candidate_feedback(_feedback_result(with_bare_code))
 
     assert mixed_feedback["guidance"] == "To expand any code, call explain_validation_error with the exact code string."
 
@@ -9344,7 +9367,7 @@ def test_withheld_mode_never_advertises_the_guaranteed_empty_explain_call() -> N
     )
 
     feedback = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        _feedback_result(summary),
         finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"source"}), routing=frozenset()),
     )
 
@@ -9371,7 +9394,7 @@ def test_truncated_component_rejection_feedback_reports_what_was_withheld() -> N
     )
 
     feedback = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        _feedback_result(summary),
         components_withheld=3,
     )
 
@@ -9479,9 +9502,9 @@ def test_candidate_rejection_fingerprint_discriminates_disjoint_component_sets()
     byte-identical (elspeth-4fad98a453).
     """
 
-    def rejection(*subjects: str) -> Any:
-        return SimpleNamespace(
-            validation=ValidationSummary(
+    def rejection(*subjects: str) -> ToolResult:
+        return _feedback_result(
+            ValidationSummary(
                 is_valid=False,
                 errors=tuple(
                     ValidationEntry(
@@ -9496,13 +9519,13 @@ def test_candidate_rejection_fingerprint_discriminates_disjoint_component_sets()
             )
         )
 
-    disjoint_first = _rejection_fingerprint(cast(Any, rejection("source:rows_in", "node:clean")))
-    disjoint_second = _rejection_fingerprint(cast(Any, rejection("output:rows_out", "node:score")))
+    disjoint_first = _rejection_fingerprint(rejection("source:rows_in", "node:clean"))
+    disjoint_second = _rejection_fingerprint(rejection("output:rows_out", "node:score"))
     assert disjoint_first != disjoint_second
 
     # A genuine repeat — same components, same codes — still fingerprints the
     # same, so the notice it earns still fires.
-    assert _rejection_fingerprint(cast(Any, rejection("source:rows_in", "node:clean"))) == disjoint_first
+    assert _rejection_fingerprint(rejection("source:rows_in", "node:clean")) == disjoint_first
 
 
 @pytest.mark.asyncio
@@ -9742,7 +9765,7 @@ def test_rejection_subject_is_read_structurally_never_parsed_from_the_message() 
     owns_something_else = _FinalizerOwnedRefs(config=frozenset({"source"}), routing=frozenset())
 
     disclosed = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=ValidationSummary(is_valid=False, errors=(attributed,)), updated_state=object())),
+        _feedback_result(ValidationSummary(is_valid=False, errors=(attributed,))),
         finalizer_owned=owns_something_else,
     )
     (disclosed_entry,) = disclosed["validation"]["errors"]
@@ -9750,7 +9773,7 @@ def test_rejection_subject_is_read_structurally_never_parsed_from_the_message() 
     assert disclosed_entry["detail"] == "Output 'rows': RAW_MESSAGE_CANARY"
 
     withheld = _allowlisted_candidate_feedback(
-        cast(Any, SimpleNamespace(validation=ValidationSummary(is_valid=False, errors=(unattributed,)), updated_state=object())),
+        _feedback_result(ValidationSummary(is_valid=False, errors=(unattributed,))),
         finalizer_owned=owns_something_else,
     )
     (withheld_entry,) = withheld["validation"]["errors"]

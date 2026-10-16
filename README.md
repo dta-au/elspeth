@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.6](https://img.shields.io/badge/status-0.8.6-green.svg)
+![Status: 0.8.7](https://img.shields.io/badge/status-0.8.7-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -98,7 +98,28 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.6
+## What changed in 0.8.7
+
+0.8.7 is unreleased. Full-replacement refusals and incremental output refusals
+retain their distinct candidate and saved-graph meanings, safe path diagnostics
+and repair guidance. Shared-link failures preserve the requested link instead
+of opening the recipient's workspace. Configured container token ceilings are
+provisioned before serving without inventing a storage ceiling; automatic title
+requests disable the adapter and SDK retry paths. See the [release notes](CHANGELOG.md).
+
+Session epoch 77 replaces session epoch 76 and retains its committed graph-review
+authority while adding the quota representation. Landscape epoch 49 is unchanged.
+Preserve epoch 75 and both epoch 76 session-store contracts and use a separately
+provisioned epoch 77 session store. Keep old workers isolated from the new store.
+Compatible stores still require exact schema admission; unsupported stores are
+preserved and refused before incompatible writes. Backwards compatibility is
+permitted and considered from 0.8.5 within explicitly supported boundaries. This
+candidate authorizes no in-place migration, reset or downgrade. Package metadata
+is 0.8.7; the package version alone does not establish qualification or image
+publication. Automatic image publication from main is held; verify the release
+tag and image digest before installing a published image.
+
+## Previously in 0.8.6
 
 0.8.6 strengthens Composer final-reply review, retained operation outcomes,
 and bounded blob inspection. Replies are reviewed against the current request,

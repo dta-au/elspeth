@@ -1233,7 +1233,8 @@ class TestEchoedServerOwnedMetadata:
         ctx, state, options = self._bound_source(tmp_path, operation_scopes)
         state, resolved_options = self._resolved_state(state, options)
         stored_row = resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]
-        context_projection = {field: stored_row[field] for field in ("id", "kind", "user_term", "draft", "status")}
+        context_projection = {field: stored_row[field] for field in ("id", "kind", "user_term", "status")}
+        context_projection["historical_draft"] = stored_row["draft"]
 
         result = _execute_patch_source_options(
             {"patch": {INTERPRETATION_REQUIREMENTS_KEY: [context_projection]}},

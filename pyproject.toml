@@ -1,6 +1,6 @@
 [project]
 name = "elspeth"
-version = "0.8.6"
+version = "0.8.7"
 description = "Auditable Sense/Decide/Act pipelines for high-reliability systems"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -285,6 +285,8 @@ packages = ["src/elspeth"]
 [tool.uv]
 # Security floors for packages also pulled in through SDK dependencies.
 constraint-dependencies = [
+    # Older Slim wheels overwrite the full Typer package pulled in by our CLI.
+    "typer-slim>=0.24.0",
     "oauthlib>=4,<5",
     "PyJWT>=2.15,<3",
 ]

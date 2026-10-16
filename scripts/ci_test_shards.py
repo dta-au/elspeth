@@ -230,8 +230,14 @@ def finalize_long_run_manifest(
         if proof_call_passed is not True and exit_status == 0:
             terminal["exit_status"] = 1
     if coverage_database is not None:
-        with coverage_database.open("rb") as stream:
-            terminal["coverage_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        try:
+            with coverage_database.open("rb") as stream:
+                terminal["coverage_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        except FileNotFoundError:
+            # Collection can fail before coverage starts. Publish that failure
+            # without claiming coverage; successful evidence still requires it.
+            if terminal["exit_status"] == 0:
+                raise
     return terminal
 
 

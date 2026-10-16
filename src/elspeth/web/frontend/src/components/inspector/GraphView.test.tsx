@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import dagre from "@dagrejs/dagre";
 import { GraphView } from "./GraphView";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
@@ -35,6 +36,7 @@ vi.mock("@xyflow/react", () => ({
     fitView,
     onInit,
     fitViewOptions,
+    minZoom,
     onNodeClick,
     nodesFocusable,
     edgesFocusable,
@@ -49,6 +51,7 @@ vi.mock("@xyflow/react", () => ({
       data-fit-view-prop={fitView === undefined ? "absent" : String(Boolean(fitView))}
       data-has-on-init={String(typeof onInit === "function")}
       data-fit-view-options={fitViewOptions ? JSON.stringify(fitViewOptions) : ""}
+      data-min-zoom={minZoom}
       // Focusability assertions (elspeth-437caadef3): both must be explicitly
       // false — React Flow defaults them to true, which puts invisible tab
       // stops inside the role="img" (children-presentational) diagram scope.
@@ -202,21 +205,25 @@ vi.mock("@/hooks/useTheme", () => ({
   }),
 }));
 
-// Mock @dagrejs/dagre — layout is not needed in tests.
+// Keep deterministic positions while recording the actual layout inputs.
 vi.mock("@dagrejs/dagre", () => ({
   default: {
     graphlib: {
       Graph: class {
+        private nodeIds = new Set<string>();
+        private connections = new Map<string, { v: string; w: string }>();
         setDefaultEdgeLabel() {}
         setGraph() {}
-        setNode() {}
-        setEdge() {}
+        setNode(id: string) { this.nodeIds.add(id); }
+        setEdge(v: string, w: string) { this.connections.set(JSON.stringify([v, w]), { v, w }); }
+        nodes() { return [...this.nodeIds]; }
+        edges() { return [...this.connections.values()]; }
         node(_id: string) { return { x: 0, y: 0 }; }
         // Keep the graph dimensions available to the layout harness.
         graph() { return { width: 480, height: 200 }; }
       },
     },
-    layout() {},
+    layout: vi.fn(),
   },
 }));
 
@@ -278,11 +285,22 @@ it("toggles quarantine routes with the keyboard, retains shared sinks and restor
   const before = JSON.stringify(useSessionStore.getState().compositionState);
   const user = userEvent.setup();
   const { container, unmount } = render(<GraphView />);
+  const layoutInputs = () => {
+    const call = vi.mocked(dagre.layout).mock.lastCall;
+    expect(call).toBeDefined();
+    const graph = call![0];
+    return { nodes: graph.nodes().sort(), edges: graph.edges().map(({ v, w }) => `${v}->${w}`).sort() };
+  };
+  const originalLayout = layoutInputs();
+  expect(originalLayout).toEqual({
+    nodes: ["quarantine", "shared", "source", "step"],
+    edges: ["shared->quarantine", "source->quarantine", "source->step", "step->shared"],
+  });
   const originalEdges = [...container.querySelectorAll("[data-edge-source]")].map((edge) => ({
     id: edge.getAttribute("data-testid"), source: edge.getAttribute("data-edge-source"), target: edge.getAttribute("data-edge-target"),
     sourceHandle: edge.getAttribute("data-source-handle"), targetHandle: edge.getAttribute("data-target-handle"),
   }));
-  const toggle = screen.getByRole("button", { name: "Show quarantine and discard routes" });
+  const toggle = screen.getByRole("button", { name: "Hide quarantine and discard routes" });
   expect(toggle).toHaveAttribute("aria-pressed", "true");
   await user.click(screen.getByText("Wiring (4)"));
   const routeList = screen.getByRole("list", { name: "Inspect pipeline routes" });
@@ -293,12 +311,23 @@ it("toggles quarantine routes with the keyboard, retains shared sinks and restor
   toggle.focus();
   await user.keyboard(" ");
   expect(toggle).toHaveAttribute("aria-pressed", "false");
+  expect(toggle).toHaveAccessibleName("Show quarantine and discard routes");
+  expect(layoutInputs()).toEqual({
+    nodes: ["shared", "source", "step"],
+    edges: ["source->step", "step->shared"],
+  });
+  const sharedArrival = container.querySelector('[data-edge-source="step"][data-edge-target="shared"]');
+  expect(sharedArrival).not.toBeNull();
+  expect(sharedArrival).not.toHaveAttribute("data-source-handle");
+  expect(sharedArrival).not.toHaveAttribute("data-target-handle");
   expect(screen.getByTestId("node-shared")).toBeInTheDocument();
   expect(screen.queryByTestId("node-quarantine")).not.toBeInTheDocument();
   expect(useSessionStore.getState().selectedNodeId).toBeNull();
   expect(screen.queryByText(/Selected route:/)).not.toBeInTheDocument();
   expect(screen.getByRole("list", { name: "Pipeline branch connections" })).not.toHaveTextContent("(error)");
   await user.keyboard("{Enter}");
+  expect(toggle).toHaveAccessibleName("Hide quarantine and discard routes");
+  expect(layoutInputs()).toEqual(originalLayout);
   expect(screen.getByTestId("node-quarantine")).toBeInTheDocument();
   expect([...container.querySelectorAll("[data-edge-source]")].map((edge) => ({
     id: edge.getAttribute("data-testid"), source: edge.getAttribute("data-edge-source"), target: edge.getAttribute("data-edge-target"),
@@ -308,7 +337,32 @@ it("toggles quarantine routes with the keyboard, retains shared sinks and restor
   await user.click(toggle);
   unmount();
   render(<GraphView />);
-  expect(screen.getByRole("button", { name: "Show quarantine and discard routes" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("button", { name: "Hide quarantine and discard routes" })).toHaveAttribute("aria-pressed", "true");
+});
+
+it("keeps the toggle available when every node of an incomplete sink-only graph is hidden", async () => {
+  resetStore(useSessionStore);
+  resetStore(useExecutionStore);
+  const state = makeState({
+    outputs: [
+      { name: "first", plugin: "json", options: {}, on_write_failure: "second" },
+      { name: "second", plugin: "json", options: {}, on_write_failure: "first" },
+    ],
+  });
+  useSessionStore.setState({ compositionState: state });
+  const before = JSON.stringify(state);
+  const user = userEvent.setup();
+  render(<GraphView />);
+  expect(screen.getByTestId("node-first")).toBeInTheDocument();
+  expect(screen.getByTestId("node-second")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Hide quarantine and discard routes" }));
+  expect(screen.queryByTestId("node-first")).not.toBeInTheDocument();
+  expect(screen.queryByTestId("node-second")).not.toBeInTheDocument();
+  expect(screen.getByTestId("react-flow")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Show quarantine and discard routes" }));
+  expect(screen.getByTestId("node-first")).toBeInTheDocument();
+  expect(screen.getByTestId("node-second")).toBeInTheDocument();
+  expect(JSON.stringify(useSessionStore.getState().compositionState)).toBe(before);
 });
 
 function makeProposal(
@@ -3442,7 +3496,8 @@ describe("GraphView", () => {
       const flow = screen.getByTestId("react-flow");
       expect(flow.dataset.fitViewOptions).not.toBe("");
       const opts = JSON.parse(flow.dataset.fitViewOptions ?? "{}");
-      expect(opts).toEqual({ padding: 0.15, maxZoom: 1.5, minZoom: 0.3 });
+      expect(opts).toEqual({ padding: 0.15, maxZoom: 1.5, minZoom: 0.15 });
+      expect(flow.dataset.minZoom).toBe("0.15");
     });
 
     // The test above pins the <ReactFlow> prop, which the fit-view BUTTON never
@@ -3476,7 +3531,7 @@ describe("GraphView", () => {
       expect(JSON.parse(controls.dataset.fitViewOptions ?? "{}")).toEqual({
         padding: 0.15,
         maxZoom: 1.5,
-        minZoom: 0.3,
+        minZoom: 0.15,
       });
     });
 

@@ -101,6 +101,8 @@ def test_runtime_default_and_explicit_null_stay_distinct() -> None:
 async def test_audited_dispatch_distinguishes_structural_and_semantic_count_failure(tool_name: str, count: object) -> None:
     state = _empty_state()
     context = _trained_context()
+    standing = context.catalog.validate_composition_state(state).validation
+    assert standing.errors
     node = _node(expected_output_count=count, options={"schema": {"mode": "observed"}, "value_field": "amount"})
     arguments = node if tool_name == "upsert_node" else _pipeline([node])
     recorder = BufferingRecorder()
@@ -135,7 +137,17 @@ async def test_audited_dispatch_distinguishes_structural_and_semantic_count_fail
             assert "'batch_stats' does not declare that its flush emits exactly one row per buffered row" in rejected[0].message
         else:
             assert outcome.result.updated_state is state
-            assert [error.error_code for error in outcome.result.validation.errors] == [CODE]
+            if tool_name == "upsert_node":
+                assert outcome.result.updated_state.version == state.version and outcome.result.data is None
+                entry = outcome.result.validation.errors[0]
+                assert (entry.component, entry.error_code, entry.rejected_component) == ("rejected_mutation", CODE, "node:batch")
+                assert outcome.result.validation.errors[1:] == standing.errors
+                assert outcome.result.validation.warnings == standing.warnings
+                assert outcome.result.validation.suggestions == standing.suggestions
+                assert outcome.result.validation.edge_contracts == standing.edge_contracts
+                assert outcome.result.validation.semantic_contracts == standing.semantic_contracts
+            else:
+                assert [error.error_code for error in outcome.result.validation.errors] == [CODE]
     assert len(recorder.invocations) == 1
     invocation = recorder.invocations[0]
     assert invocation.status is (ComposerToolStatus.ARG_ERROR if structurally_invalid else ComposerToolStatus.SUCCESS)
@@ -167,6 +179,8 @@ def test_intrinsic_failure_does_not_report_unchecked_source_or_plugin_defects() 
 def test_incremental_rejects_before_options_and_keeps_audit_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _empty_state()
     context = _trained_context()
+    standing = context.catalog.validate_composition_state(state).validation
+    assert standing.errors
     prevalidate = create_autospec(transforms_tools._prevalidate_transform_for_context, side_effect=AssertionError("plugin work ran"))
     normalize = create_autospec(transforms_tools._options_with_default_llm_reviews, side_effect=AssertionError("option normalization ran"))
     monkeypatch.setattr(transforms_tools, "_prevalidate_transform_for_context", prevalidate)
@@ -176,7 +190,14 @@ def test_incremental_rejects_before_options_and_keeps_audit_arguments(monkeypatc
     assert not result.success
     assert result.updated_state is state
     assert result.updated_state.version == state.version
-    assert [error.error_code for error in result.validation.errors] == [CODE]
+    entry = result.validation.errors[0]
+    assert (entry.component, entry.error_code, entry.rejected_component) == ("rejected_mutation", CODE, "node:batch")
+    assert result.validation.errors[1:] == standing.errors
+    assert result.validation.warnings == standing.warnings and result.validation.suggestions == standing.suggestions
+    assert (
+        result.validation.edge_contracts == standing.edge_contracts and result.validation.semantic_contracts == standing.semantic_contracts
+    )
+    assert result.data is None
     prevalidate.assert_not_called()
     normalize.assert_not_called()
     invocation = finish_success(

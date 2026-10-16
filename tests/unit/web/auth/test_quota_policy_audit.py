@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from elspeth.web.coordination.quota_authority import QuotaPolicyRow
+from elspeth.web.coordination.quota_authority import ContainerQuotaPolicyRow, QuotaPolicyRow
 from elspeth.web.coordination.quota_policy_authority import QuotaPolicyChange
 from tests.unit.web.auth.test_audit import _durable_recorder, _durable_rows, _metadata, _request
 
@@ -17,7 +17,7 @@ def _change(*, action: str, dimension: str | None, policy: QuotaPolicyRow | None
         dimension=dimension,
         policy=policy,
         previous=QuotaPolicyRow(policy_id="old", tokens_per_day=500, storage_bytes=2000),
-        container_policy=QuotaPolicyRow(policy_id="container", tokens_per_day=9000, storage_bytes=90000),
+        container_policy=ContainerQuotaPolicyRow(policy_id="container", tokens_per_day=9000, storage_bytes=90000),
         tokens_used_today=75,
         storage_bytes_used=600,
         on_behalf_of="person@example.org",
@@ -62,3 +62,15 @@ def test_revoke_records_both_dimensions(tmp_path: Any) -> None:
         "storage": (None, 2000, 600),
     }
     assert all(data["action"] == "revoke" and data["revoked_policy_id"] == "old" for data in by_dimension.values())
+
+
+def test_configured_container_ceiling_has_no_fictional_identity_or_storage_cap(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_container_quota_set(
+        provider="local", policy=ContainerQuotaPolicyRow(policy_id="configured", tokens_per_day=9000, storage_bytes=None)
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.outcome, row.identity_id, row.request_id) == ("quota_set", "success", None, None)
+    data = _metadata(row)
+    assert (data["actor"], data["source"], data["scope"], data["dimension"]) == ("config", "config", "container", "tokens")
+    assert (data["policy_id"], data["tokens_per_day"], data["storage_bytes"]) == ("configured", 9000, None)

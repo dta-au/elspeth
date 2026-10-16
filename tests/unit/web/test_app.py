@@ -91,6 +91,98 @@ from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
+@pytest.mark.asyncio
+async def test_lifespan_provisions_token_only_container_cap_and_audits_once(tmp_path: Path) -> None:
+    from elspeth.web.sessions.models import quota_policies_table
+    from tests.unit.web.auth.test_audit import _durable_rows, _metadata
+
+    app = create_app(
+        _settings(
+            tmp_path,
+            composer_boot_probe_enabled=False,
+            quota_container_tokens_per_day=9000,
+            quota_default_tokens_per_day=500,
+            quota_default_storage_bytes=1000,
+        )
+    )
+    with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+        async with lifespan(app):
+            with app.state.session_engine.connect() as conn:
+                (policy,) = conn.execute(select(quota_policies_table).where(quota_policies_table.c.identity_id.is_(None))).all()
+            assert (policy.tokens_per_day, policy.storage_bytes, policy.set_by_actor) == (9000, None, "config")
+            rows = [row for row in _durable_rows(app.state.settings.get_landscape_url()) if row.event_type == "quota_set"]
+            assert len(rows) == 1 and rows[0].identity_id is None
+            assert _metadata(rows[0])["policy_id"] == policy.policy_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_fails", [False, True])
+async def test_cancelled_startup_joins_policy_worker_before_database_finalizers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_fails: bool
+) -> None:
+    app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False), process_watchdog_factory=OwnedTestProcessWatchdog)
+    entered = threading.Event()
+    release = threading.Event()
+    order: list[str] = []
+    worker_error = RuntimeError("policy worker failed")
+    original = app.state.quota_policy_authority.ensure_container_token_policy
+    original_auth_finalizer = app.state._auth_audit_finalizer
+    original_session_finalizer = app.state._session_engine_finalizer
+
+    def blocked_policy(**kwargs: object) -> object:
+        entered.set()
+        if not release.wait(timeout=10):
+            raise AssertionError("test did not release policy worker")
+        order.append("worker")
+        if worker_fails:
+            raise worker_error
+        return original(**kwargs)
+
+    def finalize_auth() -> object:
+        order.append("auth")
+        return original_auth_finalizer()
+
+    def finalize_session() -> object:
+        order.append("sessions")
+        return original_session_finalizer()
+
+    monkeypatch.setattr(app.state.quota_policy_authority, "ensure_container_token_policy", blocked_policy)
+    app.state._auth_audit_finalizer = finalize_auth
+    app.state._session_engine_finalizer = finalize_session
+
+    async def start() -> None:
+        async with lifespan(app):
+            raise AssertionError("cancelled startup must not serve")
+
+    task = asyncio.create_task(start())
+    try:
+        async with asyncio.timeout(5):
+            while not entered.is_set():
+                await asyncio.sleep(0.01)
+        task.cancel("first startup cancellation")
+        async with asyncio.timeout(5):
+            while not app.state.instance_draining.is_set():
+                await asyncio.sleep(0.01)
+        task.cancel("second startup cancellation")
+        await asyncio.sleep(0.02)
+        assert not task.done() and order == []
+    finally:
+        release.set()
+    with pytest.raises(BaseExceptionGroup) as caught:
+        await asyncio.wait_for(task, timeout=5)
+
+    def leaves(error: BaseException) -> list[BaseException]:
+        if isinstance(error, BaseExceptionGroup):
+            return [leaf for child in error.exceptions for leaf in leaves(child)]
+        return [error]
+
+    originals = leaves(caught.value)
+    cancellations = [error for error in originals if isinstance(error, asyncio.CancelledError)]
+    assert [str(error) for error in cancellations] == ["first startup cancellation", "second startup cancellation"]
+    assert (worker_error in originals) is worker_fails
+    assert order == ["worker", "auth", "sessions"]
+
+
 class _HermeticMetricExporter(MetricExporter):
     """No-network exporter for app-factory tests that select AWS policy."""
 
@@ -1654,6 +1746,9 @@ class TestLifespanShutdown:
         async def service(_app: FastAPI):
             yield
 
+        async def initialize_policy(_app: FastAPI) -> None:
+            pass
+
         def finalize_auth() -> None:
             calls.append("auth")
             if auth_fails:
@@ -1673,6 +1768,7 @@ class TestLifespanShutdown:
         app.state._session_engine_finalizer = finalize_engine
         monkeypatch.setattr(app_module, "ExecutionLeaseReleaseRegistry", Registry)
         monkeypatch.setattr(app_module, "_service_lifespan", service)
+        monkeypatch.setattr(app_module, "_initialize_container_token_policy", initialize_policy)
 
         with pytest.raises(BaseException) as captured:
             async with lifespan(app):
@@ -1765,6 +1861,11 @@ class TestLifespanShutdown:
         app.state._session_engine_finalizer = finalize_engine
         monkeypatch.setattr(app_module, "ExecutionLeaseReleaseRegistry", Registry)
         monkeypatch.setattr(app_module, "_service_lifespan", service)
+
+        async def initialize_policy(_app: FastAPI) -> None:
+            pass
+
+        monkeypatch.setattr(app_module, "_initialize_container_token_policy", initialize_policy)
 
         async def run() -> None:
             async with lifespan(app):

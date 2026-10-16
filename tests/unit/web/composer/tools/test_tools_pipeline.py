@@ -12,13 +12,15 @@ from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.tools import ToolResult
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -42,6 +44,20 @@ from tests.unit.web.composer.test_tools import (
     _verbatim_blob_context,
     execute_tool,
 )
+
+
+def _assert_inline_source_refusal(result: ToolResult, state: CompositionState, code: str, explanation_fragment: str) -> None:
+    assert result.updated_state is state
+    assert result.affected_nodes == ()
+    assert [(entry.error_code, entry.rejected_component) for entry in result.validation.errors] == [(code, "source")]
+    guidance = result.to_dict()["validation_guidance"]["codes"][code]
+    assert explanation_fragment in guidance["explanation"]
+    assert guidance["suggested_fix"]
+    projected = _allowlisted_candidate_feedback(result)["validation"]["errors"][0]
+    assert projected["error_code"] == code
+    assert projected["explanation"] == guidance["explanation"]
+    assert projected["suggested_fix"] == guidance["suggested_fix"]
+    assert "detail" not in projected
 
 
 class TestSetPipelineSchemaShape:
@@ -1264,7 +1280,7 @@ class TestSetPipeline:
             },
             "on_validation_failure": "quarantine",
         }
-        args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / "out.csv")
+        args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "out.csv")
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
 
@@ -1288,6 +1304,7 @@ class TestSetPipeline:
             result.validation.errors[0].message == "Source 'source': Refusing inline CSV because it exceeds bounded CSV inspection limits."
         )
         assert "x" * 32 not in result.validation.errors[0].message
+        _assert_inline_source_refusal(result, state, "inline_source_csv_inspection_failed", "No uploaded-file conflict was established")
 
     @pytest.mark.parametrize(
         "unsafe_content",
@@ -1326,7 +1343,7 @@ class TestSetPipeline:
         }
         args["outputs"][0]["options"].update(
             {
-                "path": str(tmp_path / "outputs" / "out.csv"),
+                "path": str(tmp_path / "outputs" / session_id / "out.csv"),
                 "mode": "write",
                 "collision_policy": "auto_increment",
             }
@@ -1352,6 +1369,7 @@ class TestSetPipeline:
             result.validation.errors[0].message == "Source 'source': Refusing inline CSV because it exceeds bounded CSV inspection limits."
         )
         assert malformed_content not in result.validation.errors[0].message
+        _assert_inline_source_refusal(result, state, "inline_source_csv_inspection_failed", "No uploaded-file conflict was established")
 
     def test_set_pipeline_candidate_csv_parser_error_escalates_as_integrity_failure(self, tmp_path: Path) -> None:
         from datetime import UTC, datetime
@@ -1562,6 +1580,11 @@ class TestSetPipeline:
 
         assert result.success is True, result.data
         assert _default_source(result.updated_state) is not None
+        assert not any(
+            entry.error_code
+            in {"inline_source_csv_inspection_failed", "inline_source_comparison_incomplete", "inline_source_content_conflict"}
+            for entry in result.validation.errors
+        )
 
     def test_set_pipeline_header_only_inline_csv_escalates_definitive_parse_error_before_window_end(self, tmp_path: Path) -> None:
         """A larger backing file must not hide syntax errors raised before the
@@ -1633,10 +1656,10 @@ class TestSetPipeline:
             )
 
     @pytest.mark.parametrize(
-        ("candidate_count", "match_on_read", "expected_reads", "expected_error"),
+        ("candidate_count", "match_on_read", "expected_reads", "expected_error", "expected_code", "explanation_fragment"),
         [
-            (50, 50, 50, "header-only inline CSV"),
-            (51, None, 0, "candidate scan limit"),
+            (50, 50, 50, "header-only inline CSV", "inline_source_content_conflict", "Its data rows were not verified"),
+            (51, None, 0, "candidate scan limit", "inline_source_comparison_incomplete", "comparison did not finish"),
         ],
         ids=["match_at_budget", "over_budget"],
     )
@@ -1648,6 +1671,8 @@ class TestSetPipeline:
         match_on_read: int | None,
         expected_reads: int,
         expected_error: str,
+        expected_code: str,
+        explanation_fragment: str,
     ) -> None:
         from datetime import UTC, datetime
 
@@ -1698,7 +1723,7 @@ class TestSetPipeline:
             },
             "on_validation_failure": "quarantine",
         }
-        args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / "out.csv")
+        args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "out.csv")
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
 
@@ -1721,6 +1746,9 @@ class TestSetPipeline:
         assert result.success is False
         assert expected_error in result.validation.errors[0].message
         assert reads == expected_reads
+        _assert_inline_source_refusal(result, state, expected_code, explanation_fragment)
+        with engine.connect() as conn:
+            assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == candidate_count
 
     def test_set_pipeline_unknown_source_plugin_fails(self) -> None:
         state = _empty_state()

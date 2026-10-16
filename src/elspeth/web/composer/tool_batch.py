@@ -66,6 +66,7 @@ from elspeth.web.composer.audit import (
     rebind_dispatch_arguments,
 )
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
+from elspeth.web.composer.batch_dependencies import Resource, has_unavailable_prerequisite, promised_resources, unavailable_resources
 from elspeth.web.composer.bounded_json import (
     JsonBoundaryError,
     _validate_decoded_json,
@@ -162,7 +163,7 @@ from elspeth.web.composer.tools import (
     is_session_aware_tool,
     normalize_tool_result_validation,
 )
-from elspeth.web.composer.tools._common import _failure_result
+from elspeth.web.composer.tools._common import _candidate_rejection_result, _saved_graph_rejection_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
@@ -1054,6 +1055,8 @@ async def run_tool_batch(
     private_authorings_by_call: dict[str, PrivateToolAuthoring] = {}
     proposals_this_turn = 0
     mutation_success_observed = False
+    refused_resources: set[Resource] = set()
+    promises_by_call: dict[str, frozenset[Resource]] = {}
     from elspeth.web.composer.redaction import MANIFEST, redact_tool_call_arguments
 
     for tool_call in assistant_tool_calls:
@@ -1068,6 +1071,7 @@ async def run_tool_batch(
                 raise _ToolBatchCancellationRequested
             break
         tool_name = tool_call.function.name
+        promises_by_call[tool_call.id] = frozenset()
         pre_version = state.version
         private_arguments_canonical = private_authority_canonical = None
         private_raw_arguments = tool_call.function.arguments
@@ -1109,7 +1113,10 @@ async def run_tool_batch(
             _tool_call: Any = tool_call,
             _pre_version: int = pre_version,
             _wire: _CallWireFacts = call_wire_facts,
+            _state: CompositionState = state,
         ) -> None:
+            if error_class is not None or (isinstance(response, ToolResult) and not response.success):
+                refused_resources.update(unavailable_resources(promises_by_call[_tool_call.id], _state))
             _tool_outcomes.append(
                 _ToolOutcome(
                     call=_tool_call,
@@ -1370,6 +1377,7 @@ async def run_tool_batch(
         else:
             audit_arguments = arguments
         decoded_args_by_call_id[tool_call.id] = audit_arguments
+        promises_by_call[tool_call.id] = promised_resources(tool_name, arguments)
 
         # Open the audit envelope ONCE per dispatch — the cache,
         # required-paths, ToolArgumentError, plugin-crash, and
@@ -1423,6 +1431,34 @@ async def run_tool_batch(
                     "content": json.dumps(error_payload),
                 }
             )
+            all_cache_hits = False
+            continue
+
+        # A refused producer cannot supply a new prerequisite to another call
+        # authored in this same response. Existing saved resources remain usable.
+        if is_mutation_tool(tool_name) and has_unavailable_prerequisite(tool_name, arguments, refused_resources, state):
+            reject = _candidate_rejection_result if tool_name == "set_pipeline" else _saved_graph_rejection_result
+            blocked = reject(
+                state,
+                "This mutation depends on a new resource or connection from an earlier refused call in this batch. "
+                "Nothing from this call was applied. Inspect the saved pipeline and repair the refused prerequisite "
+                "in a new turn before retrying this dependent change.",
+                error_code="batch_dependency_refused",
+                rejected_component=None,
+            )
+            blocked = finalize_tool_result(
+                blocked,
+                tool_name=tool_name,
+                catalog=ctx.policy_catalog,
+                context=ToolContext(catalog=ctx.policy_catalog, plugin_snapshot=ctx.plugin_snapshot),
+                prior_validation=last_validation or ctx.policy_catalog.validate_composition_state(state).validation,
+            )
+            recorder.record(finish_success(audit, result_payload=blocked.to_dict(), version_after=state.version))
+            _append_tool_outcome(response=blocked, error_class=None, error_category=None, error_message=None, post_version=state.version)
+            anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            llm_messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": _serialize_tool_result(blocked)})
+            await emit_progress(progress, tool_completed_progress_event(tool_name, False))
+            turn_has_mutation = True
             all_cache_hits = False
             continue
 
@@ -1797,10 +1833,11 @@ async def run_tool_batch(
                             if custody_outcome == "quota_exceeded":
                                 proposal_acceptable = False
                                 finalized_candidate_result = finalize_tool_result(
-                                    _failure_result(
+                                    _candidate_rejection_result(
                                         state,
                                         "Session blob quota exceeded while reserving inline proposal custody.",
                                         error_code="BLOB_QUOTA_EXCEEDED",
+                                        rejected_component="source",
                                     ),
                                     tool_name=tool_name,
                                     catalog=ctx.policy_catalog,

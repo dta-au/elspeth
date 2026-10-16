@@ -29,6 +29,7 @@ from elspeth.web.composer.skills import load_deployment_skill, load_skill_with_h
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
     project_planner_context_interpretation_requirement,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -260,9 +261,13 @@ def build_catalog_context_string(
 # resolver-owned requirement admission, ``_RUNTIME_OWNED_LLM_OPTION_KEYS``),
 # so echoing them in a planner-visible state projection hands the model a
 # payload its own tools refuse (elspeth-c67fbbbd83, session 2e0c8ea3 seq 19).
-# ``interpretation_requirements`` is excluded here because it is REDUCED, not
-# dropped — resolved/pending review state must stay legible to the planner.
-_SERVER_OWNED_DROPPED_OPTION_KEYS: Final[frozenset[str]] = _PROFILE_LOWERING_METADATA_OPTION_KEYS - {INTERPRETATION_REQUIREMENTS_KEY}
+# Review rows are REDUCED, not dropped. Prompt parts are public authoring
+# structure: engine lowering strips them, but the planner needs their exact
+# text and interpretation references to edit without reconstructing a prompt.
+_SERVER_OWNED_DROPPED_OPTION_KEYS: Final[frozenset[str]] = _PROFILE_LOWERING_METADATA_OPTION_KEYS - {
+    INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
+}
 
 
 @observation_boundary(
@@ -306,13 +311,13 @@ def project_server_owned_option_metadata(serialized: dict[str, Any]) -> dict[str
 
     Applied between ``CompositionState.to_dict()`` and any planner-facing
     surface (the per-turn state context message here; ``plan_pipeline``'s
-    ``provider_current_state`` in ``service.py``) so a read-modify-write over
+    ``provider_current_state`` in ``planning_application.py``) so a read-modify-write over
     what the planner sees is round-trippable into ``set_pipeline``. Drops
-    ``source_authoring``, ``prompt_template_parts`` and
-    ``approved_prompt_artifact_hash`` from every source/node/output options
-    block, and reduces each ``interpretation_requirements`` row to the
-    planner-context projection (id/kind/user_term/draft/status) — resolved
-    vs pending stays legible without echoing resolver-owned linkage. Never
+    ``source_authoring`` and ``approved_prompt_artifact_hash`` from every
+    source/node/output options block. Public ``prompt_template_parts`` remain
+    exact. Requirement rows retain identity and status without resolver linkage;
+    a resolved row's original draft is explicitly ``historical_draft``. The
+    compiled ``prompt_template`` retains the current accepted wording. Never
     strip inside ``to_dict()`` itself: that serialization feeds
     ``composition_content_hash`` (pinned literals in
     ``test_state_serialisation_contract.py``).

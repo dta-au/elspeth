@@ -144,6 +144,9 @@ def test_real_count_rejection_reaches_planner_with_mode_choice_guidance() -> Non
 
     context = _trained_context()
     state = _empty_state()
+    before = state.to_dict()
+    standing = context.catalog.validate_composition_state(state).validation
+    assert standing.errors
     result = execute_tool(
         "upsert_node",
         {
@@ -162,10 +165,21 @@ def test_real_count_rejection_reaches_planner_with_mode_choice_guidance() -> Non
     )
     assert not result.success
     assert result.updated_state is state
-    (entry,) = result.validation.errors
-    assert entry.error_code == "aggregation_expected_output_count_mode_invalid"
+    assert state.to_dict() == before and result.updated_state.version == state.version
+    assert result.affected_nodes == () and result.data is None
+    entry, *saved_errors = result.validation.errors
+    code = "aggregation_expected_output_count_mode_invalid"
+    assert (entry.component, entry.error_code, entry.rejected_component) == ("rejected_mutation", code, "node:batch")
+    assert tuple(saved_errors) == standing.errors
+    assert result.validation.warnings == standing.warnings
+    assert result.validation.suggestions == standing.suggestions
+    assert result.validation.edge_contracts == standing.edge_contracts
+    assert result.validation.semantic_contracts == standing.semantic_contracts
     (reported,) = _allowlisted_candidate_feedback(result)["validation"]["errors"]
-    assert "suggested_fix" in reported
+    assert (reported["error_code"], reported["component"]) == (code, "node:batch")
+    guidance = generation._VALIDATION_GUIDANCE_BY_CODE[code]
+    assert isinstance(guidance, generation.DirectValidationGuidance)
+    assert (reported["explanation"], reported["suggested_fix"]) == (guidance.explanation, guidance.suggested_fix)
     assert "omit expected_output_count" in reported["suggested_fix"]
     assert "output_mode='transform'" in reported["suggested_fix"]
     assert "different row semantics" in reported["suggested_fix"]
@@ -247,6 +261,19 @@ def test_direct_exact_and_noisy_lookup_and_help_derive_from_records() -> None:
         help_result = execute_tool("explain_validation_error", {"error_text": "ZZZ_UNRECOGNIZED_QQQ"}, _empty_state(), _mock_catalog())
         assert record.code in help_result.data["suggested_fix"]
         assert "known_codes" not in help_result.data
+
+
+@pytest.mark.parametrize("noisy", ["LOG BLOB_QUOTA_EXCEEDED END", "log blob_quota_exceeded end", "Log Blob_Quota_Exceeded End"])
+def test_noisy_uppercase_canonical_code_retains_its_owned_guidance(noisy: str) -> None:
+    code = "BLOB_QUOTA_EXCEEDED"
+    expected = generation.explain_validation_code(code)
+    assert expected is not None
+    exact = execute_tool("explain_validation_error", {"error_text": code}, _empty_state(), _mock_catalog())
+    assert (exact.data["explanation"], exact.data["suggested_fix"]) == expected
+    result = execute_tool("explain_validation_error", {"error_text": noisy}, _empty_state(), _mock_catalog())
+    assert "error_code" in result.data
+    assert result.data["error_code"] == code
+    assert (result.data["explanation"], result.data["suggested_fix"]) == expected
 
 
 def test_public_prose_retains_first_match_and_expected_hint() -> None:

@@ -26,6 +26,8 @@ from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_SHIELD_USER_TERM, SOURCE_AUTHORING_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from tests.unit.web.composer import test_set_source_from_blobs as plural_blob_tests
+from tests.unit.web.composer.test_set_source_from_blobs import _create_ready_blob
 from tests.unit.web.composer.test_tools import (
     _AWS_S3_ENDPOINT_SENTINEL,
     _STUB_SHA256,
@@ -48,6 +50,8 @@ from tests.unit.web.composer.test_tools import (
     execute_tool,
 )
 
+harness = plural_blob_tests.harness
+
 
 class TestAwsS3EndpointUrlComposerPolicy:
     def test_aws_s3_set_source_rejects_endpoint_url_without_mutating_state(self) -> None:
@@ -65,7 +69,7 @@ class TestAwsS3EndpointUrlComposerPolicy:
             _mock_catalog(),
         )
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        _assert_aws_s3_endpoint_url_rejected(result, state, rejected_component="source", rejection_operation="saved_graph")
 
     def test_aws_s3_patch_source_options_rejects_endpoint_url_without_mutating_state(self) -> None:
         state = _aws_s3_source_state()
@@ -77,7 +81,7 @@ class TestAwsS3EndpointUrlComposerPolicy:
             _mock_catalog(),
         )
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        _assert_aws_s3_endpoint_url_rejected(result, state, rejected_component="source", rejection_operation="saved_graph")
 
     def test_aws_s3_set_output_rejects_endpoint_url_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -94,7 +98,13 @@ class TestAwsS3EndpointUrlComposerPolicy:
             _mock_catalog(),
         )
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        assert not result.success
+        assert result.updated_state is state and result.updated_state.version == state.version
+        assert result.data is None
+        entry = result.validation.errors[0]
+        assert (entry.error_code, entry.rejected_component) == ("aws_s3_endpoint_url_not_allowed", "output:main")
+        assert "endpoint_url" in entry.message
+        assert _AWS_S3_ENDPOINT_SENTINEL not in repr(result.validation)
 
     def test_aws_s3_patch_output_options_rejects_endpoint_url_without_mutating_state(self) -> None:
         state = _aws_s3_output_state()
@@ -106,7 +116,13 @@ class TestAwsS3EndpointUrlComposerPolicy:
             _mock_catalog(),
         )
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        assert not result.success
+        assert result.updated_state is state and result.updated_state.version == state.version
+        assert result.data is None
+        entry = result.validation.errors[0]
+        assert (entry.error_code, entry.rejected_component) == ("aws_s3_endpoint_url_not_allowed", "output:main")
+        assert "endpoint_url" in entry.message
+        assert _AWS_S3_ENDPOINT_SENTINEL not in repr(result.validation)
 
     def test_aws_s3_set_pipeline_named_source_rejects_endpoint_url_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -164,7 +180,7 @@ class TestAwsS3EndpointUrlComposerPolicy:
                 _mock_catalog(),
             )
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        _assert_aws_s3_endpoint_url_rejected(result, state, rejected_component="source", rejection_operation="saved_graph")
         mock_resolve.assert_not_called()
 
     def test_aws_s3_set_source_from_blob_rejects_resolved_endpoint_url_without_mutating_state(self) -> None:
@@ -191,7 +207,7 @@ class TestAwsS3EndpointUrlComposerPolicy:
                 _trained_tool_context(),
             )
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        _assert_aws_s3_endpoint_url_rejected(result, state, rejected_component="source", rejection_operation="saved_graph")
 
     @pytest.mark.parametrize(
         ("target", "target_id", "state_factory"),
@@ -423,22 +439,12 @@ class TestAwsS3SourceComposerPolicy:
         assert result.updated_state is state
         assert "attacker-bucket" not in repr(result.data)
 
-    def test_set_source_from_blob_rejects_aws_s3_for_web_authored_session_without_mutating_state(self) -> None:
-        from elspeth.web.composer.tools.sources import _execute_set_source_from_blob, _ResolvedSourceBlob
+    def test_set_source_from_blob_rejects_aws_s3_for_web_authored_session_without_mutating_state(self, harness) -> None:
+        from elspeth.web.composer.tools.sources import _execute_set_source_from_blob
 
         state = _empty_state()
-        resolved = _ResolvedSourceBlob(
-            plugin="aws_s3",
-            options=dict(_VALID_AWS_S3_OPTIONS),
-            payload={
-                "blob_id": str(uuid4()),
-                "filename": "input.jsonl",
-                "mime_type": "application/jsonl",
-                "size_bytes": 1,
-                "content_hash": _STUB_SHA256,
-            },
-            creation_modality=CreationModality.VERBATIM,
-        )
+        engine, _, session_id = harness
+        blob_id = _create_ready_blob(harness, content=b'{"a":1}\n', filename="input.jsonl", mime_type="application/jsonl")
         catalog = _mock_catalog()
         view, snapshot = _restricted_policy_pair(
             catalog,
@@ -446,12 +452,17 @@ class TestAwsS3SourceComposerPolicy:
             PluginUnavailableReason.PROFILE_UNAVAILABLE,
         )
 
-        with patch("elspeth.web.composer.tools.sources._resolve_source_blob", return_value=resolved):
-            result = _execute_set_source_from_blob(
-                {"blob_id": str(uuid4()), "on_success": "main", "on_validation_failure": "discard", "options": {}},
-                state,
-                ToolContext(catalog=view, plugin_snapshot=snapshot),
-            )
+        result = _execute_set_source_from_blob(
+            {
+                "blob_id": blob_id,
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "on_validation_failure": "discard",
+                "options": dict(_VALID_AWS_S3_OPTIONS),
+            },
+            state,
+            ToolContext(catalog=view, plugin_snapshot=snapshot, session_engine=engine, session_id=session_id),
+        )
 
         assert result.success is False
         assert result.updated_state is state
@@ -460,33 +471,30 @@ class TestAwsS3SourceComposerPolicy:
         assert "operator profile" in result.validation.errors[0].message
         assert result.validation.errors[0].error_code == "profile_unavailable"
 
-    def test_set_source_from_blob_allows_aws_s3_for_trained_operator_session(self) -> None:
-        """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
-        from elspeth.web.composer.tools.sources import _execute_set_source_from_blob, _ResolvedSourceBlob
+    def test_set_source_from_blob_trained_operator_still_requires_supported_source_options(self, harness) -> None:
+        """Policy admission does not make a local blob an AWS object binding."""
+        from elspeth.web.composer.tools.sources import _execute_set_source_from_blob
 
         state = _empty_state()
-        resolved = _ResolvedSourceBlob(
-            plugin="aws_s3",
-            options=dict(_VALID_AWS_S3_OPTIONS),
-            payload={
-                "blob_id": str(uuid4()),
-                "filename": "input.jsonl",
-                "mime_type": "application/jsonl",
-                "size_bytes": 1,
-                "content_hash": _STUB_SHA256,
+        engine, _, session_id = harness
+        blob_id = _create_ready_blob(harness, content=b'{"a":1}\n', filename="input.jsonl", mime_type="application/jsonl")
+
+        result = _execute_set_source_from_blob(
+            {
+                "blob_id": blob_id,
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "on_validation_failure": "discard",
+                "options": dict(_VALID_AWS_S3_OPTIONS),
             },
-            creation_modality=CreationModality.VERBATIM,
+            state,
+            _trained_tool_context(session_engine=engine, session_id=session_id),
         )
 
-        with patch("elspeth.web.composer.tools.sources._resolve_source_blob", return_value=resolved):
-            result = _execute_set_source_from_blob(
-                {"blob_id": str(uuid4()), "on_success": "main", "on_validation_failure": "discard", "options": {}},
-                state,
-                _trained_tool_context(),
-            )
-
-        assert result.success is True
-        assert result.updated_state.sources["source"].plugin == "aws_s3"
+        assert not result.success and result.updated_state is state
+        assert result.validation.errors[0].error_code == "plugin_options_invalid"
+        assert result.validation.errors[0].plugin_identity == ("source", "aws_s3")
+        assert "path" in result.validation.errors[0].message
 
     def test_snapshot_prohibited_source_selection_explains_the_generic_policy(self) -> None:
         """A snapshot-declared prohibition must name the policy, not a code.

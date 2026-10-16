@@ -1674,7 +1674,7 @@ describe("App shared-route Layout suppression (Phase 6B Task 8)", () => {
   });
 
   it("renders SharedInspectView and does NOT mount the composer Layout for #/shared/{token}", async () => {
-    // Set the hash BEFORE render — App reads it via useSharedToken on first
+    // Set the hash BEFORE render — App reads it via useSharedRoute on first
     // render. Setting after render would defeat the short-circuit branch
     // this test exists to pin.
     window.history.replaceState(null, "", "#/shared/tok-abc");
@@ -1698,6 +1698,28 @@ describe("App shared-route Layout suppression (Phase 6B Task 8)", () => {
     // layout-stub testid is one indirection away from the actual chrome.
     expect(screen.queryByTestId("chat-panel-stub")).toBeNull();
   });
+
+  it.each(["#/shared", "#/shared/", "#/shared/abc%ZZ"])(
+    "refuses malformed share route %s without displaying the recipient's workspace",
+    async (hash) => {
+      useSessionStore.setState({
+        activeSessionId: "22222222-2222-4222-8222-222222222222",
+        compositionStateLoaded: true,
+        compositionState: {
+          ...makeState(1),
+          metadata: { name: "Bob private graph", description: "" },
+        },
+      });
+      window.history.replaceState(null, "", hash);
+      render(<App />);
+      expect(await screen.findByTestId("shared-inspect-error")).toHaveTextContent(
+        "This share link is malformed",
+      );
+      expect(screen.queryByTestId("composer-workspace-stub")).toBeNull();
+      expect(screen.queryByTestId("chat-panel-stub")).toBeNull();
+      expect(window.location.hash).toBe(hash);
+    },
+  );
 
   it("renders the composer Layout when the hash is NOT a shared route", async () => {
     // Counterpoint: with no hash, the regular composer flow runs. This

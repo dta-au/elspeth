@@ -62,6 +62,7 @@ from elspeth.web.async_workers import (
     AsyncWorkerAdmissionTimeoutError,
     configure_required_executor_recovery,
     required_generation_unavailable,
+    run_sync_in_worker,
 )
 from elspeth.web.audit_readiness.routes import create_audit_readiness_router
 from elspeth.web.audit_readiness.service import ReadinessService, build_boot_plugin_policy_readiness
@@ -118,6 +119,7 @@ from elspeth.web.coordination.membership_lifecycle import (
     SingleProcessWebInstanceMembership,
     WebInstanceMembership,
 )
+from elspeth.web.coordination.quota_authority import ContainerQuotaPolicyRow
 from elspeth.web.coordination.quota_policy_authority import RepositoryQuotaPolicyAuthority
 from elspeth.web.coordination.rate_limit_authority import RepositoryRateLimitAuthority
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
@@ -635,6 +637,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.process_watchdog.assert_watching()
         app.state.process_recovery.start_monitor()
         app.state.auth_audit_recorder.start()
+        await _initialize_container_token_policy(app)
         async with _service_lifespan(app):
             serving_started = True
             yield
@@ -675,6 +678,46 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await app.state.process_recovery.join_escalation()
             await app.state.process_watchdog.complete(ProcessCompletionWitness(app.state.process_watchdog.target))
             await app.state.process_recovery.join_monitor_after_completion()
+
+
+async def _initialize_container_token_policy(app: FastAPI) -> None:
+    """Join startup provisioning before its database owners can be finalized."""
+
+    def record(policy: ContainerQuotaPolicyRow) -> None:
+        app.state.auth_audit_recorder.record_container_quota_set(provider=app.state.settings.auth_provider, policy=policy)
+
+    # Landscape is already open. Keep the exact worker Task owned even if the
+    # lifespan is cancelled during SQL lock acquisition or the audit callback.
+    work = run_sync_in_worker(
+        app.state.quota_policy_authority.ensure_container_token_policy,
+        tokens_per_day=app.state.settings.quota_container_tokens_per_day,
+        record=record,
+    )
+    try:
+        task = asyncio.create_task(work, name="container-token-policy-startup")
+    except BaseException:
+        work.close()
+        raise
+    failures: list[BaseException] = []
+    while not task.done():
+        try:
+            await asyncio.wait({task}, timeout=0.1)
+        except asyncio.CancelledError as cancellation:
+            failures.append(cancellation)
+            try:
+                # Arm independent supervision while retaining the worker; the
+                # watchdog still enforces the process recovery deadline.
+                app.state.process_recovery.request_startup_failure()
+            except BaseException as failure:
+                failures.append(failure)
+    try:
+        task.result()
+    except BaseException as failure:
+        failures.append(failure)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup("Container token policy startup failed", failures)
 
 
 async def _join_cancelled_orphan_task(task: asyncio.Task[None]) -> list[BaseException]:

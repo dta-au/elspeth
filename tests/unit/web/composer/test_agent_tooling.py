@@ -10,6 +10,7 @@ B5: Pipeline diff/change summary tool
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.discovery_response import admit_discovery_result
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import (
@@ -35,6 +37,7 @@ from elspeth.web.composer.tools import (
     _ALLOWED_BLOB_MIME_TYPES,
     ToolResult,
     diff_states,
+    generation,
 )
 from elspeth.web.composer.tools import (
     execute_tool as _execute_tool,
@@ -46,6 +49,8 @@ from elspeth.web.sessions.models import blobs_table, chat_messages_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import fenced_operation_context
+from tests.unit.web.composer.test_output_rejection_contracts import _context, _saved_state
+from tests.unit.web.composer.test_tools_discovery import _assert_discovery_refusal, _invoke_discovery
 
 EXPECTED_REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
 
@@ -723,6 +728,47 @@ class TestDiffStates:
 
 
 class TestDiffPipelineTool:
+    @pytest.mark.parametrize("surface", ["handler", "dispatch", "readonly"])
+    def test_missing_baseline_retains_exact_saved_discovery_findings(self, surface: str) -> None:
+        state, context = _saved_state(), _context()
+        before = state.to_dict()
+        result = _invoke_discovery(surface, "diff_pipeline", {}, state, context)
+        _assert_discovery_refusal(result, state, context, surface, "diff_pipeline", "diff_baseline_unavailable")
+        assert state.to_dict() == before
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch", "readonly"])
+    def test_successful_diff_uses_actual_baseline_and_current_validation_custody(
+        self, monkeypatch: pytest.MonkeyPatch, surface: str
+    ) -> None:
+        baseline = _saved_state()
+        current = baseline.with_metadata({"description": "Only the current composition changes"})
+        context = _context(baseline=baseline)
+        current_validation = context.catalog.validate_composition_state(current).validation
+        context = replace(context, current_validation=current_validation)
+        expected = diff_states(
+            baseline,
+            current,
+            baseline_validation=context.catalog.validate_composition_state(baseline).validation,
+            current_validation=current_validation,
+        )
+        original, observed = generation.diff_states, []
+
+        def compare(previous, saved, **kwargs):
+            assert previous is baseline and saved is current
+            assert kwargs["current_validation"] is current_validation
+            assert kwargs["baseline_validation"] == context.catalog.validate_composition_state(baseline).validation
+            observed.append((previous, saved))
+            return original(previous, saved, **kwargs)
+
+        monkeypatch.setattr(generation, "diff_states", compare)
+        result = _invoke_discovery(surface, "diff_pipeline", {}, current, context)
+        assert observed == [(baseline, current)] and result.success and result.updated_state is current
+        payload = admit_discovery_result("diff_pipeline", result).response.to_wire()
+        assert payload == expected and payload["from_version"] == baseline.version
+        assert result.to_dict()["version"] == current.version and "to_version" not in payload
+        assert payload["metadata_changed"] is True and payload["total_changes"] == 1
+        assert result.prior_validation is None and result.affected_nodes == ()
+
     def test_fails_closed_without_baseline(self) -> None:
         """A missing baseline is a failure with a closed code, not a success carrying ``error`` (D5, elspeth-e405ad7cd2)."""
         state = _empty_state()

@@ -28,7 +28,6 @@ from elspeth.contracts.value_source import get_catalog_values
 from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionParser
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import (
-    PluginNotFoundError,
     get_shared_plugin_manager,
     http_fetch_transform_names,
 )
@@ -85,11 +84,11 @@ from elspeth.web.composer.tools._common import (
     ToolContext,
     ToolResult,
     _discovery_result,
-    _failure_result,
-    _plugin_policy_failure,
+    _plugin_selection_violation,
+    _saved_graph_plugin_policy_failure,
+    _saved_graph_rejection_result,
     _source_options_for_prevalidation,
     _validate_mutation_arguments,
-    _validate_plugin_name,
     diff_states,
 )
 from elspeth.web.composer.tools._generation_responses import (
@@ -312,16 +311,11 @@ def _handle_get_plugin_schema(
     validated = _validate_mutation_arguments(GetPluginSchemaArgumentsModel, arguments, "get_plugin_schema arguments")
     plugin_type = validated.plugin_type
     name = validated.name
-    policy_error = _validate_plugin_name(context, plugin_type, name)
+    policy_error = _plugin_selection_violation(context, plugin_type, name)
     if policy_error is not None:
-        return _plugin_policy_failure(state, policy_error)
-    try:
-        schema = context.catalog.get_schema(plugin_type, name)
-        return _discovery_result(state, schema)
-    except (ValueError, KeyError) as exc:
-        # ValueError: catalog contract for "unknown plugin/type"
-        # KeyError: LLM omitted required argument (Tier 3)
-        return _failure_result(state, str(exc))
+        return _saved_graph_plugin_policy_failure(state, policy_error, component=None, rejected_component=None)
+    schema = context.catalog.get_schema(plugin_type, name)
+    return _discovery_result(state, schema)
 
 
 _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
@@ -1561,6 +1555,21 @@ def _direct_plugin_policy_guidance() -> tuple[DirectValidationGuidance, ...]:
 
 _DIRECT_VALIDATION_GUIDANCE: Final = (
     DirectValidationGuidance(
+        "edge_not_found",
+        "The requested edge is not present in the saved composition. No removal was applied.",
+        "Inspect the current edges and retry the intended exact edge ID. Preserve unrelated nodes, routes and edges; do not remove a different edge to silence this refusal.",
+    ),
+    DirectValidationGuidance(
+        "edge_not_lowerable",
+        "The proposed producer kind, edge type and destination kind do not express a supported runtime route.",
+        "Inspect the producer, destination and route kind, then choose the supported route that preserves the intended pipeline behavior. Edges between processing nodes are advisory; they do not replace scalar input or output connections. Preserve intentional gate and coalesce policies.",
+    ),
+    DirectValidationGuidance(
+        "edge_route_conflict",
+        "Another edge already expresses the same sink-routing slot. The new competing edge was not applied.",
+        "Inspect the current routing edges and update the existing intended slot edge instead of adding a competing edge ID. Preserve unrelated edges and the user's route choices; different fork destinations may occupy distinct slots.",
+    ),
+    DirectValidationGuidance(
         "edge_field_type_incompatible",
         "A consumer's required or optional field type cannot be satisfied by the producer's declared type. An int satisfies float, and an LLM number binds float; other types do not widen automatically.",
         "Match the actual producer type or convert upstream on a field every arriving row carries. A type_coerce input declares the old arriving type; its conversion determines the output type consumed downstream. A declaration alone does not convert a value.",
@@ -1616,6 +1625,36 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "Remove the named keys from the gate's options. Express the routing decision in the gate's condition and "
         "routes (plus fork_to and on_error where needed), not in options.",
     ),
+    DirectValidationGuidance(
+        "node_not_found",
+        "The requested saved node is not present in this composition.",
+        "Inspect the current pipeline and select the intended existing node ID. If a new node is intended, author it explicitly with upsert_node before referring to it.",
+    ),
+    DirectValidationGuidance(
+        "node_routing_patch_invalid",
+        "The options patch contains node routing fields, which are not plugin options.",
+        "Use upsert_node to edit input, on_success, on_error, routes or fork_to while retaining the intended node options. Preserve the user's failure choice; gates use on_error only for their supported error route.",
+    ),
+    DirectValidationGuidance(
+        "splice_ids_not_distinct",
+        "A splice needs distinct predecessor, successor and inserted-node IDs.",
+        "Inspect the intended path and name its existing predecessor and successor separately. Choose a distinct inserted-node ID without replacing either endpoint.",
+    ),
+    DirectValidationGuidance(
+        "splice_topology_unsupported",
+        "The requested splice is not an unambiguous direct source-or-transform to transform path, or its replay topology is not canonical.",
+        "Inspect the current nodes, scalar routes and visual edges. Select an existing direct linear path supported by splice_transform, preserving intentional branches and error routes; do not delete unrelated graph objects to force a splice.",
+    ),
+    DirectValidationGuidance(
+        "splice_replay_conflict",
+        "The inserted-node ID already names a different splice definition. Only an identical splice can be replayed without advancing the version.",
+        "Inspect the existing inserted node and retry its identical definition if replay is intended. For a different transform, choose an intentional distinct ID and path; do not overwrite the existing splice implicitly.",
+    ),
+    DirectValidationGuidance(
+        "splice_derivation_conflict",
+        "The splice cannot derive a bounded nonconflicting connection or visual edge identifier for the proposed inserted node.",
+        "Inspect the existing graph and choose an intentional nonconflicting inserted-node ID, then retry the same intended path. Preserve existing nodes, connections and edges.",
+    ),
     # Leading entry of a splice_transform rejection; the planner's redacted
     # repair feedback resolves it by code like every other entry.
     DirectValidationGuidance(
@@ -1626,6 +1665,13 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "Repair the inserted node's options against the entries that follow (for a schema_contract_violation, remove "
         "or satisfy the fields it names), or splice at a position whose producer supplies them, then retry "
         "splice_transform.",
+    ),
+    DirectValidationGuidance(
+        "batch_dependency_refused",
+        "This call needs a new component or connection that an earlier refused call in the same batch did not create. "
+        "The saved pipeline is unchanged by this dependent call; independent calls may still succeed.",
+        "Inspect the saved pipeline, repair the refused prerequisite in a new turn, then retry the dependent change. "
+        "Use splice_transform only for its supported direct-transform-edge topology.",
     ),
     # Prompt-role presence (session 60ab6a67): a composer-authored llm node
     # carries BOTH roles. Serves the state.py constants rather than a copy —
@@ -1690,6 +1736,145 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "contract instead. Ask the user to acknowledge the server-computed field promise. The server writes the stamp "
         "on acknowledgement. A rejected replacement is not the current saved graph: retain the requested "
         "input binding and evaluation transforms when repairing it.",
+    ),
+    DirectValidationGuidance(
+        "output_not_found",
+        "The requested output is not in the current saved graph. The requested change was not applied.",
+        "Inspect the current outputs and use the intended existing name. Create an output with set_output only "
+        "when that is the user's intended change; do not create or remove a different destination to silence this refusal.",
+    ),
+    DirectValidationGuidance(
+        "source_binding_ambiguous",
+        "The candidate supplies competing source bindings. No replacement was applied.",
+        "Keep the intended input and supply exactly one source or named sources map. For a blob-backed source, choose "
+        "either an existing blob_id or new inline_blob content, never both.",
+    ),
+    DirectValidationGuidance(
+        "source_binding_locked",
+        "The requested option patch would change a server-owned source blob binding. The saved source was retained.",
+        "Rebind the intended artifact through set_source_from_blob or set_source_from_blobs as appropriate. "
+        "Preserve its content and review provenance; do not clear the source merely to silence this refusal.",
+    ),
+    DirectValidationGuidance(
+        "source_not_found",
+        "The requested source is not in the current saved graph. The requested change was not applied.",
+        "Inspect the current named sources and select the intended existing name. Create or rebind a source only "
+        "when that is the user's intended operation; do not replace a different input to silence this refusal.",
+    ),
+    DirectValidationGuidance(
+        "source_path_policy_invalid",
+        "The source path is outside this session's permitted input locations. The candidate was not applied.",
+        "Keep the intended input artifact and use its canonical authenticated blob binding, or preserve an approved "
+        "existing source binding. Do not invent an absolute host directory or replace the input with empty data.",
+    ),
+    DirectValidationGuidance(
+        "sink_path_policy_invalid",
+        "The sink destination is outside this session's permitted output locations. The candidate was not applied.",
+        "Use a relative destination under outputs/ for the current session. Preserve the sink's purpose, output format "
+        "and explicit failure policy; do not guess a server filesystem root.",
+    ),
+    DirectValidationGuidance(
+        "provider_config_path_policy_invalid",
+        "A transform's local provider path is outside this session's permitted storage locations.",
+        "Use a session-local relative path under outputs/ for the provider's local store, or the supported authenticated "
+        "blob binding where applicable. Keep the transform's purpose and do not guess an absolute server directory.",
+    ),
+    DirectValidationGuidance(
+        "aws_s3_endpoint_url_not_allowed",
+        "The Web Composer does not permit an authored AWS S3 endpoint override.",
+        "Remove endpoint_url from the source or sink options and retain the intended authorized S3 location. Use the "
+        "deployment's served profile or supported AWS binding rather than supplying a replacement endpoint.",
+    ),
+    DirectValidationGuidance(
+        "llm_authored_inline_blob_content",
+        "LLM-authored blob content cannot replace the reviewable text or model selection of an LLM node.",
+        "Author the reviewable prompt text or served model/profile binding through its declared options and review "
+        "requirements. Use user-uploaded content only through a supported inline-reference surface; do not change blob provenance.",
+    ),
+    DirectValidationGuidance(
+        "llm_retry_budget_policy",
+        "A sequential multi-query LLM transform must use a bounded local capacity-retry budget allowed by Web policy.",
+        "Keep the intended queries and set max_capacity_retry_seconds to a positive value no greater than 30 seconds, "
+        "or use pool_size > 1 for pooled retry handling. Operator-profiled nodes use the profile's supplied retry configuration. Do not change "
+        "planner repair budgets or invent additional attempts to bypass this policy.",
+    ),
+    DirectValidationGuidance(
+        "source_binding_context_unavailable",
+        "The source binding requires session or storage context that this operation did not receive. No candidate was saved.",
+        "Retain the intended candidate and source artifact. Report the missing session/storage context and retry only "
+        "through a surface that supplies it; do not replace the source with invented empty data.",
+    ),
+    DirectValidationGuidance(
+        "inline_source_csv_inspection_failed",
+        "The inline CSV could not be inspected within the bounded CSV grammar and size limits. No uploaded-file conflict was established.",
+        "Keep the intended input content. Correct malformed CSV or use the supported uploaded-file binding for input "
+        "that exceeds inline inspection limits; do not silently truncate rows or assume that matching uploaded data exists.",
+    ),
+    DirectValidationGuidance(
+        "inline_source_comparison_incomplete",
+        "The ready uploaded CSV candidate scan exceeded its fixed limit, so the inline-source comparison did not finish.",
+        "Identify the intended input through list_blobs and bind its exact source.blob_id or use set_source_from_blob. "
+        "Keep the intended artifact; an incomplete comparison does not prove a matching upload or a content conflict.",
+    ),
+    DirectValidationGuidance(
+        "inline_source_content_conflict",
+        "The inline source contains only headers and a larger ready uploaded CSV has matching headers. Its data rows were not verified by this check.",
+        "Inspect the intended complete input artifact and bind its ready uploaded blob when appropriate, or re-supply "
+        "all intended literal rows. Do not replace the intended data with column names or infer verified rows from this header comparison.",
+    ),
+    DirectValidationGuidance(
+        "credential_literal_forbidden",
+        "Candidate options contain literal credential material. The literal values were not stored.",
+        "Discover an authorized secret reference and replace each named credential field with its inline secret_ref "
+        "marker in the rejected call. Do not echo credential values or rebuild unrelated pipeline components.",
+    ),
+    DirectValidationGuidance(
+        "BLOB_QUOTA_EXCEEDED",
+        "The inline source could not acquire blob storage within this session's quota. The replacement was not applied.",
+        "Retain the intended source data. Reuse an appropriate ready artifact or resolve the session storage limit before "
+        "retrying; do not silently drop rows to make the artifact smaller.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_identity_invalid",
+        "The source binding does not name a valid canonical blob identifier.",
+        "Use the exact blob_id returned by authenticated blob discovery for the intended source artifact; do not invent "
+        "or reconstruct an identifier from a filename or storage path.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_unavailable",
+        "The source artifact is missing, not ready, or has unavailable stored bytes.",
+        "Inspect the intended artifact's current readiness through authenticated blob discovery. Keep the requested "
+        "binding and resolve its availability before retrying; do not fabricate a replacement or assume an empty input.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_duplicate",
+        "The plural binding repeats a blob identity or canonical document content. No source replacement was applied.",
+        "Remove the duplicate entries while preserving every distinct intended input and its order. Use authenticated "
+        "blob discovery to select the intended artifacts; do not invent identities or change their content.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_review_required",
+        "The plural binding contains LLM-authored content whose interpretation review is not established by this flow.",
+        "Use a supported set_source_from_blob flow to stage the intended artifact's review where its content is "
+        "representable. Otherwise preserve the artifact and report the limitation; never relabel provenance or drop review.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_plugin_required",
+        "The artifact's MIME type does not determine a supported source plugin.",
+        "Choose an explicit source plugin from the served catalog whose input format matches the intended artifact, "
+        "then retry the same binding with that plugin and its declared options.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_changed",
+        "The artifact changed while its source binding was being checked. The attempted binding was not applied.",
+        "Re-read the intended artifact's current metadata and content evidence, then retry the binding against that "
+        "version. Do not keep a stale hash or change unrelated graph structure.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_encoding_invalid",
+        "The selected source artifact is not valid UTF-8 text for this binding.",
+        "Use an artifact with the source plugin's supported encoding and format, preserving the intended data. Do not "
+        "silently coerce bytes or discard undecodable content.",
     ),
     *_direct_plugin_policy_guidance(),
 )
@@ -1893,8 +2078,9 @@ _WITHHELD_VALIDATION_GUIDANCE: Final[tuple[str, str]] = (
     "Do not guess at the withheld configuration — you cannot see or edit it. Re-verify only the "
     "components you authored yourself: call get_plugin_schema(<plugin_type>, <plugin_name>) for "
     "the exact option shapes and allowed values, and change only fields the other errors name. "
-    "If this exact rejection set repeats, a near-identical candidate cannot succeed: restructure "
-    "the pipeline, or decline honestly.",
+    "If visible rejection classifiers repeat, compare the fields you changed: matching classifiers alone do not "
+    "prove the cause is unchanged or that repair is impossible. When necessary facts remain withheld, explain that "
+    "limitation and ask for the smallest actionable input rather than guessing.",
 )
 
 
@@ -1979,7 +2165,7 @@ def _execute_explain_validation_error(
     # an upper-cased code echoed from a log line.
     lowered = error_text.lower()
     for code in _CLOSED_VALIDATION_ERROR_CODES:
-        if code in lowered:
+        if code.lower() in lowered:
             guidance = explain_validation_code(code)
             if guidance is None:  # pragma: no cover — catalogue invariant is test-pinned
                 continue
@@ -2086,44 +2272,27 @@ def _execute_get_plugin_assistance(
     a "no assistance published" payload (summary=None, empty lists)
     rather than failing — the absence is itself a useful signal.
 
-    Unknown plugin name or invalid plugin_type surfaces here as a tool
-    failure with the original message so the agent can correct the call.
+    Unavailable selections return the policy owner's refusal. Invalid
+    arguments belong to the owned argument model; admitted catalog or
+    manager inconsistencies propagate through their fault owners.
     """
     validated = _validate_mutation_arguments(GetPluginAssistanceArgumentsModel, args, "get_plugin_assistance arguments")
-    plugin_type_raw = validated.plugin_type
+    plugin_type = validated.plugin_type
     plugin_name = validated.plugin_name
-    # ``args`` is LLM tool-call arguments (Tier 3). ``plugin_type``/``plugin_name``
-    # are required (json_schema ``required``) so direct subscript lets a KeyError
-    # surface an LLM contract violation; ``issue_code`` is optional (discovery vs
-    # failure mode), so its absence is recorded honestly as ``None`` via the
-    # membership form rather than a defensive ``.get``.
     issue_code = validated.issue_code
 
-    if plugin_type_raw not in ("source", "transform", "sink"):
-        return _failure_result(
-            state,
-            f"Unknown plugin_type: {plugin_type_raw!r}. Must be one of: 'source', 'transform', 'sink'.",
-        )
-    plugin_type: PluginKind = plugin_type_raw
-
-    policy_error = _validate_plugin_name(context, plugin_type, plugin_name)
+    policy_error = _plugin_selection_violation(context, plugin_type, plugin_name)
     if policy_error is not None:
-        return _plugin_policy_failure(state, policy_error)
-    try:
-        context.catalog.get_schema(plugin_type, plugin_name)
-    except (ValueError, KeyError) as exc:
-        return _failure_result(state, str(exc))
+        return _saved_graph_plugin_policy_failure(state, policy_error, component=None, rejected_component=None)
+    context.catalog.get_schema(plugin_type, plugin_name)
 
     manager = get_shared_plugin_manager()
-    try:
-        if plugin_type == "source":
-            plugin_cls: Any = manager.get_source_by_name(plugin_name)
-        elif plugin_type == "transform":
-            plugin_cls = manager.get_transform_by_name(plugin_name)
-        else:
-            plugin_cls = manager.get_sink_by_name(plugin_name)
-    except PluginNotFoundError as exc:
-        return _failure_result(state, str(exc))
+    if plugin_type == "source":
+        plugin_cls: Any = manager.get_source_by_name(plugin_name)
+    elif plugin_type == "transform":
+        plugin_cls = manager.get_transform_by_name(plugin_name)
+    else:
+        plugin_cls = manager.get_sink_by_name(plugin_name)
 
     assistance = plugin_cls.get_agent_assistance(issue_code=issue_code)
     if assistance is not None:
@@ -4348,10 +4517,11 @@ def _execute_diff_pipeline(
         # A failure, not a success carrying an ``error`` key: ``error`` is a
         # failure-only key on every surface (elspeth-e405ad7cd2 D5). The
         # current version already rides the envelope's ``version``.
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             "No baseline available. Load or create a session first.",
             error_code="diff_baseline_unavailable",
+            rejected_component=None,
         )
 
     baseline_validation = context.catalog.validate_composition_state(baseline).validation

@@ -26,14 +26,14 @@ from elspeth.web.composer.tools._common import (
     ToolResult,
     _apply_merge_patch,
     _attach_post_call_hints,
-    _credential_wiring_contract_failure,
-    _failure_result,
     _mutation_result,
-    _plugin_policy_failure,
+    _plugin_selection_violation,
     _post_mutation_invariant_error,
     _prevalidate_sink,
+    _saved_graph_credential_wiring_contract_failure,
+    _saved_graph_plugin_policy_failure,
+    _saved_graph_rejection_result,
     _validate_mutation_arguments,
-    _validate_plugin_name,
     _validate_sink_path,
     resolve_failure_route_choice,
     validate_composer_file_sink_collision_policy,
@@ -150,19 +150,25 @@ def _execute_set_output(
             previous=existing.on_write_failure if existing is not None else None,
         )
     except FailureRouteChoiceError as exc:
-        return _failure_result(state, str(exc), error_code="failure_route_required", rejected_component=f"output:{validated.sink_name}")
+        return _saved_graph_rejection_result(
+            state, str(exc), error_code="failure_route_required", rejected_component=f"output:{validated.sink_name}"
+        )
     plugin = validated.plugin
     sink_options = validated.options
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(plugin, sink_options)
     if endpoint_policy_error is not None:
-        return _failure_result(state, endpoint_policy_error)
-    # Validate plugin exists in catalog
-    plugin_error = _validate_plugin_name(context, "sink", plugin)
+        return _saved_graph_rejection_result(
+            state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=f"output:{validated.sink_name}"
+        )
+    plugin_error = _plugin_selection_violation(context, "sink", plugin)
     if plugin_error is not None:
-        return _plugin_policy_failure(state, plugin_error)
+        return _saved_graph_plugin_policy_failure(
+            state, plugin_error, component=f"output:{validated.sink_name}", rejected_component=f"output:{validated.sink_name}"
+        )
+    context.catalog.get_schema("sink", plugin)
 
     # S2: Validate sink path allowlist (mirrors source path check)
-    credential_error = _credential_wiring_contract_failure(
+    credential_error = _saved_graph_credential_wiring_contract_failure(
         state,
         component_id=validated.sink_name,
         component_type="output",
@@ -174,15 +180,22 @@ def _execute_set_output(
         return credential_error
     path_error = _validate_sink_path(sink_options, context.data_dir, session_id=context.session_id)
     if path_error is not None:
-        return _failure_result(state, path_error)
+        return _saved_graph_rejection_result(
+            state,
+            "Output path options (path, file or persist_directory) must use this session's permitted destinations. "
+            "Use an authorized session-local output path.",
+            error_code="sink_path_policy_invalid",
+            rejected_component=f"output:{validated.sink_name}",
+        )
 
     prevalidation_error = _prevalidate_sink(plugin, sink_options)
     if prevalidation_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             prevalidation_error,
             error_code="plugin_options_invalid",
             plugin_identity=("sink", plugin),
+            rejected_component=f"output:{validated.sink_name}",
         )
     collision_error = validate_composer_file_sink_collision_policy(
         plugin,
@@ -190,7 +203,9 @@ def _execute_set_output(
         require_explicit=context.data_dir is not None,
     )
     if collision_error is not None:
-        return _failure_result(state, collision_error)
+        return _saved_graph_rejection_result(
+            state, collision_error, error_code="file_sink_write_policy_invalid", rejected_component=f"output:{validated.sink_name}"
+        )
 
     output = OutputSpec(
         name=validated.sink_name,
@@ -203,7 +218,7 @@ def _execute_set_output(
     invariant_error = _post_mutation_invariant_error(new_state)
     if invariant_error is not None:
         message, error_code = invariant_error
-        return _failure_result(state, message, error_code=error_code)
+        return _saved_graph_rejection_result(state, message, error_code=error_code, rejected_component=None)
     return _mutation_result(new_state, (validated.sink_name,))
 
 
@@ -218,7 +233,9 @@ def _execute_remove_output(
     sink_name = validated.sink_name
     new_state = state.without_output(sink_name)
     if new_state is None:
-        return _failure_result(state, f"Output '{sink_name}' not found.")
+        return _saved_graph_rejection_result(
+            state, f"Output '{sink_name}' not found.", error_code="output_not_found", rejected_component=f"output:{sink_name}"
+        )
     return _mutation_result(new_state, (sink_name,))
 
 
@@ -252,17 +269,24 @@ def _execute_patch_output_options(
     patch = validated.patch
     current = next((o for o in state.outputs if o.name == sink_name), None)
     if current is None:
-        return _failure_result(state, f"Output '{sink_name}' not found.")
+        return _saved_graph_rejection_result(
+            state, f"Output '{sink_name}' not found.", error_code="output_not_found", rejected_component=f"output:{sink_name}"
+        )
     # State-held plugin: resolve it through the request's policy view before
     # prevalidation stamps it (see _execute_patch_source_options).
-    plugin_error = _validate_plugin_name(context, "sink", current.plugin)
+    plugin_error = _plugin_selection_violation(context, "sink", current.plugin)
     if plugin_error is not None:
-        return _plugin_policy_failure(state, plugin_error)
+        return _saved_graph_plugin_policy_failure(
+            state, plugin_error, component=f"output:{sink_name}", rejected_component=f"output:{sink_name}"
+        )
+    context.catalog.get_schema("sink", current.plugin)
     new_options = _apply_merge_patch(current.options, patch)
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(current.plugin, new_options)
     if endpoint_policy_error is not None:
-        return _failure_result(state, endpoint_policy_error)
-    credential_error = _credential_wiring_contract_failure(
+        return _saved_graph_rejection_result(
+            state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=f"output:{sink_name}"
+        )
+    credential_error = _saved_graph_credential_wiring_contract_failure(
         state,
         component_id=sink_name,
         component_type="output",
@@ -276,15 +300,22 @@ def _execute_patch_output_options(
     # S2: Validate patched sink paths against allowlist
     path_error = _validate_sink_path(new_options, context.data_dir, session_id=context.session_id)
     if path_error is not None:
-        return _failure_result(state, path_error)
+        return _saved_graph_rejection_result(
+            state,
+            "Output path options (path, file or persist_directory) must use this session's permitted destinations. "
+            "Use an authorized session-local output path.",
+            error_code="sink_path_policy_invalid",
+            rejected_component=f"output:{sink_name}",
+        )
 
     prevalidation_error = _prevalidate_sink(current.plugin, new_options)
     if prevalidation_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             prevalidation_error,
             error_code="plugin_options_invalid",
             plugin_identity=("sink", current.plugin),
+            rejected_component=f"output:{sink_name}",
         )
     collision_error = validate_composer_file_sink_collision_policy(
         current.plugin,
@@ -292,7 +323,9 @@ def _execute_patch_output_options(
         require_explicit=context.data_dir is not None,
     )
     if collision_error is not None:
-        return _failure_result(state, collision_error)
+        return _saved_graph_rejection_result(
+            state, collision_error, error_code="file_sink_write_policy_invalid", rejected_component=f"output:{sink_name}"
+        )
 
     new_output = replace(current, options=new_options)
     new_state = state.with_output(new_output)
