@@ -1,24 +1,231 @@
 # Composer 0.8.7 work ledger
 
-This is the working implementation ledger for the approved Composer 0.8.7
-plan. It records source reconciliation and later behavioral evidence; it is
-ordinary project documentation, not a release approval or immutable plan.
+This is the existing implementation and operating ledger for Composer 0.8.7.
+The current operating record below supersedes historical status and capacity
+statements later in this file and in dated pause reports. Maintain this record;
+do not start a competing ledger. It is ordinary editable project documentation.
+The full per-fix inventory is [master issue #315](https://github.com/dta-au/elspeth/issues/315)
+and its [repository snapshot](2026-10-16-composer-087-master-defect-list.md).
 
-**Exactly two efforts are authorized by John's latest direct instructions:**
-qualify the target for merge, and prepare one serial development package.
-Discovery Group A is now committed as `f0c8a597e`; SMK-06 advisor input budgeting
-is the next package, with source investigation started and implementation pending.
-The canonical target is the existing
-`codex/composer087-contracts-20261015` branch; these fixes comprise the new 0.8.7
-release. Up to 12 concurrent test workers and sole device/checkout custody are
-authorized. PRs and merges may proceed when required checks and reviews pass.
-Earlier read-only and ready-and-hold restrictions are superseded for these two
-efforts. No other development lane is active. John monitors quota; an explicit
-20-percent signal stops development and redirects effort to landing completed work.
-See [the current status report](2026-10-16-composer-087-paused-status.md).
-The full aspirational scope and current delivery statuses are maintained in
-[master issue #315](https://github.com/dta-au/elspeth/issues/315), with a
-[repository snapshot](2026-10-16-composer-087-master-defect-list.md).
+## Current operating record — 16 October 2026, 10:30 UTC
+
+Work is active. John has not requested a new pause. The [one-time independent
+Astra governance review](../reviews/2026-10-16-composer-087-governance-review.md)
+accepted the stop/resume structure subject to two stale-record corrections;
+root has applied both below and owns subsequent maintenance. Recheck native
+refs, manifests and process identity before using this dated snapshot.
+
+### Custody and delivery state
+
+| Surface or owner | Current identity and boundary |
+|---|---|
+| Host / operator | `nyx.foundryside.dev`, Unix user `john`, UID 1000; sole device/checkout custody authorized by John. |
+| LOCAL release target | `codex/composer087-contracts-20261015`, HEAD `444fc144f211b3437e71051813f639c2460a32cd`, root's assigned d66a ELSPETH worktree. Resolve its absolute root with `git rev-parse --show-toplevel`; do not switch a different shared checkout. |
+| SHARED / PR | [PR #316](https://github.com/dta-au/elspeth/pull/316), published head `e91bd01deee7ed743f4358eb590b7c0d05ca37ff`, base `main`; open, mergeable but blocked at 10:15:49 UTC. Root is the sole publisher/integrator. |
+| MAIN | `ac7e5aac43b4f20bd10dd420b43dd439f5371f55` at that API check. No main merge of this package is claimed. |
+| Root | This task, ID `01a140e3-fc15-7900-b0c5-cc80ebc95fb2`; owns release qualification, capacity, integration, one batch PR update and protected merge. |
+| Direction relay | Emmy's authorized thread `01a12334-35ad-748b-99eb-2d3a16598084`, host `durable`. John recognizes its authority. Direct current John instructions supersede older relay/time rules. Delivery errors are not acknowledgments. |
+| Finished development owner | Sol 6.1 `/root/dep01_repair` has frozen the final five-file patch and relinquished writer/test custody. Private standalone checkout `/tmp/elspeth087-dep01-20261016`, branch `codex/dep01-ciq01-20261016`, base `444fc144`. No pushes or PRs. Root now owns its canonical qualification; do not reactivate the writer against live frozen inputs. |
+| Independent reviewer | Actual Astra `/root/dep01_astra` accepted exact final repair patch `958a4b8b...` for integration/canonical qualification and completed the one-time governance review. Its reports are recorded below. It owns no source edits, tests, publication or integration; no recurring review lane is active. |
+| Finished SMK-12 owner | `/root/implementation` relinquished custody. Its stopped `/tmp/elspeth087-smk12-projection-20261016` checkout still has eight dirty paths based on `e91bd01d`; these bytes are already committed as LOCAL `444fc144`. Preserve as evidence; do not replay that patch or resume its writer. |
+| Other old lanes | No other development owner is authorized. `/root/astra_obligations` was `pending_init`, not an active writer; do not repair shared daemons or activate stale assignments to work around it. Query actual agent status before dispatch. |
+
+The root checkout was clean at the 10:17 native inspection, before this ledger
+and documentation update. Root-owned uncommitted documentation is this ledger,
+the master list and `docs/reviews/2026-10-16-composer-087-governance-review.md`.
+The private candidate's five uncommitted paths are:
+`pyproject.toml`, `uv.lock`, `scripts/ci_test_shards.py`,
+`tests/unit/test_runtime_dependency_contract.py`, and
+`tests/unit/cicd/test_ci_sharding.py`. Do not stash, clean or restore any owner.
+
+Thirteen accepted implementation commits are explicitly listed and
+ancestor-checked in the master list: twelve are SHARED, SMK-12A `444fc144` is
+LOCAL only. The master rows are overlapping views, not additive completion
+counts. Numbered items 0–18, all smoke/system/UI/shared-link findings and
+conditional work remain there. The current package is the approved coupled
+DEP-01 (P1 dependency ownership) / CIQ-01 (P2 terminal evidence) repair.
+Broader SMK-12B dependent-batch semantics remain not started. No other fix
+starts until this development custody is relinquished and root selects one.
+
+### Current rules and decisions
+
+- Keep at most two lines: release qualification and one coherent serial fix
+  or related group. Read-only review and this governance maintenance support
+  those lines; they do not create another implementation lane.
+- Direct local test capacity is 12 workers with no PR and **8 with the current
+  single PR**. Run only one broad local suite at a time. PostgreSQL
+  testcontainer runs are serial (`-n 0`). An idle host alone does not authorize
+  another broad owner. Short focused work may use the assigned capacity.
+- Integrate a locally green fix, then send **one batch PR update/CI cycle**.
+  Several completed local updates may share that update. Keep a fresh green
+  point ready to merge while preparing the next serial fix. Do not repeatedly
+  push partial work, rerun unchanged failures, or cancel useful existing CI.
+- John's latest scope threshold is **60 minutes of remaining implementation,
+  focused checks, integration and review, excluding full-suite time**. Report
+  full-suite time separately. This replaces the old total 120-minute rule.
+  John explicitly approved both DEP-01 and CIQ-01; current estimate is
+  5–15 minutes remaining review/integration after owner closure, plus an
+  independently accounted 80–90 minute full gate, now running. Refresh estimates if
+  new work changes them; do not count completed work again on resume.
+- Deliver the tested ready package by **18 October 2026, 07:45 UTC / 18:45 AEDT**.
+  Aspirational scope is not a prerequisite to that release. At the operator's
+  cutoff, triage remaining work for 0.8.8; this does not authorize 0.8.8 coding.
+- At **zero weekly allowance**, stop starting new development. Authorized
+  existing credits may finish bounded in-flight work, tests, necessary repairs,
+  integration, protected PR/merge and remainder triage. John monitors allowance;
+  do not poll quota continually or make new purchases. This current ruling
+  supersedes the old 20-percent wording retained in historical records.
+- Existing Composer graph backwards compatibility is not required for 0.8.7.
+  Narrow obsolete graph-record adjustments may be removed when justified;
+  **retain the basic dynamic upgrade framework**. No unrelated .6 fix or
+  security/integrity guard removal, user-store migration/reset/wipe or downgrade
+  is authorized. Document refusal/reinspection and actual reconstruction limits.
+- No deployment, paid provider call, operator HMAC custody/signing, credential
+  change, Unix ownership/permission change, shared daemon kill/reconfiguration,
+  branch-protection bypass or destructive shared-state cleanup is authorized.
+  Use the normal account and hooks. Failed runner stores remain protected;
+  exact failed-host dependency bytes have not been recovered.
+- The LLM authors graph structure; ordinary/tutorial paths share the backend.
+  Preserve validation, privacy and audit authority. Streaming/advisor-return
+  exploration remains analysis only and stopped; no .8 implementation lane.
+
+### Evidence and remaining gates
+
+Private coordination/evidence lives under
+`.claude/lanes/composer087-contracts-20261015/` in the release checkout and
+`.claude/lanes/dep01/` in Sol's checkout. These ignored files are never staged.
+The public master contains safe summaries, not diagnostic archives or secrets.
+
+| Evidence | Exact boundary and next action |
+|---|---|
+| SMK-12A integration | `444fc144` parent `e91bd01d`; `smk12-integration-commit-result.json` records normal preflight/hooks and all eight exact committed files. `smk12-projection-implementation.md` and `reviews/smk12-projection-final-evidence-review.md` link final source-writer 24-pass, scanned-gates 368-pass and 30 intended witnessed failures in separate executions. Full release qualification under corrected dependencies remains due. |
+| Earlier full gate | Frozen checkout `/tmp/elspeth087-validation-696db482-20261016/smk06-integrated-target`, HEAD `450f348211a43d44e436533216498cf71b686893`; log directory `/tmp/elspeth087-validation-696db482-20261016/smk06-integrated-gates/20261016T064259Z-smk06-integrated-target-1819454`. Driver exit 0, `RESULT=PASS`, frozen=yes; default 68780 passed/104 skipped/2 xfailed; PG 1042 passed/one optional skip. Its actual installed files were Slim 0.21.1 despite Typer 0.25.1 metadata. Preserve these historical results, but do not reuse them to qualify full Typer 0.25.1 or current combined inputs. Do not edit this stopped clone or its private venv. |
+| DEP-01 reproduction | Sol's `ownership312.json` / `ownership313.json` show old clean installs execute Slim 0.21.1. Four initial regression cases fail as intended. Locked repair selects dependency-only Slim 0.24.0 while retaining full Typer 0.25.1. Fresh corrected sync and effective-version checks pass on 3.12 and 3.13. Arbitrary downstream pip resolution remains outside this locked UV repair. |
+| Final coupled artifact | `/tmp/elspeth087-dep01-20261016/.claude/lanes/dep01/dep01-ciq01-final.patch`, SHA256 `958a4b8b94daf8d19b04a4967ec089339adb628e07915897746d4cb4b6df6391`; sibling `final-patch-manifest.json` records all five file hashes. Root and Astra independently matched every current file. Old `dep01-ciq01.patch` / `patch-manifest.json`, SHA `ebe06b5...`, are superseded evidence and must not be integrated. |
+| Coupled focused evidence | Final `review-final312.log` and `review-final313.log` each show 27 passing cases; `completed-command-exit-history.json` preserves exact commands and observed shell exits 0 from owner tool history, explicitly retrospective rather than original native sidecars. Real collection-child `.exit`/manifest receipts directly show exit2, no coverage/digest and false no-call proof. Shadow, competing-owner and changed-byte controls fail at intended assertions; CLI consumers pass 496. The earlier 929-case selection had disclosed test edits and is not final frozen evidence. PermissionError/IsADirectoryError propagation is source-supported, not separately executed; do not claim otherwise. |
+| Actual reserve proof | Completed Python 3.13 reserve proof: one passed in 321.63 seconds, observed shell exit0 preserved in the same retrospective tool-history receipt and reviewed by Astra. `reserve-inputs.json` records unchanged production/proof inputs; test-only guard edits during the run mean it is not a whole-tree frozen receipt. Root's live canonical gate qualifies the finished tree. |
+| Independent patch review | Root-lane `reviews/dep01-ciq01-final-owner-report.md` and `reviews/dep01-ciq01-final-review-astra.md` record owner closure and independent ACCEPT of the exact final patch. Plan-only review remains historical. Actual failed CI-host bytes remain unknown; no particular installer interleaving is proved. |
+| Root full gate | Running since 10:26:31 UTC on `/tmp/elspeth087-dep01-20261016`, base `444fc144` plus final patch above. `.venv` resolves to `/tmp/elspeth087-dep01-20261016/.claude/lanes/dep01/repaired313`, Python 3.13.15, Typer effective/metadata 0.25.1, Slim 0.24.0. Driver PID2597211; run `/tmp/elspeth087-dep01-gates/20261016T102631Z-elspeth087-dep01-20261016-2594051`. Initial tree state `444fc144f211b3437e71051813f639c2460a32cd b968db325b4eeca1`; both import roots verified private. Ruff/mypy/contracts have terminal exit0 and healthy watchers; lints/default/serialPG and final freeze remain pending. Do not mutate this candidate or start another broad suite. |
+| Keyless trust tier | Standing corpus previously 3277, semantic no-drift for finished bounded packets. It is diagnostic, not operator signature clearance. Compare current changed production inputs honestly; operator verifies/signs after churn. Never hand-edit signatures. |
+| Current CI | At 10:15:49 UTC, PR `e91bd01d`: 32 successes, five running, one reserve-actual-sources 3.13 collection failure. Run [38874373133](https://github.com/dta-au/elspeth/actions/runs/38874373133); failing job [116885751657](https://github.com/dta-au/elspeth/actions/runs/38874373133/job/116885751657) has 70 collection errors, one skip and no proof assertion execution. CodeQL, cohort and redaction passed; CI Success is still pending/blocked. Existing API snapshot `release-pr-latest-checks.json` is head-pinned. No retries/cancellations performed. |
+| Protected merge | Re-fetch current main/base and exact published head; required checks are CI Success, CodeQL, cohort-attribution and redaction, with strict branch protection. Root performs normal branch-safety before push/merge, no bypass. Green focused/local tests alone never imply protected merge, signatures, deployment or live acceptance. |
+
+For every test invocation, set BOTH source roots and verify both import paths.
+Run from the actual checkout, using its correct private interpreter. The
+canonical gate exports these paths and sets pytest's `-o pythonpath` itself.
+The executed full-gate command uses `ELSPETH_GATE_ROOT=/tmp/elspeth087-dep01-20261016`:
+
+```bash
+cd "$ELSPETH_GATE_ROOT" && scripts/full-suite-gate.sh --execute --detach \
+  --workers 8 --stages ruff,mypy,contracts,lints,pytest,testcontainer \
+  --root "$ELSPETH_GATE_ROOT" --log-dir /tmp/elspeth087-dep01-gates
+```
+
+The exact root, interpreter, patch, launch time, run path and driver PID are
+recorded above. A resume must inspect that live run before considering a restart.
+Read terminal `.done`, `driver.exit`, `summary.txt`, per-stage exits and full
+JUnit, not piped output. Require matching before/after inputs and healthy
+watcher lifetimes. A driver launch exit 0 is not a passed gate.
+
+Completed focused commands are preserved verbatim in the retrospective owner
+tool-history receipt. Their reproducible selections, with the same explicit
+source-root environment, are:
+
+```bash
+cd /tmp/elspeth087-dep01-20261016 && \
+  PYTHONPATH=/tmp/elspeth087-dep01-20261016/src:/tmp/elspeth087-dep01-20261016/elspeth-lints/src \
+  .claude/lanes/dep01/repaired312/bin/python -m pytest \
+  tests/unit/test_runtime_dependency_contract.py tests/unit/cicd/test_ci_sharding.py \
+  -k 'typer or finalizer or collection_failure_publishes' -n 0
+```
+
+The identical final selection also completed with `repaired313/bin/python`.
+Using that same Python 3.13 environment, the completed CLI selection was
+`python -m pytest tests/unit/cli -n 8`; the completed actual proof was
+`python -m pytest tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_required_work_reserve_admission_on_actual_sources -n 0 -m landscape_long_run`.
+Original commands redirect to the named private logs and save shell `$?`;
+these commands are a resume reference, not an instruction to repeat valid work.
+
+### Active processes and safe stopping
+
+`governance-host-processes.json` is the 10:17:30 UTC read-only host inventory
+of visible UID1000 processes in owned checkout directories. It observed one
+actual test interpreter, PID2574849 in Sol's checkout, with wrapper2574776;
+Sol subsequently reported its reserve proof terminal exit. The report includes
+start ticks, parent, cwd and UID. It also lists background Python processes
+whose ownership is not established; do not signal them. Normal sandbox `/proc`
+exposes a different namespace, so its empty/small view cannot prove host idleness.
+GitHub API, not local `/proc`, establishes CI runner activity. The 10:25 host
+capacity check additionally found four week-old Keisei test interpreters owned
+by john: PIDs3499848,3551016,811673,823466, each sleeping, no children and zero
+CPU-tick change across five seconds. These processes remain unidentified and
+untouched. Load was 2.51/5.54/8.35, available memory 54 GiB; `/tmp` had 406 GiB
+free. They did not block the conservatively assigned eight-worker gate.
+`governance-sibling-idle-sample.json` preserves the samples. Docker was reachable
+and existing `/usr/bin/caddy` v2.11.6 verified. Gate driver2597211 is the current
+owned live run; query its descendants and start identity before any interruption.
+Inventory is dated; refresh it before new allocation. PIDs alone are never
+reusable authority.
+
+On an explicit pause or engine-restart request:
+
+1. Stop dispatching new work. Ask the existing writer/reviewer to finish the
+   current reversible step, write their exact path/status/next-step report and
+   relinquish custody. Do not silently reactivate any old lane.
+2. Prefer allowing an owned test stage to finish. Detached canonical runs may
+   survive engine restart; preserve their PID/run directory and freeze. Do not
+   launch a second copy on resume. If stopping is necessary, verify UID, current
+   cwd, process start ticks and parent/descendants first; request cooperative
+   interruption only of the verified owned process/session. Confirm descendants
+   and watchers have ended. Do not kill broad command-name matches or CI daemons.
+3. Persist committed HEADs, all dirty path names and content hashes, exact
+   environment/commands, native terminal exits or explicitly in-flight status,
+   active PIDs/start identity, remaining gates and the owner's next action in
+   this ledger/master and ignored receipts. Preserve original red evidence.
+4. Commit only root-owned finished documentation/source after normal preflight
+   and hooks; preserve incomplete writer work in its existing private checkout
+   and immutable patch/report. No stash, force-clean, reset, forced push or
+   premature publication. Report any unfinished custody explicitly.
+
+### Exact resume sequence and safe packaging
+
+1. Read this current record, master issue, repository snapshot and last owner
+   report. Locate the assigned release worktree and measure host/user/cwd,
+   `git status --short`, branch, HEAD, git/common directories and unfinished
+   operations. Confirm expected LOCAL/SHARED/MAIN refs through Git and GitHub.
+   Ref drift or unexplained dirty paths requires reconciliation, not overwrite.
+2. Query agent state and contact the existing owner. Inspect saved run directories
+   and host process identities; distinguish completed receipt, live process,
+   failed cleanup and unknown state. Keep one integrator, one source writer
+   and one broad suite. Do not resume stopped SMK-12 or pending stale review work.
+3. Verify final patch/file hashes against its declared base and the current
+   candidate, correct private environment, both import roots and Typer effective
+   version/import ownership/RECORD. If a gate is already live and frozen, monitor
+   it. If completed, inspect actual terminal receipts before allocating any
+   missing check. Repeat only invalidated or failed evidence; never silently
+   convert interrupted/historical runs into passes.
+4. Finish DEP-01/CIQ-01 only: final source/control review, combined canonical
+   gate and any necessary narrow repairs. Absorb root documentation into the
+   release target separately without mutating a live frozen candidate. Check
+   exact reviewed blobs, normal branch-safety and normal hooks before commit.
+5. When the combined package is locally green, update master statuses with
+   verified commits, then perform one batch PR update. Record new SHARED head
+   and required exact-head checks; preserve current failure disclosure as history.
+   Reconcile a moved main before final merge. Protected green and normal merge
+   remain required. No additional PR is authorized merely to add test capacity.
+6. If quota reaches zero or deadline/cutoff is directed, start no new defect.
+   Package completed, reviewed, locally qualified work; keep incomplete work
+   isolated and explicit. A package is ready only with coherent reviewed source,
+   reproducible dependency environment, required local gates, truthful receipts
+   and exact-head protected checks. Do not merge a known red or omit a critical
+   guard to meet the deadline. Triage unfinished master rows for the next release
+   without implementing that release. No signing/deployment claim follows.
+
+## Historical baseline and reconciliation
+
+The sections below preserve their original as-of evidence and chronology.
+They do not assign current owners, capacity, permission or next work. Use the
+current operating record and master list above for those decisions.
 
 ## Baseline and boundaries
 
@@ -59,9 +266,9 @@ Raw registry/API evidence is in `live-registry.json`,
 `direct-symbol-inventory.json`; the item-1 proposal is `packet1-design.md`.
 These are coordination inputs and must never be staged.
 
-## Current status worklist
+## Historical status worklist
 
-This is the current status view requested by the maintainer. The detailed
+This is the earlier status view requested by the maintainer. The detailed
 reconciliation table below retains the original baseline findings. “Accepted
 locally” means committed, independently reviewed and checked within the stated
 packet; it does not mean merged, signed, released or deployed.
