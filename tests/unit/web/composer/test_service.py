@@ -4242,8 +4242,11 @@ class TestDiscoveryCache:
             mock_llm.side_effect = [schema1, schema2, text]
             await service.compose("Get schemas", [], state, session_id=session_id)
 
-        # Both calls should have executed (different arguments)
-        assert catalog.get_schema.call_count == 4
+        # Pure policy admission precedes one direct schema read per request.
+        assert [(entry.args, entry.kwargs) for entry in catalog.get_schema.call_args_list] == [
+            (("source", "csv"), {}),
+            (("source", "json"), {}),
+        ]
 
     @pytest.mark.asyncio
     async def test_mutation_tools_never_cached(self) -> None:
