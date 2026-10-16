@@ -121,19 +121,20 @@ def _psycopg_connect(url: str) -> psycopg.Connection[Any]:
     )
 
 
-def _grant_web_instances_dml(session_owner_url: str, runtime_role: str) -> None:
-    """Grant INSERT and UPDATE on the one table a booting replica writes.
+def _grant_runtime_startup_dml(session_owner_url: str, runtime_role: str) -> None:
+    """Grant membership writes and the quota population-lock privilege.
 
-    ``web_instances`` lives in the session database only, and provisioning runs
-    both before and after schema init, so an absent table is skipped: boot
-    cannot register into a table that does not exist, and validate-only refuses
-    earlier with a schema-not-ready error.
+    These tables live in the session database only. Provisioning runs before
+    and after schema init, so each absent table is skipped; validate-only
+    startup refuses an incomplete schema before runtime coordination begins.
     """
     with _psycopg_connect(session_owner_url) as owner:
-        existing = owner.execute("SELECT to_regclass('public.web_instances')").fetchone()
-        if existing is None or existing[0] is None:
-            return
-        owner.execute(sql.SQL("GRANT INSERT, UPDATE ON web_instances TO {}").format(sql.Identifier(runtime_role)))
+        membership_table = owner.execute("SELECT to_regclass('public.web_instances')").fetchone()
+        if membership_table is not None and membership_table[0] is not None:
+            owner.execute(sql.SQL("GRANT INSERT, UPDATE ON web_instances TO {}").format(sql.Identifier(runtime_role)))
+        quota_table = owner.execute("SELECT to_regclass('public.quota_policies')").fetchone()
+        if quota_table is not None and quota_table[0] is not None:
+            owner.execute(sql.SQL("GRANT UPDATE ON quota_policies TO {}").format(sql.Identifier(runtime_role)))
 
 
 @dataclass(slots=True)
@@ -194,16 +195,17 @@ class _DatabasePair:
         self.grant_runtime_permissions()
 
     def grant_runtime_permissions(self) -> None:
-        """Grant the runtime role its documented minimum: read everything, write ``web_instances``.
+        """Grant the documented minimum for startup with no configured quota.
 
         Read-only is no longer enough. A PostgreSQL replica registers itself in
         ``web_instances`` during the lifespan, so boot needs UPDATE (for the
         ``SELECT ... FOR UPDATE`` that claims the row) and INSERT (for a first
-        registration) on that one table. Deliberately NOT a blanket DML grant:
-        this helper is what proves which privileges boot actually requires, so
-        widening it would stop the test catching a new write. "Validate-only"
-        is unchanged — it means DDL denied, which ``_assert_ddl_denied`` still
-        pins, and it never meant no DML at boot.
+        registration). Quota population verification also needs UPDATE on
+        ``quota_policies`` to authorize its table lock, even with no configured
+        ceiling. This does not grant quota INSERT or Landscape audit writes
+        needed for configured policy creation. Keep these grants narrow so a
+        new boot write remains visible. "Validate-only" means DDL denied,
+        which ``_assert_ddl_denied`` still pins, rather than no DML at boot.
         """
         assert self.role_created
         for owner_url in (self.session_owner_url, self.landscape_owner_url):
@@ -211,7 +213,7 @@ class _DatabasePair:
                 owner.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
                 owner.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
                 owner.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
-        _grant_web_instances_dml(self.session_owner_url, self.runtime_role)
+        _grant_runtime_startup_dml(self.session_owner_url, self.runtime_role)
 
 
 @pytest.fixture
@@ -447,6 +449,7 @@ def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
         session_url=database_pair.session_runtime_url,
         landscape_url=database_pair.landscape_runtime_url,
     )
+    assert settings.quota_container_tokens_per_day is None
     session_owner = create_session_engine(database_pair.session_owner_url)
     landscape_owner = create_engine(database_pair.landscape_owner_url)
     try:
