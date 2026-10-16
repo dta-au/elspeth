@@ -1184,7 +1184,7 @@ class TestServerOwnedMetadataProjection:
                 "id": "source_review:inline_source_data",
                 "kind": "invented_source",
                 "user_term": "inline_source_data",
-                "draft": "a,b\n1,2\n",
+                "historical_draft": "a,b\n1,2\n",
                 "status": "resolved",
             }
         ]
@@ -1193,12 +1193,12 @@ class TestServerOwnedMetadataProjection:
 
         node_options = current["nodes"][0]["options"]
         assert "approved_prompt_artifact_hash" not in node_options
-        assert PROMPT_TEMPLATE_PARTS_KEY not in node_options
+        assert node_options[PROMPT_TEMPLATE_PARTS_KEY] == [{"kind": "text", "text": "Tone: warm"}]
         assert node_options[INTERPRETATION_REQUIREMENTS_KEY][0] == {
             "id": "vague:tone",
             "kind": "vague_term",
             "user_term": "friendly",
-            "draft": "friendly",
+            "historical_draft": "friendly",
             "status": "resolved",
         }
         assert node_options["prompt_template"] == "Tone: warm"
@@ -1291,7 +1291,7 @@ class TestServerOwnedMetadataProjection:
         current = json.loads(context.split("\n", 1)[1])["current_state"]
         # The context block carries only the reduced projection.
         echoed_row = current["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
-        assert set(echoed_row) == {"id", "kind", "user_term", "draft", "status"}
+        assert set(echoed_row) == {"id", "kind", "user_term", "historical_draft", "status"}
         assert echoed_row["status"] == "resolved"
 
         source = current["sources"]["source"]

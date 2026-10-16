@@ -10,13 +10,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Final
 
 import pytest
 
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.service import CatalogServiceImpl
+from elspeth.web.composer.source_demand import build_source_data_contract_draft, source_data_contract_artifact_hash
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
@@ -32,6 +35,8 @@ from elspeth.web.composer.tools._common import (
     _runtime_owned_llm_option_error,
     _serialize_set_pipeline_arguments,
 )
+from elspeth.web.composer.tools.blobs import _sync_get_blob
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
@@ -40,6 +45,196 @@ from elspeth.web.interpretation_state import (
     project_planner_context_interpretation_requirement,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from tests.helpers.session_fences import fenced_operation_context
+from tests.unit.web.composer import test_set_source_from_blobs as plural_blob_tests
+from tests.unit.web.composer.test_authoring_reconciliation import _resolved_source_contract_state
+from tests.unit.web.composer.test_set_source_from_blobs import _create_ready_blob
+
+harness = plural_blob_tests.harness
+
+
+@pytest.mark.parametrize(
+    "kind", ["vague_term", "invented_source", "source_data_contract", "llm_model_choice", "llm_prompt_template", "pipeline_decision"]
+)
+@pytest.mark.parametrize("status", ["pending", "resolved"])
+def test_review_projection_separates_historical_draft_without_exposing_authority(kind: str, status: str) -> None:
+    row = _canonical_pending_requirement(kind=kind) | {"status": status, "display_title": "Review title"}
+    before = deepcopy(row)
+    projected = project_planner_context_interpretation_requirement(row)
+    assert projected == {
+        "id": row["id"],
+        "kind": kind,
+        "user_term": row["user_term"],
+        "historical_draft" if status == "resolved" else "draft": row["draft"],
+        "status": status,
+        "display_title": "Review title",
+    }
+    echoed, matched = common_tools._normalize_echoed_interpretation_requirements(
+        {INTERPRETATION_REQUIREMENTS_KEY: [projected]}, stored_options={INTERPRETATION_REQUIREMENTS_KEY: [row]}
+    )
+    assert matched
+    assert echoed[INTERPRETATION_REQUIREMENTS_KEY] == [
+        {"kind": kind, "user_term": row["user_term"], "draft": row["draft"], "display_title": "Review title"}
+    ]
+    assert row == before
+
+
+@pytest.mark.parametrize(
+    "writer",
+    [
+        "set_source",
+        "patch_source_options",
+        "set_source_from_blob",
+        "set_source_from_blobs",
+        "set_pipeline_source",
+        "set_pipeline_named_source",
+    ],
+)
+@pytest.mark.parametrize("echo", ["current", "full", "stale-resolved", "tampered-history"])
+def test_source_writers_admit_only_exact_current_or_full_review_echoes(
+    writer: str,
+    echo: str,
+    harness,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _, session_id = harness
+    blob_id = _create_ready_blob(harness, content=b"colour\nred\n", filename="colours.csv", mime_type="text/csv")
+    catalog = _catalog()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    state = _resolved_source_contract_state(required_fields=["colour"])
+    record = _sync_get_blob(engine, blob_id, session_id)
+    assert record is not None and record["status"] == "ready"
+    assert Path(record["storage_path"]).is_file()
+    source = state.sources["source"]
+    state = replace(
+        state,
+        sources={"source": replace(source, options={**source.options, "path": record["storage_path"]})},
+        outputs=tuple(replace(output, options={**output.options, "path": f"outputs/{session_id}/out.jsonl"}) for output in state.outputs),
+    )
+    # This borrowed contract fixture originally had an unscoped display path.
+    # Use the actual ready artifact and prove both real session path guards.
+    assert common_tools._validate_source_path(state.sources["source"].options, str(tmp_path), session_id=session_id) is None
+    assert all(
+        common_tools._validate_sink_path(dict(output.options), str(tmp_path), session_id=session_id) is None for output in state.outputs
+    )
+    with fenced_operation_context(engine, session_id) as operation:
+        context = {
+            "plugin_snapshot": snapshot,
+            "data_dir": str(tmp_path),
+            "session_engine": engine,
+            "session_id": session_id,
+            "session_operation_context": operation,
+            "session_operation_authority": SQLiteLocalSessionOperationAuthority(engine),
+        }
+        if writer in ("set_source_from_blob", "set_source_from_blobs"):
+            bind_args = {"on_success": state.sources["source"].on_success, "on_validation_failure": "discard"}
+            if writer == "set_source_from_blob":
+                bind_args.update(blob_id=blob_id, options={"schema": {"mode": "observed"}})
+            else:
+                bind_args["blob_ids"] = [blob_id]
+            bound = _execute_tool(writer, bind_args, _empty_state(), policy, **context)
+            assert bound.success, bound.validation.errors
+            source = bound.updated_state.sources["source"]
+            if writer == "set_source_from_blobs":
+                fields = list(source.options["schema"]["guaranteed_fields"])
+                node = replace(state.nodes[0], options={"schema": {"mode": "observed"}, "required_input_fields": ["blob_id"]})
+                state = replace(state, nodes=(node,))
+            else:
+                fields = ["colour"]
+            card = build_source_data_contract_draft(fields, None)
+            requirement = _canonical_pending_requirement(
+                requirement_id="source-contract",
+                kind="source_data_contract",
+                user_term="source_data_contract",
+                draft=card,
+            ) | {
+                "status": "resolved",
+                "event_id": "source-contract-event",
+                "accepted_value": card,
+                "accepted_artifact_hash": source_data_contract_artifact_hash(fields),
+            }
+            source_options = deep_thaw(source.options)
+            source_options[INTERPRETATION_REQUIREMENTS_KEY] = [requirement]
+            if writer == "set_source_from_blob":
+                source_options["schema"] = {"mode": "observed", "guaranteed_fields": fields}
+            state = state.with_named_source("source", replace(source, options=source_options))
+        if writer == "set_pipeline_named_source":
+            state = replace(state, sources={"orders": state.sources["source"]})
+        source_name = next(iter(state.sources))
+        source = state.sources[source_name]
+        rows = deep_thaw(source.options[INTERPRETATION_REQUIREMENTS_KEY])
+        supplied = rows if echo == "full" else [project_planner_context_interpretation_requirement(row) for row in rows]
+        assert supplied[0]["status"] == "resolved"
+        if echo == "stale-resolved":
+            supplied[0]["draft"] = supplied[0].pop("historical_draft")
+        elif echo == "tampered-history":
+            supplied[0]["historical_draft"] = _SENSITIVE_SENTINEL
+        options = deep_thaw(source.options)
+        options[INTERPRETATION_REQUIREMENTS_KEY] = supplied
+        if writer == "patch_source_options":
+            args = {"source_name": source_name, "patch": {INTERPRETATION_REQUIREMENTS_KEY: supplied}}
+            tool = writer
+        elif writer in ("set_source_from_blob", "set_source_from_blobs"):
+            args = {
+                "on_success": source.on_success,
+                "on_validation_failure": "discard",
+                "options": {"schema": options["schema"], INTERPRETATION_REQUIREMENTS_KEY: supplied},
+            }
+            args["blob_id" if writer == "set_source_from_blob" else "blob_ids"] = blob_id if writer == "set_source_from_blob" else [blob_id]
+            tool = writer
+        elif writer == "set_source":
+            args = {"plugin": source.plugin, "on_success": source.on_success, "on_validation_failure": "discard", "options": options}
+            tool = writer
+        else:
+            # The convenience exporter cannot reconstruct named blob paths.
+            # Keep its exact node/output payload and exercise the public source
+            # shape with the actual saved path/options, as the writer accepts.
+            args, error = _serialize_set_pipeline_arguments(replace(state, sources={}))
+            assert error is None and args is not None
+            del args["sources"]
+            source_args = {
+                "plugin": source.plugin,
+                "on_success": source.on_success,
+                "on_validation_failure": source.on_validation_failure,
+                "description": source.description,
+                "options": options,
+            }
+            if writer == "set_pipeline_source":
+                args["source"] = source_args
+            else:
+                args["sources"] = {source_name: source_args}
+            tool = "set_pipeline"
+        before = state.to_dict()
+        calls = []
+        original = common_tools._normalize_echoed_interpretation_requirements
+
+        def observe(options, *, stored_options):
+            value = original(options, stored_options=stored_options)
+            if stored_options is source.options or stored_options == source.options:
+                calls.append(value[1])
+            return value
+
+        # Actual writer imports bind the shared comparator at module scope.
+        from elspeth.web.composer.tools import sessions, sources
+
+        monkeypatch.setattr(sources, "_normalize_echoed_interpretation_requirements", observe)
+        monkeypatch.setattr(sessions, "_normalize_echoed_interpretation_requirements", observe)
+        result = _execute_tool(tool, args, state, policy, **context)
+    assert calls and calls[0] is (echo in ("current", "full"))
+    assert state.to_dict() == before
+    if echo in ("current", "full"):
+        assert result.success, result.validation.errors
+        assert (
+            result.updated_state.sources[source_name].options[INTERPRETATION_REQUIREMENTS_KEY]
+            == source.options[INTERPRETATION_REQUIREMENTS_KEY]
+        )
+    else:
+        assert not result.success and result.updated_state is state
+        assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+        assert _SENSITIVE_SENTINEL not in repr(result.to_dict())
+
 
 _SENSITIVE_SENTINEL: Final[str] = "sensitive-requirement-value"
 _PLUGIN_NAMES: Final[tuple[str | None, ...]] = (
