@@ -1666,6 +1666,13 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "or satisfy the fields it names), or splice at a position whose producer supplies them, then retry "
         "splice_transform.",
     ),
+    DirectValidationGuidance(
+        "batch_dependency_refused",
+        "This call needs a new component or connection that an earlier refused call in the same batch did not create. "
+        "The saved pipeline is unchanged by this dependent call; independent calls may still succeed.",
+        "Inspect the saved pipeline, repair the refused prerequisite in a new turn, then retry the dependent change. "
+        "Use splice_transform only for its supported direct-transform-edge topology.",
+    ),
     # Prompt-role presence (session 60ab6a67): a composer-authored llm node
     # carries BOTH roles. Serves the state.py constants rather than a copy —
     # the rejection message ends with the same FIX, and the planner's redacted
