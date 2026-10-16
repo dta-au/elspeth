@@ -321,6 +321,23 @@ def test_long_run_ordinary_finalizer_and_missing_coverage(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize(
+    "partition,case,native_exit,effective_exit", [("ordinary", None, 2, 2), ("proof", "no-escape", 2, 2), ("proof", "no-escape", 0, 1)]
+)
+def test_long_run_finalizer_preserves_failure_without_coverage(
+    tmp_path: Path, partition: str, case: str | None, native_exit: int, effective_exit: int
+) -> None:
+    _init_checkout(tmp_path)
+    marked = list(LONG_RUN_CASES.values())
+    manifest = build_long_run_manifest(tmp_path, ["ordinary", *marked], marked, partition, case, 1, 0)
+    terminal = finalize_long_run_manifest(manifest, native_exit, None, tmp_path / "missing-database")
+    assert terminal["exit_status"] == effective_exit
+    assert "coverage_sha256" not in terminal
+    if partition == "proof":
+        assert terminal["proof_call_passed"] is False
+    assert manifest["exit_status"] is None
+
+
+@pytest.mark.parametrize(
     "case,outcome",
     [("ordinary", "pass"), ("ordinary", "fail")]
     + [(case, outcome) for case in LONG_RUN_CASES for outcome in ("pass", "fail", "skip", "setup_skip", "xfail", "xpass", "no_call")],
@@ -1044,6 +1061,28 @@ def _partition_run(
     (tmp_path / f"{report.stem}.log").write_text(result.stdout + result.stderr, encoding="utf-8")
     (tmp_path / f"{report.stem}.exit").write_text(f"{result.returncode}\n", encoding="utf-8")
     return result, report
+
+
+@pytest.mark.parametrize("partition,case", [("ordinary", None), ("proof", "no-escape")])
+def test_active_collection_failure_publishes_terminal_without_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, partition: str, case: str | None
+) -> None:
+    _partition_suite(tmp_path)
+    (tmp_path / "tests" / "test_broken.py").write_text("raise ImportError('controlled collection failure')\n")
+    database = tmp_path / "coverage-data"
+    monkeypatch.setenv("COVERAGE_FILE", str(database))
+    result, report = _partition_run(
+        tmp_path, partition, case=case, extra_args=["--cov=unimported_control", "--cov-report=", "--cov-fail-under=0"]
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "controlled collection failure" in result.stdout + result.stderr
+    assert "FileNotFoundError" not in result.stdout + result.stderr
+    manifest = json.loads(report.read_text())
+    assert manifest["exit_status"] == 2
+    if case is not None:
+        assert manifest["proof_call_passed"] is False
+    assert not database.exists()
+    assert "coverage_sha256" not in manifest
 
 
 def test_active_partitions_preserve_complete_disjoint_marker_selected_collection(tmp_path: Path) -> None:
