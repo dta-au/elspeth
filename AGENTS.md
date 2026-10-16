@@ -288,6 +288,16 @@ explicitly; retain current preserve/refuse contracts unless a separate change
 is approved. This policy alone does not authorize migrations, resets or
 downgrades.
 
+For 0.8.7, compatibility with existing Composer graphs is not required.
+Individual adjustments or migrations for older records, including 0.8.6
+records, may be removed when no longer needed; retain the basic dynamic upgrade
+framework. State each actual breaking change and any reinspection or
+reconstruction requirement without claiming every historical graph can be
+reconstructed. Other public interfaces, configuration, operator workflows and
+persisted data still require compatibility consideration. Preserve integrity
+and preserve/refuse contracts; this exception grants no authority to wipe data,
+run migrations, reset stores or downgrade them.
+
 ELSPETH is pre-release software maintained by a single developer. Keep a
 process, gate, or document only when it materially improves at least one of:
 

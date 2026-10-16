@@ -221,7 +221,9 @@ AUTHORING_METADATA_OPTION_KEYS: frozenset[str] = frozenset(
 # state legible without echoing resolver-owned linkage (event ids, accepted
 # values, artifact hashes) back to the provider. The echo-tolerant write gates
 # match a supplied row against this projection as well as against the full
-# stored row, so the two surfaces must share one field list.
+# stored row. ``draft`` is a source field: the projection names it
+# ``historical_draft`` for resolved rows so it cannot compete with the current
+# compiled prompt as accepted wording. Pending drafts stay editable.
 PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS: Final[tuple[str, ...]] = (
     "id",
     "kind",
@@ -233,8 +235,20 @@ PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS: Final[tuple[str, ...]] = (
 
 
 def project_planner_context_interpretation_requirement(requirement: Mapping[str, Any]) -> dict[str, Any]:
-    """Reduce one requirement row to its planner-context projection."""
-    return {field: deep_thaw(requirement[field]) for field in PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS if field in requirement}
+    """Project review facts without exposing resolver authority for authoring.
+
+    Exact echoes are compared against this same view before reducing to the
+    original author shell. Historical read-view keys never enter stored rows
+    or the authored-field admission vocabulary. Old reduced resolved rows using
+    ``draft`` no longer match: re-inspect the current view before retrying.
+    Pending projections and exact full saved-row echoes remain supported.
+    """
+    resolved = "status" in requirement and requirement["status"] == "resolved"
+    return {
+        "historical_draft" if resolved and field == "draft" else field: deep_thaw(requirement[field])
+        for field in PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS
+        if field in requirement
+    }
 
 
 def source_component_id(source_name: str) -> str:
