@@ -1,6 +1,6 @@
 import { DISCARD_CONNECTION } from "./graphTopology";
 
-/** Filter presentation only, after layout; retain the authored graph and geometry. */
+/** Filter presentation before layout; retain the authored graph and shared sinks. */
 export function visibleGraphRoutes<
   N extends { id: string },
   E extends { source: string; target: string; data: { flowType: "success" | "error" } },
