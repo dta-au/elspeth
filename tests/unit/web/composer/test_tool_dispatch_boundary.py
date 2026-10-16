@@ -190,6 +190,10 @@ def test_execute_tool_rejects_wrong_argument_types_before_handler() -> None:
 
 
 def test_source_path_arguments_require_data_dir_for_s2_confinement() -> None:
+    state, catalog = _empty_state(), _catalog()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    standing = PolicyCatalogView.for_trained_operator(catalog, snapshot).validate_composition_state(state).validation
+    assert standing.errors
     result = execute_tool(
         "set_source",
         {
@@ -198,18 +202,34 @@ def test_source_path_arguments_require_data_dir_for_s2_confinement() -> None:
             "options": {"path": "outside.csv", "schema": {"mode": "observed"}},
             "on_validation_failure": "error",
         },
-        _empty_state(),
-        _catalog(),
+        state,
+        catalog,
         tool_arguments_hash="0" * 64,
         require_data_dir_for_paths=True,
     )
 
     assert result.success is False
-    assert "Path violation (S2)" in result.validation.errors[0].message
-    assert "data_dir" in result.validation.errors[0].message
+    assert result.updated_state is state and result.updated_state.version == state.version
+    assert result.data is None and result.affected_nodes == ()
+    entry = result.validation.errors[0]
+    assert (entry.component, entry.error_code, entry.rejected_component) == ("rejected_mutation", "source_path_policy_invalid", "source")
+    assert entry.message == (
+        "Source file path options (path or file) must use this session's permitted source locations. "
+        "Use the session's blob binding or an authorized source path."
+    )
+    assert result.validation.errors[1:] == standing.errors
+    assert result.validation.warnings == standing.warnings and result.validation.suggestions == standing.suggestions
+    assert (
+        result.validation.edge_contracts == standing.edge_contracts and result.validation.semantic_contracts == standing.semantic_contracts
+    )
+    assert "outside.csv" not in entry.message
 
 
 def test_source_path_arguments_require_data_dir_without_audit_hash() -> None:
+    state, catalog = _empty_state(), _catalog()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    standing = PolicyCatalogView.for_trained_operator(catalog, snapshot).validate_composition_state(state).validation
+    assert standing.errors
     result = execute_tool(
         "set_source",
         {
@@ -218,14 +238,26 @@ def test_source_path_arguments_require_data_dir_without_audit_hash() -> None:
             "options": {"path": "outside.csv", "schema": {"mode": "observed"}},
             "on_validation_failure": "error",
         },
-        _empty_state(),
-        _catalog(),
+        state,
+        catalog,
         require_data_dir_for_paths=True,
     )
 
     assert result.success is False
-    assert "Path violation (S2)" in result.validation.errors[0].message
-    assert "data_dir" in result.validation.errors[0].message
+    assert result.updated_state is state and result.updated_state.version == state.version
+    assert result.data is None and result.affected_nodes == ()
+    entry = result.validation.errors[0]
+    assert (entry.component, entry.error_code, entry.rejected_component) == ("rejected_mutation", "source_path_policy_invalid", "source")
+    assert entry.message == (
+        "Source file path options (path or file) must use this session's permitted source locations. "
+        "Use the session's blob binding or an authorized source path."
+    )
+    assert result.validation.errors[1:] == standing.errors
+    assert result.validation.warnings == standing.warnings and result.validation.suggestions == standing.suggestions
+    assert (
+        result.validation.edge_contracts == standing.edge_contracts and result.validation.semantic_contracts == standing.semantic_contracts
+    )
+    assert "outside.csv" not in entry.message
 
 
 def test_secret_tool_missing_context_fails_before_handler(monkeypatch: pytest.MonkeyPatch) -> None:

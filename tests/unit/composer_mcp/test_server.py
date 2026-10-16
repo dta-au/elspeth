@@ -14,6 +14,7 @@ import yaml
 from elspeth.composer_mcp.server import _build_stdio_server, _build_tool_defs, _dispatch_tool, create_server
 from elspeth.composer_mcp.session import SessionCheckout, SessionManager
 from elspeth.contracts.composer_audit import ComposerToolRecorder
+from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer.state import (
@@ -25,6 +26,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 
 def test_field_mapper_patch_uses_owned_identity_through_real_mcp_dispatch(tmp_path: Path) -> None:
@@ -546,6 +548,11 @@ class TestDispatchTool:
         # argument set MUST include all four required fields.  Prior to
         # promotion this test omitted on_validation_failure and relied on
         # the handler defaulting it via .get(); that path is gone.
+        state, catalog = _empty_state(), _mock_catalog()
+        before = state.to_dict()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        standing = PolicyCatalogView.for_trained_operator(catalog, snapshot).validate_composition_state(state).validation
+        assert standing.errors
         result = _dispatch_tool(
             "set_source",
             {
@@ -554,13 +561,27 @@ class TestDispatchTool:
                 "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
                 "on_validation_failure": "discard",
             },
-            _empty_state(),
-            _mock_catalog(),
+            state,
+            catalog,
             scratch_dir,
         )
         assert result["success"] is False
-        assert "Path violation (S2)" in result["validation"]["errors"][0]["message"]
-        assert "data_dir" in result["validation"]["errors"][0]["message"]
+        assert result["state"] == before and result["version"] == state.version
+        assert state.to_dict() == before
+        entry = result["validation"]["errors"][0]
+        assert (entry["component"], entry["error_code"], entry["rejected_component"]) == (
+            "rejected_mutation",
+            "source_path_policy_invalid",
+            "source",
+        )
+        assert entry["message"] == (
+            "Source file path options (path or file) must use this session's permitted source locations. "
+            "Use the session's blob binding or an authorized source path."
+        )
+        assert result["validation"]["errors"][1:] == [item.to_dict() for item in standing.errors]
+        assert result["validation"]["warnings"] == [item.to_dict() for item in standing.warnings]
+        assert result["validation"]["suggestions"] == [item.to_dict() for item in standing.suggestions]
+        assert "/data/blobs/input.csv" not in entry["message"]
         assert "data" not in result
 
     def test_set_output_requires_explicit_collision_policy(self, scratch_dir: Path) -> None:

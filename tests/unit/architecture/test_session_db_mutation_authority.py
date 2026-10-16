@@ -5022,7 +5022,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="cb9dd966393cab1d",
         ordinal=1,
         authority=None,
-        line=1750,
+        line=1822,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -20528,7 +20528,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "0f0d2bcbf88ed81a",
             1,
             None,
-            line=186,
+            line=189,
         ),
         # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,
         # so it poisons the otherwise-proven Landscape origin of this
@@ -20673,7 +20673,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "730473cf9d5628ab",
             1,
             "SessionSchemaAuthority",
-            line=285,
+            line=288,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -20683,7 +20683,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "d7ac5811a7ee7916",
             1,
             "SessionSchemaAuthority",
-            line=320,
+            line=323,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -20693,7 +20693,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "983f117ba847fe0d",
             1,
             "SessionSchemaAuthority",
-            line=434,
+            line=437,
         ),
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",
