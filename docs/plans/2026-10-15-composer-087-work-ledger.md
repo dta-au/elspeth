@@ -7,7 +7,7 @@ do not start a competing ledger. It is ordinary editable project documentation.
 The full per-fix inventory is [master issue #315](https://github.com/dta-au/elspeth/issues/315)
 and its [repository snapshot](2026-10-16-composer-087-master-defect-list.md).
 
-## Current operating record — 16 October 2026, 10:30 UTC
+## Current operating record — 16 October 2026, after local qualification
 
 Work is active. John has not requested a new pause. The [one-time independent
 Astra governance review](../reviews/2026-10-16-composer-087-governance-review.md)
@@ -15,13 +15,17 @@ accepted the stop/resume structure subject to two stale-record corrections;
 root has applied both below and owns subsequent maintenance. Recheck native
 refs, manifests and process identity before using this dated snapshot.
 
+The independently reviewed snapshot and root correction hashes are preserved
+in that review. Governance commit `4d3362dc` contains the corrected records;
+the live record is subsequently maintained normally, with no second audit.
+
 ### Custody and delivery state
 
 | Surface or owner | Current identity and boundary |
 |---|---|
 | Host / operator | `nyx.foundryside.dev`, Unix user `john`, UID 1000; sole device/checkout custody authorized by John. |
-| LOCAL release target | `codex/composer087-contracts-20261015`, HEAD `444fc144f211b3437e71051813f639c2460a32cd`, root's assigned d66a ELSPETH worktree. Resolve its absolute root with `git rev-parse --show-toplevel`; do not switch a different shared checkout. |
-| SHARED / PR | [PR #316](https://github.com/dta-au/elspeth/pull/316), published head `e91bd01deee7ed743f4358eb590b7c0d05ca37ff`, base `main`; open, mergeable but blocked at 10:15:49 UTC. Root is the sole publisher/integrator. |
+| LOCAL release target | `codex/composer087-contracts-20261015`, HEAD `f3f9734b1264c9000c9ec1b01b252d2144774412`, root's assigned d66a ELSPETH worktree. This integrates DEP-01/CIQ-01 above governance `4d3362dc` and SMK-12A `444fc144`. Resolve the absolute root with `git rev-parse --show-toplevel`; do not switch a different shared checkout. |
+| SHARED / PR | [PR #316](https://github.com/dta-au/elspeth/pull/316), published head `e91bd01deee7ed743f4358eb590b7c0d05ca37ff`, base `main`; open, mergeable but blocked at 11:47:13 UTC. Root is the sole publisher/integrator. |
 | MAIN | `ac7e5aac43b4f20bd10dd420b43dd439f5371f55` at that API check. No main merge of this package is claimed. |
 | Root | This task, ID `01a140e3-fc15-7900-b0c5-cc80ebc95fb2`; owns release qualification, capacity, integration, one batch PR update and protected merge. |
 | Direction relay | Emmy's authorized thread `01a12334-35ad-748b-99eb-2d3a16598084`, host `durable`. John recognizes its authority. Direct current John instructions supersede older relay/time rules. Delivery errors are not acknowledgments. |
@@ -30,17 +34,17 @@ refs, manifests and process identity before using this dated snapshot.
 | Finished SMK-12 owner | `/root/implementation` relinquished custody. Its stopped `/tmp/elspeth087-smk12-projection-20261016` checkout still has eight dirty paths based on `e91bd01d`; these bytes are already committed as LOCAL `444fc144`. Preserve as evidence; do not replay that patch or resume its writer. |
 | Other old lanes | No other development owner is authorized. `/root/astra_obligations` was `pending_init`, not an active writer; do not repair shared daemons or activate stale assignments to work around it. Query actual agent status before dispatch. |
 
-The root checkout was clean at the 10:17 native inspection, before this ledger
-and documentation update. Root-owned uncommitted documentation is this ledger,
-the master list and `docs/reviews/2026-10-16-composer-087-governance-review.md`.
-The private candidate's five uncommitted paths are:
+The root checkout was clean after native source commit `f3f9734b`, before this
+later status update. Root-owned uncommitted documentation is this ledger and
+the master list; the governance review is already committed in `4d3362dc`.
+The private frozen candidate's five uncommitted paths are:
 `pyproject.toml`, `uv.lock`, `scripts/ci_test_shards.py`,
 `tests/unit/test_runtime_dependency_contract.py`, and
 `tests/unit/cicd/test_ci_sharding.py`. Do not stash, clean or restore any owner.
 
-Thirteen accepted implementation commits are explicitly listed and
-ancestor-checked in the master list: twelve are SHARED, SMK-12A `444fc144` is
-LOCAL only. The master rows are overlapping views, not additive completion
+Fourteen accepted implementation commits are explicitly listed and
+ancestor-checked: twelve are SHARED, SMK-12A `444fc144` and DEP-01/CIQ-01
+`f3f9734b` are LOCAL only. The master rows are overlapping views, not additive completion
 counts. Numbered items 0–18, all smoke/system/UI/shared-link findings and
 conditional work remain there. The current package is the approved coupled
 DEP-01 (P1 dependency ownership) / CIQ-01 (P2 terminal evidence) repair.
@@ -63,10 +67,19 @@ starts until this development custody is relinquished and root selects one.
 - John's latest scope threshold is **60 minutes of remaining implementation,
   focused checks, integration and review, excluding full-suite time**. Report
   full-suite time separately. This replaces the old total 120-minute rule.
-  John explicitly approved both DEP-01 and CIQ-01; current estimate is
-  5–15 minutes remaining review/integration after owner closure, plus an
-  independently accounted 80–90 minute full gate, now running. Refresh estimates if
-  new work changes them; do not count completed work again on resume.
+  John explicitly approved both DEP-01 and CIQ-01. Implementation, integration
+  and local qualification are complete; documentation/preflight/batch publication
+  remain, estimated 15–25 minutes. The completed full default stage took
+  43 minutes 25 seconds and PostgreSQL 26 minutes 16 seconds, accounted
+  separately. Refresh estimates if new work changes them; do not count
+  completed work again on resume.
+- Any change in `src/`, a fixture or shared test infrastructure requires a full
+  suite. The purpose is to catch formerly green tests becoming silently red.
+  John's specific exception for the ten missing-frontend-dependency failures
+  permits preserving the frozen full run and rerunning those exact cases when
+  restoring external prerequisites changes no source, fixture or shared test
+  infrastructure. A repair that changes any such input invalidates this
+  exception and requires a new full suite. Original red runs remain red.
 - Deliver the tested ready package by **18 October 2026, 07:45 UTC / 18:45 AEDT**.
   Aspirational scope is not a prerequisite to that release. At the operator's
   cutoff, triage remaining work for 0.8.8; this does not authorize 0.8.8 coding.
@@ -98,16 +111,17 @@ The public master contains safe summaries, not diagnostic archives or secrets.
 
 | Evidence | Exact boundary and next action |
 |---|---|
-| SMK-12A integration | `444fc144` parent `e91bd01d`; `smk12-integration-commit-result.json` records normal preflight/hooks and all eight exact committed files. `smk12-projection-implementation.md` and `reviews/smk12-projection-final-evidence-review.md` link final source-writer 24-pass, scanned-gates 368-pass and 30 intended witnessed failures in separate executions. Full release qualification under corrected dependencies remains due. |
+| SMK-12A integration | `444fc144` parent `e91bd01d`; `smk12-integration-commit-result.json` records normal preflight/hooks and all eight exact committed files. `smk12-projection-implementation.md` and `reviews/smk12-projection-final-evidence-review.md` link final source-writer 24-pass, scanned-gates 368-pass and 30 intended witnessed failures in separate executions. The corrected-runtime composite local qualification below includes these unchanged source/test inputs. |
 | Earlier full gate | Frozen checkout `/tmp/elspeth087-validation-696db482-20261016/smk06-integrated-target`, HEAD `450f348211a43d44e436533216498cf71b686893`; log directory `/tmp/elspeth087-validation-696db482-20261016/smk06-integrated-gates/20261016T064259Z-smk06-integrated-target-1819454`. Driver exit 0, `RESULT=PASS`, frozen=yes; default 68780 passed/104 skipped/2 xfailed; PG 1042 passed/one optional skip. Its actual installed files were Slim 0.21.1 despite Typer 0.25.1 metadata. Preserve these historical results, but do not reuse them to qualify full Typer 0.25.1 or current combined inputs. Do not edit this stopped clone or its private venv. |
 | DEP-01 reproduction | Sol's `ownership312.json` / `ownership313.json` show old clean installs execute Slim 0.21.1. Four initial regression cases fail as intended. Locked repair selects dependency-only Slim 0.24.0 while retaining full Typer 0.25.1. Fresh corrected sync and effective-version checks pass on 3.12 and 3.13. Arbitrary downstream pip resolution remains outside this locked UV repair. |
-| Final coupled artifact | `/tmp/elspeth087-dep01-20261016/.claude/lanes/dep01/dep01-ciq01-final.patch`, SHA256 `958a4b8b94daf8d19b04a4967ec089339adb628e07915897746d4cb4b6df6391`; sibling `final-patch-manifest.json` records all five file hashes. Root and Astra independently matched every current file. Old `dep01-ciq01.patch` / `patch-manifest.json`, SHA `ebe06b5...`, are superseded evidence and must not be integrated. |
+| Final coupled artifact and integration | `/tmp/elspeth087-dep01-20261016/.claude/lanes/dep01/dep01-ciq01-final.patch`, SHA256 `958a4b8b94daf8d19b04a4967ec089339adb628e07915897746d4cb4b6df6391`; sibling `final-patch-manifest.json` records all five hashes. Root/Astra matched every file. Root native commit `f3f9734b` contains exactly those five matching blobs, normal preflight/hooks exit0 and clean postcommit status (`dep01-root-commit-result.json`). All 6588 non-governance tracked inputs match the qualified candidate; only the three governance docs differ (`dep01-composite-local-qualification.json`). Do not replay this integrated patch. Old `dep01-ciq01.patch` / `patch-manifest.json`, SHA `ebe06b5...`, are superseded evidence. |
 | Coupled focused evidence | Final `review-final312.log` and `review-final313.log` each show 27 passing cases; `completed-command-exit-history.json` preserves exact commands and observed shell exits 0 from owner tool history, explicitly retrospective rather than original native sidecars. Real collection-child `.exit`/manifest receipts directly show exit2, no coverage/digest and false no-call proof. Shadow, competing-owner and changed-byte controls fail at intended assertions; CLI consumers pass 496. The earlier 929-case selection had disclosed test edits and is not final frozen evidence. PermissionError/IsADirectoryError propagation is source-supported, not separately executed; do not claim otherwise. |
-| Actual reserve proof | Completed Python 3.13 reserve proof: one passed in 321.63 seconds, observed shell exit0 preserved in the same retrospective tool-history receipt and reviewed by Astra. `reserve-inputs.json` records unchanged production/proof inputs; test-only guard edits during the run mean it is not a whole-tree frozen receipt. Root's live canonical gate qualifies the finished tree. |
+| Actual reserve proof | Completed Python 3.13 reserve proof: one passed in 321.63 seconds, observed shell exit0 preserved in the same retrospective tool-history receipt and reviewed by Astra. `reserve-inputs.json` records unchanged production/proof inputs; test-only guard edits during the run mean it is not a whole-tree frozen receipt. Root's completed composite local qualification covers the finished tree. |
 | Independent patch review | Root-lane `reviews/dep01-ciq01-final-owner-report.md` and `reviews/dep01-ciq01-final-review-astra.md` record owner closure and independent ACCEPT of the exact final patch. Plan-only review remains historical. Actual failed CI-host bytes remain unknown; no particular installer interleaving is proved. |
-| Root full gate | Running since 10:26:31 UTC on `/tmp/elspeth087-dep01-20261016`, base `444fc144` plus final patch above. `.venv` resolves to `/tmp/elspeth087-dep01-20261016/.claude/lanes/dep01/repaired313`, Python 3.13.15, Typer effective/metadata 0.25.1, Slim 0.24.0. Driver PID2597211; run `/tmp/elspeth087-dep01-gates/20261016T102631Z-elspeth087-dep01-20261016-2594051`. Initial tree state `444fc144f211b3437e71051813f639c2460a32cd b968db325b4eeca1`; both import roots verified private. Ruff/mypy/contracts have terminal exit0 and healthy watchers; lints/default/serialPG and final freeze remain pending. Do not mutate this candidate or start another broad suite. |
-| Keyless trust tier | Standing corpus previously 3277, semantic no-drift for finished bounded packets. It is diagnostic, not operator signature clearance. Compare current changed production inputs honestly; operator verifies/signs after churn. Never hand-edit signatures. |
-| Current CI | At 10:15:49 UTC, PR `e91bd01d`: 32 successes, five running, one reserve-actual-sources 3.13 collection failure. Run [38874373133](https://github.com/dta-au/elspeth/actions/runs/38874373133); failing job [116885751657](https://github.com/dta-au/elspeth/actions/runs/38874373133/job/116885751657) has 70 collection errors, one skip and no proof assertion execution. CodeQL, cohort and redaction passed; CI Success is still pending/blocked. Existing API snapshot `release-pr-latest-checks.json` is head-pinned. No retries/cancellations performed. |
+| Root full gate | Completed on `/tmp/elspeth087-dep01-20261016`, base `444fc144` plus final patch above. Private Python 3.13.15, effective/metadata Typer 0.25.1, Slim 0.24.0; both import roots verified. Run `/tmp/elspeth087-dep01-gates/20261016T102631Z-elspeth087-dep01-20261016-2594051` began 10:26:31 UTC. Ruff/mypy/contracts exit0; default exit1: 68844 passed, ten failed, 113 skipped, two xfailed. All ten failed before browser behavior because checkout-local esbuild/Playwright dependencies were absent. Serial PostgreSQL exit0: 1042 passed, one optional ddtrace skip. Terminal `.done` and driver exit1 preserve `RESULT=FAIL`; before/after state `444fc144f211b3437e71051813f639c2460a32cd b968db325b4eeca1`, frozen=yes, six healthy watchers. `dep01-canonical-terminal-receipt.json` records native results. |
+| Missing frontend prerequisites / composite local green | Pinned `npm ci` exited0 without changing any tracked input or lockfile. Existing Chromium launches in the authorized host context. `/tmp/elspeth087-dep01-ten-20261016/inputs.json`, `pytest.exit`, `junit.xml` and `summary.json` record the exact ten original failed identities rerun serially: ten passed, zero skips, native exit0, 82 seconds, tracked inputs continuously frozen over 15 samples. The controlled fingerprint detects changed bytes. `dep01-frontend-restoration-scope.json` records zero source/fixture/shared-infrastructure changes; no formerly green test was changed by this repair. John's explicit ruling accepts these receipts together with the original frozen full run and passing PG as local green, without another full suite. The original canonical result remains FAIL. |
+| Keyless trust tier | Current canonical scan exit1, 3277 standing findings. Controlled relative-path/line/column/rule/message multiset comparison against final SMK-12 scan gives zero added/removed; `dep01-keyless-semantic-comparison.json` also proves same-count mutation detection. This is diagnostic, not operator signature clearance. Operator verifies/signs after churn; never hand-edit signatures. |
+| Current CI | At 11:47:13 UTC, original PR `e91bd01d` run is terminal: 36 successful checks, four failures, one skipped. Run [38874373133](https://github.com/dta-au/elspeth/actions/runs/38874373133); reserve job [116885751657](https://github.com/dta-au/elspeth/actions/runs/38874373133/job/116885751657) failed collection before proof execution. Ordinary3.13 shard6 native JUnit has 8510 cases, 30 failures, 72 errors, nine skips; 100 bad events directly show Typer import collision and two fixture errors report missing `elspeth.cli`. Both corresponding bootstrap-preflight cases pass in the corrected full run. Combined coverage stopped at prerequisite refusal before aggregation; CI Success failed consequently. Source classification/artifacts live under `ci-shard313-6-*`; API snapshot `release-pr-latest-checks.json` is head-pinned. CodeQL/cohort/redaction pass. One qualified batch update remains; no retries/cancellations performed. |
 | Protected merge | Re-fetch current main/base and exact published head; required checks are CI Success, CodeQL, cohort-attribution and redaction, with strict branch protection. Root performs normal branch-safety before push/merge, no bypass. Green focused/local tests alone never imply protected merge, signatures, deployment or live acceptance. |
 
 For every test invocation, set BOTH source roots and verify both import paths.
@@ -121,8 +135,8 @@ cd "$ELSPETH_GATE_ROOT" && scripts/full-suite-gate.sh --execute --detach \
   --root "$ELSPETH_GATE_ROOT" --log-dir /tmp/elspeth087-dep01-gates
 ```
 
-The exact root, interpreter, patch, launch time, run path and driver PID are
-recorded above. A resume must inspect that live run before considering a restart.
+The exact root, interpreter, patch, launch time and terminal run path are
+recorded above. A resume must inspect these receipts before allocating more work.
 Read terminal `.done`, `driver.exit`, `summary.txt`, per-stage exits and full
 JUnit, not piped output. Require matching before/after inputs and healthy
 watcher lifetimes. A driver launch exit 0 is not a passed gate.
@@ -162,8 +176,8 @@ CPU-tick change across five seconds. These processes remain unidentified and
 untouched. Load was 2.51/5.54/8.35, available memory 54 GiB; `/tmp` had 406 GiB
 free. They did not block the conservatively assigned eight-worker gate.
 `governance-sibling-idle-sample.json` preserves the samples. Docker was reachable
-and existing `/usr/bin/caddy` v2.11.6 verified. Gate driver2597211 is the current
-owned live run; query its descendants and start identity before any interruption.
+and existing `/usr/bin/caddy` v2.11.6 verified. Gate driver2597211 has a complete
+terminal receipt; the ten-case follow-up also exited0. Do not reuse old PIDs.
 Inventory is dated; refresh it before new allocation. PIDs alone are never
 reusable authority.
 
@@ -200,14 +214,19 @@ On an explicit pause or engine-restart request:
    and one broad suite. Do not resume stopped SMK-12 or pending stale review work.
 3. Verify final patch/file hashes against its declared base and the current
    candidate, correct private environment, both import roots and Typer effective
-   version/import ownership/RECORD. If a gate is already live and frozen, monitor
+   version/import ownership/RECORD. Before browser acceptance, provision the
+   checkout-local pinned frontend dependencies and verify esbuild, Playwright,
+   Chromium launch and Caddy; file presence alone is insufficient. If a gate is
+   already live and frozen, monitor
    it. If completed, inspect actual terminal receipts before allocating any
    missing check. Repeat only invalidated or failed evidence; never silently
    convert interrupted/historical runs into passes.
-4. Finish DEP-01/CIQ-01 only: final source/control review, combined canonical
-   gate and any necessary narrow repairs. Absorb root documentation into the
-   release target separately without mutating a live frozen candidate. Check
-   exact reviewed blobs, normal branch-safety and normal hooks before commit.
+4. DEP-01/CIQ-01 is already integrated as `f3f9734b`; do not reapply it or rerun
+   completed focused work. Verify the completed full/PG and exact-ten receipts
+   and unchanged source equivalence. Local green follows John's explicit
+   prerequisite-only exception; do not relabel the original red run. Any later
+   `src/`, fixture or shared-test-infrastructure change requires a full suite.
+   Preserve source equivalence when maintaining root documentation separately.
 5. When the combined package is locally green, update master statuses with
    verified commits, then perform one batch PR update. Record new SHARED head
    and required exact-head checks; preserve current failure disclosure as history.
