@@ -28,7 +28,6 @@ from elspeth.contracts.value_source import get_catalog_values
 from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionParser
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import (
-    PluginNotFoundError,
     get_shared_plugin_manager,
     http_fetch_transform_names,
 )
@@ -85,11 +84,11 @@ from elspeth.web.composer.tools._common import (
     ToolContext,
     ToolResult,
     _discovery_result,
-    _failure_result,
-    _plugin_policy_failure,
+    _plugin_selection_violation,
+    _saved_graph_plugin_policy_failure,
+    _saved_graph_rejection_result,
     _source_options_for_prevalidation,
     _validate_mutation_arguments,
-    _validate_plugin_name,
     diff_states,
 )
 from elspeth.web.composer.tools._generation_responses import (
@@ -312,16 +311,11 @@ def _handle_get_plugin_schema(
     validated = _validate_mutation_arguments(GetPluginSchemaArgumentsModel, arguments, "get_plugin_schema arguments")
     plugin_type = validated.plugin_type
     name = validated.name
-    policy_error = _validate_plugin_name(context, plugin_type, name)
+    policy_error = _plugin_selection_violation(context, plugin_type, name)
     if policy_error is not None:
-        return _plugin_policy_failure(state, policy_error)
-    try:
-        schema = context.catalog.get_schema(plugin_type, name)
-        return _discovery_result(state, schema)
-    except (ValueError, KeyError) as exc:
-        # ValueError: catalog contract for "unknown plugin/type"
-        # KeyError: LLM omitted required argument (Tier 3)
-        return _failure_result(state, str(exc))
+        return _saved_graph_plugin_policy_failure(state, policy_error, component=None, rejected_component=None)
+    schema = context.catalog.get_schema(plugin_type, name)
+    return _discovery_result(state, schema)
 
 
 _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
@@ -2271,44 +2265,27 @@ def _execute_get_plugin_assistance(
     a "no assistance published" payload (summary=None, empty lists)
     rather than failing — the absence is itself a useful signal.
 
-    Unknown plugin name or invalid plugin_type surfaces here as a tool
-    failure with the original message so the agent can correct the call.
+    Unavailable selections return the policy owner's refusal. Invalid
+    arguments belong to the owned argument model; admitted catalog or
+    manager inconsistencies propagate through their fault owners.
     """
     validated = _validate_mutation_arguments(GetPluginAssistanceArgumentsModel, args, "get_plugin_assistance arguments")
-    plugin_type_raw = validated.plugin_type
+    plugin_type = validated.plugin_type
     plugin_name = validated.plugin_name
-    # ``args`` is LLM tool-call arguments (Tier 3). ``plugin_type``/``plugin_name``
-    # are required (json_schema ``required``) so direct subscript lets a KeyError
-    # surface an LLM contract violation; ``issue_code`` is optional (discovery vs
-    # failure mode), so its absence is recorded honestly as ``None`` via the
-    # membership form rather than a defensive ``.get``.
     issue_code = validated.issue_code
 
-    if plugin_type_raw not in ("source", "transform", "sink"):
-        return _failure_result(
-            state,
-            f"Unknown plugin_type: {plugin_type_raw!r}. Must be one of: 'source', 'transform', 'sink'.",
-        )
-    plugin_type: PluginKind = plugin_type_raw
-
-    policy_error = _validate_plugin_name(context, plugin_type, plugin_name)
+    policy_error = _plugin_selection_violation(context, plugin_type, plugin_name)
     if policy_error is not None:
-        return _plugin_policy_failure(state, policy_error)
-    try:
-        context.catalog.get_schema(plugin_type, plugin_name)
-    except (ValueError, KeyError) as exc:
-        return _failure_result(state, str(exc))
+        return _saved_graph_plugin_policy_failure(state, policy_error, component=None, rejected_component=None)
+    context.catalog.get_schema(plugin_type, plugin_name)
 
     manager = get_shared_plugin_manager()
-    try:
-        if plugin_type == "source":
-            plugin_cls: Any = manager.get_source_by_name(plugin_name)
-        elif plugin_type == "transform":
-            plugin_cls = manager.get_transform_by_name(plugin_name)
-        else:
-            plugin_cls = manager.get_sink_by_name(plugin_name)
-    except PluginNotFoundError as exc:
-        return _failure_result(state, str(exc))
+    if plugin_type == "source":
+        plugin_cls: Any = manager.get_source_by_name(plugin_name)
+    elif plugin_type == "transform":
+        plugin_cls = manager.get_transform_by_name(plugin_name)
+    else:
+        plugin_cls = manager.get_sink_by_name(plugin_name)
 
     assistance = plugin_cls.get_agent_assistance(issue_code=issue_code)
     if assistance is not None:
@@ -4533,10 +4510,11 @@ def _execute_diff_pipeline(
         # A failure, not a success carrying an ``error`` key: ``error`` is a
         # failure-only key on every surface (elspeth-e405ad7cd2 D5). The
         # current version already rides the envelope's ``version``.
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             "No baseline available. Load or create a session first.",
             error_code="diff_baseline_unavailable",
+            rejected_component=None,
         )
 
     baseline_validation = context.catalog.validate_composition_state(baseline).validation

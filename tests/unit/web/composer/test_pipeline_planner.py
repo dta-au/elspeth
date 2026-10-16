@@ -3555,16 +3555,28 @@ async def test_mutation_or_unknown_tool_is_rejected_without_dispatch_or_retry(
 async def test_invalid_candidate_gets_allowlisted_feedback_then_repairs(
     tmp_path: Path,
     tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Lowercase because sink names are: the advertised terminal schema now
-    # discloses that rule, so an upper-cased name is intercepted by the
-    # structural pre-check and this test would never reach the Stage-1
-    # allowlist it exists to pin (elspeth-2e9df07c69). The canary's job is to
-    # ride along in the candidate and prove no raw validator text escapes.
+    # Preserve valid non-inline source/output custody so the real Stage-1
+    # edge validator, rather than an earlier binding-context refusal, owns
+    # the raw diagnostic whose private text must not reach feedback or audit.
     raw_canary = "raw_validation_exception_canary"
+    valid = _pipeline(tmp_path)
+    invalid = deepcopy(valid)
+    invalid["edges"] = [{"id": "invalid_edge", "from_node": "source", "to_node": raw_canary, "edge_type": "on_success"}]
+    assert invalid["source"] == valid["source"] and invalid["outputs"] == valid["outputs"]
+    actual_validate = CompositionState.validate
+    raw_validations: list[ValidationSummary] = []
+
+    def observe_validate(state: CompositionState) -> ValidationSummary:
+        validation = actual_validate(state)
+        raw_validations.append(validation)
+        return validation
+
+    monkeypatch.setattr(CompositionState, "validate", observe_validate)
     completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path, output_name=raw_canary)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": invalid})),
+        _response(("emit_pipeline_proposal", {"pipeline": valid})),
     )
     recorder = BufferingRecorder()
 
@@ -3577,13 +3589,17 @@ async def test_invalid_candidate_gets_allowlisted_feedback_then_repairs(
     )
 
     assert proposal.proposal.repair_count == 1
+    assert len(completion.requests) == 2
+    raw_errors = [entry for validation in raw_validations for entry in validation.errors if entry.error_code == "edge_unknown_node"]
+    assert raw_errors
+    assert all(entry.component == "edge:invalid_edge" and raw_canary in entry.message for entry in raw_errors)
     feedback = completion.requests[1]["messages"][-1]
     assert feedback["role"] == "tool"
-    # "guidance" is a static usage line (how to expand a code via
-    # explain_validation_error) — never per-request data, so it does not
-    # widen the redaction boundary this allowlist protects.
-    assert set(json.loads(feedback["content"])) == {"success", "validation", "guidance"}
     feedback_payload = json.loads(feedback["content"])
+    # Every entry is enriched with its static catalogue pair, so the generic
+    # top-level explain-tool usage line is unnecessary and must be absent.
+    assert set(feedback_payload) == {"success", "validation"}
+    assert feedback_payload["success"] is False and feedback_payload["validation"]["is_valid"] is False
     assert set(feedback_payload["validation"]) == {"is_valid", "errors"}
     # Closed codes may additionally carry the STATIC catalogue enrichment
     # (explanation/suggested_fix, always paired) and schema-contract entries
@@ -3595,6 +3611,18 @@ async def test_invalid_candidate_gets_allowlisted_feedback_then_repairs(
         assert ("explanation" in item) == ("suggested_fix" in item), item
     assert raw_canary not in feedback["content"]
     assert raw_canary not in canonical_json([call.to_dict() for call in recorder.llm_calls])
+    guidance = explain_validation_code("edge_unknown_node")
+    assert guidance is not None
+    assert feedback_payload["validation"]["errors"] == [
+        {
+            "component": "edge:invalid_edge",
+            "severity": "high",
+            "error_code": "edge_unknown_node",
+            "error_class": "ValidationError",
+            "explanation": guidance[0],
+            "suggested_fix": guidance[1],
+        }
+    ]
 
 
 @pytest.mark.asyncio
