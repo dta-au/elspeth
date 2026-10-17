@@ -1,7 +1,7 @@
 import { installComposeTurnDouble } from "@/test/composeTurnDouble";
 import recoveryProducerFixtures from "@/test/composerRecoveryProducerFixtures.json";
 import { authenticateComposerCustody, purgeComposerCustody } from "@/stores/composerOperationCustody";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   act,
   fireEvent,
@@ -1832,5 +1832,260 @@ describe("App empty landing and auto-resume", () => {
 
     expect(onArtifactRequest).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+});
+
+describe("App shared-route keyboard isolation", () => {
+  const recipient: Session = {
+    id: "11111111-1111-4111-8111-111111111111",
+    title: "Recipient workspace",
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: "2026-07-01T00:00:00Z",
+  };
+  const created: Session = {
+    ...recipient,
+    id: "33333333-3333-4333-8333-333333333333",
+    title: "New workspace",
+  };
+  const sharedHashes = [
+    "#/shared/tok-abc",
+    "#/shared",
+    "#/shared/",
+    "#/shared/abc%ZZ",
+  ];
+  const modifiers = ["ctrlKey", "metaKey"] as const;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStore(useSessionStore);
+    resetStore(usePreferencesStore);
+    useExecutionStore.getState().reset();
+    useMailboxStore.getState().reset();
+    useAuthStore.setState({
+      token: "test-token",
+      user: {
+        user_id: "test-001",
+        username: "test-operator",
+        display_name: null,
+        email: null,
+        groups: [],
+        dev_admin: false,
+      },
+    });
+    localStorage.clear();
+    window.history.replaceState(null, "", "/");
+    usePreferencesStore.setState({
+      loaded: true,
+      tutorialCompleted: true,
+      tutorialCompletedAt: "2026-07-01T00:00:00Z",
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValue(undefined);
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+    } satisfies SystemStatus);
+    vi.spyOn(api, "fetchSessions").mockResolvedValue([]);
+    vi.spyOn(api, "fetchRuns").mockResolvedValue([]);
+    vi.spyOn(api, "createSession").mockResolvedValue(created);
+    vi.spyOn(useExecutionStore.getState(), "validate").mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function press(
+    key: string,
+    modifier: (typeof modifiers)[number] = "ctrlKey",
+    shiftKey = false,
+  ): Promise<KeyboardEvent> {
+    const event = new KeyboardEvent("keydown", {
+      key,
+      [modifier]: true,
+      shiftKey,
+      bubbles: true,
+      cancelable: true,
+    });
+    await act(async () => {
+      document.dispatchEvent(event);
+    });
+    return event;
+  }
+
+  async function mountSurface(hash: string, surface = "workspace") {
+    if (surface === "workspace") {
+      vi.mocked(api.fetchSessions).mockResolvedValue([recipient]);
+      useSessionStore.setState({
+        sessions: [recipient],
+        sessionsLoaded: true,
+        activeSessionId: recipient.id,
+        compositionStateLoaded: true,
+        compositionState: {
+          ...makeState(7),
+          sources: { source: { plugin: "csv", options: {} } },
+        },
+        messages: [makeAssistantMessage()],
+      });
+    } else {
+      useSessionStore.setState({ sessionsLoaded: true });
+      if (surface === "tutorial") {
+        usePreferencesStore.setState({
+          tutorialCompleted: false,
+          tutorialCompletedAt: null,
+        });
+      }
+    }
+    window.history.replaceState(null, "", hash);
+    const mounted = render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    if (hash.startsWith("#/shared")) {
+      await screen.findByTestId(
+        hash === "#/shared/tok-abc" ? "shared-inspect-loading" : "shared-inspect-error",
+      );
+      expect(screen.queryByTestId("composer-workspace-stub")).toBeNull();
+    } else if (surface === "workspace") {
+      await screen.findByTestId("composer-workspace-stub");
+    } else if (surface === "tutorial") {
+      await screen.findByTestId("tutorial-stub");
+    } else {
+      await screen.findByText("No sessions yet");
+    }
+    await act(async () => { await Promise.resolve(); });
+    act(() => {
+      useExecutionStore.setState({
+        validationResult: makeValidationResult({ readiness: READY_VALIDATION_READINESS }),
+        isExecuting: false,
+        progress: null,
+      });
+    });
+    vi.mocked(useExecutionStore.getState().validate).mockClear();
+    vi.mocked(api.createSession).mockClear();
+    return mounted;
+  }
+
+  for (const hash of sharedHashes) {
+    it.each(modifiers)(`blocks real New Session via %s on ${hash}`, async (modifier) => {
+      await mountSurface(hash);
+      const before = useSessionStore.getState();
+      const validationBefore = useExecutionStore.getState().validationResult;
+      const event = await press("n", modifier);
+      expect({
+        calls: vi.mocked(api.createSession).mock.calls,
+        session: useSessionStore.getState().activeSessionId,
+        composition: useSessionStore.getState().compositionState,
+        messages: useSessionStore.getState().messages,
+        validation: useExecutionStore.getState().validationResult,
+      }).toEqual({
+        calls: [],
+        session: before.activeSessionId,
+        composition: before.compositionState,
+        messages: before.messages,
+        validation: validationBefore,
+      });
+      expect(event.defaultPrevented).toBe(false);
+      expect(window.location.hash).toBe(hash);
+    });
+
+    it.each(modifiers)(`blocks real validation queue via %s on ${hash}`, async (modifier) => {
+      await mountSurface(hash);
+      const before = useSessionStore.getState();
+      const event = await press("V", modifier, true);
+      expect(useExecutionStore.getState().validate).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().activeSessionId).toBe(before.activeSessionId);
+      expect(useSessionStore.getState().compositionState).toBe(before.compositionState);
+      expect(event.defaultPrevented).toBe(false);
+      expect(window.location.hash).toBe(hash);
+    });
+
+    it.each(modifiers)(`leaves workspace intent chords dormant via %s on ${hash}`, async (modifier) => {
+      await mountSurface(hash);
+      const events = vi.fn();
+      const names = ["open-catalog", REQUEST_ARTIFACT_VIEW_EVENT, FOCUS_AUTHORING_EVENT, REQUEST_RUN_EVENT];
+      for (const name of names) window.addEventListener(name, events);
+      try {
+        for (const [key, shift] of [["k", false], ["P", true], ["G", true], ["Y", true], ["/", false], ["e", false]] as const) {
+          expect((await press(key, modifier, shift)).defaultPrevented).toBe(false);
+        }
+        const help = new KeyboardEvent("keydown", { key: "?", bubbles: true, cancelable: true });
+        act(() => { document.dispatchEvent(help); });
+        expect(help.defaultPrevented).toBe(false);
+        expect(screen.queryByTestId("shortcuts-help-stub")).toBeNull();
+        expect(events).not.toHaveBeenCalled();
+        expect(window.location.hash).toBe(hash);
+      } finally {
+        for (const name of names) window.removeEventListener(name, events);
+      }
+    });
+  }
+
+  for (const surface of ["workspace", "empty", "tutorial"]) {
+    it.each(modifiers)(`retains real New Session via %s on ordinary ${surface}`, async (modifier) => {
+      await mountSurface("/", surface);
+      expect((await press("n", modifier)).defaultPrevented).toBe(true);
+      expect(api.createSession).toHaveBeenCalledTimes(1);
+      expect(useSessionStore.getState().activeSessionId).toBe(created.id);
+      expect(useSessionStore.getState().compositionState).toBeNull();
+      expect(useExecutionStore.getState().validationResult).toBeNull();
+    });
+  }
+
+  it.each(modifiers)("retains real forced validation via %s on ordinary workspace", async (modifier) => {
+    await mountSurface("/");
+    expect((await press("V", modifier, true)).defaultPrevented).toBe(true);
+    expect(useExecutionStore.getState().validate).toHaveBeenCalledExactlyOnceWith(
+      recipient.id, { expectedVersion: 7 },
+    );
+  });
+
+  it.each(["empty", "tutorial"])("cleans up route transitions with stable %s shortcut inputs", async (surface) => {
+    const mounted = await mountSurface("/", surface);
+    const createSession = useSessionStore.getState().createSession;
+    const catalog = vi.fn();
+    window.addEventListener("open-catalog", catalog);
+    const assertStableInputs = () => {
+      expect(useSessionStore.getState().activeSessionId).toBeNull();
+      expect(useSessionStore.getState().compositionState).toBeNull();
+      expect(useSessionStore.getState().createSession).toBe(createSession);
+    };
+    try {
+      for (let round = 0; round < 2; round += 1) {
+        assertStableInputs();
+        catalog.mockClear();
+        expect((await press("P", "ctrlKey", true)).defaultPrevented).toBe(true);
+        expect(catalog).toHaveBeenCalledTimes(1);
+        for (const [hash, signal] of [["#/shared/tok-abc", "hashchange"], ["#/shared/abc%ZZ", "popstate"]] as const) {
+          act(() => {
+            window.history.replaceState(null, "", hash);
+            window.dispatchEvent(new Event(signal));
+          });
+          await screen.findByTestId(hash === "#/shared/tok-abc" ? "shared-inspect-loading" : "shared-inspect-error");
+          assertStableInputs();
+          catalog.mockClear();
+          expect((await press("P", "ctrlKey", true)).defaultPrevented).toBe(false);
+          expect(catalog).not.toHaveBeenCalled();
+          expect(window.location.hash).toBe(hash);
+        }
+        act(() => {
+          window.history.replaceState(null, "", "/");
+          window.dispatchEvent(new Event("hashchange"));
+        });
+        if (surface === "tutorial") await screen.findByTestId("tutorial-stub");
+        else await screen.findByText("No sessions yet");
+        assertStableInputs();
+      }
+      catalog.mockClear();
+      expect((await press("P", "ctrlKey", true)).defaultPrevented).toBe(true);
+      expect(catalog).toHaveBeenCalledTimes(1);
+      mounted.unmount();
+      catalog.mockClear();
+      expect((await press("P", "ctrlKey", true)).defaultPrevented).toBe(false);
+      expect(catalog).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("open-catalog", catalog);
+    }
   });
 });

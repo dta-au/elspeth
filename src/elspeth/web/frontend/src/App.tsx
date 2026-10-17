@@ -413,6 +413,7 @@ function App() {
 
   // Global keyboard shortcuts
   useEffect(() => {
+    if (isSharedRoute) return;
     function handleKeyDown(e: KeyboardEvent) {
       // Ctrl+K / Cmd+K: Open command palette
       if (e.key === "k" && (e.ctrlKey || e.metaKey)) {
@@ -530,6 +531,7 @@ function App() {
     catalogAvailable,
     compositionState,
     createSession,
+    isSharedRoute,
     runAdmissionAvailable,
   ]);
 
