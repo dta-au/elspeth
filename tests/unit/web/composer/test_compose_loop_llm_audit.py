@@ -587,7 +587,19 @@ async def test_tool_call_then_final_response_records_both_llm_calls() -> None:
     ):
         result = await service.compose("Set a name", [], state, session_id=session_id)
 
-    assert result.message == "Pipeline updated."
+    from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
+
+    raw = "Pipeline updated."
+    notice = (
+        "Checkpoint save status: Verified checkpoint evidence covers 1 saved draft revisions. "
+        "There are net authored changes from the starting draft. Checkpoint evidence does not establish task completion."
+    )
+    assert result.raw_assistant_content == raw
+    assert result.message == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+    assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+        AssistantTextSegment(raw),
+        TrustedSystemNoticeSegment(notice),
+    )
     assert [call.provider_request_id for call in result.llm_calls] == ["chatcmpl-tool", "chatcmpl-final"]
     assert [call.status for call in result.llm_calls] == [ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.SUCCESS]
     assert len(result.tool_invocations) == 1

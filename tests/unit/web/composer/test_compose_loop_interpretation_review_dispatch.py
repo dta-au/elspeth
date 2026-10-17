@@ -60,7 +60,12 @@ from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.composition_completion import _pending_interpretation_review_repair_message
 from elspeth.web.composer.interpretation_surfacing import _has_pending_prompt_template_requirement
 from elspeth.web.composer.invariants import InvariantError
-from elspeth.web.composer.no_tool_policy import ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE, is_pending_interpretation_handoff
+from elspeth.web.composer.no_tool_policy import (
+    ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE,
+    TrustedSystemNoticeSegment,
+    is_pending_interpretation_handoff,
+    visible_message_segments,
+)
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
@@ -109,6 +114,20 @@ from tests.unit.web.sessions.session_test_authority import FencedSessionServiceH
 # append in either rendering.
 _HANDOFF_SUFFIX = "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue."
 _PROSE_ONLY_CORRECTION = "I've corrected the spelling in my explanation. No pipeline settings were edited, and no records were processed."
+
+
+def _assert_checkpoint_receipt(message: str, raw: str | None, *, count: int | None = None) -> None:
+    segments = visible_message_segments(content=message, raw_content=raw)
+    receipts = [
+        segment
+        for segment in segments
+        if isinstance(segment, TrustedSystemNoticeSegment) and segment.content.startswith("Checkpoint save status: ")
+    ]
+    assert len(receipts) == 1
+    assert receipts[0] is segments[-1]
+    if count is not None:
+        assert receipts[0].content.startswith(f"Checkpoint save status: Verified checkpoint evidence covers {count} saved draft revisions.")
+
 
 # ---------------------------------------------------------------------------
 # Lightweight fake LLM that emits a single request_interpretation_review call.
@@ -1318,7 +1337,8 @@ async def test_successful_interpretation_review_rejects_reply_tool_calls_without
 
     segments = visible_message_segments(content=result.assistant_message, raw_content=result.raw_assistant_content)
     assert isinstance(segments[-1], TrustedSystemNoticeSegment)
-    assert "final reply is unavailable" in segments[-1].content
+    assert "final reply is unavailable" in segments[-2].content
+    _assert_checkpoint_receipt(result.assistant_message, result.raw_assistant_content, count=1)
     assert len(llm.messages) == 3
     assert {tool["function"]["name"] for tool in llm.tools[-1]} == {"handoff_to_user", "restore_parked_graph"}
     assert "review" in result.assistant_message.lower()
@@ -1866,6 +1886,7 @@ async def test_staged_handoff_branch_appends_exactly_one_suffix(
     assert result.assistant_message.startswith(_PROSE_ONLY_CORRECTION)
     assert result.raw_assistant_content == _PROSE_ONLY_CORRECTION
     assert "prose above contradicts" not in result.assistant_message
+    _assert_checkpoint_receipt(result.assistant_message, result.raw_assistant_content, count=1)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     assumption = next(e for e in events if e.kind is InterpretationKind.VAGUE_TERM)
     assert assumption.llm_draft == "modern, useful, engaging, and clear for the public."
@@ -2500,6 +2521,7 @@ async def test_budget_exhaustion_finalize_auto_surfaces_prompt_template(
     assert result.assistant_message.startswith(_PROSE_ONLY_CORRECTION)
     assert result.raw_assistant_content == _PROSE_ONLY_CORRECTION
     assert "prose above contradicts" not in result.assistant_message
+    _assert_checkpoint_receipt(result.assistant_message, result.raw_assistant_content, count=1)
 
 
 @pytest.mark.asyncio
@@ -4790,6 +4812,7 @@ async def test_advisor_repair_staged_handoff_does_not_claim_substituted_row_matc
     assert result.persisted_assistant_content == ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
     assert result.persisted_assistant_content != _REVIEW_TURN_PROSE
     assert result.persisted_assistant_matches_terminal_model_turn is False
+    _assert_checkpoint_receipt(result.assistant_message, result.raw_assistant_content)
     if with_prior_block:
         from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
 

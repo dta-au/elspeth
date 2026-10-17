@@ -2668,6 +2668,9 @@ async def test_checkpoint_deadline_cancels_provider_and_retains_timeout_audit(
 
 
 _ASSISTANT_CONTENT = "Done — the pipeline is ready."
+_ZERO_CHECKPOINT_SCOPE = (
+    "Verified checkpoint evidence covers 0 saved draft revisions. There is no net authored change from the starting draft."
+)
 
 
 @pytest.fixture
@@ -2862,7 +2865,7 @@ async def test_end_gate_unavailable_withholds_candidate_and_keeps_saved_scope(ma
 
     assert outcome.action == "return"
     result = outcome.result
-    prose = "No pipeline changes were saved in this request."
+    prose = _ZERO_CHECKPOINT_SCOPE
     assert result.raw_assistant_content == prose
     assert _ASSISTANT_CONTENT not in result.message
     assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in result.message
@@ -2934,7 +2937,7 @@ async def test_end_gate_refuses_admit_bound_to_a_previous_candidate_or_evidence(
     else:
         assert outcome.advisor_passes_delta == 1
         assert _ASSISTANT_CONTENT not in result.message
-        assert result.raw_assistant_content == "No pipeline changes were saved in this request."
+        assert result.raw_assistant_content == _ZERO_CHECKPOINT_SCOPE
         assert result.runtime_preflight.readiness.completion_ready is False
         assert _audit_row_origins(service) == ["advisor_publication_withheld", "advisor_signoff_withheld"]
 
@@ -3474,7 +3477,7 @@ async def test_end_gate_unrendered_verdict_chat_names_the_real_cause(
     # independent review failure remains a trusted suffix.
     raw = outcome.result.raw_assistant_content or ""
     segments = visible_message_segments(content=message, raw_content=raw)
-    assert segments[0] == AssistantTextSegment("No pipeline changes were saved in this request.")
+    assert segments[0] == AssistantTextSegment(_ZERO_CHECKPOINT_SCOPE)
     assert _ASSISTANT_CONTENT not in message
     assert len(segments) == 2
     assert type(segments[1]) is TrustedSystemNoticeSegment
@@ -3506,7 +3509,7 @@ async def test_end_gate_flagged_verdict_keeps_did_not_clear_chat(make_service, c
     assert outcome.action == "return"
     expected = _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE if preflight_shape == "absent" else _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE
     assert outcome.result.message.endswith(expected)
-    assert outcome.result.message.startswith("No pipeline changes were saved in this request.")
+    assert outcome.result.message.startswith(_ZERO_CHECKPOINT_SCOPE)
     assert _ASSISTANT_CONTENT not in outcome.result.message
     assert "MODEL_FINDING_CANARY" not in outcome.result.message
 
@@ -4239,7 +4242,7 @@ async def test_end_gate_masked_graph_failure_blocks_handoff_and_names_outstandin
     )
     # Only fixed backend chrome is trusted. The actual validator detail is
     # preserved as diagnostic text rather than replaced by advisor wording.
-    assert segments[0] == AssistantTextSegment("No pipeline changes were saved in this request.")
+    assert segments[0] == AssistantTextSegment(_ZERO_CHECKPOINT_SCOPE)
     assert segments[1] == TrustedSystemNoticeSegment(_PREFLIGHT_NOTICE_HEADER)
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER)
     assert any(isinstance(segment, AssistantTextSegment) and "Edge contract violation" in segment.content for segment in segments)
@@ -5322,7 +5325,7 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
     )
 
     assert outcome.action == "return"
-    assert outcome.result.raw_assistant_content == "No pipeline changes were saved in this request."
+    assert outcome.result.raw_assistant_content == _ZERO_CHECKPOINT_SCOPE
     assert _ASSISTANT_CONTENT not in outcome.result.message
     assert service._preflight.pending_handoff_outstanding_findings.await_count == 1
     # Three fenced audit rows: private candidate, graph disclosure, then the
@@ -5473,7 +5476,7 @@ async def test_blocked_turn_excludes_unreviewed_reply_from_next_turn_model_histo
         )
     assert outcome.action == "return"
     result = outcome.result
-    assert result.raw_assistant_content == "No pipeline changes were saved in this request."
+    assert result.raw_assistant_content == _ZERO_CHECKPOINT_SCOPE
     # Persist the terminal assistant row exactly as the route does
     # (sessions/routes/composer/compose.py): content=message, raw_content=prose.
     await sessions.add_message(
@@ -5486,7 +5489,7 @@ async def test_blocked_turn_excludes_unreviewed_reply_from_next_turn_model_histo
 
     history = _composer_chat_history(await sessions.get_messages(session.id, limit=None))
 
-    assert history[-1] == {"role": "assistant", "content": "No pipeline changes were saved in this request."}
+    assert history[-1] == {"role": "assistant", "content": _ZERO_CHECKPOINT_SCOPE}
     assert _ASSISTANT_CONTENT not in json.dumps(history)
     # The backend's disclosure replays as a user-role message between the
     # instruction and the reply.

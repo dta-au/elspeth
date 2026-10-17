@@ -761,14 +761,19 @@ def _assert_completed_trace_ledger(harness: _Harness, result: ComposeLoopTestRes
     assert {state.id for state in states} == ({cohort[1].composition_state_id} if cohort[1].composition_state_id else set())
     effects = review["saved_effects"]
     assert effects["verification"] == "verified" and effects["saved_revision_count"] == len(states)
-    if effects["net_changed"]:
-        saved_scope = f"This request saved {len(states)} draft revisions with verified changes. Saved changes do not establish that the requested task is complete."
-    elif states:
-        saved_scope = f"This request saved {len(states)} draft revisions. The final authored configuration has no net change from the request's starting draft."
-    else:
-        saved_scope = "No pipeline changes were saved in this request."
+    saved_scope = f"Verified checkpoint evidence covers {len(states)} saved draft revisions. " + (
+        "There are net authored changes from the starting draft."
+        if effects["net_changed"]
+        else "There is no net authored change from the starting draft."
+    )
     assert result.raw_assistant_content == saved_scope
-    assert result.assistant_message == saved_scope + no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+    base = saved_scope + no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+    notice = f"Checkpoint save status: {saved_scope} Checkpoint evidence does not establish task completion."
+    assert result.assistant_message == base + "\n\n" + notice
+    assert no_tool_policy.visible_message_segments(content=result.assistant_message, raw_content=saved_scope) == (
+        *no_tool_policy.visible_message_segments(content=base, raw_content=saved_scope),
+        no_tool_policy.TrustedSystemNoticeSegment(notice),
+    )
     assert result.runtime_preflight is not None and result.runtime_preflight.readiness.completion_ready is False
     assert (
         isinstance(result.advisor_gate_decision, AdvisorGateBlocked)

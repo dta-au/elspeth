@@ -2607,9 +2607,10 @@ class ComposerServiceImpl:
                             "the terminate-phase contract requires result to be set whenever the "
                             "phase signals a return."
                         )
+                    public_result = terminate.result
                     if advisor_repair_context_introduced:
-                        return await self._completion._qualified_advisor_repair_public_result(
-                            terminate.result,
+                        public_result = await self._completion._qualified_advisor_repair_public_result(
+                            public_result,
                             user_id=user_id,
                             session_id=session_id,
                             session_operation_context=session_operation_context,
@@ -2621,7 +2622,7 @@ class ComposerServiceImpl:
                             turn_evidence=turn_evidence,
                             user_message=message,
                         )
-                    return terminate.result
+                    return self._completion._append_checkpoint_receipt(public_result, turn_evidence=turn_evidence)
                 repair_turns_used += terminate.repair_turns_delta
                 advisor_checkpoint_passes_used += terminate.advisor_passes_delta
                 # The gate superseded this reply: it is never published, so keep
@@ -3078,9 +3079,10 @@ class ComposerServiceImpl:
                     )
                 if classify.result.graph_recovery_intent is not None:
                     return classify.result
+                public_result = classify.result
                 if advisor_repair_context_introduced:
-                    return await self._completion._qualified_advisor_repair_public_result(
-                        classify.result,
+                    public_result = await self._completion._qualified_advisor_repair_public_result(
+                        public_result,
                         user_id=user_id,
                         session_id=session_id,
                         session_operation_context=session_operation_context,
@@ -3092,7 +3094,7 @@ class ComposerServiceImpl:
                         turn_evidence=turn_evidence,
                         user_message=message,
                     )
-                return classify.result
+                return self._completion._append_checkpoint_receipt(public_result, turn_evidence=turn_evidence)
             continue
 
     def _build_messages(

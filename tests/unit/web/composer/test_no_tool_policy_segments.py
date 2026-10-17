@@ -434,6 +434,11 @@ class TestWrappedDiagnosticWireShapeLinkage:
 # family stayed on hand-maintained equality checks until elspeth-25f7b757e7).
 _BARE_SUFFIX_ROUND_TRIP_CASES = [
     pytest.param(
+        no_tool_policy._ADVISOR_REVIEW_BUDGET_SUFFIX,
+        no_tool_policy._ADVISOR_REVIEW_BUDGET_NOTICE,
+        id="_ADVISOR_REVIEW_BUDGET_SUFFIX",
+    ),
+    pytest.param(
         no_tool_policy._GRAPH_RECOVERY_REFUSAL_SUFFIX,
         no_tool_policy._GRAPH_RECOVERY_REFUSAL_NOTICE,
         id="_GRAPH_RECOVERY_REFUSAL_SUFFIX",

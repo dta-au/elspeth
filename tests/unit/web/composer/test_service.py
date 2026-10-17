@@ -111,6 +111,22 @@ from tests.unit.web.sessions.session_test_authority import FencedSessionServiceH
 _REAL_RUN_ADVISOR_CHECKPOINT = AdvisorCheckpointOwner._run_advisor_checkpoint
 
 
+def _assert_checkpoint_reply(result: ComposerResult, base: str, *, count: int, changed: bool = False, raw: str | None = None) -> None:
+    """Preserve the complete prior reply and require one final factual receipt."""
+    expected_raw = base if raw is None else raw
+    scope = f"Verified checkpoint evidence covers {count} saved draft revisions. " + (
+        "There are net authored changes from the starting draft." if changed else "There is no net authored change from the starting draft."
+    )
+    notice = f"Checkpoint save status: {scope} Checkpoint evidence does not establish task completion."
+    boundary = "\n\n---\n\n[ELSPETH-SYSTEM] " if base == expected_raw else "\n\n"
+    assert result.raw_assistant_content == expected_raw
+    assert result.message == base + boundary + notice
+    assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=expected_raw) == (
+        *_no_tool_policy_module.visible_message_segments(content=base, raw_content=expected_raw),
+        _no_tool_policy_module.TrustedSystemNoticeSegment(notice),
+    )
+
+
 @pytest.mark.parametrize("availability", ["available", "unavailable", "unknown"])
 def test_retained_operation_context_distinguishes_empty_unknown_and_unavailable(
     availability: Literal["available", "unavailable", "unknown"],
@@ -167,7 +183,7 @@ async def test_retained_operation_context_reaches_real_primary_and_reviewed_term
     assert any(row["content"] == context.provider_message() for row in primary[0]["messages"])
     assert "retained_operation_history" in json.dumps(reviews[0]["messages"])
     assert "unavailable" in json.dumps(reviews[0]["messages"])
-    assert result.message == "Prior operation history is unavailable; I cannot establish what happened."
+    _assert_checkpoint_reply(result, "Prior operation history is unavailable; I cannot establish what happened.", count=0)
 
 
 def _make_llm_response(
@@ -696,7 +712,16 @@ class TestComposerTextOnlyResponse:
             result = await service.compose("What can this composer do?", [], state, session_id=session_id)
 
         assert isinstance(result, ComposerResult)
-        assert result.message == "I'll help you build a pipeline!"
+        assert result.raw_assistant_content == "I'll help you build a pipeline!"
+        assert result.message.startswith(result.raw_assistant_content)
+        assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+            _no_tool_policy_module.AssistantTextSegment(result.raw_assistant_content),
+            _no_tool_policy_module.TrustedSystemNoticeSegment(
+                "Checkpoint save status: Verified checkpoint evidence covers 0 saved draft revisions. "
+                "There is no net authored change from the starting draft. Checkpoint evidence does not establish task completion."
+            ),
+        )
+        assert mock_llm.await_count == 1
         assert result.state.version == 1  # unchanged
 
     @pytest.mark.asyncio
@@ -1316,7 +1341,7 @@ class TestComposerSingleToolCall:
             mock_llm.side_effect = [tool_response, text_response]
             result = await service.compose("Use CSV as source", [], state, session_id=session_id)
 
-        assert result.message == "I've set up a CSV source."
+        _assert_checkpoint_reply(result, "I've set up a CSV source.", count=1, changed=True)
         assert result.state.sources["source"] is not None
         assert result.state.sources["source"].plugin == "csv"
         assert result.state.version == 2
@@ -1355,7 +1380,7 @@ class TestComposerSingleToolCall:
             mock_llm.side_effect = [tool_response, text_response]
             result = await service.compose("Use my OpenRouter secret", [], state, progress=record_progress, session_id=session_id)
 
-        assert result.message == "I checked the available credentials."
+        _assert_checkpoint_reply(result, "I checked the available credentials.", count=0)
         phases = [event.phase for event in progress_events]
         assert phases[:2] == ["starting", "calling_model"]
         assert "using_tools" in phases
@@ -1507,7 +1532,7 @@ class TestComposerSingleToolCall:
                 user_message_id=user_message_id,
             )
 
-        assert result.message == "Pipeline configured."
+        _assert_checkpoint_reply(result, "Pipeline configured.", count=1, changed=True)
         assert len(primary_requests) == 3 and len(reviews) == 1
         assert mock_llm.call_count == 4
         assert reviews[0]["current_graph_hash"] == authored_state_hash(result.state)
@@ -1662,8 +1687,8 @@ class TestComposerMultiTurnToolCalls:
 
         assert len(reviews) == 2 and reviews[0].binding != reviews[1].binding
         assert result.state.metadata.name == "Repaired"
-        assert result.message == "The pipeline name is now Repaired."
-        assert result.raw_assistant_content is None
+        _assert_checkpoint_reply(result, "The pipeline name is now Repaired.", count=1, changed=True)
+        assert result.raw_assistant_content == "The pipeline name is now Repaired."
         assert len(captured_messages) == 3
         # Turn 2 (the repair call) saw the injected advisor findings.
         assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
@@ -1812,12 +1837,20 @@ class TestComposerMultiTurnToolCalls:
 
         assert primary_call.await_count == 3 and advisor_call.await_count == len(reviews) == 2
         assert reviews[0]["current_graph_hash"] != reviews[1]["current_graph_hash"]
-        saved_scope = (
-            "This request saved 1 draft revisions with verified changes. "
-            "Saved changes do not establish that the requested task is complete."
-        )
+        saved_scope = "Verified checkpoint evidence covers 1 saved draft revisions. There are net authored changes from the starting draft."
         assert result.message.startswith(saved_scope)
         assert result.raw_assistant_content == saved_scope
+        assert (
+            len(
+                [
+                    segment
+                    for segment in _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=saved_scope)
+                    if isinstance(segment, _no_tool_policy_module.TrustedSystemNoticeSegment)
+                    and segment.content.startswith("Checkpoint save status: Verified checkpoint evidence covers 1 saved draft revisions.")
+                ]
+            )
+            == 1
+        )
         assert result.state.metadata.name == "Repaired"
         assert len(persisted_assistant_rows) == 1
         assert persisted_assistant_rows[0]["content"] == "ELSPETH is applying a pipeline correction."
@@ -1942,7 +1975,7 @@ class TestComposerMultiTurnToolCalls:
         assert result.runtime_preflight is None or result.runtime_preflight.is_valid
         assert primary_call.await_count == 3 and advisor_call.await_count == len(reviews) == 2
         assert result.state.metadata.name == "Repaired"
-        assert result.message == "The pipeline name is now Repaired."
+        _assert_checkpoint_reply(result, "The pipeline name is now Repaired.", count=1, changed=True)
         assert reviews[0]["current_graph_hash"] != reviews[1]["current_graph_hash"]
         first_arguments = advisor_call.await_args_list[0].args[0]
         second_arguments = advisor_call.await_args_list[1].args[0]
@@ -2185,11 +2218,18 @@ class TestComposerMultiTurnToolCalls:
         preflight.assert_not_called()
         assert result.state == state
         assert result.tool_invocations == ()
-        saved_scope = "No pipeline changes were saved in this request."
+        saved_scope = (
+            "Verified checkpoint evidence covers 0 saved draft revisions. There is no net authored change from the starting draft."
+        )
         assert result.raw_assistant_content == saved_scope
-        assert result.message == saved_scope + _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+        _assert_checkpoint_reply(
+            result,
+            saved_scope + _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX,
+            raw=saved_scope,
+            count=0,
+        )
         assert "Looks ready." not in result.message
-        assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+        assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)[:-1] == (
             _no_tool_policy_module.AssistantTextSegment(saved_scope),
             # No mutation this turn, so no preflight ran: the absent-shape twin.
             _no_tool_policy_module.TrustedSystemNoticeSegment(
@@ -2280,8 +2320,8 @@ class TestComposerMultiTurnToolCalls:
             result = await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
 
         assert len(reviews) == 2 and reviews[0].binding != reviews[1].binding
-        assert result.message == "The pipeline name is now Repaired."
-        assert result.raw_assistant_content is None
+        _assert_checkpoint_reply(result, "The pipeline name is now Repaired.", count=1, changed=True)
+        assert result.raw_assistant_content == "The pipeline name is now Repaired."
 
         assert service._sessions_service is not None
         stored = await service._sessions_service.get_messages(UUID(session_id))
@@ -2447,16 +2487,22 @@ class TestComposerMultiTurnToolCalls:
             assert saved_revisions() == () and result.state == state
             preflight.assert_not_called()
         saved_scope = (
-            "This request saved 1 draft revisions with verified changes. Saved changes do not establish that the requested task is complete."
+            "Verified checkpoint evidence covers 1 saved draft revisions. There are net authored changes from the starting draft."
             if mutate_after_discovery
-            else "No pipeline changes were saved in this request."
+            else "Verified checkpoint evidence covers 0 saved draft revisions. There is no net authored change from the starting draft."
         )
         suffix = (
             _no_tool_policy_module._ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX
             if mutate_after_discovery
             else _no_tool_policy_module._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
         )
-        assert result.raw_assistant_content == saved_scope and result.message == saved_scope + suffix
+        _assert_checkpoint_reply(
+            result,
+            saved_scope + suffix,
+            raw=saved_scope,
+            count=int(mutate_after_discovery),
+            changed=mutate_after_discovery,
+        )
         assert result.runtime_preflight is not None and result.runtime_preflight.readiness.completion_ready is False
         assert isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
         assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.GRAPH_REJECTED
@@ -2754,7 +2800,7 @@ class TestComposerConvergence:
             mock_llm.side_effect = [mut, text]
             result = await service.compose("Do it", [], state, session_id=session_id)
 
-        assert result.message == "Done after final correction."
+        _assert_checkpoint_reply(result, "Done after final correction.", count=1, changed=True)
         assert result.state.metadata.name == "Final"
 
     @pytest.mark.asyncio
@@ -2797,7 +2843,7 @@ class TestComposerConvergence:
             mock_llm.side_effect = [disc, mut, text]
             result = await service.compose("Build", [], state, session_id=session_id)
 
-        assert result.message == "Done."
+        _assert_checkpoint_reply(result, "Done.", count=1, changed=True)
         assert result.state.metadata.name == "Works"
 
 
@@ -2947,7 +2993,7 @@ class TestComposerErrorHandling:
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Do something", [], state, session_id=session_id)
 
-        assert result.message == "Sorry, let me try again."
+        _assert_checkpoint_reply(result, "Sorry, let me try again.", count=0)
         # State unchanged — the bad tool call didn't modify anything
         assert result.state.version == 1
 
@@ -3452,7 +3498,7 @@ class TestComposerErrorHandling:
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Explore", [], state, session_id=session_id)
 
-        assert result.message == "Recovered."
+        _assert_checkpoint_reply(result, "Recovered.", count=0)
         mock_execute_tool.assert_not_called()
         tool_msg = mock_llm.call_args_list[1][0][0][-1]
         error_content = json.loads(tool_msg["content"])
@@ -3882,7 +3928,7 @@ class TestDiscoveryCache:
             result = await service.compose("List sources", [], state, session_id=session_id)
 
         # Should NOT have raised — second list_sources was a cache hit
-        assert result.message == "Found sources."
+        _assert_checkpoint_reply(result, "Found sources.", count=0)
         assert dispatch.call_count == 1
         # Catalog list_sources is called once by snapshot construction
         # (before any PolicyCatalogView exists) and once more by the
@@ -5334,7 +5380,7 @@ class TestComposerAvailabilityAndBadRequest:
         ):
             result = await service.compose("Hello", [], state, session_id=session_id)
 
-        assert result.message == "Recovered."
+        _assert_checkpoint_reply(result, "Recovered.", count=0)
         assert mock_llm.call_count == 2
         mock_sleep.assert_awaited_once()
         mock_sleep.assert_awaited_once_with(1.0)
@@ -5353,7 +5399,7 @@ class TestComposerAvailabilityAndBadRequest:
         ):
             result = await service.compose("Hello", [], _empty_state(), session_id=session_id)
 
-        assert result.message == "Recovered."
+        _assert_checkpoint_reply(result, "Recovered.", count=0)
         assert mock_llm.call_count == 2
         mock_sleep.assert_awaited_once()
         mock_sleep.assert_awaited_once_with(1.0)
@@ -9424,7 +9470,7 @@ class TestComposeLoopForcedRepair:
         assert len(repair_msgs) == 1, f"exactly one composer-system repair message must precede turn 3; got {len(repair_msgs)}"
         # Final assistant content reflects turn 4's claim, not turn 2's
         # (which was preempted by the repair gate).
-        assert result.message == "Repaired and ready."
+        _assert_checkpoint_reply(result, "Repaired and ready.", count=3, changed=True)
 
     @pytest.mark.asyncio
     async def test_divergence_repair_does_not_clear_blocker(self) -> None:

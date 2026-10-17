@@ -415,7 +415,19 @@ async def test_saved_advisor_findings_preserve_request_and_completion_gate(tmp_p
     assert any(item["role"] == "user" and item["content"] == message for item in primary[1])
     assert result.runtime_preflight is not None
     if repair_authorized:
-        assert result.message == "case_study is required in the CSV source contract."
+        from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
+
+        raw = "case_study is required in the CSV source contract."
+        notice = (
+            "Checkpoint save status: Verified checkpoint evidence covers 1 saved draft revisions. "
+            "There are net authored changes from the starting draft. Checkpoint evidence does not establish task completion."
+        )
+        assert result.raw_assistant_content == raw
+        assert result.message == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+        assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+            AssistantTextSegment(raw),
+            TrustedSystemNoticeSegment(notice),
+        )
         assert result.state.sources["source"].options["schema"] == {"mode": "flexible", "fields": ("case_study: str",)}
         assert any(
             invocation.tool_name == "patch_source_options" and invocation.status.value == "success"
