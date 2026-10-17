@@ -1876,6 +1876,47 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "Use an artifact with the source plugin's supported encoding and format, preserving the intended data. Do not "
         "silently coerce bytes or discard undecodable content.",
     ),
+    DirectValidationGuidance(
+        "secret_context_unavailable",
+        "Required authenticated secret-service context is unavailable for this request. The saved graph was retained.",
+        "Retain the intended graph and reference. Report the missing secret-service or user context and retry only "
+        "through a surface that supplies it. Rewriting the graph or inventing a secret cannot supply this context.",
+    ),
+    DirectValidationGuidance(
+        "secret_target_required",
+        "The secret wiring operation did not select one existing destination.",
+        "Inspect the saved graph and supply its intended exact target_id: the node ID or output name, or the source "
+        "name when multiple sources are configured. Preserve unrelated components and the intended reference.",
+    ),
+    DirectValidationGuidance(
+        "secret_target_unsupported",
+        "The selected node cannot receive plugin credential options.",
+        "Select the intended existing source, transform/aggregation/collector plugin node, or output. Do not change "
+        "a structural node's kind or replace unrelated components merely to make a credential destination.",
+    ),
+    DirectValidationGuidance(
+        "missing_secret_ref",
+        "The intended secret reference does not currently resolve for this authenticated request. This does not "
+        "establish that the reference is absent.",
+        "Use list_secret_refs and validate_secret_ref to inspect the intended reference's current availability and "
+        "reported reason where present. Use the existing secret-management workflow for user-owned references when "
+        "appropriate, or ask the operator to resolve deployment prerequisites when needed. Do not invent names, literal "
+        "credentials or environment interpolation, or assume availability grants destination authorization.",
+    ),
+    DirectValidationGuidance(
+        "unauthorized_secret_ref",
+        "The deployment has not authorized this exact secret/component/plugin/option destination.",
+        "Preserve the intended graph and explain the destination refusal. An operator must authorize the exact "
+        "destination through the server-authored secret wiring policy if it is required. Availability checks and "
+        "repeated wiring attempts cannot grant that authority; do not silently remove or substitute the reference.",
+    ),
+    DirectValidationGuidance(
+        "disallowed_secret_ref",
+        "An option does not permit secret_ref markers under the credential-placement policy.",
+        "Use the intended credential-bearing option allowed by the existing placement policy, still subject to exact "
+        "destination authorization. Do not paste a literal credential into a noncredential field or rewrite unrelated "
+        "components to silence the refusal.",
+    ),
     *_direct_plugin_policy_guidance(),
 )
 
