@@ -15,7 +15,16 @@ from openai import OpenAIError
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.prompt_guard import PromptGuardMode, PromptGuardRole, PromptGuardTrust, detach_prompt_guard_messages
+from elspeth.contracts.prompt_guard import (
+    PromptGuardContentPart,
+    PromptGuardMode,
+    PromptGuardRole,
+    PromptGuardTextMessage,
+    PromptGuardToolArgumentParts,
+    detach_prompt_guard_evidence,
+    validate_prompt_guard_content_parts,
+    validate_prompt_guard_tool_argument_parts,
+)
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.transforms.llm.model_catalog import OPENROUTER_LITELLM_PREFIX
 from elspeth.web.composer._compose_loop_carriers import (
@@ -444,6 +453,8 @@ async def _litellm_acompletion(
     prompt_guard_role: PromptGuardRole,
     prompt_guard_user_prompt: str | None = None,
     prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+    prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+    prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     provider_custody: ProviderCallCustody | None = None,
     on_provider_dispatch: Callable[[], None] | None = None,
     **kwargs: Any,
@@ -465,7 +476,32 @@ async def _litellm_acompletion(
     # intentionally excluded.  The dynamic messages are the Web/Composer
     # control content that crosses the provider boundary.
     kwargs = deepcopy(kwargs)
-    kwargs["messages"], trusted_indexes = detach_prompt_guard_messages(kwargs["messages"])
+    evidence = detach_prompt_guard_evidence(kwargs["messages"])
+    kwargs["messages"] = evidence.messages
+    content_parts = evidence.content_parts
+    argument_parts = evidence.tool_argument_parts
+    if prompt_guard_content_parts is not None:
+        validate_prompt_guard_content_parts(evidence.messages, prompt_guard_content_parts)
+        if any(
+            current is not None and forwarded is not None and current != forwarded
+            for current, forwarded in zip(content_parts, prompt_guard_content_parts, strict=True)
+        ):
+            raise AuditIntegrityError("Prompt guard content provenance changed before physical dispatch")
+        content_parts = tuple(
+            current if current is not None else forwarded
+            for current, forwarded in zip(content_parts, prompt_guard_content_parts, strict=True)
+        )
+    if prompt_guard_tool_argument_parts is not None:
+        validate_prompt_guard_tool_argument_parts(evidence.messages, prompt_guard_tool_argument_parts)
+        if any(
+            current is not None and forwarded is not None and current != forwarded
+            for current, forwarded in zip(argument_parts, prompt_guard_tool_argument_parts, strict=True)
+        ):
+            raise AuditIntegrityError("Prompt guard tool argument provenance changed before physical dispatch")
+        argument_parts = tuple(
+            current if current is not None else forwarded
+            for current, forwarded in zip(argument_parts, prompt_guard_tool_argument_parts, strict=True)
+        )
     require_no_credential_material(kwargs["messages"], surface="composer_provider_request")
     await enforce_prompt_guard(
         mount=prompt_guard_mount,
@@ -475,7 +511,9 @@ async def _litellm_acompletion(
         messages=kwargs["messages"],
         tools=kwargs["tools"] if "tools" in kwargs else (),
         user_prompt=prompt_guard_user_prompt,
-        trusted_message_indexes=trusted_indexes | prompt_guard_trusted_message_indexes,
+        trusted_message_indexes=evidence.trusted_message_indexes | prompt_guard_trusted_message_indexes,
+        content_parts=content_parts,
+        tool_argument_parts=argument_parts,
     )
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
@@ -540,6 +578,8 @@ class ProviderGateway:
         provider_custody: ProviderCallCustody | None = None,
         credential_state: CompositionState | None = None,
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call LiteLLM and return only the admitted, owned completion."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
@@ -559,6 +599,8 @@ class ProviderGateway:
                 prompt_guard_mode=self._prompt_guard_mode,
                 prompt_guard_role="composer",
                 prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
+                prompt_guard_content_parts=prompt_guard_content_parts,
+                prompt_guard_tool_argument_parts=prompt_guard_tool_argument_parts,
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
@@ -589,10 +631,11 @@ class ProviderGateway:
 
     async def _call_text_llm(
         self,
-        messages: list[dict[str, str | PromptGuardTrust]],
+        messages: list[PromptGuardTextMessage],
         *,
         provider_custody: ProviderCallCustody | None = None,
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
     ) -> Any:
         """Call the LLM for non-tool text generation."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
@@ -613,6 +656,7 @@ class ProviderGateway:
                 prompt_guard_role="composer",
                 prompt_guard_user_prompt="",
                 prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
+                prompt_guard_content_parts=prompt_guard_content_parts,
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
@@ -683,7 +727,8 @@ class ProviderGateway:
         credential_state: CompositionState | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call the primary model once and record the exact marked request."""
-        wire_messages, trusted_indexes = detach_prompt_guard_messages(messages)
+        evidence = detach_prompt_guard_evidence(messages)
+        wire_messages, trusted_indexes = evidence.messages, evidence.trusted_message_indexes
         wire_tools = [dict(tool) for tool in tools]
         if supports_anthropic_prompt_cache_markers(self._model):
             wire_messages, tools_or_none = apply_anthropic_cache_markers(wire_messages, wire_tools, mark_history_tail=True)
@@ -700,18 +745,36 @@ class ProviderGateway:
         failure_to_capture: Exception | None = None
         recovery_batch: _AdmittedToolBatch | None = None
         try:
-            completion = await asyncio.wait_for(
-                self._call_llm(
+            if any(parts is not None for parts in evidence.tool_argument_parts):
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                    prompt_guard_tool_argument_parts=evidence.tool_argument_parts,
+                )
+            elif any(parts is not None for parts in evidence.content_parts):
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                )
+            elif provider_custody is not None or credential_state is not None or trusted_indexes:
+                completion_call = self._call_llm(
                     wire_messages,
                     wire_tools,
                     provider_custody=provider_custody,
                     credential_state=credential_state,
                     prompt_guard_trusted_message_indexes=trusted_indexes,
                 )
-                if provider_custody is not None or credential_state is not None or trusted_indexes
-                else self._call_llm(wire_messages, wire_tools),
-                timeout=timeout,
-            )
+            else:
+                completion_call = self._call_llm(wire_messages, wire_tools)
+            completion = await asyncio.wait_for(completion_call, timeout=timeout)
             _require_no_credential_material_in_completion(
                 completion,
                 surface="composer_provider_response",
@@ -861,14 +924,15 @@ class ProviderGateway:
 
     async def _call_text_llm_with_audit_body(
         self,
-        messages: list[dict[str, str | PromptGuardTrust]],
+        messages: list[PromptGuardTextMessage],
         *,
         timeout: float,
         recorder: BufferingRecorder | None,
         provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Call the diagnostics text model and record one redacted audit row."""
-        messages, trusted_indexes = detach_prompt_guard_messages(messages)
+        evidence = detach_prompt_guard_evidence(messages)
+        messages, trusted_indexes = evidence.messages, evidence.trusted_message_indexes
         private_request = capture_provider_context(messages=messages, tools=None)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
@@ -878,12 +942,20 @@ class ProviderGateway:
         error_message: str | None = None
         failure_to_capture: Exception | None = None
         try:
-            provider_response = await asyncio.wait_for(
-                self._call_text_llm(messages, provider_custody=provider_custody, prompt_guard_trusted_message_indexes=trusted_indexes)
-                if provider_custody is not None or trusted_indexes
-                else self._call_text_llm(messages),
-                timeout=timeout,
-            )
+            if any(parts is not None for parts in evidence.content_parts):
+                response_call = self._call_text_llm(
+                    messages,
+                    provider_custody=provider_custody,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                )
+            elif provider_custody is not None or trusted_indexes:
+                response_call = self._call_text_llm(
+                    messages, provider_custody=provider_custody, prompt_guard_trusted_message_indexes=trusted_indexes
+                )
+            else:
+                response_call = self._call_text_llm(messages)
+            provider_response = await asyncio.wait_for(response_call, timeout=timeout)
             choice = provider_response.choices[0] if provider_response.choices else None
             message = choice.message if choice is not None else None
             admitted_metadata = admit_llm_provider_metadata(
@@ -1036,13 +1108,13 @@ class ProviderGateway:
 
     @quota_provider_calls
     async def _call_text_llm_with_audit_legacy(
-        self, messages: list[dict[str, str | PromptGuardTrust]], *, timeout: float, recorder: BufferingRecorder | None
+        self, messages: list[PromptGuardTextMessage], *, timeout: float, recorder: BufferingRecorder | None
     ) -> str:
         return await self._call_text_llm_with_audit_body(messages, timeout=timeout, recorder=recorder)
 
     async def _call_text_llm_with_audit(
         self,
-        messages: list[dict[str, str | PromptGuardTrust]],
+        messages: list[PromptGuardTextMessage],
         *,
         timeout: float,
         recorder: BufferingRecorder | None,

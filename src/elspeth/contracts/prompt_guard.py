@@ -20,6 +20,11 @@ PromptGuardReason = Literal[
 ]
 
 PROMPT_GUARD_TRUST_KEY = "_elspeth_prompt_guard_trust"
+PROMPT_GUARD_CONTENT_PARTS_KEY = "_elspeth_prompt_guard_content_parts"
+PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY = "_elspeth_prompt_guard_tool_argument_parts"
+PROMPT_GUARD_MAX_TEXT_CHARACTERS = 10_000
+PROMPT_GUARD_MAX_DOCUMENTS = 128
+PROMPT_GUARD_MAX_INPUT_UTF8_BYTES = 262_144
 
 
 class PromptGuardTrust(Enum):
@@ -29,7 +34,64 @@ class PromptGuardTrust(Enum):
     REFERENCE = "operator_reference"
 
 
-def detach_prompt_guard_messages(messages: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], frozenset[int]]:
+@dataclass(frozen=True, slots=True)
+class PromptGuardContentPart:
+    """One complete producer-rendered semantic unit, untrusted by default."""
+
+    text: str = field(repr=False)
+    trust: PromptGuardTrust | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.text) is not str or (self.trust is not None and type(self.trust) is not PromptGuardTrust):
+            raise AuditIntegrityError("Prompt guard content part lacks exact owned provenance")
+
+
+@dataclass(frozen=True, slots=True)
+class PromptGuardToolArgumentParts:
+    """Lossless untrusted units of one already-decoded tool argument string."""
+
+    tool_call_index: int
+    parts: tuple[PromptGuardContentPart, ...] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.tool_call_index) is not int
+            or self.tool_call_index < 0
+            or type(self.parts) is not tuple
+            or any(type(part) is not PromptGuardContentPart or part.trust is not None for part in self.parts)
+        ):
+            raise AuditIntegrityError("Prompt guard tool arguments require owned untrusted semantic units")
+
+
+type PromptGuardTextMessage = dict[str, str | PromptGuardTrust | tuple[PromptGuardContentPart, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class DetachedPromptGuardEvidence:
+    """Detached external wire values and separate, immutable producer evidence."""
+
+    messages: list[dict[str, Any]] = field(repr=False)
+    trusted_message_indexes: frozenset[int]
+    content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] = field(repr=False)
+    tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] = field(repr=False)
+
+
+def validate_prompt_guard_content_parts(
+    messages: Sequence[Mapping[str, Any]], content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...]
+) -> None:
+    """Reject foreign, missing or overlapping coverage before interpreting trust."""
+    if type(content_parts) is not tuple or len(content_parts) != len(messages):
+        raise AuditIntegrityError("Prompt guard content partition lacks exact message positions")
+    for message, parts in zip(messages, content_parts, strict=True):
+        if parts is None:
+            continue
+        if type(parts) is not tuple or any(type(part) is not PromptGuardContentPart for part in parts):
+            raise AuditIntegrityError("Prompt guard content partition is not an owned producer identity")
+        if "content" not in message or type(message["content"]) is not str or "".join(part.text for part in parts) != message["content"]:
+            raise AuditIntegrityError("Prompt guard content partition does not cover the complete wire content")
+
+
+def detach_prompt_guard_evidence(messages: Sequence[Mapping[str, Any]]) -> DetachedPromptGuardEvidence:
     """Separate nominal producer provenance from detached, marker-free wire input.
 
     Call this before wire hashing, provider-context capture or dispatch. A
@@ -37,14 +99,67 @@ def detach_prompt_guard_messages(messages: Sequence[Mapping[str, Any]]) -> tuple
     """
     wire: list[dict[str, Any]] = []
     trusted: set[int] = set()
+    content_parts: list[tuple[PromptGuardContentPart, ...] | None] = []
+    tool_argument_parts: list[tuple[PromptGuardToolArgumentParts, ...] | None] = []
     for index, message in enumerate(messages):
         if PROMPT_GUARD_TRUST_KEY in message:
             marker = message[PROMPT_GUARD_TRUST_KEY]
             if type(marker) is not PromptGuardTrust:
                 raise AuditIntegrityError("Prompt guard trust marker is not an owned producer identity")
             trusted.add(index)
-        wire.append({key: value for key, value in message.items() if key != PROMPT_GUARD_TRUST_KEY})
-    return deepcopy(wire), frozenset(trusted)
+        parts = message[PROMPT_GUARD_CONTENT_PARTS_KEY] if PROMPT_GUARD_CONTENT_PARTS_KEY in message else None
+        if PROMPT_GUARD_CONTENT_PARTS_KEY in message and (parts is None or PROMPT_GUARD_TRUST_KEY in message):
+            raise AuditIntegrityError("Prompt guard content partition conflicts with whole-message provenance")
+        content_parts.append(parts)
+        arguments = message[PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY] if PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY in message else None
+        if PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY in message and (arguments is None or PROMPT_GUARD_TRUST_KEY in message):
+            raise AuditIntegrityError("Prompt guard tool argument partition conflicts with whole-message provenance")
+        tool_argument_parts.append(arguments)
+        wire.append(
+            {
+                key: value
+                for key, value in message.items()
+                if key not in (PROMPT_GUARD_TRUST_KEY, PROMPT_GUARD_CONTENT_PARTS_KEY, PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY)
+            }
+        )
+    detached = deepcopy(wire)
+    admitted_parts = tuple(content_parts)
+    validate_prompt_guard_content_parts(detached, admitted_parts)
+    admitted_arguments = tuple(tool_argument_parts)
+    validate_prompt_guard_tool_argument_parts(detached, admitted_arguments)
+    return DetachedPromptGuardEvidence(detached, frozenset(trusted), admitted_parts, admitted_arguments)
+
+
+def validate_prompt_guard_tool_argument_parts(
+    messages: Sequence[Mapping[str, Any]], partitions: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...]
+) -> None:
+    """Bind each unique argument partition to its complete original wire string."""
+    if type(partitions) is not tuple or len(partitions) != len(messages):
+        raise AuditIntegrityError("Prompt guard tool argument partition lacks exact message positions")
+    for message, entries in zip(messages, partitions, strict=True):
+        if entries is None:
+            continue
+        if type(entries) is not tuple or any(type(entry) is not PromptGuardToolArgumentParts for entry in entries):
+            raise AuditIntegrityError("Prompt guard tool argument partition is not an owned producer identity")
+        if len({entry.tool_call_index for entry in entries}) != len(entries):
+            raise AuditIntegrityError("Prompt guard tool argument partition overlaps a tool call")
+        calls = message["tool_calls"] if "tool_calls" in message else None
+        if not isinstance(calls, (list, tuple)):
+            raise AuditIntegrityError("Prompt guard tool argument partition has no complete wire tool calls")
+        for entry in entries:
+            if entry.tool_call_index >= len(calls):
+                raise AuditIntegrityError("Prompt guard tool argument partition names an absent tool call")
+            call = calls[entry.tool_call_index]
+            function = call["function"] if isinstance(call, Mapping) and "function" in call else None
+            arguments = function["arguments"] if isinstance(function, Mapping) and "arguments" in function else None
+            if type(arguments) is not str or "".join(part.text for part in entry.parts) != arguments:
+                raise AuditIntegrityError("Prompt guard tool argument partition does not cover the complete wire arguments")
+
+
+def detach_prompt_guard_messages(messages: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], frozenset[int]]:
+    """Preserve the existing two-value wire projection while stripping both markers."""
+    evidence = detach_prompt_guard_evidence(messages)
+    return evidence.messages, evidence.trusted_message_indexes
 
 
 @dataclass(frozen=True, slots=True)

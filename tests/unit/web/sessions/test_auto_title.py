@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -11,7 +11,7 @@ import pytest
 from litellm import ModelResponse
 from litellm.exceptions import BadGatewayError, ServiceUnavailableError
 from litellm.exceptions import Timeout as LiteLLMTimeout
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
 from elspeth.contracts.chargeable_admission import (
     AdmissionPolicyEvidence,
@@ -22,9 +22,7 @@ from elspeth.contracts.chargeable_admission import (
 )
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.session_operation import SessionOperationContext
-from elspeth.web.composer import llm_response_parsing
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
-from elspeth.web.coordination import quota_authority
 from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions.models import chat_messages_table, token_usage_ledger_table
@@ -32,21 +30,24 @@ from elspeth.web.sessions.telemetry import _FakeCounter
 from tests.helpers.auto_title import RecordingTitleService as _TitleService
 from tests.helpers.auto_title import call_auto_title
 
-_DISPATCHED_AT = datetime(2026, 9, 15, 23, 59, 59, tzinfo=UTC)
+_UNLINKED_LEDGER_AT = datetime(2026, 9, 15, 23, 59, 59, tzinfo=UTC)
 
 
-class _TitleClock:
-    @staticmethod
-    def now(tz: object) -> datetime:
-        assert tz is UTC
-        return _DISPATCHED_AT
-
-
-@pytest.fixture(autouse=True)
-def _freeze_dispatch_time(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_auto_title, "datetime", _TitleClock)
-    monkeypatch.setattr(llm_response_parsing, "datetime", _TitleClock)
-    monkeypatch.setattr(quota_authority, "database_now", lambda _connection: _DISPATCHED_AT)
+def _actual_title_finished_at(service: _TitleService) -> datetime:
+    """Cross-check ledger time against the independently persisted provider audit."""
+    with service._engine.connect() as connection:
+        rows = connection.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == str(service.session_id))).all()
+    calls = [envelope["call"] for row in rows for envelope in (row.tool_calls or ()) if envelope["_kind"] == "llm_call_audit"]
+    assert len(calls) == len(service.attempts) == 1
+    call = calls[0]
+    assert call["call_id"] == service.attempts[0].attempt_id
+    started_at = datetime.fromisoformat(call["started_at"])
+    finished_at = datetime.fromisoformat(call["finished_at"])
+    assert started_at == service.attempts[0].started_at
+    assert finished_at >= started_at
+    assert len(service.usage) == 1
+    assert service.usage[0][2][0].recorded_at == finished_at, "Actual title ledger completion must match persisted provider audit"
+    return finished_at
 
 
 def _completion(content: str | None) -> ModelResponse:
@@ -139,7 +140,7 @@ async def test_recording_title_usage_does_not_hide_unlinked_ledger_rows(monkeypa
                 completion_tokens=1,
                 cached_prompt_tokens=None,
                 reasoning_tokens=None,
-                recorded_at=_DISPATCHED_AT,
+                recorded_at=_UNLINKED_LEDGER_AT,
             )
         )
     with pytest.raises(AssertionError, match="Title ledger rows must retain their actual provider attempt"):
@@ -338,9 +339,12 @@ async def test_auto_title_outbound_call_redacts_fences_and_truncates(monkeypatch
     monkeypatch.setattr(litellm, "acompletion", _capture)
     service = _TitleService()
     secret = "AKIA" + "A" * 16
+    excerpt = _auto_title._build_auto_title_user_content(f"Use key {secret} to build a CSV pipeline. " + "x" * 5000)
+    assert secret not in excerpt
+    assert "<redacted-sensitive:aws_access_key>" in excerpt
     await call_auto_title(
         service=service,
-        user_message=f"Use key {secret} to build a CSV pipeline. " + "x" * 5000,
+        user_message="Build a CSV pipeline. " + "x" * 5000,
         model="openai/test",
         temperature=None,
         seed=None,
@@ -349,11 +353,45 @@ async def test_auto_title_outbound_call_redacts_fences_and_truncates(monkeypatch
     assert messages[0]["role"] == "system"
     user_content = messages[1]["content"]
     assert secret not in user_content
-    assert "<redacted-sensitive:aws_access_key>" in user_content
     assert user_content.count(_auto_title._AUTO_TITLE_EXCERPT_FENCE) == 2
     assert len(user_content) < _auto_title._AUTO_TITLE_EXCERPT_CHAR_LIMIT + 300
     assert captured["max_tokens"] == 40
     assert [title for _sid, title in service.updates] == ["Useful Pipeline"]
+
+
+@pytest.mark.asyncio
+async def test_auto_title_genuine_user_credentials_refuse_before_guard_and_sdk(monkeypatch) -> None:
+    from elspeth.web.credential_guard import CredentialMaterialRefused
+
+    calls = []
+
+    async def provider(**kwargs):
+        calls.append(kwargs)
+        return _completion("Useful Pipeline")
+
+    monkeypatch.setattr(litellm, "acompletion", provider)
+    service = _TitleService()
+    with pytest.raises(CredentialMaterialRefused):
+        await call_auto_title(
+            service=service,
+            user_message="Use key " + "AKIA" + "A" * 16 + " to build a CSV pipeline.",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+        )
+    assert calls == service.attempts == service.updates == service.usage == []
+    with service._engine.connect() as connection:
+        assert connection.execute(select(chat_messages_table)).all() == []
+
+
+@pytest.mark.asyncio
+async def test_title_clock_check_detects_ledger_timestamp_mutation(monkeypatch) -> None:
+    service, _failed, _rejected = await _run_auto_title(monkeypatch, _completion("Useful Pipeline"))
+    finished_at = _actual_title_finished_at(service)
+    with service._engine.begin() as connection:
+        connection.execute(update(token_usage_ledger_table).values(recorded_at=finished_at + timedelta(days=1)))
+    with pytest.raises(AssertionError, match="Actual title ledger completion must match persisted provider audit"):
+        _actual_title_finished_at(service)
 
 
 @pytest.mark.asyncio
@@ -931,7 +969,7 @@ async def test_auto_title_charges_a_returned_completion_even_when_the_title_is_r
                     completion_tokens=4,
                     cached_prompt_tokens=None,
                     reasoning_tokens=None,
-                    recorded_at=_DISPATCHED_AT,
+                    recorded_at=_actual_title_finished_at(service),
                     call_id=service.attempts[0].attempt_id,
                 ),
             ),
@@ -954,7 +992,7 @@ async def test_auto_title_charges_an_unreported_completion_as_unknown_never_zero
                     completion_tokens=None,
                     cached_prompt_tokens=None,
                     reasoning_tokens=None,
-                    recorded_at=_DISPATCHED_AT,
+                    recorded_at=_actual_title_finished_at(service),
                     call_id=service.attempts[0].attempt_id,
                 ),
             ),
@@ -988,7 +1026,7 @@ async def test_auto_title_provider_timeout_charges_unknown_usage(monkeypatch) ->
                     completion_tokens=None,
                     cached_prompt_tokens=None,
                     reasoning_tokens=None,
-                    recorded_at=_DISPATCHED_AT,
+                    recorded_at=_actual_title_finished_at(service),
                     call_id=service.attempts[0].attempt_id,
                 ),
             ),
@@ -1041,7 +1079,7 @@ async def test_auto_title_malformed_response_preserves_reported_or_unknown_usage
         completion_tokens=0 if reported else None,
         cached_prompt_tokens=None,
         reasoning_tokens=None,
-        recorded_at=_DISPATCHED_AT,
+        recorded_at=_actual_title_finished_at(service),
         call_id=service.attempts[0].attempt_id,
     )
     assert service.usage == [("auto_title", None, (expected,))]

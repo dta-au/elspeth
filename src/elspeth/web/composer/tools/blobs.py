@@ -1951,6 +1951,9 @@ def _locked_read_ready_blob(
         return None, None
 
 
+_BLOB_CONTENT_PAGE_MAX_UTF8_BYTES = 4_096
+
+
 def _execute_get_blob_content(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -2083,21 +2086,22 @@ def _execute_get_blob_content(
         }
         candidate = replace(result, data=page_payload)
         # Use the actual selected provider serializer, including validation,
-        # metadata and JSON escaping. This is a new conservative page bound;
-        # it does not expand or replace the aggregate provider request budget.
+        # metadata and JSON escaping. Keep each complete page small enough
+        # for guard evidence framing without slicing a guard input unit. This
+        # does not expand or replace the aggregate provider request budget.
         encoded = serialize_admitted_discovery_result(admit_discovery_result("get_blob_content", candidate))
         return candidate, len(encoded.encode("utf-8"))
 
     end_char = min(start_char + 50_000, total_chars)
     candidate, size = page(end_char)
-    if size <= 65_536:
+    if size <= _BLOB_CONTENT_PAGE_MAX_UTF8_BYTES:
         return candidate
     low, high = start_char + 1, end_char - 1
     best: ToolResult | None = None
     while low <= high:
         middle = (low + high) // 2
         candidate, size = page(middle)
-        if size <= 65_536:
+        if size <= _BLOB_CONTENT_PAGE_MAX_UTF8_BYTES:
             best = candidate
             low = middle + 1
         else:
@@ -2114,7 +2118,7 @@ _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
     response_contract=_BLOB_CONTENT_RESPONSE,
     description=(
         "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
-        "Pages contain at most 50,000 original Unicode code points and the complete JSON tool response is bounded to 65,536 bytes. "
+        "Each complete JSON tool response, including metadata, is bounded to 4,096 UTF-8 bytes and preserves original Unicode code points. "
         "Read `next_offset_chars` with `expected_content_hash` to continue; ranges are [start_char,end_char), "
         "`total_chars` counts the full decoded text and `content_hash` identifies the verified original bytes. "
         "`truncated` means end_char < total_chars, not whole-file inspection; `size_bytes` is the full byte size. "

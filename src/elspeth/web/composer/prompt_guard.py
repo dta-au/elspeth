@@ -10,6 +10,7 @@ import time
 from collections.abc import Coroutine, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
@@ -20,13 +21,20 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import is_lower_sha256_hex
 from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_MAX_DOCUMENTS,
+    PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
+    PROMPT_GUARD_MAX_TEXT_CHARACTERS,
     PromptGuardClient,
+    PromptGuardContentPart,
     PromptGuardDecision,
     PromptGuardDisposition,
     PromptGuardMode,
     PromptGuardReason,
     PromptGuardRequest,
     PromptGuardRole,
+    PromptGuardToolArgumentParts,
+    validate_prompt_guard_content_parts,
+    validate_prompt_guard_tool_argument_parts,
 )
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.credential_guard import require_no_credential_material
@@ -179,6 +187,8 @@ def _request(
     tools: Sequence[Mapping[str, Any]],
     user_prompt: str | None,
     trusted_message_indexes: frozenset[int],
+    content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+    tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
 ) -> tuple[PromptGuardRequest, bool]:
     """Bind exact supported wire input and preserve user/document provenance.
 
@@ -190,6 +200,12 @@ def _request(
     supported = genuine_user is not None
     user = genuine_user if genuine_user is not None else ""
     require_no_credential_material(user, surface="composer_prompt_guard_request")
+    partitions = tuple(None for _ in messages) if content_parts is None else content_parts
+    validate_prompt_guard_content_parts(messages, partitions)
+    argument_partitions = tuple(None for _ in messages) if tool_argument_parts is None else tool_argument_parts
+    validate_prompt_guard_tool_argument_parts(messages, argument_partitions)
+    if any(partitions[index] is not None or argument_partitions[index] is not None for index in trusted_message_indexes):
+        raise AuditIntegrityError("Prompt guard partition conflicts with whole-message trust")
     exact = {
         "role": role,
         "policy_fingerprint": policy_fingerprint,
@@ -197,8 +213,20 @@ def _request(
         "messages": list(messages),
         "tools": list(tools),
         "trusted_message_indexes": sorted(trusted_message_indexes),
+        "content_parts": [
+            None
+            if parts is None
+            else [{"text": part.text, "trust": part.trust.value if part.trust is not None else None} for part in parts]
+            for parts in partitions
+        ],
+        "tool_argument_parts": [
+            None
+            if entries is None
+            else [{"tool_call_index": entry.tool_call_index, "parts": [part.text for part in entry.parts]} for entry in entries]
+            for entries in argument_partitions
+        ],
     }
-    canonical = json.dumps(exact, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    canonical = json.dumps(exact, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
     request_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     documents: list[str] = []
     # Exclude only the exact latest genuine user message from documents. Its
@@ -210,11 +238,51 @@ def _request(
     for index, message in enumerate(messages):
         if index in trusted_message_indexes:
             continue
+        parts = partitions[index]
+        argument_entries = argument_partitions[index]
+        shadow = dict(message)
         if index == genuine_index:
-            # Other fields are not discarded merely because text matches.
-            extras = {key: value for key, value in message.items() if key not in ("role", "content")}
-            if extras:
-                documents.append(json.dumps(extras, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
+            shadow = {key: value for key, value in shadow.items() if key not in ("role", "content")}
+        elif parts is not None:
+            shadow.pop("content")
+        if argument_entries:
+            shadow = deepcopy(shadow)
+            for entry in argument_entries:
+                # Only this exact, fully covered string moves to ordered units.
+                # Every sibling function/tool-call field remains untrusted.
+                shadow["tool_calls"][entry.tool_call_index]["function"]["arguments"] = ""
+        if shadow:
+            documents.append(json.dumps(shadow, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
+        if parts is not None and index != genuine_index:
+            documents.extend(
+                json.dumps(
+                    {"message_index": index, "part_index": part_index, "content": part.text},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                for part_index, part in enumerate(parts)
+                if part.trust is None
+            )
+        if argument_entries:
+            documents.extend(
+                json.dumps(
+                    {
+                        "message_index": index,
+                        "tool_call_index": entry.tool_call_index,
+                        "argument_part_index": part_index,
+                        "arguments": part.text,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                for entry in argument_entries
+                for part_index, part in enumerate(entry.parts)
+            )
+        if parts is not None or index == genuine_index:
             continue
         content = message["content"] if "content" in message else None
         if content is not None and type(content) is not str:
@@ -230,8 +298,38 @@ def _request(
                         or type(block["text"]) is not str
                     ):
                         supported = False
-        documents.append(json.dumps(dict(message), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
-    return PromptGuardRequest(role, user, tuple(documents), request_hash), supported and bool(user or documents)
+    packed = _pack_documents(documents)
+    try:
+        size = len(user.encode("utf-8")) + sum(len(document.encode("utf-8")) for document in packed)
+    except UnicodeEncodeError:
+        supported = False
+    else:
+        supported = supported and size <= PROMPT_GUARD_MAX_INPUT_UTF8_BYTES
+    supported = (
+        supported
+        and len(user) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
+        and len(packed) <= PROMPT_GUARD_MAX_DOCUMENTS
+        and all(len(document) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in packed)
+        and bool(user or any(packed))
+    )
+    return PromptGuardRequest(role, user, packed, request_hash), supported
+
+
+def _pack_documents(units: Sequence[str]) -> tuple[str, ...]:
+    """Coalesce complete units in order; an oversized unit is never sliced."""
+    packed: list[str] = []
+    current: str | None = None
+    for unit in units:
+        if current is None:
+            current = unit
+        elif len(current) + 1 + len(unit) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS:
+            current += "\n" + unit
+        else:
+            packed.append(current)
+            current = unit
+    if current is not None:
+        packed.append(current)
+    return tuple(packed)
 
 
 async def _persist(
@@ -289,6 +387,8 @@ async def enforce_prompt_guard(
     tools: Sequence[Mapping[str, Any]] = (),
     user_prompt: str | None = None,
     trusted_message_indexes: frozenset[int] = frozenset(),
+    content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+    tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
 ) -> None:
     """Audit a complete check before any protected model admission or dispatch."""
     if mode not in ("required", "debug-when-unconfigured"):
@@ -315,12 +415,14 @@ async def enforce_prompt_guard(
         tools=tools,
         user_prompt=user_prompt,
         trusted_message_indexes=trusted_message_indexes,
+        content_parts=content_parts,
+        tool_argument_parts=tool_argument_parts,
     )
     original_cancellation: asyncio.CancelledError | None = None
-    if mount is None:
-        decision = PromptGuardDecision("debug_bypass" if mode == "debug-when-unconfigured" else "unavailable", "guard_not_configured")
-    elif not supported:
+    if not supported:
         decision = PromptGuardDecision("unavailable", "unsupported_input")
+    elif mount is None:
+        decision = PromptGuardDecision("debug_bypass" if mode == "debug-when-unconfigured" else "unavailable", "guard_not_configured")
     else:
         try:
             async with asyncio.timeout(mount.client.timeout_seconds):
@@ -332,7 +434,9 @@ async def enforce_prompt_guard(
             decision = PromptGuardDecision("cancelled", "cancelled")
         if type(decision) is not PromptGuardDecision:
             raise AuditIntegrityError("Dedicated prompt guard returned a foreign decision")
-        if original_cancellation is None and decision.disposition not in ("allow", "blocked", "unavailable"):
+        if original_cancellation is None and (
+            decision.disposition not in ("allow", "blocked", "unavailable") or decision.reason == "guard_not_configured"
+        ):
             raise AuditIntegrityError("Dedicated prompt guard authored an enforcer-only outcome")
     fence = provider_custody.context.fence
     envelope: _GuardAuditEnvelope = {

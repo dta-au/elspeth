@@ -705,6 +705,7 @@ async def test_real_planner_selects_independent_mount_even_with_identical_model_
 async def test_captured_planner_catalog_reference_preserves_complete_untrusted_graph_evidence(tmp_path, tool_context, record_property):
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.planner_authoring_aids import build_schema_contract_evidence
+    from elspeth.web.composer.prompt_guard_rendering import json_content_parts
     from elspeth.web.composer.state import NodeSpec
     from elspeth.web.dependencies import create_catalog_service
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -757,8 +758,7 @@ async def test_captured_planner_catalog_reference_preserves_complete_untrusted_g
     evidence = next(payload for payload in parsed if "intent" in payload)
     assert {**reference["schema_contract_evidence"], **evidence["schema_contract_evidence"]} == expected_schema
     assert reference["schema_contract_evidence"]["schemas"][0]["plugin_id"] == "transform/passthrough"
-    documents = [json.loads(document) for document in client.requests[0].documents]
-    assert all("authoring_aids" not in json.loads(document["content"]) for document in documents)
+    assert "authoring_aids" not in "\n".join(client.requests[0].documents)
     assert graph_plugin in "\n".join(client.requests[0].documents)
     assert max(map(len, client.requests[0].documents)) < 10_000
     assert all(PROMPT_GUARD_TRUST_KEY not in message for message in wire["messages"])
@@ -769,8 +769,17 @@ async def test_captured_planner_catalog_reference_preserves_complete_untrusted_g
         "messages": wire["messages"],
         "tools": wire["tools"],
         "trusted_message_indexes": [0, 1],
+        "content_parts": [
+            None,
+            None,
+            [
+                {"text": part.text, "trust": None}
+                for part in json_content_parts(wire["messages"][2]["content"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            ],
+        ],
+        "tool_argument_parts": [None, None, None],
     }
     assert (
         client.requests[0].request_hash
-        == sha256(json.dumps(hashed, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        == sha256(json.dumps(hashed, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     )

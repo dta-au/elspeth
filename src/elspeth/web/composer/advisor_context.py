@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final, cast
 
 from jinja2 import TemplateSyntaxError
 
+from elspeth.contracts.prompt_guard import PromptGuardContentPart
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.templates import extract_jinja2_fields
 from elspeth.web.composer.invariants import InvariantError
+from elspeth.web.composer.prompt_guard_rendering import json_content_parts
 from elspeth.web.composer.state import CompositionState, NodeSpec, _well_formed_query_entries
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.validation import _redact_sensitive_content
@@ -138,7 +141,7 @@ def _neutralize_untrusted_summary_sentinels(text: str, *, json_encoded: bool = F
     return text
 
 
-def build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
+def _advisor_user_sections(arguments: Mapping[str, Any]) -> tuple[str, ...]:
     """Build the exact variable user message sent to the advisor LLM.
 
     The validation path uses this same helper for prompt-size accounting, so
@@ -222,7 +225,116 @@ def build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
             + "\n"
             + _ADVISOR_UNTRUSTED_SUMMARY_END
         )
-    return "\n".join(user_msg_parts)
+    return tuple(user_msg_parts)
+
+
+def build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
+    """Render the same complete variable message used for budget admission."""
+    return "\n".join(_advisor_user_sections(arguments))
+
+
+@dataclass(frozen=True, slots=True)
+class AdvisorSummaryParts:
+    """Semantic summary units retained only by the deterministic producer."""
+
+    values: tuple[str, ...]
+
+
+def advisor_summary_parts(state: CompositionState, published: str) -> AdvisorSummaryParts:
+    """Retain source/node/sink boundaries without changing existing fitting.
+
+    The current budget fitter may already have shortened its published last
+    line. Keep that exact published remainder as one unit; this helper never
+    selects, clips or withholds another byte.
+    """
+    remaining = published
+    selected: list[str] = []
+    for index, section in enumerate(_pipeline_advisor_summary_sections(state)):
+        unit = ("\n" if index else "") + section
+        if not remaining.startswith(unit):
+            break
+        selected.append(unit)
+        remaining = remaining[len(unit) :]
+    if remaining:
+        selected.append(remaining)
+    if "".join(selected) != published:
+        raise InvariantError("Advisor summary parts changed published evidence")
+    return AdvisorSummaryParts(tuple(selected))
+
+
+def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuardContentPart, ...]:
+    """Partition at owned field/component boundaries; every value is untrusted."""
+    sections = _advisor_user_sections(arguments)
+    replacements: dict[int, tuple[PromptGuardContentPart, ...]] = {}
+    index = 2
+    recent = cast(list[str], arguments["recent_errors"])
+    if recent:
+        # Each prior finding remains atomic, including embedded newlines.
+        prefix = sections[index].index(_ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN) + len(_ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN) + 1
+        parts = [PromptGuardContentPart(sections[index][:prefix])]
+        for item_index, item in enumerate(recent):
+            text = _redact_sensitive_content(item)
+            text = text.replace(
+                _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN,
+                _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN[0] + "\\" + _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN[1:],
+            ).replace(
+                _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END,
+                _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END[0] + "\\" + _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END[1:],
+            )
+            parts.append(PromptGuardContentPart(("\n" if item_index else "") + "- " + text))
+        parts.append(PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END))
+        replacements[index] = tuple(parts)
+        index += 1
+    attempted = cast(list[str], arguments["attempted_actions"])
+    if attempted:
+        replacements[index] = (
+            PromptGuardContentPart("\nAlready attempted:\n"),
+            *(
+                PromptGuardContentPart(("\n" if item_index else "") + "- " + _redact_sensitive_content(item))
+                for item_index, item in enumerate(attempted)
+            ),
+        )
+        index += 1
+    if "user_message" in arguments and arguments["user_message"]:
+        index += 1
+    if "schema_excerpt" in arguments and arguments["schema_excerpt"]:
+        if "_elspeth_advisor_summary_parts" in arguments:
+            summary = arguments["_elspeth_advisor_summary_parts"]
+            if type(summary) is not AdvisorSummaryParts:
+                raise InvariantError("Advisor summary parts lack producer ownership")
+            replacements[index] = (
+                PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_HEADER + "\n" + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n"),
+                *(
+                    PromptGuardContentPart(_neutralize_untrusted_summary_sentinels(_redact_sensitive_content(value)))
+                    for value in summary.values
+                ),
+                PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END),
+            )
+        index += 1
+    if "publication_review" in arguments:
+        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
+
+        review = arguments["publication_review"]
+        if type(review) is not AdvisorPublicationReview:
+            raise InvariantError("Advisor publication review lacks producer ownership")
+        prefix = sections[index].index(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) + len(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) + 1
+        replacements[index] = (
+            PromptGuardContentPart(sections[index][:prefix]),
+            *(
+                PromptGuardContentPart(_neutralize_untrusted_summary_sentinels(part.text, json_encoded=True))
+                for part in json_content_parts(review.provider_payload_json, ensure_ascii=False)
+            ),
+            PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END),
+        )
+    result: list[PromptGuardContentPart] = []
+    for section_index, section in enumerate(sections):
+        if section_index:
+            result.append(PromptGuardContentPart("\n"))
+        section_parts = replacements[section_index] if section_index in replacements else (PromptGuardContentPart(section),)
+        # Redaction may span producer components. Preserve the whole exact
+        # published section in that case; never inspect a different rendering.
+        result.extend(section_parts if "".join(part.text for part in section_parts) == section else (PromptGuardContentPart(section),))
+    return tuple(result)
 
 
 # Salient, intent-bearing option keys whose VALUES are rendered (compactly) in
@@ -619,7 +731,7 @@ def _render_schema_for_advisor(raw_schema: object) -> str:
     return rendered
 
 
-def summarize_pipeline_for_advisor(state: CompositionState) -> str:
+def _pipeline_advisor_summary_sections(state: CompositionState) -> tuple[str, ...]:
     """Render a compact, redaction-safe description of the pipeline.
 
     Produces descriptive text the advisor can reason about for BOTH halves of
@@ -696,7 +808,12 @@ def summarize_pipeline_for_advisor(state: CompositionState) -> str:
             opt_text = _render_options_for_advisor(output.options)
             lines.append(f"  - {output.name}: plugin={output.plugin} on_write_failure={output.on_write_failure} [{opt_text}]")
 
-    return "\n".join(lines)
+    return tuple(lines)
+
+
+def summarize_pipeline_for_advisor(state: CompositionState) -> str:
+    """Render the complete existing summary from its semantic components."""
+    return "\n".join(_pipeline_advisor_summary_sections(state))
 
 
 def _advisor_control_flow_fields(node: NodeSpec) -> list[tuple[str, str, str]]:

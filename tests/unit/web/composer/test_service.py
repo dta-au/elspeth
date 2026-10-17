@@ -30,6 +30,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardDecision, PromptGuardRequest
 from elspeth.core.canonical import canonical_json
 from elspeth.web import async_workers
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -43,6 +44,7 @@ from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS, _comp
 from elspeth.web.composer.planning_application import (
     _freeform_planner_conversation_context,
 )
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
@@ -70,6 +72,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools import _registry as tool_registry
 from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
+from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
@@ -91,8 +94,17 @@ from elspeth.web.required_work import (
     RequiredWorkCoordinator,
     RequiredWorkRole,
 )
+from elspeth.web.sessions._persist_payload import CommittedCheckpointWitness
+from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, chat_messages_table, quota_provider_attempts_table, sessions_table
+from elspeth.web.sessions.models import (
+    blobs_table,
+    chat_messages_table,
+    composition_states_table,
+    quota_provider_attempts_table,
+    sessions_table,
+)
+from elspeth.web.sessions.routes._helpers import _persist_turn_audit_cohort
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -486,6 +498,238 @@ def _sampling_provider_owner(
         )
         assert {attempt.attempt_id for attempt in attempts} == {call.call_id for call in recorder.llm_calls}
         assert all(attempt.settled_at is not None and attempt.ledger_entry_id is not None for attempt in attempts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verification_fails", [False, True], ids=["guard-only", "guard-and-integrity"])
+async def test_early_guard_refusal_retains_committed_effect_integrity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verification_fails: bool,
+) -> None:
+    import litellm
+
+    from elspeth.web.dependencies import create_catalog_service
+
+    class CheckpointGuard(PromptGuardClient):
+        def __init__(self, decision: PromptGuardDecision) -> None:
+            self.decision = decision
+            self.requests: list[PromptGuardRequest] = []
+
+        @property
+        def adapter(self) -> str:
+            return "controlled-local"
+
+        @property
+        def policy_fingerprint(self) -> str:
+            return "b" * 64
+
+        @property
+        def timeout_seconds(self) -> float:
+            return 5.0
+
+        async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
+            self.requests.append(request)
+            return self.decision
+
+    primary_guard = CheckpointGuard(PromptGuardDecision("allow", "clean"))
+    advisor_guard = CheckpointGuard(PromptGuardDecision("blocked", "policy_blocked"))
+    monkeypatch.setattr("elspeth.web.composer.provider_gateway.build_prompt_guard_mount", lambda _settings: PromptGuardMount(primary_guard))
+    monkeypatch.setattr("elspeth.web.composer.service.build_prompt_guard_mount", lambda _settings: PromptGuardMount(advisor_guard))
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _REAL_RUN_ADVISOR_CHECKPOINT)
+    service, session_id = _composer_service_with_session(
+        create_catalog_service(), _make_settings(data_dir=tmp_path, composer_prompt_guard_mode="required")
+    )
+    sessions = service._require_sessions_service()
+    engine = service._session_engine
+    assert engine is not None
+    blob_id = _create_session_blob_for_test(
+        engine=engine, session_id=session_id, data_dir=tmp_path, filename="input.csv", content="name,score\nada,42\n"
+    )
+    with engine.connect() as connection:
+        source_path = connection.execute(select(blobs_table.c.storage_path).where(blobs_table.c.id == blob_id)).scalar_one()
+    source_arguments = {
+        "plugin": "csv",
+        "on_success": "rows",
+        "options": {"path": source_path, "schema": {"mode": "observed"}},
+        "on_validation_failure": "discard",
+    }
+    pipeline = {
+        "source": source_arguments,
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "rows",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/result.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            }
+        ],
+    }
+    sdk_calls: list[dict[str, Any]] = []
+
+    async def completion(**kwargs: Any) -> litellm.ModelResponse:
+        sdk_calls.append(deepcopy(kwargs))
+        assert len(sdk_calls) == 1, [message for message in kwargs["messages"] if message["role"] == "tool"]
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+            choices=[
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "source-early-1",
+                                "type": "function",
+                                "function": {"name": "set_pipeline", "arguments": json.dumps({"pipeline": pipeline})},
+                            }
+                        ],
+                    }
+                }
+            ],
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    original_early = service._advisor_checkpoint._maybe_run_early_checkpoint
+    original_accept = TurnEvidence.accept_checkpoint
+    early_refusals: list[PromptGuardRefused] = []
+    integrity_failures: list[AuditIntegrityError] = []
+    committed_snapshots: list[tuple[list[Any], list[Any], str]] = []
+    evidence_owners: list[TurnEvidence] = []
+
+    async def observe_early(**kwargs: Any) -> bool:
+        try:
+            return await original_early(**kwargs)
+        except PromptGuardRefused as refusal:
+            early_refusals.append(refusal)
+            raise
+
+    def verify_actual_checkpoint(
+        evidence: TurnEvidence,
+        witness: CommittedCheckpointWitness,
+        *,
+        expected_state: CompositionState,
+        tool_call_ids: tuple[str, ...],
+        assistant_message_id: str,
+    ) -> None:
+        with engine.connect() as connection:
+            states = connection.execute(select(composition_states_table)).all()
+            conversation = connection.execute(
+                select(chat_messages_table)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+                .order_by(chat_messages_table.c.sequence_no)
+            ).all()
+        assert len(states) == 1 and states[0].id == str(witness.state.id)
+        assert [row.role for row in conversation] == ["assistant", "tool"]
+        assert conversation[0].id == assistant_message_id
+        assert conversation[1].tool_call_id == "source-early-1"
+        committed_snapshots.append((states, conversation, assistant_message_id))
+        evidence_owners.append(evidence)
+        try:
+            # Corrupt only the actual comparison input after the real P4
+            # commit. The production verifier raises the integrity original;
+            # neither the persisted rows nor the dispatched state is changed.
+            original_accept(
+                evidence,
+                witness,
+                expected_state=expected_state.with_metadata({"name": "controlled comparison mismatch"})
+                if verification_fails
+                else expected_state,
+                tool_call_ids=tool_call_ids,
+                assistant_message_id=assistant_message_id,
+            )
+        except AuditIntegrityError as failure:
+            integrity_failures.append(failure)
+            raise
+
+    monkeypatch.setattr(service._advisor_checkpoint, "_maybe_run_early_checkpoint", observe_early)
+    monkeypatch.setattr(TurnEvidence, "accept_checkpoint", verify_actual_checkpoint)
+    try:
+        with fenced_operation_context(engine, session_id) as context:
+            coordinator = RequiredWorkCoordinator(
+                RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+            )
+            binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+            owner = ProviderInvocationOwner(service=sessions, required_work=binding)
+            with pytest.raises((PromptGuardRefused, BaseExceptionGroup)) as caught:
+                await service.compose(
+                    "Add a CSV source and review it.",
+                    [],
+                    _empty_state(),
+                    session_id=session_id,
+                    user_id="test-user",
+                    session_operation_context=context,
+                    required_work=binding,
+                    provider_owner=owner,
+                )
+            assert len(early_refusals) == len(committed_snapshots) == len(evidence_owners) == 1
+            assert len(primary_guard.requests) == len(advisor_guard.requests) == len(sdk_calls) == 1
+            leaves = caught.value.exceptions if isinstance(caught.value, BaseExceptionGroup) else (caught.value,)
+            enriched = [failure for failure in leaves if isinstance(failure, PromptGuardRefused)]
+            assert len(enriched) == 1
+            refusal = enriched[0]
+            assert refusal.__cause__ is early_refusals[0]
+            assert refusal.audit_id == early_refusals[0].audit_id
+            assert refusal.tool_invocations == () and refusal.partial_state is None
+            assert len(refusal.llm_calls) == 1 and refusal.failed_turn is not None
+            assert refusal.failed_turn.assistant_message_id == committed_snapshots[0][2]
+            assert refusal.failed_turn.tool_calls_attempted == refusal.failed_turn.tool_responses_persisted == 1
+            projection = project_composer_operation_error(caught.value, request_id="controlled-early-request")
+            if verification_fails:
+                assert len(integrity_failures) == 1
+                assert integrity_failures[0] in leaves
+                assert integrity_failures[0].failed_turn is refusal.failed_turn
+                assert evidence_owners[0].effects.verification == "unavailable"
+                assert projection.http_status == 500 and projection.error_type == "audit_integrity_error"
+            else:
+                assert integrity_failures == []
+                assert evidence_owners[0].effects.verification == "verified"
+                assert projection.http_status == 422 and projection.error_type == "prompt_guard_blocked"
+            # Drain only the remaining physical model-call audit as the route
+            # does. The committed assistant/tool checkpoint must not replay.
+            await _persist_turn_audit_cohort(
+                sessions,
+                UUID(session_id),
+                refusal.tool_invocations,
+                refusal.llm_calls,
+                tool_composition_state_id=None,
+                llm_composition_state_id=None,
+                plugin_crash_pending=True,
+                required_audit=True,
+                required_work=coordinator,
+                session_operation_context=context,
+            )
+            coordinator.assert_completed()
+            with engine.connect() as connection:
+                states_after = connection.execute(select(composition_states_table)).all()
+                rows = connection.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).all()
+                attempts = connection.execute(select(quota_provider_attempts_table)).all()
+            assert states_after == committed_snapshots[0][0]
+            assert [row for row in rows if row.role in ("assistant", "tool")] == committed_snapshots[0][1]
+            assert [
+                row.tool_calls[0]["check"]["disposition"]
+                for row in rows
+                if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == "prompt_guard_audit"
+            ] == ["allow", "blocked"]
+            assert (
+                len([row for row in rows if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == "llm_call_audit"])
+                == len(attempts)
+                == 1
+            )
+            assert attempts[0].attempt_id == refusal.llm_calls[0].call_id
+            current = await sessions.get_current_state(UUID(session_id))
+            assert current is not None and current.sources["source"]["plugin"] == "csv"
+    finally:
+        engine.dispose()
 
 
 def _create_session_blob_for_test(

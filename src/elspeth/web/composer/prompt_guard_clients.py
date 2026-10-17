@@ -8,16 +8,19 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardDecision, PromptGuardRequest
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_MAX_DOCUMENTS,
+    PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
+    PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+    PromptGuardClient,
+    PromptGuardDecision,
+    PromptGuardRequest,
+)
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.bounded_json import bounded_json_loads
 from elspeth.web.prompt_guard_config import AZURE_PROMPT_SHIELDS_API_VERSION, PromptGuardSettings
 
-_MAX_PROMPT_CHARACTERS = 10_000
-_MAX_DOCUMENT_CHARACTERS = 10_000
 _MAX_DOCUMENTS_PER_CALL = 5
-_MAX_DOCUMENTS = 128
-_MAX_INPUT_UTF8_BYTES = 262_144
 _MAX_RESPONSE_BYTES = 65_536
 
 
@@ -36,7 +39,7 @@ class _AzureResponse(BaseModel):
 
 def _document_batches(request: PromptGuardRequest) -> tuple[tuple[str, ...], ...] | None:
     """Keep whole documents within the standalone API's count/character limits."""
-    if len(request.user_prompt) > _MAX_PROMPT_CHARACTERS or len(request.documents) > _MAX_DOCUMENTS:
+    if len(request.user_prompt) > PROMPT_GUARD_MAX_TEXT_CHARACTERS or len(request.documents) > PROMPT_GUARD_MAX_DOCUMENTS:
         return None
     if not request.user_prompt and not any(request.documents):
         return None
@@ -44,13 +47,13 @@ def _document_batches(request: PromptGuardRequest) -> tuple[tuple[str, ...], ...
         size = len(request.user_prompt.encode("utf-8")) + sum(len(document.encode("utf-8")) for document in request.documents)
     except UnicodeEncodeError:
         return None
-    if size > _MAX_INPUT_UTF8_BYTES or any(len(document) > _MAX_DOCUMENT_CHARACTERS for document in request.documents):
+    if size > PROMPT_GUARD_MAX_INPUT_UTF8_BYTES or any(len(document) > PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in request.documents):
         return None
     batches: list[tuple[str, ...]] = []
     current: list[str] = []
     characters = 0
     for document in request.documents:
-        if current and (len(current) == _MAX_DOCUMENTS_PER_CALL or characters + len(document) > _MAX_DOCUMENT_CHARACTERS):
+        if current and (len(current) == _MAX_DOCUMENTS_PER_CALL or characters + len(document) > PROMPT_GUARD_MAX_TEXT_CHARACTERS):
             batches.append(tuple(current))
             current = []
             characters = 0
@@ -102,11 +105,11 @@ class AzurePromptGuardClient(PromptGuardClient):
                 "api_version": AZURE_PROMPT_SHIELDS_API_VERSION,
                 "auth": "subscription_key",
                 "timeout_seconds": settings.timeout_seconds,
-                "max_prompt_characters": _MAX_PROMPT_CHARACTERS,
-                "max_document_characters": _MAX_DOCUMENT_CHARACTERS,
+                "max_prompt_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+                "max_document_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
                 "max_documents_per_call": _MAX_DOCUMENTS_PER_CALL,
-                "max_documents": _MAX_DOCUMENTS,
-                "max_input_utf8_bytes": _MAX_INPUT_UTF8_BYTES,
+                "max_documents": PROMPT_GUARD_MAX_DOCUMENTS,
+                "max_input_utf8_bytes": PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
                 "max_response_bytes": _MAX_RESPONSE_BYTES,
             }
         )

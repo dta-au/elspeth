@@ -18,7 +18,12 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
-from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardTrust, detach_prompt_guard_messages
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_TRUST_KEY,
+    PromptGuardTrust,
+    detach_prompt_guard_evidence,
+)
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
@@ -384,7 +389,11 @@ class AdvisorCheckpointOwner:
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_msg, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION},
-            {"role": "user", "content": user_msg},
+            {
+                "role": "user",
+                "content": user_msg,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: _advisor_context.advisor_user_content_parts(arguments),
+            },
         ]
         if self._composer_skill_text and supports_anthropic_prompt_cache_markers(advisor_model):
             messages[0]["content"] = [
@@ -418,7 +427,9 @@ class AdvisorCheckpointOwner:
             structured_output=structured_output,
             checkpoint_phase=checkpoint_phase,
         )
-        messages, trusted_indexes = detach_prompt_guard_messages(messages)
+        guard_evidence = detach_prompt_guard_evidence(messages)
+        messages = guard_evidence.messages
+        trusted_indexes = guard_evidence.trusted_message_indexes
         kwargs["messages"] = messages
         private_request = capture_provider_context(messages=messages, tools=None)
         try:
@@ -430,6 +441,7 @@ class AdvisorCheckpointOwner:
                     prompt_guard_mode=self._settings.composer_prompt_guard_mode,
                     prompt_guard_role="advisor",
                     prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=guard_evidence.content_parts,
                     **kwargs,
                 ),
                 timeout=effective_timeout,
@@ -660,7 +672,7 @@ class AdvisorCheckpointOwner:
         # prefix is fitted, after every mandatory phase field is assembled.
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
         if phase == "early":
-            early_arguments = {
+            early_arguments: dict[str, str | list[str] | _advisor_context.AdvisorSummaryParts] = {
                 "trigger": ADVISOR_TRIGGER_DETERMINISTIC_EARLY,
                 "problem_summary": (
                     "Review this pipeline APPROACH early (it was just established). "
@@ -672,7 +684,9 @@ class AdvisorCheckpointOwner:
                 "attempted_actions": [],
                 "schema_excerpt": pipeline_summary,
             }
-            early_arguments["schema_excerpt"] = _advisor_context.bound_advisor_checkpoint_summary(early_arguments, char_cap)
+            bounded_summary = _advisor_context.bound_advisor_checkpoint_summary(early_arguments, char_cap)
+            early_arguments["schema_excerpt"] = bounded_summary
+            early_arguments["_elspeth_advisor_summary_parts"] = _advisor_context.advisor_summary_parts(state, bounded_summary)
             return early_arguments
         review_state = advisor_review_state or _AdvisorReviewState()
         current_evidence_hash = stable_hash({"advisor_evidence": pipeline_summary})
@@ -744,6 +758,7 @@ class AdvisorCheckpointOwner:
                 raise TypeError("END publication review must be an owned snapshot")
             end_arguments["publication_review"] = publication_review
         end_arguments["schema_excerpt"] = _advisor_context.bound_advisor_checkpoint_summary(end_arguments, char_cap)
+        end_arguments["_elspeth_advisor_summary_parts"] = _advisor_context.advisor_summary_parts(state, end_arguments["schema_excerpt"])
         return end_arguments
 
     def _advisor_blocked_result(
@@ -1192,6 +1207,9 @@ class AdvisorCheckpointOwner:
                 # marker would be mistaken for an original evidence line.
                 call_arguments = {**call_arguments, "schema_excerpt": _advisor_context.summarize_pipeline_for_advisor(state)}
                 call_arguments["schema_excerpt"] = _advisor_context.bound_advisor_checkpoint_summary(call_arguments, char_cap)
+                call_arguments["_elspeth_advisor_summary_parts"] = _advisor_context.advisor_summary_parts(
+                    state, call_arguments["schema_excerpt"]
+                )
             if len(_advisor_context.build_advisor_user_message(call_arguments)) > char_cap:
                 # Expected size exhaustion is not a completed model review.
                 # Preserve any prior actual call, but spend no further attempt.

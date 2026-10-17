@@ -1,10 +1,9 @@
 """First-message-of-session auto-titling.
 
 Generates a 3-6 word session title from the user's first message via a
-single LLM completion and persists it via the session service. Runs as
-a background task spawned from the send_message route; awaited (with
-timeout) after compose returns so the title is visible in the same
-response cycle as the assistant reply.
+single LLM completion and persists it via the session service. The send turn
+owns this child under its adopted lease and joins it before primary composition.
+Title work consumes the same admitted operation deadline.
 
 Trust tier: the user message is Tier 3 (external), the LLM response is
 Tier 3 (external — model output). The completion is admitted through the
@@ -12,9 +11,9 @@ fail-closed title-shape gate ``_admit_title_candidate`` (character
 allowlist, word/length bounds, credential-shape rejection) before being
 written to ``session.title`` (Tier 1, audit DB); rejected completions
 are counted on ``composer.auto_title.rejected`` and the session keeps
-its minted default title. The outbound naming call likewise never ships
-raw first-message content: credential/PII-shaped substrings are redacted
-and only a fenced, truncated excerpt leaves the process. No
+its minted default title. The naming model receives a redacted, fenced excerpt;
+the dedicated prompt guard separately checks the credential-screened genuine
+user message before model admission. No
 Landscape audit entry is emitted — this is UI metadata, not a pipeline
 decision. See docs/guides/data-trust-and-error-handling.md §The Three-Tier
 Trust Model for the rationale.
@@ -431,6 +430,7 @@ async def maybe_auto_title_session(
         provider_custody=provider_custody,
         prompt_guard_mount=prompt_guard_mount,
         prompt_guard_mode=prompt_guard_mode,
+        user_message=user_message,
     )
 
 
@@ -447,6 +447,7 @@ async def _maybe_auto_title_session_required(
     provider_custody: ProviderCallCustody,
     prompt_guard_mount: PromptGuardMount | None,
     prompt_guard_mode: PromptGuardMode,
+    user_message: str,
 ) -> None:
     if (
         type(provider_custody) is not ProviderCallCustody
@@ -475,7 +476,7 @@ async def _maybe_auto_title_session_required(
                         prompt_guard_mount=prompt_guard_mount,
                         prompt_guard_mode=prompt_guard_mode,
                         prompt_guard_role="composer",
-                        prompt_guard_user_prompt=wire_messages[-1]["content"],
+                        prompt_guard_user_prompt=user_message,
                         prompt_guard_trusted_message_indexes=trusted_indexes,
                         **wire_kwargs,
                     )

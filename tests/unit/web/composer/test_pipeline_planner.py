@@ -43,7 +43,7 @@ from elspeth.contracts.composer_planner_audit import (
 )
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.prompt_guard import PromptGuardMode
+from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardDecision, PromptGuardMode, PromptGuardRequest
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -83,6 +83,7 @@ from elspeth.web.composer.pipeline_planner import (
 )
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, planner_plugin_contract
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import (
@@ -5585,6 +5586,151 @@ async def test_absolute_deadline_audits_slow_provider_timeout_and_settles(
     (call,) = recorder.llm_calls
     assert call.status is ComposerLLMCallStatus.TIMEOUT
     assert events[-1] == "settled:failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["primary-operation", "hatch-operation", "guard-bound"])
+async def test_guard_deadline_preserves_operation_timeout_without_provider_attempt(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    scope: str,
+) -> None:
+    engine, origin = await _session_context()
+    guard_started_at: float | None = None
+    guard_cancelled = False
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    # Warm catalog validation before the operation's real deadline starts.
+    build_planner_authoring_aids(policy)
+    policy.validate_composition_state(_empty_state())
+
+    class DeadlineGuard(PromptGuardClient):
+        def __init__(self, *, slow: bool) -> None:
+            self.slow = slow
+
+        @property
+        def adapter(self) -> str:
+            return "controlled-local"
+
+        @property
+        def policy_fingerprint(self) -> str:
+            return "a" * 64
+
+        @property
+        def timeout_seconds(self) -> float:
+            return 0.02 if scope == "guard-bound" else 5.0
+
+        async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
+            nonlocal guard_started_at, guard_cancelled
+            if not self.slow:
+                return PromptGuardDecision("allow", "clean")
+            guard_started_at = asyncio.get_running_loop().time()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                guard_cancelled = True
+                raise
+            raise AssertionError("unreachable")
+
+    hatch = scope == "hatch-operation"
+    slow_guard = DeadlineGuard(slow=True)
+    primary_guard = DeadlineGuard(slow=False) if hatch else slow_guard
+    completion = _ScriptedCompletion(_response(("list_sources", {})), _response(("list_sinks", {}))) if hatch else _ScriptedCompletion()
+    recorder = BufferingRecorder()
+    events: list[str] = []
+    failure: BaseException | None = None
+    try:
+        try:
+            await _plan(
+                tmp_path=tmp_path,
+                tool_context=tool_context,
+                completion=completion,
+                recorder=recorder,
+                originating_message=origin,
+                custody_config=replace(_custody(tmp_path), session_engine=engine),
+                policy_override=(policy, snapshot),
+                model_overrides={
+                    "timeout_seconds": 1.0,
+                    "max_discovery_turns": 1,
+                    "prompt_guard_mode": "required",
+                    "prompt_guard_mount": PromptGuardMount(primary_guard),
+                    "escape_hatch_model": "anthropic/claude-planner" if hatch else None,
+                    "escape_hatch_provider": "test-provider" if hatch else None,
+                    "escape_hatch_prompt_guard_mount": PromptGuardMount(slow_guard) if hatch else None,
+                },
+                lifecycle=_lifecycle(events),
+            )
+        except BaseException as exc:
+            failure = exc
+
+        with engine.connect() as connection:
+            rows = connection.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).mappings().all()
+            attempts = connection.execute(select(quota_provider_attempts_table)).mappings().all()
+            ledger = connection.execute(select(token_usage_ledger_table)).mappings().all()
+        guards = [
+            row["tool_calls"][0]["check"] for row in rows if row["tool_calls"] and row["tool_calls"][0]["_kind"] == "prompt_guard_audit"
+        ]
+        expected_attempts = 2 if hatch else 0
+        assert guard_started_at is not None
+        assert guard_cancelled
+        assert len(completion.requests) == len(recorder.llm_calls) == len(attempts) == len(ledger) == expected_attempts
+        assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.SUCCESS] * expected_attempts
+        assert [(check["role"], check["disposition"], check["reason"]) for check in guards] == (
+            [("composer", "allow", "clean")] * expected_attempts
+            + [
+                (
+                    "advisor" if hatch else "composer",
+                    "unavailable" if scope == "guard-bound" else "cancelled",
+                    "timeout" if scope == "guard-bound" else "cancelled",
+                )
+            ]
+        )
+        assert events[-1] == "settled:failed"
+        if scope == "guard-bound":
+            assert isinstance(failure, PromptGuardRefused)
+            assert failure.disposition == "unavailable"
+        else:
+            assert isinstance(failure, PipelinePlannerError)
+            assert failure.code == "TIMEOUT"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["timeout", "outage"])
+async def test_hatch_provider_weather_keeps_original_exhaustion_while_operation_budget_remains(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    failure_kind: str,
+) -> None:
+    provider_failure = (
+        LiteLLMTimeout(message="controlled timeout", llm_provider="test-provider", model="test/planner")
+        if failure_kind == "timeout"
+        else ServiceUnavailableError(message="controlled outage", llm_provider="test-provider", model="test/planner")
+    )
+    completion = _ScriptedCompletion(_response(("list_sources", {})), _response(("list_sinks", {})), provider_failure)
+    recorder = BufferingRecorder()
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={
+                "max_discovery_turns": 1,
+                "max_api_attempts": 1,
+                "escape_hatch_model": "anthropic/claude-planner",
+                "escape_hatch_provider": "test-provider",
+            },
+        )
+    assert caught.value.code == "DISCOVERY_EXHAUSTED"
+    assert len(completion.requests) == 3
+    assert [call.status for call in recorder.llm_calls] == [
+        ComposerLLMCallStatus.SUCCESS,
+        ComposerLLMCallStatus.SUCCESS,
+        ComposerLLMCallStatus.TIMEOUT if failure_kind == "timeout" else ComposerLLMCallStatus.API_ERROR,
+    ]
 
 
 @pytest.mark.asyncio

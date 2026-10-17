@@ -56,16 +56,21 @@ do not control it.
 The adapter uses the
 [standalone Prompt Shields 2024-09-01 API](https://learn.microsoft.com/en-us/rest/api/contentsafety/text-operations/shield-prompt?view=rest-contentsafety-2024-09-01).
 Genuine latest-user text goes into `userPrompt`; untrusted graph and tool text
-goes into `documents`. Trusted deployment system instructions remain outside
-attack classification. Credentials are screened before guard egress.
+goes into `documents`. Trusted deployment instructions and exact registered
+catalog references remain outside attack classification. User, graph, model
+and tool argument values remain untrusted. Credentials are screened before
+guard egress.
 
 Azure accepts a prompt of at most 10,000 characters and at most five documents
-totaling 10,000 characters per call. ELSPETH groups whole documents within those
-limits and requires all groups to pass. It never truncates or splits one
-document to fit. The logical check accepts at most 128 documents and 262,144
-aggregate UTF-8 bytes. An individual oversized prompt/document, unsupported
-image/audio/file input or excessive aggregate input is refused. These are
-explicit coverage limits, not clean verdicts. See
+totaling 10,000 characters per call. Owned producers retain complete semantic
+units of structured context and decoded tool arguments. Their concatenation
+must exactly match the original provider text; the metadata never reaches the
+model provider. ELSPETH packs complete units and history messages into bounded
+documents, requires every batch to pass, and never cuts a string value or
+truncates history to fit. The logical check accepts at most 128 packed documents
+and 262,144 aggregate UTF-8 bytes. An individual oversized user prompt or atomic
+value, unsupported image/audio/file input or excessive aggregate input is
+refused, including in debug mode. These are explicit coverage limits, not clean verdicts. See
 [Azure input limits](https://learn.microsoft.com/en-us/azure/ai-services/content-safety/region-availability).
 
 A detected attack blocks the protected model request. A missing/malformed
@@ -78,6 +83,9 @@ raw input, provider error bodies and credentials are excluded from that audit.
 The historical advisor regex prescan no longer produces decisions. Existing
 prescan audit records remain readable. A service block preserves existing
 graph state; it does not undo valid work committed earlier in the request.
+When a new session needs a generated title, its protected title call finishes
+before primary composition and consumes the same admitted operation deadline.
+A title guard refusal stops that turn before primary work begins.
 
 Sessionless startup model probes skip paid verification because they have no
 durable authoring lifecycle for the guard audit. The standalone AWS ECS

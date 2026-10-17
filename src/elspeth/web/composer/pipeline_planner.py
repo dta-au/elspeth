@@ -45,7 +45,16 @@ from elspeth.contracts.composer_planner_audit import (
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardMode, PromptGuardTrust, detach_prompt_guard_messages
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
+    PROMPT_GUARD_TRUST_KEY,
+    PromptGuardContentPart,
+    PromptGuardMode,
+    PromptGuardToolArgumentParts,
+    PromptGuardTrust,
+    detach_prompt_guard_evidence,
+)
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import is_valid_provider_replay_tool_call_id
@@ -110,6 +119,7 @@ from elspeth.web.composer.progress import (
     tool_started_progress_event,
 )
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused
+from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts, json_content_parts
 
 # Private by name, deliberate import: one derivation of "plugins the current
 # state names" for every authoring path that builds schema evidence — the
@@ -1985,6 +1995,11 @@ def _assistant_tool_calls_message(message: Any, calls: tuple[_ParsedToolCall, ..
             }
             for call in calls
         ],
+        PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY: tuple(
+            PromptGuardToolArgumentParts(index, json_argument_content_parts(call.raw_arguments))
+            for index, call in enumerate(calls)
+            if call.wire_error is None
+        ),
     }
 
 
@@ -3130,6 +3145,18 @@ def _serialize_provider_discovery_result(
     return serialize_admitted_discovery_result(admitted)
 
 
+def _feedback_content_parts(feedback: _PlannerFeedbackWire) -> tuple[PromptGuardContentPart, ...]:
+    """Only the compiler's current policy-rehydrated contracts are references."""
+    references = frozenset(
+        ("validation", "errors", index, "plugin_contracts")
+        for index, entry in enumerate(feedback["validation"]["errors"])
+        if "plugin_contracts" in entry
+    )
+    return json_content_parts(
+        canonical_json(feedback), reference_paths=references, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
 async def _await_custody_settlement(awaitable: Awaitable[Any]) -> Any:
     """Finish idempotent custody after cancellation, then preserve cancellation."""
 
@@ -3327,6 +3354,8 @@ async def _complete_planner_provider(
     advisor_hatch: bool,
     user_prompt: str,
     trusted_indexes: frozenset[int],
+    content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...],
+    tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...],
 ) -> Any:
     return await _litellm_acompletion(
         provider_custody=provider_custody,
@@ -3335,6 +3364,8 @@ async def _complete_planner_provider(
         prompt_guard_role="advisor" if advisor_hatch else "composer",
         prompt_guard_user_prompt=user_prompt,
         prompt_guard_trusted_message_indexes=trusted_indexes,
+        prompt_guard_content_parts=content_parts,
+        prompt_guard_tool_argument_parts=tool_argument_parts,
         **dict(request),
     )
 
@@ -3638,6 +3669,9 @@ async def _plan_pipeline_inner(
         {
             "role": "user",
             "content": canonical_json(provider_request),
+            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                canonical_json(provider_request), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
         },
     ]
     total_calls = 0
@@ -3737,7 +3771,9 @@ async def _plan_pipeline_inner(
             else (list(messages), list(active_tools))
         )
         assert cache_marked_tools is not None
-        cache_marked_messages, trusted_indexes = detach_prompt_guard_messages(cache_marked_messages)
+        guard_evidence = detach_prompt_guard_evidence(cache_marked_messages)
+        cache_marked_messages = guard_evidence.messages
+        trusted_indexes = guard_evidence.trusted_message_indexes
         call_input_snapshot = json.loads(
             canonical_json(
                 {
@@ -3903,6 +3939,8 @@ async def _plan_pipeline_inner(
                         advisor_hatch=model_override is not None,
                         user_prompt=intent,
                         trusted_indexes=trusted_indexes,
+                        content_parts=guard_evidence.content_parts,
+                        tool_argument_parts=guard_evidence.tool_argument_parts,
                     )
                     if provider_custody is not None
                     else _litellm_acompletion(
@@ -3914,6 +3952,8 @@ async def _plan_pipeline_inner(
                         prompt_guard_role="advisor" if model_override is not None else "composer",
                         prompt_guard_user_prompt=intent,
                         prompt_guard_trusted_message_indexes=trusted_indexes,
+                        prompt_guard_content_parts=guard_evidence.content_parts,
+                        prompt_guard_tool_argument_parts=guard_evidence.tool_argument_parts,
                         **kwargs,
                     ),
                     timeout=remaining,
@@ -3950,7 +3990,10 @@ async def _plan_pipeline_inner(
                 if not (
                     provider_custody.needs_terminal_audit() if provider_custody is not None else provider_attempt_needs_terminal_audit()
                 ):
-                    raise
+                    # The enclosing planner timer also covers the guard. An
+                    # undispatched check owes no provider attempt, but expiry
+                    # still belongs to this operation's wall-clock budget.
+                    raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT") from exc
                 with required_provider_audit_scope(provider_custody):
                     timed_out_call = build_llm_call_record(
                         private_request=private_request,
@@ -4310,7 +4353,7 @@ async def _plan_pipeline_inner(
         provider_message: Any,
         parsed_calls: tuple[_ParsedToolCall, ...],
         terminal_call: _ParsedToolCall,
-        feedback: Mapping[str, Any],
+        feedback: _PlannerFeedbackWire,
     ) -> None:
         # A rejected terminal proposal was evaluated and its safe result is
         # known, so retain the exact provider-authored tool call together with
@@ -4322,6 +4365,7 @@ async def _plan_pipeline_inner(
                 "role": "tool",
                 "tool_call_id": terminal_call.call_id,
                 "content": canonical_json(feedback),
+                PROMPT_GUARD_CONTENT_PARTS_KEY: _feedback_content_parts(feedback),
             }
         )
 
@@ -4378,6 +4422,12 @@ async def _plan_pipeline_inner(
                     ),
                 )
         except PipelinePlannerError as exc:
+            if exc.code == "TIMEOUT" and _planner_deadline_time() >= deadline:
+                # A spent operation budget takes precedence over the hatch's
+                # earlier exhaustion. Short provider timeouts with remaining
+                # operation budget keep the ordinary hatch fallback below.
+                trail.finalize_active_exception(exc)
+                raise
             if exc.code == "PROSE_REPLY":
                 # A no-tool-call reply (thinking aloud) mid-plan: nudge the
                 # model back to tool calling on its own bounded budget —
@@ -4688,6 +4738,7 @@ async def _plan_pipeline_inner(
                         "role": "tool",
                         "tool_call_id": call.call_id,
                         "content": canonical_json(terminal_feedback),
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: _feedback_content_parts(terminal_feedback),
                     }
                 )
                 continue
@@ -4909,6 +4960,7 @@ async def _plan_pipeline_inner(
                         "role": "tool",
                         "tool_call_id": call.call_id,
                         "content": canonical_json(candidate_feedback),
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: _feedback_content_parts(candidate_feedback),
                     }
                 )
                 continue
@@ -5189,6 +5241,14 @@ async def _plan_pipeline_inner(
                     "role": "tool",
                     "tool_call_id": call.call_id,
                     "content": serialized_result,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                        serialized_result,
+                        reference_paths=frozenset({("data",)})
+                        if isinstance(discovery_result, AdmittedDiscoveryResult)
+                        and discovery_result.result.success
+                        and type(discovery_result.response) is AdmittedPluginSchemaResponse
+                        else frozenset(),
+                    ),
                 }
             )
             information_available = result.success

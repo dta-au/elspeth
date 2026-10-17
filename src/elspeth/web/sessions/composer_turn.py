@@ -288,7 +288,7 @@ class ComposerTurnObservation:
 
     - ``compose_result``: set on the first statement after ``compose()``
       returns, before any post-compose write, so a cancel anywhere in the tail
-      (the title join, settlement, the state save, a composite that loses to a
+      (settlement, the state save, a composite that loses to a
       committed cancel) still leaves the provider evidence to
       :func:`persist_cancelled_turn_audit`;
     - ``pending_exception_llm_calls``: the LLM calls a typed arm holds on its
@@ -485,6 +485,7 @@ async def _join_auto_title(
     session_id: UUID,
     operation_id: str,
     cancellation_observations: list[asyncio.CancelledError],
+    wait_until_complete: bool = False,
 ) -> None:
     """Bounded, cancellation-safe join of the first-message auto-title child (E12; review m3).
 
@@ -504,8 +505,11 @@ async def _join_auto_title(
       settled before the ``CancelledError`` propagates, and that is logged
       (``composer_operation.auto_title_join_cancelled``).
     """
+    # Before primary authoring, only the admitted operation deadline may stop
+    # title work. A local best-effort join timeout must not let a pending guard
+    # decision race with graph/proposal effects.
     try:
-        done, _pending = await asyncio.wait({task}, timeout=_AUTO_TITLE_JOIN_SECONDS)
+        done, _pending = await asyncio.wait({task}, timeout=None if wait_until_complete else _AUTO_TITLE_JOIN_SECONDS)
     except asyncio.CancelledError as cancellation:
         if all(cancellation is not earlier for earlier in cancellation_observations):
             cancellation_observations.append(cancellation)
@@ -545,7 +549,7 @@ async def _join_auto_title(
 def _required_title_result(task: asyncio.Task[None]) -> None:
     try:
         task.result()
-    except (AuditIntegrityError, SQLAlchemyError):
+    except (AuditIntegrityError, SQLAlchemyError, PromptGuardRefused, ComposerAdmissionRefused):
         raise
     except Exception as exc:
         raise ComposerOwnedSettlementFailure() from exc
@@ -1012,7 +1016,6 @@ async def _run_composer_turn(
 
     _COMPOSER_REQUESTS_INFLIGHT.add(1, {"endpoint": labels.endpoint})
     terminal_status: _ComposerRequestTerminalStatus = "failed"
-    auto_title_task: asyncio.Task[None] | None = None
     try:
         if isinstance(request, SendMessageRequest):
             # messages.py:303-310: Tier-1 snapshot guard over CONVERSATION rows, inside the try.
@@ -1033,50 +1036,12 @@ async def _run_composer_turn(
             records if has_partial_turn else [record for record in records if record.id != turn_user_message_id]
         )
 
-        # messages.py:335-355: first-message auto-title, a child of the lease.
-        if (
+        should_auto_title = (
             not recovery_context.malformed_head
             and isinstance(request, SendMessageRequest)
             and len(records) == 1
             and is_default_session_title(session.title)
-        ):
-            title_custody = provider_owner.mint(ProviderInvocationFamily.TITLE)
-            title_producer = required_work.reserve(
-                RequiredWorkSource.TITLE_CONTINUATION_PRODUCER,
-                transition_ordinal=title_custody.required_work.transition_ordinal,
-                semantic_ordinal=title_custody.required_work.semantic_ordinal,
-            )
-
-            async def run_owned_title() -> None:
-                try:
-                    await maybe_auto_title_session(
-                        service=service,
-                        session_id=session.id,
-                        user_message=request.content,
-                        model=settings.composer_model,
-                        temperature=settings.composer_temperature,
-                        seed=settings.composer_seed,
-                        session_operation_context=lease.context,
-                        prompt_guard_mount=services.composer_service.composer_prompt_guard_mount,
-                        prompt_guard_mode=settings.composer_prompt_guard_mode,
-                        api_base=settings.composer_endpoint_base_url,
-                        api_key=(
-                            settings.composer_endpoint_api_key.get_secret_value()
-                            if settings.composer_endpoint_api_key is not None
-                            else None
-                        ),
-                        provider_custody=title_custody,
-                    )
-                except BaseException as failure:
-                    title_producer.complete_owned(failure)
-                    raise
-                title_producer.complete_owned()
-
-            try:
-                auto_title_task = lease.create_task(run_owned_title())
-            except BaseException as failure:
-                title_producer.complete_owned(failure)
-                raise
+        )
 
         from openai import OpenAIError
 
@@ -1446,6 +1411,60 @@ async def _run_composer_turn(
                 budget_seconds_at_running=budget_anchor.remaining_at_running_seconds,
             )
         try:
+            if should_auto_title:
+                title_custody = provider_owner.mint(ProviderInvocationFamily.TITLE)
+                title_producer = required_work.reserve(
+                    RequiredWorkSource.TITLE_CONTINUATION_PRODUCER,
+                    transition_ordinal=title_custody.required_work.transition_ordinal,
+                    semantic_ordinal=title_custody.required_work.semantic_ordinal,
+                )
+
+                async def run_owned_title() -> None:
+                    try:
+                        await maybe_auto_title_session(
+                            service=service,
+                            session_id=session.id,
+                            user_message=message_text,
+                            model=settings.composer_model,
+                            temperature=settings.composer_temperature,
+                            seed=settings.composer_seed,
+                            session_operation_context=lease.context,
+                            prompt_guard_mount=services.composer_service.composer_prompt_guard_mount,
+                            prompt_guard_mode=settings.composer_prompt_guard_mode,
+                            api_base=settings.composer_endpoint_base_url,
+                            api_key=(
+                                settings.composer_endpoint_api_key.get_secret_value()
+                                if settings.composer_endpoint_api_key is not None
+                                else None
+                            ),
+                            provider_custody=title_custody,
+                        )
+                    except BaseException as failure:
+                        title_producer.complete_owned(failure)
+                        raise
+                    title_producer.complete_owned()
+
+                try:
+                    auto_title_task = lease.create_task(run_owned_title())
+                except BaseException as failure:
+                    title_producer.complete_owned(failure)
+                    raise
+                await _join_auto_title(
+                    auto_title_task,
+                    session_id=turn.session_id,
+                    operation_id=turn.operation_id,
+                    cancellation_observations=auto_title_cancellations,
+                    wait_until_complete=True,
+                )
+                compose_budget_seconds = budget_anchor.remaining_seconds(monotonic_now=time.monotonic())
+                if compose_budget_seconds <= 0:
+                    terminal_status = "timed_out"
+                    raise ComposerTurnDeadlineExpired(
+                        session_id=turn.session_id,
+                        operation_id=turn.operation_id,
+                        remaining_seconds=compose_budget_seconds,
+                        budget_seconds_at_running=budget_anchor.remaining_at_running_seconds,
+                    )
             # Awaited inline in the turn task: attach_llm_calls rides on the
             # CancelledError instance and a task boundary would drop it.
             result: ComposerResult | GraphRecoveryResponse
@@ -1480,19 +1499,6 @@ async def _run_composer_turn(
                 )
             # F-B2/C2: first statement after compose() returns.
             observation.compose_result = result
-            if auto_title_task is not None:
-                # E12: joined before the terminal composite. The reference is dropped
-                # only once the join finished by any route (m3), so the outer finally
-                # never joins it twice and a cancel here never orphans the child.
-                try:
-                    await _join_auto_title(
-                        auto_title_task,
-                        session_id=turn.session_id,
-                        operation_id=turn.operation_id,
-                        cancellation_observations=auto_title_cancellations,
-                    )
-                finally:
-                    auto_title_task = None
             continuation = lease.create_task(
                 _capture_freeform_child(settle_post_provider(result)),
                 name=labels.settlement_task_name,
@@ -1994,24 +2000,6 @@ async def _run_composer_turn(
     finally:
         _COMPOSER_REQUESTS_INFLIGHT.add(-1, {"endpoint": labels.endpoint})
         _record_composer_request_terminal(terminal_status, endpoint=labels.endpoint)
-        if auto_title_task is not None:
-            # Every exit that did not reach the pre-terminal join (m3).
-            original = sys.exception()
-            try:
-                await _join_auto_title(
-                    auto_title_task,
-                    session_id=turn.session_id,
-                    operation_id=turn.operation_id,
-                    cancellation_observations=auto_title_cancellations,
-                )
-            except BaseException as title_failure:
-                retained: list[BaseException] = []
-                for retained_error in (original, title_failure, *auto_title_cancellations):
-                    if retained_error is not None and all(retained_error is not earlier for earlier in retained):
-                        retained.append(retained_error)
-                if len(retained) > 1:
-                    raise BaseExceptionGroup("Composer turn retained original and auto-title join failures", retained) from title_failure
-                raise
 
 
 async def run_composer_turn(

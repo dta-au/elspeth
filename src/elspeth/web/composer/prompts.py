@@ -15,11 +15,18 @@ from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any, Final
 
-from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardTrust
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_TRUST_KEY,
+    PromptGuardContentPart,
+    PromptGuardTextMessage,
+    PromptGuardTrust,
+)
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.capability_skill import render_with_pipeline_capabilities
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, build_schema_contract_evidence
+from elspeth.web.composer.prompt_guard_rendering import json_content_parts
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
     COMPOSER_HISTORY_USER_MESSAGE_ID_KEY,
@@ -592,7 +599,21 @@ def build_messages(
         plugin_snapshot=plugin_snapshot,
         schemas_loaded=schemas_loaded,
     )
-    messages.append({"role": "user", "content": context_str})
+    prefix = STATE_CONTEXT_PREFIX + "\n"
+    messages.append(
+        {
+            "role": "user",
+            "content": context_str,
+            PROMPT_GUARD_CONTENT_PARTS_KEY: (
+                PromptGuardContentPart(prefix),
+                *json_content_parts(
+                    context_str[len(prefix) :],
+                    reference_paths=frozenset({("schema_contract_evidence", "schemas")}),
+                    separators=_COMPACT_JSON_SEPARATORS,
+                ),
+            ),
+        }
+    )
 
     # 5. Current user message
     messages.append({"role": "user", "content": user_message})
@@ -603,7 +624,7 @@ def build_messages(
 def build_run_diagnostics_messages(
     snapshot: Mapping[str, object],
     data_dir: str | None = None,
-) -> list[dict[str, str | PromptGuardTrust]]:
+) -> list[PromptGuardTextMessage]:
     """Build messages for run diagnostics explanation.
 
     Uses the same composer skill pack stack as normal composition so every
@@ -622,11 +643,16 @@ def build_run_diagnostics_messages(
         "- Evidence entries must cite visible evidence from the snapshot, not hidden chain-of-thought.\n"
         "- Do not call tools, invent hidden progress, expose hidden chain-of-thought, or mention secrets."
     )
+    snapshot_json = json.dumps(snapshot, indent=2, sort_keys=True, allow_nan=False)
     return [
         {
             "role": "system",
             "content": prompt + "\n\n" + diagnostics_instructions,
             PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
         },
-        {"role": "user", "content": json.dumps(snapshot, indent=2, sort_keys=True, allow_nan=False)},
+        {
+            "role": "user",
+            "content": snapshot_json,
+            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(snapshot_json, indent=2, sort_keys=True),
+        },
     ]

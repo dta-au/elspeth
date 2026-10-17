@@ -232,7 +232,9 @@ async def test_cancellation_joins_checker_and_commits_cancelled_audit_before_ret
 
 
 @pytest.mark.asyncio
-async def test_unsupported_modalities_and_missing_user_provenance_are_audited_not_allowed(authority):
+@pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
+@pytest.mark.parametrize("configured", [False, True])
+async def test_unsupported_modalities_and_missing_user_provenance_are_audited_not_allowed(authority, mode, configured):
     engine, _service, owner, coordinator = authority
     client = _GuardClient(PromptGuardDecision("allow", "clean"))
     for message, user in [
@@ -241,8 +243,8 @@ async def test_unsupported_modalities_and_missing_user_provenance_are_audited_no
     ]:
         with pytest.raises(PromptGuardRefused):
             await enforce_prompt_guard(
-                mount=PromptGuardMount(client),
-                mode="required",
+                mount=PromptGuardMount(client) if configured else None,
+                mode=mode,
                 role="composer",
                 provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
                 messages=[message],
@@ -270,7 +272,9 @@ async def test_configured_mount_without_real_custody_cannot_inspect_or_dispatch(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
-@pytest.mark.parametrize("disposition,reason", [("debug_bypass", "guard_not_configured"), ("cancelled", "cancelled")])
+@pytest.mark.parametrize(
+    "disposition,reason", [("debug_bypass", "guard_not_configured"), ("cancelled", "cancelled"), ("unavailable", "guard_not_configured")]
+)
 async def test_adapter_cannot_mint_enforcer_only_debug_or_cancellation(authority, mode, disposition, reason):
     engine, _service, owner, coordinator = authority
     custody = owner.mint(ProviderInvocationFamily.PRIMARY)

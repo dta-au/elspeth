@@ -3099,13 +3099,23 @@ class ComposerServiceImpl:
 
             if early_checkpoint_failure is not None:
                 if isinstance(early_checkpoint_failure, PromptGuardRefused):
-                    raise early_checkpoint_failure.with_evidence(
+                    early_refusal = early_checkpoint_failure.with_evidence(
                         state=state,
                         initial_version=state.version,
                         tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
                         llm_calls=recorder.llm_calls,
                         failed_turn=failed_turn,
-                    ) from early_checkpoint_failure
+                    )
+                    if persist.effect_verification_failure is not None:
+                        # P4 already committed. Keep both originals visible to
+                        # the operation reducer so a policy refusal cannot mask
+                        # failure to verify the saved effect or replay its rows.
+                        early_refusal.__cause__ = early_checkpoint_failure
+                        raise BaseExceptionGroup(
+                            "EARLY guard refusal and committed effect verification failure",
+                            (early_refusal, persist.effect_verification_failure),
+                        ) from None
+                    raise early_refusal from early_checkpoint_failure
                 attach_llm_calls(early_checkpoint_failure, recorder)
                 if persist.effect_verification_failure is not None:
                     prior_cause = early_checkpoint_failure.__cause__

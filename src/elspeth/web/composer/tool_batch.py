@@ -27,6 +27,11 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
+    PromptGuardToolArgumentParts,
+)
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -82,6 +87,7 @@ from elspeth.web.composer.discovery_cache import (
 )
 from elspeth.web.composer.discovery_cache import (
     admitted_result_from_cached_discovery_payload,
+    tool_result_content_parts,
 )
 from elspeth.web.composer.discovery_cache import (
     cached_discovery_payload as _cached_discovery_payload,
@@ -127,6 +133,7 @@ from elspeth.web.composer.progress import (
     tool_started_progress_event,
 )
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
+from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
@@ -491,8 +498,29 @@ def _pre_dispatch_argument_error(tool_name: str, category: ToolArgumentErrorCate
     )
 
 
+def _retain_llm_tool_argument_parts(llm_messages: Sequence[dict[str, Any]], *, tool_call_id: str) -> None:
+    """Attach all-untrusted semantic units only after argument admission."""
+    for message in reversed(llm_messages):
+        if message["role"] != "assistant" or "tool_calls" not in message:
+            continue
+        for index, call in enumerate(message["tool_calls"]):
+            if call["id"] != tool_call_id:
+                continue
+            entry = PromptGuardToolArgumentParts(index, json_argument_content_parts(call["function"]["arguments"]))
+            existing = (
+                cast(tuple[PromptGuardToolArgumentParts, ...], message[PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY])
+                if PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY in message
+                else ()
+            )
+            message[PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY] = tuple(
+                sorted((*[part for part in existing if part.tool_call_index != index], entry), key=lambda part: part.tool_call_index)
+            )
+            return
+    raise AuditIntegrityError("Admitted tool argument was not present in the active LLM transcript")
+
+
 def _replace_llm_tool_call_arguments(
-    llm_messages: Sequence[Mapping[str, Any]],
+    llm_messages: Sequence[dict[str, Any]],
     *,
     tool_call_id: str,
     arguments: Mapping[str, Any],
@@ -543,6 +571,7 @@ def _replace_llm_tool_call_arguments(
                 provider_arguments = {"pipeline": arguments}
             encoded = json.dumps(provider_arguments, separators=(",", ":"))
             function["arguments"] = encoded
+            _retain_llm_tool_argument_parts(llm_messages, tool_call_id=tool_call_id)
             return
     raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
 
@@ -1360,6 +1389,7 @@ async def run_tool_batch(
             call_wire_facts.wire_conformant = decoded.wire_conformant
         else:
             arguments = cast(dict[str, Any], decoded_arguments)
+        _retain_llm_tool_argument_parts(llm_messages, tool_call_id=tool_call.id)
         try:
             private_arguments_canonical = canonical_json(arguments)
             if tool_name == "set_pipeline":
@@ -1542,6 +1572,9 @@ async def run_tool_batch(
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": cached_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(
+                            cached_admitted if cached_admitted is not None else cached_result, cached_json
+                        ),
                     }
                 )
                 continue
@@ -3156,6 +3189,9 @@ async def run_tool_batch(
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "content": result_json,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(
+                    admitted_result if admitted_result is not None else result, result_json
+                ),
             }
         )
 
