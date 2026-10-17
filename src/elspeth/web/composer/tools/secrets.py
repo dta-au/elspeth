@@ -25,8 +25,8 @@ from elspeth.web.composer.tools._common import (
     ToolResult,
     _composition_canonical_interpretation_requirement_error,
     _discovery_result,
-    _failure_result,
     _mutation_result,
+    _saved_graph_rejection_result,
     _secret_ref_placement_error,
     _validate_mutation_arguments,
     review_reconciliation_failure_message,
@@ -35,7 +35,7 @@ from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
-from elspeth.web.interpretation_state import reconcile_authoritative_reviews
+from elspeth.web.interpretation_state import reconcile_authoritative_reviews, source_component_id
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.secrets.wiring_policy import secret_wiring_authorization_error
 
@@ -200,7 +200,12 @@ def _handle_list_secret_refs(
 ) -> ToolResult:
     _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_secret_refs arguments")
     if context.secret_service is None or context.user_id is None:
-        return _failure_result(state, "Secret tools require secret service context.")
+        return _saved_graph_rejection_result(
+            state,
+            "Secret tools require secret service context.",
+            error_code="secret_context_unavailable",
+            rejected_component=None,
+        )
     items = context.secret_service.list_refs(context.user_id)
     # Return inventory dicts — NEVER include values
     data = [_inventory_item_payload(item) for item in items]
@@ -227,7 +232,12 @@ def _handle_validate_secret_ref(
     context: ToolContext,
 ) -> ToolResult:
     if context.secret_service is None or context.user_id is None:
-        return _failure_result(state, "Secret tools require secret service context.")
+        return _saved_graph_rejection_result(
+            state,
+            "Secret tools require secret service context.",
+            error_code="secret_context_unavailable",
+            rejected_component=None,
+        )
     try:
         validated = _ValidateSecretRefArgumentsModel.model_validate(arguments)
     except PydanticValidationError as exc:
@@ -290,20 +300,22 @@ def _reconciled_secret_wire_result(
     try:
         reconciled = reconcile_authoritative_reviews(state, new_state)
     except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+            rejected_component=None,
         )
     canonical_error = _composition_canonical_interpretation_requirement_error(
         reconciled,
         tool_name="wire_secret_ref",
     )
     if canonical_error is not None:
-        return _failure_result(
+        return _saved_graph_rejection_result(
             state,
             canonical_error,
             error_code="interpretation_requirements_invalid",
+            rejected_component=None,
         )
     return _mutation_result(reconciled, affected)
 
@@ -314,7 +326,12 @@ def _execute_wire_secret_ref(
     context: ToolContext,
 ) -> ToolResult:
     if context.secret_service is None or context.user_id is None:
-        return _failure_result(state, "Secret tools require secret service context.")
+        return _saved_graph_rejection_result(
+            state,
+            "Secret tools require secret service context.",
+            error_code="secret_context_unavailable",
+            rejected_component=None,
+        )
 
     try:
         validated = _WireSecretRefArgumentsModel.model_validate(arguments)
@@ -333,23 +350,43 @@ def _execute_wire_secret_ref(
 
     # Validate the secret ref exists
     if not context.secret_service.has_ref(context.user_id, name):
-        return _failure_result(state, f"Secret reference '{name}' not found or not accessible.")
+        return _saved_graph_rejection_result(
+            state,
+            f"Secret reference '{name}' not found or not accessible.",
+            error_code="missing_secret_ref",
+            rejected_component=None,
+        )
 
     marker = {"secret_ref": name}
 
     if target == "source":
         if not state.sources:
-            return _failure_result(state, "No source configured — set a source first.")
+            return _saved_graph_rejection_result(
+                state,
+                "No source configured — set a source first.",
+                error_code="source_not_found",
+                rejected_component=None,
+            )
         if target_id is None:
             if len(state.sources) == 1:
                 source_name = next(iter(state.sources))
             else:
-                return _failure_result(state, "target_id is required for source targets when multiple sources are configured.")
+                return _saved_graph_rejection_result(
+                    state,
+                    "target_id is required for source targets when multiple sources are configured.",
+                    error_code="secret_target_required",
+                    rejected_component=None,
+                )
         else:
             source_name = str(target_id)
         source = state.sources[source_name] if source_name in state.sources else None
         if source is None:
-            return _failure_result(state, f"Source '{source_name}' not found.")
+            return _saved_graph_rejection_result(
+                state,
+                f"Source '{source_name}' not found.",
+                error_code="source_not_found",
+                rejected_component=source_component_id(source_name),
+            )
         authorization_error = secret_wiring_authorization_error(
             context.secret_wiring_policy,
             secret_name=name,
@@ -358,15 +395,30 @@ def _execute_wire_secret_ref(
             option_key=option_key,
         )
         if authorization_error is not None:
-            return _failure_result(state, authorization_error)
+            return _saved_graph_rejection_result(
+                state,
+                authorization_error,
+                error_code="unauthorized_secret_ref",
+                rejected_component=source_component_id(source_name),
+            )
         patched_options = dict(deep_thaw(source.options))
         patched_options[option_key] = marker
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(source.plugin, patched_options)
         if endpoint_policy_error is not None:
-            return _failure_result(state, endpoint_policy_error)
+            return _saved_graph_rejection_result(
+                state,
+                endpoint_policy_error,
+                error_code="aws_s3_endpoint_url_not_allowed",
+                rejected_component=source_component_id(source_name),
+            )
         placement_error = _secret_ref_placement_error("source", source.plugin, patched_options)
         if placement_error is not None:
-            return _failure_result(state, placement_error)
+            return _saved_graph_rejection_result(
+                state,
+                placement_error,
+                error_code="disallowed_secret_ref",
+                rejected_component=source_component_id(source_name),
+            )
         new_source = replace(source, options=patched_options)
         new_state = state.with_named_source(source_name, new_source)
         affected = "source" if source_name == "source" else f"source:{source_name}"
@@ -374,14 +426,26 @@ def _execute_wire_secret_ref(
 
     elif target == "node":
         if target_id is None:
-            return _failure_result(state, "target_id is required for node targets.")
+            return _saved_graph_rejection_result(
+                state,
+                "target_id is required for node targets.",
+                error_code="secret_target_required",
+                rejected_component=None,
+            )
         node = next((n for n in state.nodes if n.id == target_id), None)
         if node is None:
-            return _failure_result(state, f"Node '{target_id}' not found.")
+            return _saved_graph_rejection_result(
+                state,
+                f"Node '{target_id}' not found.",
+                error_code="node_not_found",
+                rejected_component=f"node:{target_id}",
+            )
         if node.node_type not in ("transform", "aggregation", "collector") or node.plugin is None:
-            return _failure_result(
+            return _saved_graph_rejection_result(
                 state,
                 "Secret references can only be wired into source, transform, aggregation, collector, or output plugin options.",
+                error_code="secret_target_unsupported",
+                rejected_component=f"node:{target_id}",
             )
         # ``"transform"`` covers aggregation and collector nodes too — the
         # same vocabulary ``_secret_ref_placement_error`` and centralized
@@ -394,12 +458,22 @@ def _execute_wire_secret_ref(
             option_key=option_key,
         )
         if authorization_error is not None:
-            return _failure_result(state, authorization_error)
+            return _saved_graph_rejection_result(
+                state,
+                authorization_error,
+                error_code="unauthorized_secret_ref",
+                rejected_component=f"node:{target_id}",
+            )
         patched_options = dict(deep_thaw(node.options))
         patched_options[option_key] = marker
         placement_error = _secret_ref_placement_error("transform", node.plugin, patched_options)
         if placement_error is not None:
-            return _failure_result(state, placement_error)
+            return _saved_graph_rejection_result(
+                state,
+                placement_error,
+                error_code="disallowed_secret_ref",
+                rejected_component=f"node:{target_id}",
+            )
         new_node = replace(node, options=patched_options)
         new_state = state.with_node(new_node)
         return _reconciled_secret_wire_result(state, new_state, (target_id,))
@@ -409,10 +483,20 @@ def _execute_wire_secret_ref(
         # guarantees this is the only remaining variant; explicit
         # ``elif`` plus an "unknown target" else was dead code post-validation.
         if target_id is None:
-            return _failure_result(state, "target_id is required for output targets.")
+            return _saved_graph_rejection_result(
+                state,
+                "target_id is required for output targets.",
+                error_code="secret_target_required",
+                rejected_component=None,
+            )
         output = next((o for o in state.outputs if o.name == target_id), None)
         if output is None:
-            return _failure_result(state, f"Output '{target_id}' not found.")
+            return _saved_graph_rejection_result(
+                state,
+                f"Output '{target_id}' not found.",
+                error_code="output_not_found",
+                rejected_component=f"output:{target_id}",
+            )
         authorization_error = secret_wiring_authorization_error(
             context.secret_wiring_policy,
             secret_name=name,
@@ -421,15 +505,30 @@ def _execute_wire_secret_ref(
             option_key=option_key,
         )
         if authorization_error is not None:
-            return _failure_result(state, authorization_error)
+            return _saved_graph_rejection_result(
+                state,
+                authorization_error,
+                error_code="unauthorized_secret_ref",
+                rejected_component=f"output:{target_id}",
+            )
         patched_options = dict(deep_thaw(output.options))
         patched_options[option_key] = marker
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(output.plugin, patched_options)
         if endpoint_policy_error is not None:
-            return _failure_result(state, endpoint_policy_error)
+            return _saved_graph_rejection_result(
+                state,
+                endpoint_policy_error,
+                error_code="aws_s3_endpoint_url_not_allowed",
+                rejected_component=f"output:{target_id}",
+            )
         placement_error = _secret_ref_placement_error("sink", output.plugin, patched_options)
         if placement_error is not None:
-            return _failure_result(state, placement_error)
+            return _saved_graph_rejection_result(
+                state,
+                placement_error,
+                error_code="disallowed_secret_ref",
+                rejected_component=f"output:{target_id}",
+            )
         new_output = replace(output, options=patched_options)
         new_state = state.with_output(new_output)
         return _reconciled_secret_wire_result(state, new_state, (target_id,))

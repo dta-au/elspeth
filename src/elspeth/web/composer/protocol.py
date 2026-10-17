@@ -1061,7 +1061,8 @@ _SAFE_TOOL_ARGUMENT_EXPECTATIONS = (
             "a pending interpretation requirement or placeholder",
             "id of an existing LLM transform",
             "one of: the allowed values",
-            "prompt_template_parts interpretation_ref or placeholder wiring",
+            "one matching pending vague_term requirement with at least one matching interpretation_ref in prompt_template_parts; "
+            "legacy-only: exactly one placeholder with no matching pending vague_term",
             "the current non-empty options.model",
             "the current non-empty options.prompt_template",
             LLM_PROMPT_REVIEW_DRAFT_EXPECTATION,
@@ -1188,7 +1189,10 @@ def _canonical_tool_argument_expectation(value: object, argument: str) -> str:
     if "per term" in lowered and ("at most" in lowered or "limit" in lowered):
         return INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION
     if "prompt_template_parts" in lowered or "interpretation_ref" in lowered:
-        return "prompt_template_parts interpretation_ref or placeholder wiring"
+        return (
+            "one matching pending vague_term requirement with at least one matching interpretation_ref in prompt_template_parts; "
+            "legacy-only: exactly one placeholder with no matching pending vague_term"
+        )
     if "preserves raw html/fingerprint field" in lowered:
         return "a pipeline decision without preserved raw HTML/fingerprint fields"
     for kind in InterpretationKind:

@@ -850,21 +850,18 @@ LLM node preflight has four independent review checks:
   recommending a policy-visible authorized prompt-injection control discovered
   through the capability catalog and its plugin assistance.
 
-**HARD RULE — never leave a bare `{{interpretation:<term>}}` token.** Any
-`{{interpretation:<term>}}` token you place in a prompt (in `prompt_template` or
-anywhere a prompt is authored) MUST be accompanied, in the SAME `set_pipeline`
-call, by a staged and wired `vague_term` requirement for that term: a pending
-`vague_term` entry in the node's `interpretation_requirements` wired into the
-prompt via a `prompt_template_parts` `interpretation_ref` slot (preferred), or
-the legacy flat token referencing that requirement. A token with no matching
-co-staged requirement is an **orphan**: nothing can resolve it, no review card
-appears, and the run is **blocked** at execution
-(`UnresolvedInterpretationPlaceholderError`). Never write the token first and
-plan to stage the review later. If you are not staging the matching wired
-requirement in the same mutation, do not write the token at all — use plain
-prose. (`request_interpretation_review(kind="vague_term", ...)` is still called
-after the mutation succeeds, per the wiring rule below; staging and wiring happen
-in the `set_pipeline`.)
+**HARD RULE — stage and wire every new structured interpretation together.** A
+new pending `vague_term` entry in the node's `interpretation_requirements` MUST
+be wired into the prompt via a matching `prompt_template_parts`
+`interpretation_ref` slot in the SAME `set_pipeline` call. A legacy flat token
+is not an alternative to structured wiring.
+Render each slot's draft in readable `prompt_template` text. A bare
+`{{interpretation:<term>}}` token without a matching review site is an **orphan**:
+no resolver or review card exists; execution is **blocked**
+(`UnresolvedInterpretationPlaceholderError`). Never write a token first and
+stage its review later; use plain prose without a co-staged wired requirement.
+Call `request_interpretation_review(kind="vague_term", ...)` after the mutation
+succeeds; staging and wiring happen in the same mutation.
 
 These checks stack. A web-scrape-to-LLM scoring node may need all four LLM-node
 review requirements in the same `interpretation_requirements` list before
@@ -1024,9 +1021,11 @@ criterion slot is a readable draft in `prompt_template` and an
 Anchor the structure, not the bytes: the `llm_prompt_template` review is checked
 against the prompt *skeleton* (the parts structure), so resolving the
 `vague_term` — which rewrites the rendered prompt — does not drift it, in either
-operator resolution order. A flat `{{interpretation:<term>}}` placeholder also
-wires the slot, but it drifts the prompt-template review when the operator
-resolves the prompt-template card first; prefer `prompt_template_parts`.
+operator resolution order. Historical legacy-only flat tokens remain supported
+when no pending `vague_term` requirement matches that term. Other review kinds
+may coexist with that legacy token. This compatibility does not replace the
+structured wiring required for new requirements; a legacy token can drift the
+prompt-template review when the operator resolves the prompt-template card first.
 
 Construction pattern for an LLM-authored scoring prompt (criterion "cool", node
 id "rate_cool"):
