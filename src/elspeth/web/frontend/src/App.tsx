@@ -14,7 +14,7 @@ import {
   nextStaleBuildStreak,
   ownFrontendBuild,
 } from "./utils/deployBeacon";
-import { Button } from "./components/ui";
+import { AlertBanner, Button } from "./components/ui";
 import { AuthGuard } from "./components/common/AuthGuard";
 import { AppHeader } from "./components/common/AppHeader";
 import { GraphModal } from "./components/sidebar/GraphModal";
@@ -196,6 +196,8 @@ function App() {
 
   const createSession = useSessionStore((s) => s.createSession);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const sessionError = useSessionStore((s) => s.error);
+  const clearSessionError = useSessionStore((s) => s.clearError);
   const compositionState = useSessionStore((s) => s.compositionState);
   const sessionsLoaded = useSessionStore((s) => s.sessionsLoaded);
   const hasLiveSessions = useSessionStore((s) =>
@@ -747,6 +749,25 @@ function App() {
           onOpenLibrary={openLibrary}
           onOpenPeopleAccess={canAdministerPeople ? openPeopleAccess : undefined}
         />
+        {/* Chat owns errors while a session is active. The landing, tutorial
+            and empty workspace must also surface failures before one exists. */}
+        {activeSessionId === null && sessionError && (
+          <AlertBanner
+            action={
+              <Button
+                variant="bare"
+                type="button"
+                className="alert-banner-action"
+                aria-label="Dismiss error"
+                onClick={clearSessionError}
+              >
+                Dismiss
+              </Button>
+            }
+          >
+            {sessionError}
+          </AlertBanner>
+        )}
         {showTutorial ? (
           <div id="composer-main" className="app-main" tabIndex={-1}>
             <HelloWorldTutorial
