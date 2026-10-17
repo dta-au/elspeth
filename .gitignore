@@ -53,6 +53,8 @@ docs/bugs/generated/
 /docs/quality-audit/findings-panel-raw/
 docs/audit/triage/
 docs-archive/
+# Local review notes and reports.
+/docs/reviews/
 # Local debugging screenshots.
 /images/
 
