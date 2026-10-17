@@ -427,16 +427,6 @@ def _announce_staged_review_handoff(result: ComposerResult, raw_content: str | N
     decision panel's reload backfill recomputes separate Stage-1 suggestions
     and does not restore this runtime suggestion.
 
-    KNOWN REMAINING OVERLAP, deliberately not fixed here: the tail's
-    state-claim GROUNDING correction can also co-occur with this announcement
-    (green-or-unknown preflight plus contradicting prose), and those two
-    suffixes still stack. It is not this branch's defect — the shared tail has
-    the same overlap on the pending-handoff shape it owns — and unlike the red
-    arm the two carry orthogonal facts, so folding them needs a genuinely new
-    composed canonical shape, which is the case
-    ``no_tool_finalize.finalize_no_tool_response`` already documents as
-    deferred ("a naively concatenated suffix would fail closed ... Composing
-    therefore needs a new canonical shape, not a bigger f-string").
     """
     runtime_result = result.runtime_preflight
     if (

@@ -1906,7 +1906,7 @@ class CompositionCompletion:
             # B-4D-3 budget-exhaustion finalize and the CLEAN no-tool tail,
             # which is the single most common way a compose turn ends —
             # published a pending-review result with NOTHING backend-authored
-            # appended: for a handoff result with no grounding violations
+            # appended: for a handoff result
             # ``finalize_no_tool_response`` returns the model's raw prose
             # verbatim, so an operator whose model happened not to mention the
             # review got no indication one existed. Owning it in the shared

@@ -628,7 +628,9 @@ def validate_llm_retry_budget_policy(materialized: MaterializedYaml) -> PhaseRep
 
 def validate_llm_base_url_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Reject web-authored OpenRouter base URL overrides."""
-    for component in _llm_policy_components(materialized.authored.policy.state):
+    # Profile lowering can inject a validated operator endpoint. This author
+    # policy must inspect the retained original options, not that binding.
+    for component in _llm_policy_components(materialized.authored.policy.authored_state):
         policy_error = web_llm_base_url_policy_error(component.options)
         if policy_error is None:
             continue

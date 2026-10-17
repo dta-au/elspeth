@@ -108,6 +108,7 @@ from tests.unit.web.sessions.session_test_authority import FencedSessionServiceH
 # prefix of the validation-qualified variant, so counting it catches a double
 # append in either rendering.
 _HANDOFF_SUFFIX = "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue."
+_PROSE_ONLY_CORRECTION = "I've corrected the spelling in my explanation. No pipeline settings were edited, and no records were processed."
 
 # ---------------------------------------------------------------------------
 # Lightweight fake LLM that emits a single request_interpretation_review call.
@@ -1325,9 +1326,17 @@ async def test_successful_interpretation_review_rejects_reply_tool_calls_without
     vague_events = [e for e in events if e.kind is InterpretationKind.VAGUE_TERM]
     assert len(vague_events) == 1
     assert vague_events[0].tool_call_id == "call_review"
+    assert vague_events[0].llm_draft == "modern, useful, engaging, and clear for the public."
+    assert vague_events[0].choice is InterpretationChoice.PENDING
+    assert vague_events[0].accepted_value is None
+    assert vague_events[0].resolved_at is None
     pt_events = [e for e in events if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE]
     assert len(pt_events) == 1
     assert pt_events[0].tool_call_id.startswith("backend_auto_surface:")
+    assert pt_events[0].llm_draft == "Rate how {{interpretation:cool}} this row is."
+    assert pt_events[0].choice is InterpretationChoice.PENDING
+    assert pt_events[0].accepted_value is None
+    assert pt_events[0].resolved_at is None
 
 
 @pytest.mark.asyncio
@@ -1829,7 +1838,7 @@ async def test_staged_handoff_branch_appends_exactly_one_suffix(
                     "llm_draft": "modern, useful, engaging, and clear for the public.",
                 },
             ),
-            _fake_text_response("Done — interpretation review is pending."),
+            _fake_text_response(_PROSE_ONLY_CORRECTION),
         ]
     )
 
@@ -1854,6 +1863,20 @@ async def test_staged_handoff_branch_appends_exactly_one_suffix(
     assert is_pending_interpretation_handoff(result.runtime_preflight)
 
     assert result.assistant_message.count(_HANDOFF_SUFFIX) == 1, result.assistant_message
+    assert result.assistant_message.startswith(_PROSE_ONLY_CORRECTION)
+    assert result.raw_assistant_content == _PROSE_ONLY_CORRECTION
+    assert "prose above contradicts" not in result.assistant_message
+    events = await sessions_service.list_interpretation_events(session_id, status="pending")
+    assumption = next(e for e in events if e.kind is InterpretationKind.VAGUE_TERM)
+    assert assumption.llm_draft == "modern, useful, engaging, and clear for the public."
+    assert assumption.choice is InterpretationChoice.PENDING
+    assert assumption.accepted_value is None
+    assert assumption.resolved_at is None
+    prompt_event = next(e for e in events if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE)
+    assert prompt_event.llm_draft == "Rate how {{interpretation:cool}} this row is."
+    assert prompt_event.choice is InterpretationChoice.PENDING
+    assert prompt_event.accepted_value is None
+    assert prompt_event.resolved_at is None
 
 
 @pytest.mark.asyncio
@@ -2245,7 +2268,7 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
                 initial_state_id=str(state_id),
                 initial_state=state,
             ),
-            assistant_message=_AdmittedAssistantMessage(content="Done — the pipeline is ready."),
+            assistant_message=_AdmittedAssistantMessage(content=_PROSE_ONLY_CORRECTION),
             message="rate how cool the pages are",
             llm_messages=[],
             state=state,
@@ -2268,13 +2291,19 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
         )
 
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
-    assert any(e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE for e in events)
+    prompt_event = next(e for e in events if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE)
+    assert prompt_event.llm_draft == "Read {{ row.html }} and return JSON."
+    assert prompt_event.choice is InterpretationChoice.PENDING
+    assert prompt_event.accepted_value is None
+    assert prompt_event.resolved_at is None
     assert outcome.action == "return"
     # Both the orphan-block and the finalize path return action="return", so
     # assert specifically that the turn did NOT fail closed on a prompt-template
     # orphan — the backend surfacing cleared that site.
     result = outcome.result
     assert result is not None
+    assert result.message.startswith(_PROSE_ONLY_CORRECTION)
+    assert "prose above contradicts" not in result.message
     preflight = result.runtime_preflight
     assert preflight is None or all(blocker.code != "interpretation_review_orphaned" for blocker in preflight.readiness.blockers)
 
@@ -2448,11 +2477,11 @@ async def test_budget_exhaustion_finalize_auto_surfaces_prompt_template(
                 tool_name="set_pipeline",
                 arguments=_set_pipeline_clean_llm_node_args(),
             ),
-            _fake_text_response("Done — the pipeline is ready."),
+            _fake_text_response(_PROSE_ONLY_CORRECTION),
         ]
     )
 
-    await composer._run_one_turn_for_test(
+    result = await composer._run_one_turn_for_test(
         llm=llm,
         session_id=str(session_id),
         current_state_id=None,
@@ -2464,6 +2493,13 @@ async def test_budget_exhaustion_finalize_auto_surfaces_prompt_template(
     assert len(pt) == 1, "budget-exhaustion finalize must auto-surface the PT review"
     assert pt[0].affected_node_id == "rate_node"
     assert pt[0].tool_call_id.startswith("backend_auto_surface:")
+    assert pt[0].llm_draft == "Summarise {{ row.text }} in one sentence."
+    assert pt[0].choice is InterpretationChoice.PENDING
+    assert pt[0].accepted_value is None
+    assert pt[0].resolved_at is None
+    assert result.assistant_message.startswith(_PROSE_ONLY_CORRECTION)
+    assert result.raw_assistant_content == _PROSE_ONLY_CORRECTION
+    assert "prose above contradicts" not in result.assistant_message
 
 
 @pytest.mark.asyncio

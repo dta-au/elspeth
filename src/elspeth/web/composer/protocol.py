@@ -251,9 +251,8 @@ class ComposerResult:
     """Result of a compose() call.
 
     Attributes:
-        message: The assistant's text response. When synthesis fires
-            (preflight invalid, or state-claim grounding correction on
-            the happy-path), ``message`` is *augmented*: the model's
+        message: The assistant's text response. When a backend notice is
+            appended, ``message`` is *augmented*: the model's
             prose is preserved verbatim and an operator-facing suffix is
             appended. The model's pre-synthesis prose is preserved in
             ``raw_assistant_content`` for the audit trail and LLM
@@ -266,9 +265,8 @@ class ComposerResult:
         raw_assistant_content: The model's pre-synthesis prose whenever
             ``message`` is *synthesized* (augmented relative to raw LLM
             output), regardless of why synthesis fired. Synthesis
-            triggers include preflight failure (empty-state and
-            non-empty-state augmentation) and state-claim grounding
-            correction on the happy-path. ``None`` when ``message`` is
+            triggers include preflight failure, clarification and pending
+            interpretation review notices. ``None`` when ``message`` is
             the verbatim LLM response.
 
     Field-pairing invariant:
@@ -287,8 +285,8 @@ class ComposerResult:
         happen.
 
     Synthesis shapes (all augmentation):
-        Producers (see ``service._finalize_no_tool_response``) emit
-        four synthesis shapes — all of them augmentations
+        Producers (see ``no_tool_finalize.finalize_no_tool_response``) emit
+        validation and clarification augmentations
         (``message == raw_assistant_content + operator_suffix``):
 
         1. No-mutation empty-state augmentation — preflight invalid,
@@ -299,16 +297,17 @@ class ComposerResult:
         3. Preflight-invalid non-empty-state augmentation (issue
            elspeth-9cfbad6901) — preflight invalid, state has been
            populated. Suffix names the validator's specific objection.
-        4. State-claim grounding correction (issue elspeth-c028f7d186) —
-           preflight VALID. Fires when the model's prose contradicts
-           persisted state (forward contradiction) or claims a fresh
-           action when state was unchanged this turn (backward
-           contradiction).
+        4. Unstarted clarification — a typed clarification response on a
+           structurally empty state receives a notice asking for an answer.
+
+        The shared completion tail also announces pending interpretation
+        reviews. Historical stored augmentations retain their raw/content
+        pairing even when their producer has been retired.
 
         Consumers (see ``routes._composer_history_content``) detect
         synthesis structurally at read time via
         ``message.startswith(raw_assistant_content)`` — true for all
-        four shapes. The structural property lets consumers strip the
+        these shapes. The structural property lets consumers strip the
         operator-facing suffix from LLM history without parsing it.
 
     Producer contract (mechanical):
@@ -421,8 +420,8 @@ class ComposerResult:
         #    audit trail would falsely imply synthesis happened on a
         #    verbatim response. The narrowing on ``message ==
         #    raw_assistant_content`` allows non-preflight synthesis
-        #    triggers (state-claim grounding correction, issue
-        #    elspeth-c028f7d186) where preflight is valid but the
+        #    triggers (clarification and interpretation-review notices)
+        #    where preflight is valid or unknown but the
         #    message is augmented relative to raw LLM output. The
         #    consumer-side discriminator at
         #    ``routes._composer_history_content`` does not depend on
@@ -456,9 +455,7 @@ class ComposerResult:
                 "row would falsely imply synthesis (augmentation or "
                 "replacement) happened on a verbatim LLM response. "
                 "raw_assistant_content must only be set when message has "
-                "actually been synthesized (preflight-failure shapes, or "
-                "the state-claim grounding correction shape on the "
-                "happy-path)."
+                "actually been synthesized by a backend notice or replacement."
             )
         if self.final_persisted_state_id is not None and type(self.final_persisted_state_id) is not UUID:
             raise TypeError("final_persisted_state_id must be an exact UUID or None")

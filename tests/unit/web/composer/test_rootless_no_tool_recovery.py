@@ -159,7 +159,10 @@ async def test_marked_clarification_preserves_question_without_build_failure(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("prose", "notice"),
-    [(_FALSE_COMPLETION, "No pipeline has been built yet"), ("I just configured the source. Which categories?", "contradicts")],
+    [
+        (_FALSE_COMPLETION, "No pipeline has been built yet"),
+        ("I just configured the source. Which categories?", "No pipeline has been built yet"),
+    ],
 )
 async def test_marked_false_completion_retains_authoritative_disclosure(prose: str, notice: str) -> None:
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())

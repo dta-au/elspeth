@@ -595,6 +595,11 @@ async def test_advisor_call_includes_core_and_deployment_skill_context(tmp_path:
 
     messages = mock_acompletion.call_args.kwargs["messages"]
     system_content = messages[0]["content"]
+    if isinstance(system_content, list):
+        assert all(block["type"] == "text" for block in system_content)
+        system_content = "".join(block["text"] for block in system_content)
+    else:
+        assert isinstance(system_content, str)
     assert SYSTEM_PROMPT in system_content
     assert "DEPLOYMENT_PROVIDER_MAPPING_SENTINEL" in system_content
     assert "You are advising another LLM" in system_content

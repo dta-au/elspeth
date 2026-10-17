@@ -834,7 +834,7 @@ async def test_checkpoint_wire_uses_verdict_contract_not_stuck_hint_contract(
     )
 
     assert guidance == _checkpoint_reply()
-    system_message = captured[0]["messages"][0]["content"]
+    system_message = "".join(block["text"] for block in captured[0]["messages"][0]["content"])
     assert "Advisor checkpoint mode" in system_message
     assert "A correct pipeline requires no invented repair" in system_message
     assert "JSON" in system_message
@@ -881,7 +881,7 @@ async def test_manual_advisor_hint_wire_retains_stuck_hint_contract(
 
     await service._advisor_checkpoint._call_advisor_with_audit(arguments, recorder=make_recorder())
 
-    system_message = captured[0]["messages"][0]["content"]
+    system_message = "".join(block["text"] for block in captured[0]["messages"][0]["content"])
     assert "another LLM (a pipeline composer) that is stuck" in system_message
     assert "Return ONE concrete actionable hint" in system_message
     assert "Advisor checkpoint mode" not in system_message
@@ -2882,6 +2882,61 @@ async def test_end_gate_clean_proceeds_to_finalize(make_service, clean_runnable_
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
     assert outcome.action == "return"
     assert outcome.result.runtime_preflight is None or outcome.result.runtime_preflight.is_valid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_kind", ["current", "previous_candidate", "previous_state_evidence"])
+async def test_end_gate_refuses_admit_bound_to_a_previous_candidate_or_evidence(
+    make_service, clean_runnable_state, monkeypatch: pytest.MonkeyPatch, binding_kind: str
+):
+    """A well-formed ADMIT is useful only for this candidate and current evidence."""
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    service = make_service()
+    original_review = TurnEvidence.review_candidate
+    owners: list[TurnEvidence] = []
+    reviewed_bindings: list[str] = []
+
+    def capture_owner(owner: TurnEvidence, **kwargs):
+        owners.append(owner)
+        return original_review(owner, **kwargs)
+
+    monkeypatch.setattr(TurnEvidence, "review_candidate", capture_owner)
+
+    async def review(**kwargs):
+        current = kwargs["publication_review"]
+        reviewed_bindings.append(current.binding)
+        binding = current.binding
+        if binding_kind != "current":
+            state = clean_runnable_state
+            candidate = _ASSISTANT_CONTENT
+            if binding_kind == "previous_candidate":
+                candidate = "A different earlier reply."
+            else:
+                state = dataclass_replace(state, metadata=dataclass_replace(state.metadata, name="Earlier draft"))
+            prior = original_review(owners[0], candidate=candidate, request=kwargs["user_message"], current_state=state)
+            assert prior.binding != current.binding
+            binding = prior.binding
+        return AdvisorCheckpointVerdict(
+            ok=True, blocking=False, findings_text="CLEAN", publication_verdict="ADMIT", publication_binding=binding
+        )
+
+    service._advisor_checkpoint._run_advisor_checkpoint = review
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=1)
+
+    assert outcome.action == "return"
+    assert len(reviewed_bindings) == 1
+    result = outcome.result
+    assert result is not None
+    if binding_kind == "current":
+        assert result.message == _ASSISTANT_CONTENT
+        assert _audit_row_origins(service) == []
+    else:
+        assert outcome.advisor_passes_delta == 1
+        assert _ASSISTANT_CONTENT not in result.message
+        assert result.raw_assistant_content == "No pipeline changes were saved in this request."
+        assert result.runtime_preflight.readiness.completion_ready is False
+        assert _audit_row_origins(service) == ["advisor_publication_withheld", "advisor_signoff_withheld"]
 
 
 @pytest.mark.asyncio

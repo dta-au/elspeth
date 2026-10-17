@@ -14,10 +14,6 @@ from opentelemetry import metrics
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.state import CompositionState
-from elspeth.web.composer.state_claim_grounding import (
-    GROUNDING_CORRECTION_HEADER,
-    GROUNDING_CORRECTION_INSTRUCTION,
-)
 from elspeth.web.composer.tools import is_discovery_tool
 from elspeth.web.execution.schemas import (
     CHECK_STATE_EXISTS,
@@ -680,7 +676,6 @@ _AugmentationBranch = Literal[
     "no_mutation_empty_state_augmentation",
     "preflight_invalid_empty_state_augmentation",
     "preflight_invalid_non_empty_state_augmentation",
-    "state_claim_grounding_correction",
     "orphaned_interpretation_review_augmentation",
     "advisor_signoff_blocked_augmentation",
     "interpretation_review_handoff_augmentation",
@@ -752,19 +747,29 @@ def _split_wrapped_diagnostic(
     )
 
 
-def _split_grounding_correction(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
-    """Split the exact grounding wrapper without trusting violation bullets."""
-    prefix = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + GROUNDING_CORRECTION_HEADER + "\n\n"
-    postfix = "\n\n" + GROUNDING_CORRECTION_INSTRUCTION
+# Historical stored messages retain their original provenance. These literal
+# bytes are reader vocabulary only; no live producer makes this NLP judgment.
+_LEGACY_GROUNDING_HEADER: Final = (
+    "The composer's prose above contradicts the actual "
+    "pipeline state. The state below is authoritative; the prose may be "
+    "stale or refer to an earlier turn."
+)
+_LEGACY_GROUNDING_INSTRUCTION: Final = "Re-check the actual pipeline state before making further claims about pipeline configuration."
+
+
+def _split_legacy_grounding_correction(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
+    """Decode a historical wrapper without rejudging prose or trusting bullets."""
+    prefix = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _LEGACY_GROUNDING_HEADER + "\n\n"
+    postfix = "\n\n" + _LEGACY_GROUNDING_INSTRUCTION
     if not suffix.startswith(prefix) or not suffix.endswith(postfix):
         return None
     violation_bullets = suffix[len(prefix) : -len(postfix)]
     if not violation_bullets.startswith("- "):
         return None
     return (
-        TrustedSystemNoticeSegment(GROUNDING_CORRECTION_HEADER),
+        TrustedSystemNoticeSegment(_LEGACY_GROUNDING_HEADER),
         AssistantTextSegment(violation_bullets),
-        TrustedSystemNoticeSegment(GROUNDING_CORRECTION_INSTRUCTION),
+        TrustedSystemNoticeSegment(_LEGACY_GROUNDING_INSTRUCTION),
     )
 
 
@@ -865,7 +870,7 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
     )
     if preflight_with_diagnostic is not None:
         return preflight_with_diagnostic
-    return _split_grounding_correction(suffix)
+    return _split_legacy_grounding_correction(suffix)
 
 
 def visible_message_segments(*, content: str, raw_content: str | None) -> tuple[VisibleMessageSegment, ...]:
@@ -874,7 +879,7 @@ def visible_message_segments(*, content: str, raw_content: str | None) -> tuple[
     The ``raw_content`` prefix pairing is necessary but not sufficient: empty
     or stale prefixes can match attacker-controlled content.  A suffix mints
     trusted chrome only when it exactly matches one of the closed canonical
-    composer shapes above. Dynamic blocker, validator, and grounding
+    composer shapes above. Dynamic blocker, validator, and historical grounding
     diagnostics remain ordinary text between fixed trusted segments.
 
     Equality, legacy replacement, malformed, and unknown synthesis shapes fail

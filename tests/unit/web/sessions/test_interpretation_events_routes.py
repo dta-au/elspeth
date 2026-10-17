@@ -840,6 +840,57 @@ async def test_resolve_after_site_death_is_already_resolved_not_eternal_drift(
 
 
 @pytest.mark.asyncio
+async def test_prompt_draft_remains_readable_and_ordinary_user_can_approve_it(test_client: TestClient) -> None:
+    """Visibility is preserved through authenticated acceptance and readback."""
+    draft = "Read {{ row.html }} and return JSON."
+    seeded = await _seed_session_with_pending_event(
+        test_client,
+        node=_prompt_template_review_node(),
+        user_term="llm_prompt_template:identify_colour",
+        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+        llm_draft=draft,
+    )
+    session_id = seeded["session_id"]
+    event_id = str(seeded["event"].id)
+    pending_response = await _get(test_client, f"/api/sessions/{session_id}/interpretations?status=pending")
+    assert pending_response.status_code == 200, pending_response.text
+    pending = next(event for event in pending_response.json()["events"] if event["id"] == event_id)
+    assert pending["llm_draft"] == draft
+    assert pending["choice"] == "pending"
+    assert pending["accepted_value"] is None
+    assert pending["resolved_at"] is None
+
+    response = await _post(
+        test_client,
+        f"/api/sessions/{session_id}/interpretations/{event_id}/resolve",
+        json={"choice": "accepted_as_drafted"},
+    )
+    assert response.status_code == 200, response.text
+    accepted = response.json()["event"]
+    assert accepted["choice"] == "accepted_as_drafted"
+    assert accepted["accepted_value"] == draft
+    assert accepted["resolved_at"] is not None
+    assert accepted["approved_prompt_artifact_hash"] is not None
+
+    service: SessionServiceImpl = test_client.app.state.session_service
+    persisted = await service.get_current_state(session_id)
+    assert persisted is not None
+    node = next(node for node in persisted.nodes if node["id"] == "identify_colour")
+    assert node["options"]["prompt_template"] == draft
+    assert node["options"]["approved_prompt_artifact_hash"] == accepted["approved_prompt_artifact_hash"]
+    requirement = node["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert requirement["status"] == "resolved"
+    assert requirement["event_id"] == event_id
+    assert requirement["accepted_value"] == draft
+    resolved_response = await _get(test_client, f"/api/sessions/{session_id}/interpretations?status=all")
+    assert resolved_response.status_code == 200, resolved_response.text
+    resolved = next(event for event in resolved_response.json()["events"] if event["id"] == event_id)
+    assert resolved["llm_draft"] == draft
+    assert resolved["accepted_value"] == draft
+    assert resolved["approved_prompt_artifact_hash"] == accepted["approved_prompt_artifact_hash"]
+
+
+@pytest.mark.asyncio
 async def test_resolve_prompt_template_amended_returns_422(test_client: TestClient) -> None:
     seeded = await _seed_session_with_pending_event(
         test_client,
