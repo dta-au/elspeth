@@ -1,5 +1,14 @@
 # Azure Container Apps command cheat sheet
 
+**Current policy: new stores only.** Existing-store redeployment, transition,
+and rollback are held, even if an older compatibility record permits rollback.
+The [existing-service runbook](../../../../docs/runbooks/azure-container-apps-existing-service-redeploy.md)
+is authoritative. The mutating commands below are historical and must not be
+executed while the hold remains. For a first install, follow the
+[cold-install runbook](../../../../docs/runbooks/azure-container-apps-cold-install.md)
+from step 1; after image publication resume its step 3. Read-only diagnosis
+remains available.
+
 These commands operate an **existing** ELSPETH container app. Run them from
 the repository/worktree containing the code to deploy. They deliberately do
 not bootstrap or destroy Azure infrastructure. Every literal comes from the
@@ -166,6 +175,6 @@ az containerapp update --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP
 az containerapp update --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" --min-replicas 2 --max-replicas 4
 ```
 
-Rollback only when the compatibility record permits it (a Scenario A install
-does not): activate the previous revision, set its weight to 100, deactivate
-the candidate, then repeat sections 6 and 7.
+Rollback is held under the current new-stores-only policy, including when an
+older compatibility record permits it. Do not activate an older image against
+existing stores.

@@ -25,6 +25,14 @@
   ],
   "extraEnvironment": [
     {
+      "name": "ELSPETH_WEB__COMPOSER_PRICING_MODEL",
+      "value": "REPLACE_PRIMARY_PRICING_MODEL"
+    },
+    {
+      "name": "ELSPETH_WEB__COMPOSER_ADVISOR_PRICING_MODEL",
+      "value": "REPLACE_ADVISOR_PRICING_MODEL"
+    },
+    {
       "name": "AZURE_API_BASE",
       "value": "https://REPLACE_AZURE_RESOURCE.openai.azure.com"
     },
@@ -78,7 +86,7 @@
     },
     {
       "name": "ELSPETH_WEB__LLM_PROFILES",
-      "value": "{\"standard\":{\"provider\":\"azure\",\"model\":\"REPLACE_PRIMARY_DEPLOYMENT\",\"deployment_name\":\"REPLACE_PRIMARY_DEPLOYMENT\",\"endpoint\":\"https://REPLACE_AZURE_RESOURCE.openai.azure.com\",\"api_version\":\"REPLACE_AZURE_API_VERSION\",\"credential_scope\":\"server\",\"credential_ref\":\"AZURE_API_KEY\"}}"
+      "value": "{\"standard\":{\"provider\":\"azure\",\"model\":\"REPLACE_PRIMARY_DEPLOYMENT\",\"deployment_name\":\"REPLACE_PRIMARY_DEPLOYMENT\",\"pricing_model\":\"REPLACE_PRIMARY_PRICING_MODEL\",\"endpoint\":\"https://REPLACE_AZURE_RESOURCE.openai.azure.com\",\"api_version\":\"REPLACE_AZURE_API_VERSION\",\"credential_scope\":\"server\",\"credential_ref\":\"AZURE_API_KEY\"}}"
     },
     {
       "name": "ELSPETH_WEB__DEFAULT_LLM_PROFILE",

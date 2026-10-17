@@ -10,12 +10,14 @@ never reaches a receipt.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -71,6 +73,50 @@ def _text(path: Path) -> str:
 
 def _fences(text: str, language: str) -> list[str]:
     return re.findall(rf"```{language}\n(.*?)```", text, flags=re.DOTALL)
+
+
+def _assert_example_pricing(resolved: dict[str, Any]) -> None:
+    """Admit the resolved example with real settings and the bundled cost map."""
+    from litellm import Usage
+
+    from elspeth.core.llm_pricing import calculate_missing_provider_cost
+    from elspeth.web.config import settings_from_env
+
+    with pytest.MonkeyPatch.context() as patch:
+        for key in tuple(os.environ):
+            if key.startswith("ELSPETH_WEB__"):
+                patch.delenv(key)
+        patch.setenv("ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY", base64.b64encode(b"synthetic-test-value-32-bytes-long").decode())
+        for parameter, field in (
+            ("composerMaxCompositionTurns", "COMPOSER_MAX_COMPOSITION_TURNS"),
+            ("composerMaxDiscoveryTurns", "COMPOSER_MAX_DISCOVERY_TURNS"),
+            ("composerTimeoutSeconds", "COMPOSER_TIMEOUT_SECONDS"),
+            ("composerRateLimitPerMinute", "COMPOSER_RATE_LIMIT_PER_MINUTE"),
+            ("composerModel", "COMPOSER_MODEL"),
+            ("composerAdvisorModel", "COMPOSER_ADVISOR_MODEL"),
+            ("authProvider", "AUTH_PROVIDER"),
+            ("registrationMode", "REGISTRATION_MODE"),
+        ):
+            patch.setenv(f"ELSPETH_WEB__{field}", str(resolved[parameter]["value"]))
+        for entry in resolved["extraEnvironment"]["value"]:
+            if "value" in entry:
+                patch.setenv(entry["name"], entry["value"])
+            else:
+                patch.setenv(entry["name"], "synthetic-secret-value-for-offline-test")
+        settings = settings_from_env()
+    assert settings.composer_model == "azure/enclave-primary"
+    assert settings.composer_advisor_model == "azure/enclave-advisor"
+    usage = Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+    for identity in (
+        settings.composer_pricing_model,
+        settings.composer_advisor_pricing_model,
+        settings.llm_profiles["standard"].pricing_model,
+    ):
+        cost, source = calculate_missing_provider_cost(usage, pricing_model=identity)
+        assert cost is not None and cost > 0
+        assert source == "litellm.cost_per_token"
+    for alias in (settings.composer_model, settings.composer_advisor_model):
+        assert calculate_missing_provider_cost(usage, pricing_model=alias) == (None, "not_available")
 
 
 def _compatibility_record() -> dict[str, object]:
@@ -461,8 +507,11 @@ print("https://" + vault + ".vault.azure.net/secrets/" + name + "/" + "a" * 32)
         assert (tmp_path / f"{name}.version").is_file()
 
 
+@pytest.mark.parametrize("export_ceiling", [True, False])
 @pytest.mark.parametrize("failed_job", ["", "provision-storage", "doctor-schema-init", "doctor-runtime"])
-def test_cold_install_commands_create_dependencies_and_stop_on_failed_execution(tmp_path: Path, failed_job: str) -> None:
+def test_cold_install_commands_create_dependencies_and_stop_on_failed_execution(
+    tmp_path: Path, failed_job: str, export_ceiling: bool
+) -> None:
     """Execute the actual runbook commands with stateful Azure API responses."""
     output = tmp_path / "environment-outputs.json"
     prefix = "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/aca-live/providers/"
@@ -514,18 +563,24 @@ elif args[:3] != ["deployment", "group", "what-if"]:
     candidate = "b" * 40
     params = tmp_path / "workload.parameters.json"
     application = tmp_path / "application.json"
-    application.write_text(
-        json.dumps(
-            {
-                "composerMaxCompositionTurns": 15,
-                "composerMaxDiscoveryTurns": 10,
-                "composerTimeoutSeconds": 180,
-                "composerRateLimitPerMinute": 10,
-                "authProvider": "entra",
-                "registrationMode": "closed",
-            }
-        )
-    )
+    example = _text(REPO_ROOT / "deploy/azure-container-apps/application.example.json")
+    replacements = {
+        "REPLACE_PRIMARY_PRICING_MODEL": "azure/gpt-4o",
+        "REPLACE_ADVISOR_PRICING_MODEL": "azure/gpt-4o-mini",
+        "REPLACE_PRIMARY_DEPLOYMENT": "enclave-primary",
+        "REPLACE_ADVISOR_DEPLOYMENT": "enclave-advisor",
+        "REPLACE_AZURE_RESOURCE": "enclave-models",
+        "REPLACE_AZURE_API_VERSION": "2024-10-21",
+        "REPLACE_ENTRA_TENANT_ID": "12345678-1234-1234-1234-123456789abc",
+        "REPLACE_ENTRA_CLIENT_ID": "12345678-1234-1234-1234-123456789def",
+        "REPLACE_APP_FQDN": "elspeth-web.example.com",
+        "REPLACE_FIRST_ADMIN_SUBJECT": "enclave-admin",
+        "replace-runtime-vault": "aca-vault",
+        "0" * 32: "a" * 32,
+    }
+    for placeholder, value in replacements.items():
+        example = example.replace(placeholder, value)
+    application.write_text(example)
     for secret_name in (
         "elspeth-session-db-url-runtime",
         "elspeth-landscape-url-runtime",
@@ -548,17 +603,34 @@ elif args[:3] != ["deployment", "group", "what-if"]:
         "CANDIDATE_SHA": candidate,
         "CANDIDATE_IMAGE": "registry.azurecr.io/elspeth@sha256:" + "c" * 64,
         "PROVISION_STORAGE_IMAGE": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "d" * 64,
-        "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS": "210",
         "RESOURCE_GROUP": "aca-live",
         "FAILED_JOB": failed_job,
     }
+    ceiling_name = "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS"
+    env.pop(ceiling_name, None)
     text = _text(COLD_INSTALL_RUNBOOK)
+    setup = next(block for block in _fences(text, "bash") if f': "${{{ceiling_name}:?' in block)
+    # Execute the documented check/export with an ordinary, unexported shell
+    # variable. The negative control removes the export, reproducing the bug.
+    ceiling_setup = "\n".join(line for line in setup.splitlines() if ceiling_name in line)
+    if not export_ceiling:
+        ceiling_setup = ceiling_setup.replace(f"export {ceiling_name}", ":")
     commands = "\n".join(_fences(text[text.index("## 5.") : text.index("## 9.")], "bash"))
+    commands = f"{ceiling_name}=210\n{ceiling_setup}\n{commands}"
     result = subprocess.run(["bash", "-Eeuo", "pipefail", "-c", commands], cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+    if not export_ceiling:
+        assert result.returncode != 0
+        assert "explicit transport ceiling required" in result.stderr
+        assert not params.exists()
+        assert not (tmp_path / "events.jsonl").exists()
+        return
     assert result.returncode == (1 if failed_job else 0), result.stderr
     assert (tmp_path / "app-created").exists() == (not failed_job)
     resolved = json.loads(params.read_text())["parameters"]
     assert resolved["candidateSourceSha"]["value"] == candidate
+    assert resolved["composerTransportIdleCeilingSeconds"]["value"] == 210
+    assert resolved["extraEnvironment"]["value"] == json.loads(example)["extraEnvironment"]
+    _assert_example_pricing(resolved)
     assert all(set(entry) == {"value"} for entry in resolved.values())
     assert resolved["environmentResourceId"]["value"] == prefix + "Microsoft.App/managedEnvironments/aca-env"
     assert resolved["sessionDbUrlRuntimeSecretUrl"]["value"].endswith("/" + "a" * 32)
