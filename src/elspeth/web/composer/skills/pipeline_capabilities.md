@@ -293,15 +293,12 @@ Source plugins may coerce declared fields only where their live contract permits
 CSV fixed/flexible schemas coerce declared fields at ingestion; observed CSV cells remain strings.
 Source validation failures use `on_validation_failure`.
 A downstream input type declaration validates arriving values without converting them:
-a row whose value has another type goes to `on_error` when the mismatch depends
-on the value; a provable contradiction can be refused at build (an `int`
-satisfies `float`; nothing else is widened). Declare the type the value actually has, and `any`
-for a created field whose type varies. A model node's structured output fields
-bind their row types — `integer` is `int`, `number` is `float`, `boolean` is
-`bool`, `string` and `enum` are `str` — so a node schema type on a field the
-model writes must admit that bound type (validation refuses `int` over `number`), the
-`<response>_usage` field is `any`, and a downstream consumer of a `number`
-field declares `float`.
+value-dependent mismatches use `on_error`; provable contradictions may be refused
+at build. Only `int` widens to `float`. Declare actual types; use `any` for created
+fields with varying types. Model structured outputs bind row types: `integer` →
+`int`, `number` → `float`, `boolean` → `bool`, `string`/`enum` → `str`. Node schemas
+must admit these types (`int` over `number` is refused); `<response>_usage` is
+`any`. Downstream consumers declare `float` for `number` fields.
 
 A row template — an LLM prompt or query template, or a retrieval
 `query_template` — sees only the fields its node declares in

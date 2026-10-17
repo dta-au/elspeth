@@ -854,16 +854,14 @@ LLM node preflight has four independent review checks:
 new pending `vague_term` entry in the node's `interpretation_requirements` MUST
 be wired into the prompt via a matching `prompt_template_parts`
 `interpretation_ref` slot in the SAME `set_pipeline` call. A legacy flat token
-is not an alternative to structured wiring. Keep `prompt_template` readable by
-rendering the slot with its draft, as described below. A bare
-`{{interpretation:<term>}}` token with no matching review site is an **orphan**:
-nothing can resolve it, no review card appears, and the run is **blocked** at
-execution (`UnresolvedInterpretationPlaceholderError`). Never write a token
-first and plan to stage the review later. If you are not staging the matching
-wired requirement in the same mutation, use plain prose.
-(`request_interpretation_review(kind="vague_term", ...)` is still called after
-the mutation succeeds, per the wiring rule below; staging and wiring happen in
-the same mutation.)
+is not an alternative to structured wiring.
+Render each slot's draft in readable `prompt_template` text. A bare
+`{{interpretation:<term>}}` token without a matching review site is an **orphan**:
+no resolver or review card exists; execution is **blocked**
+(`UnresolvedInterpretationPlaceholderError`). Never write a token first and
+stage its review later; use plain prose without a co-staged wired requirement.
+Call `request_interpretation_review(kind="vague_term", ...)` after the mutation
+succeeds; staging and wiring happen in the same mutation.
 
 These checks stack. A web-scrape-to-LLM scoring node may need all four LLM-node
 review requirements in the same `interpretation_requirements` list before
