@@ -118,6 +118,11 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/provider_discovery_response.py", "to_wire", "code"),
         ("composer/provider_discovery_response.py", "to_wire", "self.error_code"),
         ("composer/tools/generation.py", "_execute_explain_validation_error", "code"),
+        # Source-proof completion retains detector-owned blocking codes (the
+        # _blocking_diagnostic closed set is pinned below) and existing
+        # state.validate() entries, whose producers this census already scans.
+        ("composer/composition_completion.py", "_source_proof_unavailable_validation", "diagnostic['code']"),
+        ("composer/composition_completion.py", "_source_proof_unavailable_validation", "error.error_code"),
         # Conversation diagnostics forward only the leading persisted code
         # after registry membership and public catalogue lookup succeed.
         ("sessions/routes/_helpers.py", "_message_response", "projected.rejection.error_code"),
@@ -201,6 +206,8 @@ def _walk_outside_fstrings(expression: ast.expr) -> list[ast.AST]:
     would otherwise report ``"_suffix"``); the whole f-string is a non-literal
     site and must be a reviewed forwarder. A conditional's predicate chooses
     between code values; its own comparison strings are not emitted codes.
+    A subscript's lookup key selects a value; it is not itself that value.
+    Keep walking the indexed container so literal code values remain visible.
     """
     nodes: list[ast.AST] = []
     pending: list[ast.AST] = [expression]
@@ -209,6 +216,8 @@ def _walk_outside_fstrings(expression: ast.expr) -> list[ast.AST]:
         nodes.append(node)
         if isinstance(node, ast.IfExp):
             pending.extend((node.body, node.orelse))
+        elif isinstance(node, ast.Subscript):
+            pending.append(node.value)
         elif not isinstance(node, ast.JoinedStr):
             pending.extend(ast.iter_child_nodes(node))
     return nodes
@@ -385,6 +394,65 @@ class TestRegistryCensus:
         sites = _code_sites("planted.py", planted)
         assert _unregistered_literals(sites) == set()
         assert _unreviewed_forwarders(sites) == {("planted.py", "f", "f'{c}_zz_suffix'")}
+
+    @pytest.mark.parametrize("expression", ["diagnostic['code']", "error.error_code"])
+    def test_source_proof_reuses_reviewed_code_forwarders(self, expression: str) -> None:
+        source = f"def _source_proof_unavailable_validation():\n    return ValidationError(error_code={expression})\n"
+        sites = _code_sites("composer/composition_completion.py", source)
+        assert _unregistered_literals(sites) == set()
+        assert _unreviewed_forwarders(sites) == set()
+
+    @pytest.mark.parametrize(
+        "expression",
+        ["'zz_unregistered_source_proof'", "diagnostic['other_code']", "other_error.error_code"],
+    )
+    def test_source_proof_census_still_refuses_new_code_values(self, expression: str) -> None:
+        source = f"def _source_proof_unavailable_validation():\n    return ValidationError(error_code={expression})\n"
+        sites = _code_sites("composer/composition_completion.py", source)
+        assert _unregistered_literals(sites) or _unreviewed_forwarders(sites)
+
+    def test_subscript_value_does_not_hide_unregistered_literal_codes(self) -> None:
+        source = (
+            "def _source_proof_unavailable_validation():\n"
+            "    return ValidationError(error_code=['plugin_options_invalid', 'zz_unregistered_source_proof'][0])\n"
+        )
+        sites = _code_sites("composer/composition_completion.py", source)
+        assert _unregistered_literals(sites) == {
+            ("composer/composition_completion.py", "_source_proof_unavailable_validation", "zz_unregistered_source_proof")
+        }
+
+    def test_source_proof_diagnostic_producer_refuses_unregistered_forwarded_code(self) -> None:
+        from elspeth.web.composer.tools.generation import _blocking_diagnostic
+
+        with pytest.raises(AssertionError, match="not registered"):
+            _blocking_diagnostic(
+                code="zz_unregistered_source_proof",
+                message="Synthetic diagnostic.",
+                suggested_repair="Retry the synthetic check.",
+                evidence_locator={"source": "blob", "source_name": "source"},
+            )
+
+    def test_source_proof_forwards_registered_owned_diagnostics(self) -> None:
+        from elspeth.web.composer.composition_completion import _source_proof_unavailable_validation
+        from elspeth.web.composer.tools.generation import ProofUnavailable, _blocking_diagnostic
+
+        codes = ("source_blob_unavailable", "csv_duplicate_headers")
+        proof = ProofUnavailable(
+            tuple(
+                _blocking_diagnostic(
+                    code=code,
+                    message="Synthetic source diagnostic.",
+                    suggested_repair="Retry the synthetic source check.",
+                    evidence_locator={"source": "blob", "source_name": "source"},
+                )
+                for code in codes
+            )
+        )
+
+        result = _source_proof_unavailable_validation(_empty_state(), proof, None)
+
+        assert [error.error_code for error in result.errors[:2]] == list(codes)
+        assert {error.error_code for error in result.errors} <= REGISTERED_ERROR_CODES
 
     def test_every_plugin_unavailable_reason_is_registered(self) -> None:
         from elspeth.web.plugin_policy.models import PluginUnavailableReason
