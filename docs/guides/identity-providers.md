@@ -504,14 +504,12 @@ compartment. It is required for every provider profile, and it is a label you
 choose: a stable, meaningful identifier for the environment, such as its
 scenario or environment name.
 
-Its purpose is to make the same artifact appearing in two deployments
-detectable later. **In this release the setting is validated and stored but
-not yet consumed:** the `library_entries` table carries a non-null
-`compartment_id` column and an index for it, and no runtime path writes or
-reads one. The stamping of the marking into published library rows, exported
-YAML, audit metadata and signed exports is the work this column is waiting
-for. It is required now so that the value is fixed before anything starts
-depending on it, and so no deployment has to be reconfigured when it does.
+Its purpose is to record where a published artifact originated. Library
+publication requires a nonblank configured marking and stores it in the
+entry's `compartment_id`. The publication audit records that marking with
+the entry identity and payload digest. When a user forks an entry, the new
+session's Library provenance retains the source entry's compartment marking,
+entry identity, digest and version.
 
 Pick a value that will still identify this deployment in a year, and do not
 reuse one across environments that should not be confused with each other.
