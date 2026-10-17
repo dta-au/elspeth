@@ -50,6 +50,7 @@ from elspeth.web.composer.tools._common import (
     ToolResult,
     _composition_canonical_interpretation_requirement_error,
     _failure_result,
+    _saved_graph_rejection_result,
     build_plugin_schemas_for_failure,
     normalize_tool_result_validation,
 )
@@ -934,10 +935,16 @@ def execute_tool(
             return normalize_tool_result_validation(argument_error, catalog)
 
     if _requires_secret_context(tool_name) and (secret_service is None or user_id is None):
-        return normalize_tool_result_validation(
-            _failure_result(state, "Secret tools require secret service context."),
+        result = normalize_tool_result_validation(
+            _saved_graph_rejection_result(
+                state,
+                "Secret tools require secret service context.",
+                error_code="secret_context_unavailable",
+                rejected_component=None,
+            ),
             catalog,
         )
+        return _augment_with_validation_guidance(result, tool_name)
 
     # ``current_validation`` carries the live state's ValidationSummary
     # into ``diff_pipeline`` so its delta against the baseline is computed
@@ -1023,7 +1030,12 @@ def execute_discovery_tool_with_context(
     assert argument_error is None
     if _requires_secret_context(tool_name) and (context.secret_service is None or context.user_id is None):
         return normalize_tool_result_validation(
-            _failure_result(state, "Secret tools require secret service context."),
+            _saved_graph_rejection_result(
+                state,
+                "Secret tools require secret service context.",
+                error_code="secret_context_unavailable",
+                rejected_component=None,
+            ),
             context.catalog,
         )
     prior_validation = context.current_validation or context.catalog.validate_composition_state(state).validation

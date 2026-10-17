@@ -251,7 +251,13 @@ class TestAwsS3EndpointUrlComposerPolicy:
             ),
         )
 
-        _assert_aws_s3_endpoint_url_rejected(result, state, forbidden_value=secret_name)
+        _assert_aws_s3_endpoint_url_rejected(
+            result,
+            state,
+            forbidden_value=secret_name,
+            rejected_component="source" if target == "source" else "output:main",
+            rejection_operation="saved_graph",
+        )
 
 
 class TestAwsS3SourceComposerPolicy:
