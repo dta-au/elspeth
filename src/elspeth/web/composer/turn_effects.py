@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, cast, final
+from typing import Any, Final, Literal, cast, final
 
 from pydantic import JsonValue
 
@@ -22,6 +22,25 @@ from elspeth.web.composer.tools._registry import response_contract_for
 from elspeth.web.sessions._persist_payload import CommittedCheckpointWitness
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.validation import _redact_sensitive_content
+
+CHECKPOINT_CHANGED_SCOPE: Final = (
+    "Verified checkpoint evidence covers {count} saved draft revisions. There are net authored changes from the starting draft."
+)
+CHECKPOINT_UNCHANGED_SCOPE: Final = (
+    "Verified checkpoint evidence covers {count} saved draft revisions. There is no net authored change from the starting draft."
+)
+CHECKPOINT_UNAVAILABLE_SCOPE: Final = (
+    "Checkpoint evidence records {count} committed draft revisions; saved-change verification is unavailable."
+)
+CHECKPOINT_SESSIONLESS_SCOPE: Final = "No verified persistence receipt is available for this sessionless request."
+CHECKPOINT_NO_OPERATION_SCOPE: Final = "No verified persistence receipt is available for this request without an operation identity."
+CHECKPOINT_SCOPE_TEMPLATES: Final = (
+    CHECKPOINT_CHANGED_SCOPE,
+    CHECKPOINT_UNCHANGED_SCOPE,
+    CHECKPOINT_UNAVAILABLE_SCOPE,
+    CHECKPOINT_SESSIONLESS_SCOPE,
+    CHECKPOINT_NO_OPERATION_SCOPE,
+)
 
 
 def authored_state_hash(state: CompositionState) -> str:
@@ -572,17 +591,18 @@ class TurnEvidence:
         )
 
     def render_saved_scope(self) -> str:
-        """Public status contains counts only, never private values or field paths."""
+        """Describe owned checkpoint evidence, not subsequent route settlement.
+
+        Counts and net change cover accepted checkpoint witnesses only. No
+        private values/paths or task-completion/approval claim is rendered.
+        """
         count = self.effects.saved_revision_count
-        if self.effects.verification != "verified":
-            return (
-                f"This request saved {count} draft revisions. " if count else ""
-            ) + "Saved-change verification is unavailable; review the current draft."
-        if self.effects.net_changed:
-            return f"This request saved {count} draft revisions with verified changes. Saved changes do not establish that the requested task is complete."
-        if count:
-            return f"This request saved {count} draft revisions. The final authored configuration has no net change from the request's starting draft."
-        return "No pipeline changes were saved in this request."
+        if self.effects.verification == "not_persisted":
+            return CHECKPOINT_SESSIONLESS_SCOPE if self.session_id is None else CHECKPOINT_NO_OPERATION_SCOPE
+        if self.effects.verification == "unavailable":
+            return CHECKPOINT_UNAVAILABLE_SCOPE.format(count=count)
+        template = CHECKPOINT_CHANGED_SCOPE if self.effects.net_changed else CHECKPOINT_UNCHANGED_SCOPE
+        return template.format(count=count)
 
     def mark_verification_unavailable(self) -> None:
         self.effects = replace(self.effects, verification="unavailable")

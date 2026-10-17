@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -13,6 +14,8 @@ import yaml
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
+from elspeth.core.llm_profiles import LLMProfileSettings, RuntimeLLMProfile, lower_llm_profile_options
+from elspeth.plugins.transforms.llm.providers.openrouter import OPENROUTER_BASE_URL
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution._validation_materialization import (
@@ -568,6 +571,96 @@ def test_provider_policy_successes_detach_materialized_semantic_evidence(phase_n
     assert result.artifact.pipeline_yaml == artifact.pipeline_yaml
     assert result.artifact.authored.semantic_contracts[0].outcome == "satisfied"
     assert [(check.name, check.passed) for check in result.checks] == [(check_name, True)]
+
+
+def _llm_policy_materialized(
+    component_type: str,
+    *,
+    authored_options: dict[str, object],
+    lowered_options: dict[str, object],
+) -> MaterializedYaml:
+    if component_type == "source":
+        authored_state = _state(source=_source(plugin="llm", options=authored_options))
+        lowered_state = _state(source=_source(plugin="llm", options=lowered_options))
+    else:
+        authored_state = _state(nodes=(_node(plugin="llm", options=authored_options),))
+        lowered_state = _state(nodes=(_node(plugin="llm", options=lowered_options),))
+    artifact = _materialized(lowered_state)
+    return replace(
+        artifact,
+        authored=replace(artifact.authored, policy=replace(artifact.authored.policy, authored_state=authored_state)),
+    )
+
+
+@pytest.mark.parametrize("component_type", ["source", "transform"])
+@pytest.mark.parametrize("base_url", ["https://llm.example.com/v1", "http://127.0.0.1:8199/v1"])
+def test_llm_base_url_policy_preserves_validated_operator_endpoint(component_type: str, base_url: str) -> None:
+    settings = LLMProfileSettings(
+        provider="openrouter",
+        model="operator-model",
+        credential_scope="server",
+        credential_ref="TEST_OPERATOR_API_KEY",
+        base_url=base_url,
+    )
+    profile = RuntimeLLMProfile.from_settings("operator-custom", settings)
+    executable, audit_safe = lower_llm_profile_options("operator-custom", profile, {})
+    assert audit_safe == {"profile": "operator-custom"}
+    assert executable["base_url"] == base_url
+    assert executable["api_key"] == {"secret_ref": "TEST_OPERATOR_API_KEY", "secret_scope": "server"}
+    artifact = _llm_policy_materialized(component_type, authored_options=audit_safe, lowered_options=executable)
+    assert artifact.authored.policy.authored_state is not artifact.authored.policy.state
+
+    result = validate_llm_base_url_policy(artifact)
+
+    assert isinstance(result, PhaseReport)
+    assert [(check.name, check.passed) for check in result.checks] == [("llm_base_url_policy", True)]
+    assert result.artifact.authored.policy is artifact.authored.policy
+    assert result.artifact.materialized_state is artifact.materialized_state
+    lowered = result.artifact.materialized_state
+    options = lowered.sources["source"].options if component_type == "source" else lowered.nodes[0].options
+    assert options == executable
+    assert options["base_url"] == base_url
+    assert options["api_key"] == {"secret_ref": "TEST_OPERATOR_API_KEY", "secret_scope": "server"}
+
+
+@pytest.mark.parametrize("component_type", ["source", "transform"])
+@pytest.mark.parametrize("profile_alias", [None, "operator-custom", "unavailable"])
+@pytest.mark.parametrize("base_url", ["https://attacker.invalid/v1", "https://llm.example.com/v1"])
+@pytest.mark.parametrize("lowered_options", [{}, {"base_url": OPENROUTER_BASE_URL}], ids=["omitted", "canonical-replacement"])
+def test_llm_base_url_policy_rejects_authored_endpoint_despite_lowered_options(
+    component_type: str,
+    profile_alias: str | None,
+    base_url: str,
+    lowered_options: dict[str, object],
+) -> None:
+    authored_options: dict[str, object] = {"base_url": base_url}
+    if profile_alias is not None:
+        authored_options["profile"] = profile_alias
+    artifact = _llm_policy_materialized(component_type, authored_options=authored_options, lowered_options=lowered_options)
+
+    result = validate_llm_base_url_policy(artifact)
+
+    assert isinstance(result, PhaseFailure)
+    component_id = "source" if component_type == "source" else "node"
+    assert [(error.component_id, error.component_type, error.error_code) for error in result.errors] == [
+        (component_id, component_type, "llm_base_url_not_allowed")
+    ]
+    assert result.failed_check.name == "llm_base_url_policy"
+    assert result.failed_check.affected_nodes == (component_id,)
+    assert result.readiness.execution_ready is False
+    assert base_url not in result.errors[0].message
+    assert result.semantic_contracts == (_contract(),)
+
+
+@pytest.mark.parametrize("component_type", ["source", "transform"])
+@pytest.mark.parametrize("options", [{}, {"base_url": OPENROUTER_BASE_URL}], ids=["omitted", "canonical"])
+def test_llm_base_url_policy_preserves_unprofiled_canonical_behavior(component_type: str, options: dict[str, object]) -> None:
+    artifact = _llm_policy_materialized(component_type, authored_options=options, lowered_options=options)
+
+    result = validate_llm_base_url_policy(artifact)
+
+    assert isinstance(result, PhaseReport)
+    assert [(check.name, check.passed) for check in result.checks] == [("llm_base_url_policy", True)]
 
 
 def test_s3_source_policy_accepts_profile_lowered_source_evidence() -> None:

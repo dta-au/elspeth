@@ -71,6 +71,7 @@ from elspeth.web.composer.no_tool_policy import (
 )
 from elspeth.web.composer.no_tool_policy import (
     carries_build_action,
+    compose_checkpoint_receipt_message,
 )
 from elspeth.web.composer.no_tool_policy import (
     classify_pipeline_mutation_intent as _classify_pipeline_mutation_intent,
@@ -1906,7 +1907,7 @@ class CompositionCompletion:
             # B-4D-3 budget-exhaustion finalize and the CLEAN no-tool tail,
             # which is the single most common way a compose turn ends —
             # published a pending-review result with NOTHING backend-authored
-            # appended: for a handoff result with no grounding violations
+            # appended: for a handoff result
             # ``finalize_no_tool_response`` returns the model's raw prose
             # verbatim, so an operator whose model happened not to mention the
             # review got no indication one existed. Owning it in the shared
@@ -2365,3 +2366,17 @@ class CompositionCompletion:
             publication_binding=publication_review.binding,
             graph_review_identity=review_identity,
         )
+
+    def _append_checkpoint_receipt(self, result: ComposerResult, *, turn_evidence: TurnEvidence) -> ComposerResult:
+        """Decorate only settled no-tool loop copy, before route settlement.
+
+        Commit/recovery intents have separate settlement/replacement owners.
+        Raw None means the current authorized message, which can be fixed
+        backend copy; it is never permission to resurrect a hidden candidate.
+        """
+        if result.pipeline_commit_intent is not None or result.graph_recovery_intent is not None:
+            return result
+        raw = result.message if result.raw_assistant_content is None else result.raw_assistant_content
+        message = compose_checkpoint_receipt_message(result.message, raw_content=raw, evidence=turn_evidence)
+        _enforce_augmentation_prefix_invariant(branch="checkpoint_receipt_augmentation", content=result.message, augmented=message)
+        return replace(result, message=message, raw_assistant_content=raw)

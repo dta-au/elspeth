@@ -345,9 +345,8 @@ class TestComposerResultPairingInvariant:
        verbatim response).
 
     Note the narrowing on direction (2): synthesis with passing preflight
-    IS legitimate when message ≠ raw_assistant_content (the state-claim
-    grounding correction case from issue elspeth-c028f7d186 augments the
-    happy-path message with an [ELSPETH-SYSTEM] correction suffix).
+    IS legitimate when message ≠ raw_assistant_content, including historical
+    stored augmentations whose producers have since been retired.
     The audit-integrity guarantee — no spurious raw_content set on a
     verbatim pass-through — survives the narrowing because the consumer
     discriminator at routes._composer_history_content uses
@@ -430,11 +429,10 @@ class TestComposerResultPairingInvariant:
                 raw_assistant_content="hi",
             )
 
-    def test_grounding_correction_synthesis_with_passed_preflight_is_valid(self) -> None:
+    def test_historical_synthesis_with_passed_preflight_is_valid(self) -> None:
         """raw_assistant_content set with passing preflight AND
-        message ≠ raw — legitimate (state-claim grounding correction
-        from issue elspeth-c028f7d186 augments happy-path prose with
-        an [ELSPETH-SYSTEM] correction suffix).
+        message ≠ raw — legitimate historical augmentation. Compatibility
+        of the carrier does not authorize a new live semantic judgment.
         """
         ComposerResult(
             message="hi\n\n---\n\n[ELSPETH-SYSTEM] correction text",
@@ -443,11 +441,8 @@ class TestComposerResultPairingInvariant:
             raw_assistant_content="hi",
         )
 
-    def test_grounding_correction_synthesis_with_no_preflight_is_valid(self) -> None:
-        """Same shape as above, with no preflight (the finalizer's
-        skip-preflight branch when state.version is unchanged and no
-        cached preflight is available — runtime_result is None and the
-        grounding check still runs)."""
+    def test_historical_synthesis_with_no_preflight_is_valid(self) -> None:
+        """Historical augmentation remains readable with an unknown preflight."""
         ComposerResult(
             message="hi\n\n---\n\n[ELSPETH-SYSTEM] correction text",
             state=_make_empty_state(),

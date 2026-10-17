@@ -555,7 +555,19 @@ async def test_advisor_only_turn_does_not_consume_discovery_budget() -> None:
         ]
         result = await service.compose("help me", [], state, session_id=session_id)
 
-    assert result.message == "I read the guidance and can continue."
+    from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
+
+    raw = "I read the guidance and can continue."
+    notice = (
+        "Checkpoint save status: Verified checkpoint evidence covers 0 saved draft revisions. "
+        "There is no net authored change from the starting draft. Checkpoint evidence does not establish task completion."
+    )
+    assert result.raw_assistant_content == raw
+    assert result.message == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+    assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+        AssistantTextSegment(raw),
+        TrustedSystemNoticeSegment(notice),
+    )
     assert mock_llm.call_count == 2
     assert mock_acompletion.call_count == 1
     invocations = [inv for inv in result.tool_invocations if inv.tool_name == "request_advisor_hint"]
@@ -595,6 +607,11 @@ async def test_advisor_call_includes_core_and_deployment_skill_context(tmp_path:
 
     messages = mock_acompletion.call_args.kwargs["messages"]
     system_content = messages[0]["content"]
+    if isinstance(system_content, list):
+        assert all(block["type"] == "text" for block in system_content)
+        system_content = "".join(block["text"] for block in system_content)
+    else:
+        assert isinstance(system_content, str)
     assert SYSTEM_PROMPT in system_content
     assert "DEPLOYMENT_PROVIDER_MAPPING_SENTINEL" in system_content
     assert "You are advising another LLM" in system_content

@@ -531,13 +531,21 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
     assert unexpected_models == []
     assert len(primary_requests) == len(end_requests) == 1
 
-    # ``raw_assistant_content`` is threaded through only for specific
-    # handoff scenarios (interpretation-review repair prose); it is None on
-    # this plain terminal path even though the provider's message.content
-    # was a real string -- ``assistant_message`` is the field that carries
-    # the final rendered text on this path, and IS asserted below.
-    assert result.assistant_message == primary_replies[0]
-    assert result.raw_assistant_content is None
+    from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
+
+    # The final rendered reply adds a factual checkpoint receipt while raw
+    # retains exactly the primary response independently checked above.
+    raw = primary_replies[0]
+    notice = (
+        "Checkpoint save status: Verified checkpoint evidence covers 0 saved draft revisions. "
+        "There is no net authored change from the starting draft. Checkpoint evidence does not establish task completion."
+    )
+    assert result.raw_assistant_content == raw
+    assert result.assistant_message == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+    assert visible_message_segments(content=result.assistant_message, raw_content=result.raw_assistant_content) == (
+        AssistantTextSegment(raw),
+        TrustedSystemNoticeSegment(notice),
+    )
     assert result.tool_outcomes == ()
     assert result.tool_invocations == ()
     stored = await sessions_service.get_messages(UUID(session_id), limit=None)

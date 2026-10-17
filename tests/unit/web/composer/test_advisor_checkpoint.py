@@ -834,7 +834,7 @@ async def test_checkpoint_wire_uses_verdict_contract_not_stuck_hint_contract(
     )
 
     assert guidance == _checkpoint_reply()
-    system_message = captured[0]["messages"][0]["content"]
+    system_message = "".join(block["text"] for block in captured[0]["messages"][0]["content"])
     assert "Advisor checkpoint mode" in system_message
     assert "A correct pipeline requires no invented repair" in system_message
     assert "JSON" in system_message
@@ -881,7 +881,7 @@ async def test_manual_advisor_hint_wire_retains_stuck_hint_contract(
 
     await service._advisor_checkpoint._call_advisor_with_audit(arguments, recorder=make_recorder())
 
-    system_message = captured[0]["messages"][0]["content"]
+    system_message = "".join(block["text"] for block in captured[0]["messages"][0]["content"])
     assert "another LLM (a pipeline composer) that is stuck" in system_message
     assert "Return ONE concrete actionable hint" in system_message
     assert "Advisor checkpoint mode" not in system_message
@@ -2668,6 +2668,9 @@ async def test_checkpoint_deadline_cancels_provider_and_retains_timeout_audit(
 
 
 _ASSISTANT_CONTENT = "Done — the pipeline is ready."
+_ZERO_CHECKPOINT_SCOPE = (
+    "Verified checkpoint evidence covers 0 saved draft revisions. There is no net authored change from the starting draft."
+)
 
 
 @pytest.fixture
@@ -2862,7 +2865,7 @@ async def test_end_gate_unavailable_withholds_candidate_and_keeps_saved_scope(ma
 
     assert outcome.action == "return"
     result = outcome.result
-    prose = "No pipeline changes were saved in this request."
+    prose = _ZERO_CHECKPOINT_SCOPE
     assert result.raw_assistant_content == prose
     assert _ASSISTANT_CONTENT not in result.message
     assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in result.message
@@ -2882,6 +2885,61 @@ async def test_end_gate_clean_proceeds_to_finalize(make_service, clean_runnable_
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
     assert outcome.action == "return"
     assert outcome.result.runtime_preflight is None or outcome.result.runtime_preflight.is_valid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_kind", ["current", "previous_candidate", "previous_state_evidence"])
+async def test_end_gate_refuses_admit_bound_to_a_previous_candidate_or_evidence(
+    make_service, clean_runnable_state, monkeypatch: pytest.MonkeyPatch, binding_kind: str
+):
+    """A well-formed ADMIT is useful only for this candidate and current evidence."""
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    service = make_service()
+    original_review = TurnEvidence.review_candidate
+    owners: list[TurnEvidence] = []
+    reviewed_bindings: list[str] = []
+
+    def capture_owner(owner: TurnEvidence, **kwargs):
+        owners.append(owner)
+        return original_review(owner, **kwargs)
+
+    monkeypatch.setattr(TurnEvidence, "review_candidate", capture_owner)
+
+    async def review(**kwargs):
+        current = kwargs["publication_review"]
+        reviewed_bindings.append(current.binding)
+        binding = current.binding
+        if binding_kind != "current":
+            state = clean_runnable_state
+            candidate = _ASSISTANT_CONTENT
+            if binding_kind == "previous_candidate":
+                candidate = "A different earlier reply."
+            else:
+                state = dataclass_replace(state, metadata=dataclass_replace(state.metadata, name="Earlier draft"))
+            prior = original_review(owners[0], candidate=candidate, request=kwargs["user_message"], current_state=state)
+            assert prior.binding != current.binding
+            binding = prior.binding
+        return AdvisorCheckpointVerdict(
+            ok=True, blocking=False, findings_text="CLEAN", publication_verdict="ADMIT", publication_binding=binding
+        )
+
+    service._advisor_checkpoint._run_advisor_checkpoint = review
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=1)
+
+    assert outcome.action == "return"
+    assert len(reviewed_bindings) == 1
+    result = outcome.result
+    assert result is not None
+    if binding_kind == "current":
+        assert result.message == _ASSISTANT_CONTENT
+        assert _audit_row_origins(service) == []
+    else:
+        assert outcome.advisor_passes_delta == 1
+        assert _ASSISTANT_CONTENT not in result.message
+        assert result.raw_assistant_content == _ZERO_CHECKPOINT_SCOPE
+        assert result.runtime_preflight.readiness.completion_ready is False
+        assert _audit_row_origins(service) == ["advisor_publication_withheld", "advisor_signoff_withheld"]
 
 
 @pytest.mark.asyncio
@@ -3419,7 +3477,7 @@ async def test_end_gate_unrendered_verdict_chat_names_the_real_cause(
     # independent review failure remains a trusted suffix.
     raw = outcome.result.raw_assistant_content or ""
     segments = visible_message_segments(content=message, raw_content=raw)
-    assert segments[0] == AssistantTextSegment("No pipeline changes were saved in this request.")
+    assert segments[0] == AssistantTextSegment(_ZERO_CHECKPOINT_SCOPE)
     assert _ASSISTANT_CONTENT not in message
     assert len(segments) == 2
     assert type(segments[1]) is TrustedSystemNoticeSegment
@@ -3451,7 +3509,7 @@ async def test_end_gate_flagged_verdict_keeps_did_not_clear_chat(make_service, c
     assert outcome.action == "return"
     expected = _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE if preflight_shape == "absent" else _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE
     assert outcome.result.message.endswith(expected)
-    assert outcome.result.message.startswith("No pipeline changes were saved in this request.")
+    assert outcome.result.message.startswith(_ZERO_CHECKPOINT_SCOPE)
     assert _ASSISTANT_CONTENT not in outcome.result.message
     assert "MODEL_FINDING_CANARY" not in outcome.result.message
 
@@ -4184,7 +4242,7 @@ async def test_end_gate_masked_graph_failure_blocks_handoff_and_names_outstandin
     )
     # Only fixed backend chrome is trusted. The actual validator detail is
     # preserved as diagnostic text rather than replaced by advisor wording.
-    assert segments[0] == AssistantTextSegment("No pipeline changes were saved in this request.")
+    assert segments[0] == AssistantTextSegment(_ZERO_CHECKPOINT_SCOPE)
     assert segments[1] == TrustedSystemNoticeSegment(_PREFLIGHT_NOTICE_HEADER)
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER)
     assert any(isinstance(segment, AssistantTextSegment) and "Edge contract violation" in segment.content for segment in segments)
@@ -5267,7 +5325,7 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
     )
 
     assert outcome.action == "return"
-    assert outcome.result.raw_assistant_content == "No pipeline changes were saved in this request."
+    assert outcome.result.raw_assistant_content == _ZERO_CHECKPOINT_SCOPE
     assert _ASSISTANT_CONTENT not in outcome.result.message
     assert service._preflight.pending_handoff_outstanding_findings.await_count == 1
     # Three fenced audit rows: private candidate, graph disclosure, then the
@@ -5418,7 +5476,7 @@ async def test_blocked_turn_excludes_unreviewed_reply_from_next_turn_model_histo
         )
     assert outcome.action == "return"
     result = outcome.result
-    assert result.raw_assistant_content == "No pipeline changes were saved in this request."
+    assert result.raw_assistant_content == _ZERO_CHECKPOINT_SCOPE
     # Persist the terminal assistant row exactly as the route does
     # (sessions/routes/composer/compose.py): content=message, raw_content=prose.
     await sessions.add_message(
@@ -5431,7 +5489,7 @@ async def test_blocked_turn_excludes_unreviewed_reply_from_next_turn_model_histo
 
     history = _composer_chat_history(await sessions.get_messages(session.id, limit=None))
 
-    assert history[-1] == {"role": "assistant", "content": "No pipeline changes were saved in this request."}
+    assert history[-1] == {"role": "assistant", "content": _ZERO_CHECKPOINT_SCOPE}
     assert _ASSISTANT_CONTENT not in json.dumps(history)
     # The backend's disclosure replays as a user-role message between the
     # instruction and the reply.

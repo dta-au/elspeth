@@ -930,7 +930,19 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
         mock_llm.side_effect = [turn1, turn2]
         result = await service.compose("Trigger non-finite object arguments", [], state, session_id=session_id)
 
-    assert result.message == "Recovered."
+    from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
+
+    raw = "Recovered."
+    notice = (
+        "Checkpoint save status: Verified checkpoint evidence covers 0 saved draft revisions. "
+        "There is no net authored change from the starting draft. Checkpoint evidence does not establish task completion."
+    )
+    assert result.raw_assistant_content == raw
+    assert result.message == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+    assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+        AssistantTextSegment(raw),
+        TrustedSystemNoticeSegment(notice),
+    )
     mock_execute_tool.assert_not_called()
     assert len(result.tool_invocations) == 1
     inv = result.tool_invocations[0]
@@ -974,7 +986,19 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
         mock_llm.side_effect = [turn1, turn2]
         result = await service.compose("Trigger non-finite scalar arguments", [], state, session_id=session_id)
 
-    assert result.message == "Recovered."
+    from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
+
+    raw = "Recovered."
+    notice = (
+        "Checkpoint save status: Verified checkpoint evidence covers 0 saved draft revisions. "
+        "There is no net authored change from the starting draft. Checkpoint evidence does not establish task completion."
+    )
+    assert result.raw_assistant_content == raw
+    assert result.message == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+    assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+        AssistantTextSegment(raw),
+        TrustedSystemNoticeSegment(notice),
+    )
     mock_execute_tool.assert_not_called()
     assert len(result.tool_invocations) == 1
     inv = result.tool_invocations[0]

@@ -50,6 +50,7 @@ from elspeth.web.composer.llm_response_parsing import (
     attach_llm_calls,
     build_llm_call_record,
     safe_response_model,
+    supports_anthropic_prompt_cache_markers,
     token_usage_from_response,
 )
 from elspeth.web.composer.no_tool_policy import (
@@ -349,12 +350,11 @@ class AdvisorCheckpointOwner:
         an unclassified first-party failure closes with
         ``finish_plugin_crash`` and propagates after P4.
 
-        Anthropic prompt-cache markers are deliberately NOT applied here.
-        Advisor calls now include the same composer skill stack as normal
-        composer requests, but their model and accounting are independent
-        from the primary composer path. If advisor prompt caching becomes
-        required, add it with focused usage-accounting tests rather than
-        inheriting the primary-composer marker placement by accident.
+        Anthropic routes cache only the stable composer skill prefix. Trigger
+        instructions remain outside that breakpoint so early/end checkpoints
+        and hints can reuse the same skill bytes without changing their text.
+        Advisor model, calls, review and usage accounting remain independent
+        from the primary composer path.
         """
         advisor_model = self._settings.composer_advisor_model
         configured_timeout = self._settings.composer_advisor_timeout_seconds
@@ -364,7 +364,8 @@ class AdvisorCheckpointOwner:
             max_completion = min(max_completion, continuation_budget.policy.max_completion_tokens)
 
         trigger = cast(str, arguments["trigger"])
-        system_msg = self._composer_skill_text + "\n\n" + _advisor_context.advisor_system_instructions_for_trigger(trigger)
+        trigger_instructions = "\n\n" + _advisor_context.advisor_system_instructions_for_trigger(trigger)
+        system_msg = self._composer_skill_text + trigger_instructions
         # Required fields (trigger, problem_summary, recent_errors,
         # attempted_actions) are validated by _TOOL_REQUIRED_PATHS before this
         # method runs, so direct dict access is sound. schema_excerpt is the
@@ -379,6 +380,11 @@ class AdvisorCheckpointOwner:
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ]
+        if self._composer_skill_text and supports_anthropic_prompt_cache_markers(advisor_model):
+            messages[0]["content"] = [
+                {"type": "text", "text": self._composer_skill_text, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": trigger_instructions},
+            ]
 
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()

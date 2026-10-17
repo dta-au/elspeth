@@ -17,6 +17,7 @@ from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.config import WebSettings
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_settings, _mock_catalog
+from tests.unit.web.composer.test_service import _assert_checkpoint_reply
 
 _BEDROCK_PRIMARY = "bedrock/global.anthropic.claude-sonnet-4-6"
 _BEDROCK_ADVISOR = "bedrock/global.anthropic.claude-opus-4-6-v1"
@@ -124,7 +125,7 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
 
     assert unexpected_models == []
     assert len(captured) == len(result.llm_calls) == 2 and len(reviews) == 1
-    assert result.message == candidate
+    _assert_checkpoint_reply(result, candidate, count=0)
     request = captured[0]
     assert request["model"] == _BEDROCK_PRIMARY
     assert {tool["function"]["name"] for tool in request["tools"]} == expected_tool_names

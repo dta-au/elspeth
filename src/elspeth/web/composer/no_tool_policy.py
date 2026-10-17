@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -14,11 +15,8 @@ from opentelemetry import metrics
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.state import CompositionState
-from elspeth.web.composer.state_claim_grounding import (
-    GROUNDING_CORRECTION_HEADER,
-    GROUNDING_CORRECTION_INSTRUCTION,
-)
 from elspeth.web.composer.tools import is_discovery_tool
+from elspeth.web.composer.turn_effects import CHECKPOINT_SCOPE_TEMPLATES, TurnEvidence
 from elspeth.web.execution.schemas import (
     CHECK_STATE_EXISTS,
     ValidationCheck,
@@ -36,6 +34,23 @@ _COMPOSER_AUDIT_INTEGRITY_VIOLATION_COUNTER = metrics.get_meter(__name__).create
 
 _TRUSTED_NOTICE_SEPARATOR: Final = "\n\n---\n\n"
 _TRUSTED_NOTICE_MARKER: Final = "[ELSPETH-SYSTEM] "
+_CHECKPOINT_RECEIPT_LABEL: Final = "Checkpoint save status: "
+_CHECKPOINT_RECEIPT_REGION_PREFIX: Final = "\n\n" + _CHECKPOINT_RECEIPT_LABEL
+_CHECKPOINT_RECEIPT_END: Final = " Checkpoint evidence does not establish task completion."
+# len(tuple) is bounded by Py_ssize_t. The closed decimal grammar also refuses
+# signs, leading zeroes, Unicode digits and unbounded conversion work.
+_CHECKPOINT_COUNT_PATTERN: Final = re.compile(r"\b(?:0|[1-9][0-9]{0,18})\b")
+_CHECKPOINT_SCOPE_GRAMMAR: Final = (
+    "(?:"
+    + "|".join(re.escape(template).replace(re.escape("{count}"), r"(?:0|[1-9][0-9]{0,18})") for template in CHECKPOINT_SCOPE_TEMPLATES)
+    + ")"
+)
+_CHECKPOINT_RECEIPT_PATTERN: Final = re.compile(
+    rf"(?:(?P<base>.+){re.escape(_CHECKPOINT_RECEIPT_REGION_PREFIX)}|"
+    rf"{re.escape(_TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _CHECKPOINT_RECEIPT_LABEL)})"
+    rf"(?P<scope>{_CHECKPOINT_SCOPE_GRAMMAR}){re.escape(_CHECKPOINT_RECEIPT_END)}",
+    re.DOTALL,
+)
 
 
 def _wrapped_diagnostic_wire_shape(header: str, footer: str) -> tuple[str, str]:
@@ -96,6 +111,11 @@ def compose_graph_recovery_refusal_message() -> str:
 
 _REVIEW_REPLY_UNAVAILABLE_NOTICE: Final = "The model's final reply is unavailable. Please retry your question."
 _REVIEW_REPLY_UNAVAILABLE_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_UNAVAILABLE_NOTICE)
+_ADVISOR_REVIEW_BUDGET_NOTICE: Final = (
+    "The reply was withheld because the completion review could not run within the existing request limits. "
+    "Saved draft progress remains available; continue in a new message."
+)
+_ADVISOR_REVIEW_BUDGET_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_BUDGET_NOTICE)
 
 
 def compose_review_reply_unavailable_message(content: str) -> str:
@@ -680,11 +700,11 @@ _AugmentationBranch = Literal[
     "no_mutation_empty_state_augmentation",
     "preflight_invalid_empty_state_augmentation",
     "preflight_invalid_non_empty_state_augmentation",
-    "state_claim_grounding_correction",
     "orphaned_interpretation_review_augmentation",
     "advisor_signoff_blocked_augmentation",
     "interpretation_review_handoff_augmentation",
     "proof_repair_exhausted_augmentation",
+    "checkpoint_receipt_augmentation",
 ]
 
 
@@ -752,19 +772,29 @@ def _split_wrapped_diagnostic(
     )
 
 
-def _split_grounding_correction(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
-    """Split the exact grounding wrapper without trusting violation bullets."""
-    prefix = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + GROUNDING_CORRECTION_HEADER + "\n\n"
-    postfix = "\n\n" + GROUNDING_CORRECTION_INSTRUCTION
+# Historical stored messages retain their original provenance. These literal
+# bytes are reader vocabulary only; no live producer makes this NLP judgment.
+_LEGACY_GROUNDING_HEADER: Final = (
+    "The composer's prose above contradicts the actual "
+    "pipeline state. The state below is authoritative; the prose may be "
+    "stale or refer to an earlier turn."
+)
+_LEGACY_GROUNDING_INSTRUCTION: Final = "Re-check the actual pipeline state before making further claims about pipeline configuration."
+
+
+def _split_legacy_grounding_correction(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
+    """Decode a historical wrapper without rejudging prose or trusting bullets."""
+    prefix = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _LEGACY_GROUNDING_HEADER + "\n\n"
+    postfix = "\n\n" + _LEGACY_GROUNDING_INSTRUCTION
     if not suffix.startswith(prefix) or not suffix.endswith(postfix):
         return None
     violation_bullets = suffix[len(prefix) : -len(postfix)]
     if not violation_bullets.startswith("- "):
         return None
     return (
-        TrustedSystemNoticeSegment(GROUNDING_CORRECTION_HEADER),
+        TrustedSystemNoticeSegment(_LEGACY_GROUNDING_HEADER),
         AssistantTextSegment(violation_bullets),
-        TrustedSystemNoticeSegment(GROUNDING_CORRECTION_INSTRUCTION),
+        TrustedSystemNoticeSegment(_LEGACY_GROUNDING_INSTRUCTION),
     )
 
 
@@ -804,17 +834,19 @@ _ADVISOR_PUBLISHED_WRAPPED_SHAPES: Final[tuple[tuple[str, str], ...]] = (
 )
 
 
-def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
-    """Recognize the closed set of canonical composer synthesis suffixes."""
+def _canonical_base_suffix_segments(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
+    """Recognize only pre-receipt shapes, including one final unavailable notice."""
     if suffix == _GRAPH_RECOVERY_REFUSAL_SUFFIX:
         return (TrustedSystemNoticeSegment(_GRAPH_RECOVERY_REFUSAL_NOTICE),)
     if suffix == _REVIEW_REPLY_UNAVAILABLE_SUFFIX:
         return (TrustedSystemNoticeSegment(_REVIEW_REPLY_UNAVAILABLE_NOTICE),)
+    if suffix == _ADVISOR_REVIEW_BUDGET_SUFFIX:
+        return (TrustedSystemNoticeSegment(_ADVISOR_REVIEW_BUDGET_NOTICE),)
     if suffix.endswith(_REVIEW_REPLY_UNAVAILABLE_SUFFIX):
         preceding = suffix[: -len(_REVIEW_REPLY_UNAVAILABLE_SUFFIX)]
         if _REVIEW_REPLY_UNAVAILABLE_SUFFIX in preceding:
             return None
-        segments = _canonical_trusted_suffix_segments(preceding)
+        segments = _canonical_base_suffix_segments(preceding)
         if segments is not None:
             return (*segments, TrustedSystemNoticeSegment(_REVIEW_REPLY_UNAVAILABLE_NOTICE))
         return None
@@ -865,7 +897,47 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
     )
     if preflight_with_diagnostic is not None:
         return preflight_with_diagnostic
-    return _split_grounding_correction(suffix)
+    return _split_legacy_grounding_correction(suffix)
+
+
+def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
+    """Consume a base, receipt, or complete base followed by one closed receipt."""
+    receipt = _CHECKPOINT_RECEIPT_PATTERN.fullmatch(suffix)
+    if receipt is None:
+        return _canonical_base_suffix_segments(suffix)
+    scope = receipt.group("scope")
+    count = _CHECKPOINT_COUNT_PATTERN.search(scope)
+    if count is not None and int(count.group()) > sys.maxsize:
+        return None
+    notice = TrustedSystemNoticeSegment(_CHECKPOINT_RECEIPT_LABEL + scope + _CHECKPOINT_RECEIPT_END)
+    base = receipt.group("base")
+    if base is None:
+        return (notice,)
+    segments = _canonical_base_suffix_segments(base)
+    return (*segments, notice) if segments is not None else None
+
+
+def compose_checkpoint_receipt_message(content: str, *, raw_content: str, evidence: TurnEvidence) -> str:
+    """Append facts at the durable raw boundary after all base reconstruction.
+
+    Unsupported or already decorated suffixes are caller contract violations;
+    never promote an interior marker or recover hidden prose to repair them.
+    """
+    if type(evidence) is not TurnEvidence:
+        raise TypeError("Checkpoint receipt requires owned turn evidence")
+    if not content.startswith(raw_content):
+        raise AuditIntegrityError("Checkpoint receipt requires the exact raw prefix")
+    scope = evidence.render_saved_scope()
+    notice = _CHECKPOINT_RECEIPT_LABEL + scope + _CHECKPOINT_RECEIPT_END
+    suffix = content[len(raw_content) :]
+    if not suffix:
+        return content + _bare_trusted_suffix(notice)
+    canonical_suffix = (
+        _TRUSTED_NOTICE_SEPARATOR + suffix if raw_content == "" and not suffix.startswith(_TRUSTED_NOTICE_SEPARATOR) else suffix
+    )
+    if _canonical_base_suffix_segments(canonical_suffix) is None:
+        raise AuditIntegrityError("Checkpoint receipt requires a complete base-only suffix")
+    return content + _CHECKPOINT_RECEIPT_REGION_PREFIX + scope + _CHECKPOINT_RECEIPT_END
 
 
 def visible_message_segments(*, content: str, raw_content: str | None) -> tuple[VisibleMessageSegment, ...]:
@@ -874,7 +946,7 @@ def visible_message_segments(*, content: str, raw_content: str | None) -> tuple[
     The ``raw_content`` prefix pairing is necessary but not sufficient: empty
     or stale prefixes can match attacker-controlled content.  A suffix mints
     trusted chrome only when it exactly matches one of the closed canonical
-    composer shapes above. Dynamic blocker, validator, and grounding
+    composer shapes above. Dynamic blocker, validator, and historical grounding
     diagnostics remain ordinary text between fixed trusted segments.
 
     Equality, legacy replacement, malformed, and unknown synthesis shapes fail
@@ -1076,10 +1148,7 @@ def compose_advisor_signoff_unrendered_pending_message(
     configuration). Fixed prose; nothing from the advisor is interpolated.
     """
     if failure_class == "budget_exhausted":
-        return _append_advisor_suffix(
-            content,
-            "The reply was withheld because the completion review could not run within the existing request limits. Saved draft progress remains available; continue in a new message.",
-        )
+        return _append_advisor_suffix(content, _ADVISOR_REVIEW_BUDGET_SUFFIX)
     if failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX
     else:
@@ -1097,10 +1166,7 @@ def compose_advisor_signoff_unrendered_unverified_message(
     the could-not-be-obtained framing and remedy for the verdict class.
     """
     if failure_class == "budget_exhausted":
-        return _append_advisor_suffix(
-            content,
-            "The reply was withheld because the completion review could not run within the existing request limits. Saved draft progress remains available; continue in a new message.",
-        )
+        return _append_advisor_suffix(content, _ADVISOR_REVIEW_BUDGET_SUFFIX)
     if failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
     else:

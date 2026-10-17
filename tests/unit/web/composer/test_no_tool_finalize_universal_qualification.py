@@ -14,7 +14,7 @@ appended:
 * ``_try_terminate_no_tools`` — the CLEAN tail, and the single most common way
   a compose turn ends.
 
-For a pending-handoff result with no grounding violations,
+For a pending-handoff result,
 ``finalize_no_tool_response`` returns the model's raw prose verbatim (its
 plain-passthrough branch), so an operator whose model happened not to mention
 the pending review got zero indication one existed. Nothing caught it because

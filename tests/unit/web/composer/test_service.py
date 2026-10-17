@@ -111,6 +111,22 @@ from tests.unit.web.sessions.session_test_authority import FencedSessionServiceH
 _REAL_RUN_ADVISOR_CHECKPOINT = AdvisorCheckpointOwner._run_advisor_checkpoint
 
 
+def _assert_checkpoint_reply(result: ComposerResult, base: str, *, count: int, changed: bool = False, raw: str | None = None) -> None:
+    """Preserve the complete prior reply and require one final factual receipt."""
+    expected_raw = base if raw is None else raw
+    scope = f"Verified checkpoint evidence covers {count} saved draft revisions. " + (
+        "There are net authored changes from the starting draft." if changed else "There is no net authored change from the starting draft."
+    )
+    notice = f"Checkpoint save status: {scope} Checkpoint evidence does not establish task completion."
+    boundary = "\n\n---\n\n[ELSPETH-SYSTEM] " if base == expected_raw else "\n\n"
+    assert result.raw_assistant_content == expected_raw
+    assert result.message == base + boundary + notice
+    assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=expected_raw) == (
+        *_no_tool_policy_module.visible_message_segments(content=base, raw_content=expected_raw),
+        _no_tool_policy_module.TrustedSystemNoticeSegment(notice),
+    )
+
+
 @pytest.mark.parametrize("availability", ["available", "unavailable", "unknown"])
 def test_retained_operation_context_distinguishes_empty_unknown_and_unavailable(
     availability: Literal["available", "unavailable", "unknown"],
@@ -167,7 +183,7 @@ async def test_retained_operation_context_reaches_real_primary_and_reviewed_term
     assert any(row["content"] == context.provider_message() for row in primary[0]["messages"])
     assert "retained_operation_history" in json.dumps(reviews[0]["messages"])
     assert "unavailable" in json.dumps(reviews[0]["messages"])
-    assert result.message == "Prior operation history is unavailable; I cannot establish what happened."
+    _assert_checkpoint_reply(result, "Prior operation history is unavailable; I cannot establish what happened.", count=0)
 
 
 def _make_llm_response(
@@ -696,7 +712,16 @@ class TestComposerTextOnlyResponse:
             result = await service.compose("What can this composer do?", [], state, session_id=session_id)
 
         assert isinstance(result, ComposerResult)
-        assert result.message == "I'll help you build a pipeline!"
+        assert result.raw_assistant_content == "I'll help you build a pipeline!"
+        assert result.message.startswith(result.raw_assistant_content)
+        assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+            _no_tool_policy_module.AssistantTextSegment(result.raw_assistant_content),
+            _no_tool_policy_module.TrustedSystemNoticeSegment(
+                "Checkpoint save status: Verified checkpoint evidence covers 0 saved draft revisions. "
+                "There is no net authored change from the starting draft. Checkpoint evidence does not establish task completion."
+            ),
+        )
+        assert mock_llm.await_count == 1
         assert result.state.version == 1  # unchanged
 
     @pytest.mark.asyncio
@@ -1316,7 +1341,7 @@ class TestComposerSingleToolCall:
             mock_llm.side_effect = [tool_response, text_response]
             result = await service.compose("Use CSV as source", [], state, session_id=session_id)
 
-        assert result.message == "I've set up a CSV source."
+        _assert_checkpoint_reply(result, "I've set up a CSV source.", count=1, changed=True)
         assert result.state.sources["source"] is not None
         assert result.state.sources["source"].plugin == "csv"
         assert result.state.version == 2
@@ -1355,7 +1380,7 @@ class TestComposerSingleToolCall:
             mock_llm.side_effect = [tool_response, text_response]
             result = await service.compose("Use my OpenRouter secret", [], state, progress=record_progress, session_id=session_id)
 
-        assert result.message == "I checked the available credentials."
+        _assert_checkpoint_reply(result, "I checked the available credentials.", count=0)
         phases = [event.phase for event in progress_events]
         assert phases[:2] == ["starting", "calling_model"]
         assert "using_tools" in phases
@@ -1507,7 +1532,7 @@ class TestComposerSingleToolCall:
                 user_message_id=user_message_id,
             )
 
-        assert result.message == "Pipeline configured."
+        _assert_checkpoint_reply(result, "Pipeline configured.", count=1, changed=True)
         assert len(primary_requests) == 3 and len(reviews) == 1
         assert mock_llm.call_count == 4
         assert reviews[0]["current_graph_hash"] == authored_state_hash(result.state)
@@ -1662,8 +1687,8 @@ class TestComposerMultiTurnToolCalls:
 
         assert len(reviews) == 2 and reviews[0].binding != reviews[1].binding
         assert result.state.metadata.name == "Repaired"
-        assert result.message == "The pipeline name is now Repaired."
-        assert result.raw_assistant_content is None
+        _assert_checkpoint_reply(result, "The pipeline name is now Repaired.", count=1, changed=True)
+        assert result.raw_assistant_content == "The pipeline name is now Repaired."
         assert len(captured_messages) == 3
         # Turn 2 (the repair call) saw the injected advisor findings.
         assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
@@ -1812,12 +1837,20 @@ class TestComposerMultiTurnToolCalls:
 
         assert primary_call.await_count == 3 and advisor_call.await_count == len(reviews) == 2
         assert reviews[0]["current_graph_hash"] != reviews[1]["current_graph_hash"]
-        saved_scope = (
-            "This request saved 1 draft revisions with verified changes. "
-            "Saved changes do not establish that the requested task is complete."
-        )
+        saved_scope = "Verified checkpoint evidence covers 1 saved draft revisions. There are net authored changes from the starting draft."
         assert result.message.startswith(saved_scope)
         assert result.raw_assistant_content == saved_scope
+        assert (
+            len(
+                [
+                    segment
+                    for segment in _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=saved_scope)
+                    if isinstance(segment, _no_tool_policy_module.TrustedSystemNoticeSegment)
+                    and segment.content.startswith("Checkpoint save status: Verified checkpoint evidence covers 1 saved draft revisions.")
+                ]
+            )
+            == 1
+        )
         assert result.state.metadata.name == "Repaired"
         assert len(persisted_assistant_rows) == 1
         assert persisted_assistant_rows[0]["content"] == "ELSPETH is applying a pipeline correction."
@@ -1942,7 +1975,7 @@ class TestComposerMultiTurnToolCalls:
         assert result.runtime_preflight is None or result.runtime_preflight.is_valid
         assert primary_call.await_count == 3 and advisor_call.await_count == len(reviews) == 2
         assert result.state.metadata.name == "Repaired"
-        assert result.message == "The pipeline name is now Repaired."
+        _assert_checkpoint_reply(result, "The pipeline name is now Repaired.", count=1, changed=True)
         assert reviews[0]["current_graph_hash"] != reviews[1]["current_graph_hash"]
         first_arguments = advisor_call.await_args_list[0].args[0]
         second_arguments = advisor_call.await_args_list[1].args[0]
@@ -2185,11 +2218,18 @@ class TestComposerMultiTurnToolCalls:
         preflight.assert_not_called()
         assert result.state == state
         assert result.tool_invocations == ()
-        saved_scope = "No pipeline changes were saved in this request."
+        saved_scope = (
+            "Verified checkpoint evidence covers 0 saved draft revisions. There is no net authored change from the starting draft."
+        )
         assert result.raw_assistant_content == saved_scope
-        assert result.message == saved_scope + _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+        _assert_checkpoint_reply(
+            result,
+            saved_scope + _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX,
+            raw=saved_scope,
+            count=0,
+        )
         assert "Looks ready." not in result.message
-        assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+        assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)[:-1] == (
             _no_tool_policy_module.AssistantTextSegment(saved_scope),
             # No mutation this turn, so no preflight ran: the absent-shape twin.
             _no_tool_policy_module.TrustedSystemNoticeSegment(
@@ -2280,8 +2320,8 @@ class TestComposerMultiTurnToolCalls:
             result = await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
 
         assert len(reviews) == 2 and reviews[0].binding != reviews[1].binding
-        assert result.message == "The pipeline name is now Repaired."
-        assert result.raw_assistant_content is None
+        _assert_checkpoint_reply(result, "The pipeline name is now Repaired.", count=1, changed=True)
+        assert result.raw_assistant_content == "The pipeline name is now Repaired."
 
         assert service._sessions_service is not None
         stored = await service._sessions_service.get_messages(UUID(session_id))
@@ -2447,16 +2487,22 @@ class TestComposerMultiTurnToolCalls:
             assert saved_revisions() == () and result.state == state
             preflight.assert_not_called()
         saved_scope = (
-            "This request saved 1 draft revisions with verified changes. Saved changes do not establish that the requested task is complete."
+            "Verified checkpoint evidence covers 1 saved draft revisions. There are net authored changes from the starting draft."
             if mutate_after_discovery
-            else "No pipeline changes were saved in this request."
+            else "Verified checkpoint evidence covers 0 saved draft revisions. There is no net authored change from the starting draft."
         )
         suffix = (
             _no_tool_policy_module._ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX
             if mutate_after_discovery
             else _no_tool_policy_module._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
         )
-        assert result.raw_assistant_content == saved_scope and result.message == saved_scope + suffix
+        _assert_checkpoint_reply(
+            result,
+            saved_scope + suffix,
+            raw=saved_scope,
+            count=int(mutate_after_discovery),
+            changed=mutate_after_discovery,
+        )
         assert result.runtime_preflight is not None and result.runtime_preflight.readiness.completion_ready is False
         assert isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
         assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.GRAPH_REJECTED
@@ -2754,7 +2800,7 @@ class TestComposerConvergence:
             mock_llm.side_effect = [mut, text]
             result = await service.compose("Do it", [], state, session_id=session_id)
 
-        assert result.message == "Done after final correction."
+        _assert_checkpoint_reply(result, "Done after final correction.", count=1, changed=True)
         assert result.state.metadata.name == "Final"
 
     @pytest.mark.asyncio
@@ -2797,7 +2843,7 @@ class TestComposerConvergence:
             mock_llm.side_effect = [disc, mut, text]
             result = await service.compose("Build", [], state, session_id=session_id)
 
-        assert result.message == "Done."
+        _assert_checkpoint_reply(result, "Done.", count=1, changed=True)
         assert result.state.metadata.name == "Works"
 
 
@@ -2947,7 +2993,7 @@ class TestComposerErrorHandling:
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Do something", [], state, session_id=session_id)
 
-        assert result.message == "Sorry, let me try again."
+        _assert_checkpoint_reply(result, "Sorry, let me try again.", count=0)
         # State unchanged — the bad tool call didn't modify anything
         assert result.state.version == 1
 
@@ -3452,7 +3498,7 @@ class TestComposerErrorHandling:
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Explore", [], state, session_id=session_id)
 
-        assert result.message == "Recovered."
+        _assert_checkpoint_reply(result, "Recovered.", count=0)
         mock_execute_tool.assert_not_called()
         tool_msg = mock_llm.call_args_list[1][0][0][-1]
         error_content = json.loads(tool_msg["content"])
@@ -3882,7 +3928,7 @@ class TestDiscoveryCache:
             result = await service.compose("List sources", [], state, session_id=session_id)
 
         # Should NOT have raised — second list_sources was a cache hit
-        assert result.message == "Found sources."
+        _assert_checkpoint_reply(result, "Found sources.", count=0)
         assert dispatch.call_count == 1
         # Catalog list_sources is called once by snapshot construction
         # (before any PolicyCatalogView exists) and once more by the
@@ -5334,7 +5380,7 @@ class TestComposerAvailabilityAndBadRequest:
         ):
             result = await service.compose("Hello", [], state, session_id=session_id)
 
-        assert result.message == "Recovered."
+        _assert_checkpoint_reply(result, "Recovered.", count=0)
         assert mock_llm.call_count == 2
         mock_sleep.assert_awaited_once()
         mock_sleep.assert_awaited_once_with(1.0)
@@ -5353,7 +5399,7 @@ class TestComposerAvailabilityAndBadRequest:
         ):
             result = await service.compose("Hello", [], _empty_state(), session_id=session_id)
 
-        assert result.message == "Recovered."
+        _assert_checkpoint_reply(result, "Recovered.", count=0)
         assert mock_llm.call_count == 2
         mock_sleep.assert_awaited_once()
         mock_sleep.assert_awaited_once_with(1.0)
@@ -8619,440 +8665,6 @@ class TestEmptyStateFinalizePassthrough:
         assert result.message == "All good."
         assert result.raw_assistant_content is None  # no replacement happened
 
-    @pytest.mark.asyncio
-    async def test_state_claim_grounding_appends_correction_on_t4_contradiction(self) -> None:
-        """Path 3 of issue elspeth-c028f7d186: when the model's prose claims
-        a state field has its old value while state has been mutated to a
-        new value, the finalizer appends an [ELSPETH-SYSTEM] correction.
-
-        Reproduces the panel-evals T4 case from the
-        boolean_routing__p1_compliance cell (Linda the compliance officer):
-        prose claims ``on_validation_failure: discard`` while state has
-        ``rejected_records`` (the fix had already landed a turn earlier).
-
-        The augmentation must satisfy
-        ``_enforce_augmentation_prefix_invariant`` — message starts with
-        the model's prose verbatim — and ``raw_assistant_content`` must
-        carry the unaugmented prose for LLM history replay.
-        """
-        catalog = _mock_catalog()
-        settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
-        # State already has the fix applied: on_validation_failure == "rejected_records".
-        state = (
-            _empty_state()
-            .with_source(
-                SourceSpec(
-                    plugin="csv",
-                    on_success="rows",
-                    options={"path": "/data/inputs/in.csv"},
-                    on_validation_failure="rejected_records",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="main",
-                    plugin="csv",
-                    options={"path": "/data/outputs/out.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="rejected_records",
-                    plugin="csv",
-                    options={"path": "/data/outputs/rejected.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-        )
-        valid_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
-        # Prose contradicts state: claims discard, but state has rejected_records.
-        contradicting_prose = "I see the issue — the source still uses `on_validation_failure: discard`, so I'll fix that next."
-
-        with patch.object(service._preflight, "runtime_preflight"):
-            result = await service._completion._finalize_no_tool_response(
-                content=contradicting_prose,
-                state=state,
-                initial_version=state.version,
-                user_id="user-1",
-                session_id=None,
-                last_runtime_preflight=valid_preflight,
-                runtime_preflight_cache=service._preflight.new_cache(),
-                session_scope="session:test",
-            )
-
-        # Augmentation prefix invariant: model's prose verbatim at start.
-        assert result.message.startswith(contradicting_prose)
-        # Correction suffix attached.
-        assert "[ELSPETH-SYSTEM]" in result.message
-        # Actual state value surfaced for the operator to read.
-        assert "rejected_records" in result.message
-        # raw_assistant_content carries the unaugmented prose so the
-        # LLM history-replay path is unaffected by the synthetic suffix.
-        assert result.raw_assistant_content == contradicting_prose
-        # Preflight was passed through (still valid).
-        assert result.runtime_preflight is valid_preflight
-
-    @pytest.mark.asyncio
-    async def test_state_claim_grounding_appends_correction_on_t5_unmotivated_action(self) -> None:
-        """Path 3 backward-contradiction case from the panel-evals T5 cell:
-        prose claims a fresh action ("I just fixed it") while state was
-        unchanged this turn and no mutation tool succeeded.
-
-        The action-claim detector flags the un-grounded completion claim
-        even though the prose contains no concrete field=value claim.
-        """
-        catalog = _mock_catalog()
-        settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
-        # State is the same as the prior turn — no mutation happened this turn.
-        state = (
-            _empty_state()
-            .with_source(
-                SourceSpec(
-                    plugin="csv",
-                    on_success="rows",
-                    options={"path": "/data/inputs/in.csv"},
-                    on_validation_failure="rejected_records",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="main",
-                    plugin="csv",
-                    options={"path": "/data/outputs/out.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="rejected_records",
-                    plugin="csv",
-                    options={"path": "/data/outputs/rejected.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-        )
-        valid_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
-        unmotivated_prose = "I just fixed the workflow behavior. All set now."
-
-        with patch.object(service._preflight, "runtime_preflight"):
-            result = await service._completion._finalize_no_tool_response(
-                content=unmotivated_prose,
-                state=state,
-                initial_version=state.version,  # unchanged → no mutation
-                user_id="user-1",
-                session_id=None,
-                last_runtime_preflight=valid_preflight,
-                runtime_preflight_cache=service._preflight.new_cache(),
-                session_scope="session:test",
-                mutation_success_seen=False,
-            )
-
-        assert result.message.startswith(unmotivated_prose)
-        assert "[ELSPETH-SYSTEM]" in result.message
-        # Explanation wording is pattern-agnostic across the four
-        # action-claim pattern categories (issue elspeth-905fe2a3d8
-        # widened the detector beyond "I just <verb>"). The shared
-        # phrasing covers all four pattern shapes uniformly.
-        assert "no mutation tool succeeded this turn" in result.message
-        assert result.raw_assistant_content == unmotivated_prose
-
-    @pytest.mark.asyncio
-    async def test_state_claim_grounding_no_op_on_grounded_prose(self) -> None:
-        """Negative control: when the model's prose is consistent with
-        state, the grounding check is a no-op and the prose is passed
-        through verbatim. Critical to avoid corrupting honest reports."""
-        catalog = _mock_catalog()
-        settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
-        state = (
-            _empty_state()
-            .with_source(
-                SourceSpec(
-                    plugin="csv",
-                    on_success="rows",
-                    options={"path": "/data/inputs/in.csv"},
-                    on_validation_failure="rejected_records",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="main",
-                    plugin="csv",
-                    options={"path": "/data/outputs/out.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="rejected_records",
-                    plugin="csv",
-                    options={"path": "/data/outputs/rejected.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-        )
-        valid_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
-        # Prose accurately reports state: it correctly says rejected_records.
-        grounded_prose = "I configured the source with `on_validation_failure: rejected_records`. The pipeline is ready."
-
-        with patch.object(service._preflight, "runtime_preflight"):
-            result = await service._completion._finalize_no_tool_response(
-                content=grounded_prose,
-                state=state,
-                initial_version=state.version,
-                user_id="user-1",
-                session_id=None,
-                last_runtime_preflight=valid_preflight,
-                runtime_preflight_cache=service._preflight.new_cache(),
-                session_scope="session:test",
-                mutation_success_seen=True,
-            )
-
-        # Verbatim pass-through; no augmentation; no raw_assistant_content set.
-        assert result.message == grounded_prose
-        assert "[ELSPETH-SYSTEM]" not in result.message
-        assert result.raw_assistant_content is None
-
-    @pytest.mark.asyncio
-    async def test_state_claim_grounding_runs_when_runtime_result_is_none_agreement_language(self) -> None:
-        """Bypass-fix coverage for issue elspeth-905fe2a3d8.
-
-        Previously, when state did not change AND no preview_pipeline was
-        called this turn, ``_finalize_no_tool_response`` early-returned with
-        bare passthrough at the ``runtime_result is None`` branch — the
-        state-claim grounding check at the bottom of the function was
-        unreachable on that control-flow path. Cells #2/#4 of the
-        panel-smoke-2026-05-10 cohort landed in that hole: the model
-        agreed verbally ("you're right, I'll change that") without
-        calling any mutation tool, and the augmentation never fired.
-
-        After restructure: grounding runs even when ``runtime_result is None``
-        (state non-empty, no preview), and the agreement-promise pattern
-        category catches the prose."""
-        catalog = _mock_catalog()
-        settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
-        # Routed source -> sink so Stage-1 ``state.validate()`` passes: the
-        # cross-turn arm (elspeth-ac85b0ab0e) reruns the preflight for
-        # Stage-1-invalid unmutated states, and this test's subject is the
-        # grounding check on a genuinely UNKNOWN verdict.
-        state = (
-            _empty_state()
-            .with_source(
-                SourceSpec(
-                    plugin="csv",
-                    on_success="main",
-                    options={"path": "/data/inputs/in.csv"},
-                    on_validation_failure="discard",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="main",
-                    plugin="csv",
-                    options={"path": "/data/outputs/out.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-        )
-        agreement_prose = "You're right, I'll change that to rejected_records."
-
-        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
-            result = await service._completion._finalize_no_tool_response(
-                content=agreement_prose,
-                state=state,
-                initial_version=state.version,  # unchanged → no mutation
-                user_id="user-1",
-                session_id=None,
-                last_runtime_preflight=None,  # no preview was called
-                runtime_preflight_cache=service._preflight.new_cache(),
-                session_scope="session:test",
-                mutation_success_seen=False,
-            )
-
-        # The grounding correction must fire — the prior bare passthrough
-        # would have returned the prose verbatim with no [ELSPETH-SYSTEM]
-        # block.
-        assert result.message.startswith(agreement_prose)
-        assert "[ELSPETH-SYSTEM]" in result.message
-        assert "no mutation tool succeeded this turn" in result.message
-        assert result.raw_assistant_content == agreement_prose
-        # No preflight was rerun (state unchanged); the existing
-        # branch-skip behaviour for preflight is preserved.
-        mock_preflight.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_state_claim_grounding_runs_when_runtime_result_is_none_t5_widened(self) -> None:
-        """Bypass-fix coverage for issue elspeth-c028f7d186 (T5 widened).
-
-        The T5 cell prose ("I fixed the workflow behavior so source
-        validation is no longer silently dropping rows...") would land
-        on the same previously-bypassed control-flow path: state didn't
-        change after the T4 mutation, and the model didn't preview on
-        T5 either. The bare-past-with-consequence pattern category
-        added in this fix flags the prose; restructured grounding plumb
-        ensures the check actually runs."""
-        catalog = _mock_catalog()
-        settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
-        # Routed source -> sink: Stage-1-clean so the cross-turn arm
-        # (elspeth-ac85b0ab0e) leaves the verdict UNKNOWN — this test's
-        # subject (see the sibling above).
-        state = (
-            _empty_state()
-            .with_source(
-                SourceSpec(
-                    plugin="csv",
-                    on_success="main",
-                    options={"path": "/data/inputs/in.csv"},
-                    on_validation_failure="rejected_records",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="main",
-                    plugin="csv",
-                    options={"path": "/data/outputs/out.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="rejected_records",
-                    plugin="csv",
-                    options={"path": "/data/outputs/rejected.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-        )
-        t5_prose = "I fixed the workflow behavior so source validation is no longer silently dropping rows from the record set."
-
-        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
-            result = await service._completion._finalize_no_tool_response(
-                content=t5_prose,
-                state=state,
-                initial_version=state.version,
-                user_id="user-1",
-                session_id=None,
-                last_runtime_preflight=None,
-                runtime_preflight_cache=service._preflight.new_cache(),
-                session_scope="session:test",
-                mutation_success_seen=False,
-            )
-
-        assert result.message.startswith(t5_prose)
-        assert "[ELSPETH-SYSTEM]" in result.message
-        assert result.raw_assistant_content == t5_prose
-        mock_preflight.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_no_grounding_correction_when_runtime_result_is_none_and_prose_is_innocuous(self) -> None:
-        """Negative control: the bypass-fix restructure must NOT regress
-        the bare-passthrough behaviour for prose that contains no
-        action claim.
-
-        Pins the contract that grounding is additive — it only augments
-        when violations are detected, never in the no-violation case.
-        Companion test to ``test_unchanged_text_without_preview_does_not_run_preflight``
-        which exercises the same control-flow path with empty state."""
-        catalog = _mock_catalog()
-        settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
-        # Routed source -> sink: Stage-1-clean so the cross-turn arm
-        # (elspeth-ac85b0ab0e) leaves the verdict UNKNOWN and the bare
-        # passthrough under test stays reachable.
-        state = (
-            _empty_state()
-            .with_source(
-                SourceSpec(
-                    plugin="csv",
-                    on_success="main",
-                    options={"path": "/data/inputs/in.csv"},
-                    on_validation_failure="rejected_records",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="main",
-                    plugin="csv",
-                    options={"path": "/data/outputs/out.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="rejected_records",
-                    plugin="csv",
-                    options={"path": "/data/outputs/rejected.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-        )
-        # Bare past tense without a consequence clause — deliberately
-        # below the conservative-anchoring threshold of every action
-        # pattern. The detector must NOT flag this.
-        innocuous_prose = "I fixed it."
-
-        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
-            result = await service._completion._finalize_no_tool_response(
-                content=innocuous_prose,
-                state=state,
-                initial_version=state.version,
-                user_id="user-1",
-                session_id=None,
-                last_runtime_preflight=None,
-                runtime_preflight_cache=service._preflight.new_cache(),
-                session_scope="session:test",
-                mutation_success_seen=False,
-            )
-
-        assert result.message == innocuous_prose
-        assert result.raw_assistant_content is None
-        mock_preflight.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_no_grounding_correction_when_mutation_succeeded_this_turn(self) -> None:
-        """Verifier-gate protection on the bypass-fix path.
-
-        Even when the agreement-promise pattern matches, the verifier
-        gate (``mutation_success_seen or state_changed``) suppresses
-        the violation if a mutation tool actually succeeded. Critical
-        to avoid corrupting honest reports where the model agreed AND
-        acted in the same turn."""
-        catalog = _mock_catalog()
-        settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
-        state = _empty_state().with_source(
-            SourceSpec(
-                plugin="csv",
-                on_success="rows",
-                options={"path": "/data/inputs/in.csv"},
-                on_validation_failure="rejected_records",
-            )
-        )
-        agreement_prose = "You're right, I'll change that to rejected_records."
-
-        with patch.object(service._preflight, "runtime_preflight"):
-            result = await service._completion._finalize_no_tool_response(
-                content=agreement_prose,
-                state=state,
-                initial_version=state.version,
-                user_id="user-1",
-                session_id=None,
-                last_runtime_preflight=None,
-                runtime_preflight_cache=service._preflight.new_cache(),
-                session_scope="session:test",
-                mutation_success_seen=True,  # the model DID act
-            )
-
-        # No augmentation: the verifier gate suppresses the action-claim
-        # violation. Prose passes through verbatim.
-        assert result.message == agreement_prose
-        assert result.raw_assistant_content is None
-
 
 # ---------------------------------------------------------------------------
 # Forced-repair loop coverage. When the assistant emits no tool_calls but
@@ -9858,7 +9470,7 @@ class TestComposeLoopForcedRepair:
         assert len(repair_msgs) == 1, f"exactly one composer-system repair message must precede turn 3; got {len(repair_msgs)}"
         # Final assistant content reflects turn 4's claim, not turn 2's
         # (which was preempted by the repair gate).
-        assert result.message == "Repaired and ready."
+        _assert_checkpoint_reply(result, "Repaired and ready.", count=3, changed=True)
 
     @pytest.mark.asyncio
     async def test_divergence_repair_does_not_clear_blocker(self) -> None:

@@ -2390,6 +2390,84 @@ async def test_resolve_prompt_template_review_survives_sibling_vague_term_bake(s
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prompt_first", [False, True], ids=["criterion-first", "prompt-first"])
+async def test_combined_scoring_criterion_amendment_survives_both_review_orders(service, prompt_first: bool) -> None:
+    session_id = uuid4()
+    draft = "Rate readability from 1 to 10: 1 is illegible, 5 requires effort, and 10 is easy to read."
+    amended = "Rate readability from 0 to 4: 0 is illegible, 2 requires effort, and 4 is easy to read."
+    prefix = "Apply this scoring rule: "
+    suffix = "\nReply with the score and one reason."
+    pending_prompt = prefix + "pending interpretation" + suffix
+    node = _vague_term_and_prompt_template_node(vague_term="readable", vague_draft=draft)
+    node["options"]["prompt_template"] = pending_prompt
+    node["options"][PROMPT_TEMPLATE_PARTS_KEY] = [
+        {"kind": "text", "text": prefix},
+        {"kind": "interpretation_ref", "requirement_id": "readable"},
+        {"kind": "text", "text": suffix},
+    ]
+    node["options"][INTERPRETATION_REQUIREMENTS_KEY][1]["draft"] = pending_prompt
+    state = await _seed_state_with_llm_node(service, session_id=session_id, node=node)
+    criterion_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_readability",
+        user_term="readable",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft=draft,
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    prompt_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_readability_prompt",
+        user_term="llm_prompt_template:llm_transform_1",
+        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+        llm_draft=pending_prompt,
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    ordered_events = (prompt_event, criterion_event) if prompt_first else (criterion_event, prompt_event)
+    for event in ordered_events:
+        is_criterion = event.id == criterion_event.id
+        await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=event.id,
+            choice=InterpretationChoice.AMENDED if is_criterion else InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=amended if is_criterion else None,
+            actor="user:alice",
+            runtime_model_identifier=None,
+            runtime_model_version=None,
+        )
+
+    reloaded = await service.get_current_state(session_id)
+    assert reloaded is not None
+    final_node = next(node for node in reloaded.nodes if node["id"] == "llm_transform_1")
+    options = final_node["options"]
+    expected_prompt = prefix + amended + suffix
+    assert options["prompt_template"] == expected_prompt
+    assert draft not in options["prompt_template"]
+    assert "1 to 10" not in options["prompt_template"]
+    assert options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash(prompt_template=expected_prompt, system_prompt=None)
+    requirements = {requirement["id"]: requirement for requirement in options[INTERPRETATION_REQUIREMENTS_KEY]}
+    assert requirements["readable"]["status"] == "resolved"
+    assert requirements["readable"]["accepted_value"] == amended
+    assert requirements["readable"]["resolved_prompt_template_hash"] == stable_hash(amended)
+    assert requirements["prompt_template_review"]["status"] == "resolved"
+    events = {event.id: event for event in await service.list_interpretation_events(session_id, status="all")}
+    assert events[criterion_event.id].choice is InterpretationChoice.AMENDED
+    assert events[criterion_event.id].accepted_value == amended
+    assert events[prompt_event.id].choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
+    assert events[prompt_event.id].accepted_value == pending_prompt
+
+
+@pytest.mark.asyncio
 async def test_resolve_prompt_template_review_still_rejects_genuine_skeleton_edit(service) -> None:
     """The relaxed gate must still reject a GENUINE structural edit.
 

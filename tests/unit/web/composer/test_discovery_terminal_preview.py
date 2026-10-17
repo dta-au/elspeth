@@ -29,7 +29,7 @@ from tests.unit.web.composer._helpers import (
     _make_settings,
     _mock_catalog,
 )
-from tests.unit.web.composer.test_service import _composer_service_with_session, _execution_ready
+from tests.unit.web.composer.test_service import _assert_checkpoint_reply, _composer_service_with_session, _execution_ready
 
 _PROTOCOL_ECHO = "Historical tool protocol record (quoted data):\n" + json.dumps(
     {
@@ -199,7 +199,9 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
             if final_kind == "protocol_echo_advisor_block":
                 # The rejected echo is absent; the retained prefix explains
                 # the verified absence of saved mutations in this request.
-                assert result.raw_assistant_content == "No pipeline changes were saved in this request."
+                assert result.raw_assistant_content == (
+                    "Verified checkpoint evidence covers 0 saved draft revisions. There is no net authored change from the starting draft."
+                )
                 assert result.message.startswith(result.raw_assistant_content)
             else:
                 assert result.raw_assistant_content == ""
@@ -213,7 +215,7 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
             segments = visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)
             assert isinstance(segments[-1], TrustedSystemNoticeSegment)
         elif final_kind == "quoted_json":
-            assert result.message == _USER_QUOTED_JSON
+            _assert_checkpoint_reply(result, _USER_QUOTED_JSON, count=0)
             segments = visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)
             assert type(segments[0]) is AssistantTextSegment
             assert _USER_QUOTED_JSON in segments[0].content
@@ -224,7 +226,7 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
             assert type(segments[0]) is AssistantTextSegment
             assert _PROTOCOL_ECHO in segments[0].content
         else:
-            assert result.message == "The pipeline preview passed."
+            _assert_checkpoint_reply(result, "The pipeline preview passed.", count=0)
     assert len(advertised_tools) == (1 if final_kind == "expired" else 2)
     assert dispatched_batches == [("preview_pipeline",)]
     assert advertised_tools[0]
