@@ -5517,7 +5517,8 @@ class TestMessageRoutes:
 
     def test_external_cancel_racing_disconnect_keeps_unwinding(self, tmp_path, monkeypatch) -> None:
         """A durable Stop cannot turn an already-pending shutdown into user Stop."""
-        from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED, COMPOSER_SHUTDOWN
+        from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
+        from elspeth.web.sessions.composer_operations import COMPOSER_SHUTDOWN
 
         app, service = _make_app(tmp_path)
         client = TestClient(app)
@@ -5527,17 +5528,29 @@ class TestMessageRoutes:
         async def drive(http: AsyncClient) -> None:
             composer = _CancellableComposer()
             app.state.composer_service = composer
+            real_read = ComposerOperationWatchReader.read
+
+            async def shutdown_before_stop(reader):
+                record, now = await real_read(reader)
+                if record is not None and record.cancel_requested_at is not None:
+                    assert composer.owner is not None
+                    assert composer.owner.cancelling() == 0
+                    # The real watcher delivers durable Stop immediately after
+                    # this read, establishing shutdown-first without an HTTP race.
+                    composer.owner.cancel(COMPOSER_SHUTDOWN)
+                return record, now
+
+            monkeypatch.setattr(ComposerOperationWatchReader, "read", shutdown_before_stop)
             async with running_operation_async(
                 http, app, path=f"/api/sessions/{session_id}/messages", body=message_body("Cancel race")
             ) as operation:
-                await asyncio.wait_for(composer.entered.wait(), timeout=3)
+                # Startup includes real SQL/worker setup; this is a hang guard.
+                await asyncio.wait_for(composer.entered.wait(), timeout=30)
                 stop = await http.post(f"{operation.poll_path}/cancel")
                 assert stop.status_code in (200, 202)
                 assert composer.owner is not None
-                composer.owner.cancel(COMPOSER_SHUTDOWN)
-                composer.owner.cancel(COMPOSER_CANCEL_REQUESTED)
-                assert composer.owner.cancelling() == 2
                 await asyncio.wait_for(operation.drive, timeout=5)
+                assert composer.owner.cancelling() == 2
                 final = await http.get(operation.poll_path)
                 assert final.status_code == 200
                 assert final.json()["status"] == "failed"
