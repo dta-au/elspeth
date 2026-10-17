@@ -26,7 +26,7 @@ import {
 import { useComposer } from "@/hooks/useComposer";
 import {
   getBlobMetadata,
-  previewBlobContent,
+  downloadBlobContent,
   toInlineSourceProvenance,
 } from "@/api/client";
 import { MessageBubble } from "./MessageBubble";
@@ -749,11 +749,12 @@ export function ChatPanelContent({
       try {
         const meta = await getBlobMetadata(sessionId, targetBlobId);
         if (cancelled || !isInlineSourceBlob(meta)) return;
-        const text = await previewBlobContent(sessionId, targetBlobId);
+        const { data } = await downloadBlobContent(sessionId, targetBlobId);
+        const contentBytes = await data.arrayBuffer();
         if (cancelled) return;
         const summary = await projectInlineSourceSummary({
           metadata: meta,
-          contentText: text,
+          contentBytes,
           toProvenance: toInlineSourceProvenance,
         });
         if (!cancelled) setInlineSourceSummary(sessionId, summary);

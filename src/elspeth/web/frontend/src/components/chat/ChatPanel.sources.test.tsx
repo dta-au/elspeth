@@ -15,7 +15,7 @@ vi.mock("@/hooks/useComposer", () => ({
 }));
 vi.mock("@/api/client", async (original) => ({
   ...await original<typeof api>(),
-  getBlobMetadata: vi.fn(), previewBlobContent: vi.fn(), fetchSystemStatus: vi.fn(),
+  getBlobMetadata: vi.fn(), downloadBlobContent: vi.fn(), fetchSystemStatus: vi.fn(),
 }));
 
 const content = (id: string) => `url\nhttps://example.com/${id}`;
@@ -46,7 +46,9 @@ beforeEach(() => {
     sessions: [{ id: "s", title: "Test", created_at: "2026-09-22T00:00:00Z", updated_at: "2026-09-22T00:00:00Z" }],
   });
   vi.mocked(api.getBlobMetadata).mockImplementation(async (_session, id) => metadata(id, id === "a_upload"));
-  vi.mocked(api.previewBlobContent).mockImplementation(async (_session, id) => content(id));
+  vi.mocked(api.downloadBlobContent).mockImplementation(async (_session, id) => ({
+    data: await new Response(content(id)).blob(), filename: `${id}.csv`,
+  }));
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -75,7 +77,7 @@ it("projects all generated sources even when an uploaded source sorts first", as
   await screen.findByText(/example.com\/b_generated/);
   await screen.findByText(/example.com\/c_generated/);
   expect(screen.queryByText("a_upload.csv")).not.toBeInTheDocument();
-  expect(api.previewBlobContent).not.toHaveBeenCalledWith("s", "a_upload");
+  expect(api.downloadBlobContent).not.toHaveBeenCalledWith("s", "a_upload");
   expect(screen.getAllByRole("region", { name: /source created/i })).toHaveLength(2);
   fireEvent.click(screen.getAllByRole("button", { name: "Edit the list" })[1]);
   expect(sendMessage).toHaveBeenCalledWith(expect.stringContaining('"shared.csv"'));
