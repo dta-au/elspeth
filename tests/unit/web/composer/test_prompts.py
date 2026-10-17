@@ -782,6 +782,55 @@ class TestBuildSystemPrompt:
         assert 'This includes terms such as "cool", "good", "bad"' not in result
         assert "Subjective user terms (cool, risky, relevant, good)" not in result
 
+    def test_authored_scoring_example_keeps_scale_and_anchors_in_one_criterion(self) -> None:
+        result = build_system_prompt(None)
+        heading = 'Construction pattern for an LLM-authored scoring prompt (criterion "cool", node'
+        assert result.count(heading) == 1
+        example_section = result.split(heading, 1)[1].split("You author ONLY", 1)[0]
+        assert example_section.count("```json\n") == 1
+        example = json.loads(example_section.split("```json\n", 1)[1].split("\n```", 1)[0])
+        requirements = example[INTERPRETATION_REQUIREMENTS_KEY]
+        assert len(requirements) == 1
+        criterion = requirements[0]
+        assert criterion["kind"] == "vague_term"
+        assert criterion["user_term"] == "cool"
+        expected_criterion = (
+            "Cool means distinctive, coherent visual presentation. Use a 1-10 scale: "
+            "1 means ordinary elements presented inconsistently, "
+            "5 means some distinctive elements with uneven coherence, and "
+            "10 means distinctive elements presented coherently throughout."
+        )
+        assert criterion["draft"] == expected_criterion, "authored scale and anchors must share the criterion value"
+        parts = example[PROMPT_TEMPLATE_PARTS_KEY]
+        references = [part for part in parts if part["kind"] == "interpretation_ref"]
+        assert references == [{"kind": "interpretation_ref", "requirement_id": "cool:rate_cool"}]
+        framing = "".join(part["text"] for part in parts if part["kind"] == "text")
+        assert "1-10" not in framing
+        assert "1-10" not in example["system_prompt"]
+        rendered = "".join(part["text"] if part["kind"] == "text" else criterion["draft"] for part in parts)
+        assert example["prompt_template"] == rendered, "the readable example must equal its complete parts render"
+        assert rendered == (
+            f"Apply this criterion to the page: {expected_criterion}\n"
+            "Page content: {{ row['content'] }}\nReply with the score followed by one short reason."
+        )
+        amended_criterion = (
+            "Assess text legibility on a 0-4 scale: 0 means unreadable, 2 means readable with effort, and 4 means immediately readable."
+        )
+        amended = "".join(part["text"] if part["kind"] == "text" else amended_criterion for part in parts)
+        assert amended == (
+            f"Apply this criterion to the page: {amended_criterion}\n"
+            "Page content: {{ row['content'] }}\nReply with the score followed by one short reason."
+        )
+        assert expected_criterion not in amended
+        assert "1-10" not in amended
+
+    def test_scoring_guidance_preserves_user_supplied_rule_provenance(self) -> None:
+        result = " ".join(build_system_prompt(None).split())
+
+        assert "Preserve user-supplied scales and rules literally; do not present them as choices you authored." in result
+        assert "Do not rewrite a user-supplied literal prompt to fit this construction pattern." in result
+        assert "If you chose the scale, anchors and criterion meaning, keep them together in one criterion string" in result
+
     def test_core_skill_does_not_treat_primary_colours_as_inherently_vague(self) -> None:
         """Objective design extraction is not automatically a vague-term review."""
         result = build_system_prompt(None)

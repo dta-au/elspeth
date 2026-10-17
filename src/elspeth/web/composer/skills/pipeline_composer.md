@@ -969,6 +969,19 @@ ranking, or category semantics you authored, not the whole prompt template.
 In the review call, omit `llm_draft`: the server resolves the staged draft
 itself.
 
+If you chose the scale, anchors and criterion meaning, keep them together in one
+criterion string referenced by the existing `interpretation_ref` slot. The draft
+carries the exact scale/rubric/cutoff/category semantics you authored. Do not
+repeat those choices in fixed prompt text outside the slot: amending the
+criterion must replace the whole authored scoring rule without leaving an old
+range or anchor behind.
+
+Preserve user-supplied scales and rules literally; do not present them as choices
+you authored. If you add meanings the user did not supply, distinguish those
+additions from the supplied rules and keep them consistent. Ask about a genuine
+conflict rather than silently replacing a supplied rule. Do not rewrite a
+user-supplied literal prompt to fit this construction pattern.
+
 Prompt-template review is not a substitute for rubric review — and the
 `vague_term` one is yours. When the LLM node has a prompt you wrote AND authored
 judgement/rubric semantics, author the `vague_term` entry in
@@ -1021,11 +1034,11 @@ id "rate_cool"):
 ```json
 {
   "system_prompt": "You rate web pages against one stated criterion. Reply with the score followed by one short reason, and nothing else.",
-  "prompt_template": "Rate how <your draft definition of \"cool\"> the page is, on a 1-10 scale. Page content: {{ row['content'] }}. Reply with the score followed by one short reason.",
+  "prompt_template": "Apply this criterion to the page: Cool means distinctive, coherent visual presentation. Use a 1-10 scale: 1 means ordinary elements presented inconsistently, 5 means some distinctive elements with uneven coherence, and 10 means distinctive elements presented coherently throughout.\nPage content: {{ row['content'] }}\nReply with the score followed by one short reason.",
   "prompt_template_parts": [
-    {"kind": "text", "text": "Rate how "},
+    {"kind": "text", "text": "Apply this criterion to the page: "},
     {"kind": "interpretation_ref", "requirement_id": "cool:rate_cool"},
-    {"kind": "text", "text": " the page is, on a 1-10 scale. Page content: {{ row['content'] }}. Reply with the score followed by one short reason."}
+    {"kind": "text", "text": "\nPage content: {{ row['content'] }}\nReply with the score followed by one short reason."}
   ],
   "required_input_fields": ["content"],
   "interpretation_requirements": [
@@ -1033,7 +1046,7 @@ id "rate_cool"):
       "kind": "vague_term",
       "user_term": "cool",
       "display_title": "Definition of cool",
-      "draft": "<your draft definition of \"cool\" — the exact scale/rubric/cutoff/category semantics you authored>"
+      "draft": "Cool means distinctive, coherent visual presentation. Use a 1-10 scale: 1 means ordinary elements presented inconsistently, 5 means some distinctive elements with uneven coherence, and 10 means distinctive elements presented coherently throughout."
     }
   ]
 }
@@ -1069,9 +1082,11 @@ Per the ownership matrix, the example authors ONLY the planner-owned
 backend auto-staged and never hand-authored. You MUST still surface the
 auto-staged `llm_model_choice` with `request_interpretation_review`; do NOT
 call `request_interpretation_review(kind="llm_prompt_template")` — it is
-rejected (backend-owned; register rule applies in prose). The `1-10` scale here is fixed prompt wording covered
-by the (backend-surfaced) `llm_prompt_template` review — only the criterion
-*meaning* (`"cool"`) needs the wired `vague_term` slot. The model's reply
+rejected (backend-owned; register rule applies in prose). The `1-10` scale,
+anchors and meaning in this example are LLM-authored choices held together in
+the wired `vague_term` value. The `llm_prompt_template` review covers the
+surrounding prompt skeleton; it does not substitute for reviewing that value.
+The model's reply
 lands as one raw string in the node's single reply field; asking for a score
 and reason in the prompt does not create separate row fields — several named
 result fields exist only through a plugin mechanism whose live schema declares
