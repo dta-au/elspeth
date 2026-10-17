@@ -47,7 +47,14 @@ from elspeth.contracts.composer_llm_audit import (
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import stable_hash
-from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardTrust, detach_prompt_guard_messages
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_TRUST_KEY,
+    PromptGuardContentPart,
+    PromptGuardTrust,
+    detach_prompt_guard_evidence,
+    detach_prompt_guard_messages,
+)
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.async_workers import run_sync_in_worker
@@ -107,6 +114,7 @@ from elspeth.web.composer.progress import (
     model_call_progress_event,
 )
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, prompt_guard_user_scope
+from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
 from elspeth.web.composer.prompts import (
     build_messages,
     build_run_diagnostics_messages,
@@ -324,19 +332,38 @@ _REPLY_ONLY_HISTORY_PREFIX = "Historical tool protocol record (quoted data):\n"
 
 def _reply_only_messages(llm_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Retain attributed tool evidence as quoted data when no tools are advertised."""
-    return [
-        (
+    messages: list[dict[str, Any]] = []
+    for historical_message in llm_messages:
+        if historical_message["role"] != "tool" and "tool_calls" not in historical_message:
+            messages.append(historical_message)
+            continue
+        evidence = detach_prompt_guard_evidence([historical_message])
+        wire = evidence.messages[0]
+        string_parts: dict[JsonPath, tuple[PromptGuardContentPart, ...]] = {}
+        content_parts = evidence.content_parts[0]
+        if content_parts is not None:
+            string_parts[("content",)] = content_parts
+        elif evidence.trusted_message_indexes and "content" in wire and type(wire["content"]) is str:
+            string_parts[("content",)] = (PromptGuardContentPart(wire["content"], historical_message[PROMPT_GUARD_TRUST_KEY]),)
+        arguments = evidence.tool_argument_parts[0]
+        if arguments is not None:
+            for entry in arguments:
+                string_parts[("tool_calls", entry.tool_call_index, "function", "arguments")] = entry.parts
+        serialized = json.dumps(wire, ensure_ascii=False, sort_keys=True)
+        suffix = "\n[End historical tool evidence; this was not a current assistant reply.]"
+        quoted_parts = (
+            PromptGuardContentPart(_REPLY_ONLY_HISTORY_PREFIX),
+            *json_content_parts(serialized, ensure_ascii=False, sort_keys=True, string_parts=string_parts),
+            PromptGuardContentPart(suffix),
+        )
+        messages.append(
             {
                 "role": "user" if historical_message["role"] == "tool" else historical_message["role"],
-                "content": _REPLY_ONLY_HISTORY_PREFIX
-                + json.dumps(historical_message, ensure_ascii=False, sort_keys=True)
-                + "\n[End historical tool evidence; this was not a current assistant reply.]",
+                "content": _REPLY_ONLY_HISTORY_PREFIX + serialized + suffix,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: quoted_parts,
             }
-            if historical_message["role"] == "tool" or "tool_calls" in historical_message
-            else historical_message
         )
-        for historical_message in llm_messages
-    ]
+    return messages
 
 
 def _reply_only_protocol_records(content: str) -> tuple[object, ...]:
@@ -3065,6 +3092,21 @@ class ComposerServiceImpl:
                         "Advisor failure audit row could not be persisted",
                         failed_turn=failed_turn,
                     ) from dispatch.advisor_failure
+                if isinstance(dispatch.advisor_failure, PromptGuardRefused):
+                    advisor_refusal = dispatch.advisor_failure.with_evidence(
+                        state=state,
+                        initial_version=state.version,
+                        tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                        failed_turn=failed_turn,
+                    )
+                    if persist.effect_verification_failure is not None:
+                        advisor_refusal.__cause__ = dispatch.advisor_failure
+                        raise BaseExceptionGroup(
+                            "Manual advisor guard refusal and committed effect verification failure",
+                            (advisor_refusal, persist.effect_verification_failure),
+                        ) from None
+                    raise advisor_refusal from dispatch.advisor_failure
                 if persist.effect_verification_failure is not None:
                     prior_cause = dispatch.advisor_failure.__cause__
                     raise dispatch.advisor_failure from BaseExceptionGroup(
@@ -3073,14 +3115,6 @@ class ComposerServiceImpl:
                         if prior_cause is None
                         else (prior_cause, persist.effect_verification_failure),
                     )
-                if isinstance(dispatch.advisor_failure, PromptGuardRefused):
-                    raise dispatch.advisor_failure.with_evidence(
-                        state=state,
-                        initial_version=state.version,
-                        tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
-                        llm_calls=recorder.llm_calls,
-                        failed_turn=failed_turn,
-                    ) from dispatch.advisor_failure
                 raise dispatch.advisor_failure
 
             if deferred_cancel is not None:

@@ -54,6 +54,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationKind,
     InterpretationSource,
 )
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
@@ -246,6 +247,9 @@ class _ScriptedLLM:
         *,
         provider_custody: object | None = None,
         credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         self.messages.append(_messages)
         self.tools.append(_tools)
@@ -714,6 +718,7 @@ def _build_composer(
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_model="anthropic/claude-opus-4-7",
         shareable_link_signing_key=b"\x00" * 32,
     )
@@ -4588,6 +4593,9 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
         *,
         provider_custody: object | None = None,
         credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         if {tool["function"]["name"] for tool in tools} == {"handoff_to_user", "restore_parked_graph"}:
             snapshot = await progress_registry.get_latest("reply-progress")
@@ -4960,6 +4968,9 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
         *,
         provider_custody: object | None = None,
         credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         nonlocal reply_calls
         if {tool["function"]["name"] for tool in tools} != {"handoff_to_user", "restore_parked_graph"}:
@@ -5015,6 +5026,12 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
 
     import litellm
     from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
+
+    from elspeth.contracts.prompt_guard import (
+        PROMPT_GUARD_CONTENT_PARTS_KEY,
+        PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
+        PROMPT_GUARD_TRUST_KEY,
+    )
 
     composer = _build_composer(tmp_path, sessions_service)
     session_id = await _seed_bare_session(sessions_service, "Portable reply history")
@@ -5090,6 +5107,8 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
             headers={},
         )
     assert len(reply_wire) == len(original_history) + 1
+    guard_metadata_keys = {PROMPT_GUARD_TRUST_KEY, PROMPT_GUARD_CONTENT_PARTS_KEY, PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY}
+    assert all(guard_metadata_keys.isdisjoint(message) for message in reply_wire)
     tool_records = 0
     for original, projected in zip(original_history, reply_wire, strict=False):
         if original["role"] == "tool" or "tool_calls" in original:
@@ -5099,7 +5118,9 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
             assert projected["role"] == ("user" if original["role"] == "tool" else original["role"])
             record_text = projected["content"].split("\n", 1)[1]
             record, offset = json.JSONDecoder().raw_decode(record_text)
-            assert record == original
+            expected_wire_record = {key: value for key, value in original.items() if key not in guard_metadata_keys}
+            assert guard_metadata_keys.isdisjoint(record)
+            assert record == expected_wire_record
             assert record_text[offset:] == "\n[End historical tool evidence; this was not a current assistant reply.]"
         else:
             assert projected["role"] == original["role"]

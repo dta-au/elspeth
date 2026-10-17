@@ -5818,7 +5818,7 @@ _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operation
 _reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6bc46d9e075c8a4e6"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "fbd8951bb2cccff4d982072302e8484efd6446a1a7ebe1f5d4b5e0b5fd5389a2",
+    "src/elspeth/web/sessions/composer_turn.py": "42686a0365decfd83febe0a888866a7f70f79bc955bdeb210db2e0e4e5688990",
     "src/elspeth/web/sessions/composer_async_worker.py": "863285bd0bc2ffb3c7002738834c09e892b479b2b11dd3dff062fe91ea905a2a",
 }
 
@@ -9501,7 +9501,8 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     turn_path = "src/elspeth/web/sessions/composer_turn.py"
     dto_path = "src/elspeth/web/sessions/composer_app_services.py"
     title_path = "src/elspeth/web/sessions/_auto_title.py"
-    if any(path not in paths for path in (helper_path, turn_path, dto_path, title_path)):
+    service_path = "src/elspeth/web/composer/service.py"
+    if any(path not in paths for path in (helper_path, turn_path, dto_path, title_path, service_path)):
         return ["captured composer receiver source is missing"], None
     helper = _reserve_node_at(paths[helper_path], "composer_session_lock_registry")
     registry = _reserve_node_at(paths[helper_path], "_SessionComposeLockRegistry")
@@ -9582,7 +9583,7 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     titles = [node for node in ast.walk(turn) if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_owned_title"]
     auto_title = _reserve_node_at(paths[title_path], "maybe_auto_title_session")
     if len(title_tasks) != 1 or len(titles) != 1 or auto_title is None:
-        return ["parallel title task producer is missing or duplicated"], None
+        return ["guarded title task producer is missing or duplicated"], None
     if not any(
         isinstance(statement, ast.ImportFrom)
         and statement.level == 0
@@ -9595,14 +9596,6 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     prefix = outer.body[4:index] + outer.body[index + 1 : 21]
     if index != 15 or not _reserve_composer_receiver.receiver_transfer_prefix(prefix):
         return ["captured composer receiver interval has an unreviewed effect"], None
-    # These are the exact deferred definitions admitted by the closed prefix
-    # and title checks. Their bodies do not execute at definition; defaults,
-    # decorators and postponed-annotation premises remain checked separately.
-    settlement_definition = prefix[1]
-    deferred_bodies = {
-        node for definition in (title, settlement_definition) for statement in definition.body for node in ast.walk(statement)
-    }
-    history_join = outer.body[8].value
     session_service_stores = [
         node
         for node in ast.walk(turn)
@@ -9612,45 +9605,7 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
         isinstance(node, ast.Assign) and node.targets == session_service_stores and ast.unparse(node.value) == "services.session_service"
         for node in ast.walk(turn)
     ):
-        return ["parallel title service is not the separate DTO session service"], None
-    title_calls = [node for node in ast.walk(title) if isinstance(node, ast.Call) and ast.unparse(node.func) == "maybe_auto_title_session"]
-    if (
-        title_task.lineno >= capture.lineno
-        or title.decorator_list
-        or title.args.posonlyargs
-        or title.args.args
-        or title.args.kwonlyargs
-        or title.args.defaults
-        or title.args.kw_defaults
-        or title.args.vararg is not None
-        or title.args.kwarg is not None
-        or title.type_params
-        or len(title_calls) != 1
-        or len(title_calls[0].args) != 0
-        or [keyword.arg for keyword in title_calls[0].keywords]
-        != [
-            "service",
-            "session_id",
-            "user_message",
-            "model",
-            "temperature",
-            "seed",
-            "session_operation_context",
-            "api_base",
-            "api_key",
-            "provider_custody",
-        ]
-        or ast.unparse(title_calls[0].keywords[0].value) != "service"
-        or any(isinstance(node, ast.Name) and node.id in {"composer", "services", "app", "_app"} for node in ast.walk(title))
-        or any(isinstance(node, ast.Name) and node.id in {"composer", "app", "_app"} for node in ast.walk(auto_title))
-        or any(isinstance(node, ast.Attribute) and node.attr in {"composer_service", "state", "_state"} for node in ast.walk(auto_title))
-        or any(
-            isinstance(node, ast.Await) and title_task.lineno <= node.lineno < capture.lineno
-            for node in ast.walk(turn)
-            if node not in deferred_bodies and node is not history_join
-        )
-    ):
-        return ["parallel title task can reach or preempt the captured composer receiver"], None
+        return ["guarded title service is not the separate DTO session service"], None
     prelude = outer.body[4:6]
     suffix = outer.body[index + 1 : index + 7]
     dispatch = _reserve_composer_receiver.composer_dispatch_calls(suffix[5]) if len(suffix) == 6 else None
@@ -9687,8 +9642,36 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
         or (turn_path, id(dispatch[0])) != compose_call
     ):
         return ["captured composer receiver interval has an unreviewed effect"], None
-    # An await in the timeout arm cannot reach the following compose: that arm
-    # raises. Any other await or receiver reference before the call is unsafe.
+    # The exact title prelude is the one admitted suspended interval after
+    # capture. It carries session/custody/guard authority and is deliberately
+    # effectful; common supplier/receiver premises still exclude foreign
+    # instance/class mutation. The complete finite grammar independently binds
+    # its mounted guard read, physical join, deadline and typed refusal audit.
+    title_prelude = _reserve_composer_receiver.composer_title_prelude(suffix[5])
+    if (
+        title_prelude is None
+        or title is not title_prelude.body[2]
+        or title_task is not title_prelude.body[3].body[0].value
+        or any(isinstance(node, ast.Name) and node.id in {"composer", "app", "_app"} for node in ast.walk(title))
+        or any(isinstance(node, ast.Name) and node.id in {"composer", "services", "app", "_app"} for node in ast.walk(auto_title))
+        or any(isinstance(node, ast.Attribute) and node.attr in {"composer_service", "state", "_state"} for node in ast.walk(auto_title))
+    ):
+        return ["guarded title interval has an unreviewed supplier or receiver effect"], None
+    mount_property = _reserve_node_at(paths[service_path], "ComposerServiceImpl.composer_prompt_guard_mount")
+    expected_property = ast.parse(
+        "@property\n"
+        "def composer_prompt_guard_mount(self) -> PromptGuardMount | None:\n"
+        "    return self._provider_gateway.prompt_guard_mount\n"
+    ).body[0]
+    if not isinstance(mount_property, ast.FunctionDef):
+        return ["guarded title mount property is missing"], None
+    property_body = _reserve_composer_receiver.body(mount_property)
+    normalized_property = ast.parse(ast.unparse(mount_property)).body[0]
+    normalized_property.body = property_body
+    if stable_ast_dump(normalized_property) != stable_ast_dump(expected_property):
+        return ["guarded title mount property has an unreviewed receiver effect"], None
+    # An await in the earlier timeout arm cannot reach the following compose:
+    # that arm raises. Other prefix suspensions and receiver escapes stay banned.
     for statement in suffix[:5]:
         for node in ast.walk(statement):
             if isinstance(node, ast.Await) and statement is not suffix[4]:
@@ -10760,7 +10743,7 @@ def _reserve_retained_failure_transfer_receipts(units):
     failure = _reserve_node_at(index[service_path], "SessionServiceImpl.fail_composer_async_operation")
     # Keep the independently checked history/cancellation structure even when a
     # caller grammar is deliberately rebound by an adversarial control.
-    prefix = turn.body[37].body[4:15] + turn.body[37].body[16:21]
+    prefix = turn.body[36].body[4:15] + turn.body[36].body[16:21]
     if not _reserve_composer_receiver.receiver_transfer_prefix(prefix):
         return ["retained/private transfer history ownership or cancellation changed"], frozenset()
     expected = {

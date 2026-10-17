@@ -19,6 +19,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.blobs.protocol import BlobPendingProposalError
@@ -87,7 +88,15 @@ class _ScriptedLLM:
         self.message_snapshots: list[list[dict[str, Any]]] = []
 
     async def __call__(
-        self, messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        self,
+        messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         self.message_snapshots.append(deepcopy(messages))
         if not self._responses:
@@ -458,7 +467,14 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
         original_record_failure(tracker, tool_name, arguments_hash)
 
     async def _llm(
-        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         message_snapshots.append(deepcopy(messages))
         if len(message_snapshots) == 2:
@@ -951,7 +967,14 @@ async def test_inline_candidate_argument_error_is_audited_once_and_repairable(
     invalid_turn_outcomes: list[Any] = []
 
     async def _llm(
-        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         message_snapshots.append(deepcopy(messages))
         if len(message_snapshots) == 2:
@@ -1103,7 +1126,14 @@ async def test_surrogate_inline_content_fails_closed_at_canonicalization_and_is_
     invalid_turn_outcomes: list[Any] = []
 
     async def _llm(
-        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         message_snapshots.append(deepcopy(messages))
         if len(message_snapshots) == 2:
@@ -1328,7 +1358,14 @@ async def test_candidate_prior_validation_runtime_error_uses_plugin_crash_audit_
         return original_validate(candidate_state)
 
     async def _llm(
-        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         nonlocal armed, llm_calls
         assert messages
@@ -1399,7 +1436,14 @@ async def test_candidate_prior_validation_base_exception_is_audited_once_and_pro
         return original_validate(candidate_state)
 
     async def _llm(
-        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         nonlocal armed, llm_calls
         assert messages

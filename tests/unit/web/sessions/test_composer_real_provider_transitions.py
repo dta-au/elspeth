@@ -9,13 +9,16 @@ from uuid import UUID, uuid4
 
 import litellm
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, MockTransport, Response
 from jsonschema import Draft202012Validator
 from sqlalchemy import select
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.prompt_guard import PromptGuardMount
+from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.provider_gateway import (
     ProviderGateway,
     _admit_composer_llm_completion,
@@ -23,6 +26,7 @@ from elspeth.web.composer.provider_gateway import (
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
+from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import (
     composer_async_operations_table,
@@ -62,6 +66,36 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
     # This local SDK double needs no real provider credentials. Availability
     # is an explicit test dependency, rather than a fabricated environment key.
     monkeypatch.setattr("elspeth.web.composer.service.compute_availability", local_available)
+    app.state.settings = app.state.settings.model_copy(
+        update={
+            "composer_prompt_guard_mode": "required",
+            "composer_prompt_guard": PromptGuardSettings(
+                endpoint="https://primary-shield.example.test", subscription_key="offline-primary-shield"
+            ),
+            "composer_advisor_prompt_guard": PromptGuardSettings(
+                endpoint="https://advisor-shield.example.test", subscription_key="offline-advisor-shield"
+            ),
+        }
+    )
+    shield_requests = []
+
+    def shield_response(request):
+        assert request.url.host in {"primary-shield.example.test", "advisor-shield.example.test"}
+        payload = json.loads(request.content)
+        shield_requests.append((request.url.host, payload))
+        return Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _document in payload["documents"]],
+            },
+        )
+
+    def mount(settings):
+        return PromptGuardMount(AzurePromptGuardClient(settings, http_transport=MockTransport(shield_response)))
+
+    monkeypatch.setattr("elspeth.web.composer.provider_gateway.build_prompt_guard_mount", mount)
+    monkeypatch.setattr("elspeth.web.composer.service.build_prompt_guard_mount", mount)
     app.state.composer_service = ComposerServiceImpl(
         catalog=app.state.catalog_service,
         settings=app.state.settings,
@@ -180,15 +214,12 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                         }
                     )
         else:
-            content = json.dumps(
-                {
-                    "verdict": "CLEAN",
-                    "category": "other",
-                    "steps": [],
-                    "findings": "CLEAN",
-                    "note": None,
-                }
-            )
+            schema_name = kwargs["response_format"]["json_schema"]["name"]
+            assert schema_name in {"advisor_checkpoint_response", "advisor_end_response"}
+            payload = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "CLEAN", "note": None}
+            if schema_name == "advisor_end_response":
+                payload["publication_verdict"] = "ADMIT"
+            content = json.dumps(payload)
         return litellm.ModelResponse(
             id=f"local-{len(dispatches)}",
             model=model,
@@ -272,6 +303,17 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                 if entry["_kind"] == "llm_call_audit"
             }
             assert audit_ids == {call.attempt_id for call in dispatches}
+            guards = [
+                entry["check"]
+                for message in messages
+                if message.role == "audit" and message.tool_calls is not None
+                for entry in message.tool_calls
+                if entry["_kind"] == "prompt_guard_audit"
+            ]
+            assert [(check["role"], check["disposition"]) for check in guards] == [
+                ("composer" if call.model == app.state.settings.composer_model else "advisor", "allow") for call in dispatches
+            ]
+            assert shield_requests
             if transition == "authoring":
                 current = await service.get_current_state(UUID(session_id))
                 assert current is not None
@@ -324,11 +366,23 @@ async def test_transition_instrument_rejects_primary_provider_bypass(tmp_path: P
         *,
         provider_custody: ProviderCallCustody | None = None,
         credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         nonlocal calls
         calls += 1
         if calls == 1:
-            return await physical_call(self, messages, tools, provider_custody=provider_custody, credential_state=credential_state)
+            return await physical_call(
+                self,
+                messages,
+                tools,
+                provider_custody=provider_custody,
+                credential_state=credential_state,
+                prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
+                prompt_guard_content_parts=prompt_guard_content_parts,
+                prompt_guard_tool_argument_parts=prompt_guard_tool_argument_parts,
+            )
         # First transition dispatches normally. Counterfeit the second path
         # while leaving accounting real: a positive per-walk total misses it.
         assert type(provider_custody) is ProviderCallCustody

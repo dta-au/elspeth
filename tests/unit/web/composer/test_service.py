@@ -25,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
@@ -502,10 +502,12 @@ def _sampling_provider_owner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("verification_fails", [False, True], ids=["guard-only", "guard-and-integrity"])
-async def test_early_guard_refusal_retains_committed_effect_integrity(
+@pytest.mark.parametrize("advisor_path", ["early", "manual"])
+async def test_guard_refusal_retains_committed_effect_integrity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     verification_fails: bool,
+    advisor_path: str,
 ) -> None:
     import litellm
 
@@ -574,6 +576,32 @@ async def test_early_guard_refusal_retains_committed_effect_integrity(
         ],
     }
     sdk_calls: list[dict[str, Any]] = []
+    tool_calls = [
+        {
+            "id": "source-early-1",
+            "type": "function",
+            "function": {"name": "set_pipeline", "arguments": json.dumps({"pipeline": pipeline})},
+        }
+    ]
+    if advisor_path == "manual":
+        tool_calls.append(
+            {
+                "id": "manual-advisor-1",
+                "type": "function",
+                "function": {
+                    "name": "request_advisor_hint",
+                    "arguments": json.dumps(
+                        {
+                            "trigger": "proactive_security_safety",
+                            "problem_summary": "Review the supplied pipeline evidence.",
+                            "recent_errors": [],
+                            "attempted_actions": ["set_pipeline"],
+                        }
+                    ),
+                },
+            }
+        )
+    expected_tool_ids = tuple(call["id"] for call in tool_calls)
 
     async def completion(**kwargs: Any) -> litellm.ModelResponse:
         sdk_calls.append(deepcopy(kwargs))
@@ -586,31 +614,33 @@ async def test_early_guard_refusal_retains_committed_effect_integrity(
                     "message": {
                         "role": "assistant",
                         "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "source-early-1",
-                                "type": "function",
-                                "function": {"name": "set_pipeline", "arguments": json.dumps({"pipeline": pipeline})},
-                            }
-                        ],
+                        "tool_calls": tool_calls,
                     }
                 }
             ],
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)
-    original_early = service._advisor_checkpoint._maybe_run_early_checkpoint
+    original_advisor = (
+        service._advisor_checkpoint._call_advisor_with_audit
+        if advisor_path == "manual"
+        else service._advisor_checkpoint._maybe_run_early_checkpoint
+    )
     original_accept = TurnEvidence.accept_checkpoint
-    early_refusals: list[PromptGuardRefused] = []
+    guard_refusals: list[PromptGuardRefused] = []
     integrity_failures: list[AuditIntegrityError] = []
     committed_snapshots: list[tuple[list[Any], list[Any], str]] = []
     evidence_owners: list[TurnEvidence] = []
+    observed_recorders: list[BufferingRecorder] = []
 
-    async def observe_early(**kwargs: Any) -> bool:
+    async def observe_advisor(*args: Any, **kwargs: Any) -> Any:
+        recorder = kwargs["recorder"]
+        assert isinstance(recorder, BufferingRecorder)
+        observed_recorders.append(recorder)
         try:
-            return await original_early(**kwargs)
+            return await original_advisor(*args, **kwargs)
         except PromptGuardRefused as refusal:
-            early_refusals.append(refusal)
+            guard_refusals.append(refusal)
             raise
 
     def verify_actual_checkpoint(
@@ -629,9 +659,9 @@ async def test_early_guard_refusal_retains_committed_effect_integrity(
                 .order_by(chat_messages_table.c.sequence_no)
             ).all()
         assert len(states) == 1 and states[0].id == str(witness.state.id)
-        assert [row.role for row in conversation] == ["assistant", "tool"]
+        assert [row.role for row in conversation] == ["assistant", *["tool"] * len(expected_tool_ids)]
         assert conversation[0].id == assistant_message_id
-        assert conversation[1].tool_call_id == "source-early-1"
+        assert tuple(row.tool_call_id for row in conversation[1:]) == expected_tool_ids
         committed_snapshots.append((states, conversation, assistant_message_id))
         evidence_owners.append(evidence)
         try:
@@ -651,7 +681,10 @@ async def test_early_guard_refusal_retains_committed_effect_integrity(
             integrity_failures.append(failure)
             raise
 
-    monkeypatch.setattr(service._advisor_checkpoint, "_maybe_run_early_checkpoint", observe_early)
+    if advisor_path == "manual":
+        monkeypatch.setattr(service._advisor_checkpoint, "_call_advisor_with_audit", observe_advisor)
+    else:
+        monkeypatch.setattr(service._advisor_checkpoint, "_maybe_run_early_checkpoint", observe_advisor)
     monkeypatch.setattr(TurnEvidence, "accept_checkpoint", verify_actual_checkpoint)
     try:
         with fenced_operation_context(engine, session_id) as context:
@@ -671,25 +704,40 @@ async def test_early_guard_refusal_retains_committed_effect_integrity(
                     required_work=binding,
                     provider_owner=owner,
                 )
-            assert len(early_refusals) == len(committed_snapshots) == len(evidence_owners) == 1
+            assert len(guard_refusals) == len(committed_snapshots) == len(evidence_owners) == 1
             assert len(primary_guard.requests) == len(advisor_guard.requests) == len(sdk_calls) == 1
+            assert len(integrity_failures) == int(verification_fails)
+            projection = project_composer_operation_error(caught.value, request_id="controlled-advisor-request")
+            assert projection.http_status == (500 if verification_fails else 422)
+            if advisor_path == "manual":
+                assert len(observed_recorders) == 1
+                advisor_invocation = next(
+                    invocation for invocation in observed_recorders[0].invocations if invocation.tool_name == "request_advisor_hint"
+                )
+                assert advisor_invocation.status is ComposerToolStatus.SUCCESS
+                assert advisor_invocation.result_canonical is not None
+                refusal_payload = json.loads(advisor_invocation.result_canonical)
+                assert refusal_payload["success"] is False and refusal_payload["outbound_call_made"] is False
+                assert refusal_payload["error_type"] == "prompt_guard_blocked"
             leaves = caught.value.exceptions if isinstance(caught.value, BaseExceptionGroup) else (caught.value,)
             enriched = [failure for failure in leaves if isinstance(failure, PromptGuardRefused)]
             assert len(enriched) == 1
             refusal = enriched[0]
-            assert refusal.__cause__ is early_refusals[0]
-            assert refusal.audit_id == early_refusals[0].audit_id
+            assert refusal.__cause__ is guard_refusals[0]
+            assert refusal.audit_id == guard_refusals[0].audit_id
             assert refusal.tool_invocations == () and refusal.partial_state is None
             assert len(refusal.llm_calls) == 1 and refusal.failed_turn is not None
             assert refusal.failed_turn.assistant_message_id == committed_snapshots[0][2]
-            assert refusal.failed_turn.tool_calls_attempted == refusal.failed_turn.tool_responses_persisted == 1
-            projection = project_composer_operation_error(caught.value, request_id="controlled-early-request")
+            assert refusal.failed_turn.tool_calls_attempted == refusal.failed_turn.tool_responses_persisted == len(expected_tool_ids)
             if verification_fails:
                 assert len(integrity_failures) == 1
                 assert integrity_failures[0] in leaves
                 assert integrity_failures[0].failed_turn is refusal.failed_turn
                 assert evidence_owners[0].effects.verification == "unavailable"
                 assert projection.http_status == 500 and projection.error_type == "audit_integrity_error"
+                assert projection.body["failed_turn"]["assistant_message_id"] == refusal.failed_turn.assistant_message_id
+                assert projection.body["failed_turn"]["tool_calls_attempted"] == len(expected_tool_ids)
+                assert projection.body["failed_turn"]["tool_responses_persisted"] == len(expected_tool_ids)
             else:
                 assert integrity_failures == []
                 assert evidence_owners[0].effects.verification == "verified"

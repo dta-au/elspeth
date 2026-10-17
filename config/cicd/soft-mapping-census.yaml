@@ -859,7 +859,7 @@ files:
   src/elspeth/web/composer/service.py:
     Mapping[str, Any]: 2
     Mapping[str, object]: 1
-    dict[str, Any]: 14
+    dict[str, Any]: 15
   src/elspeth/web/composer/session_tool.py:
     boundary: 1
     dict[str, Any]: 4
@@ -1071,6 +1071,6 @@ totals:
   Mapping[str, object]: 315
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1077
+  dict[str, Any]: 1078
   dict[str, object]: 395
-  soft: 2556
+  soft: 2557

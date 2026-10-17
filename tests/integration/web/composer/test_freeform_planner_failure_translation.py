@@ -241,6 +241,7 @@ def _build_app(
         data_dir=tmp_path,
         composer_model="test/planner",
         composer_boot_probe_enabled=False,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         llm_profiles={
             "offline-review": {
                 "provider": "bedrock",

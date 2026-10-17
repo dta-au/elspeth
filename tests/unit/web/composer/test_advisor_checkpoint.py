@@ -2295,9 +2295,10 @@ async def test_checkpoint_sdk_failure_requires_response_evidence_for_malformed(
     service = make_service()
     monkeypatch.setattr(litellm, "acompletion", sdk_fake)
     recorder = make_recorder()
-    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-        phase="end", state=simple_state, **physical_advisor.bind(service, review_state=simple_state), recorder=recorder
-    )
+    with prompt_guard_user_scope(""):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end", state=simple_state, **physical_advisor.bind(service, review_state=simple_state), recorder=recorder
+        )
 
     assert calls == attempts
     assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus[audit_status]] * attempts
@@ -2610,15 +2611,16 @@ async def test_checkpoint_deadline_cancels_provider_and_retains_timeout_audit(
 
     monkeypatch.setattr(litellm, "acompletion", wait_until_cancelled)
 
-    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-        phase="end",
-        state=simple_state,
-        **session,
-        recorder=recorder,
-        # Leave room for the real required guard audit and provider admission;
-        # the same shared deadline still cancels the SDK and prevents a retry.
-        deadline=asyncio.get_running_loop().time() + 1.0,
-    )
+    with prompt_guard_user_scope(""):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=simple_state,
+            **session,
+            recorder=recorder,
+            # Leave room for the real required guard audit and provider admission;
+            # the same shared deadline still cancels the SDK and prevents a retry.
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
 
     assert provider_entered.is_set()
     assert provider_cleanup_seen.is_set()
@@ -4285,15 +4287,16 @@ async def test_end_gate_nonretryable_sdk_failure_waits_for_later_request(
     monkeypatch.setattr(litellm, "acompletion", sdk_fake)
     first_context = physical_advisor.context
     first_recorder = make_recorder()
-    first = await drive_try_terminate(
-        service,
-        clean_runnable_state,
-        advisor_checkpoint_passes_used=0,
-        candidate="UNREVIEWED_FIRST_CANDIDATE",
-        recorder=first_recorder,
-        session_operation_context=first_context,
-        provider_owner=physical_advisor.owner,
-    )
+    with prompt_guard_user_scope("rate how cool the pages are"):
+        first = await drive_try_terminate(
+            service,
+            clean_runnable_state,
+            advisor_checkpoint_passes_used=0,
+            candidate="UNREVIEWED_FIRST_CANDIDATE",
+            recorder=first_recorder,
+            session_operation_context=first_context,
+            provider_owner=physical_advisor.owner,
+        )
 
     assert len(calls) == 1
     assert first.action == "return" and first.advisor_passes_delta == 1
@@ -4314,17 +4317,18 @@ async def test_end_gate_nonretryable_sdk_failure_waits_for_later_request(
     assert next_context.fence.operation_id != first_context.fence.operation_id
     next_candidate = "Truthful reply after the configuration was corrected."
     next_recorder = make_recorder()
-    recovered = await drive_try_terminate(
-        service,
-        clean_runnable_state,
-        advisor_checkpoint_passes_used=0,
-        completion_gates=CompletionGateFacts(advisor_signoff=fact),
-        candidate=next_candidate,
-        message="Please review the reply again after the configuration change.",
-        recorder=next_recorder,
-        session_operation_context=next_context,
-        provider_owner=physical_advisor.owner,
-    )
+    with prompt_guard_user_scope("Please review the reply again after the configuration change."):
+        recovered = await drive_try_terminate(
+            service,
+            clean_runnable_state,
+            advisor_checkpoint_passes_used=0,
+            completion_gates=CompletionGateFacts(advisor_signoff=fact),
+            candidate=next_candidate,
+            message="Please review the reply again after the configuration change.",
+            recorder=next_recorder,
+            session_operation_context=next_context,
+            provider_owner=physical_advisor.owner,
+        )
 
     assert len(calls) == 2
     assert recovered.action == "return" and recovered.result.message == next_candidate
@@ -4369,14 +4373,15 @@ async def test_end_gate_retryable_sdk_failure_still_uses_remaining_pass(
     physical_advisor.bind(service)
     monkeypatch.setattr(litellm, "acompletion", sdk_fake)
     candidate = "A truthful reviewed reply."
-    outcome = await drive_try_terminate(
-        service,
-        clean_runnable_state,
-        advisor_checkpoint_passes_used=0,
-        candidate=candidate,
-        session_operation_context=physical_advisor.context,
-        provider_owner=physical_advisor.owner,
-    )
+    with prompt_guard_user_scope("rate how cool the pages are"):
+        outcome = await drive_try_terminate(
+            service,
+            clean_runnable_state,
+            advisor_checkpoint_passes_used=0,
+            candidate=candidate,
+            session_operation_context=physical_advisor.context,
+            provider_owner=physical_advisor.owner,
+        )
 
     assert calls == 3
     assert outcome.action == "return" and outcome.result.message == candidate
@@ -4421,14 +4426,15 @@ async def test_end_gate_sdk_request_failure_withholds_without_malformed_claim(
     physical_advisor.bind(service)
     monkeypatch.setattr(litellm, "acompletion", sdk_fake)
     candidate = "UNREVIEWED_COMPLETION_CANDIDATE"
-    outcome = await drive_try_terminate(
-        service,
-        clean_runnable_state,
-        advisor_checkpoint_passes_used=0,
-        candidate=candidate,
-        session_operation_context=physical_advisor.context,
-        provider_owner=physical_advisor.owner,
-    )
+    with prompt_guard_user_scope("rate how cool the pages are"):
+        outcome = await drive_try_terminate(
+            service,
+            clean_runnable_state,
+            advisor_checkpoint_passes_used=0,
+            candidate=candidate,
+            session_operation_context=physical_advisor.context,
+            provider_owner=physical_advisor.owner,
+        )
 
     assert calls == expected_calls
     assert outcome.action == "return"
@@ -6197,7 +6203,8 @@ async def test_actual_checkpoint_dispatch_and_retry_fit_complete_input(
         }
         assert len(build_advisor_user_message(minimum_retry)) <= cap
 
-    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=state, recorder=recorder, **fenced)
+    with prompt_guard_user_scope(""):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=state, recorder=recorder, **fenced)
 
     assert verdict.ok and not verdict.blocking
     assert len(calls) == (1 if first == "clean" else 2)
@@ -6227,9 +6234,10 @@ async def test_large_checkpoint_body_without_publication_fits_real_wire(make_ser
     arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase=phase, state=_pathological_multi_query_state(simple_state))
     assert "user_message" not in arguments and "publication_review" not in arguments
     recorder = make_recorder()
-    guidance, _ = await service._advisor_checkpoint._call_advisor_with_audit(
-        arguments, recorder=recorder, structured_output=True, provider_owner=physical_advisor.owner
-    )
+    with prompt_guard_user_scope(""):
+        guidance, _ = await service._advisor_checkpoint._call_advisor_with_audit(
+            arguments, recorder=recorder, structured_output=True, provider_owner=physical_advisor.owner
+        )
     assert guidance == reply and len(calls) == 1 and len(recorder.llm_calls) == 1
     assert len(calls[0]["messages"][1]["content"]) <= 16000
     # This qualifies wire budgeting, not the separately defective unbound
@@ -6242,12 +6250,14 @@ async def test_unsent_format_retry_keeps_first_actual_call_without_completed_rev
 ):
     from elspeth.web.composer.advisor_context import (
         _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER,
+        ADVISOR_CHARS_PER_TOKEN,
         build_advisor_user_message,
         summarize_pipeline_for_advisor,
     )
     from elspeth.web.composer.turn_effects import TurnEvidence
 
-    service = make_service()
+    service = make_service(composer_advisor_max_prompt_tokens=2500)
+    char_cap = service._settings.composer_advisor_max_prompt_tokens * ADVISOR_CHARS_PER_TOKEN
     fenced = physical_advisor.bind(service)
     evidence = TurnEvidence(
         session_id=fenced["session_id"],
@@ -6259,24 +6269,27 @@ async def test_unsent_format_retry_keeps_first_actual_call_without_completed_rev
     )
     blank = evidence.review_candidate(candidate="", request="Review this graph", current_state=simple_state)
     arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=simple_state, publication_review=blank)
-    marker = _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(count=len(summarize_pipeline_for_advisor(simple_state).split("\n")), limit=16000)
+    marker = _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(
+        count=len(summarize_pipeline_for_advisor(simple_state).split("\n")), limit=char_cap
+    )
     mandatory_size = len(build_advisor_user_message({**arguments, "schema_excerpt": marker}))
-    assert mandatory_size < 16000
+    assert mandatory_size < char_cap
     review = evidence.review_candidate(
-        candidate="x" * (16000 - mandatory_size - 1), request="Review this graph", current_state=simple_state
+        candidate="x" * (char_cap - mandatory_size - 1), request="Review this graph", current_state=simple_state
     )
     calls = _install_budget_advisor_transport(monkeypatch, ["not JSON"])
     recorder = make_recorder()
-    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-        phase="end",
-        state=simple_state,
-        publication_review=review,
-        recorder=recorder,
-        **fenced,
-    )
+    with prompt_guard_user_scope("Review this graph"):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=simple_state,
+            publication_review=review,
+            recorder=recorder,
+            **fenced,
+        )
     assert verdict.failure_class == "budget_exhausted" and not verdict.retryable
     assert len(calls) == 1 and len(recorder.llm_calls) == 1
-    assert len(calls[0]["messages"][1]["content"]) == 15999
+    assert len(calls[0]["messages"][1]["content"]) == char_cap - 1
     assert "The previous reply" not in calls[0]["messages"][1]["content"]
     service._sessions_service.add_message.assert_not_awaited()
 

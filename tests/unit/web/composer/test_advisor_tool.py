@@ -21,14 +21,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID, uuid4
 
 import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._compose_loop_carriers import (
@@ -38,9 +41,11 @@ from elspeth.web.composer._compose_loop_carriers import (
 from elspeth.web.composer.advisor_context import build_advisor_user_message
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.prompts import SYSTEM_PROMPT
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, composer_loop_tool_definitions
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.service import (
     ComposerAvailability,
     ComposerServiceImpl,
@@ -49,7 +54,16 @@ from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import get_tool_definitions
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import CredentialMaterialRefused
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
+from tests.helpers.session_fences import ensure_session_fence
 from tests.unit.web.composer._helpers import (
     _composer_service_with_session,
     _persisted_tool_responses,
@@ -148,6 +162,7 @@ def _make_settings(
         composer_max_discovery_turns=discovery_turns,
         composer_timeout_seconds=composer_timeout_seconds,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_advisor_max_calls_per_compose=budget,
         composer_advisor_timeout_seconds=advisor_timeout_seconds,
         shareable_link_signing_key=b"\x00" * 32,
@@ -218,6 +233,40 @@ def _make_advisor_response(text: str = "Try setting `provider: azure` and supply
         model="anthropic/claude-sonnet-4-6",
         usage=_FakeUsage(prompt_tokens=120, completion_tokens=45, total_tokens=165),
     )
+
+
+@asynccontextmanager
+async def _owned_direct_advisor(service: ComposerServiceImpl, session_id: str, *, genuine_user_message: str):
+    """Own one direct SDK test invocation, without a default user or fake fence."""
+    sessions = service._require_sessions_service()
+    ensure_session_fence(sessions._engine, session_id, owner_instance_id=sessions.session_operation_owner_instance_id)
+    lease = await SessionOperationLease.acquire(
+        sessions.session_operation_authority,
+        session_id=UUID(session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=sessions.session_operation_lease_seconds,
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, lease.context, invocation_id=str(uuid4()))
+    )
+    lease.bind_required_work(coordinator)
+    binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+    owner = ProviderInvocationOwner(service=sessions, required_work=binding)
+    original = None
+    try:
+        with prompt_guard_user_scope(genuine_user_message):
+            yield owner
+    except BaseException as failure:
+        original = failure
+        raise
+    finally:
+        try:
+            await lease.close()
+        except BaseException as closing:
+            if original is not None and closing is not original:
+                raise BaseExceptionGroup("Direct advisor body and owned lease close outcomes", [original, closing]) from None
+            raise
 
 
 @pytest.fixture(autouse=True)
@@ -534,6 +583,7 @@ async def test_advisor_only_turn_does_not_consume_discovery_budget() -> None:
         composer_max_discovery_turns=1,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_advisor_max_calls_per_compose=3,
         composer_advisor_timeout_seconds=60.0,
         shareable_link_signing_key=b"\x00" * 32,
@@ -586,10 +636,7 @@ async def test_advisor_call_includes_core_and_deployment_skill_context(tmp_path:
         encoding="utf-8",
     )
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(
-        catalog=catalog,
-        settings=_make_settings(data_dir=tmp_path),
-    )
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(data_dir=tmp_path))
     recorder = BufferingRecorder()
     args = {
         "trigger": "proactive_security_safety",
@@ -603,7 +650,8 @@ async def test_advisor_call_includes_core_and_deployment_skill_context(tmp_path:
         new_callable=AsyncMock,
         return_value=_make_advisor_response(),
     ) as mock_acompletion:
-        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
+        async with _owned_direct_advisor(service, session_id, genuine_user_message="") as owner:
+            await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder, provider_owner=owner)
 
     messages = mock_acompletion.call_args.kwargs["messages"]
     system_content = messages[0]["content"]
@@ -630,7 +678,7 @@ async def test_advisor_omits_seed_when_advisor_model_does_not_support_it(monkeyp
         lambda model: ["temperature", "max_tokens"],
     )
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
     recorder = BufferingRecorder()
     args = {
         "trigger": "proactive_security_safety",
@@ -644,7 +692,8 @@ async def test_advisor_omits_seed_when_advisor_model_does_not_support_it(monkeyp
         new_callable=AsyncMock,
         return_value=_make_advisor_response(),
     ) as mock_acompletion:
-        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
+        async with _owned_direct_advisor(service, session_id, genuine_user_message="") as owner:
+            await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder, provider_owner=owner)
 
     kwargs = mock_acompletion.call_args.kwargs
     assert "seed" not in kwargs
@@ -721,6 +770,7 @@ async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
         composer_max_discovery_turns=1,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_advisor_max_calls_per_compose=0,
         composer_advisor_timeout_seconds=60.0,
         shareable_link_signing_key=b"\x00" * 32,
@@ -1523,6 +1573,7 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_advisor_max_calls_per_compose=3,
         composer_advisor_max_prompt_tokens=1000,  # → ~4000 char cap
         shareable_link_signing_key=b"\x00" * 32,
@@ -1593,6 +1644,7 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_advisor_max_calls_per_compose=3,
         composer_advisor_max_prompt_tokens=prompt_tokens,
         shareable_link_signing_key=b"\x00" * 32,
@@ -1680,7 +1732,7 @@ async def test_advisor_cancelled_error_carries_buffered_llm_calls() -> None:
     session route's cancellation handler can persist the audit row.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     recorder = BufferingRecorder()
     args = {
         "trigger": "proactive_security_safety",
@@ -1697,7 +1749,8 @@ async def test_advisor_cancelled_error_carries_buffered_llm_calls() -> None:
         ),
         pytest.raises(asyncio.CancelledError) as exc_info,
     ):
-        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
+        async with _owned_direct_advisor(service, session_id, genuine_user_message="") as owner:
+            await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder, provider_owner=owner)
 
     assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[0].status.name == "CANCELLED"

@@ -30,7 +30,7 @@
       "worker_lost_error",
       "project_composer_operation_error"
     ],
-    "sha256": "f5e136be9beeefdc3a6b82d7e965f41ad3aa63d50d5b9f5b8d825a600bad9e70"
+    "sha256": "c8d907a6e134513e568f40dc01dfce718dd5eae9c5654b8763267922e29a0851"
   },
   "src/elspeth/web/sessions/composer_operations.py": {
     "protected_exports": [

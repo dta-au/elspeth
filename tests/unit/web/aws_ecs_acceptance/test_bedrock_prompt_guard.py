@@ -13,7 +13,7 @@ from elspeth.web._aws_ecs_acceptance.contracts import AcceptanceCheckError
 async def test_sessionless_bedrock_probe_refuses_without_durable_guard_audit(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     import litellm
 
-    sdk = AsyncMock(side_effect=AssertionError("Sessionless probe entered the protected model SDK"))
+    sdk = AsyncMock(spec=litellm.acompletion, side_effect=AssertionError("Sessionless probe entered the protected model SDK"))
     monkeypatch.setattr(litellm, "acompletion", sdk)
     env = {
         "ELSPETH_BEDROCK_LIVE_TEST_MODEL": "bedrock/test-model",

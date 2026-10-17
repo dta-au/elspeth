@@ -45,6 +45,8 @@ from elspeth.contracts.composer_planner_audit import (
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.hashing import canonical_json as _primitive_canonical_json
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
     PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
@@ -3153,7 +3155,13 @@ def _feedback_content_parts(feedback: _PlannerFeedbackWire) -> tuple[PromptGuard
         if "plugin_contracts" in entry
     )
     return json_content_parts(
-        canonical_json(feedback), reference_paths=references, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        canonical_json(feedback),
+        reference_paths=references,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        encoder=_primitive_canonical_json,
+        decoder=canonical_json_loads,
     )
 
 
@@ -3670,7 +3678,12 @@ async def _plan_pipeline_inner(
             "role": "user",
             "content": canonical_json(provider_request),
             PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
-                canonical_json(provider_request), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                canonical_json(provider_request),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                encoder=_primitive_canonical_json,
+                decoder=canonical_json_loads,
             ),
         },
     ]
@@ -4559,7 +4572,21 @@ async def _plan_pipeline_inner(
             messages.append(_assistant_tool_calls_message(message, calls))
             not_alone_feedback = canonical_json(_terminal_call_not_alone_feedback())
             for rejected_call in calls:
-                messages.append({"role": "tool", "tool_call_id": rejected_call.call_id, "content": not_alone_feedback})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": rejected_call.call_id,
+                        "content": not_alone_feedback,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                            not_alone_feedback,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            encoder=_primitive_canonical_json,
+                            decoder=canonical_json_loads,
+                        ),
+                    }
+                )
             repair_count += 1
             if repair_count > repair_budget:
                 if _hatch_available():
@@ -4820,11 +4847,20 @@ async def _plan_pipeline_inner(
                     raise _rejection_exhausted() from None
                 trail.finish_attempt(attempt_phase, "arg_error", codes=last_rejection_codes, led_to="repair")
                 messages.append(_assistant_tool_calls_message(message, calls))
+                argument_feedback_json = canonical_json(_allowlisted_argument_feedback(exc))
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.call_id,
-                        "content": canonical_json(_allowlisted_argument_feedback(exc)),
+                        "content": argument_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                            argument_feedback_json,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            encoder=_primitive_canonical_json,
+                            decoder=canonical_json_loads,
+                        ),
                     }
                 )
                 continue
@@ -5067,17 +5103,26 @@ async def _plan_pipeline_inner(
                 tool_calls=len(calls),
             )
             for call in no_gain_calls:
+                no_gain_feedback_json = canonical_json(
+                    {
+                        "success": False,
+                        "error_code": "DISCOVERY_NO_GAIN",
+                        "information_keys": list(information_keys[call.call_id]),
+                        "message": "The requested information is already supplied or unavailable.",
+                    }
+                )
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.call_id,
-                        "content": canonical_json(
-                            {
-                                "success": False,
-                                "error_code": "DISCOVERY_NO_GAIN",
-                                "information_keys": list(information_keys[call.call_id]),
-                                "message": "The requested information is already supplied or unavailable.",
-                            }
+                        "content": no_gain_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                            no_gain_feedback_json,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            encoder=_primitive_canonical_json,
+                            decoder=canonical_json_loads,
                         ),
                     }
                 )
@@ -5203,17 +5248,26 @@ async def _plan_pipeline_inner(
         new_information: list[ComposerPlannerInformationClass] = []
         for call in calls:
             if call in no_gain_calls:
+                no_gain_feedback_json = canonical_json(
+                    {
+                        "success": False,
+                        "error_code": "DISCOVERY_NO_GAIN",
+                        "information_keys": list(information_keys[call.call_id]),
+                        "message": "The requested information is already supplied or unavailable.",
+                    }
+                )
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.call_id,
-                        "content": canonical_json(
-                            {
-                                "success": False,
-                                "error_code": "DISCOVERY_NO_GAIN",
-                                "information_keys": list(information_keys[call.call_id]),
-                                "message": "The requested information is already supplied or unavailable.",
-                            }
+                        "content": no_gain_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                            no_gain_feedback_json,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            encoder=_primitive_canonical_json,
+                            decoder=canonical_json_loads,
                         ),
                     }
                 )

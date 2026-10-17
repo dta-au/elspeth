@@ -36,13 +36,23 @@ class PromptGuardTrust(Enum):
 
 @dataclass(frozen=True, slots=True)
 class PromptGuardContentPart:
-    """One complete producer-rendered semantic unit, untrusted by default."""
+    """One complete producer-rendered unit, untrusted by default.
+
+    ``text`` covers exact wire bytes. Owned serializers may separately carry
+    decoded ``inspection_text`` so the detector reads the original words;
+    an absent projection inspects ``text`` directly. Neither grants trust.
+    """
 
     text: str = field(repr=False)
     trust: PromptGuardTrust | None = None
+    inspection_text: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        if type(self.text) is not str or (self.trust is not None and type(self.trust) is not PromptGuardTrust):
+        if (
+            type(self.text) is not str
+            or (self.trust is not None and type(self.trust) is not PromptGuardTrust)
+            or (self.inspection_text is not None and type(self.inspection_text) is not str)
+        ):
             raise AuditIntegrityError("Prompt guard content part lacks exact owned provenance")
 
 

@@ -321,7 +321,12 @@ def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuar
         replacements[index] = (
             PromptGuardContentPart(sections[index][:prefix]),
             *(
-                PromptGuardContentPart(_neutralize_untrusted_summary_sentinels(part.text, json_encoded=True))
+                PromptGuardContentPart(
+                    _neutralize_untrusted_summary_sentinels(part.text, json_encoded=True),
+                    inspection_text=(
+                        _neutralize_untrusted_summary_sentinels(part.inspection_text) if part.inspection_text is not None else None
+                    ),
+                )
                 for part in json_content_parts(review.provider_payload_json, ensure_ascii=False)
             ),
             PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END),

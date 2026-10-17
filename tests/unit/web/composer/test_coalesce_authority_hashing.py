@@ -18,9 +18,13 @@ import hashlib
 import json
 from collections.abc import Sequence
 from typing import Any
+from uuid import UUID
 
+import litellm
 import pytest
+from sqlalchemy import select
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.audit import begin_dispatch, finish_success, rebind_dispatch_arguments
@@ -31,6 +35,7 @@ from elspeth.web.composer.authority_hashing import (
     project_composer_authority_payload,
     restore_composer_authority_payload,
 )
+from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
@@ -41,13 +46,14 @@ from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
+from elspeth.web.sessions.models import quota_provider_attempts_table
 from elspeth.web.sessions.proposal_authority import (
     _composition_state_data_content_hash,
     _pipeline_audit_payload_hash,
     _pipeline_private_arguments_hash,
 )
 from elspeth.web.sessions.protocol import CompositionStateData
-from tests.unit.web.composer.conftest import _fake_llm_response, _FakeComposeLLM
+from tests.unit.web.composer.conftest import _fake_llm_response
 
 _COALESCE_TAG = "composer.coalesce-ordered-branches.v1"
 _ROW_UNION_TAG = "composer.row-union-ordered-branches.v1"
@@ -450,15 +456,56 @@ async def test_planner_argument_error_persists_through_the_compose_loop(
     case: str,
     fake_composer_service: ComposerServiceImpl,
     result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A malformed planner ``set_pipeline`` is an argument error that persists, not a crash."""
-    llm = _FakeComposeLLM(
-        (
-            _fake_llm_response(tool_calls=({"id": "call_sp", "name": "set_pipeline", "arguments": _LOOP_ARGUMENT_ERROR_CASES[case]},)),
-            _fake_llm_response(content="Done."),
-        )
+    responses = (
+        _fake_llm_response(tool_calls=({"id": "call_sp", "name": "set_pipeline", "arguments": _LOOP_ARGUMENT_ERROR_CASES[case]},)),
+        _fake_llm_response(content="Done."),
     )
-    result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)
+    service = fake_composer_service
+    sessions = service._require_sessions_service()
+    message = "one-turn compose-loop test driver"
+    human = await sessions.add_message(UUID(result_session_id), "user", message, writer_principal="route_user_message")
+    assert human.role == "user" and human.writer_principal == "route_user_message"
+    primary_calls = 0
+    advisor_calls = 0
+
+    async def complete(**kwargs: Any) -> litellm.ModelResponse:
+        nonlocal primary_calls, advisor_calls
+        if kwargs["model"] == service._settings.composer_advisor_model:
+            advisor_calls += 1
+            assert advisor_calls == 1, "Only one real terminal advisor attempt is supplied"
+            raise litellm.APIConnectionError(
+                message="Synthetic terminal advisor transport unavailable", llm_provider="test", model=kwargs["model"]
+            )
+        assert kwargs["model"] == service._model
+        assert primary_calls < len(responses), "No extra primary completion is supplied"
+        response = responses[primary_calls]
+        primary_calls += 1
+        reply = response.choices[0].message
+        calls = [
+            {"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}
+            for call in reply.tool_calls or ()
+        ]
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            choices=[{"message": {"role": "assistant", "content": reply.content, "tool_calls": calls or None}}],
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    # The existing compose adapter owns the one COMPOSE lease and provider owner.
+    # The earlier human-message harness lease is already released; no second
+    # owner or test-only turn driver crosses the physical terminal advisor seam.
+    result = await service.compose(
+        message,
+        [],
+        CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        session_id=result_session_id,
+        user_id="phase3-test-user",
+        user_message_id=str(human.id),
+    )
 
     invocations = [inv for inv in result.tool_invocations if inv.tool_name == "set_pipeline"]
     assert len(invocations) == 1
@@ -473,6 +520,38 @@ async def test_planner_argument_error_persists_through_the_compose_loop(
     assert type(persisted) is dict
     assert persisted["status"] == "arg_error"
     assert persisted["authority_arguments_canonical"] is not None
+    assert primary_calls == 2 and advisor_calls == 1
+    assert [call.status for call in result.llm_calls] == [
+        ComposerLLMCallStatus.SUCCESS,
+        ComposerLLMCallStatus.SUCCESS,
+        ComposerLLMCallStatus.API_ERROR,
+    ]
+    stored = await sessions.get_messages(UUID(result_session_id), limit=None)
+    private = [
+        ComposerDiagnosticEvidence.from_envelope(item, expected_session_id=result_session_id, expected_tool_call_id="call_sp")
+        for row in stored
+        if row.role == "audit" and row.tool_calls
+        for item in row.tool_calls
+        if item["_kind"] == DIAGNOSTIC_EVIDENCE_KIND and item["tool_call_id"] == "call_sp"
+    ]
+    assert len(private) == 1
+    assert private[0].tool_name == "set_pipeline" and private[0].status == "arg_error"
+    assert private[0].authority_arguments is not None
+    assert private[0].authority_arguments.content == invocation.authority_arguments_canonical
+    assert private[0].wire_arguments.content == responses[0].choices[0].message.tool_calls[0].function.arguments
+    checks = [
+        row.tool_calls[0]["check"]
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == "prompt_guard_audit"
+    ]
+    assert [check["role"] for check in checks] == ["composer", "composer", "advisor"]
+    assert all(check["disposition"] == "debug_bypass" for check in checks)
+    with sessions._engine.connect() as connection:
+        attempts = connection.execute(
+            select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == result_session_id)
+        ).all()
+    assert len(attempts) == 3
+    assert all(attempt.settled_at is not None and attempt.ledger_entry_id is not None for attempt in attempts)
 
 
 # --- 14: a malformed discriminant passes through unprojected -----------------

@@ -43,7 +43,15 @@ from elspeth.contracts.composer_planner_audit import (
 )
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardDecision, PromptGuardMode, PromptGuardRequest
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_MAX_DOCUMENTS,
+    PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
+    PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+    PromptGuardClient,
+    PromptGuardDecision,
+    PromptGuardMode,
+    PromptGuardRequest,
+)
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -2305,14 +2313,16 @@ _DISCOVERY_TEST_ARGUMENTS: Mapping[str, Mapping[str, Any]] = {
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", PLANNER_DISCOVERY_TOOL_NAMES)
 async def test_every_freeform_planner_discovery_tool_returns_admitted_state(
     tmp_path: Path,
     tool_context: ToolContext,
+    tool_name: str,
 ) -> None:
     assert set(_DISCOVERY_TEST_ARGUMENTS) == set(PLANNER_DISCOVERY_TOOL_NAMES)
     current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
     provider_state = current_state.to_dict()
-    calls = tuple((name, dict(_DISCOVERY_TEST_ARGUMENTS[name])) for name in PLANNER_DISCOVERY_TOOL_NAMES)
+    calls = ((tool_name, dict(_DISCOVERY_TEST_ARGUMENTS[tool_name])),)
     completion = _ScriptedCompletion(
         _response(*calls),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
@@ -2327,6 +2337,18 @@ async def test_every_freeform_planner_discovery_tool_returns_admitted_state(
         model_overrides={"max_tool_calls_per_turn": len(calls)},
     )
 
+    assert len(completion.requests) == 2
+    actual_discovery_names = tuple(
+        tool["function"]["name"] for tool in completion.requests[0]["tools"] if tool["function"]["name"] in PLANNER_DISCOVERY_TOOL_NAMES
+    )
+    assert actual_discovery_names == PLANNER_DISCOVERY_TOOL_NAMES
+    actual_authored_names = [
+        call["function"]["name"]
+        for message in completion.requests[1]["messages"]
+        if message["role"] == "assistant" and "tool_calls" in message
+        for call in message["tool_calls"]
+    ]
+    assert actual_authored_names == [tool_name]
     tool_messages = {
         message["tool_call_id"]: message["content"] for message in completion.requests[1]["messages"] if message["role"] == "tool"
     }
@@ -2338,6 +2360,58 @@ async def test_every_freeform_planner_discovery_tool_returns_admitted_state(
         assert _HIDDEN_EDGE_COMPONENT_CANARY in content
         if name == "get_pipeline_state":
             assert _DISCLOSURE_CANARIES[1] in content
+
+
+@pytest.mark.asyncio
+async def test_full_discovery_batch_refuses_oversized_aggregate_before_second_sdk(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Complete discovery results retain their aggregate guard limit."""
+    from elspeth.web.composer import prompt_guard
+
+    assert set(_DISCOVERY_TEST_ARGUMENTS) == set(PLANNER_DISCOVERY_TOOL_NAMES)
+    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
+    calls = tuple((name, dict(_DISCOVERY_TEST_ARGUMENTS[name])) for name in PLANNER_DISCOVERY_TOOL_NAMES)
+    completion = _ScriptedCompletion(_response(*calls))
+    recorder = BufferingRecorder()
+    guard_requests: list[tuple[PromptGuardRequest, bool]] = []
+    original_request = prompt_guard._request
+
+    def observe_request(**kwargs: Any) -> tuple[PromptGuardRequest, bool]:
+        request, supported = original_request(**kwargs)
+        guard_requests.append((request, supported))
+        return request, supported
+
+    monkeypatch.setattr(prompt_guard, "_request", observe_request)
+    with pytest.raises(PromptGuardRefused) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            current_state=current_state,
+            provider_current_state=current_state.to_dict(),
+            model_overrides={"max_tool_calls_per_turn": len(calls)},
+        )
+
+    assert type(caught.value) is PromptGuardRefused
+    assert caught.value.disposition == "unavailable"
+    assert caught.value._decision.reason == "unsupported_input"
+    assert len(guard_requests) == 2
+    assert guard_requests[0][1] is True
+    request, supported = guard_requests[1]
+    assert supported is False
+    assert len(request.user_prompt) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
+    assert len(request.documents) <= PROMPT_GUARD_MAX_DOCUMENTS
+    assert all(len(document) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in request.documents)
+    inspected_bytes = len(request.user_prompt.encode("utf-8")) + sum(len(document.encode("utf-8")) for document in request.documents)
+    assert inspected_bytes > PROMPT_GUARD_MAX_INPUT_UTF8_BYTES
+    assert len(completion.requests) == 1
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].status is ComposerLLMCallStatus.SUCCESS
+    assert caught.value.llm_calls == recorder.llm_calls
 
 
 @pytest.mark.asyncio
@@ -6017,7 +6091,9 @@ async def test_planner_blob_pages_require_owned_admitted_delivery(tmp_path: Path
     from elspeth.web.composer.turn_effects import BlobInspectionCoverage, TurnEvidence
 
     engine, origin = await _session_context()
-    content = "name,score\n" + "ada,42\n" * 8_000
+    # Exercise exactly two real bounded pages within the existing three-call
+    # success walk; this is a delivery-coverage test, not a large-file workload.
+    content = "name,score\n" + "ada,42\n" * 600
     recorder = BufferingRecorder()
     observed_pages = []
 

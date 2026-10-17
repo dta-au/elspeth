@@ -216,13 +216,22 @@ def _request(
         "content_parts": [
             None
             if parts is None
-            else [{"text": part.text, "trust": part.trust.value if part.trust is not None else None} for part in parts]
+            else [
+                {"text": part.text, "trust": part.trust.value if part.trust is not None else None, "inspection_text": part.inspection_text}
+                for part in parts
+            ]
             for parts in partitions
         ],
         "tool_argument_parts": [
             None
             if entries is None
-            else [{"tool_call_index": entry.tool_call_index, "parts": [part.text for part in entry.parts]} for entry in entries]
+            else [
+                {
+                    "tool_call_index": entry.tool_call_index,
+                    "parts": [{"text": part.text, "inspection_text": part.inspection_text} for part in entry.parts],
+                }
+                for entry in entries
+            ]
             for entries in argument_partitions
         ],
     }
@@ -254,34 +263,18 @@ def _request(
         if shadow:
             documents.append(json.dumps(shadow, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
         if parts is not None and index != genuine_index:
-            documents.extend(
-                json.dumps(
-                    {"message_index": index, "part_index": part_index, "content": part.text},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                )
-                for part_index, part in enumerate(parts)
-                if part.trust is None
-            )
+            for part_index, part in enumerate(parts):
+                if part.trust is not None:
+                    continue
+                text = part.text if part.inspection_text is None else part.inspection_text
+                require_no_credential_material(text, surface="composer_prompt_guard_request")
+                documents.append(f"Message {index}, content part {part_index}:\n{text}")
         if argument_entries:
-            documents.extend(
-                json.dumps(
-                    {
-                        "message_index": index,
-                        "tool_call_index": entry.tool_call_index,
-                        "argument_part_index": part_index,
-                        "arguments": part.text,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                )
-                for entry in argument_entries
-                for part_index, part in enumerate(entry.parts)
-            )
+            for entry in argument_entries:
+                for part_index, part in enumerate(entry.parts):
+                    text = part.text if part.inspection_text is None else part.inspection_text
+                    require_no_credential_material(text, surface="composer_prompt_guard_request")
+                    documents.append(f"Message {index}, tool call {entry.tool_call_index}, argument part {part_index}:\n{text}")
         if parts is not None or index == genuine_index:
             continue
         content = message["content"] if "content" in message else None

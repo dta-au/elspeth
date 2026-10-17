@@ -316,13 +316,22 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
         "content_parts": [
             None
             if parts is None
-            else [{"text": part.text, "trust": part.trust.value if part.trust is not None else None} for part in parts]
+            else [
+                {"text": part.text, "trust": part.trust.value if part.trust is not None else None, "inspection_text": part.inspection_text}
+                for part in parts
+            ]
             for parts in forwarded["content_parts"]
         ],
         "tool_argument_parts": [
             None
             if entries is None
-            else [{"tool_call_index": entry.tool_call_index, "parts": [part.text for part in entry.parts]} for entry in entries]
+            else [
+                {
+                    "tool_call_index": entry.tool_call_index,
+                    "parts": [{"text": part.text, "inspection_text": part.inspection_text} for part in entry.parts],
+                }
+                for entry in entries
+            ]
             for entries in forwarded["tool_argument_parts"]
         ],
     }

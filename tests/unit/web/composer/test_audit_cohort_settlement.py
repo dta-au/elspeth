@@ -36,6 +36,7 @@ from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
 from elspeth.web.composer.diagnostic_evidence import (
@@ -215,7 +216,14 @@ async def _drive_turn_then_provider_timeout(
     responses = [_metadata_tool_response("call_turn1_metadata", "Committed inline")]
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         if responses:
             return responses.pop(0)

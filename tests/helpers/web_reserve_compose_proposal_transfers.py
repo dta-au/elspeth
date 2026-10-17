@@ -184,7 +184,7 @@ def _source3_local_transfers(units):
         return ["composer service custom lookup unproved"], None
     if any(_lexical_bindings(statement, "compose") for statement in compose_class.body if statement is not compose):
         return ["composer service compose lookup rebound"], None
-    if len(turn.body) < 38 or not all(isinstance(turn.body[i], ast.Assign) for i in (17, 18)):
+    if len(turn.body) < 37 or not all(isinstance(turn.body[i], ast.Assign) for i in (17, 18)):
         return ["composer turn binding position changed"], None
     if not _exact(
         turn.body[8],
@@ -231,19 +231,19 @@ def _source3_local_transfers(units):
     compose_calls = _calls(turn, compose_predicate)
     if len(compose_calls) != 2 or {call.func.attr for call in compose_calls} != {"compose", "compose_recovery"}:
         return ["composer turn compose call universe changed"], None
-    if not isinstance(turn.body[37], ast.Try) or len(turn.body[37].body) < 22:
+    if not isinstance(turn.body[36], ast.Try) or len(turn.body[36].body) < 22:
         return ["composer call executed path or preceding terminal changed"], None
-    dispatch = composer_dispatch_calls(turn.body[37].body[21])
-    if dispatch is None or set(dispatch) != set(compose_calls) or _direct_prefix_has_terminal(turn, 37):
+    dispatch = composer_dispatch_calls(turn.body[36].body[21])
+    if dispatch is None or set(dispatch) != set(compose_calls) or _direct_prefix_has_terminal(turn, 36):
         return ["composer turn exact paired call arguments or closed branches changed"], None
     compose_call, recovery_call = dispatch
     if _shape(_keyword(compose_call, "retained_operation_context")) != _shape(ast.Name(id="retained_operation_context", ctx=ast.Load())):
         return ["composer retained operation context argument changed"], None
     for call, arm, index in ((compose_call, "orelse", 1), (recovery_call, "body", 0)):
         if _executed_path(turn, call) != (
-            ("AsyncFunctionDef", "body", 37, "Try"),
+            ("AsyncFunctionDef", "body", 36, "Try"),
             ("Try", "body", 21, "Try"),
-            ("Try", "body", 1, "If"),
+            ("Try", "body", 2, "If"),
             ("If", arm, index, "Assign"),
             ("Assign", "value", None, "Await"),
             ("Await", "value", None, "Call"),
@@ -385,12 +385,12 @@ def _source3_local_transfers(units):
 # hashes bind structural ASTs, not import identity or physical custody; those
 # remain explicit common-boundary obligations in the returned receipt.
 _REVIEWED_METHOD_SHAPES = {
-    TURN: "ddba716849ec234e21d3cb68303918db24bb6130a99c0723ed55812fe9fefa89",
-    SERVICE: "3eea7cc61485bc73088c306cce73b9b33fb82170684d35a39fb81617e8317cbe",
+    TURN: "1c5df064cf350b62e4d0ccc18877c466c43b826a4d44f08dad9c426288dbef77",
+    SERVICE: "b69a495125d0ccecc8a8047be8e88e0fadb03d594aa317955740453d130b429e",
     PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
     SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
 }
-_REVIEWED_RECOVERY_METHOD_SHAPE = "2db2d25106a944bdfa39236b7f7344cc99d855dfbfee3da76be3c02b9bda6a4e"
+_REVIEWED_RECOVERY_METHOD_SHAPE = "3ae93045b40c4679440983c32f813a6d0ae75749e63adeaf01f2dffcdb7df89c"
 _REVIEWED_ANNOTATIONS = {TURN: frozenset({"assistant_write", "parent_assistant_id"})}
 _METHOD_PATHS = {
     TURN: "_run_composer_turn",

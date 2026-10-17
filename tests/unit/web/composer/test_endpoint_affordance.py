@@ -82,6 +82,8 @@ async def test_call_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
         "prompt_guard_mode": "required",
         "prompt_guard_role": "composer",
         "prompt_guard_trusted_message_indexes": frozenset(),
+        "prompt_guard_content_parts": None,
+        "prompt_guard_tool_argument_parts": None,
     }
 
 
@@ -154,6 +156,7 @@ async def test_text_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
         "prompt_guard_role": "composer",
         "prompt_guard_user_prompt": "",
         "prompt_guard_trusted_message_indexes": frozenset(),
+        "prompt_guard_content_parts": None,
     }
 
 

@@ -78,6 +78,8 @@ _AUTO_TITLE_MAX_LEN = 60
 # (BPE spends 12-18 tokens on capitalized technical words); a runaway
 # answer overruns any cap and is discarded by the shape gate regardless.
 _AUTO_TITLE_MAX_TOKENS = 40
+# Bound SDK latency while guard and durable settlement retain the operation deadline.
+_AUTO_TITLE_PROVIDER_TIMEOUT_SECONDS = 5.0
 _AUTO_TITLE_MIN_WORDS = 2
 _AUTO_TITLE_MAX_WORDS = 8
 # Topic extraction needs a paragraph, not the 64 KiB send_message route
@@ -409,6 +411,7 @@ async def maybe_auto_title_session(
         "model": model,
         "messages": audit_messages,
         "max_tokens": _AUTO_TITLE_MAX_TOKENS,
+        "timeout": _AUTO_TITLE_PROVIDER_TIMEOUT_SECONDS,
         # Each physical attempt needs its own admission and usage outcome.
         "num_retries": 0,
         "max_retries": 0,

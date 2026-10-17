@@ -9,6 +9,8 @@ B5: Pipeline diff/change summary tool
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -23,7 +25,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
-from elspeth.web.composer.discovery_response import admit_discovery_result
+from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import (
@@ -917,7 +919,57 @@ class TestGetBlobContentTruncation:
         )
         assert get_result.success is True
         assert get_result.data["truncated"] is True
-        assert len(get_result.data["content"]) == 50_000
+        assert 0 < len(get_result.data["content"]) < len(large_content)
+        digest = hashlib.sha256(large_content.encode("utf-8")).hexdigest()
+        assert create_result.data["content_hash"] == digest
+        chunks: list[str] = []
+        offset = 0
+        page = get_result
+        while True:
+            assert page.success is True
+            assert page.updated_state is state
+            assert page.data["content_hash"] == digest
+            assert page.data["size_bytes"] == len(large_content.encode("utf-8"))
+            assert page.data["total_chars"] == len(large_content)
+            assert page.data["start_char"] == offset
+            end = page.data["end_char"]
+            assert offset < end <= len(large_content)
+            assert page.data["content"] == large_content[offset:end]
+            assert page.data["truncated"] is (end < len(large_content))
+            serialized = serialize_admitted_discovery_result(admit_discovery_result("get_blob_content", page))
+            assert len(serialized.encode("utf-8")) <= 4_096
+            assert json.loads(serialized)["data"]["content"] == large_content[offset:end]
+            chunks.append(page.data["content"])
+            if page.data["next_offset_chars"] is None:
+                assert end == len(large_content)
+                break
+            assert page.data["next_offset_chars"] == end
+            offset = end
+            page = execute_tool(
+                "get_blob_content",
+                {"blob_id": create_result.data["blob_id"], "offset_chars": offset, "expected_content_hash": digest},
+                state,
+                catalog,
+                data_dir=blob_env["data_dir"],
+                session_engine=blob_env["engine"],
+                session_id=blob_env["session_id"],
+                session_operation_context=blob_env["operation"],
+                session_operation_authority=blob_env["authority"],
+            )
+        assert "".join(chunks) == large_content
+        stale = execute_tool(
+            "get_blob_content",
+            {"blob_id": create_result.data["blob_id"], "offset_chars": 1, "expected_content_hash": "0" * 64},
+            state,
+            catalog,
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
+        )
+        assert stale.success is False
+        assert "content changed" in stale.validation.errors[0].message
 
 
 class TestUpdateBlobFileOnDisk:

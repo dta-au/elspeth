@@ -773,7 +773,7 @@ async def test_captured_planner_catalog_reference_preserves_complete_untrusted_g
             None,
             None,
             [
-                {"text": part.text, "trust": None}
+                {"text": part.text, "trust": None, "inspection_text": part.inspection_text}
                 for part in json_content_parts(wire["messages"][2]["content"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             ],
         ],
