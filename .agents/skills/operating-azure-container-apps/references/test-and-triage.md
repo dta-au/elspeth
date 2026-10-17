@@ -86,15 +86,12 @@ the orphan sweep.
 
 ## Rollback decision
 
-Rollback only when all are true:
-
-- the compatibility record says `rollback_permitted: true`;
-- the failure is isolated to image/config;
-- the previous revision's digest still exists in the registry; and
-- the previous secret versions remain valid.
-
-Otherwise fix forward. After rollback, repeat the revision, replica, probe and
-identity checks.
+**Current policy: new stores only.** Existing-store redeployment, transition,
+and rollback are held, even if an older compatibility record permits rollback.
+Follow the [existing-service runbook](../../../../docs/runbooks/azure-container-apps-existing-service-redeploy.md).
+Preserve the existing stores and diagnose the failure; this matrix does not
+authorize a transition. An authorized fresh installation follows the
+[cold-install runbook](../../../../docs/runbooks/azure-container-apps-cold-install.md).
 
 ## Full environment acceptance caveat
 
