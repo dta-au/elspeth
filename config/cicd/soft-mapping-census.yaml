@@ -779,7 +779,7 @@ files:
   src/elspeth/web/composer/capability_skill.py:
     Mapping[str, Any]: 8
   src/elspeth/web/composer/composition_completion.py:
-    Mapping[str, Any]: 4
+    Mapping[str, Any]: 3
     dict[str, Any]: 4
   src/elspeth/web/composer/control_messages.py:
     Mapping[str, Any]: 1
@@ -894,7 +894,7 @@ files:
   src/elspeth/web/composer/tools/declarations.py:
     Mapping[str, Any]: 4
   src/elspeth/web/composer/tools/generation.py:
-    Mapping[str, Any]: 19
+    Mapping[str, Any]: 20
     boundary: 4
     dict[str, Any]: 13
   src/elspeth/web/composer/tools/outputs.py:
@@ -986,7 +986,7 @@ files:
   src/elspeth/web/execution/routes.py:
     dict[str, Any]: 1
   src/elspeth/web/execution/service.py:
-    Mapping[str, Any]: 6
+    Mapping[str, Any]: 5
     dict[str, Any]: 5
   src/elspeth/web/interpretation_state.py:
     Mapping[str, Any]: 18
@@ -1062,10 +1062,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 755
+  Mapping[str, Any]: 754
   Mapping[str, object]: 315
   MutableMapping[str, Any]: 8
   boundary: 60
   dict[str, Any]: 1072
   dict[str, object]: 395
-  soft: 2545
+  soft: 2544

@@ -8824,28 +8824,43 @@ class TestAttemptProofRepair:
         return result.updated_state
 
     def test_returns_clear_when_no_blocking_diagnostics(self) -> None:
-        state = self._state_without_blob()
-        messages: list[dict[str, Any]] = []
-        outcome = self.service._completion._attempt_proof_repair(
-            state=state,
-            llm_messages=messages,
+        from elspeth.web.composer.tools.generation import ProofNotApplicable
+
+        absent = self.service._completion._assess_source_proof(
+            self._state_without_blob(),
             session_id=self.session_id,
             session_operation_context=self.operation_context,
+        )
+        assert type(absent) is ProofNotApplicable
+        state = self._state_with_blocking_csv(schema={"mode": "observed"})
+        messages: list[dict[str, Any]] = []
+        outcome = self.service._completion._attempt_proof_repair(
+            proof=self._evaluated_proof(state),
+            llm_messages=messages,
             repair_turns_used=0,
         )
         assert outcome.action == "clear"
         assert outcome.blocking_diagnostics == ()
         assert messages == []
 
+    def _evaluated_proof(self, state: CompositionState):
+        from elspeth.web.composer.tools.generation import ProofEvaluated
+
+        proof = self.service._completion._assess_source_proof(
+            state,
+            session_id=self.session_id,
+            session_operation_context=self.operation_context,
+        )
+        assert type(proof) is ProofEvaluated
+        return proof
+
     def test_returns_blocked_when_budget_exhausted(self) -> None:
 
         state = self._state_with_blocking_csv()
         messages: list[dict[str, Any]] = []
         outcome = self.service._completion._attempt_proof_repair(
-            state=state,
+            proof=self._evaluated_proof(state),
             llm_messages=messages,
-            session_id=self.session_id,
-            session_operation_context=self.operation_context,
             repair_turns_used=_MAX_REPAIR_TURNS,
         )
         assert outcome.action == "blocked"
@@ -8856,10 +8871,8 @@ class TestAttemptProofRepair:
         state = self._state_with_blocking_csv()
         messages: list[dict[str, Any]] = []
         outcome = self.service._completion._attempt_proof_repair(
-            state=state,
+            proof=self._evaluated_proof(state),
             llm_messages=messages,
-            session_id=self.session_id,
-            session_operation_context=self.operation_context,
             repair_turns_used=0,
         )
         assert outcome.action == "repair_injected"
@@ -8882,10 +8895,8 @@ class TestAttemptProofRepair:
         messages: list[dict[str, Any]] = []
 
         outcome = self.service._completion._attempt_proof_repair(
-            state=state,
+            proof=self._evaluated_proof(state),
             llm_messages=messages,
-            session_id=self.session_id,
-            session_operation_context=self.operation_context,
             repair_turns_used=0,
         )
 
@@ -8924,10 +8935,8 @@ class TestAttemptProofRepair:
         messages: list[dict[str, Any]] = []
 
         outcome = self.service._completion._attempt_proof_repair(
-            state=state,
+            proof=self._evaluated_proof(state),
             llm_messages=messages,
-            session_id=self.session_id,
-            session_operation_context=self.operation_context,
             repair_turns_used=0,
         )
 
@@ -8953,10 +8962,8 @@ class TestAttemptProofRepair:
         messages: list[dict[str, Any]] = []
         # Simulate one already-used repair turn
         outcome = self.service._completion._attempt_proof_repair(
-            state=state,
+            proof=self._evaluated_proof(state),
             llm_messages=messages,
-            session_id=self.session_id,
-            session_operation_context=self.operation_context,
             repair_turns_used=1,
         )
         assert outcome.action == "repair_injected"
@@ -8966,7 +8973,7 @@ class TestAttemptProofRepair:
         """Plugin exceptions must propagate — the repair gate only handles configs.
 
         Patch compute_proof_diagnostics to raise a synthetic 'plugin bug';
-        _attempt_proof_repair must not swallow it.
+        The acquisition boundary must propagate it before repair admission.
         """
         from elspeth.web.composer import composition_completion as svc_module
 
@@ -8974,12 +8981,10 @@ class TestAttemptProofRepair:
             patch.object(svc_module, "compute_proof_diagnostics", side_effect=RuntimeError("simulated plugin crash")),
             pytest.raises(RuntimeError, match="simulated plugin crash"),
         ):
-            self.service._completion._attempt_proof_repair(
-                state=self._state_with_blocking_csv(),
-                llm_messages=[],
+            self.service._completion._assess_source_proof(
+                self._state_with_blocking_csv(),
                 session_id=self.session_id,
                 session_operation_context=self.operation_context,
-                repair_turns_used=0,
             )
 
     def test_repair_message_caps_at_three_blockers(self) -> None:
@@ -8988,11 +8993,10 @@ class TestAttemptProofRepair:
         cap is documented in the synthesizer; this test pins it so future
         edits cannot relax the bound silently.
 
-        The test patches ``compute_proof_diagnostics`` to return a
-        deterministic 5-item list of blocking entries — the synthesiser is
-        the unit under test, and the diagnostic source is irrelevant.
+        The test supplies a deterministic evaluated proof with five blockers;
+        the repair renderer consumes evidence rather than acquiring it again.
         """
-        from elspeth.web.composer import composition_completion as svc_module
+        from elspeth.web.composer.tools.generation import ProofEvaluated
 
         fake_blockers = [
             {
@@ -9005,14 +9009,11 @@ class TestAttemptProofRepair:
             for i in range(5)
         ]
         messages: list[dict[str, Any]] = []
-        with patch.object(svc_module, "compute_proof_diagnostics", return_value=fake_blockers):
-            outcome = self.service._completion._attempt_proof_repair(
-                state=self._state_without_blob(),
-                llm_messages=messages,
-                session_id=self.session_id,
-                session_operation_context=self.operation_context,
-                repair_turns_used=0,
-            )
+        outcome = self.service._completion._attempt_proof_repair(
+            proof=ProofEvaluated(tuple(fake_blockers)),
+            llm_messages=messages,
+            repair_turns_used=0,
+        )
         assert outcome.action == "repair_injected"
         assert len(messages) == 1
         body = messages[0]["content"]

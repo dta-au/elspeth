@@ -2155,10 +2155,10 @@ def _is_exact_blob_metadata_callback_edge(call: ast.Call, keyword: ast.keyword) 
 
 
 def _is_exact_proof_resolver_consumer_call(call: ast.Call) -> bool:
-    """``compute_proof_diagnostics(..., blob_resolver=self._authoritative_proof_blob_resolver(...))``."""
+    """The proof consumer receives the exact factory's owned context directly."""
     if not (isinstance(call.func, ast.Name) and call.func.id == "compute_proof_diagnostics"):
         return False
-    resolver_keywords = [keyword for keyword in call.keywords if keyword.arg == "blob_resolver"]
+    resolver_keywords = [keyword for keyword in call.keywords if keyword.arg == "context"]
     if len(resolver_keywords) != 1:
         return False
     resolver = resolver_keywords[0].value
@@ -2177,8 +2177,25 @@ def _is_exact_proof_resolver_return_edge(
     *,
     exact_consumer_calls: tuple[ast.Call, ...],
 ) -> bool:
-    """``return <local def>`` from the proof resolver member, consumed live as ``blob_resolver=``."""
-    return function.name == _PROOF_RESOLVER_MEMBER and isinstance(statement.value, ast.Name) and bool(exact_consumer_calls)
+    """Admit only the exact nominal constructor's sole resolver callback."""
+    value = statement.value
+    return (
+        function.name == _PROOF_RESOLVER_MEMBER
+        and bool(exact_consumer_calls)
+        and isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_AuthoritativeProofContext"
+        and not value.args
+        and len(value.keywords) == 1
+        and value.keywords[0].arg == "resolve"
+        and isinstance(value.keywords[0].value, ast.Name)
+        and _has_unique_exact_import_binding(
+            function,
+            _reachable_function_nodes(function),
+            name="_AuthoritativeProofContext",
+            module=_PROOF_DIAGNOSTICS_MODULE,
+        )
+    )
 
 
 def _has_unique_exact_import_binding(
@@ -2425,13 +2442,14 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
             callable_edges.extend(delegated_edges)
             pending.extend(local_functions[edge.id] for edge in callable_edges if isinstance(edge, ast.Name) and edge.id in local_functions)
         for statement in (candidate for candidate in live_nodes if isinstance(candidate, ast.Return)):
-            if (
-                isinstance(statement.value, ast.Name)
-                and statement.value.id in local_functions
-                and _is_exact_proof_resolver_return_edge(function, statement, exact_consumer_calls=tuple(exact_consumer_calls))
-            ):
-                admitted.add(id(statement.value))
-                pending.append(local_functions[statement.value.id])
+            if _is_exact_proof_resolver_return_edge(function, statement, exact_consumer_calls=tuple(exact_consumer_calls)):
+                assert isinstance(statement.value, ast.Call)
+                callback = statement.value.keywords[0].value
+                assert isinstance(callback, ast.Name)
+                definition = _unique_local_callable(function, callback.id, enclosing)
+                if definition is not None:
+                    admitted.add(id(callback))
+                    pending.append(definition)
     return _ExecutionReachability(reachable=tuple(result), admitted_callback_edges=frozenset(admitted))
 
 
@@ -3824,10 +3842,12 @@ _PROOF_RESOLVER_EDGE = """
         {consumption}
 
     def {member}(self, state, *, session_id, session_operation_context):
+        from {context_module} import {constructor}
+
         def _resolve(blob_id):
             return self._call_async({receiver}.get_blob(blob_id, session_operation_context={context}))
 
-        return _resolve
+        return {constructor}({callback_keyword}=_resolve)
 """
 _DIRECT_CONSUMPTION = (
     "return {consumer}(state, {keyword}=self.{member}(state, session_id=session_id, session_operation_context=session_operation_context))"
@@ -3842,11 +3862,14 @@ def _proof_resolver_case(
     *,
     module: str = _PROOF_DIAGNOSTICS_MODULE,
     consumer: str = "compute_proof_diagnostics",
-    keyword: str = "blob_resolver",
+    keyword: str = "context",
     member: str = _PROOF_RESOLVER_MEMBER,
     consumption: str = _DIRECT_CONSUMPTION,
     receiver: str = "self._blob_service",
     context: str = "session_operation_context",
+    constructor: str = "_AuthoritativeProofContext",
+    context_module: str = _PROOF_DIAGNOSTICS_MODULE,
+    callback_keyword: str = "resolve",
     admitted: bool,
     context_offenders: tuple[str, ...] = (),
     unresolved_receiver_count: int = 0,
@@ -3857,6 +3880,9 @@ def _proof_resolver_case(
         member=member,
         receiver=receiver,
         context=context,
+        constructor=constructor,
+        context_module=context_module,
+        callback_keyword=callback_keyword,
         consumption=consumption.format(consumer=consumer, keyword=keyword, member=member),
     )
     return _EdgeControlCase(
@@ -3877,12 +3903,47 @@ def _proof_resolver_case(
         ("other-keyword-escapes", _proof_resolver_case(keyword="resolver", admitted=False)),
         ("aliased-consumption-escapes", _proof_resolver_case(consumption=_ALIASED_CONSUMPTION, admitted=False)),
         ("other-module-binding-escapes", _proof_resolver_case(module="elspeth.web.composer.tools.staging", admitted=False)),
+        ("other-context-constructor-escapes", _proof_resolver_case(constructor="OtherContext", admitted=False)),
+        ("other-context-module-escapes", _proof_resolver_case(context_module="elspeth.web.composer.tools.staging", admitted=False)),
+        ("other-callback-keyword-escapes", _proof_resolver_case(callback_keyword="reader", admitted=False)),
         ("admitted-wrong-context-flagged", _proof_resolver_case(admitted=True, context="other_context", context_offenders=("get_blob",))),
         ("admitted-wrong-receiver-flagged", _proof_resolver_case(admitted=True, receiver="self._staging", unresolved_receiver_count=1)),
     ],
 )
 def test_proof_resolver_return_edge_admits_only_the_exact_blob_resolver_consumption(case_id: str, case: _EdgeControlCase) -> None:
     _assert_edge_control(case)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["none", "constructor_rebound", "constructor_alias", "extra_argument", "duplicate_keyword", "callback_alias"]
+)
+def test_proof_context_constructor_retains_exact_binding_and_callback(mutation: str) -> None:
+    owner = _synthetic_owner(_proof_resolver_case(admitted=True).body)
+    factory = next(member for member in owner.body if isinstance(member, ast.FunctionDef) and member.name == _PROOF_RESOLVER_MEMBER)
+    returned = next(statement for statement in factory.body if isinstance(statement, ast.Return))
+    assert isinstance(returned.value, ast.Call)
+    if mutation == "constructor_rebound":
+        factory.body.insert(1, ast.parse("_AuthoritativeProofContext = unrelated").body[0])
+    elif mutation == "constructor_alias":
+        factory.body.insert(1, ast.parse("context_type = _AuthoritativeProofContext").body[0])
+        returned.value.func = ast.Name(id="context_type", ctx=ast.Load())
+    elif mutation == "extra_argument":
+        returned.value.args = [ast.Name(id="state", ctx=ast.Load())]
+    elif mutation == "duplicate_keyword":
+        returned.value.keywords.append(ast.keyword(arg="resolve", value=ast.Name(id="_resolve", ctx=ast.Load())))
+    elif mutation == "callback_alias":
+        factory.body.insert(-1, ast.parse("reader = _resolve").body[0])
+        returned.value.keywords[0].value = ast.Name(id="reader", ctx=ast.Load())
+    ast.fix_missing_locations(owner)
+    findings = _execution_effect_findings(owner)
+    if mutation == "none":
+        assert findings.escaped_local_helpers == ()
+        assert findings.unreachable_decoys == ()
+        assert [_call_name(call) for call in findings.effect_calls] == ["get_blob"]
+    else:
+        assert "_resolve" in findings.escaped_local_helpers
+        assert [_call_name(call) for call in findings.unreachable_decoys] == ["get_blob"]
+        assert findings.effect_calls == ()
 
 
 _WORKER_DELEGATION_EDGE = """

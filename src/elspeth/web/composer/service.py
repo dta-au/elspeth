@@ -21,7 +21,7 @@ import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
@@ -92,6 +92,7 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_cache import (
     RuntimePreflightCache as _RuntimePreflightCache,
 )
+from elspeth.web.composer.discovery_response import admit_discovery_result, preview_source_proof_stop
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.invariants import InvariantError
@@ -153,6 +154,7 @@ from elspeth.web.composer.strict_transport import (
     resolve_composer_tool_contract,
 )
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, ProofUnavailable
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
 from elspeth.web.execution.completion_gates import (
@@ -1705,6 +1707,74 @@ class ComposerServiceImpl:
         persisted_assistant_message_id = persist.persisted_assistant_message_id
         persisted_assistant_content = persist.persisted_assistant_content
         failed_turn = persist.failed_turn
+
+        # P4 and original failure/cancellation primacy have completed. Reuse
+        # the current preview's observation without resolving the blob again:
+        # newly ready bytes cannot reopen this request's primary dialogue.
+        source_stop: ProofUnavailable | MalformedSourceProofClaim | None = None
+        if dispatch.tool_outcomes:
+            terminal = dispatch.tool_outcomes[-1]
+            if (
+                terminal.call.function.name == "preview_pipeline"
+                and terminal.error_class is None
+                and isinstance(terminal.response, ToolResult)
+            ):
+                source_stop = preview_source_proof_stop(admit_discovery_result("preview_pipeline", terminal.response), state)
+        terminal_without_preview = (
+            _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes)
+            or (turn_has_mutation and composition_turns_used + 1 >= self._max_composition_turns)
+            or (
+                not turn_has_mutation
+                and turn_has_discovery
+                and discovery_turns_used + 1 >= self._max_discovery_turns
+                and _tool_batch_ends_with_valid_current_preview(dispatch.tool_outcomes, state)
+            )
+        )
+        if source_stop is None and terminal_without_preview:
+            assessment = self._completion._assess_source_proof(
+                state, session_id=session_id, session_operation_context=session_operation_context
+            )
+            if type(assessment) in (ProofUnavailable, MalformedSourceProofClaim):
+                source_stop = cast(ProofUnavailable | MalformedSourceProofClaim, assessment)
+        if source_stop is not None:
+            stopped = await self._completion._terminate_source_proof(
+                proof=source_stop,
+                state=state,
+                assistant_message=dispatch.assistant_message,
+                turn_evidence=turn_evidence,
+                message=message,
+                session_id=session_id,
+                current_state_id=persist.current_state_id,
+                session_operation_context=session_operation_context,
+                user_id=user_id,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                runtime_preflight_cache=runtime_preflight_cache,
+                last_runtime_preflight=last_runtime_preflight,
+                recorder=recorder,
+                progress=progress,
+                repair_turns_used=repair_turns_used,
+                advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+                persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_assistant_content=persisted_assistant_content,
+                persisted_tool_call_turn=persisted_tool_call_turn,
+                plugin_snapshot=plugin_snapshot,
+                deadline=deadline,
+                composition_turns_used=composition_turns_used + int(turn_has_mutation),
+                discovery_turns_used=discovery_turns_used + int(turn_has_discovery and not turn_has_mutation),
+                failed_turn=failed_turn,
+                completion_gates=completion_gates,
+                provider_owner=provider_owner,
+            )
+            return _ClassifyOutcome(
+                action="return",
+                result=stopped.result,
+                composition_turns_delta=int(turn_has_mutation),
+                discovery_turns_delta=int(turn_has_discovery and not turn_has_mutation),
+                advisor_passes_delta=stopped.advisor_passes_delta,
+                publication_binding=stopped.publication_binding,
+            )
 
         # §7.7 anti-anchor hint: if the last 3 failed tool calls share the
         # same (tool_name, arguments_hash), the model has stopped reading

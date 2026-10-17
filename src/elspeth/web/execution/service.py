@@ -96,6 +96,7 @@ from elspeth.web.async_workers import (
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import (
     AllowedMimeType,
+    BlobContentMissingError,
     BlobIntegrityError,
     BlobNotFoundError,
     BlobQuotaExceededError,
@@ -211,7 +212,14 @@ from elspeth.web.sessions.telemetry import _SessionsTelemetry
 if TYPE_CHECKING:
     from elspeth.core.landscape.database import LandscapeDB
     from elspeth.web.catalog.protocol import CatalogService
-    from elspeth.web.composer.tools.generation import ResolvedProofBlob, UnresolvedClaimedProofBlob
+    from elspeth.web.composer.tools.generation import (
+        ProofEvaluated,
+        ProofNotApplicable,
+        ProofUnavailable,
+        ResolvedProofBlob,
+        UnresolvedClaimedProofBlob,
+        _AuthoritativeProofContext,
+    )
 
 slog = structlog.get_logger()
 _meter = metrics.get_meter(__name__)
@@ -363,11 +371,18 @@ def _insert_proof_check(
 
 def _merge_authoritative_proof_diagnostics(
     result: ValidationResult,
-    diagnostics: Sequence[Mapping[str, Any]],
+    proof: ProofNotApplicable | ProofEvaluated | ProofUnavailable,
 ) -> ValidationResult:
     """Append the real proof check and fail readiness on sampled blockers."""
+    from elspeth.web.composer.tools.generation import ProofEvaluated, ProofNotApplicable, ProofUnavailable
+
     if not result.is_valid:
         return result
+    if type(proof) is ProofNotApplicable:
+        return result
+    if type(proof) not in (ProofEvaluated, ProofUnavailable):
+        raise TypeError("Authoritative proof requires an owned proof outcome")
+    diagnostics = proof.diagnostics
 
     blocking = [diagnostic for diagnostic in diagnostics if diagnostic["severity"] == "blocking"]
     bounded_blocking = blocking[:_MAX_AUTHORITATIVE_PROOF_DIAGNOSTICS]
@@ -442,7 +457,9 @@ def _merge_authoritative_proof_diagnostics(
             "checks": checks,
             "errors": [*result.errors, *errors],
             "readiness": ValidationReadiness(
-                authoring_valid=False,
+                authoring_valid=result.readiness.authoring_valid
+                and type(proof) is ProofUnavailable
+                and all(diagnostic["code"] == "source_blob_unavailable" for diagnostic in blocking),
                 execution_ready=False,
                 completion_ready=False,
                 blockers=[*result.readiness.blockers, *blockers],
@@ -1391,28 +1408,31 @@ class ExecutionServiceImpl:
         *,
         session_id: UUID | None,
         session_operation_context: SessionOperationContext,
-    ) -> Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]:
+    ) -> _AuthoritativeProofContext:
         """Resolve only exact, session-owned, ready blob bindings for proof."""
         from elspeth.web.composer.tools.blobs import BlobToolRecord
-        from elspeth.web.composer.tools.generation import ResolvedProofBlob, UnresolvedClaimedProofBlob
+        from elspeth.web.composer.tools.generation import (
+            MalformedSourceProofClaim,
+            ResolvedProofBlob,
+            UnresolvedClaimedProofBlob,
+            _admit_source_proof_claims,
+            _AuthoritativeProofContext,
+        )
         from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
 
         # Every authored source blob_ref is a custody claim. If its live
         # binding cannot be resolved, the bounded proof must fail closed.
         claimed_blob_ids: set[str] = set()
         expected_paths_by_blob_id: dict[str, set[str]] = {}
-        for source_name, source in state.sources.items():
-            if "blob_ref" not in source.options:
-                continue
-            raw_blob_id = source.options["blob_ref"]
-            if type(raw_blob_id) is not str:
-                raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a canonical UUID string")
-            try:
-                parsed_blob_id = UUID(raw_blob_id)
-            except ValueError as exc:
-                raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a UUID") from exc
-            if str(parsed_blob_id) != raw_blob_id:
-                raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a canonical UUID string")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise AuditIntegrityError("Authoritative source proof requires the actual session operation context")
+        if session_id is not None and session_operation_context.fence.session_id != str(session_id):
+            raise AuditIntegrityError("Authoritative source proof context belongs to another session")
+        try:
+            claims = _admit_source_proof_claims(state)
+        except MalformedSourceProofClaim as exc:
+            raise MalformedBlobRefError(f"sources.{exc.source_name}.blob_ref must be a canonical UUID string") from exc
+        for _source_name, source, raw_blob_id in claims:
             claimed_blob_ids.add(raw_blob_id)
             paths = {
                 value
@@ -1476,13 +1496,17 @@ class ExecutionServiceImpl:
                     "creating_arguments_hash": record.creating_arguments_hash,
                 },
             )
-            verified_prefix, verified_content_hash, total_size_bytes = self._call_async(
-                self._blob_service.read_blob_content_prefix_verified(
-                    parsed_blob_id,
-                    prefix_bytes=8 * 1024,
-                    session_operation_context=session_operation_context,
+            try:
+                verified_prefix, verified_content_hash, total_size_bytes = self._call_async(
+                    self._blob_service.read_blob_content_prefix_verified(
+                        parsed_blob_id,
+                        prefix_bytes=8 * 1024,
+                        session_operation_context=session_operation_context,
+                    )
                 )
-            )
+            except (BlobNotFoundError, BlobContentMissingError, BlobStateError):
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
             resolved = ResolvedProofBlob(
                 metadata=metadata,
                 verified_prefix=verified_prefix,
@@ -1492,7 +1516,7 @@ class ExecutionServiceImpl:
             resolved_by_blob_id[blob_id] = resolved
             return resolved
 
-        return _resolve
+        return _AuthoritativeProofContext(resolve=_resolve)
 
     def _authoritative_state_preflight_sync(
         self,
@@ -1548,8 +1572,7 @@ class ExecutionServiceImpl:
 
         diagnostics = compute_proof_diagnostics(
             state,
-            session_id=str(session_id) if session_id is not None else None,
-            blob_resolver=self._authoritative_proof_blob_resolver(
+            context=self._authoritative_proof_blob_resolver(
                 state,
                 session_id=session_id,
                 session_operation_context=session_operation_context,

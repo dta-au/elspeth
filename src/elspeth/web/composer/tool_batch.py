@@ -101,6 +101,7 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_response import (
     AdmittedDiscoveryResult,
     admit_discovery_result,
+    preview_source_proof_stop,
     serialize_admitted_discovery_result,
 )
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls
@@ -165,6 +166,7 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools._common import _candidate_rejection_result, _saved_graph_rejection_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
+from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _admit_source_proof_claims
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.credential_guard import (
@@ -2603,7 +2605,15 @@ async def run_tool_batch(
         # before it enters the worker thread pool.
         runtime_preflight_callback: RuntimePreflight | None = None
         structural_preflight_callback: RuntimePreflight | None = None
+        preview_claims_admitted = True
         if tool_name == "preview_pipeline":
+            try:
+                _admit_source_proof_claims(state)
+            except MalformedSourceProofClaim:
+                # The ordinary producer owns the saved-graph refusal. Do not
+                # inspect any resource before its complete scalar admission.
+                preview_claims_admitted = False
+        if tool_name == "preview_pipeline" and preview_claims_admitted:
             try:
                 preview_preflight = await ctx.preflight.cached_runtime_preflight(
                     state,
@@ -3138,6 +3148,12 @@ async def run_tool_batch(
             turn_has_mutation = True
         else:
             turn_has_discovery = True
+
+        # The completed preview has its ordinary audit, message, outcome and
+        # classification. An unavailable saved claim closes this issued batch;
+        # P4 will persist only this executed prefix before the loop terminates.
+        if admitted_result is not None and preview_source_proof_stop(admitted_result, state) is not None:
+            break
 
     dispatch = _DispatchOutcome(
         state=state,

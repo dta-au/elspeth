@@ -29,6 +29,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdvisorReviewState,
     _TerminateOutcome,
 )
+from elspeth.web.composer._producer_resolver import source_producer_id
 from elspeth.web.composer.advisor_audit import (
     AdvisorGraphReviewIdentity,
     AdvisorTerminalPublication,
@@ -115,6 +116,13 @@ from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import (
     _sync_list_blobs,
+)
+from elspeth.web.composer.tools.generation import (
+    ComposerProofContext,
+    MalformedSourceProofClaim,
+    ProofEvaluated,
+    ProofNotApplicable,
+    ProofUnavailable,
     compute_proof_diagnostics,
 )
 from elspeth.web.composer.turn_effects import TurnEvidence
@@ -178,6 +186,118 @@ _PROOF_DIAGNOSTICS_CHECK_NAME: Final[ValidationCheckName] = CHECK_PROOF_DIAGNOST
 _MAX_REPAIR_TURNS: Final[int] = 2
 
 _CROSS_TURN_REPAIR_LEDGER_MAX: Final[int] = 512
+
+
+def _source_proof_unavailable_validation(
+    state: CompositionState,
+    proof: ProofUnavailable | MalformedSourceProofClaim,
+    prior: ValidationResult | None,
+) -> ValidationResult:
+    """Retain known validation, distinguishing invalid claims from unavailable bytes."""
+    evaluated_configuration_invalid = False
+    if type(proof) is MalformedSourceProofClaim:
+        evaluated_configuration_invalid = True
+        additions = [
+            ValidationError(
+                component_id=source_producer_id(proof.source_name),
+                component_type="source",
+                message=proof.reason,
+                suggestion="Use the exact canonical blob identifier returned by authenticated discovery for the intended source.",
+                error_code="source_blob_identity_invalid",
+            )
+        ]
+    else:
+        nodes_by_id = {node.id: node for node in state.nodes}
+        additions = []
+        for diagnostic in sorted(cast(ProofUnavailable, proof).diagnostics, key=lambda entry: entry["code"] != "source_blob_unavailable"):
+            if diagnostic["severity"] != "blocking":
+                continue
+            evidence = diagnostic["evidence_locator"]
+            component_type: str
+            if "node_id" in evidence:
+                component_id = evidence["node_id"]
+                # This assessment is bound to this immutable state. Preserve
+                # the detector's target rather than relabeling its objection
+                # as an unavailable source merely because both coexist.
+                component_type = nodes_by_id[component_id].node_type
+            elif "output_name" in evidence:
+                component_id, component_type = evidence["output_name"], "sink"
+            elif evidence["source"] == "pipeline":
+                component_id, component_type = "pipeline", "pipeline"
+            else:
+                component_id, component_type = source_producer_id(evidence["source_name"]), "source"
+            additions.append(
+                ValidationError(
+                    component_id=component_id,
+                    component_type=component_type,
+                    message=diagnostic["message"],
+                    suggestion=diagnostic["suggested_repair"],
+                    error_code=diagnostic["code"],
+                )
+            )
+        evaluated_configuration_invalid = any(error.error_code != "source_blob_unavailable" for error in additions)
+    if prior is None:
+        authored = state.validate()
+        prior = ValidationResult(
+            is_valid=authored.is_valid,
+            checks=[],
+            errors=[
+                ValidationError(
+                    component_id=error.component,
+                    component_type=None,
+                    message=error.message,
+                    suggestion=None,
+                    error_code=error.error_code,
+                )
+                for error in authored.errors
+            ],
+            readiness=ValidationReadiness(
+                authoring_valid=authored.is_valid,
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[],
+            ),
+        )
+    # Prefer the readiness cause in the one public notice, while retaining
+    # every independently established error/check/warning on the result.
+    errors = [*additions, *(error for error in prior.errors if error not in additions)]
+    blockers = [
+        ValidationReadinessBlocker(
+            code=cast(str, error.error_code),
+            component_id=error.component_id,
+            component_type=error.component_type,
+            detail=error.message,
+            suggestion=error.suggestion,
+            note=None,
+        )
+        for error in additions
+    ]
+    return prior.model_copy(
+        update={
+            "is_valid": False,
+            "errors": errors,
+            "checks": [
+                *(check for check in prior.checks if check.name != CHECK_PROOF_DIAGNOSTICS),
+                ValidationCheck(
+                    name=CHECK_PROOF_DIAGNOSTICS,
+                    passed=False,
+                    detail=(
+                        "The authored source blob claim failed canonical identity admission."
+                        if type(proof) is MalformedSourceProofClaim
+                        else "Claimed source content was not available as verified ready evidence for this request."
+                    ),
+                    affected_nodes=(),
+                    outcome_code=None,
+                ),
+            ],
+            "readiness": ValidationReadiness(
+                authoring_valid=prior.readiness.authoring_valid and not evaluated_configuration_invalid,
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[*blockers, *(blocker for blocker in prior.readiness.blockers if blocker not in blockers)],
+            ),
+        }
+    )
 
 
 def _pending_interpretation_review_repair_message(
@@ -674,25 +794,6 @@ class _ProofRepairOutcome:
         freeze_fields(self, "blocking_diagnostics")
 
 
-def _proof_repair_is_applicable(state: CompositionState) -> bool:
-    """Return True iff the proof step has any input it can inspect.
-
-    The forced-repair gate must fire whenever ``compute_proof_diagnostics``
-    might find blocking diagnostics. The proof step is a no-op for sources
-    that aren't blob-backed (no bytes to read), so the gate's predicate is
-    "at least one source is present AND options carries a ``blob_ref``" — *not* "state
-    changed this turn", because a blocker can survive session resume into
-    a turn where the LLM does no mutations.
-
-    ``SourceSpec.options`` is internally typed as ``Mapping[str, Any]``
-    (Tier-1 dataclass invariant — no isinstance probe needed). ``blob_ref``
-    is an optional, well-known key set by the binding tools; its absence
-    is a documented part of the contract (path-based sources don't have
-    one), so containment checking is the appropriate primitive here.
-    """
-    return any("blob_ref" in source.options for source in state.sources.values())
-
-
 def _uploaded_blob_recovery_context(ready_blobs: tuple[Mapping[str, Any], ...]) -> str:
     """Expose bounded upload facts without authorizing construction.
 
@@ -963,14 +1064,44 @@ class CompositionCompletion:
             return ""
         return _uploaded_blob_recovery_context(ready_blobs)
 
+    def _assess_source_proof(
+        self,
+        state: CompositionState,
+        *,
+        session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
+    ) -> ProofNotApplicable | ProofEvaluated | ProofUnavailable | MalformedSourceProofClaim:
+        """Acquire one completion decision's proof through its actual custody."""
+        if session_operation_context is not None:
+            if type(session_operation_context) is not SessionOperationContext:
+                raise AuditIntegrityError("Source proof requires the actual session operation context")
+            if session_id is not None and session_operation_context.fence.session_id != session_id:
+                raise AuditIntegrityError("Source proof context does not match the requested store")
+        context = (
+            ComposerProofContext(
+                self._session_engine,
+                session_id,
+                self._data_dir,
+                session_operation_context,
+                self._sessions_service.session_operation_authority,
+            )
+            if self._session_engine is not None
+            and session_id is not None
+            and session_operation_context is not None
+            and self._sessions_service is not None
+            else None
+        )
+        try:
+            return compute_proof_diagnostics(state, context=context)
+        except MalformedSourceProofClaim as exc:
+            return exc
+
     def _attempt_proof_repair(
         self,
         *,
-        state: CompositionState,
+        proof: ProofEvaluated,
         llm_messages: list[dict[str, Any]],
-        session_id: str | None,
         repair_turns_used: int,
-        session_operation_context: SessionOperationContext | None = None,
     ) -> _ProofRepairOutcome:
         """Pre-finalize proof gate.
 
@@ -1000,14 +1131,9 @@ class CompositionCompletion:
         path that retains decoded content; only inspect_blob_content's
         bounded-summary facts are surfaced.
         """
-        diagnostics = compute_proof_diagnostics(
-            state,
-            session_engine=self._session_engine,
-            session_id=session_id,
-            data_dir=self._data_dir,
-            session_operation_context=session_operation_context,
-            session_operation_authority=self._sessions_service.session_operation_authority if self._sessions_service is not None else None,
-        )
+        if type(proof) is not ProofEvaluated:
+            raise TypeError("Only evaluated source diagnostics may enter configuration repair")
+        diagnostics = proof.diagnostics
         # The diagnostic dict shape is the documented contract of
         # ``compute_proof_diagnostics`` (see ``tools.py``): every entry
         # has ``severity``, ``code``, ``message``, ``suggested_repair``,
@@ -1061,7 +1187,7 @@ class CompositionCompletion:
         state: CompositionState,
         assistant_message: _AdmittedAssistantMessage,
         recorder: BufferingRecorder,
-        blocking_diagnostics: tuple[Mapping[str, Any], ...],
+        runtime_result: ValidationResult,
         repair_turns_used: int,
         persisted_assistant_message_id: str | None,
         # REQUIRED (no default): the content of the row named by
@@ -1075,10 +1201,9 @@ class CompositionCompletion:
         """Return a backend-owned blocker instead of finalizing after the cap."""
 
         raw_content = assistant_message.content or ""
-        runtime_result = _proof_repair_exhausted_validation(blocking_diagnostics)
         augmented = _compose_preflight_failure_message(raw_content, runtime_result=runtime_result)
         _enforce_augmentation_prefix_invariant(
-            branch="proof_repair_exhausted_augmentation",
+            branch="preflight_invalid_non_empty_state_augmentation",
             content=raw_content,
             augmented=augmented,
         )
@@ -1095,6 +1220,173 @@ class CompositionCompletion:
             persisted_assistant_message_id=persisted_assistant_message_id,
             persisted_assistant_content=persisted_assistant_content,
             persisted_tool_call_turn=persisted_tool_call_turn,
+        )
+
+    async def _terminate_source_proof(
+        self,
+        *,
+        proof: ProofUnavailable | MalformedSourceProofClaim,
+        state: CompositionState,
+        assistant_message: _AdmittedAssistantMessage,
+        turn_evidence: TurnEvidence,
+        message: str,
+        session_id: str | None,
+        current_state_id: str | None,
+        session_operation_context: SessionOperationContext | None,
+        user_id: str | None,
+        initial_version: int,
+        session_scope: str,
+        runtime_preflight_cache: _RuntimePreflightCache,
+        last_runtime_preflight: ValidationResult | None,
+        recorder: BufferingRecorder,
+        progress: ComposerProgressSink | None,
+        repair_turns_used: int,
+        advisor_checkpoint_passes_used: int,
+        advisor_review_state: _AdvisorReviewState,
+        persisted_assistant_message_id: str | None,
+        persisted_assistant_content: str | None,
+        persisted_tool_call_turn: bool,
+        plugin_snapshot: PluginAvailabilitySnapshot | None,
+        deadline: float | None,
+        composition_turns_used: int,
+        discovery_turns_used: int,
+        failed_turn: FailedTurnMetadata | None,
+        completion_gates: CompletionGateFacts | None,
+        provider_owner: ProviderInvocationOwner | None,
+    ) -> _TerminateOutcome:
+        """Close authoring on the bound observation, retaining END and card duties."""
+        runtime = _source_proof_unavailable_validation(state, proof, last_runtime_preflight)
+        orphan = await self._surface_pt_and_gate_orphans_or_none(
+            state=state,
+            session_id=session_id,
+            current_state_id=current_state_id,
+            session_operation_context=session_operation_context,
+            assistant_message=assistant_message,
+            recorder=recorder,
+            progress=progress,
+        )
+        if orphan is not None:
+            orphan_runtime = orphan.runtime_preflight
+            if orphan_runtime is None:
+                raise AuditIntegrityError("Orphan refusal omitted its readiness")
+            runtime = runtime.model_copy(
+                update={
+                    "errors": [*runtime.errors, *orphan_runtime.errors],
+                    "checks": [*runtime.checks, *orphan_runtime.checks],
+                    "readiness": runtime.readiness.model_copy(
+                        update={
+                            "authoring_valid": runtime.readiness.authoring_valid and orphan_runtime.readiness.authoring_valid,
+                            "blockers": [*runtime.readiness.blockers, *orphan_runtime.readiness.blockers],
+                        }
+                    ),
+                }
+            )
+        try:
+            gate = await self._evaluate_terminal_no_tool_advisor_gate(
+                state=state,
+                turn_evidence=turn_evidence,
+                session_id=session_id,
+                current_state_id=current_state_id,
+                session_operation_context=session_operation_context,
+                assistant_message=assistant_message,
+                # A source stop cannot enter the gate's authoring-repair arm;
+                # END builds its own publication packet, not primary dialogue.
+                llm_messages=[],
+                recorder=recorder,
+                progress=progress,
+                advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                repair_turns_used=repair_turns_used,
+                persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_assistant_content=persisted_assistant_content,
+                persisted_tool_call_turn=persisted_tool_call_turn,
+                allow_repair_continue=False,
+                runtime_preflight=runtime,
+                user_message=message,
+                user_id=user_id,
+                runtime_preflight_cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                plugin_snapshot=plugin_snapshot,
+                advisor_review_state=advisor_review_state,
+                deadline=deadline,
+                completion_gates=completion_gates,
+                provider_owner=provider_owner,
+            )
+        except _AdvisorCheckpointComposeDeadlineExpired:
+            await self._persist_withheld_reply(
+                "compose_deadline_expired",
+                assistant_message.content or "",
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
+            raise ComposerConvergenceError.capture(
+                max_turns=composition_turns_used + discovery_turns_used,
+                budget_exhausted="timeout",
+                state=state,
+                initial_version=initial_version,
+                tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                llm_calls=recorder.llm_calls,
+                failed_turn=failed_turn,
+            ) from None
+        if gate.action == "continue":
+            raise AuditIntegrityError("Source readiness stop reopened primary authoring")
+        if gate.action == "return":
+            result = gate.result
+            if result is None:
+                raise AuditIntegrityError("Terminal source review omitted its result")
+            reviewed_runtime = result.runtime_preflight
+            if reviewed_runtime is not None:
+                # END may add independent objections, but cannot erase the
+                # bound source observation or substitute its authoring axis.
+                runtime = runtime.model_copy(
+                    update={
+                        "checks": [*runtime.checks, *(check for check in reviewed_runtime.checks if check not in runtime.checks)],
+                        "errors": [*runtime.errors, *(error for error in reviewed_runtime.errors if error not in runtime.errors)],
+                        "warnings": [
+                            *runtime.warnings,
+                            *(warning for warning in reviewed_runtime.warnings if warning not in runtime.warnings),
+                        ],
+                        "readiness": runtime.readiness.model_copy(
+                            update={
+                                "blockers": [
+                                    *runtime.readiness.blockers,
+                                    *(
+                                        blocker
+                                        for blocker in reviewed_runtime.readiness.blockers
+                                        if blocker not in runtime.readiness.blockers
+                                    ),
+                                ],
+                            }
+                        ),
+                    }
+                )
+            # Keep only the actual authorized prose prefix. The one existing
+            # preflight suffix now carries both source and END objections.
+            raw = result.message if result.raw_assistant_content is None else result.raw_assistant_content
+            result = replace(
+                result,
+                message=_compose_preflight_failure_message(raw, runtime_result=runtime),
+                raw_assistant_content=raw,
+                runtime_preflight=runtime,
+            )
+        else:
+            result = self._proof_repair_blocked_result(
+                state=state,
+                assistant_message=assistant_message,
+                recorder=recorder,
+                runtime_result=runtime,
+                repair_turns_used=repair_turns_used,
+                persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_assistant_content=persisted_assistant_content,
+                persisted_tool_call_turn=persisted_tool_call_turn,
+            )
+            result = _with_advisor_gate_decision(result, completion_gates, gate.advisor_gate_decision, gate.graph_review_identity)
+        return _TerminateOutcome(
+            action="return",
+            result=result,
+            advisor_passes_delta=gate.advisor_passes_delta,
+            advisor_review_state=gate.advisor_review_state,
+            publication_binding=gate.publication_binding,
         )
 
     async def _attempt_preflight_repair(
@@ -1338,6 +1630,42 @@ class CompositionCompletion:
         """
         no_tool_response = parse_no_tool_response(assistant_message.content or "")
         assistant_message = replace(assistant_message, content=no_tool_response.body)
+        proof = self._assess_source_proof(
+            state,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
+        if type(proof) in (ProofUnavailable, MalformedSourceProofClaim):
+            return await self._terminate_source_proof(
+                proof=cast(ProofUnavailable | MalformedSourceProofClaim, proof),
+                state=state,
+                assistant_message=assistant_message,
+                turn_evidence=turn_evidence,
+                message=message,
+                session_id=session_id,
+                current_state_id=current_state_id,
+                session_operation_context=session_operation_context,
+                user_id=user_id,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                runtime_preflight_cache=runtime_preflight_cache,
+                last_runtime_preflight=last_runtime_preflight,
+                recorder=recorder,
+                progress=progress,
+                repair_turns_used=repair_turns_used,
+                advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+                persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_assistant_content=persisted_assistant_content,
+                persisted_tool_call_turn=persisted_tool_call_turn,
+                plugin_snapshot=plugin_snapshot,
+                deadline=deadline,
+                composition_turns_used=composition_turns_used,
+                discovery_turns_used=discovery_turns_used,
+                failed_turn=failed_turn,
+                completion_gates=completion_gates,
+                provider_owner=provider_owner,
+            )
         if (
             repair_turns_used < _MAX_REPAIR_TURNS
             and _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
@@ -1456,18 +1784,15 @@ class CompositionCompletion:
         # the cross-turn scenario the gate exists to catch (e.g.
         # ``csv_fixed_schema_omits_observed_columns`` blockers
         # surviving session resume). For chat-only turns where the
-        # source is absent or not blob-backed, ``_attempt_proof_repair``
-        # short-circuits cheaply via ``compute_proof_diagnostics``'s
-        # own early return.
+        # source is absent or not blob-backed, the owned assessment is
+        # NotApplicable and never enters configuration repair.
         proof_runtime_preflight: ValidationResult | None = None
         proof_repair: _ProofRepairOutcome | None = None
-        if _proof_repair_is_applicable(state):
+        if type(proof) is ProofEvaluated:
             proof_repair = self._attempt_proof_repair(
-                state=state,
+                proof=proof,
                 llm_messages=llm_messages,
-                session_id=session_id,
                 repair_turns_used=repair_turns_used,
-                session_operation_context=session_operation_context,
             )
             if proof_repair.action == "repair_injected":
                 return _TerminateOutcome(action="continue", repair_turns_delta=1)
@@ -1504,6 +1829,36 @@ class CompositionCompletion:
             session_operation_context=session_operation_context,
         ):
             return _TerminateOutcome(action="continue", repair_turns_delta=1)
+
+        if proof_runtime_preflight is not None:
+            # Exhausted configuration repair still owes the same durable
+            # backend review cards and unfiltered orphan refusal as every
+            # other terminal path. Run the coupled pair before END, without
+            # letting the proof finding short-circuit its surfacing work.
+            orphan = await self._surface_pt_and_gate_orphans_or_none(
+                state=state,
+                session_id=session_id,
+                current_state_id=current_state_id,
+                session_operation_context=session_operation_context,
+                assistant_message=assistant_message,
+                recorder=recorder,
+                progress=progress,
+            )
+            if orphan is not None:
+                orphan_runtime = orphan.runtime_preflight
+                if orphan_runtime is None:
+                    raise AuditIntegrityError("Orphan refusal omitted its readiness")
+                proof_runtime_preflight = proof_runtime_preflight.model_copy(
+                    update={
+                        "checks": [*proof_runtime_preflight.checks, *orphan_runtime.checks],
+                        "errors": [*proof_runtime_preflight.errors, *orphan_runtime.errors],
+                        "readiness": proof_runtime_preflight.readiness.model_copy(
+                            update={
+                                "blockers": [*proof_runtime_preflight.readiness.blockers, *orphan_runtime.readiness.blockers],
+                            }
+                        ),
+                    }
+                )
 
         try:
             advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
@@ -1594,7 +1949,7 @@ class CompositionCompletion:
                 state=state,
                 assistant_message=assistant_message,
                 recorder=recorder,
-                blocking_diagnostics=proof_repair.blocking_diagnostics,
+                runtime_result=proof_runtime_preflight,
                 repair_turns_used=repair_turns_used,
                 persisted_assistant_message_id=persisted_assistant_message_id,
                 persisted_assistant_content=persisted_assistant_content,

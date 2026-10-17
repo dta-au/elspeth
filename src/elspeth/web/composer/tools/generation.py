@@ -10,7 +10,6 @@ import re
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, Literal, TypedDict, final
 from uuid import UUID
@@ -20,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from sqlalchemy import Engine
 
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.schema import FieldDefinition, get_aggregation_contract_options, get_raw_schema_config
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
@@ -102,7 +101,6 @@ from elspeth.web.composer.tools._generation_schema_response import PLUGIN_SCHEMA
 from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
     _locked_read_ready_blob,
-    _verify_blob_content_integrity,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -2668,6 +2666,7 @@ _BLOCKING_DIAGNOSTIC_CODES: Final[frozenset[str]] = frozenset(
         "gate_expression_unbounded_string_amplification",
         "text_source_url_without_web_scrape",
         "source_inspection_failed",
+        "source_blob_unavailable",
     }
 )
 _MAX_PROOF_BLOB_SOURCES: Final[int] = 256
@@ -2677,23 +2676,14 @@ _MAX_DECLARED_INPUT_TYPE_DIAGNOSTICS: Final[int] = 16
 
 @dataclass(frozen=True, slots=True)
 class ResolvedProofBlob:
-    """One custody-resolved blob and optional verified bounded content."""
+    """One custody-resolved blob with verified bounded content."""
 
     metadata: BlobToolRecord
-    verified_prefix: bytes | None = None
-    verified_content_hash: str | None = None
-    total_size_bytes: int | None = None
+    verified_prefix: bytes
+    verified_content_hash: str
+    total_size_bytes: int
 
     def __post_init__(self) -> None:
-        supplied = (
-            self.verified_prefix is not None,
-            self.verified_content_hash is not None,
-            self.total_size_bytes is not None,
-        )
-        if any(supplied) and not all(supplied):
-            raise TypeError("verified proof bytes, content hash, and total size must be supplied together")
-        if not any(supplied):
-            return
         if type(self.verified_prefix) is not bytes or len(self.verified_prefix) > 8 * 1024:
             raise TypeError("verified proof prefix must be exact bytes bounded to 8192 bytes")
         if type(self.verified_content_hash) is not str:
@@ -2723,6 +2713,98 @@ class UnresolvedClaimedProofBlob:
     resolver union with the house ``type(x) is C`` idiom, which only narrows the
     negative branch to ``ResolvedProofBlob`` because this marker cannot be subclassed.
     """
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ComposerProofContext:
+    """Complete dependencies for proof through the existing fenced blob reader.
+
+    This carrier grants no authority; the reader still verifies the operation
+    against the store under its normal custody lock.
+    """
+
+    session_engine: Engine
+    session_id: str
+    data_dir: str
+    operation: SessionOperationContext
+    authority: SessionOperationAuthority
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not SessionOperationContext or self.authority is None:
+            raise AuditIntegrityError("Source proof requires the actual session operation context and authority")
+        if self.operation.fence.session_id != self.session_id:
+            raise AuditIntegrityError("Source proof context does not match the requested store")
+        if not isinstance(self.session_engine, Engine):
+            raise TypeError("Source proof requires a session Engine")
+        if type(self.data_dir) is not str or not self.data_dir:
+            raise TypeError("Source proof requires a storage root")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _AuthoritativeProofContext:
+    """Resolver captured by the execution owner's exact custody factory."""
+
+    resolve: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ProofNotApplicable:
+    """No source claims scalar blob content; no proof was performed."""
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ProofEvaluated:
+    """Bounded proof diagnostics were evaluated, including configuration faults."""
+
+    diagnostics: tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "diagnostics")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ProofUnavailable:
+    """At least one claimed source could not supply verified ready evidence."""
+
+    diagnostics: tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        if not any(d["code"] == "source_blob_unavailable" and d["severity"] == "blocking" for d in self.diagnostics):
+            raise AuditIntegrityError("Unavailable source proof requires a blocking availability diagnostic")
+        freeze_fields(self, "diagnostics")
+
+
+class MalformedSourceProofClaim(ValueError):
+    """A present scalar claim is invalid; raw authored values are never retained."""
+
+    def __init__(self, source_name: str, reason: str) -> None:
+        self.source_name = source_name
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _admit_source_proof_claims(state: CompositionState) -> tuple[tuple[str, SourceSpec, str], ...]:
+    """Admit every present scalar identity before any metadata or byte read."""
+    claims: list[tuple[str, SourceSpec, str]] = []
+    for name, source in state.sources.items():
+        if "blob_ref" not in source.options:
+            continue
+        raw = source.options["blob_ref"]
+        if type(raw) is not str:
+            raise MalformedSourceProofClaim(name, "The source blob claim must be an exact canonical UUID string.")
+        try:
+            parsed = UUID(raw)
+        except ValueError:
+            raise MalformedSourceProofClaim(name, "The source blob claim must be a canonical UUID string.") from None
+        if str(parsed) != raw:
+            raise MalformedSourceProofClaim(name, "The source blob claim must use canonical UUID spelling.")
+        claims.append((name, source, raw))
+    return tuple(claims)
 
 
 class _BlockingDiagnosticPayload(TypedDict):
@@ -3623,7 +3705,7 @@ def _compute_proof_diagnostics_for_source(
     *,
     source_name: str,
     source: SourceSpec,
-    blob_id: object,
+    blob_id: str,
     blob_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None],
     declared_input_type_budget: _DeclaredInputTypeProofBudget,
 ) -> list[Mapping[str, Any]]:
@@ -3678,49 +3760,30 @@ def _compute_proof_diagnostics_for_source(
     """
     diagnostics: list[Mapping[str, Any]] = []
 
-    resolved_blob = blob_resolver(str(blob_id))
-    if type(resolved_blob) is UnresolvedClaimedProofBlob:
+    resolved_blob = blob_resolver(blob_id)
+    if resolved_blob is None or type(resolved_blob) is UnresolvedClaimedProofBlob:
         return [
             _blocking_diagnostic(
-                code="source_inspection_failed",
-                message=("This source claims blob custody, but the live blob is not an exact ready, session-owned path match."),
-                suggested_repair="Re-select or re-upload the source blob, then validate the pipeline again.",
-                evidence_locator={"source": "blob", "blob_id": str(blob_id)},
+                code="source_blob_unavailable",
+                message="The claimed source content could not be verified as ready for this request.",
+                suggested_repair=(
+                    "Inspect the intended artifact through authenticated blob discovery and resolve its availability before retrying. "
+                    "Retain the intended binding; do not fabricate or assume empty source content."
+                ),
+                evidence_locator={"source": "blob", "blob_id": blob_id},
             )
         ]
-    blob = None if resolved_blob is None else resolved_blob.metadata
+    if type(resolved_blob) is not ResolvedProofBlob:
+        raise TypeError("Source proof resolver returned an unowned evidence type")
+    blob = resolved_blob.metadata
     # ``blob`` is a BlobToolRecord (TypedDict produced by
     # ``_blob_row_to_tool_dict`` from a validated blobs row). Direct
     # subscript access is mandatory — a missing key is a Tier-1
     # contract violation in our own dict shape, not external data.
-    if blob is None or blob["status"] != "ready":
-        return diagnostics
-    assert resolved_blob is not None
-
-    if resolved_blob.verified_prefix is None:
-        storage_path = Path(blob["storage_path"])
-        if not storage_path.exists():
-            diagnostics.append(
-                _blocking_diagnostic(
-                    code="source_inspection_failed",
-                    message=(f"Source blob '{blob_id}' storage file is missing — pipeline cannot run until the blob is re-uploaded."),
-                    suggested_repair="create_blob with the original content and re-wire via set_source_from_blob",
-                    evidence_locator={"source": "blob", "blob_id": str(blob_id)},
-                )
-            )
-            return diagnostics
-
-        # Existing Composer-engine behavior: read and verify the complete local
-        # file. Authoritative validate/execute callers instead supply the
-        # BlobService's already-verified 8 KiB prefix to avoid full-file memory
-        # use and a metadata/path TOCTOU seam.
-        content = storage_path.read_bytes()
-        _verify_blob_content_integrity(blob, content)
-        total_size_bytes = len(content)
-    else:
-        content = resolved_blob.verified_prefix
-        assert resolved_blob.total_size_bytes is not None
-        total_size_bytes = resolved_blob.total_size_bytes
+    if blob["status"] != "ready":
+        raise AuditIntegrityError("Resolved source proof evidence is not ready")
+    content = resolved_blob.verified_prefix
+    total_size_bytes = resolved_blob.total_size_bytes
 
     facts = inspect_blob_content(
         content=content,
@@ -4153,27 +4216,63 @@ def _attribute_proof_diagnostic_to_source(
 def compute_proof_diagnostics(
     state: CompositionState,
     *,
-    session_engine: Engine | None = None,
-    session_id: str | None = None,
-    data_dir: str | None = None,
-    session_operation_context: SessionOperationContext | None = None,
-    session_operation_authority: SessionOperationAuthority | None = None,
-    blob_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None] | None = None,
-) -> list[Mapping[str, Any]]:
+    context: ComposerProofContext | _AuthoritativeProofContext | None,
+) -> ProofNotApplicable | ProofEvaluated | ProofUnavailable:
     """Inspect every blob-backed source within the authored-source proof cap.
 
     Each source gets an independent custody resolution and bounded 8 KiB
     inspection. Pipelines above the explicit cap block deterministically rather
     than silently marking a partially inspected topology as proof-passed.
-    Composer callers supply ``session_engine``/``session_id``; authoritative
-    execution supplies the BlobService-backed ``blob_resolver``.
+    Composer supplies its complete fenced reader context; execution supplies
+    the nominal context captured by its authoritative BlobService factory.
     """
-    if session_id is None:
-        return []
-    effective_resolver = blob_resolver
-    if effective_resolver is None:
-        if session_engine is None:
-            return []
+    if context is not None and type(context) not in (ComposerProofContext, _AuthoritativeProofContext):
+        raise TypeError("Source proof requires an owned proof context or explicit absence")
+    blob_sources = _admit_source_proof_claims(state)
+    if not blob_sources:
+        return ProofNotApplicable()
+
+    if len(blob_sources) > _MAX_PROOF_BLOB_SOURCES:
+        return ProofEvaluated(
+            (
+                _blocking_diagnostic(
+                    code="source_inspection_failed",
+                    message=(
+                        f"Pipeline has {len(blob_sources)} blob-backed sources, exceeding the bounded proof "
+                        f"limit of {_MAX_PROOF_BLOB_SOURCES}; no partial proof was admitted."
+                    ),
+                    suggested_repair=(
+                        f"Reduce the pipeline to at most {_MAX_PROOF_BLOB_SOURCES} blob-backed sources or partition "
+                        "it into separately validated pipelines, then re-run preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "pipeline",
+                        "blob_source_count": len(blob_sources),
+                        "max_blob_sources": _MAX_PROOF_BLOB_SOURCES,
+                    },
+                ),
+            )
+        )
+    if context is None:
+        return ProofUnavailable(
+            tuple(
+                _attribute_proof_diagnostic_to_source(
+                    _blocking_diagnostic(
+                        code="source_blob_unavailable",
+                        message="Authenticated source-proof context is unavailable for this request; source content was not verified.",
+                        suggested_repair=(
+                            "Restore the authenticated session and storage context before retrying. "
+                            "Retain the intended source binding; do not rewrite the graph to supply missing infrastructure."
+                        ),
+                        evidence_locator={"source": "blob", "blob_id": blob_id},
+                    ),
+                    source_name=source_name,
+                )
+                for source_name, _source, blob_id in blob_sources
+            )
+        )
+    effective_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]
+    if type(context) is ComposerProofContext:
 
         def _resolve_from_composer_store(resolved_blob_id: str) -> ResolvedProofBlob | None:
             # Row + bytes observed as ONE version under the session custody
@@ -4181,19 +4280,15 @@ def compute_proof_diagnostics(
             # file swap would escalate a false BlobIntegrityError
             # (elspeth-3d1d1fcb6c).
             metadata, content = _locked_read_ready_blob(
-                session_engine,
-                session_id,
+                context.session_engine,
+                context.session_id,
                 resolved_blob_id,
-                data_dir=data_dir,
-                session_operation_context=session_operation_context,
-                session_operation_authority=session_operation_authority,
+                data_dir=context.data_dir,
+                session_operation_context=context.operation,
+                session_operation_authority=context.authority,
             )
-            if metadata is None:
+            if metadata is None or content is None:
                 return None
-            if content is None:
-                # Not ready, or storage file missing — metadata-only
-                # resolution; downstream emits the matching diagnostic.
-                return ResolvedProofBlob(metadata=metadata)
             stored_hash = metadata["content_hash"]
             if stored_hash is None:
                 raise AuditIntegrityError("ready proof blob has null content_hash")
@@ -4205,50 +4300,16 @@ def compute_proof_diagnostics(
             )
 
         effective_resolver = _resolve_from_composer_store
+    else:
+        effective_resolver = context.resolve
 
     uncached_resolver = effective_resolver
-    resolved_by_blob_id: dict[tuple[str, str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None] = {}
+    resolved_by_blob_id: dict[str, ResolvedProofBlob | UnresolvedClaimedProofBlob | None] = {}
 
     def _memoized_resolver(resolved_blob_id: str) -> ResolvedProofBlob | UnresolvedClaimedProofBlob | None:
-        try:
-            parsed_blob_id = UUID(resolved_blob_id)
-        except ValueError:
-            cache_key = ("raw", resolved_blob_id)
-        else:
-            canonical_blob_id = str(parsed_blob_id)
-            cache_key = (
-                "uuid" if canonical_blob_id == resolved_blob_id else "noncanonical",
-                canonical_blob_id if canonical_blob_id == resolved_blob_id else resolved_blob_id,
-            )
-        if cache_key not in resolved_by_blob_id:
-            resolved_by_blob_id[cache_key] = uncached_resolver(resolved_blob_id)
-        return resolved_by_blob_id[cache_key]
-
-    blob_sources: list[tuple[str, SourceSpec, object]] = []
-    for source_name, source in state.sources.items():
-        blob_id = source.options["blob_ref"] if "blob_ref" in source.options else None
-        if blob_id is not None:
-            blob_sources.append((source_name, source, blob_id))
-
-    if len(blob_sources) > _MAX_PROOF_BLOB_SOURCES:
-        return [
-            _blocking_diagnostic(
-                code="source_inspection_failed",
-                message=(
-                    f"Pipeline has {len(blob_sources)} blob-backed sources, exceeding the bounded proof "
-                    f"limit of {_MAX_PROOF_BLOB_SOURCES}; no partial proof was admitted."
-                ),
-                suggested_repair=(
-                    f"Reduce the pipeline to at most {_MAX_PROOF_BLOB_SOURCES} blob-backed sources or partition "
-                    "it into separately validated pipelines, then re-run preview_pipeline."
-                ),
-                evidence_locator={
-                    "source": "pipeline",
-                    "blob_source_count": len(blob_sources),
-                    "max_blob_sources": _MAX_PROOF_BLOB_SOURCES,
-                },
-            )
-        ]
+        if resolved_blob_id not in resolved_by_blob_id:
+            resolved_by_blob_id[resolved_blob_id] = uncached_resolver(resolved_blob_id)
+        return resolved_by_blob_id[resolved_blob_id]
 
     diagnostics: list[Mapping[str, Any]] = []
     declared_input_type_budget = _DeclaredInputTypeProofBudget()
@@ -4279,7 +4340,9 @@ def compute_proof_diagnostics(
                 )
             )
             break
-    return diagnostics
+    if any(d["code"] == "source_blob_unavailable" and d["severity"] == "blocking" for d in diagnostics):
+        return ProofUnavailable(tuple(diagnostics))
+    return ProofEvaluated(tuple(diagnostics))
 
 
 def _runtime_preflight_not_run_error() -> ValidationEntryDict:
@@ -4421,6 +4484,36 @@ def _execute_preview_pipeline(
     explicit ``runtime_preflight_not_run`` entry naming the stage that did
     not run.
     """
+    operation = context.session_operation_context
+    if operation is not None:
+        if type(operation) is not SessionOperationContext:
+            raise AuditIntegrityError("Source proof requires the actual session operation context")
+        if context.session_id is not None and operation.fence.session_id != context.session_id:
+            raise AuditIntegrityError("Source proof context does not match the requested store")
+    proof_context = (
+        ComposerProofContext(
+            context.session_engine,
+            context.session_id,
+            context.data_dir,
+            operation,
+            context.session_operation_authority,
+        )
+        if context.session_engine is not None
+        and context.session_id is not None
+        and context.data_dir is not None
+        and operation is not None
+        and context.session_operation_authority is not None
+        else None
+    )
+    try:
+        _admit_source_proof_claims(state)
+    except MalformedSourceProofClaim as exc:
+        return _saved_graph_rejection_result(
+            state,
+            exc.reason,
+            error_code="source_blob_identity_invalid",
+            rejected_component=source_producer_id(exc.source_name),
+        )
     validation = context.catalog.validate_composition_state(state).validation
     _AUTHORING_VALIDATION_COUNTER.add(
         1,
@@ -4436,14 +4529,8 @@ def _execute_preview_pipeline(
         _structural_preview_block(state, context.structural_preflight(state)) if context.structural_preflight is not None else None
     )
 
-    proof_diagnostics = compute_proof_diagnostics(
-        state,
-        session_engine=context.session_engine,
-        session_id=context.session_id,
-        data_dir=context.data_dir,
-        session_operation_context=context.session_operation_context,
-        session_operation_authority=context.session_operation_authority,
-    )
+    proof = compute_proof_diagnostics(state, context=proof_context)
+    proof_diagnostics = () if type(proof) is ProofNotApplicable else proof.diagnostics
     has_blocking_proof = any(d["severity"] == "blocking" for d in proof_diagnostics)
 
     preview_is_valid = validation.is_valid
