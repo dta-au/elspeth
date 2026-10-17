@@ -148,7 +148,7 @@ describe("projectInlineSourceSummary", () => {
     await expect(
       projectInlineSourceSummary({
         metadata: makeBlobMetadata({ mime_type: "text/csv; charset=" }),
-        contentText: ONE_ROW_TEXT,
+        contentBytes: await new Response(ONE_ROW_TEXT).arrayBuffer(),
         toProvenance,
       }),
     ).rejects.toThrow(/invalid MIME metadata/i);
@@ -158,7 +158,7 @@ describe("projectInlineSourceSummary", () => {
     await expect(
       projectInlineSourceSummary({
         metadata: makeBlobMetadata({ content_hash: DIFFERENT_HASH }),
-        contentText: ONE_ROW_TEXT,
+        contentBytes: await new Response(ONE_ROW_TEXT).arrayBuffer(),
         toProvenance,
       }),
     ).rejects.toThrow(/content_hash mismatch/i);
@@ -173,7 +173,7 @@ describe("projectInlineSourceSummary", () => {
     await expect(
       projectInlineSourceSummary({
         metadata: makeBlobMetadata(),
-        contentText: ONE_ROW_TEXT,
+        contentBytes: await new Response(ONE_ROW_TEXT).arrayBuffer(),
         toProvenance: throwingMapper,
       }),
     ).rejects.toBe(projectionError);
