@@ -2808,7 +2808,7 @@ def _assert_affected_component(
     # A pending vague_term requirement is only a *resolvable* handoff when the
     # prompt actually carries the substitution wiring the resolver consumes. A
     # requirement staged without a matching ``prompt_template_parts``
-    # ``interpretation_ref`` (or legacy placeholder) produces a review the
+    # ``interpretation_ref`` produces a review the
     # operator can approve but never resolve — the resolver raises at
     # ``prompt_template_parts is required`` (a dead-end 422) or, worse, silently
     # drops the accepted value from the prompt. Reject at the Tier-3 boundary so
@@ -2818,9 +2818,9 @@ def _assert_affected_component(
             argument="affected_node_id",
             expected=(
                 f"node {affected_node_id!r} to wire the requested interpretation into the prompt — "
-                "exactly one prompt_template_parts entry "
-                '{"kind": "interpretation_ref", "requirement_id": "<the pending requirement id>"} '
-                "referencing the requirement, or exactly one legacy interpretation placeholder in options.prompt_template"
+                "one matching pending vague_term requirement with at least one matching interpretation_ref "
+                "in prompt_template_parts (repeated slots are supported); "
+                "legacy-only: exactly one placeholder with no matching pending vague_term requirement"
             ),
             actual_type=("pending vague_term requirement with no resolvable prompt wiring (the operator's resolve would dead-end)"),
         )
