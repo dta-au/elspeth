@@ -148,7 +148,9 @@ A shareable link goes through three distinct lifecycle phases.
 
 ### Mark-time
 
-The owner clicks **Share inspect link** in the composer UI. The backend:
+The owner performs **Save for review**, labelled **Share inspect link** in
+the composer UI (`POST /api/sessions/{session_id}/mark-ready-for-review`).
+The backend:
 
 1. Runs validation against the current composition state. Validation
    failures return HTTP 409 — the user fixes the errors and tries again.
@@ -169,21 +171,19 @@ the same instant.
 
 ### Re-mint-time (no new audit row)
 
-If the owner clicks **Share inspect link** again on the same composition
-state — for example, because they lost the URL — the backend reads the
-current state, rebuilds the snapshot, and mints a fresh token. Because
-the content is identical, the `payload_digest` is identical too;
-content-addressing in the payload store dedupes the blob automatically.
-The token string differs (different nonce + different mint-time), but it
-resolves to the same blob.
+`GET /api/sessions/{session_id}/shareable-link` mints a fresh token for
+the current composition state's existing mark-time snapshot. It reads the
+prior mark's `payload_digest` and requires that blob to still exist. The
+token string and expiry are fresh, but it resolves to the same frozen blob.
 
-No new audit row is written on re-mint — only the original mark-time
-write is the auditable decision. Re-mints are UI affordances.
+No audit row or blob is written on re-mint, and readiness is not recomputed.
+The original mark-time write remains the auditable decision.
 
-The `GET /api/sessions/{session_id}/shareable-link` route is the
-re-mint entry point. It re-runs the readiness snapshot, but normalises
-the snapshot's `checked_at` to the composition state's `created_at` so
-two re-mints on an unchanged composition produce the same digest.
+If the current state has no mark or its marked blob is missing, re-mint
+returns HTTP 409. The owner must **Save for review** again: this reruns
+validation, completion and readiness gates, records a new audit event, and
+stores a snapshot. Clicking **Share inspect link** invokes that mark-time
+operation rather than the re-mint GET.
 
 ### Resolve-time
 
@@ -242,8 +242,10 @@ they can read, not *whether they can read at all*).
    or config file).
 3. **Restart the web service.** The service will load the new key and
    reject every outstanding token immediately.
-4. **Notify users** that previously shared links have been invalidated;
-   they must re-mint by clicking **Share inspect link** again.
+4. **Notify users** that previously shared links have been invalidated.
+   The re-mint API can issue a token under the new key if the current
+   state's marked blob still exists. In the UI, click **Share inspect
+   link** to Save for review again, subject to the normal gates.
 
 There is no per-token revocation in v1 — rotation invalidates all.
 
@@ -256,14 +258,15 @@ a fresh link."
 
 1. The owner of the original session opens the composer at that
    session.
-2. The owner clicks **Share inspect link** again. This re-mints a fresh
-   token (the payload store stores the blob again under the same
-   digest).
+2. The owner performs **Save for review** again by clicking **Share inspect
+   link**. Resolve any validation, completion or readiness blockers first.
+   This records a new mark-time audit event and stores a new snapshot;
+   re-minting alone cannot restore a deleted blob.
 3. The owner sends the new URL to the reviewer.
 
-If the underlying composition has changed since the original mark, the
-new digest will differ from the original. The audit trail records both
-events distinctly.
+The new snapshot describes the current composition and newly computed
+readiness, not a recovery of the deleted historical snapshot. Send the URL
+returned by this new mark; the audit trail records both mark events.
 
 ### The sessions DB has been deleted (data loss event)
 
@@ -358,8 +361,8 @@ The re-mint route refuses when the current state has never been marked
 ready ("mark this composition ready for review before requesting a
 shareable link"), or when the mark-time audit row exists but its snapshot
 blob is gone from the payload store ("current composition state has not
-been marked ready for review"). Both are resolved by clicking **Save for
-review** again.
+been marked ready for review"). Both require **Save for review** again
+(the **Share inspect link** button), with its normal gates and audit write.
 
 ### `GET /sessions/shared/{token}` returns 401 unexpectedly
 
@@ -372,16 +375,17 @@ Ask the sender to re-mint and resend.
 
 ### `GET /sessions/shared/{token}` returns 404
 
-The payload store has reaped the blob. Ask the sender to re-mint.
+The payload store has reaped the blob. Ask the sender to **Save for review**
+again and send the newly returned URL. Re-minting cannot restore the blob.
 
 ## Frontend surfaces (post-Phase-6B)
 
 The user-facing entry points landed by Phase 6B:
 
 * **Completion bar** — `components/composer/CompletionBar.tsx`. Mounted
-  in the pipeline artifact action bar. Renders, in DOM order: Save for
-  review, Import YAML (only when the per-user `show_advanced`
-  preference is on), and Run pipeline. There is no Export YAML button —
+  in the pipeline artifact action bar. Renders, in DOM order: Share inspect
+  link (the Save-for-review operation), Import YAML (only when the per-user
+  `show_advanced` preference is on), and Run pipeline. There is no Export YAML button —
   export lives on the YAML artifact tab's Copy/Download controls and on
   the command palette (Ctrl+Shift+Y). Run pipeline is not co-equal: it
   carries the danger-family red fill and is isolated at the bar's right
