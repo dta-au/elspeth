@@ -42,9 +42,11 @@ from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardMode, PromptGuardTrust, detach_prompt_guard_messages
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record, safe_response_model, token_usage_from_response
+from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
 from elspeth.web.composer.provider_quota import ProviderCallCustody, provider_call_scope, required_provider_audit_scope
@@ -375,6 +377,8 @@ async def maybe_auto_title_session(
     temperature: float | None,
     seed: int | None,
     session_operation_context: SessionOperationContext,
+    prompt_guard_mount: PromptGuardMount | None,
+    prompt_guard_mode: PromptGuardMode,
     api_base: str | None = None,
     api_key: str | None = None,
     provider_custody: ProviderCallCustody | None = None,
@@ -396,8 +400,10 @@ async def maybe_auto_title_session(
         return
     if session_operation_context.fence.session_id != str(session_id):
         raise AuditIntegrityError("Auto-title session authority targets a different session")
-    audit_messages: list[dict[str, str]] = [
-        {"role": "system", "content": _AUTO_TITLE_SYSTEM_PROMPT},
+    if provider_custody is None:
+        raise AuditIntegrityError("Auto-title requires real fenced prompt-guard custody before model admission")
+    audit_messages: list[dict[str, str | PromptGuardTrust]] = [
+        {"role": "system", "content": _AUTO_TITLE_SYSTEM_PROMPT, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION},
         {"role": "user", "content": _build_auto_title_user_content(user_message)},
     ]
     kwargs: dict[str, Any] = {
@@ -413,108 +419,18 @@ async def maybe_auto_title_session(
     if seed is not None:
         kwargs["seed"] = seed
     _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
-    if provider_custody is not None:
-        await _maybe_auto_title_session_required(
-            service=service,
-            session_id=session_id,
-            model=model,
-            temperature=temperature,
-            seed=seed,
-            session_operation_context=session_operation_context,
-            kwargs=kwargs,
-            audit_messages=audit_messages,
-            provider_custody=provider_custody,
-        )
-        return
-    admission = asyncio.create_task(
-        service.begin_provider_attempt(session_operation_context=session_operation_context, source="auto_title")
-    )
-    try:
-        attempt, interrupted = await _join_auto_title_custody_task(
-            admission,
-            child_cancel_message="Auto-title provider admission was cancelled before its outcome was known",
-        )
-    except ChargeableAdmissionRefused as exc:
-        if exc.decision.refusal_reason is None:
-            raise AuditIntegrityError("Refused auto-title admission has no refusal reason") from exc
-        _AUTO_TITLE_ADMISSION_REFUSED_COUNTER.add(1, {"reason": exc.decision.refusal_reason.value})
-        return
-    if interrupted is not None:
-        closure = asyncio.create_task(
-            service.cancel_undispatched_provider_attempt(
-                session_operation_context=session_operation_context,
-                attempt_id=attempt.attempt_id,
-                requested_model=model,
-            )
-        )
-        await _join_auto_title_custody_task(
-            closure,
-            primary_cancellation=interrupted,
-            child_cancel_message="Auto-title undispatched attempt closure was cancelled before durable completion",
-        )
-        raise interrupted
-    response: object | None = None
-    try:
-        try:
-            response = await provider_gateway._litellm_acompletion(on_provider_dispatch=None, **kwargs)
-        except httpx.TransportError as exc:
-            raise _AutoTitleProviderTransportError("Auto-title provider transport failed") from exc
-        admitted = _admit_auto_title_completion(response)
-    except asyncio.CancelledError as exc:
-        await _charge_auto_title_response(
-            service,
-            session_operation_context,
-            model=model,
-            response=exc,
-            attempt_id=attempt.attempt_id,
-            recorded_at=datetime.now(UTC),
-            primary_cancellation=exc,
-        )
-        _record_auto_title_failure(exc)
-        raise
-    except (OpenAIError, _AutoTitleProviderTransportError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
-        # Auto-titling is best-effort UI metadata for expected provider/
-        # scheduling failures, but those failures still need an operational
-        # signal so "provider declined" does not look identical to "feature
-        # silently broke."
-        await _charge_auto_title_response(
-            service,
-            session_operation_context,
-            model=model,
-            response=exc if response is None else response,
-            attempt_id=attempt.attempt_id,
-            recorded_at=datetime.now(UTC),
-        )
-        _record_auto_title_failure(exc)
-        return
-    except Exception as exc:
-        # A dispatched call remains chargeable even if our own parsing or
-        # provider adapter fails unexpectedly. Keep the original first-party
-        # failure visible after accounting, without calling it provider weather.
-        await _charge_auto_title_response(
-            service,
-            session_operation_context,
-            model=model,
-            response=exc if response is None else response,
-            attempt_id=attempt.attempt_id,
-            recorded_at=datetime.now(UTC),
-        )
-        raise
-    await _charge_auto_title_response(
-        service, session_operation_context, model=model, response=response, attempt_id=attempt.attempt_id, recorded_at=datetime.now(UTC)
-    )
-    if admitted.content is None:
-        return
-    candidate = _admit_title_candidate(admitted.content)
-    if isinstance(candidate, _RejectedTitle):
-        _record_auto_title_rejection(candidate.rejection_class, admitted.finish_reason)
-        return
-    # Persistence is outside the provider recovery boundary: a database
-    # timeout is a failed write, not an unavailable model response.
-    await service.update_session_title(
-        session_id,
-        candidate,
+    await _maybe_auto_title_session_required(
+        service=service,
+        session_id=session_id,
+        model=model,
+        temperature=temperature,
+        seed=seed,
         session_operation_context=session_operation_context,
+        kwargs=kwargs,
+        audit_messages=audit_messages,
+        provider_custody=provider_custody,
+        prompt_guard_mount=prompt_guard_mount,
+        prompt_guard_mode=prompt_guard_mode,
     )
 
 
@@ -527,8 +443,10 @@ async def _maybe_auto_title_session_required(
     seed: int | None,
     session_operation_context: SessionOperationContext,
     kwargs: Mapping[str, Any],
-    audit_messages: Sequence[Mapping[str, str]],
+    audit_messages: Sequence[Mapping[str, str | PromptGuardTrust]],
     provider_custody: ProviderCallCustody,
+    prompt_guard_mount: PromptGuardMount | None,
+    prompt_guard_mode: PromptGuardMode,
 ) -> None:
     if (
         type(provider_custody) is not ProviderCallCustody
@@ -539,6 +457,8 @@ async def _maybe_auto_title_session_required(
     provider_custody.required_work.validate_context(session_operation_context)
     if kwargs["messages"] is not audit_messages:
         raise AuditIntegrityError("Auto-title request and audit messages must share their owned identity")
+    wire_messages, trusted_indexes = detach_prompt_guard_messages(audit_messages)
+    wire_kwargs = {**kwargs, "messages": wire_messages}
     started_at = datetime.now(UTC)
     started_ns = time.monotonic_ns()
     response: Any = None
@@ -549,7 +469,20 @@ async def _maybe_auto_title_session_required(
     try:
         async with provider_call_scope(provider_custody):
             try:
-                response = await provider_gateway._litellm_acompletion(provider_custody=provider_custody, **kwargs)
+                try:
+                    response = await provider_gateway._litellm_acompletion(
+                        provider_custody=provider_custody,
+                        prompt_guard_mount=prompt_guard_mount,
+                        prompt_guard_mode=prompt_guard_mode,
+                        prompt_guard_role="composer",
+                        prompt_guard_user_prompt=wire_messages[-1]["content"],
+                        prompt_guard_trusted_message_indexes=trusted_indexes,
+                        **wire_kwargs,
+                    )
+                except httpx.TransportError as exc:
+                    # Only the physical await establishes provider transport
+                    # weather. HTTP-shaped parser faults remain first party.
+                    raise _AutoTitleProviderTransportError from exc
                 admitted = _admit_auto_title_completion(response)
                 status = ComposerLLMCallStatus.SUCCESS
             except asyncio.CancelledError as exc:
@@ -576,7 +509,7 @@ async def _maybe_auto_title_session_required(
                     if status is not None and provider_custody.needs_terminal_audit():
                         call = build_llm_call_record(
                             model_requested=model,
-                            messages=audit_messages,
+                            messages=wire_messages,
                             tools=None,
                             status=status,
                             started_at=started_at,
@@ -594,7 +527,7 @@ async def _maybe_auto_title_session_required(
             raise AuditIntegrityError("Refused auto-title admission has no refusal reason") from exc
         _AUTO_TITLE_ADMISSION_REFUSED_COUNTER.add(1, {"reason": exc.decision.refusal_reason.value})
         return
-    except (OpenAIError, httpx.TransportError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
+    except (OpenAIError, _AutoTitleProviderTransportError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
         _record_auto_title_failure(exc)
         return
     if admitted is None or admitted.content is None:

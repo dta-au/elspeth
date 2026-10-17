@@ -1,18 +1,20 @@
-"""The composer boot probe sends the requests production sends (plan S0, boot probe).
+"""Pure boot request descriptions match fenced production requests (plan S0).
 
-A boot probe that sends different request options from the real composer proves
+A request description with different options from the real composer proves
 nothing about the route production uses. These tests capture the exact LiteLLM
 kwargs of two real ``compose()`` turns (the freeform tool loop and the pipeline
 planner) through the ``litellm.acompletion`` seam, and compare them with the
-probe's requests built from the same settings.
+descriptions built from the same settings. Sessionless probes themselves skip
+paid verification: neither mode has durable lifecycle audit custody at boot.
+The expected wire includes the gateway's explicit OpenRouter identity and usage
+opt-in, asserted here independently of the gateway's shaping functions.
 
 Excluded from the comparison, and why:
 
 - ``messages``: the probe sends its own one-line prompt.
 - ``max_tokens`` on the loop request only: ``_call_llm`` sends none, and the
-  probe caps its reply at 16 tokens (a 200 with a truncated reply still proves
-  acceptance). The planner request sends the planner's own cap, so it is
-  compared.
+  description caps its reply at 16 tokens. The planner request describes the
+  planner's own cap, so it is compared. These tests make no live acceptance claim.
 - ``tools`` on the planner request: production sends a request-scoped
   discovery subset and terminal contract, and the probe sends the default
   ``planner_tool_definitions()``. The planner tool *names* production sent are
@@ -36,7 +38,8 @@ from sqlalchemy.pool import StaticPool
 
 import elspeth.web.composer.pipeline_planner as planner_module
 import elspeth.web.composer.provider_gateway as gateway_module
-from elspeth.web.composer.boot_probe import ComposerProbeRequest, build_composer_probe_requests
+from elspeth.plugins.transforms.llm.providers.openrouter import OPENROUTER_APP_REFERER, OPENROUTER_APP_TITLE
+from elspeth.web.composer.boot_probe import build_composer_probe_requests, probe_composer_config
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
@@ -97,6 +100,7 @@ def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
         "composer_discovery_reasoning_effort": "medium",
         "composer_candidate_reasoning_effort": "medium",
         "composer_boot_probe_enabled": False,
+        "composer_prompt_guard_mode": "debug-when-unconfigured",
         "composer_max_composition_turns": 3,
         "composer_max_discovery_turns": 2,
         "composer_timeout_seconds": 20.0,
@@ -204,34 +208,67 @@ async def _run_production_turn(
         return _Response(choices=[_Choice(message=_Message(content="I can help you build a pipeline.", tool_calls=[]))], usage=_usage())
 
     monkeypatch.setattr("litellm.acompletion", completion)
-    result = await composer.compose(
-        message,
-        [],
-        CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-        session_id=str(session.id),
-        user_id="parity-user",
-        user_message_id=str(user_message.id),
-    )
+    # The integration conftest's real lease adapter binds this exact persisted
+    # session/service to required work and provider custody, then joins before
+    # closing the COMPOSE lease. Only the physical SDK is replaced above.
+    try:
+        result = await composer.compose(
+            message,
+            [],
+            CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+            session_id=str(session.id),
+            user_id="parity-user",
+            user_message_id=str(user_message.id),
+        )
+    finally:
+        engine.dispose()
     return requests, composer, result
 
 
-async def _capture_probe_requests(monkeypatch: pytest.MonkeyPatch, settings: WebSettings) -> dict[str, dict[str, Any]]:
-    """The probe's requests, after the same ``_litellm_acompletion`` shaping production gets."""
-    import elspeth.web.composer.boot_probe as boot_probe
+def _expected_planner_wire_requests(settings: WebSettings) -> dict[str, dict[str, Any]]:
+    """Describe planner wire options without invoking a sessionless probe."""
+    described: dict[str, dict[str, Any]] = {}
+    for request in build_composer_probe_requests(settings):
+        if request.role == "planner":
+            kwargs = request.to_litellm_kwargs()
+            if request.model.startswith("openrouter/"):
+                kwargs["extra_headers"] = {
+                    "HTTP-Referer": OPENROUTER_APP_REFERER,
+                    "X-OpenRouter-Title": OPENROUTER_APP_TITLE,
+                    "X-Title": OPENROUTER_APP_TITLE,
+                }
+                kwargs["usage"] = {"include": True}
+            described[request.surface] = kwargs
+    return described
 
-    captured: dict[str, dict[str, Any]] = {}
-    requests: tuple[ComposerProbeRequest, ...] = build_composer_probe_requests(settings)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
+async def test_sessionless_probe_is_not_qualified_and_calls_neither_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    settings = _settings(tmp_path, composer_prompt_guard_mode=mode, composer_advisor_model=_ADVISOR)
+    sdk_calls: list[object] = []
+    guard_calls: list[object] = []
+
+    async def forbid_sdk(**kwargs):
+        sdk_calls.append(kwargs)
+        raise AssertionError("sessionless probe called the model")
+
+    async def forbid_guard(*args, **kwargs):
+        guard_calls.append((args, kwargs))
+        raise AssertionError("sessionless probe called the guard")
+
+    monkeypatch.setattr("litellm.acompletion", forbid_sdk)
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", forbid_guard)
+    monkeypatch.setattr(gateway_module, "enforce_prompt_guard", forbid_guard)
+    requests = build_composer_probe_requests(settings)
+    assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
 
     for request in requests:
+        assert await probe_composer_config(request) is None
 
-        async def completion(*, _surface: str = request.surface, **kwargs: Any) -> _Response:
-            captured[_surface] = kwargs
-            return _Response(choices=[_Choice(message=_Message(content="ok", tool_calls=[]))], usage=_usage())
-
-        monkeypatch.setattr("litellm.acompletion", completion)
-        if request.role == "planner":
-            await boot_probe.probe_composer_config(request)
-    return captured
+    assert sdk_calls == guard_calls == []
 
 
 def _without(kwargs: Mapping[str, Any], *keys: str) -> dict[str, Any]:
@@ -251,10 +288,10 @@ def _planner_request(requests: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_loop_tools_probe_sends_the_compose_loop_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_loop_tools_description_matches_the_fenced_compose_loop_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(tmp_path)
     production = _loop_request(await _capture_production_requests(tmp_path, monkeypatch, settings, message="What can you help me build?"))
-    probe = (await _capture_probe_requests(monkeypatch, settings))["loop_tools"]
+    probe = _expected_planner_wire_requests(settings)["loop_tools"]
 
     assert "reasoning" in production, "control: the compared request must carry a reasoning kwarg"
     assert probe["max_tokens"] == 16
@@ -262,12 +299,14 @@ async def test_loop_tools_probe_sends_the_compose_loop_request(tmp_path: Path, m
 
 
 @pytest.mark.asyncio
-async def test_planner_tools_probe_sends_the_pipeline_planner_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_planner_tools_description_matches_the_fenced_pipeline_planner_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings = _settings(tmp_path)
     production = _planner_request(
         await _capture_production_requests(tmp_path, monkeypatch, settings, message="Build a CSV to JSONL pipeline.")
     )
-    probe = (await _capture_probe_requests(monkeypatch, settings))["planner_tools"]
+    probe = _expected_planner_wire_requests(settings)["planner_tools"]
 
     assert "reasoning" in production, "control: the compared request must carry a reasoning kwarg"
     assert production["max_tokens"] == settings.composer_planner_max_completion_tokens
@@ -283,7 +322,7 @@ async def test_mutation_control_dropped_reasoning_makes_the_loop_comparison_red(
     settings = _settings(tmp_path)
     production = _loop_request(await _capture_production_requests(tmp_path, monkeypatch, settings, message="What can you help me build?"))
     monkeypatch.setattr(gateway_module, "apply_reasoning_kwargs", lambda _kwargs, **_ignored: None)
-    probe = (await _capture_probe_requests(monkeypatch, settings))["loop_tools"]
+    probe = _expected_planner_wire_requests(settings)["loop_tools"]
 
     assert "reasoning" not in probe
     assert _without(probe, "messages", "max_tokens") != _without(production, "messages")
@@ -296,7 +335,7 @@ async def test_mutation_control_dropped_reasoning_makes_the_planner_comparison_r
         await _capture_production_requests(tmp_path, monkeypatch, settings, message="Build a CSV to JSONL pipeline.")
     )
     monkeypatch.setattr(planner_module, "apply_reasoning_kwargs", lambda _kwargs, **_ignored: None)
-    probe = (await _capture_probe_requests(monkeypatch, settings))["planner_tools"]
+    probe = _expected_planner_wire_requests(settings)["planner_tools"]
 
     assert "reasoning" not in probe
     assert _without(probe, "messages", "tools") != _without(production, "messages", "tools")
@@ -309,7 +348,7 @@ async def test_mutation_control_changed_planner_token_cap_makes_the_comparison_r
         await _capture_production_requests(tmp_path, monkeypatch, settings, message="Build a CSV to JSONL pipeline.")
     )
     mutated = _settings(tmp_path, composer_planner_max_completion_tokens=settings.composer_planner_max_completion_tokens - 1)
-    probe = (await _capture_probe_requests(monkeypatch, mutated))["planner_tools"]
+    probe = _expected_planner_wire_requests(mutated)["planner_tools"]
 
     assert probe["max_tokens"] != production["max_tokens"]
     assert _without(probe, "messages", "tools") != _without(production, "messages", "tools")
@@ -353,10 +392,10 @@ def _hatch_call(recorded: list[Any]) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_probe_and_production_send_the_same_strict_flags_on_a_forwarding_route(
+async def test_description_and_production_have_the_same_strict_flags_on_a_forwarding_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Both routes resolve ``openai_strict``; the probe's stamps equal production's on every surface.
+    """Both routes resolve ``openai_strict``; described stamps equal production's on every surface.
 
     Controls: stamp the probe's loop list with ``NONE`` and it goes red; stamp
     the probe's planner list with ``NONE`` and it goes red.
@@ -372,7 +411,7 @@ async def test_probe_and_production_send_the_same_strict_flags_on_a_forwarding_r
     planner_requests, composer, _result = await _run_production_turn(
         tmp_path, monkeypatch, settings, message="Build a CSV to JSONL pipeline.", reach_the_hatch=True
     )
-    probe = await _capture_probe_requests(monkeypatch, settings)
+    probe = _expected_planner_wire_requests(settings)
 
     assert composer.tool_contract_summary.contract == resolve_composer_tool_contract(settings, env=os.environ)
     assert [tool["function"]["strict"] for tool in probe["loop_tools"]["tools"]] == [
@@ -399,7 +438,7 @@ async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_not_the_planner
     """Codex finding 3, direction (i): planner row 4 (FORWARDING) + advisor row 5 (NONE, a proxy base).
 
     Each ``NONE`` side comes from the routing table, not from D8's Anthropic
-    short-circuit. No hatch probe is sent, and the hatch turn goes to the
+    short-circuit. No hatch request is described, and the hatch turn goes to the
     proxy with today's bytes. Direction (ii) is the next test. Control:
     substitute the planner's dialect for the hatch dialect (the probe's
     inclusion check and the service's escape-hatch dialect) and both
@@ -413,7 +452,7 @@ async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_not_the_planner
         composer_advisor_endpoint_base_url=_PROXY,
         composer_advisor_endpoint_api_key=_PROXY_KEY,
     )
-    probe_i = await _capture_probe_requests(monkeypatch, settings_i)
+    probe_i = _expected_planner_wire_requests(settings_i)
     assert set(probe_i) == {"loop_tools", "planner_tools"}
     assert True in _strict_map(probe_i["loop_tools"]["tools"]).values()
     assert True in _strict_map(probe_i["planner_tools"]["tools"]).values()
@@ -437,7 +476,7 @@ async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_when_only_the_h
 ) -> None:
     """Codex finding 3, direction (ii): planner row 5 (NONE, a proxy base) + advisor row 4 (FORWARDING).
 
-    The hatch probe is sent to the advisor's effective endpoint (no
+    The hatch request describes the advisor's effective endpoint (no
     ``api_base``: OpenRouter's default), not the planner's proxy, with the
     terminal as ``strict: false``; the planner lists carry no ``strict`` key;
     a production hatch turn sends the same terminal to the same endpoint.
@@ -448,7 +487,7 @@ async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_when_only_the_h
         composer_endpoint_api_key=_PROXY_KEY,
         composer_advisor_model=_ADVISOR,
     )
-    probe_ii = await _capture_probe_requests(monkeypatch, settings_ii)
+    probe_ii = _expected_planner_wire_requests(settings_ii)
     assert set(probe_ii) == {"loop_tools", "planner_tools", "hatch_terminal"}
     assert set(_strict_map(probe_ii["loop_tools"]["tools"]).values()) == {"omitted"}
     assert set(_strict_map(probe_ii["planner_tools"]["tools"]).values()) == {"omitted"}

@@ -18,6 +18,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardTrust, detach_prompt_guard_messages
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
@@ -71,6 +72,7 @@ from elspeth.web.composer.no_tool_policy import (
 )
 from elspeth.web.composer.pipeline_planner import PlannerContinuationBudget, PlannerContinuationUnavailable
 from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emit_progress
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
@@ -222,6 +224,7 @@ class AdvisorCheckpointOwner:
         advisor_endpoint_api_key: str | None,
         sessions_service: SessionServiceProtocol | None,
         chargeable_admission: ComposerChargeableAdmission,
+        prompt_guard_mount: PromptGuardMount | None = None,
     ) -> None:
         self._settings = settings
         self._composer_skill_text = composer_skill_text
@@ -229,6 +232,9 @@ class AdvisorCheckpointOwner:
         self._advisor_endpoint_api_key = advisor_endpoint_api_key
         self._sessions_service = sessions_service
         self._chargeable_admission = chargeable_admission
+        self._prompt_guard_mount = (
+            prompt_guard_mount if prompt_guard_mount is not None else build_prompt_guard_mount(settings.composer_advisor_prompt_guard)
+        )
 
     def _require_sessions_service(self) -> SessionServiceProtocol:
         if self._sessions_service is None:
@@ -377,7 +383,7 @@ class AdvisorCheckpointOwner:
             raise InvariantError("Advisor input exceeded its admitted complete-message budget")
 
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_msg},
+            {"role": "system", "content": system_msg, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION},
             {"role": "user", "content": user_msg},
         ]
         if self._composer_skill_text and supports_anthropic_prompt_cache_markers(advisor_model):
@@ -412,15 +418,20 @@ class AdvisorCheckpointOwner:
             structured_output=structured_output,
             checkpoint_phase=checkpoint_phase,
         )
+        messages, trusted_indexes = detach_prompt_guard_messages(messages)
         kwargs["messages"] = messages
         private_request = capture_provider_context(messages=messages, tools=None)
         try:
             response = await asyncio.wait_for(
                 provider_gateway._litellm_acompletion(
-                    provider_custody=provider_custody, on_provider_dispatch=on_provider_dispatch, **kwargs
-                )
-                if provider_custody is not None
-                else provider_gateway._litellm_acompletion(on_provider_dispatch=on_provider_dispatch, **kwargs),
+                    provider_custody=provider_custody,
+                    on_provider_dispatch=on_provider_dispatch,
+                    prompt_guard_mount=self._prompt_guard_mount,
+                    prompt_guard_mode=self._settings.composer_prompt_guard_mode,
+                    prompt_guard_role="advisor",
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    **kwargs,
+                ),
                 timeout=effective_timeout,
             )
             message, tool_calls, response_metadata = _capture_composer_llm_completion_fields(
@@ -477,6 +488,8 @@ class AdvisorCheckpointOwner:
                 "latency_ms": (time.monotonic_ns() - started_ns) // 1_000_000,
             }
             return guidance, metadata
+        except PromptGuardRefused:
+            raise
         except TimeoutError:
             status = ComposerLLMCallStatus.TIMEOUT
             error_class = "TimeoutError"
@@ -1148,19 +1161,6 @@ class AdvisorCheckpointOwner:
             return verdict
 
         await emit_progress(progress, advisor_checkpoint_progress_event(phase))
-        if phase == "end":
-            prompt_injection_finding = _advisor_context.advisor_prompt_template_injection_finding(state, user_message=user_message)
-            if prompt_injection_finding is not None:
-                return await completed(
-                    AdvisorCheckpointVerdict(
-                        ok=True,
-                        blocking=True,
-                        findings_text=prompt_injection_finding.text,
-                        findings_backend_authored=True,
-                        repair_unactionable=prompt_injection_finding.user_message_surface,
-                    ),
-                    source="prescan",
-                )
         arguments = self._build_checkpoint_arguments(
             phase=phase,
             state=state,
@@ -1238,6 +1238,10 @@ class AdvisorCheckpointOwner:
                         provider_owner=provider_owner,
                         continuation_budget=continuation_budget,
                     )
+            except PromptGuardRefused as exc:
+                raise exc.with_evidence(
+                    state=state, initial_version=state.version, llm_calls=recorder.llm_calls if recorder is not None else ()
+                ) from exc
             except PlannerContinuationUnavailable:
                 return continuation_withheld()
             except _MalformedLLMResponseError as exc:

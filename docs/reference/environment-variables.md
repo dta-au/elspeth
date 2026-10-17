@@ -261,6 +261,10 @@ ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL=true
 
 Restart the web service after changing these settings.
 
+Composer and advisor also require independently configured authoring prompt
+guards. See [Composer prompt guard](composer-prompt-guard.md) for the Azure
+endpoint/credential objects and the explicit development mode.
+
 Composer credentials come from the web process environment, keyed by the
 inferred provider. Both the primary and the advisor contract must be
 satisfied:

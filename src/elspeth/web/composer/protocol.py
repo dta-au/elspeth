@@ -21,12 +21,15 @@ from pydantic import ValidationError as PydanticValidationError
 if TYPE_CHECKING:
     from pydantic import SecretStr
 
+    from elspeth.contracts.prompt_guard import PromptGuardMode
     from elspeth.contracts.session_operation import SessionOperationContext
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
-    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+    from elspeth.web.composer.prompt_guard import PromptGuardMount
+    from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationOwner
     from elspeth.web.composer.strict_transport import StrictToolsSetting
     from elspeth.web.execution.completion_gates import CompletionGateFacts
+    from elspeth.web.prompt_guard_config import PromptGuardSettings
     from elspeth.web.required_work import RequiredWorkBinding
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
@@ -1611,6 +1614,15 @@ class ComposerSettings(Protocol):
     def composer_model(self) -> str: ...
 
     @property
+    def composer_prompt_guard(self) -> PromptGuardSettings | None: ...
+
+    @property
+    def composer_advisor_prompt_guard(self) -> PromptGuardSettings | None: ...
+
+    @property
+    def composer_prompt_guard_mode(self) -> PromptGuardMode: ...
+
+    @property
     def composer_pricing_model(self) -> str | None: ...
 
     @property
@@ -1726,6 +1738,9 @@ class ComposerService(Protocol):
     no-tool assistant messages are still route-persisted (seam contract B).
     """
 
+    @property
+    def composer_prompt_guard_mount(self) -> PromptGuardMount | None: ...
+
     async def compose_recovery(
         self,
         *,
@@ -1799,6 +1814,7 @@ class ComposerService(Protocol):
         *,
         recorder: BufferingRecorder | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Explain a bounded run diagnostics snapshot without mutating state."""
         ...

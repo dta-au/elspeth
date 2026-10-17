@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretBytes, SecretStr, Valid
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+from elspeth.contracts.prompt_guard import PromptGuardMode
 from elspeth.core.config import PayloadStoreSettings, RateLimitSettings
 from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
 from elspeth.core.url_validation import validate_credential_safe_https_url
@@ -42,6 +43,7 @@ from elspeth.web.plugin_policy.profiles import (
     AWSTextractProfileSettings,
     AzureSearchProfileSettings,
 )
+from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 from elspeth.web.validation import (
     SERVER_SECRET_RESERVED_PREFIX,
@@ -256,6 +258,8 @@ class WebSettings(BaseModel):
         default=None
     )
     composer_model: str = "gpt-5.5"
+    composer_prompt_guard: PromptGuardSettings | None = Field(default=None, repr=False)
+    composer_prompt_guard_mode: PromptGuardMode = "required"
     composer_pricing_model: str | None = Field(
         default=None, min_length=1, description="LiteLLM catalog identity for missing-cost calculation; defaults to the routing model."
     )
@@ -395,6 +399,7 @@ class WebSettings(BaseModel):
     composer_expose_provider_errors: bool = False
     e2e_state_seed_enabled: bool = False
     composer_advisor_model: str = "anthropic/claude-sonnet-4-6"
+    composer_advisor_prompt_guard: PromptGuardSettings | None = Field(default=None, repr=False)
     composer_advisor_pricing_model: str | None = Field(
         default=None,
         min_length=1,
@@ -1481,6 +1486,7 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
     {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles", "execution_rate_limit"}
 )
+_OPTIONAL_JSON_OBJECT_FIELDS: frozenset[str] = frozenset({"composer_prompt_guard", "composer_advisor_prompt_guard"})
 
 
 def _text_configured(value: str | None) -> bool:
@@ -1580,7 +1586,7 @@ def settings_from_env() -> WebSettings:
             raise RuntimeError("ELSPETH_WEB__DEPLOYMENT_AWS_REGION is reserved; deployment region comes from ambient AWS_REGION")
         if field_name not in WebSettings.model_fields:
             raise RuntimeError(f"Unknown ELSPETH_WEB__ setting: {key}")
-        if field_name in _JSON_COLLECTION_FIELDS | _JSON_OBJECT_FIELDS:
+        if field_name in _JSON_COLLECTION_FIELDS | _JSON_OBJECT_FIELDS | _OPTIONAL_JSON_OBJECT_FIELDS:
             try:
                 parsed = json.loads(value)
             except (json.JSONDecodeError, ValueError):
@@ -1591,6 +1597,9 @@ def settings_from_env() -> WebSettings:
                     raise RuntimeError(f"ELSPETH_WEB__{field_name.upper()} must be valid JSON array.")
                 kwargs[field_name] = tuple(parsed)
             else:
+                if parsed is None and field_name in _OPTIONAL_JSON_OBJECT_FIELDS:
+                    kwargs[field_name] = None
+                    continue
                 if not isinstance(parsed, dict):
                     raise RuntimeError(f"ELSPETH_WEB__{field_name.upper()} must be valid JSON object.")
                 kwargs[field_name] = parsed
@@ -1624,10 +1633,17 @@ def settings_from_env() -> WebSettings:
             "aws_s3_source_profiles",
             "aws_textract_profiles",
             "azure_search_profiles",
+            "composer_prompt_guard",
+            "composer_advisor_prompt_guard",
+            "composer_prompt_guard_mode",
         }
         safe_paths = {
             str(item) for detail in error.errors(include_input=False) for item in detail.get("loc", ()) if isinstance(item, (str, int))
         }
+        guard_paths = (_OPTIONAL_JSON_OBJECT_FIELDS | {"composer_prompt_guard_mode"}) & safe_paths
+        if guard_paths:
+            rendered_paths = ", ".join(sorted(guard_paths))
+            raise RuntimeError(f"Invalid ELSPETH_WEB__ prompt guard setting at: {rendered_paths}") from None
         if policy_fields & safe_paths:
             rendered_paths = ", ".join(sorted(safe_paths))
             raise RuntimeError(f"Invalid ELSPETH_WEB__ plugin policy setting at: {rendered_paths}") from None

@@ -1034,6 +1034,16 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                         )
                         continue
                     ok = await asyncio.wait_for(probe_composer_config(probe_request), timeout=probe_timeout)
+                    if ok is None:
+                        probe_status = "skipped_no_durable_guard_audit"
+                        slog.warning(
+                            "composer_boot_probe_not_qualified",
+                            probed_surface=probe_request.surface,
+                            probed_role=role,
+                            mode=settings.composer_prompt_guard_mode,
+                            reason="No durable lifecycle prompt-guard audit sink is available for sessionless probes.",
+                        )
+                        continue
                     if ok:
                         probe_status = "success"
                         if probe_request.thinking_route_unproven:

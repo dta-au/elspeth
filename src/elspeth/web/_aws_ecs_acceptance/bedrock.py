@@ -48,7 +48,6 @@ from elspeth.plugins.transforms.llm.model_catalog import read_openrouter_catalog
 from elspeth.telemetry import create_telemetry_manager
 from elspeth.web.audit_readiness.service import build_plugin_policy_readiness
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
-from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.config import settings_from_env
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.service import _build_web_plugin_policy_evidence
@@ -254,9 +253,13 @@ def _bedrock_receipt_projection(
 async def verify_bedrock(
     env: Mapping[str, str],
     *,
-    completion: Callable[..., Awaitable[Any]] = _litellm_acompletion,
+    completion: Callable[..., Awaitable[Any]] | None = None,
 ) -> dict[str, object]:
-    """Call Bedrock through the production composer boundary under FD suppression."""
+    """Refuse sessionless model qualification without durable guard custody.
+
+    The injected completion seam remains available for offline protocol tests;
+    the CLI has no fenced authoring lifecycle in which to audit a guard check.
+    """
 
     if any(name in env for name in FORBIDDEN_AWS_OVERRIDE_ENV):
         raise AcceptanceCheckError("bedrock_aws_override")
@@ -272,6 +275,8 @@ async def verify_bedrock(
     ):
         raise AcceptanceCheckError("bedrock_input")
     region = _resolve_aws_region(env, check="bedrock_input")
+    if completion is None:
+        raise AcceptanceCheckError("bedrock_prompt_guard_audit_unavailable")
     messages = [{"role": "user", "content": _BEDROCK_PROMPT}]
     try:
         with _suppress_process_output():

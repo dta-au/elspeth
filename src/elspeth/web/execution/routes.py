@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, cast
 from urllib.parse import quote
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import structlog
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -42,8 +42,10 @@ from elspeth.web.auth.models import AuthenticationError, UserIdentity
 from elspeth.web.auth.session_token import SessionBinding
 from elspeth.web.blobs.protocol import BlobNotFoundError
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
+from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer_stream_auth import ComposerStreamAuthServices
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
@@ -107,6 +109,13 @@ from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
 from elspeth.web.interpretation_state import InterpretationReviewCapacityError, InterpretationReviewIntegrityError
 from elspeth.web.middleware.rate_limit import get_rate_limiter
 from elspeth.web.paths import allowed_sink_directories
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.ownership import verify_session_ownership
 from elspeth.web.sessions.protocol import (
@@ -1455,11 +1464,24 @@ def create_execution_router() -> APIRouter:
                 owner_instance_id=session_service.session_operation_owner_instance_id,
                 lease_seconds=session_service.session_operation_lease_seconds,
             ) as diagnostics_lease:
-                explanation = await composer.explain_run_diagnostics(
-                    llm_safe_diagnostics_snapshot(diagnostics),
-                    recorder=recorder,
-                    session_operation_context=diagnostics_lease.context,
+                coordinator = RequiredWorkCoordinator(
+                    RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, diagnostics_lease.context, invocation_id=str(uuid4()))
                 )
+                owner = ProviderInvocationOwner(
+                    service=session_service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+                )
+                try:
+                    explanation = await composer.explain_run_diagnostics(
+                        llm_safe_diagnostics_snapshot(diagnostics),
+                        recorder=recorder,
+                        session_operation_context=diagnostics_lease.context,
+                        provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
+                    )
+                finally:
+                    coordinator.assert_completed()
+        except PromptGuardRefused as exc:
+            await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
+            raise HTTPException(status_code=422 if exc.disposition == "blocked" else 503, detail=exc.to_payload()) from exc
         except _BadRequestLLMError as exc:
             await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
             # Provider rejected the request (400-class). Carrier exposes

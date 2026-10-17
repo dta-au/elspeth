@@ -1,7 +1,8 @@
 """Composer boot probe: production-shaped requests per surface.
 
 The probe builds each request with the production builder for its surface
-(loop list, planner list, advisor) and sends it once. Production parity against
+(loop list, planner list, advisor), but skips sessionless physical calls.
+Production parity against
 real ``compose()`` turns is pinned in
 ``tests/integration/web/composer/test_boot_probe_production_parity.py``.
 """
@@ -9,14 +10,10 @@ real ``compose()`` turns is pinned in
 from __future__ import annotations
 
 import copy
-import json
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
-import httpx
 import pytest
-from litellm.exceptions import InternalServerError
 
 import elspeth.web.composer.boot_probe as bp
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
@@ -32,7 +29,6 @@ from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.recovery_controls import recovery_tool_definitions
 from elspeth.web.config import WebSettings
 
-_CLEAN = '{"verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null,"publication_verdict":"ADMIT"}'
 _PROBE_PROMPT = "This is a composer boot-time configuration smoke test. Please reply with ok."
 
 
@@ -57,10 +53,6 @@ def settings_factory(tmp_path: Path) -> Any:
 def _request(settings: WebSettings, surface: str) -> bp.ComposerProbeRequest:
     (request,) = [request for request in bp.build_composer_probe_requests(settings) if request.surface == surface]
     return request
-
-
-def _ok_response(content: object = "ok", tool_calls: object = None) -> SimpleNamespace:
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls))])
 
 
 # --- request construction ---------------------------------------------------
@@ -391,248 +383,21 @@ def test_thinking_route_flag_is_off_when_reasoning_is_off(settings_factory: Any)
     assert _request(settings, "loop_tools").thinking_route_unproven is False
 
 
-# --- sending -------------------------------------------------------------------
+# --- sessionless qualification --------------------------------------------------
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["loop_tools", "planner_tools"])
-async def test_tool_surfaces_pass_on_any_accepted_response(monkeypatch: pytest.MonkeyPatch, settings_factory: Any, surface: str) -> None:
-    sent: list[dict[str, object]] = []
-
-    async def complete(*, on_provider_dispatch: object = None, **kwargs: object) -> object:
-        assert on_provider_dispatch is None
-        sent.append(kwargs)
-        return _ok_response(content=None, tool_calls=[object()])
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
-    request = _request(settings_factory(composer_model="gpt-5.5"), surface)
-
-    assert await bp.probe_composer_config(request) is True
-    assert sent == [request.to_litellm_kwargs()]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "tool_count", "strict_counts"),
-    [
-        ("loop_tools", 44, (0, 0, 44)),
-        (
-            "planner_tools",
-            len(planner_tool_definitions(dialect=ToolContractDialect.NONE)),
-            (0, 0, len(planner_tool_definitions(dialect=ToolContractDialect.NONE))),
-        ),
-        # The fixture's default OpenRouter advisor is FORWARDING, so the hatch
-        # terminal goes out with an explicit ``strict: false``.
-        ("hatch_terminal", 3, (2, 1, 0)),
-        ("advisor", 0, (0, 0, 0)),
-    ],
-)
-async def test_bad_request_names_the_surface_and_owned_request_facts(
-    monkeypatch: pytest.MonkeyPatch, settings_factory: Any, surface: str, tool_count: int, strict_counts: tuple[int, int, int]
+@pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
+@pytest.mark.parametrize("surface", ["loop_tools", "planner_tools", "hatch_terminal", "advisor"])
+async def test_sessionless_probe_is_not_qualified_and_never_dispatches(
+    monkeypatch: pytest.MonkeyPatch, settings_factory: Any, mode: str, surface: str
 ) -> None:
-    from litellm.exceptions import BadRequestError
+    async def forbidden_dispatch(**_kwargs: object) -> object:
+        pytest.fail("A sessionless probe has no durable guard audit sink")
 
-    provider_error = BadRequestError(message="SENSITIVE_PROVIDER_TEXT", model="gpt-5.5", llm_provider="openai")
-
-    async def complete(**_kwargs: object) -> object:
-        raise provider_error
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
-    request = _request(settings_factory(composer_model="gpt-5.5"), surface)
-    with pytest.raises(bp.ComposerBootConfigError) as caught:
-        await bp.probe_composer_config(request)
-
-    text = str(caught.value)
-    assert "SENSITIVE_PROVIDER_TEXT" not in text
-    assert text.startswith(f"composer {request.role} boot request rejected by {request.model}:")
-    assert f"surface={surface}," in text
-    assert f"tool_count={tool_count}," in text
-    strict_true, strict_false, omitted = strict_counts
-    assert f"strict_true_count={strict_true}, strict_false_count={strict_false}, strict_key_omitted={omitted}," in text
-    assert caught.value.__cause__ is provider_error
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("overrides", "surface", "expected_presence"),
-    [
-        ({"composer_model": "gpt-5.5"}, "loop_tools", (False, False, False, False, False)),
-        ({"composer_model": "gpt-4.1", "composer_temperature": 0.0, "composer_seed": 7}, "loop_tools", (True, True, False, False, False)),
-        ({"composer_model": "anthropic/claude-sonnet-4-6"}, "planner_tools", (False, False, True, False, False)),
-        (
-            # A bare model name is an OpenAI-surface name: no reasoning kwarg is sent.
-            {"composer_advisor_model": "probe-model", "composer_advisor_reasoning_effort": "low"},
-            "advisor",
-            (False, False, False, True, False),
-        ),
-        (
-            {
-                "composer_advisor_model": "openrouter/probe-model",
-                "composer_advisor_reasoning_effort": "low",
-                "composer_temperature": 0.0,
-                "composer_seed": 7,
-            },
-            "advisor",
-            (True, True, True, True, True),
-        ),
-    ],
-)
-async def test_probe_rejection_reports_only_sent_option_presence(
-    monkeypatch: pytest.MonkeyPatch,
-    settings_factory: Any,
-    overrides: dict[str, Any],
-    surface: str,
-    expected_presence: tuple[bool, bool, bool, bool, bool],
-) -> None:
-    from litellm.exceptions import BadRequestError
-
-    async def complete(**_kwargs: object) -> object:
-        raise BadRequestError(message="rejected", model="m", llm_provider="openai")
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
-    with pytest.raises(bp.ComposerBootConfigError) as caught:
-        await bp.probe_composer_config(_request(settings_factory(**overrides), surface))
-    text = str(caught.value)
-    for field, present in zip(
-        ("temperature", "seed", "reasoning_effort", "response_format", "provider_routing"), expected_presence, strict=True
-    ):
-        assert f"{field}_present={present}" in text
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["loop_tools", "planner_tools", "advisor"])
-@pytest.mark.parametrize(
-    "failure",
-    [
-        pytest.param(lambda: TimeoutError(), id="timeout"),
-        pytest.param(lambda: httpx.ConnectError("boom"), id="transport"),
-        pytest.param(lambda: InternalServerError(message="Missing credentials.", model="m", llm_provider="openai"), id="provider"),
-    ],
-)
-async def test_transient_failures_are_nonfatal(monkeypatch: pytest.MonkeyPatch, settings_factory: Any, surface: str, failure: Any) -> None:
-    async def complete(**_kwargs: object) -> object:
-        raise failure()
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
-
-    assert await bp.probe_composer_config(_request(settings_factory(), surface)) is False
-
-
-@pytest.mark.asyncio
-async def test_probe_propagates_programmer_errors(monkeypatch: pytest.MonkeyPatch, settings_factory: Any) -> None:
-    async def complete(**_kwargs: object) -> object:
-        raise TypeError("signature drift")
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
-
-    with pytest.raises(TypeError, match="signature drift"):
-        await bp.probe_composer_config(_request(settings_factory(), "loop_tools"))
-
-
-@pytest.mark.asyncio
-async def test_probe_sends_a_copy_and_leaves_the_request_unchanged(monkeypatch: pytest.MonkeyPatch, settings_factory: Any) -> None:
-    # LiteLLM and the OpenRouter helpers mutate the request they are handed, at
-    # nested levels too. Python already gives the callee a fresh top-level dict
-    # (``**kwargs``), so only nested mutation can tell a copy from a shared
-    # object (Codex review of S0). The snapshot is an independent deep copy.
-    async def complete(**kwargs: Any) -> object:
-        kwargs["messages"][0]["content"] = "mutated"
-        kwargs["tools"][0]["function"]["description"] = "mutated"
-        kwargs["tools"].append({"type": "function", "function": {"name": "mutated"}})
-        return _ok_response()
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
-    request = _request(settings_factory(), "loop_tools")
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", forbidden_dispatch)
+    request = _request(settings_factory(composer_model="gpt-5.5", composer_prompt_guard_mode=mode), surface)
     before = copy.deepcopy(request.to_litellm_kwargs())
 
-    assert await bp.probe_composer_config(request) is True
+    assert await bp.probe_composer_config(request) is None
     assert request.to_litellm_kwargs() == before
-
-
-# --- advisor structured-output admission ------------------------------------------
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "content",
-    [
-        "ok",
-        '{"verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null}',
-        f"```json\n{_CLEAN}\n```",
-        "",
-        '{"verdict":',
-        '{"verdict":"FLAGGED","verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null}',
-        None,
-        4,
-    ],
-    ids=["prose", "old-five-fields", "fenced-json", "empty", "truncated", "duplicate", "reasoning-only", "wrong-type"],
-)
-async def test_advisor_probe_rejects_nonconforming_content(monkeypatch: pytest.MonkeyPatch, settings_factory: Any, content: object) -> None:
-    async def complete(**_kwargs: object) -> object:
-        return _ok_response(content=content)
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
-    with pytest.raises(bp.ComposerBootConfigError, match=r"advisor.*probe-model.*structured-output"):
-        await bp.probe_composer_config(_request(settings_factory(composer_advisor_model="probe-model"), "advisor"))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "response",
-    [
-        SimpleNamespace(),
-        SimpleNamespace(choices=[]),
-        SimpleNamespace(choices="invalid"),
-        SimpleNamespace(choices=[SimpleNamespace()]),
-        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=_CLEAN, tool_calls=[object()]))]),
-    ],
-    ids=["missing-choices", "empty-choices", "wrong-choices", "missing-message", "tool-call"],
-)
-async def test_advisor_probe_rejects_malformed_provider_response(
-    monkeypatch: pytest.MonkeyPatch, settings_factory: Any, response: object
-) -> None:
-    async def complete(**_kwargs: object) -> object:
-        return response
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
-    with pytest.raises(bp.ComposerBootConfigError, match="structured-output"):
-        await bp.probe_composer_config(_request(settings_factory(composer_advisor_model="probe-model"), "advisor"))
-
-
-@pytest.mark.asyncio
-async def test_advisor_probe_rejects_excessively_nested_json(monkeypatch: pytest.MonkeyPatch, settings_factory: Any) -> None:
-    async def complete(**_kwargs: object) -> object:
-        return _ok_response(content="[" * 10_000 + "0" + "]" * 10_000)
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
-    with pytest.raises(bp.ComposerBootConfigError, match="JSON/schema admission"):
-        await bp.probe_composer_config(_request(settings_factory(composer_advisor_model="probe-model"), "advisor"))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "content",
-    [
-        _CLEAN,
-        json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": "ok", "publication_verdict": "ADMIT"}),
-        json.dumps(
-            {"verdict": "CLEAN", "category": "other", "steps": ["step"], "findings": "", "note": None, "publication_verdict": "ADMIT"}
-        ),
-        json.dumps(
-            {"verdict": "FLAGGED", "category": "other", "steps": [], "findings": " ", "note": None, "publication_verdict": "WITHHOLD"}
-        ),
-    ],
-    ids=["accepted-clean", "clean-note", "clean-steps", "flagged-empty"],
-)
-async def test_advisor_probe_accepts_schema_valid_without_requiring_checkpoint_semantics(
-    monkeypatch: pytest.MonkeyPatch, settings_factory: Any, content: str
-) -> None:
-    async def complete(**_kwargs: object) -> object:
-        return _ok_response(content=content)
-
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
-    try:
-        accepted = await bp.probe_composer_config(_request(settings_factory(composer_advisor_model="probe-model"), "advisor"))
-    except bp.ComposerBootConfigError:
-        accepted = False
-    assert accepted, "boot must accept schema-valid output even when checkpoint semantics reject it"

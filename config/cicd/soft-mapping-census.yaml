@@ -92,6 +92,9 @@ files:
     dict[str, Any]: 18
   src/elspeth/contracts/preflight.py:
     Mapping[str, Any]: 1
+  src/elspeth/contracts/prompt_guard.py:
+    Mapping[str, Any]: 1
+    dict[str, Any]: 2
   src/elspeth/contracts/results.py:
     dict[str, Any]: 2
     dict[str, object]: 2
@@ -755,7 +758,7 @@ files:
     Mapping[str, Any]: 3
     dict[str, Any]: 10
   src/elspeth/web/composer/advisor_context.py:
-    Mapping[str, Any]: 5
+    Mapping[str, Any]: 4
     dict[str, Any]: 1
   src/elspeth/web/composer/advisor_output.py:
     dict[str, object]: 1
@@ -817,6 +820,8 @@ files:
     dict[str, Any]: 8
     dict[str, object]: 17
   src/elspeth/web/composer/planning_application.py:
+    Mapping[str, Any]: 4
+  src/elspeth/web/composer/prompt_guard.py:
     Mapping[str, Any]: 4
   src/elspeth/web/composer/prompts.py:
     Mapping[str, object]: 1
@@ -1062,10 +1067,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 754
+  Mapping[str, Any]: 758
   Mapping[str, object]: 315
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1072
+  dict[str, Any]: 1074
   dict[str, object]: 395
-  soft: 2544
+  soft: 2550

@@ -126,6 +126,7 @@ from elspeth.web.composer.progress import (
     tool_completed_progress_event,
     tool_started_progress_event,
 )
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
@@ -2436,6 +2437,20 @@ async def run_tool_batch(
                 # driver re-raise this exact exception object after the tool
                 # row has been published.
                 first_party_exc = advisor_outcome.original_exc
+                if isinstance(first_party_exc, PromptGuardRefused):
+                    # The tool completed with a semantic refusal. It is neither
+                    # provider-outage feedback nor a plugin implementation fault.
+                    refusal_payload = {"success": False, "outbound_call_made": False, **first_party_exc.to_payload()}
+                    recorder.record(finish_success(audit, result_payload=refusal_payload, version_after=state.version))
+                    _append_tool_outcome(
+                        response=refusal_payload,
+                        error_class=None,
+                        error_category=None,
+                        error_message=None,
+                        post_version=state.version,
+                    )
+                    advisor_failure = first_party_exc
+                    break
                 recorder.record(finish_plugin_crash(audit, exc=first_party_exc))
                 _append_tool_outcome(
                     response=None,

@@ -74,6 +74,7 @@ from elspeth.web.composer.no_tool_policy import compose_graph_recovery_refusal_m
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.protocol import (
     PIPELINE_STAGED_REVIEW_MESSAGE,
     ComposerAdmissionRefused,
@@ -1056,6 +1057,8 @@ async def _run_composer_turn(
                         temperature=settings.composer_temperature,
                         seed=settings.composer_seed,
                         session_operation_context=lease.context,
+                        prompt_guard_mount=services.composer_service.composer_prompt_guard_mount,
+                        prompt_guard_mode=settings.composer_prompt_guard_mode,
                         api_base=settings.composer_endpoint_base_url,
                         api_key=(
                             settings.composer_endpoint_api_key.get_secret_value()
@@ -1781,6 +1784,28 @@ async def _run_composer_turn(
             )
             observation.audit_cohort_durable = True
             raise chargeable_refusal from exc
+        except PromptGuardRefused as exc:
+            llm_calls = exc.llm_calls
+            observation.pending_exception_llm_calls = llm_calls
+            observation.pending_exception_tool_invocations = exc.tool_invocations
+            if llm_calls or exc.tool_invocations:
+                await _required_audit(
+                    observation,
+                    _persist_turn_audit_cohort(
+                        service,
+                        session.id,
+                        exc.tool_invocations,
+                        llm_calls,
+                        tool_composition_state_id=compose_base_state_id,
+                        llm_composition_state_id=compose_base_state_id,
+                        plugin_crash_pending=True,
+                        session_operation_context=lease.context,
+                        required_audit=True,
+                        required_work=observation.required_work,
+                    ),
+                )
+                observation.audit_cohort_durable = True
+            raise HTTPException(status_code=422 if exc.disposition == "blocked" else 503, detail=exc.to_payload()) from exc
         except ComposerAdmissionRefused as exc:
             observation.pending_exception_llm_calls = _llm_calls_from_exception(exc)
             await _publish_progress(

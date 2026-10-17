@@ -614,8 +614,9 @@ class _FakeComposeLLM:
         *,
         provider_custody: object | None = None,
         credential_state: CompositionState | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
     ) -> _AdmittedLLMCompletion:
-        del provider_custody, credential_state
+        del provider_custody, credential_state, prompt_guard_trusted_message_indexes
         if not self._responses:
             return _admit_composer_llm_completion(_fake_llm_response(content="Done."))
         return _admit_composer_llm_completion(self._responses.pop(0))
@@ -706,12 +707,18 @@ def make_tool_context() -> Any:
 
 
 def _make_settings(data_dir: Path, **overrides: Any) -> WebSettings:
+    """Use explicit development guard mode for this fake-provider harness.
+
+    Actual physical calls still require fenced custody and durable guard audit.
+    Guard-policy tests can override the mode to exercise required admission.
+    """
     values: dict[str, Any] = {
         "data_dir": data_dir,
         "composer_max_composition_turns": 15,
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
+        "composer_prompt_guard_mode": "debug-when-unconfigured",
         "shareable_link_signing_key": b"\x00" * 32,
     }
     values.update(overrides)

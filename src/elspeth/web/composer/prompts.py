@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any, Final
 
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardTrust
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.capability_skill import render_with_pipeline_capabilities
@@ -557,7 +558,7 @@ def build_messages(
     # ``data_dir is None → SYSTEM_PROMPT`` fast path bypassed it. The
     # @lru_cache on build_system_prompt makes repeat calls free.
     prompt = rendered_skill if rendered_skill is not None else build_system_prompt(data_dir)
-    messages.append({"role": "system", "content": prompt})
+    messages.append({"role": "system", "content": prompt, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION})
 
     # 2. Deployment-constant catalog context. Stored plugin-authored data,
     # so it must not be elevated to system-role instructions; byte-stable
@@ -566,6 +567,7 @@ def build_messages(
         {
             "role": "user",
             "content": build_catalog_context_string(catalog, plugin_snapshot=plugin_snapshot),
+            PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.REFERENCE,
         }
     )
 
@@ -601,7 +603,7 @@ def build_messages(
 def build_run_diagnostics_messages(
     snapshot: Mapping[str, object],
     data_dir: str | None = None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, str | PromptGuardTrust]]:
     """Build messages for run diagnostics explanation.
 
     Uses the same composer skill pack stack as normal composition so every
@@ -621,6 +623,10 @@ def build_run_diagnostics_messages(
         "- Do not call tools, invent hidden progress, expose hidden chain-of-thought, or mention secrets."
     )
     return [
-        {"role": "system", "content": prompt + "\n\n" + diagnostics_instructions},
+        {
+            "role": "system",
+            "content": prompt + "\n\n" + diagnostics_instructions,
+            PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
+        },
         {"role": "user", "content": json.dumps(snapshot, indent=2, sort_keys=True, allow_nan=False)},
     ]

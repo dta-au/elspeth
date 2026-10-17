@@ -45,6 +45,7 @@ from elspeth.contracts.composer_planner_audit import (
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardMode, PromptGuardTrust, detach_prompt_guard_messages
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import is_valid_provider_replay_tool_call_id
@@ -93,6 +94,7 @@ from elspeth.web.composer.pipeline_proposal import PipelineProposal, ProposalBas
 from elspeth.web.composer.planner_authoring_aids import (
     PlannerPluginContract,
     SchemaContractProjectionUnsupported,
+    _SchemaContractEvidenceEntry,
     build_planner_authoring_aids,
     build_schema_contract_evidence,
     discovery_digest_detail_tools,
@@ -107,6 +109,7 @@ from elspeth.web.composer.progress import (
     tool_completed_progress_event,
     tool_started_progress_event,
 )
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused
 
 # Private by name, deliberate import: one derivation of "plugins the current
 # state names" for every authoring path that builds schema evidence — the
@@ -820,6 +823,18 @@ class PlannerBudgetPolicy:
         )
 
 
+class _PlannerCatalogSchemaReference(TypedDict):
+    """Registered catalog bytes, excluding graph-derived omission labels."""
+
+    policy_hash: str
+    snapshot_hash: str
+    max_entries: int
+    max_omissions: int
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+    schemas: list[_SchemaContractEvidenceEntry]
+
+
 @dataclass(frozen=True, slots=True)
 class PlannerModelConfig:
     completion: _Completion
@@ -850,6 +865,9 @@ class PlannerModelConfig:
     tool_contract_dialect: ToolContractDialect
     escape_hatch_tool_contract_dialect: ToolContractDialect
     pricing_model: str | None = None
+    prompt_guard_mount: PromptGuardMount | None = field(default=None, repr=False)
+    escape_hatch_prompt_guard_mount: PromptGuardMount | None = field(default=None, repr=False)
+    prompt_guard_mode: PromptGuardMode = "required"
     # Senior advisor model for the one-shot escape-hatch overtime turn.
     # None disables the hatch: budget exhaustion raises exactly as before.
     escape_hatch_model: str | None = None
@@ -3167,7 +3185,8 @@ def _attach_planner_evidence(
     planner_attempt_start: int,
 ) -> None:
     """Attach both halves of this planner operation's paired audit evidence."""
-    attach_llm_calls(exc, recorder, start_index=llm_call_start)
+    if not isinstance(exc, PromptGuardRefused):
+        attach_llm_calls(exc, recorder, start_index=llm_call_start)
     exc_with_evidence = cast(Any, exc)
     exc_with_evidence.planner_attempts = recorder.planner_attempts[planner_attempt_start:]
 
@@ -3299,8 +3318,25 @@ def _new_planner_custody(provider_owner: ProviderInvocationOwner) -> ProviderCal
     return provider_owner.mint(ProviderInvocationFamily.PLANNER)
 
 
-async def _complete_planner_provider(*, provider_custody: ProviderCallCustody, request: Mapping[str, Any]) -> Any:
-    return await _litellm_acompletion(provider_custody=provider_custody, **dict(request))
+async def _complete_planner_provider(
+    *,
+    provider_custody: ProviderCallCustody,
+    request: Mapping[str, Any],
+    mount: PromptGuardMount | None,
+    mode: PromptGuardMode,
+    advisor_hatch: bool,
+    user_prompt: str,
+    trusted_indexes: frozenset[int],
+) -> Any:
+    return await _litellm_acompletion(
+        provider_custody=provider_custody,
+        prompt_guard_mount=mount,
+        prompt_guard_mode=mode,
+        prompt_guard_role="advisor" if advisor_hatch else "composer",
+        prompt_guard_user_prompt=user_prompt,
+        prompt_guard_trusted_message_indexes=trusted_indexes,
+        **dict(request),
+    )
 
 
 async def plan_pipeline(
@@ -3411,6 +3447,15 @@ async def plan_pipeline(
         outcome = "complete"
         trail.log_summary("accepted")
         return proposal
+    except PromptGuardRefused as exc:
+        captured = exc.with_evidence(
+            state=current_state, initial_version=current_state.version, llm_calls=recorder.llm_calls[llm_call_start:]
+        )
+        primary_error = captured
+        trail.finalize_active_exception(captured)
+        _attach_planner_evidence(captured, recorder, llm_call_start=llm_call_start, planner_attempt_start=planner_attempt_start)
+        trail.log_summary(type(captured).__name__)
+        raise captured from exc
     except BaseException as exc:
         primary_error = exc
         trail.finalize_active_exception(exc)
@@ -3553,11 +3598,24 @@ async def _plan_pipeline_inner(
     declared_pending_information = frozenset(information_manifest.unresolved) | frozenset(_intent_selected_schema_keys(intent))
     pending_information = set(declared_pending_information)
     tools = planner_tool_definitions(discovery_policy, dialect=model_config.tool_contract_dialect)
+    # Only registered schema entries and owned policy metadata are catalog
+    # reference. Omission labels can originate in arbitrary graph plugin names.
+    catalog_schema_reference = _PlannerCatalogSchemaReference(
+        policy_hash=schema_contract_evidence["policy_hash"],
+        snapshot_hash=schema_contract_evidence["snapshot_hash"],
+        max_entries=schema_contract_evidence["max_entries"],
+        max_omissions=schema_contract_evidence["max_omissions"],
+        max_canonical_bytes=schema_contract_evidence["max_canonical_bytes"],
+        canonical_bytes_used=schema_contract_evidence["canonical_bytes_used"],
+        schemas=schema_contract_evidence["schemas"],
+    )
     provider_request: dict[str, Any] = {
         "intent": intent,
         "current_state": provider_current_state,
-        "authoring_aids": authoring_aids,
-        "schema_contract_evidence": schema_contract_evidence,
+        "schema_contract_evidence": {
+            "omitted": schema_contract_evidence["omitted"],
+            "omissions_withheld_count": schema_contract_evidence["omissions_withheld_count"],
+        },
         "information_manifest": information_manifest.provider_payload(
             discoverable_classes=discovery_policy.unresolved_classes,
             unresolved_keys=frozenset(pending_information),
@@ -3571,7 +3629,12 @@ async def _plan_pipeline_inner(
     provider_request.update(json.loads(retained_operation_context_message(retained_operation_context)))
 
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": rendered_skill},
+        {"role": "system", "content": rendered_skill, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION},
+        {
+            "role": "user",
+            "content": canonical_json({"authoring_aids": authoring_aids, "schema_contract_evidence": catalog_schema_reference}),
+            PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.REFERENCE,
+        },
         {
             "role": "user",
             "content": canonical_json(provider_request),
@@ -3674,6 +3737,7 @@ async def _plan_pipeline_inner(
             else (list(messages), list(active_tools))
         )
         assert cache_marked_tools is not None
+        cache_marked_messages, trusted_indexes = detach_prompt_guard_messages(cache_marked_messages)
         call_input_snapshot = json.loads(
             canonical_json(
                 {
@@ -3829,9 +3893,29 @@ async def _plan_pipeline_inner(
 
             try:
                 response = await asyncio.wait_for(
-                    _complete_planner_provider(provider_custody=provider_custody, request=kwargs)
+                    _complete_planner_provider(
+                        provider_custody=provider_custody,
+                        request=kwargs,
+                        mount=model_config.escape_hatch_prompt_guard_mount
+                        if model_override is not None
+                        else model_config.prompt_guard_mount,
+                        mode=model_config.prompt_guard_mode,
+                        advisor_hatch=model_override is not None,
+                        user_prompt=intent,
+                        trusted_indexes=trusted_indexes,
+                    )
                     if provider_custody is not None
-                    else model_config.completion(**kwargs),
+                    else _litellm_acompletion(
+                        provider_custody=None,
+                        prompt_guard_mount=model_config.escape_hatch_prompt_guard_mount
+                        if model_override is not None
+                        else model_config.prompt_guard_mount,
+                        prompt_guard_mode=model_config.prompt_guard_mode,
+                        prompt_guard_role="advisor" if model_override is not None else "composer",
+                        prompt_guard_user_prompt=intent,
+                        prompt_guard_trusted_message_indexes=trusted_indexes,
+                        **kwargs,
+                    ),
                     timeout=remaining,
                 )
             except asyncio.CancelledError as exc:
@@ -4345,6 +4429,10 @@ async def _plan_pipeline_inner(
             trail.finish_attempt("repair", "truncated", led_to="repair")
             messages.append({"role": "user", "content": _truncated_response_notice()})
             continue
+        except PromptGuardRefused:
+            # A dedicated-service refusal terminates this physical invocation;
+            # it is not the hatch's ordinary failure-to-propose fallback.
+            raise
         except Exception as exc:
             if is_hatch_turn:
                 trail.finalize_active_exception(exc)

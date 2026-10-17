@@ -518,6 +518,12 @@ def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None
     assert [(item.arg, ast.unparse(item.value)) for item in title_call.keywords if item.arg == "session_operation_context"] == [
         ("session_operation_context", "lease.context")
     ]
+    assert [
+        (item.arg, ast.unparse(item.value)) for item in title_call.keywords if item.arg in {"prompt_guard_mount", "prompt_guard_mode"}
+    ] == [
+        ("prompt_guard_mount", "services.composer_service.composer_prompt_guard_mount"),
+        ("prompt_guard_mode", "settings.composer_prompt_guard_mode"),
+    ]
     assert isinstance(title_branch.body[3], ast.Try)
     owned_try = title_branch.body[3]
     assert len(owned_try.body) == 1 and isinstance(owned_try.body[0], ast.Assign)
@@ -532,7 +538,7 @@ def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None
         "02f2e650fc7028278be731ffefe2f2f3013d7fe08c5e04ebba2c6bcb80484350"
     )
     assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=main_try.body[:4], type_ignores=[]))).hexdigest() == (
-        "2f65c341a560baf72b0f8ba1c12a939c8724a2d7691d83690529e79413b31929"
+        "452fdd92d3c7b1eeb51819c852b5edb0e9455eb2f48b9b3f380694370b40f966"
     )
 
 
@@ -549,6 +555,12 @@ def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
         ("helper", "session_operation_context=lease.context", "session_operation_context=other_context"),
         ("helper", "auto_title_task = lease.create_task(run_owned_title())", "auto_title_task = asyncio.create_task(run_owned_title())"),
         ("helper", "not recovery_context.malformed_head", "True"),
+        (
+            "helper",
+            "prompt_guard_mount=services.composer_service.composer_prompt_guard_mount",
+            "prompt_guard_mount=services.composer_service.composer_advisor_prompt_guard_mount",
+        ),
+        ("helper", "prompt_guard_mode=settings.composer_prompt_guard_mode", "prompt_guard_mode='debug-when-unconfigured'"),
     ],
 )
 def test_auto_title_ownership_rejects_foreign_lease_or_unowned_child(owner: str, before: str, after: str) -> None:

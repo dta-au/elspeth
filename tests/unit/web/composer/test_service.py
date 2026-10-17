@@ -57,6 +57,7 @@ from elspeth.web.composer.protocol import (
     ToolArgumentError,
 )
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import (
     CompositionState,
@@ -83,8 +84,15 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
+from elspeth.web.sessions.models import blobs_table, chat_messages_table, quota_provider_attempts_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -213,6 +221,7 @@ class _ReconciliationLLMScript:
         *,
         provider_custody: object | None = None,
         credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
     ) -> _AdmittedLLMCompletion:
         self.prompts.append(deepcopy(messages))
         return next(self._responses)
@@ -438,6 +447,45 @@ def _composer_service_with_session(catalog: CatalogService, settings: Any) -> tu
         session_engine=engine,
     )
     return service, session_id
+
+
+@contextlib.contextmanager
+def _sampling_provider_owner(
+    service: ComposerServiceImpl, session_id: str, *, expected_calls: int
+) -> Iterator[tuple[ProviderInvocationOwner, BufferingRecorder]]:
+    sessions = service._sessions_service
+    engine = service._session_engine
+    assert isinstance(sessions, SessionServiceImpl) and engine is not None
+    with fenced_operation_context(engine, session_id) as context:
+        coordinator = RequiredWorkCoordinator(
+            RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+        )
+        owner = ProviderInvocationOwner(service=sessions, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+        recorder = BufferingRecorder()
+        try:
+            yield owner, recorder
+        finally:
+            coordinator.assert_completed()
+        with engine.connect() as connection:
+            attempts = connection.execute(select(quota_provider_attempts_table)).all()
+            rows = connection.execute(select(chat_messages_table)).all()
+        checks = [
+            envelope["check"]
+            for row in rows
+            if row.tool_calls is not None
+            for envelope in row.tool_calls
+            if envelope["_kind"] == "prompt_guard_audit"
+        ]
+        assert len(checks) == len(attempts) == len(recorder.llm_calls) == expected_calls
+        assert all(
+            check["role"] == "composer"
+            and check["mode"] == "debug-when-unconfigured"
+            and check["disposition"] == "debug_bypass"
+            and check["operation_id"] == context.fence.operation_id
+            for check in checks
+        )
+        assert {attempt.attempt_id for attempt in attempts} == {call.call_id for call in recorder.llm_calls}
+        assert all(attempt.settled_at is not None and attempt.ledger_entry_id is not None for attempt in attempts)
 
 
 def _create_session_blob_for_test(
@@ -1142,7 +1190,12 @@ class TestComposerSingleToolCall:
         responses = [turn, done]
 
         async def _llm(
-            _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+            _messages: Any,
+            _tools: Any,
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         ) -> Any:
             return responses.pop(0)
 
@@ -1203,7 +1256,12 @@ class TestComposerSingleToolCall:
         responses = [turn, done]
 
         async def _llm(
-            _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+            _messages: Any,
+            _tools: Any,
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         ) -> Any:
             return responses.pop(0)
 
@@ -1672,6 +1730,7 @@ class TestComposerMultiTurnToolCalls:
             *,
             provider_custody: object | None = None,
             credential_state: object | None = None,
+            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         ) -> Any:
             captured_messages.append(list(messages))
             return next(responses)
@@ -2110,6 +2169,7 @@ class TestComposerMultiTurnToolCalls:
             *,
             provider_custody: object | None = None,
             credential_state: object | None = None,
+            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         ) -> Any:
             provider_contexts.append([dict(item) for item in messages])
             return replies[len(provider_contexts) - 1]
@@ -2405,6 +2465,7 @@ class TestComposerMultiTurnToolCalls:
             *,
             provider_custody: object | None = None,
             credential_state: object | None = None,
+            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         ) -> Any:
             assert len(captured_messages) < len(replies), "Only the original finite primary responses are supplied"
             captured_messages.append(deepcopy(messages))
@@ -2612,6 +2673,7 @@ class TestComposerMultiTurnToolCalls:
             *,
             provider_custody: object | None = None,
             credential_state: object | None = None,
+            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         ) -> Any:
             captured_messages.append(list(messages))
             return next(responses)
@@ -4984,12 +5046,26 @@ class TestComposerSamplingConfig:
 
     @pytest.mark.asyncio
     async def test_freeform_tool_and_prose_calls_disable_hidden_sdk_retries(self) -> None:
-        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         completion = _make_raw_llm_response(content="acknowledged")
 
-        with patch("litellm.acompletion", new_callable=AsyncMock, return_value=completion) as mock_acomp:
-            await service._provider_gateway._call_llm([{"role": "user", "content": "Hello"}], [])
-            await service._provider_gateway._call_text_llm([{"role": "user", "content": "Hello"}])
+        with (
+            _sampling_provider_owner(service, session_id, expected_calls=2) as (owner, recorder),
+            patch("litellm.acompletion", new_callable=AsyncMock, return_value=completion) as mock_acomp,
+        ):
+            await service._provider_gateway._call_llm_with_audit(
+                [{"role": "user", "content": "Hello"}],
+                [],
+                timeout=5.0,
+                recorder=recorder,
+                provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
+            )
+            await service._provider_gateway._call_text_llm_with_audit(
+                [{"role": "user", "content": "Hello"}],
+                timeout=5.0,
+                recorder=recorder,
+                provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
+            )
 
         assert mock_acomp.call_count == 2
         for call in mock_acomp.call_args_list:
@@ -5027,15 +5103,20 @@ class TestComposerSamplingConfig:
     async def test_call_llm_omits_sampling_when_operator_leaves_it_unset(self) -> None:
         catalog = _mock_catalog()
         settings = _make_settings(composer_model="anthropic/claude-3-5-sonnet-20241022")
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         completion = _make_raw_llm_response(content="acknowledged")
 
-        with patch(
-            "litellm.acompletion",
-            new_callable=AsyncMock,
-            return_value=completion,
-        ) as mock_acomp:
-            await service._provider_gateway._call_llm([{"role": "user", "content": "Hello"}], [])
+        with (
+            _sampling_provider_owner(service, session_id, expected_calls=1) as (owner, recorder),
+            patch("litellm.acompletion", new_callable=AsyncMock, return_value=completion) as mock_acomp,
+        ):
+            await service._provider_gateway._call_llm_with_audit(
+                [{"role": "user", "content": "Hello"}],
+                [],
+                timeout=5.0,
+                recorder=recorder,
+                provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
+            )
 
         kwargs = mock_acomp.call_args_list[0].kwargs
         assert "temperature" not in kwargs
@@ -5045,16 +5126,20 @@ class TestComposerSamplingConfig:
     async def test_call_text_llm_sends_configured_temperature_and_seed(self) -> None:
         catalog = _mock_catalog()
         settings = _make_settings(composer_temperature=0.0, composer_seed=42)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
 
         completion = _make_raw_llm_response(content="diagnostic text")
 
-        with patch(
-            "litellm.acompletion",
-            new_callable=AsyncMock,
-            return_value=completion,
-        ) as mock_acomp:
-            await service._provider_gateway._call_text_llm([{"role": "user", "content": "explain"}])
+        with (
+            _sampling_provider_owner(service, session_id, expected_calls=1) as (owner, recorder),
+            patch("litellm.acompletion", new_callable=AsyncMock, return_value=completion) as mock_acomp,
+        ):
+            await service._provider_gateway._call_text_llm_with_audit(
+                [{"role": "user", "content": "explain"}],
+                timeout=5.0,
+                recorder=recorder,
+                provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
+            )
 
         assert mock_acomp.call_count == 1
         kwargs = mock_acomp.call_args_list[0].kwargs
@@ -5065,15 +5150,19 @@ class TestComposerSamplingConfig:
     async def test_call_text_llm_omits_sampling_when_operator_leaves_it_unset(self) -> None:
         catalog = _mock_catalog()
         settings = _make_settings(composer_model="anthropic/claude-3-5-sonnet-20241022")
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         completion = _make_raw_llm_response(content="diagnostic text")
 
-        with patch(
-            "litellm.acompletion",
-            new_callable=AsyncMock,
-            return_value=completion,
-        ) as mock_acomp:
-            await service._provider_gateway._call_text_llm([{"role": "user", "content": "explain"}])
+        with (
+            _sampling_provider_owner(service, session_id, expected_calls=1) as (owner, recorder),
+            patch("litellm.acompletion", new_callable=AsyncMock, return_value=completion) as mock_acomp,
+        ):
+            await service._provider_gateway._call_text_llm_with_audit(
+                [{"role": "user", "content": "explain"}],
+                timeout=5.0,
+                recorder=recorder,
+                provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
+            )
 
         kwargs = mock_acomp.call_args_list[0].kwargs
         assert "temperature" not in kwargs
