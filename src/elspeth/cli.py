@@ -2904,6 +2904,16 @@ def purge(
     Deletes PayloadStore blobs older than retention period.
     Landscape metadata (hashes) is preserved for audit trail.
 
+    Offline maintenance only: stop all writers using the payload store.
+    Prevent new starts and automatic restarts from payload selection through
+    deletion and grade updates.
+    All references to the payload namespace must belong to the selected Landscape.
+    Purging a store shared by independent Landscape databases is unsupported,
+    even with writers stopped.
+    A restored database requires an isolated payload copy, not the live store.
+    This command does not establish maintenance exclusion; --yes only skips
+    confirmation, and a dry-run is not authority for a later deletion.
+
     Examples:
 
         # See what would be deleted
