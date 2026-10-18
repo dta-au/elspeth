@@ -685,18 +685,12 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
     message: str,
 ) -> None:
     """The HTTP route must keep non-authorizing requests conversational."""
-    # Fixed expectations for the five measured information-only controls.
-    # This table selects test expectations; the offline SDK never routes content.
-    single_transition_requests = {
-        "Read the CSV documentation and explain how transforms work.",
-        "Read customers.csv and explain how transforms work.",
-        "Read customers.csv and explain the password policy.",
-        "Read customers.csv and explain: write is a pipeline operation.",
-        "Read customers.csv and summarize the data, then write a summary in this chat.",
-    }
-    expected_primary_calls = 1 if message in single_transition_requests else 2
+    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+
+    # Every unchanged non-authorizing request gets one PRIMARY and its real END
+    # review. Lexical request classification does not manufacture another call.
+    expected_primary_calls = 1
     completion = AsyncMock(spec=litellm.acompletion, side_effect=_conversational_completion())
-    reconciliation_completion = AsyncMock(spec=litellm.acompletion, side_effect=_conversational_completion())
     requests = []
     primary_requests = []
     advisor_requests = []
@@ -708,6 +702,12 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
             assert kwargs["model"] == composer._settings.composer_advisor_model
             advisor_requests.append(request)
             assert len(advisor_requests) == 1, "An unbudgeted additional END transition must not occur"
+            summary = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
+            review = json.loads(summary.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            assert review["current_request"] == message
+            assert review["candidate_reply"] == "No pipeline changes were requested."
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
             return _Response(
                 choices=[
                     _Choice(
@@ -729,11 +729,7 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
             )
         primary_requests.append(request)
         assert len(primary_requests) <= expected_primary_calls, "An unbudgeted primary transition must not occur"
-        if len(primary_requests) == 1:
-            return await completion(**kwargs)
-        if len(primary_requests) == 2:
-            return await reconciliation_completion(**kwargs)
-        raise AssertionError("An unbudgeted third provider transition must not occur")
+        return await completion(**kwargs)
 
     physical_sdk = AsyncMock(spec=litellm.acompletion, side_effect=physical_completion)
     client, engine, sessions = _build_app(tmp_path, monkeypatch, physical_sdk)
@@ -792,29 +788,6 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
             ),
         }
     }
-    if expected_primary_calls == 2:
-        reconciliation_completion.assert_awaited_once()
-        assert requests[1]["model"] == requests[0]["model"]
-        assert requests[1]["tools"] == requests[0]["tools"]
-        assert requests[1]["messages"][:-2] == requests[0]["messages"]
-        assert requests[1]["messages"][-2] == {
-            "role": "assistant",
-            "content": "No pipeline changes were requested.",
-        }
-        assert requests[1]["messages"][-1] == {
-            "role": "user",
-            "content": (
-                "[composer-system] No tool has run this turn, and the pipeline has no source or nodes. "
-                "Re-check the user's request against that state. If the user requested construction or generated "
-                "source data, carry out that authorized work using the declared tools before claiming it is complete. "
-                "If a required product fact is missing, start your no-tool reply with CLARIFY: and ask the concrete question. "
-                "If the user asked only for "
-                "explanation or revoked construction, answer that request without building. Do not describe data "
-                "as saved, bound, or reviewed until tool results establish it."
-            ),
-        }
-    else:
-        reconciliation_completion.assert_not_awaited()
     audit_rows = _llm_audit_rows(engine)
     assert len(audit_rows) == expected_primary_calls + 1
     actual_calls = [row.tool_calls[0]["call"] for row in audit_rows]
@@ -1635,12 +1608,8 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
     physical_requests: list[dict[str, Any]] = []
     reviews = _observe_publication_reviews(monkeypatch)
     end_payloads = []
-    primary_count = 3 if base_kind == "absent" else 2
-    candidate_reply = (
-        "The pipeline proposal awaits your approval; no pipeline state has been committed."
-        if base_kind == "absent"
-        else "The proposed pipeline is waiting for your approval."
-    )
+    primary_count = 2
+    candidate_reply = "The proposed pipeline is waiting for your approval."
 
     async def pending_completion(**kwargs: Any) -> _Response:
         physical_requests.append(deepcopy(kwargs))
@@ -1676,7 +1645,7 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
                 model=kwargs["model"],
                 id="pending-proposal-end-review",
             )
-        assert ordinal <= primary_count, "only the authored mutation, post-tool reply, and applicable empty-graph canary are allowed"
+        assert ordinal <= primary_count, "only the authored mutation and its post-tool reply are supplied"
         names = [tool["function"]["name"] for tool in kwargs["tools"]]
         assert "set_pipeline" in names
         assert "emit_pipeline_proposal" not in names
@@ -1687,36 +1656,6 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
         assert parameters["required"] == ["pipeline"]
         assert parameters["additionalProperties"] is False
         assert parameters["properties"]["pipeline"]["type"] == "object"
-        if ordinal == 3:
-            assert base_kind == "absent", "A populated base does not take the empty-graph canary"
-            assert kwargs["model"] == physical_requests[1]["model"]
-            assert kwargs["tools"] == physical_requests[1]["tools"]
-            assert kwargs["messages"][:-2] == physical_requests[1]["messages"]
-            assert kwargs["messages"][-2] == {
-                "role": "assistant",
-                "content": "The proposed pipeline is waiting for your approval.",
-            }
-            assert kwargs["messages"][-1] == {
-                "role": "user",
-                "content": (
-                    "[composer-system] No composition-state mutation completed successfully this turn, "
-                    "and the pipeline has no source or nodes. Re-check the user's request against that state. "
-                    "If the user requested construction or generated source data, carry out that authorized work "
-                    "using the declared tools before claiming it is complete. If a required product fact is missing, "
-                    "start your no-tool reply with CLARIFY: and ask the concrete question. "
-                    "If the user asked only for explanation or revoked construction, "
-                    "answer that request without building. Do not describe data as saved, bound, or reviewed "
-                    "until tool results establish it."
-                ),
-            }
-            return _Response(
-                choices=[
-                    _Choice(message=_Message(content="The pipeline proposal awaits your approval; no pipeline state has been committed."))
-                ],
-                usage={"prompt_tokens": 14, "completion_tokens": 7, "total_tokens": 21, "cost": 0.03},
-                model="provider/canary-reply-v1",
-                id="canary-request-3",
-            )
         if ordinal == 2:
             assert kwargs["model"] == physical_requests[0]["model"]
             assert kwargs["tools"] == physical_requests[0]["tools"]
@@ -2065,12 +2004,12 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
         "planner-request-1",
         "post-tool-request-2",
         "pending-proposal-end-review",
-    } | ({"canary-request-3"} if base_kind == "absent" else set())
+    }
     assert {call["model_returned"] for call in calls} == {
         "provider/planner-v1",
         "provider/post-tool-v1",
         client.app.state.composer_service._settings.composer_advisor_model,
-    } | ({"provider/canary-reply-v1"} if base_kind == "absent" else set())
+    }
     for physical in physical_requests:
         (call,) = [call for call in calls if call["messages_hash"] == stable_hash(physical["messages"])]
         assert call["status"] == "success"

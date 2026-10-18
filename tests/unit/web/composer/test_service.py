@@ -18,8 +18,10 @@ from typing import Any, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 from uuid import UUID, uuid4
 
+import litellm
 import pytest
 import structlog
+from httpx import MockTransport, Request, Response
 from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
@@ -30,7 +32,13 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.hashing import stable_hash
-from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardDecision, PromptGuardRequest
+from elspeth.contracts.prompt_guard import (
+    PromptGuardClient,
+    PromptGuardContentPart,
+    PromptGuardDecision,
+    PromptGuardRequest,
+    PromptGuardToolArgumentParts,
+)
 from elspeth.core.canonical import canonical_json
 from elspeth.web import async_workers
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -44,7 +52,8 @@ from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS, _comp
 from elspeth.web.composer.planning_application import (
     _freeform_planner_conversation_context,
 )
-from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, prompt_guard_user_scope
+from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
@@ -72,7 +81,8 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools import _registry as tool_registry
 from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
-from elspeth.web.composer.turn_effects import TurnEvidence
+from elspeth.web.composer.turn_effects import AdvisorPublicationReview, TurnEvidence
+from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
@@ -87,6 +97,7 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
     RequiredWorkAuthority,
@@ -103,6 +114,7 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     quota_provider_attempts_table,
     sessions_table,
+    token_usage_ledger_table,
 )
 from elspeth.web.sessions.routes._helpers import _persist_turn_audit_cohort
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -234,19 +246,195 @@ class _ReconciliationLLMScript:
         provider_custody: object | None = None,
         credential_state: object | None = None,
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         self.prompts.append(deepcopy(messages))
         return next(self._responses)
 
 
 def _assert_reconciliation_turn(mock_llm: AsyncMock, script: _ReconciliationLLMScript) -> None:
-    assert mock_llm.await_count == 3
-    assert len(script.prompts) == 3
-    prompt = script.prompts[2][-1]
-    assert prompt["role"] == "user"
-    assert "[composer-system]" in prompt["content"]
-    assert "No composition-state mutation completed successfully this turn" in prompt["content"]
-    assert "Re-check the user's request against that state" in prompt["content"]
+    """Require exact tool feedback without the retired lexical PRIMARY retry."""
+    assert mock_llm.await_count == len(script.responses) == 2
+    assert len(script.prompts) == 2
+    prompt = script.prompts[1][-1]
+    assert prompt["role"] == "tool"
+    calls = script.responses[0].tool_batch.calls
+    assert len(calls) == 1
+    assert prompt["tool_call_id"] == calls[0].id
+
+
+class _SemanticRecoveryLLMScript:
+    """Finite SDK responses; the real checkpoint owner parses and binds every review."""
+
+    def __init__(
+        self,
+        service: ComposerServiceImpl,
+        request: str,
+        primary_responses: tuple[_AdmittedLLMCompletion, ...],
+        *,
+        phases: tuple[Literal["primary", "early", "end"], ...],
+        first_findings: str,
+    ) -> None:
+        self.service = service
+        self.request = request
+        self.primary_responses = primary_responses
+        self.expected_phases = phases
+        self.first_findings = first_findings
+        self.phases: list[str] = []
+        self.requests: list[dict[str, Any]] = []
+        self.primary_requests: list[dict[str, Any]] = []
+        self.end_inputs: list[AdvisorPublicationReview] = []
+        self.end_outputs: list[AdvisorCheckpointVerdict] = []
+        self.mints: list[tuple[ProviderInvocationOwner, ProviderInvocationFamily, Any]] = []
+        self.attempt_ids: list[str] = []
+
+    async def checkpoint(self, *args: Any, **kwargs: Any) -> AdvisorCheckpointVerdict:
+        if kwargs["phase"] == "end":
+            assert kwargs["user_message"] == self.request
+            review = kwargs["publication_review"]
+            assert isinstance(review, AdvisorPublicationReview)
+            self.end_inputs.append(review)
+        verdict = await _REAL_RUN_ADVISOR_CHECKPOINT(self.service._advisor_checkpoint, *args, **kwargs)
+        if kwargs["phase"] == "end":
+            assert verdict.publication_binding == review.binding
+            self.end_outputs.append(verdict)
+        return verdict
+
+    async def complete(self, **kwargs: Any) -> Any:
+        if "response_format" not in kwargs:
+            phase = "primary"
+            assert kwargs["model"] == self.service._model
+        else:
+            schema = kwargs["response_format"]["json_schema"]
+            assert schema["name"] in {"advisor_checkpoint_response", "advisor_end_response"}
+            phase = "end" if schema["name"] == "advisor_end_response" else "early"
+            assert kwargs["model"] == self.service._settings.composer_advisor_model
+        assert len(self.phases) < len(self.expected_phases), "Unexpected extra provider transition"
+        assert phase == self.expected_phases[len(self.phases)]
+        owner, family, custody = self.mints[-1]
+        assert owner.service is self.service._require_sessions_service()
+        assert family is (ProviderInvocationFamily.PRIMARY if phase == "primary" else ProviderInvocationFamily.ADVISOR)
+        assert custody.attempt is not None
+        self.attempt_ids.append(custody.attempt.attempt_id)
+        self.phases.append(phase)
+        self.requests.append(deepcopy(kwargs))
+        tool_calls = None
+        if phase == "primary":
+            response = self.primary_responses[len(self.primary_requests)]
+            self.primary_requests.append(deepcopy(kwargs))
+            content = response.message.content
+            if response.tool_batch.calls:
+                tool_calls = [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.function.name, "arguments": call.function.arguments},
+                    }
+                    for call in response.tool_batch.calls
+                ]
+        else:
+            payload: dict[str, Any] = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}
+            if phase == "end":
+                review = self.end_inputs[-1]
+                texts = [
+                    message["content"] if isinstance(message["content"], str) else "".join(part["text"] for part in message["content"])
+                    for message in kwargs["messages"]
+                ]
+                assert any(review.provider_payload_json in text for text in texts)
+                evidence = json.loads(review.payload_json)
+                assert evidence["current_request"] == self.request
+                assert evidence["candidate_reply"] == self.primary_responses[len(self.primary_requests) - 1].message.content
+                first = len(self.end_inputs) == 1
+                payload["publication_verdict"] = "WITHHOLD" if first else "ADMIT"
+                payload["findings"] = self.first_findings if first else ""
+            content = json.dumps(payload)
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            choices=[
+                {
+                    "message": {"role": "assistant", "content": content, "tool_calls": tool_calls},
+                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                }
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        )
+
+    def assert_finished(self) -> None:
+        assert tuple(self.phases) == self.expected_phases
+        assert len(self.primary_requests) == len(self.primary_responses)
+        assert [verdict.publication_verdict for verdict in self.end_outputs] == ["WITHHOLD", "ADMIT"]
+        assert self.end_inputs[0].binding != self.end_inputs[1].binding
+        assert len(self.attempt_ids) == len(set(self.attempt_ids)) == len(self.expected_phases)
+        assert len(self.mints) == len(self.expected_phases)
+        assert len({id(owner.required_work.coordinator) for owner, _family, _custody in self.mints}) == 1
+        self.mints[0][0].required_work.coordinator.assert_completed()
+        with self.service._session_engine.connect() as conn:
+            attempts = conn.execute(
+                select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.attempt_id.in_(self.attempt_ids))
+            ).all()
+            session_id = self.mints[0][2].context.fence.session_id
+            audit_rows = conn.execute(
+                select(chat_messages_table)
+                .where(chat_messages_table.c.session_id == session_id, chat_messages_table.c.role == "audit")
+                .order_by(chat_messages_table.c.sequence_no)
+            ).all()
+            ledger = conn.execute(
+                select(token_usage_ledger_table).where(
+                    token_usage_ledger_table.c.entry_id.in_(attempt.ledger_entry_id for attempt in attempts)
+                )
+            ).all()
+        assert len(attempts) == len(self.attempt_ids)
+        assert all(attempt.settled_at is not None and attempt.ledger_entry_id is not None for attempt in attempts)
+        assert len(ledger) == len(attempts)
+        assert all(row.prompt_tokens == row.completion_tokens == 10 for row in ledger)
+        calls = [envelope["call"] for row in audit_rows for envelope in (row.tool_calls or ()) if envelope["_kind"] == "llm_call_audit"]
+        assert len(calls) == len(self.attempt_ids) and {call["call_id"] for call in calls} == set(self.attempt_ids)
+        assert all(call["status"] == "success" for call in calls)
+        guards = [
+            envelope["check"] for row in audit_rows for envelope in (row.tool_calls or ()) if envelope["_kind"] == "prompt_guard_audit"
+        ]
+        assert [(check["role"], check["disposition"]) for check in guards] == [
+            ("composer" if phase == "primary" else "advisor", "debug_bypass") for phase in self.expected_phases
+        ]
+        assert any(
+            row.content == self.primary_responses[0].message.content
+            and any(
+                envelope["_kind"] == COMPOSER_WITHHELD_REPLY_KIND and envelope["origin"] == "repair_gate_superseded"
+                for envelope in (row.tool_calls or ())
+            )
+            for row in audit_rows
+        )
+        repair = self.primary_requests[1]["messages"]
+        assert self.first_findings in json.dumps(repair)
+        assert any(message["role"] == "assistant" and message["content"] == self.primary_responses[0].message.content for message in repair)
+        assert not any(
+            message["role"] == "user"
+            and isinstance(message["content"], str)
+            and message["content"].startswith(
+                ("[composer-system] No tool has run this turn", "[composer-system] No composition-state mutation completed successfully")
+            )
+            for request in self.primary_requests
+            for message in request["messages"]
+        )
+
+
+@contextlib.contextmanager
+def _real_semantic_recovery_sdk(script: _SemanticRecoveryLLMScript) -> Iterator[None]:
+    """Restore the real per-instance checkpoint and observe its actual mint owner."""
+    real_mint = ProviderInvocationOwner.mint
+
+    def mint(owner: ProviderInvocationOwner, family: ProviderInvocationFamily):
+        custody = real_mint(owner, family)
+        script.mints.append((owner, family, custody))
+        return custody
+
+    with (
+        patch("litellm.acompletion", new=script.complete),
+        patch.object(script.service._advisor_checkpoint, "_run_advisor_checkpoint", new=script.checkpoint),
+        patch.object(ProviderInvocationOwner, "mint", new=mint),
+    ):
+        yield
 
 
 def _advisor_checkpoint_responses(*replies: str) -> Callable[..., Awaitable[tuple[str, dict[str, object]]]]:
@@ -463,11 +651,16 @@ def _composer_service_with_session(catalog: CatalogService, settings: Any) -> tu
 
 @contextlib.contextmanager
 def _sampling_provider_owner(
-    service: ComposerServiceImpl, session_id: str, *, expected_calls: int
+    service: ComposerServiceImpl,
+    session_id: str,
+    *,
+    expected_calls: int,
+    expected_guard_mode: Literal["required", "debug-when-unconfigured"] = "debug-when-unconfigured",
 ) -> Iterator[tuple[ProviderInvocationOwner, BufferingRecorder]]:
     sessions = service._sessions_service
     engine = service._session_engine
     assert isinstance(sessions, SessionServiceImpl) and engine is not None
+    assert service._settings.composer_prompt_guard_mode == expected_guard_mode
     with fenced_operation_context(engine, session_id) as context:
         coordinator = RequiredWorkCoordinator(
             RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
@@ -489,15 +682,55 @@ def _sampling_provider_owner(
             if envelope["_kind"] == "prompt_guard_audit"
         ]
         assert len(checks) == len(attempts) == len(recorder.llm_calls) == expected_calls
-        assert all(
-            check["role"] == "composer"
-            and check["mode"] == "debug-when-unconfigured"
-            and check["disposition"] == "debug_bypass"
-            and check["operation_id"] == context.fence.operation_id
-            for check in checks
-        )
+        if expected_guard_mode == "required":
+            assert all(
+                check["role"] == "composer"
+                and check["mode"] == "required"
+                and check["adapter"] == "azure_prompt_shields"
+                and check["disposition"] == "allow"
+                and check["reason"] == "clean"
+                and check["operation_id"] == context.fence.operation_id
+                and check["operation_epoch"] == context.fence.operation_epoch
+                for check in checks
+            )
+        else:
+            assert all(
+                check["role"] == "composer"
+                and check["mode"] == "debug-when-unconfigured"
+                and check["disposition"] == "debug_bypass"
+                and check["operation_id"] == context.fence.operation_id
+                for check in checks
+            )
         assert {attempt.attempt_id for attempt in attempts} == {call.call_id for call in recorder.llm_calls}
         assert all(attempt.settled_at is not None and attempt.ledger_entry_id is not None for attempt in attempts)
+
+
+@pytest.fixture
+def _sampling_required_guard(monkeypatch: pytest.MonkeyPatch) -> tuple[PromptGuardSettings, list[dict[str, Any]]]:
+    """Keep the real required Azure guard and durable custody on direct SDK tests."""
+    settings = PromptGuardSettings(endpoint="https://sampling-guard.example.test", subscription_key="offline-sampling")
+    requests: list[dict[str, Any]] = []
+
+    def shield_response(request: Request) -> Response:
+        assert request.url.host == "sampling-guard.example.test"
+        assert request.method == "POST" and request.url.path == "/contentsafety/text:shieldPrompt"
+        body = json.loads(request.content)
+        requests.append(body)
+        return Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _document in body["documents"]],
+            },
+        )
+
+    def mount(config: PromptGuardSettings | None) -> PromptGuardMount:
+        assert config is not None and config is settings
+        return PromptGuardMount(AzurePromptGuardClient(config, http_transport=MockTransport(shield_response)))
+
+    monkeypatch.setattr("elspeth.web.composer.provider_gateway.build_prompt_guard_mount", mount)
+    monkeypatch.setattr("elspeth.web.composer.service.build_prompt_guard_mount", mount)
+    return settings, requests
 
 
 @pytest.mark.asyncio
@@ -1065,33 +1298,36 @@ class TestComposerTextOnlyResponse:
         assert result.state.version == 1  # unchanged
 
     @pytest.mark.asyncio
-    async def test_build_request_text_only_on_empty_state_returns_no_mutation_blocker(self) -> None:
-        """A build request cannot end with conceptual prose when no mutation ran."""
+    async def test_build_request_text_only_reaches_real_end_without_fabricated_mutation_blocker(self) -> None:
+        """Actual END withholds unsupported prose; zero attempts do not invent a tool failure."""
         catalog = _mock_catalog()
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
         model_prose = "I set up the workflow conceptually and can continue."
-        llm_response = _make_llm_response(content=model_prose)
+        truthful = "No workflow has been configured. Please supply leads_q3.csv."
+        request = 'Build the workflow described by the accepted request: "Read leads_q3.csv and write JSON".'
+        user_message_id = _insert_user_message(service._session_engine, session_id, request)
+        script = _SemanticRecoveryLLMScript(
+            service,
+            request,
+            (_make_llm_response(content=model_prose), _make_llm_response(content=truthful)),
+            phases=("primary", "end", "primary", "end"),
+            first_findings="The reply claims a configured workflow without any saved composition work.",
+        )
+        with _real_semantic_recovery_sdk(script):
+            result = await service.compose(request, [], state, session_id=session_id, user_id="test-user", user_message_id=user_message_id)
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.return_value = llm_response
-            result = await service.compose("Set this up to actually run from leads_q3.csv.", [], state, session_id=session_id)
-
+        script.assert_finished()
         assert result.state.version == state.version
-        assert result.raw_assistant_content == model_prose
-        assert result.runtime_preflight is not None
-        assert result.runtime_preflight.is_valid is False
-        assert [check.name for check in result.runtime_preflight.checks] == ["state_exists"]
-        # New contract (post elspeth-861b0c58f5): model prose preserved
-        # verbatim, system suffix appended carrying the concrete blocker.
-        assert result.message.startswith(model_prose)
-        assert "[ELSPETH-SYSTEM]" in result.message
-        assert "still empty" in result.message
-        assert "the model ended the turn without calling any build/edit tool" in result.message
-        # Audit-trail attribution: blocker recorded in the runtime_preflight
-        # ValidationResult (so structured downstream consumers can route on it).
-        assert "state_exists=false" in result.runtime_preflight.checks[0].detail
+        assert not result.tool_invocations
+        assert result.runtime_preflight is None
+        assert result.repair_turns_used == 0
+        _assert_checkpoint_reply(result, truthful, count=0)
+        assert model_prose not in result.message
+        assert "still empty" not in result.message
+        assert "without calling any build/edit tool" not in result.message
+        assert all(json.loads(review.payload_json)["saved_effects"]["saved_revision_count"] == 0 for review in script.end_inputs)
 
     @pytest.mark.asyncio
     async def test_failed_mutation_then_empty_state_reply_names_blocking_tool_error(self) -> None:
@@ -1118,7 +1354,7 @@ class TestComposerTextOnlyResponse:
         text_response = _make_llm_response(content=final_prose)
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(failed_set_pipeline, text_response, text_response)
+            script = _ReconciliationLLMScript(failed_set_pipeline, text_response)
             mock_llm.side_effect = script.respond
             result = await service.compose("Build the CSV workflow now.", [], state, session_id=session_id)
 
@@ -1488,6 +1724,8 @@ class TestComposerSingleToolCall:
             provider_custody: object | None = None,
             credential_state: object | None = None,
             prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
         ) -> Any:
             return responses.pop(0)
 
@@ -1554,6 +1792,8 @@ class TestComposerSingleToolCall:
             provider_custody: object | None = None,
             credential_state: object | None = None,
             prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
         ) -> Any:
             return responses.pop(0)
 
@@ -2023,6 +2263,8 @@ class TestComposerMultiTurnToolCalls:
             provider_custody: object | None = None,
             credential_state: object | None = None,
             prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
         ) -> Any:
             captured_messages.append(list(messages))
             return next(responses)
@@ -2462,6 +2704,8 @@ class TestComposerMultiTurnToolCalls:
             provider_custody: object | None = None,
             credential_state: object | None = None,
             prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
         ) -> Any:
             provider_contexts.append([dict(item) for item in messages])
             return replies[len(provider_contexts) - 1]
@@ -2758,6 +3002,8 @@ class TestComposerMultiTurnToolCalls:
             provider_custody: object | None = None,
             credential_state: object | None = None,
             prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
         ) -> Any:
             assert len(captured_messages) < len(replies), "Only the original finite primary responses are supplied"
             captured_messages.append(deepcopy(messages))
@@ -2966,6 +3212,8 @@ class TestComposerMultiTurnToolCalls:
             provider_custody: object | None = None,
             credential_state: object | None = None,
             prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
         ) -> Any:
             captured_messages.append(list(messages))
             return next(responses)
@@ -3378,7 +3626,7 @@ class TestComposerErrorHandling:
         text = _make_llm_response(content="No pipeline changes were saved.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(bad_call, text, text)
+            script = _ReconciliationLLMScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
@@ -3442,7 +3690,7 @@ class TestComposerErrorHandling:
             ),
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
-            script = _ReconciliationLLMScript(bad_call, text, text)
+            script = _ReconciliationLLMScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
@@ -3510,7 +3758,7 @@ class TestComposerErrorHandling:
         text = _make_llm_response(content="Recovered.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(bad_call, text, text)
+            script = _ReconciliationLLMScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
@@ -3599,7 +3847,7 @@ class TestComposerErrorHandling:
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
-            script = _ReconciliationLLMScript(good_call, text, text)
+            script = _ReconciliationLLMScript(good_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Setup", [], state, session_id=session_id)
 
@@ -3681,7 +3929,7 @@ class TestComposerErrorHandling:
         text = _make_llm_response(content="Adjusted.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(partial_call, text, text)
+            script = _ReconciliationLLMScript(partial_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
@@ -3767,7 +4015,7 @@ class TestComposerErrorHandling:
         text = _make_llm_response(content="Ok.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(bad_call, text, text)
+            script = _ReconciliationLLMScript(bad_call, text)
             mock_llm.side_effect = script.respond
             await service.compose("Setup", [], state, session_id=session_id)
 
@@ -3806,7 +4054,7 @@ class TestComposerErrorHandling:
             ) as mock_execute_tool,
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
-            script = _ReconciliationLLMScript(bad_call, text, text)
+            script = _ReconciliationLLMScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
@@ -5337,12 +5585,23 @@ class TestComposerSamplingConfig:
     """
 
     @pytest.mark.asyncio
-    async def test_freeform_tool_and_prose_calls_disable_hidden_sdk_retries(self) -> None:
-        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+    async def test_freeform_tool_and_prose_calls_disable_hidden_sdk_retries(
+        self, _sampling_required_guard: tuple[PromptGuardSettings, list[dict[str, Any]]]
+    ) -> None:
+        guard_settings, guard_requests = _sampling_required_guard
+        service, session_id = _composer_service_with_session(
+            catalog=_mock_catalog(),
+            settings=_make_settings(
+                composer_prompt_guard_mode="required",
+                composer_prompt_guard=guard_settings,
+                composer_advisor_prompt_guard=guard_settings,
+            ),
+        )
         completion = _make_raw_llm_response(content="acknowledged")
 
         with (
-            _sampling_provider_owner(service, session_id, expected_calls=2) as (owner, recorder),
+            _sampling_provider_owner(service, session_id, expected_calls=2, expected_guard_mode="required") as (owner, recorder),
+            prompt_guard_user_scope("Hello"),
             patch("litellm.acompletion", new_callable=AsyncMock, return_value=completion) as mock_acomp,
         ):
             await service._provider_gateway._call_llm_with_audit(
@@ -5363,6 +5622,10 @@ class TestComposerSamplingConfig:
         for call in mock_acomp.call_args_list:
             assert call.kwargs["num_retries"] == 0
             assert call.kwargs["max_retries"] == 0
+        assert guard_requests == [
+            {"userPrompt": "Hello", "documents": []},
+            {"userPrompt": "", "documents": ['{"content":"Hello","role":"user"}']},
+        ]
 
     @pytest.mark.asyncio
     async def test_call_llm_sends_configured_temperature_and_seed(self) -> None:
@@ -5392,14 +5655,23 @@ class TestComposerSamplingConfig:
         assert first_call_kwargs["seed"] == 42
 
     @pytest.mark.asyncio
-    async def test_call_llm_omits_sampling_when_operator_leaves_it_unset(self) -> None:
+    async def test_call_llm_omits_sampling_when_operator_leaves_it_unset(
+        self, _sampling_required_guard: tuple[PromptGuardSettings, list[dict[str, Any]]]
+    ) -> None:
+        guard_settings, guard_requests = _sampling_required_guard
         catalog = _mock_catalog()
-        settings = _make_settings(composer_model="anthropic/claude-3-5-sonnet-20241022")
+        settings = _make_settings(
+            composer_model="anthropic/claude-3-5-sonnet-20241022",
+            composer_prompt_guard_mode="required",
+            composer_prompt_guard=guard_settings,
+            composer_advisor_prompt_guard=guard_settings,
+        )
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         completion = _make_raw_llm_response(content="acknowledged")
 
         with (
-            _sampling_provider_owner(service, session_id, expected_calls=1) as (owner, recorder),
+            _sampling_provider_owner(service, session_id, expected_calls=1, expected_guard_mode="required") as (owner, recorder),
+            prompt_guard_user_scope("Hello"),
             patch("litellm.acompletion", new_callable=AsyncMock, return_value=completion) as mock_acomp,
         ):
             await service._provider_gateway._call_llm_with_audit(
@@ -5413,6 +5685,7 @@ class TestComposerSamplingConfig:
         kwargs = mock_acomp.call_args_list[0].kwargs
         assert "temperature" not in kwargs
         assert "seed" not in kwargs
+        assert guard_requests == [{"userPrompt": "Hello", "documents": ['{"cache_control":{"type":"ephemeral"}}']}]
 
     @pytest.mark.asyncio
     async def test_call_text_llm_sends_configured_temperature_and_seed(self) -> None:
@@ -6154,7 +6427,7 @@ class TestPluginBugCrashesFromToolExecution:
                 ),
             ),
         ):
-            script = _ReconciliationLLMScript(valid_call, text, text)
+            script = _ReconciliationLLMScript(valid_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Setup", [], state, session_id=session_id)
 
@@ -6242,7 +6515,7 @@ class TestPluginBugCrashesFromToolExecution:
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=leaky),
         ):
-            script = _ReconciliationLLMScript(tool_call, text, text)
+            script = _ReconciliationLLMScript(tool_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Setup", [], state, session_id=session_id)
 
@@ -7515,22 +7788,11 @@ class TestToolArgumentErrorAcrossThreadBoundary:
 
     @pytest.mark.asyncio
     async def test_real_create_blob_type_guard_feeds_error_to_llm(self) -> None:
-        """Tier-3 wrong-type ``content`` routes through ARG_ERROR (Task 13 / Wave 2).
+        """The real threaded schema boundary retains safe blob ARG_ERROR feedback.
 
-        Post-promotion (Task 13) ``create_blob`` validates via
-        :class:`CreateBlobArgumentsModel` BEFORE ``_prepare_blob_create``
-        reads any field.  Pydantic rejects ``content: int`` and the
-        handler re-raises :class:`pydantic.ValidationError` as
-        :class:`ToolArgumentError` (pattern at ``tools.py:2320-2327``,
-        rev-2 BLOCKER_A).  The LLM-facing payload is intentionally
-        leak-safe: it names the argument-bundle and the expected model,
-        not the offending value or per-field detail.  The structured
-        Pydantic detail survives on ``__cause__`` for auditors.
-
-        Memory: ``feedback_locked_in_buggy_expectations`` — the prior
-        assertion pinned the legacy ``_prepare_blob_create`` message
-        ``"'content' must be a string, got int"``; the Pydantic boundary
-        now fires first and that message no longer reaches the LLM.
+        The flat registry schema rejects integer content before the handler's
+        Pydantic parser. Blob-only failure remains audited and reaches the next
+        PRIMARY, without manufacturing a failed CompositionState mutation.
         """
         catalog = _mock_catalog()
         settings = _make_settings(data_dir=self.data_dir)
@@ -7558,27 +7820,31 @@ class TestToolArgumentErrorAcrossThreadBoundary:
         text = _make_llm_response(content="Fixed.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(bad_call, text, text)
+            script = _ReconciliationLLMScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=self.session_id)
 
         _assert_reconciliation_turn(mock_llm, script)
 
-        _assert_no_mutation_empty_state_blocker(
-            result,
-            tool_name="create_blob",
-            expected_detail="ToolArgumentError",
-        )
+        assert result.state == state
+        assert result.runtime_preflight is None
+        assert len(result.tool_invocations) == 1
+        invocation = result.tool_invocations[0]
+        assert invocation.tool_call_id == "call_bad" and invocation.tool_name == "create_blob"
+        assert invocation.status is ComposerToolStatus.ARG_ERROR
+        assert invocation.error_class == "ToolArgumentError"
+        assert invocation.error_category is ToolArgumentErrorCategory.SCHEMA_SHAPE
+        _assert_checkpoint_reply(result, "Fixed.", count=0)
+        assert "pipeline is still empty" not in result.message
         second_call_messages = script.prompts[1]
         tool_messages = [m for m in second_call_messages if m.get("role") == "tool"]
         assert len(tool_messages) == 1
         error_content = json.loads(tool_messages[0]["content"])
-        # New (post-promotion) LLM-facing message names the argument-bundle
-        # and the Pydantic model — no leak of the raw offending value.
+        # The safe schema message names the argument-bundle/model, excluding
+        # the received value and the legacy type-guard wording.
         assert "create_blob arguments" in error_content["error"]
         assert "CreateBlobArgumentsModel" in error_content["error"]
-        # The raw value (42 / "int") MUST NOT survive into the LLM echo;
-        # actual_type is the exception's class name, not the value's type.
+        # The legacy raw type-guard wording must not survive into the LLM echo.
         assert "got int" not in error_content["error"]
 
     @pytest.mark.asyncio
@@ -7640,7 +7906,7 @@ class TestToolArgumentErrorAcrossThreadBoundary:
         text = _make_llm_response(content="Fixed.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(bad_call, text, text)
+            script = _ReconciliationLLMScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=self.session_id)
 
@@ -8690,8 +8956,7 @@ class TestEmptyStateFinalizePassthrough:
         assert _last_mutation_was_pending_proposal((proposal, arg_error)) is False
 
     def test_last_mutation_was_pending_proposal_false_for_create_blob_success(self) -> None:
-        """create_blob success without state advance is the original target
-        of the empty-state augmentation — it must continue to fire."""
+        """Blob creation is not an approval proposal or a failed graph mutation."""
         from datetime import UTC, datetime
 
         from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
@@ -9623,15 +9888,8 @@ class TestComposeLoopForcedRepair:
         ]
 
     @pytest.mark.asyncio
-    async def test_empty_state_uploaded_blob_stall_gets_neutral_recovery_turn(self) -> None:
-        """An authorized uploaded build retains a neutral recovery opportunity.
-
-        Regression for elspeth-b493ddf810: the hard-mode uploaded-CSV happy
-        path produced repeated prose replies, no tool calls, and an empty
-        CompositionState even though a ready uploaded CSV blob was present.
-        The service should expose the ready blob on a neutral retry while
-        retaining the user's request as the authority for construction.
-        """
+    async def test_empty_state_uploaded_blob_stall_recovers_through_actual_end(self) -> None:
+        """Actual END rejects an unsupported header-only claim before the provider builds."""
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         turn1_stall = _make_llm_response(
             content="The uploaded CSV appears to contain only the header row, so I cannot build yet.",
@@ -9641,21 +9899,31 @@ class TestComposeLoopForcedRepair:
         turn3_done = _make_llm_response(content="Ready.", tool_calls=None)
 
         empty = _empty_state()
+        request = 'Build from my uploaded CSV using this specification: "CSV source to JSON output; preserve every observed column".'
+        user_message_id = _insert_user_message(self.engine, self.session_id, request)
+        script = _SemanticRecoveryLLMScript(
+            self.service,
+            request,
+            (turn1_stall, turn2_build, turn3_done),
+            phases=("primary", "end", "primary", "early", "primary", "end"),
+            first_findings="The header-only claim lacks current source inspection, and the authorized uploaded-source build remains unstarted.",
+        )
         with (
-            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            _real_semantic_recovery_sdk(script),
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
-            mock_llm.side_effect = [turn1_stall, turn2_build, turn3_done]
             result = await self.service.compose(
-                "Build from my uploaded CSV",
+                request,
                 [],
                 empty,
                 session_id=self.session_id,
                 user_id="test-user",
+                user_message_id=user_message_id,
             )
 
-        assert mock_llm.call_count == 3
-        assert result.repair_turns_used == 1
+        script.assert_finished()
+        assert len(script.primary_requests) == 3
+        assert result.repair_turns_used == 0
         assert result.state.sources["source"] is not None
         assert result.state.sources["source"].options["blob_ref"] == self.blob_id
         # Uploaded blob: no auto-declared guaranteed_fields (John's ruling
@@ -9664,23 +9932,12 @@ class TestComposeLoopForcedRepair:
         assert result.state.outputs[0].name == "out"
         assert result.runtime_preflight is not None and result.runtime_preflight.is_valid is True
 
-        turn2_messages = mock_llm.call_args_list[1].args[0]
-        repair_msgs = [
-            m
-            for m in turn2_messages
-            if isinstance(m, dict)
-            and m.get("role") == "user"
-            and "[composer-system]" in str(m.get("content", ""))
-            and self.blob_id in str(m.get("content", ""))
-        ]
-        assert len(repair_msgs) == 1
-        repair_text = str(repair_msgs[0]["content"])
-        assert "ready uploaded blob" in repair_text
-        assert "inspect_source" in repair_text
-        assert "source.blob_id" in repair_text
-        assert "Do not infer that a CSV is header-only" in repair_text
-        assert "explanation or revoked construction" in repair_text
-        assert "availability does not authorize construction" in repair_text
+        initial_review = json.loads(script.end_inputs[0].payload_json)
+        final_review = json.loads(script.end_inputs[1].payload_json)
+        assert initial_review["saved_effects"]["saved_revision_count"] == 0
+        assert initial_review["inspection"]["currently_available"] == []
+        assert final_review["saved_effects"]["saved_revision_count"] > 0
+        assert final_review["saved_effects"]["net_changed"] is True
 
     @pytest.mark.asyncio
     async def test_unsupported_from_json_recovery_retains_authorized_fallback_build(self, tmp_path: Path) -> None:
@@ -9734,45 +9991,44 @@ class TestComposeLoopForcedRepair:
         turn3_done = _make_llm_response(content="Built the supported fallback.", tool_calls=None)
 
         empty = _empty_state()
+        request = (
+            'Build the accepted specification from uploaded events.csv: "Parse payload with from_json(payload). '
+            'If unsupported, keep payload as a string and route by event_type into signups, upgrades and other JSONL outputs".'
+        )
+        user_message_id = _insert_user_message(self.engine, self.session_id, request)
+        script = _SemanticRecoveryLLMScript(
+            self.service,
+            request,
+            (turn1_refusal, turn2_build, turn3_done),
+            phases=("primary", "end", "primary", "early", "primary", "end"),
+            first_findings="The accepted fallback remains unbuilt; unsupported parsing does not cancel the authorized routing and outputs.",
+        )
         with (
-            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            _real_semantic_recovery_sdk(script),
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
-            mock_llm.side_effect = [turn1_refusal, turn2_build, turn3_done]
             result = await self.service.compose(
-                (
-                    "Build a CSV pipeline on the uploaded events.csv, parse payload with "
-                    "from_json(payload), gate on event_type, and write signups/upgrades/other."
-                ),
+                request,
                 [],
                 empty,
                 session_id=self.session_id,
                 user_id="test-user",
+                user_message_id=user_message_id,
             )
 
-        assert mock_llm.call_count == 3
-        assert result.repair_turns_used == 1
+        script.assert_finished()
+        assert len(script.primary_requests) == 3
+        assert result.repair_turns_used == 0
         assert result.state.sources["source"].options["blob_ref"] == event_blob_id
         assert {node.id for node in result.state.nodes} == {"gate_signup", "gate_upgrade"}
         assert {output.name for output in result.state.outputs} == {"signups", "upgrades", "other"}
         assert result.runtime_preflight is not None and result.runtime_preflight.is_valid is True
 
-        turn2_messages = mock_llm.call_args_list[1].args[0]
-        repair_msgs = [
-            m
-            for m in turn2_messages
-            if isinstance(m, dict)
-            and m.get("role") == "user"
-            and "[composer-system]" in str(m.get("content", ""))
-            and event_blob_id in str(m.get("content", ""))
-        ]
-        assert len(repair_msgs) == 1
-        repair_text = str(repair_msgs[0]["content"])
-        assert "unsupported requested primitive" in repair_text
-        assert "from_json" in repair_text
-        assert "supported fallback" in repair_text
-        assert "authorized supported fallback" in repair_text
-        assert "explanation or revoked construction" in repair_text
+        initial_review = json.loads(script.end_inputs[0].payload_json)
+        final_review = json.loads(script.end_inputs[1].payload_json)
+        assert initial_review["saved_effects"]["saved_revision_count"] == 0
+        assert final_review["saved_effects"]["saved_revision_count"] > 0
+        assert final_review["saved_effects"]["net_changed"] is True
 
     def _futile_repair_tool_call(self, call_id: str, name_value: str) -> list[dict[str, Any]]:
         """Tool call that mutates state but does NOT clear the proof blocker.

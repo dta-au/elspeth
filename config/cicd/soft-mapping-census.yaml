@@ -782,7 +782,7 @@ files:
   src/elspeth/web/composer/capability_skill.py:
     Mapping[str, Any]: 8
   src/elspeth/web/composer/composition_completion.py:
-    Mapping[str, Any]: 3
+    Mapping[str, Any]: 2
     dict[str, Any]: 4
   src/elspeth/web/composer/control_messages.py:
     Mapping[str, Any]: 1
@@ -1067,10 +1067,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 761
+  Mapping[str, Any]: 760
   Mapping[str, object]: 315
   MutableMapping[str, Any]: 8
   boundary: 60
   dict[str, Any]: 1078
   dict[str, object]: 395
-  soft: 2557
+  soft: 2556

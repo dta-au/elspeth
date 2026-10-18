@@ -669,11 +669,9 @@ def test_intent_classifier_has_no_new_consumers() -> None:
         if parsed.path.name != "no_tool_policy.py" and "classify_pipeline_mutation_intent" in parsed.source
     }
     # service.py selects the authoring surface; composition_completion.py
-    # chooses the repair nudge. no_tool_finalize.py has a comment-only
-    # historical reference ("which this path no longer" consults). The pin
-    # is a TEXT search on purpose: even a new prose reference warrants a look.
+    # retains the interpretation repair nudge. The pin is a TEXT search on
+    # purpose: even a new prose reference warrants a look.
     assert consumers == {
         "web/composer/service.py",
         "web/composer/composition_completion.py",
-        "web/composer/no_tool_finalize.py",
     }

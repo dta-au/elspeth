@@ -1690,15 +1690,16 @@ async def test_actual_end_permission_controls_public_terminal_and_saved_history(
     expected_review_calls = 1 if admitted or stale_evidence else 2
     assert len([call for call in calls if "response_format" in call]) == expected_review_calls
     primary_calls = [call for call in calls if "response_format" not in call]
-    assert len(primary_calls) == expected_review_calls + int(revoke_build)
+    assert len(primary_calls) == expected_review_calls
     primary_audits = [call for call in result.llm_calls if call.model_requested == app.state.settings.composer_model]
     assert all(call.call_id is not None for call in primary_audits)
     assert json.loads(reviews[-1].payload_json)["inspection"]["current_candidate_call"][0] == primary_audits[-1].call_id
-    if revoke_build:
-        assert any(
-            message["role"] == "user" and message["content"].startswith("[composer-system] No tool has run this turn")
-            for message in primary_calls[1]["messages"]
-        )
+    assert not any(
+        message["role"] == "user" and message["content"].startswith("[composer-system] No tool has run this turn")
+        for call in primary_calls
+        for message in call["messages"]
+        if isinstance(message["content"], str)
+    )
     withheld = [
         entry
         for row in messages

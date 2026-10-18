@@ -21,7 +21,6 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.session_operation import SessionOperationContext
-from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
 from elspeth.web.composer._compose_loop_carriers import (
@@ -71,10 +70,6 @@ from elspeth.web.composer.no_tool_policy import (
     PipelineMutationIntentDecision as _PipelineMutationIntentDecision,
 )
 from elspeth.web.composer.no_tool_policy import (
-    carries_build_action,
-    compose_checkpoint_receipt_message,
-)
-from elspeth.web.composer.no_tool_policy import (
     classify_pipeline_mutation_intent as _classify_pipeline_mutation_intent,
 )
 from elspeth.web.composer.no_tool_policy import (
@@ -83,6 +78,7 @@ from elspeth.web.composer.no_tool_policy import (
 from elspeth.web.composer.no_tool_policy import (
     compose_advisor_signoff_pending_message as _compose_advisor_signoff_pending_message,
 )
+from elspeth.web.composer.no_tool_policy import compose_checkpoint_receipt_message
 from elspeth.web.composer.no_tool_policy import (
     compose_interpretation_review_handoff_message as _compose_interpretation_review_handoff_message,
 )
@@ -104,7 +100,7 @@ from elspeth.web.composer.no_tool_policy import (
 from elspeth.web.composer.no_tool_policy import (
     state_is_structurally_empty as _state_is_structurally_empty,
 )
-from elspeth.web.composer.no_tool_response import NoToolResponse, is_unstarted_clarification, parse_no_tool_response
+from elspeth.web.composer.no_tool_response import NoToolResponse, parse_no_tool_response
 from elspeth.web.composer.progress import (
     emit_progress,
 )
@@ -114,9 +110,6 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState
-from elspeth.web.composer.tools import (
-    _sync_list_blobs,
-)
 from elspeth.web.composer.tools.generation import (
     ComposerProofContext,
     MalformedSourceProofClaim,
@@ -794,46 +787,6 @@ class _ProofRepairOutcome:
         freeze_fields(self, "blocking_diagnostics")
 
 
-def _uploaded_blob_recovery_context(ready_blobs: tuple[Mapping[str, Any], ...]) -> str:
-    """Expose bounded upload facts without authorizing construction.
-
-    The message contains a subset of the metadata exposed by ``list_blobs``:
-    blob id, filename, MIME type, byte size, creator, and status. It omits
-    ``creation_modality`` because the caller has already filtered to
-    ``created_by == "user"`` uploads, for which the modality is uniform. It
-    never includes raw blob bytes, storage paths, or full content hashes.
-    """
-    rendered_blobs = []
-    for blob in ready_blobs[:5]:
-        rendered_blobs.append(
-            "- "
-            f"id={blob['id']}; "
-            f"filename={blob['filename']}; "
-            f"mime_type={blob['mime_type']}; "
-            f"size_bytes={blob['size_bytes']}; "
-            f"created_by={blob['created_by']}; "
-            f"status={blob['status']}"
-        )
-    remaining = len(ready_blobs) - len(rendered_blobs)
-    if remaining > 0:
-        rendered_blobs.append(f"- ... {remaining} more ready blob(s) omitted from this bounded repair prompt.")
-
-    blob_block = "\n".join(rendered_blobs)
-    return (
-        "\n\nThis session has ready uploaded blob(s). Their availability does not authorize construction. "
-        "If the user's active request authorizes a build, set_pipeline with source.blob_id or "
-        "set_source_from_blob can bind an upload. Use inspect_source(blob_id) when you need headers, "
-        "sample_row_count, or inferred types. "
-        "If prior prose identified an unsupported requested primitive, for example from_json(payload) "
-        "inside value_transform.compute, treat that as a catalog constraint rather than a reason to stop. "
-        "Check the request and conversation for an authorized supported fallback; if its scope is uncertain, "
-        "ask the concrete question instead of choosing a replacement workflow for the user. "
-        "Do not infer that a CSV is header-only from metadata, filename, prior prose, or a failed attempt; "
-        "only inspect_source can establish the observed row count. "
-        f"\n\nReady uploaded blob(s):\n{blob_block}"
-    )
-
-
 def _compose_preflight_repair_message(runtime_result: ValidationResult, *, next_turn: int) -> str:
     """Build a model-facing review prompt for an invalid runtime preflight.
 
@@ -1048,21 +1001,6 @@ class CompositionCompletion:
             session_operation_context=session_operation_context,
         )
         return published
-
-    async def _ready_uploaded_blob_recovery_context(
-        self,
-        *,
-        session_id: str | None,
-    ) -> str:
-        """Supply upload facts to an already-eligible neutral provider retry."""
-        if self._session_engine is None or session_id is None:
-            return ""
-
-        blobs = await run_sync_in_worker(_sync_list_blobs, self._session_engine, session_id)
-        ready_blobs = tuple(blob for blob in blobs if blob["status"] == "ready" and blob["created_by"] == "user")
-        if not ready_blobs:
-            return ""
-        return _uploaded_blob_recovery_context(ready_blobs)
 
     def _assess_source_proof(
         self,
@@ -1723,51 +1661,6 @@ class CompositionCompletion:
                         }
                     )
                     return _TerminateOutcome(action="continue", repair_turns_delta=1)
-
-        if (
-            repair_turns_used == 0
-            and repair_turns_used < _MAX_REPAIR_TURNS
-            and not mutation_success_seen
-            and _state_is_structurally_empty(state)
-            and carries_build_action(message)
-            and not is_unstarted_clarification(
-                no_tool_response,
-                state=state,
-                initial_version=initial_version,
-                mutation_success_seen=mutation_success_seen,
-                tool_invocations=recorder.invocations,
-            )
-            and (deadline is None or deadline > asyncio.get_running_loop().time())
-        ):
-            # This existing disclosure predicate includes questions and
-            # revocations; it must not authorize construction. Uploads supply
-            # facts, never a separate construction trigger. Discovery or a
-            # rejected mutation can precede a stall, so retain their actual
-            # receipts while giving the provider one neutral chance to reconcile
-            # its reply with the original request. The counter and deadline bound
-            # the retry exactly as they do without uploads.
-            activity = (
-                "No tool has run this turn"
-                if not recorder.invocations
-                else "No composition-state mutation completed successfully this turn"
-            )
-            upload_context = await self._ready_uploaded_blob_recovery_context(session_id=session_id)
-            llm_messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"[composer-system] {activity}, and the pipeline has no source or nodes. "
-                        "Re-check the user's request against that state. If the user requested construction or generated "
-                        "source data, carry out that authorized work using the declared tools before claiming it is complete. "
-                        "If a required product fact is missing, start your no-tool reply with CLARIFY: and ask the concrete question. "
-                        "If the user asked only for "
-                        "explanation or revoked construction, answer that request without building. Do not describe data "
-                        "as saved, bound, or reviewed until tool results establish it."
-                        f"{upload_context}"
-                    ),
-                }
-            )
-            return _TerminateOutcome(action="continue", repair_turns_delta=1)
 
         # Forced-repair gate: when the model claims completion but the proof
         # step still has blocking diagnostics, inject a repair message and
