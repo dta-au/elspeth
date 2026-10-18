@@ -668,7 +668,7 @@ def composer_title_prelude(invoke):
             "            session_operation_context=lease.context, required_audit=True,\n"
             "            required_work=observation.required_work))\n"
             "        observation.audit_cohort_durable = True\n"
-            "    raise HTTPException(status_code=422 if exc.disposition == 'blocked' else 503,\n"
+            "    raise HTTPException(status_code=exc.http_status,\n"
             "        detail=exc.to_payload()) from exc\n"
         )
         .body[0]

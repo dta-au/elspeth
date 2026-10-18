@@ -105,6 +105,11 @@ class PromptGuardRefused(Exception):
         return self._decision.disposition
 
     @property
+    def http_status(self) -> Literal[422, 503]:
+        """Project local input refusal separately from remote unavailability."""
+        return 422 if self.disposition == "blocked" or self._decision.reason == "unsupported_input" else 503
+
+    @property
     def audit_id(self) -> str:
         return self._audit_id
 
@@ -145,6 +150,14 @@ class PromptGuardRefused(Exception):
         )
 
     def to_payload(self) -> dict[str, str]:
+        if self._decision.reason == "unsupported_input":
+            return {
+                "error_type": "prompt_guard_unsupported_input",
+                "detail": (
+                    "The authoring input is outside the supported prompt guard input envelope. The protected dispatch was not sent."
+                ),
+                "audit_id": self.audit_id,
+            }
         blocked = self.disposition == "blocked"
         return {
             "error_type": "prompt_guard_blocked" if blocked else "prompt_guard_unavailable",

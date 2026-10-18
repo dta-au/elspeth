@@ -196,7 +196,7 @@ def project_composer_operation_error(
     leaf = leaves[0]
     if isinstance(leaf, PromptGuardRefused):
         payload: dict[str, JsonValue] = {**leaf.to_payload(), "request_id": request_id}
-        return _http_error(422 if leaf.disposition == "blocked" else 503, payload, str(payload["error_type"]))
+        return _http_error(leaf.http_status, payload, str(payload["error_type"]))
     if isinstance(leaf, SessionOperationFenceLost):
         return _http_error(404, {"detail": "Session not found"})
     if isinstance(leaf, SessionOperationConflictError):

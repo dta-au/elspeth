@@ -1481,7 +1481,7 @@ def create_execution_router() -> APIRouter:
                     coordinator.assert_completed()
         except PromptGuardRefused as exc:
             await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
-            raise HTTPException(status_code=422 if exc.disposition == "blocked" else 503, detail=exc.to_payload()) from exc
+            raise HTTPException(status_code=exc.http_status, detail=exc.to_payload()) from exc
         except _BadRequestLLMError as exc:
             await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
             # Provider rejected the request (400-class). Carrier exposes

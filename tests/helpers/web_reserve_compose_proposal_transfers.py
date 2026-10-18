@@ -385,7 +385,7 @@ def _source3_local_transfers(units):
 # hashes bind structural ASTs, not import identity or physical custody; those
 # remain explicit common-boundary obligations in the returned receipt.
 _REVIEWED_METHOD_SHAPES = {
-    TURN: "1c5df064cf350b62e4d0ccc18877c466c43b826a4d44f08dad9c426288dbef77",
+    TURN: "14b360cf06b6b637bad4af92dc08351b88ab38069a78dd5f4231a6fa919f6227",
     SERVICE: "b69a495125d0ccecc8a8047be8e88e0fadb03d594aa317955740453d130b429e",
     PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
     SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",

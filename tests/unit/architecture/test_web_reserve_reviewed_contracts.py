@@ -705,3 +705,216 @@ def test_captured_composer_receiver_interval_is_closed_after_history(fault: str 
     else:
         assert failures
         assert receipt is None
+
+
+DIAGNOSTICS = "src/elspeth/web/execution/routes.py"
+DIAGNOSTICS_CALLER = "create_execution_router.evaluate_run_diagnostics"
+DIAGNOSTICS_CONTRACT = "elspeth.web.execution.routes:" + DIAGNOSTICS_CALLER
+
+
+def _provider_mint_units() -> tuple[fencing.SourceUnit, ...]:
+    paths = {"src/" + qualified.split(":", 1)[0].replace(".", "/") + ".py" for qualified in provider.CONTRACTS}
+    # Include the actual route even before its missing contract is repaired.
+    return _source_units(tuple(sorted({*paths, DIAGNOSTICS})))
+
+
+def _provider_mint_rows(units, sites):
+    return {(unit.path, ast.unparse(node)) for unit in units for node in ast.walk(unit.tree) if (unit.path, id(node)) in sites}
+
+
+def test_provider_mint_contract_covers_actual_diagnostics_caller_without_closing_common_premises() -> None:
+    units = _provider_mint_units()
+    failures, receipt = provider.provider_mint_local_contracts(units)
+    assert failures == []
+    assert receipt is not None
+    assert _provider_mint_rows(units, receipt["owner_constructor_calls"]) == {
+        (TURN, "ProviderInvocationOwner(service=service, required_work=provider_binding)"),
+        (
+            DIAGNOSTICS,
+            "ProviderInvocationOwner(service=session_service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))",
+        ),
+    }
+    assert _provider_mint_rows(units, receipt["mint_calls"]) == {
+        (TURN, "provider_owner.mint(ProviderInvocationFamily.TITLE)"),
+        (DIAGNOSTICS, "owner.mint(ProviderInvocationFamily.PRIMARY)"),
+        ("src/elspeth/web/composer/pipeline_planner.py", "provider_owner.mint(ProviderInvocationFamily.PLANNER)"),
+        ("src/elspeth/web/composer/service.py", "provider_owner.mint(ProviderInvocationFamily.PRIMARY)"),
+        ("src/elspeth/web/composer/advisor_checkpoint.py", "provider_owner.mint(ProviderInvocationFamily.ADVISOR)"),
+    }
+    unit = next(item for item in units if item.path == DIAGNOSTICS)
+    endpoint = provider._node(unit, DIAGNOSTICS_CALLER)
+    assert endpoint is not None
+    assert (DIAGNOSTICS, id(endpoint)) in receipt["caller_regions"]
+    dependencies = [row for row in receipt["dependencies"] if row["unit_path"] == DIAGNOSTICS]
+    assert {row["node_id"] for row in dependencies} == {id(node) for node in ast.walk(endpoint) if isinstance(node, ast.Call)}
+    assert all(row["qualification"] == "COMMON_ORIGIN_RECEIVER_EFFECT_PROOF_REQUIRED" for row in dependencies)
+    assert all(row["execution_role"] == "UNCLASSIFIED_COMMON_EXECUTION_ROLE_REQUIRED" for row in dependencies)
+    member_dependencies = [row for row in receipt["receiver_dependencies"] if row["unit_path"] == DIAGNOSTICS]
+    assert {row["node_id"] for row in member_dependencies} == {id(node) for node in ast.walk(endpoint) if isinstance(node, ast.Attribute)}
+    assert all(row["qualification"] == "COMMON_SOURCE_RECEIVER_MEMBER_EFFECT_PROOF_REQUIRED" for row in member_dependencies)
+    assert receipt["remaining_premises"] == (
+        "UNKNOWN_COMMON_SOURCE_IMPORT_BINDING_CLOSURE",
+        "UNKNOWN_COMMON_RECEIVER_MEMBER_OUTSIDE_EFFECT_CLOSURE",
+        "UNKNOWN_REQUIRED_BINDING_COORDINATOR_AUTHORITY_CONTEXT_CUSTODY",
+    )
+    quota = next(item for item in units if provider._module(item) == provider.QUOTA)
+    mint = provider._node(quota, "ProviderInvocationOwner.mint")
+    assert mint is not None
+    assert receipt["validated_transfer_methods"] == frozenset({(quota.path, id(mint))})
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "service",
+        "coordinator",
+        "role",
+        "lease_authority",
+        "context",
+        "receiver",
+        "family",
+        "completion",
+        "audit",
+        "refusal_status",
+        "dispatch",
+    ),
+)
+def test_provider_mint_diagnostics_contract_refuses_authority_receiver_and_audit_drift(fault: str) -> None:
+    units = _provider_mint_units()
+    assert provider.provider_mint_local_contracts(units)[0] == []
+    unit = next(item for item in units if item.path == DIAGNOSTICS)
+    endpoint = provider._node(unit, DIAGNOSTICS_CALLER)
+    assert endpoint is not None
+    calls = {
+        expression: next(node for node in ast.walk(endpoint) if isinstance(node, ast.Call) and ast.unparse(node.func) == expression)
+        for expression in (
+            "ProviderInvocationOwner",
+            "RequiredWorkBinding",
+            "SessionOperationLease.acquire",
+            "owner.mint",
+            "composer.explain_run_diagnostics",
+            "coordinator.assert_completed",
+            "_persist_run_diagnostics_llm_calls",
+        )
+    }
+    foreign = ast.Name(id="foreign", ctx=ast.Load())
+    if fault == "service":
+        next(keyword for keyword in calls["ProviderInvocationOwner"].keywords if keyword.arg == "service").value = foreign
+    elif fault == "coordinator":
+        calls["RequiredWorkBinding"].args[0] = foreign
+    elif fault == "role":
+        calls["RequiredWorkBinding"].args[3] = ast.parse("RequiredWorkRole.TITLE", mode="eval").body
+    elif fault == "lease_authority":
+        calls["SessionOperationLease.acquire"].args[0] = foreign
+    elif fault == "context":
+        next(
+            keyword for keyword in calls["composer.explain_run_diagnostics"].keywords if keyword.arg == "session_operation_context"
+        ).value = foreign
+    elif fault == "receiver":
+        calls["owner.mint"].func.value = foreign
+    elif fault == "family":
+        calls["owner.mint"].args[0] = ast.parse("ProviderInvocationFamily.TITLE", mode="eval").body
+    elif fault == "completion":
+        calls["coordinator.assert_completed"].func = foreign
+    elif fault == "audit":
+        calls["_persist_run_diagnostics_llm_calls"].func = foreign
+    elif fault == "refusal_status":
+        handler = next(
+            node
+            for node in ast.walk(endpoint)
+            if isinstance(node, ast.ExceptHandler) and isinstance(node.type, ast.Name) and node.type.id == "PromptGuardRefused"
+        )
+        refusal = handler.body[-1].exc
+        assert isinstance(refusal, ast.Call)
+        next(keyword for keyword in refusal.keywords if keyword.arg == "status_code").value = ast.Constant(value=200)
+    else:
+        calls["composer.explain_run_diagnostics"].func.value = foreign
+    ast.fix_missing_locations(unit.tree)
+    failures, receipt = provider.provider_mint_local_contracts(units)
+    assert failures == ["provider mint complete producer/retention/caller contract changed " + DIAGNOSTICS_CONTRACT]
+    assert receipt is None
+
+
+@pytest.mark.parametrize(
+    "binding",
+    (
+        "ProviderInvocationOwner",
+        "ProviderInvocationFamily",
+        "RequiredWorkBinding",
+        "RequiredWorkRole",
+        "RequiredWorkCoordinator",
+        "RequiredWorkAuthority",
+        "RequiredAuthorityKind",
+        "SessionOperationLease",
+        "SessionOperationKind",
+    ),
+)
+def test_provider_mint_diagnostics_contract_refuses_import_origin_drift(binding: str) -> None:
+    units = _provider_mint_units()
+    assert provider.provider_mint_local_contracts(units)[0] == []
+    unit = next(item for item in units if item.path == DIAGNOSTICS)
+    imported = next(
+        alias
+        for node in unit.tree.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if (alias.asname or alias.name) == binding
+    )
+    imported.name = "Foreign" + binding
+    imported.asname = binding
+    # Caller source is unchanged: the qualified import check must catch this.
+    actual = provider._node(unit, DIAGNOSTICS_CALLER)
+    assert provider._shape(actual) == provider._shape(ast.parse(provider.CONTRACTS[DIAGNOSTICS_CONTRACT]).body[0])
+    failures, receipt = provider.provider_mint_local_contracts(units)
+    assert failures == ["provider mint selected constructor/family/binding import origin changed elspeth.web.execution.routes"]
+    assert receipt is None
+
+
+@pytest.mark.parametrize("with_mint", (False, True))
+def test_provider_mint_contract_refuses_additional_qualified_outside_constructor_and_mint(with_mint: bool) -> None:
+    units = _provider_mint_units()
+    assert provider.provider_mint_local_contracts(units)[0] == []
+    source = (
+        "from __future__ import annotations\n"
+        "from elspeth.web.composer.provider_quota import ProviderInvocationOwner as Owner, ProviderInvocationFamily as Family\n"
+        "def outside(service, binding):\n"
+        "    owner = Owner(service=service, required_work=binding)\n"
+        + ("    return owner.mint(Family.PRIMARY)\n" if with_mint else "    return owner\n")
+    )
+    outside = fencing._parse_source("src/elspeth/provider_mint_universe_control.py", source)
+    failures, receipt = provider.provider_mint_local_contracts((*units, outside))
+    assert failures == ["provider mint actual qualified constructor/mint call universe changed"]
+    assert receipt is None
+
+
+def test_provider_mint_contract_does_not_treat_unqualified_mint_spelling_as_owned_custody() -> None:
+    units = _provider_mint_units()
+    failures, receipt = provider.provider_mint_local_contracts(units)
+    assert failures == [] and receipt is not None
+    unrelated = fencing._parse_source(
+        "src/elspeth/provider_mint_unrelated_control.py",
+        "from __future__ import annotations\ndef unrelated(value):\n    return value.mint('ordinary value')\n",
+    )
+    failures, enlarged = provider.provider_mint_local_contracts((*units, unrelated))
+    assert failures == [] and enlarged is not None
+    assert enlarged["mint_calls"] == receipt["mint_calls"]
+    assert enlarged["owner_constructor_calls"] == receipt["owner_constructor_calls"]
+
+
+def test_provider_mint_callable_escape_remains_an_unclosed_common_premise() -> None:
+    units = _provider_mint_units()
+    assert provider.provider_mint_local_contracts(units)[0] == []
+    carrier = fencing._parse_source(
+        "src/elspeth/provider_mint_carrier_control.py",
+        "from __future__ import annotations\n"
+        "from elspeth.web.composer.provider_quota import ProviderInvocationOwner\n"
+        "def retain():\n    return ProviderInvocationOwner\n",
+    )
+    failures, receipt = provider.provider_mint_local_contracts((*units, carrier))
+    assert failures == [] and receipt is not None
+    escaped = next(
+        node
+        for node in ast.walk(carrier.tree)
+        if isinstance(node, ast.Name) and node.id == "ProviderInvocationOwner" and isinstance(node.ctx, ast.Load)
+    )
+    assert (carrier.path, id(escaped)) in receipt["unclosed_callable_carriers"]

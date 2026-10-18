@@ -1811,7 +1811,7 @@ async def _run_composer_turn(
                     ),
                 )
                 observation.audit_cohort_durable = True
-            raise HTTPException(status_code=422 if exc.disposition == "blocked" else 503, detail=exc.to_payload()) from exc
+            raise HTTPException(status_code=exc.http_status, detail=exc.to_payload()) from exc
         except ComposerAdmissionRefused as exc:
             observation.pending_exception_llm_calls = _llm_calls_from_exception(exc)
             await _publish_progress(

@@ -40,6 +40,16 @@ All notable changes to ELSPETH are documented here.
   cost bound; calls may cost more or take longer. Public Advisor hints retain
   their complete-message limit. This allowance does not reserve model context
   tokens or account credit.
+- **Prompt guard input refusals report their local cause.** Unsupported
+  authoring input returns `prompt_guard_unsupported_input` with status 422;
+  guard service failures retain status 503. Audit decisions and previously
+  stored operation replies remain unchanged.
+- **Planner routing semantics stay with the model.** Quoted comparisons no
+  longer trigger the prose-based threshold rejection. Removing that heuristic
+  also removes its automatic second authoring opportunity for an incorrect
+  constant gate, including under auto-commit; no replacement semantic review
+  is added. Structural checks and artifact-bound approval retain their
+  existing behavior.
 
 Session epoch advances from 76 to 77; Landscape remains at epoch 49. The combined
 contract retains committed graph-review authority over immutable graph snapshots
