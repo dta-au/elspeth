@@ -25,7 +25,7 @@ Each guard object has exactly these fields:
 | `adapter` | `azure_prompt_shields`; may be omitted because it is the only 0.8.7 adapter |
 | `endpoint` | HTTPS resource origin, such as `https://example-resource.cognitiveservices.azure.com`; no path, userinfo, query or fragment |
 | `subscription_key` | Required subscription credential, injected from the deployment's secret store |
-| `timeout_seconds` | Positive number, at most 60 seconds; defaults to 10 seconds for the complete check, including all document batches |
+| `timeout_seconds` | Positive number, at most 60 seconds; defaults to 10 seconds shared by all Azure batches for one inspection |
 
 For example, the object shape is:
 
@@ -68,10 +68,25 @@ must exactly match the original provider text; the metadata never reaches the
 model provider. ELSPETH packs complete units and history messages into bounded
 documents, requires every batch to pass, and never cuts a string value or
 truncates history to fit. The logical check accepts at most 128 packed documents
-and 262,144 aggregate UTF-8 bytes. An individual oversized user prompt or atomic
-value, unsupported image/audio/file input or excessive aggregate input is
-refused, including in debug mode. These are explicit coverage limits, not clean verdicts. See
+of at most 10,000 characters each, plus the user prompt. Its finite local UTF-8
+envelope is derived from those limits: `(128 + 1) × 10,000 × 4` = **5,160,000
+bytes**, including document framing. This logical envelope is separate from
+Azure's per-call limits; it does not guarantee process memory use or model
+context capacity. An individual oversized user prompt or atomic value,
+unsupported image/audio/file input, invalid Unicode or excessive document count
+is refused, including in debug mode. These are explicit coverage limits, not
+clean verdicts. See
 [Azure input limits](https://learn.microsoft.com/en-us/azure/ai-services/content-safety/region-availability).
+
+Larger inputs require more sequential Azure batches, each repeating the complete
+user prompt. All Azure batches for one inspection share the configured timeout:
+it defaults to 10 seconds and permits at most 60 seconds. Request preparation
+and required audit settlement are outside that inspection interval. All batches
+must pass within it; a large supported input can still time out and refuse dispatch.
+Inspection can incur Azure work even if later model admission refuses. The
+byte envelope does not alter credential screening or other resource limits.
+Both configured and unconfigured policy fingerprints bind the numerical input
+limits. Historical audits retain their original policy and request hashes.
 
 A detected attack blocks the protected model request. A missing/malformed
 verdict, document-analysis count mismatch, HTTP/network error, timeout or

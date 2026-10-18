@@ -24,7 +24,9 @@ PROMPT_GUARD_CONTENT_PARTS_KEY = "_elspeth_prompt_guard_content_parts"
 PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY = "_elspeth_prompt_guard_tool_argument_parts"
 PROMPT_GUARD_MAX_TEXT_CHARACTERS = 10_000
 PROMPT_GUARD_MAX_DOCUMENTS = 128
-PROMPT_GUARD_MAX_INPUT_UTF8_BYTES = 262_144
+# One user prompt plus complete packed documents, with at most four UTF-8
+# bytes per valid character. Azure's per-call limits are enforced separately.
+PROMPT_GUARD_MAX_INPUT_UTF8_BYTES = (PROMPT_GUARD_MAX_DOCUMENTS + 1) * PROMPT_GUARD_MAX_TEXT_CHARACTERS * 4
 
 
 class PromptGuardTrust(Enum):

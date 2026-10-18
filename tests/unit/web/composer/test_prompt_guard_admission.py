@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 from uuid import uuid4
@@ -168,6 +169,55 @@ async def test_unconfigured_requires_explicit_named_debug_mode_with_distinct_aud
     assert _checks(engine)[0]["disposition"] == disposition
     assert _checks(engine)[0]["adapter"] == "unconfigured"
     assert custody.attempt is None
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
+async def test_unconfigured_fingerprint_binds_every_input_limit_and_mode(authority, monkeypatch, mode):
+    from elspeth.web.composer import prompt_guard
+
+    engine, _service, owner, coordinator = authority
+    messages = [{"role": "user", "content": "Build a graph"}]
+
+    async def check():
+        operation = enforce_prompt_guard(
+            mount=None,
+            mode=mode,
+            role="composer",
+            provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
+            messages=messages,
+            user_prompt=messages[0]["content"],
+        )
+        if mode == "required":
+            with pytest.raises(PromptGuardRefused):
+                await operation
+        else:
+            await operation
+        return _checks(engine)[-1]
+
+    baseline = await check()
+    expected_policy = {
+        "mount": None,
+        "mode": mode,
+        "max_prompt_characters": prompt_guard.PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+        "max_document_characters": prompt_guard.PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+        "max_documents": prompt_guard.PROMPT_GUARD_MAX_DOCUMENTS,
+        "max_input_utf8_bytes": prompt_guard.PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
+    }
+    assert baseline["policy_fingerprint"] == hashlib.sha256(json.dumps(expected_policy, sort_keys=True).encode("utf-8")).hexdigest()
+    for changed_limit in ("characters", "documents", "bytes"):
+        with monkeypatch.context() as change:
+            if changed_limit == "characters":
+                change.setattr(prompt_guard, "PROMPT_GUARD_MAX_TEXT_CHARACTERS", 9_999)
+            elif changed_limit == "documents":
+                change.setattr(prompt_guard, "PROMPT_GUARD_MAX_DOCUMENTS", 127)
+            else:
+                change.setattr(prompt_guard, "PROMPT_GUARD_MAX_INPUT_UTF8_BYTES", 5_159_999)
+            updated = await check()
+        assert updated["policy_fingerprint"] != baseline["policy_fingerprint"]
+        assert updated["request_hash"] != baseline["request_hash"]
+        assert updated["disposition"] == baseline["disposition"]
     coordinator.assert_completed()
 
 

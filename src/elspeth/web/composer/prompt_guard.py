@@ -399,7 +399,19 @@ async def enforce_prompt_guard(
     policy_fingerprint = (
         mount.client.policy_fingerprint
         if mount is not None
-        else hashlib.sha256(json.dumps({"mount": None, "mode": mode}, sort_keys=True).encode("utf-8")).hexdigest()
+        else hashlib.sha256(
+            json.dumps(
+                {
+                    "mount": None,
+                    "mode": mode,
+                    "max_prompt_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+                    "max_document_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+                    "max_documents": PROMPT_GUARD_MAX_DOCUMENTS,
+                    "max_input_utf8_bytes": PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
     )
     request, supported = _request(
         policy_fingerprint=policy_fingerprint,

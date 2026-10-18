@@ -2363,18 +2363,21 @@ async def test_every_freeform_planner_discovery_tool_returns_admitted_state(
 
 
 @pytest.mark.asyncio
-async def test_full_discovery_batch_refuses_oversized_aggregate_before_second_sdk(
+async def test_full_discovery_batch_preserves_complete_results_above_old_aggregate_cap(
     tmp_path: Path,
     tool_context: ToolContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Complete discovery results retain their aggregate guard limit."""
+    """Individually supported discovery results retain the full logical envelope."""
     from elspeth.web.composer import prompt_guard
 
     assert set(_DISCOVERY_TEST_ARGUMENTS) == set(PLANNER_DISCOVERY_TOOL_NAMES)
     current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
     calls = tuple((name, dict(_DISCOVERY_TEST_ARGUMENTS[name])) for name in PLANNER_DISCOVERY_TOOL_NAMES)
-    completion = _ScriptedCompletion(_response(*calls))
+    completion = _ScriptedCompletion(
+        _response(*calls),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
     recorder = BufferingRecorder()
     guard_requests: list[tuple[PromptGuardRequest, bool]] = []
     original_request = prompt_guard._request
@@ -2385,33 +2388,40 @@ async def test_full_discovery_batch_refuses_oversized_aggregate_before_second_sd
         return request, supported
 
     monkeypatch.setattr(prompt_guard, "_request", observe_request)
-    with pytest.raises(PromptGuardRefused) as caught:
-        await _plan(
-            tmp_path=tmp_path,
-            tool_context=tool_context,
-            completion=completion,
-            recorder=recorder,
-            current_state=current_state,
-            provider_current_state=current_state.to_dict(),
-            model_overrides={"max_tool_calls_per_turn": len(calls)},
-        )
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        current_state=current_state,
+        provider_current_state=current_state.to_dict(),
+        model_overrides={"max_tool_calls_per_turn": len(calls)},
+    )
 
-    assert type(caught.value) is PromptGuardRefused
-    assert caught.value.disposition == "unavailable"
-    assert caught.value._decision.reason == "unsupported_input"
     assert len(guard_requests) == 2
     assert guard_requests[0][1] is True
     request, supported = guard_requests[1]
-    assert supported is False
+    assert supported is True
     assert len(request.user_prompt) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
     assert len(request.documents) <= PROMPT_GUARD_MAX_DOCUMENTS
     assert all(len(document) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in request.documents)
     inspected_bytes = len(request.user_prompt.encode("utf-8")) + sum(len(document.encode("utf-8")) for document in request.documents)
-    assert inspected_bytes > PROMPT_GUARD_MAX_INPUT_UTF8_BYTES
-    assert len(completion.requests) == 1
-    assert len(recorder.llm_calls) == 1
-    assert recorder.llm_calls[0].status is ComposerLLMCallStatus.SUCCESS
-    assert caught.value.llm_calls == recorder.llm_calls
+    assert 262_144 < inspected_bytes <= PROMPT_GUARD_MAX_INPUT_UTF8_BYTES
+    assert len(completion.requests) == len(recorder.llm_calls) == 2
+    assert all(call.status is ComposerLLMCallStatus.SUCCESS for call in recorder.llm_calls)
+    assert len({call.call_id for call in recorder.llm_calls}) == 2
+    assert all(call.call_id is not None for call in recorder.llm_calls)
+    tool_messages = {
+        message["tool_call_id"]: message["content"] for message in completion.requests[1]["messages"] if message["role"] == "tool"
+    }
+    assert len(tool_messages) == len(calls)
+    for index, (name, _arguments) in enumerate(calls, start=1):
+        content = tool_messages[f"call-{index}"]
+        assert _VALIDATION_MESSAGE_CANARY in content
+        assert _HIDDEN_CONNECTION_COMPONENT_CANARY in content
+        assert _HIDDEN_EDGE_COMPONENT_CANARY in content
+        if name == "get_pipeline_state":
+            assert _DISCLOSURE_CANARIES[1] in content
 
 
 @pytest.mark.asyncio
@@ -4954,7 +4964,17 @@ def _assert_debug_guard_audit(row: dict[str, Any], context: SessionOperationCont
         "adapter": "unconfigured",
         "mode": "debug-when-unconfigured",
         "policy_fingerprint": hashlib.sha256(
-            json.dumps({"mount": None, "mode": "debug-when-unconfigured"}, sort_keys=True).encode("utf-8")
+            json.dumps(
+                {
+                    "mount": None,
+                    "mode": "debug-when-unconfigured",
+                    "max_prompt_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+                    "max_document_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+                    "max_documents": PROMPT_GUARD_MAX_DOCUMENTS,
+                    "max_input_utf8_bytes": PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
         ).hexdigest(),
         "request_hash": check["request_hash"],
         "disposition": "debug_bypass",

@@ -8,7 +8,12 @@ import json
 import httpx
 import pytest
 
-from elspeth.contracts.prompt_guard import PromptGuardRequest
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_MAX_DOCUMENTS,
+    PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
+    PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+    PromptGuardRequest,
+)
 from elspeth.web.prompt_guard_config import PromptGuardSettings
 
 
@@ -98,12 +103,40 @@ async def test_azure_batches_whole_documents_without_truncation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_azure_accepts_complete_declared_utf8_envelope_without_changing_call_limits() -> None:
+    from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+
+    user = "\U0001f680" * PROMPT_GUARD_MAX_TEXT_CHARACTERS
+    documents = tuple(chr(0x1F300 + index) * PROMPT_GUARD_MAX_TEXT_CHARACTERS for index in range(PROMPT_GUARD_MAX_DOCUMENTS))
+    inspected_bytes = len(user.encode("utf-8")) + sum(len(document.encode("utf-8")) for document in documents)
+    assert inspected_bytes == 5_160_000
+    observed: list[dict[str, object]] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["userPrompt"] == user
+        assert 1 <= len(body["documents"]) <= 5
+        assert sum(len(document) for document in body["documents"]) <= 10_000
+        observed.append(body)
+        return httpx.Response(200, json=_response(len(body["documents"])))
+
+    client = AzurePromptGuardClient(_settings(timeout_seconds=60), http_transport=httpx.MockTransport(serve))
+    result = await client.inspect(_request(user=user, documents=documents))
+    assert (result.disposition, result.reason) == ("allow", "clean")
+    assert tuple(document for body in observed for document in body["documents"]) == documents
+    assert len(observed) == PROMPT_GUARD_MAX_DOCUMENTS
+    assert inspected_bytes == PROMPT_GUARD_MAX_INPUT_UTF8_BYTES
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "guard_request",
     [
         _request(user="u" * 10001),
         _request(documents=("d" * 10001,)),
         _request(documents=("d",) * 129),
+        _request(user="\ud800"),
+        _request(documents=("\ud800",)),
         _request(user="", documents=()),
     ],
 )
