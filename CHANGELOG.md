@@ -16,6 +16,20 @@ Azure Container Apps enhancements attributed to 0.8.8.
   Historical advisor prescan audits remain readable. Runtime graph transforms
   remain separately configured.
 
+- **CSV sinks can require retention and include verified audit context.** The
+  opt-in `require_all_rows` stops a rejected member before publishing that
+  effect. With `include_audit_context`, a retention envelope carries owned row
+  and token identity, recorded outcomes, audit reason references and the complete
+  canonical carried row. Unprovable predecessor context refuses publication.
+  Defaults remain ordinary CSV, and earlier published effects are not rolled
+  back. These options require a supporting runtime beginning with 0.8.9; see
+  [CSV required-row retention](docs/runbooks/csv-required-row-retention.md) for
+  configuration constraints and recovery limits.
+- **Composer repair guidance distinguishes replies from graph changes.** A
+  publication-only review can request a prose correction without demanding graph
+  mutations; graph-blocking reviews retain their tool-call requirement. Plugin
+  option repair guidance tells the planner to preserve explicit user requirements
+  and report unsupported capabilities.
 - **Refusals retain the correct graph context.** Full-replacement candidate
   refusals exclude errors from the old saved graph; incremental output refusals
   retain standing validation and the original version. Producer-owned codes,
