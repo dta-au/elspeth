@@ -75,6 +75,10 @@ from elspeth.plugins.sinks._local_file_effects import (
 )
 
 
+class CSVRowRejectedError(RuntimeError):
+    """A required pipeline row was refused before CSV effect publication."""
+
+
 class CSVSinkConfig(SinkPathConfig):
     """Configuration for CSV sink plugin.
 
@@ -87,6 +91,15 @@ class CSVSinkConfig(SinkPathConfig):
     delimiter: str = Field(default=",", description="Single-character delimiter used when writing CSV fields.")
     encoding: str = Field(default="utf-8", description="Text encoding used when writing the CSV file.")
     mode: Literal["write", "append"] = Field(default="write", description="Whether to create/replace the CSV file or append rows.")
+    require_all_rows: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "For pipeline rows, fail preparation before publication if any row cannot be represented, "
+            "instead of diverting or discarding it. Use for required retention outputs. "
+            "False preserves on_write_failure routing. Does not roll back earlier publications."
+        ),
+    )
 
     @field_validator("delimiter")
     @classmethod
@@ -131,6 +144,7 @@ class CSVSink(BaseSink):
         delimiter: Field delimiter (default: ",")
         encoding: File encoding (default: "utf-8")
         mode: "write" (truncate, default) or "append" (add to existing file)
+        require_all_rows: Stop preparation if a pipeline row is refused (default: False)
 
     The schema can be (all use infer-and-lock pattern):
         - Fixed: {"mode": "fixed", "fields": [...]} - columns from config, extras rejected
@@ -145,7 +159,7 @@ class CSVSink(BaseSink):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:cb4119567e0d1b1c"
+    source_file_hash: str | None = "sha256:d80484e46a83bdad"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -331,6 +345,7 @@ class CSVSink(BaseSink):
         self._delimiter = cfg.delimiter
         self._encoding = cfg.encoding
         self._mode = cfg.mode
+        self._require_all_rows = cfg.require_all_rows
         self._collision_policy = cfg.collision_policy
         if self._mode != "append" and not plugin_preflight_mode_enabled():
             self._path = resolve_output_collision_path(self._requested_path, self._collision_policy)
@@ -379,6 +394,11 @@ class CSVSink(BaseSink):
         elif self._mode != "append":
             self._path = resolve_output_collision_path(self._requested_path, self._collision_policy)
         return inspect_local_effect(target_path=self._path, request=request)
+
+    def _divert_row(self, row_data: dict[str, object], *, row_index: int, reason: str) -> None:
+        if self._require_all_rows:
+            raise CSVRowRejectedError(f"CSV row {row_index} refused with require_all_rows=true: {reason}") from None
+        super()._divert_row(row_data, row_index=row_index, reason=reason)
 
     def prepare_effect(
         self,
@@ -600,7 +620,7 @@ class CSVSink(BaseSink):
                     "delimiter (default ',', single character) is an operator concern — pick for the consuming tool (Excel: ','; analytics tools may prefer '\\t'). Quoting is fixed (standard csv quoting); only delimiter and encoding are configurable.",
                     "collision_policy: 'fail_if_exists', 'auto_increment', or 'append_or_create' (only with mode: append). Unset is the default and OVERWRITES/truncates an existing file — set it deliberately to protect prior runs.",
                     "To guarantee column order, set schema.mode='fixed' and order schema.fields explicitly, including quarantine sinks. 'observed' infers order from first-row keys. headers changes display names only. Resume appends must preserve established order.",
-                    "on_write_failure is REQUIRED (no default): set 'discard' (drop with an audit record) or a quarantine sink name so per-row write errors don't crash the run; omitting it fails validation.",
+                    "on_write_failure is REQUIRED (no default): set 'discard' (drop with an audit record) or a quarantine sink name for per-row write errors; omitting it fails validation. Set options.require_all_rows=true when every pipeline row must be retained: a row refusal then stops preparation before publication instead of routing or discarding it. Earlier publications are not rolled back.",
                 ),
             )
         return None

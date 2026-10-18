@@ -82,6 +82,16 @@
         "nullable": false,
         "required": false,
         "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "For pipeline rows, fail preparation before publication if any row cannot be represented, instead of diverting or discarding it. Use for required retention outputs. False preserves on_write_failure routing. Does not roll back earlier publications.",
+        "kind": "checkbox",
+        "label": "Require All Rows",
+        "name": "require_all_rows",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
       }
     ]
   },

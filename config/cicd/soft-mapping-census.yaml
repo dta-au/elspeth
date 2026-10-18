@@ -422,6 +422,7 @@ files:
   src/elspeth/plugins/sinks/csv_sink.py:
     Mapping[str, object]: 1
     dict[str, Any]: 3
+    dict[str, object]: 1
   src/elspeth/plugins/sinks/database_sink.py:
     Mapping[str, object]: 4
     boundary: 1
@@ -1072,5 +1073,5 @@ totals:
   MutableMapping[str, Any]: 8
   boundary: 60
   dict[str, Any]: 1078
-  dict[str, object]: 395
-  soft: 2556
+  dict[str, object]: 396
+  soft: 2557
