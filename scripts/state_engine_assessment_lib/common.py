@@ -120,6 +120,28 @@ CANONICAL_V2_HARD_GATES_SHA256 = "4fe26992d0000a02e5a102849e85dcd15ac11fb05a0229
 CANONICAL_V2_APPLICABILITY_SHA256 = "e9d4565ecf7eb489f90d4472b1d93315fd9d50161b4a4f922e1fb4fd1c010596"
 CANONICAL_V2_EVIDENCE_CONTRACT_SHA256 = "e95c84c9067a7bdd9eb29af6c5acc20e4cf67e924518628dd400196aa132fb35"
 CANONICAL_V2_EXECUTION_PROFILES_SHA256 = "a31b3fed112d69b8992f4e00c111c474d420b81e9ffe1a7775cdec4d733593d6"
+CANONICAL_V3_EXECUTION_PROFILES_SHA256 = "a31b3fed112d69b8992f4e00c111c474d420b81e9ffe1a7775cdec4d733593d6"
+CANONICAL_V2_VOCABULARIES = {
+    "token_work_status": ["ready", "leased", "blocked", "pending_sink", "terminal", "failed"],
+    "terminal_path": [
+        "default_flow",
+        "gate_routed",
+        "gate_discarded",
+        "gate_error_discarded",
+        "on_error_routed",
+        "filter_dropped",
+        "coalesced",
+        "unrouted",
+        "quarantined_at_source",
+        "sink_fallback_to_failsink",
+        "sink_discarded",
+        "fork_parent",
+        "expand_parent",
+        "batch_consumed",
+        "buffered",
+        "abandoned",
+    ],
+}
 CANONICAL_V2_TOP_LEVEL_KEYS = {
     "schema_version",
     "catalog_id",

@@ -42,18 +42,43 @@ def _load_catalog(path: Path) -> dict[str, object]:
     return value
 
 
-def test_v2_catalog_uses_owned_state_and_path_vocabularies() -> None:
+def test_v2_catalog_keeps_historical_state_and_path_vocabularies() -> None:
     catalog = _load_catalog(V2_CATALOG_PATH)
 
     assert catalog["catalog_id"] == "elspeth-state-engine-v2"
+    assert catalog["vocabularies"] == {
+        "token_work_status": ["ready", "leased", "blocked", "pending_sink", "terminal", "failed"],
+        "terminal_path": [
+            "default_flow",
+            "gate_routed",
+            "gate_discarded",
+            "gate_error_discarded",
+            "on_error_routed",
+            "filter_dropped",
+            "coalesced",
+            "unrouted",
+            "quarantined_at_source",
+            "sink_fallback_to_failsink",
+            "sink_discarded",
+            "fork_parent",
+            "expand_parent",
+            "batch_consumed",
+            "buffered",
+            "abandoned",
+        ],
+    }
+
+
+def test_v3_catalog_uses_owned_state_and_path_vocabularies() -> None:
+    catalog = _load_catalog(V3_CATALOG_PATH)
     assert catalog["vocabularies"] == {
         "token_work_status": [item.value for item in TokenWorkStatus],
         "terminal_path": [item.value for item in TerminalPath],
     }
 
 
-def test_v2_catalog_first_party_plugin_inventory_matches_live_discovery() -> None:
-    catalog = _load_catalog(V2_CATALOG_PATH)
+def test_v3_catalog_first_party_plugin_inventory_matches_live_discovery() -> None:
+    catalog = _load_catalog(V3_CATALOG_PATH)
     discovered = discover_all_plugins()
     execution_profiles = catalog["execution_profiles"]
     assert isinstance(execution_profiles, dict)
@@ -152,20 +177,28 @@ def test_v2_catalog_profile_cases_bind_backend_deployment_and_lifecycle() -> Non
     assert {leg["applicability_profile"] for leg in legs if leg["id"] not in {"RC-05", "PB-08", "PB-11"}} == {"all-required-v2"}
 
 
-def test_v2_catalog_plugin_cases_exhaust_live_inventory() -> None:
+def test_v2_catalog_plugin_cases_exhaust_historical_inventory() -> None:
     catalog = _load_catalog(V2_CATALOG_PATH)
     legs = catalog["legs"]
     assert isinstance(legs, list)
     pb09 = next(leg for leg in legs if leg["id"] == "PB-09")
-    discovered = discover_all_plugins()
-    expected = [
-        f"{kind.removesuffix('s')}:{name}"
-        for kind in ("sources", "transforms", "sinks")
-        for name in sorted(cast(Any, plugin).name for plugin in discovered[kind])
-    ]
+    profiles = catalog["execution_profiles"]
+    assert isinstance(profiles, dict)
+    inventory = profiles["first_party_plugins"]
+    expected = [f"{kind.removesuffix('s')}:{name}" for kind in ("sources", "transforms", "sinks") for name in inventory[kind]]
 
     assert pb09["required_cases"] == expected
     assert len(expected) == 59
+
+
+def test_v3_catalog_plugin_cases_exhaust_live_inventory() -> None:
+    catalog = _load_catalog(V3_CATALOG_PATH)
+    discovered = discover_all_plugins()
+    expected = {f"{kind.removesuffix('s')}:{plugin.name}" for kind, plugins in discovered.items() for plugin in plugins}
+    legs = catalog["legs"]
+    assert isinstance(legs, list)
+    pb09 = next(leg for leg in legs if leg["id"] == "PB-09")
+    assert {case["plugin_key"] for case in pb09["required_cases"]} == expected
 
 
 def test_v1_catalog_remains_byte_identical_historical_evidence() -> None:
@@ -233,8 +266,6 @@ def test_v3_transition_preserves_v2_outside_reviewed_amendments() -> None:
         "criteria_ref",
         "architecture_ref",
         "dimensions",
-        "vocabularies",
-        "execution_profiles",
         "family_dimension_acceptance",
         "evidence_contract",
         "hard_gates",
@@ -1538,7 +1569,7 @@ def test_validate_package_rejects_unsupported_assessment_version_pair(
         ),
         pytest.param(
             _add_unsupported_postgresql_profile,
-            "supported state-store profiles",
+            "canonical v2 execution profiles",
             id="unsupported-postgresql-multi-host-profile",
         ),
         pytest.param(

@@ -14,6 +14,8 @@ from .common import (
     CANONICAL_V2_HARD_GATES_SHA256,
     CANONICAL_V2_LEGS_SHA256,
     CANONICAL_V2_TOP_LEVEL_KEYS,
+    CANONICAL_V2_VOCABULARIES,
+    CANONICAL_V3_EXECUTION_PROFILES_SHA256,
     CANONICAL_V3_TOP_LEVEL_KEYS,
     DIMENSIONS,
     FAMILY_LABELS,
@@ -144,7 +146,7 @@ def _validate_v3_cases(catalog: dict[str, Any], legs: list[dict[str, Any]], prof
             )
 
 
-def _validate_profile_cases(catalog: dict[str, Any]) -> list[str]:
+def _validate_profile_cases(catalog: dict[str, Any], *, current: bool) -> list[str]:
     profiles = _dict(catalog["execution_profiles"], "execution_profiles")
     _require(
         set(profiles) == {"state_store", "deployments", "profile_cases", "lifecycle_modes", "first_party_plugins"},
@@ -170,20 +172,22 @@ def _validate_profile_cases(catalog: dict[str, Any]) -> list[str]:
         store_id: _strings(store.get("deployments"), f"state-store profile {store_id} deployments")
         for store_id, store in store_by_id.items()
     }
-    _require(
-        actual_store_deployments == SUPPORTED_STATE_STORES and all(store.get("required") is True for store in store_by_id.values()),
-        "catalog supported state-store profiles do not match the v2 contract",
-    )
+    if current:
+        _require(
+            actual_store_deployments == SUPPORTED_STATE_STORES and all(store.get("required") is True for store in store_by_id.values()),
+            "catalog supported state-store profiles do not match the current contract",
+        )
 
     deployments = _strings(profiles.get("deployments"), "execution_profiles.deployments")
     lifecycle_modes = _strings(profiles.get("lifecycle_modes"), "execution_profiles.lifecycle_modes")
     _unique(deployments, "execution_profiles.deployments")
     _unique(lifecycle_modes, "execution_profiles.lifecycle_modes")
-    _require(deployments == SUPPORTED_DEPLOYMENTS, "catalog supported state-store profiles have deployment drift")
-    _require(
-        lifecycle_modes == SUPPORTED_LIFECYCLE_MODES,
-        "catalog supported state-store profiles have lifecycle drift",
-    )
+    if current:
+        _require(deployments == SUPPORTED_DEPLOYMENTS, "catalog supported state-store profiles have deployment drift")
+        _require(
+            lifecycle_modes == SUPPORTED_LIFECYCLE_MODES,
+            "catalog supported state-store profiles have lifecycle drift",
+        )
 
     cases = _list(profiles.get("profile_cases"), "execution_profiles.profile_cases")
     case_ids: list[str] = []
@@ -218,10 +222,11 @@ def _validate_profile_cases(catalog: dict[str, Any]) -> list[str]:
     _unique(case_ids, "execution_profiles.profile_cases")
 
     actual_cases = {case["id"]: (case["state_store"], case["deployment"], case["lifecycle_modes"]) for case in cases}
-    _require(
-        actual_cases == SUPPORTED_PROFILE_CASES,
-        "catalog supported state-store profiles do not match the four v2 profile cases",
-    )
+    if current:
+        _require(
+            actual_cases == SUPPORTED_PROFILE_CASES,
+            "catalog supported state-store profiles do not match the current profile cases",
+        )
 
     expected_pairs = {
         (store_id, deployment)
@@ -325,21 +330,28 @@ def validate_catalog(catalog: dict[str, Any], catalog_path: Path) -> None:
             "catalog applicability profile namespace does not match the versioned contract",
         )
     if catalog_id in {"elspeth-state-engine-v2", "elspeth-state-engine-v3"}:
-        from elspeth.contracts.enums import TerminalPath
-        from elspeth.contracts.scheduler import TokenWorkStatus
+        current = catalog_id == "elspeth-state-engine-v3"
+        if current:
+            from elspeth.contracts.enums import TerminalPath
+            from elspeth.contracts.scheduler import TokenWorkStatus
 
-        _require(
-            catalog.get("vocabularies")
-            == {
+            expected_vocabularies = {
                 "token_work_status": [item.value for item in TokenWorkStatus],
                 "terminal_path": [item.value for item in TerminalPath],
-            },
-            "catalog vocabularies do not match owned runtime enums",
-        )
-        profile_case_ids = _validate_profile_cases(catalog)
+            }
+        else:
+            expected_vocabularies = CANONICAL_V2_VOCABULARIES
         _require(
-            _semantic_sha256(profiles) == CANONICAL_V2_EXECUTION_PROFILES_SHA256,
-            "canonical v2 execution profiles changed without a catalog identity revision",
+            catalog.get("vocabularies") == expected_vocabularies,
+            "catalog vocabularies do not match owned runtime enums"
+            if current
+            else "catalog vocabularies do not match the historical v2 contract",
+        )
+        profile_case_ids = _validate_profile_cases(catalog, current=current)
+        profiles_digest = CANONICAL_V3_EXECUTION_PROFILES_SHA256 if current else CANONICAL_V2_EXECUTION_PROFILES_SHA256
+        _require(
+            _semantic_sha256(profiles) == profiles_digest,
+            f"canonical {'v3' if current else 'v2'} execution profiles changed without a catalog identity revision",
         )
         expected_profile_fields = {"default_case_id", "profile_case_applicability", *DIMENSIONS}
     else:
