@@ -334,6 +334,14 @@ Required names: `elspeth-session-db-url-runtime`, `elspeth-landscape-url-runtime
 `elspeth-operator-metrics-bearer-token`. PostgreSQL URLs use
 `sslmode=verify-full&sslrootcert=system`: the runtime image's CA store carries
 both Azure roots (facts §4.4). Never print a secret value.
+ACA startup and doctor reject URLs without a single explicit `sslmode=verify-full`
+and `sslrootcert=system` or an absolute CA-file path. Existing ACA configurations
+that omitted these settings must be corrected before using this version.
+Repeated TLS parameters and the legacy `requiressl` option are rejected. If
+`gssencmode` is supplied, it must be a single `disable` value. The supported
+configuration uses TCP/TLS, without competing GSS transport. An explicit CA
+file must exist and contain the trusted server roots in the runtime image;
+static URL validation does not establish that the file is usable.
 Store URL-escaped role passwords in those URLs; never put raw passwords into
 the shell command line. Clear `PGPASSWORD`, `ELSPETH_SCHEMA_OWNER_PASSWORD`
 and `ELSPETH_RUNTIME_PASSWORD` after storing their Key Vault versions.
@@ -578,16 +586,20 @@ bash deploy/azure-container-apps/scripts/run-job.sh "$RESOURCE_GROUP" doctor-run
 ```
 
 `doctor-runtime` runs `elspeth doctor deployment --json` with the runtime
-URLs; every reported check must be OK, including schema and storage checks.
-The ACA collector does not emit `session_tls` or `landscape_tls`; a successful
-Job does not establish those named checks ran. The configured runtime URLs
-must retain `sslmode=verify-full&sslrootcert=system`. From the connected
-operator host, test each runtime database with `psql`, using separate `PGHOST`,
-`PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE=verify-full` and a trusted
-`PGSSLROOTCERT` bundle. This query must return `t` and the negotiated protocol:
-`SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid();`.
-That proves the operator's connection; runtime Jobs prove connectivity using
-their configured URLs. Retrieve the report from Log
+URLs; every reported check must be OK, including schema, storage,
+`session_tls` and `landscape_tls`. The TLS checks query `pg_stat_ssl` on the
+same initial preflight connections used to inspect each schema. A failed TLS
+preflight prevents schema initialization. Initialization and its final schema
+verification use separate connections with the validated URLs; those connections
+are not independently measured by these checks. Run this runtime doctor after
+schema initialization, as shown here.
+
+The configured runtime URLs must retain
+`sslmode=verify-full&sslrootcert=system`. The report proves the doctor's
+connections using runtime credentials, not every subsequent web connection,
+the production image's CA store in isolation, or completed Azure acceptance.
+An operator-host `psql` query measures only that operator connection and cannot
+substitute for these Job checks. Retrieve the report from Log
 Analytics by execution name (ingestion lags by minutes, facts §5.1).
 
 ## 8. Deploy the workload

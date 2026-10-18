@@ -58,6 +58,22 @@ def _assert_redacted(value: object) -> None:
     assert "landscape-secret" not in rendered
 
 
+@pytest.mark.parametrize("field", ["session_db_url", "landscape_url"])
+def test_aca_startup_rejects_unverified_tls_settings(tmp_path: Path, field: str) -> None:
+    settings = _settings(
+        tmp_path,
+        deployment_target="azure-container-apps",
+        session_db_url="postgresql+psycopg://runtime:session-secret@db/session?sslmode=verify-full&sslrootcert=system",
+        landscape_url="postgresql+psycopg://runtime:landscape-secret@db/landscape?sslmode=verify-full&sslrootcert=system",
+    ).model_copy(update={field: "postgresql+psycopg://runtime:opaque-credential@db/unverified?sslmode=require"})
+
+    with pytest.raises(startup.ExternalStateStartupContractError) as error:
+        startup.enforce_external_state_contract(settings)
+
+    assert field in str(error.value)
+    _assert_redacted(error.value)
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 0.0

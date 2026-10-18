@@ -17,6 +17,8 @@ import importlib
 import json
 import os
 import re
+import socket
+import subprocess
 import threading
 import time
 import uuid
@@ -34,7 +36,7 @@ from psycopg import sql
 from pydantic import SecretBytes
 from sqlalchemy import create_engine, event, inspect, update
 from sqlalchemy.engine import URL, Engine, make_url
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from typer.testing import CliRunner
 
 from elspeth.cli import app as cli_app
@@ -431,6 +433,12 @@ def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
 
     assert doctor_result.exit_code == 0, doctor_result.output
     _assert_all_green_report(doctor_result.stdout)
+    if target == "azure-container-apps":
+        report = {item["name"]: item for item in json.loads(doctor_result.stdout)}
+        assert report["session_tls"]["ok"] is True
+        assert report["landscape_tls"]["ok"] is True
+        assert "TLSv" in report["session_tls"]["detail"]
+        assert "TLSv" in report["landscape_tls"]["detail"]
     initialized_session = create_session_engine(database_pair.session_owner_url)
     initialized_landscape = create_engine(database_pair.landscape_owner_url)
     try:
@@ -540,6 +548,96 @@ def test_external_apps_share_all_web_rate_budgets(tmp_path: Path, database_pair:
     finally:
         first.state.session_engine.dispose()
         second.state.session_engine.dispose()
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+psycopg2", "postgresql+psycopg"])
+def test_verified_tls_rejects_reachable_certificate_hostname_mismatch(database_pair: _DatabasePair, driver: str) -> None:
+    parsed = make_url(database_pair.session_owner_url).set(drivername=driver)
+    positive = create_engine(parsed, connect_args={"connect_timeout": 5})
+    try:
+        with positive.connect() as connection:
+            assert connection.exec_driver_sql("SELECT 1").scalar_one() == 1
+    finally:
+        positive.dispose()
+
+    assert parsed.host is not None
+    address = socket.getaddrinfo(parsed.host, parsed.port or 5432, type=socket.SOCK_STREAM)[0][4][0]
+    # Keep the actual reachable address and trusted CA, changing only the
+    # certificate name to verify. This bypasses ELSPETH's target-override guard
+    # solely to exercise the underlying driver's real handshake negative.
+    negative = create_engine(
+        parsed.set(host="certificate-mismatch.invalid"),
+        connect_args={"hostaddr": address, "connect_timeout": 5},
+    )
+    try:
+        with pytest.raises(OperationalError, match="does not match host name"), negative.connect():
+            pytest.fail("the trusted certificate must not authenticate another hostname")
+    finally:
+        negative.dispose()
+
+
+@pytest.mark.parametrize("field", ["session_db_url", "landscape_url"])
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+psycopg2", "postgresql+psycopg"])
+def test_aca_doctor_untrusted_ca_prevents_all_schema_initialization(
+    tmp_path: Path, database_pair: _DatabasePair, field: str, driver: str
+) -> None:
+    unrelated_ca = tmp_path / "unrelated-ca.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=unrelated-ca",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-keyout",
+            str(tmp_path / "unrelated-ca.key"),
+            "-out",
+            str(unrelated_ca),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    session_url = make_url(database_pair.session_owner_url).set(drivername=driver)
+    landscape_url = make_url(database_pair.landscape_owner_url).set(drivername=driver)
+    failing = session_url if field == "session_db_url" else landscape_url
+    failing = failing.update_query_dict({"sslrootcert": str(unrelated_ca)})
+    environment = _doctor_environment(
+        tmp_path,
+        target="azure-container-apps",
+        session_url=(failing if field == "session_db_url" else session_url).render_as_string(hide_password=False),
+        landscape_url=(failing if field == "landscape_url" else landscape_url).render_as_string(hide_password=False),
+    )
+
+    result = _invoke_doctor(environment, init_schema=True)
+
+    assert result.exit_code == 1
+    report = {item["name"]: item for item in json.loads(result.stdout)}
+    failed_tls = "session_tls" if field == "session_db_url" else "landscape_tls"
+    healthy_tls = "landscape_tls" if field == "session_db_url" else "session_tls"
+    assert report["session_db_url"]["ok"] is True
+    assert report["landscape_url"]["ok"] is True
+    assert report["separate_db_targets"]["ok"] is True
+    assert report[failed_tls]["ok"] is False
+    assert report[healthy_tls]["ok"] is True
+    assert report["session_schema"]["ok"] is False
+    assert report["landscape_schema"]["ok"] is False
+    for url in (session_url, landscape_url):
+        rendered = result.stdout + result.stderr
+        assert url.render_as_string(hide_password=False) not in rendered
+        assert url.password is not None and url.password not in rendered
+        engine = create_engine(url)
+        try:
+            assert inspect(engine).get_table_names() == []
+        finally:
+            engine.dispose()
 
 
 def test_doctor_rejects_same_database_without_leaking_credentials(

@@ -188,9 +188,11 @@ without a new unhandled startup or runtime failure (Log Analytics lags by
 minutes).
 For a first launch, verify first-admin login and grant an explicit workload
 role, then make a real Composer request and a small LLM pipeline run. An admin
-grant alone does not grant author/run access. The ACA doctor does not emit
-`session_tls`/`landscape_tls`; keep verified TLS URLs and use the cold-install
-runbook's separate connection check.
+grant alone does not grant author/run access. Require the ACA doctor's
+`session_tls`/`landscape_tls` checks: these measure its initial preflight
+schema-inspection connections, using the configured runtime URLs. They do not
+measure every web connection or initialization's separate final verification
+connection. Keep verified TLS URLs and follow the cold-install runbook.
 
 For the disposable acceptance, `scripts/acceptance.sh all` includes the final
 `single-revision` stage after the labelled P1/P2/P4/P3 probes. It deploys
