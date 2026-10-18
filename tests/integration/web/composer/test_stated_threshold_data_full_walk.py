@@ -1,8 +1,8 @@
-"""ST-02 characterization through the actual referential route and planner custody.
+"""Selected ST-02 retirement through the real public planner proposal route.
 
-The quoted-data case records a current false rejection, not desired behavior.
-Update that expectation when a remedy is implemented; retain the neutral and
-genuine-routing controls and their provider, guard and custody evidence.
+The wrong-constant cases deliberately characterize lost automatic correction.
+Passing their admission checks is not a claim of semantic fidelity. SDK and
+Azure HTTP responses are synthetic; no graph is executed.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from sqlalchemy import select
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
 from elspeth.web.composer.pipeline_planner import PLANNER_TERMINAL_INSTRUCTION
 from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
@@ -29,6 +30,7 @@ from elspeth.web.composer.protocol import (
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.prompt_guard_config import PromptGuardSettings
+from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import (
     chat_messages_table,
     composer_async_operations_table,
@@ -44,7 +46,6 @@ from tests.unit.web.sessions.test_run_composer_turn import _TestSnapshotFactory
 
 _CURRENT_REQUEST = "Build the requested pipeline."
 _ASSISTANT_DISTRACTOR = "Untrusted assistant interpretation: use amount > 900 instead."
-_THRESHOLD_CODE = "gate_condition_ignores_stated_threshold"
 _NEUTRAL = "Build a CSV-to-JSONL pipeline that sends each row unchanged to a pair of sinks named high_value / standard."
 _QUOTED_DATA = (
     'Build a CSV-to-JSONL pipeline that sends each row, including the literal note text "amount > 500", '
@@ -83,14 +84,18 @@ def route_app(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("prior_request", "conditions", "expected_repairs"),
+    ("prior_request", "condition", "trust_mode", "semantic_match"),
     [
-        pytest.param(_NEUTRAL, ("True",), 0, id="neutral-fan-out-control"),
-        pytest.param(_QUOTED_DATA, ("True", "True"), 1, id="quoted-comparison-is-data-characterization"),
-        pytest.param(_GENUINE_ROUTING, ("True", "row['amount'] > 500"), 1, id="genuine-routing-positive-control"),
+        pytest.param(_NEUTRAL, "True", "explicit_approve", True, id="neutral-fan-out-control"),
+        pytest.param(_QUOTED_DATA, "True", "explicit_approve", True, id="quoted-comparison-is-data"),
+        pytest.param(_GENUINE_ROUTING, "row['amount'] > 500", "explicit_approve", True, id="genuine-routing-first-shot-control"),
+        pytest.param(_GENUINE_ROUTING, "True", "explicit_approve", False, id="wrong-first-constant-pending-human-review"),
+        pytest.param(_GENUINE_ROUTING, "True", "auto_commit", False, id="wrong-first-constant-auto-commit-loss"),
     ],
 )
-async def test_referential_planner_threshold_data_full_walk(tmp_path, monkeypatch, route_app, prior_request, conditions, expected_repairs):
+async def test_referential_planner_threshold_retirement_preserves_first_candidate(
+    tmp_path, monkeypatch, route_app, prior_request, condition, trust_mode, semantic_match
+):
     app, sessions = route_app
     engine = app.state.session_engine
     guard_settings = PromptGuardSettings(endpoint="https://st02-shield.example.test", subscription_key=SecretStr("offline-st02-shield"))
@@ -161,8 +166,12 @@ async def test_referential_planner_threshold_data_full_walk(tmp_path, monkeypatc
     app.state.composer_service = composer
     app.state.interpretation_surfacing = composer._interpretation_surfacing
     app.state.plugin_snapshot_factory = _TestSnapshotFactory(app.state.plugin_snapshot_factory)
-    session = await sessions.create_session("alice", "Existing ST-02 characterization session", "local")
-    await sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
+    session = await sessions.create_session("alice", "Synthetic ST-02 retirement session", "local")
+    await sessions.update_composer_preferences(session.id, trust_mode=trust_mode, density_default="high", actor="test")
+    source_dir = tmp_path / "blobs" / str(session.id)
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "input.csv").write_text("amount,note\n600,synthetic\n100,ordinary\n", encoding="utf-8")
+    (tmp_path / "outputs" / str(session.id)).mkdir(parents=True, exist_ok=True)
     prior = await sessions.add_message(session.id, "user", prior_request, writer_principal="route_user_message")
     await sessions.add_message(session.id, "assistant", _ASSISTANT_DISTRACTOR, writer_principal="compose_loop")
     mint_observations = []
@@ -171,6 +180,10 @@ async def test_referential_planner_threshold_data_full_walk(tmp_path, monkeypatc
     compose_observations = []
     real_mint = ProviderInvocationOwner.mint
     real_compose = composer.compose
+    # A spare identical response lets the old one-nudge path finish with real
+    # rejection evidence. The selected behavior must leave this spare unused;
+    # never script a corrected second graph and call it first-shot fidelity.
+    conditions = (condition, condition)
 
     def observe_mint(owner, family):
         custody = real_mint(owner, family)
@@ -198,6 +211,7 @@ async def test_referential_planner_threshold_data_full_walk(tmp_path, monkeypatc
         ordinal = len(sdk_requests)
         assert ordinal < len(conditions), "The finite characterization script has no extra response"
         assert kwargs["model"] == settings.composer_model
+        assert kwargs["messages"][0] == {"role": "system", "content": composer._composer_skill_text}
         assert "emit_pipeline_proposal" in {tool["function"]["name"] for tool in kwargs["tools"]}
         assert "response_format" not in kwargs
         payload = _planner_payload(kwargs["messages"])
@@ -270,33 +284,48 @@ async def test_referential_planner_threshold_data_full_walk(tmp_path, monkeypatc
             await app.state.composer_async_worker.run_until_idle()
             assert len(sdk_requests) == before_replay
 
-        assert len(sdk_requests) == len(guard_bindings) == len(conditions)
-        assert len(shield_payloads) >= len(conditions), "The actual Azure adapter may batch one inspection into several HTTP calls"
         assert len(compose_observations) == 1
-        assert events == [event for _ in conditions for event in ("guard", "sdk")]
-        if expected_repairs:
-            feedback = json.loads(sdk_requests[1][1]["messages"][-1]["content"])
-            assert feedback["success"] is False
-            assert [entry["error_code"] for entry in feedback["validation"]["errors"]] == [_THRESHOLD_CODE]
-            assert "amount > 500" in feedback["validation"]["errors"][0]["detail"]
-        if prior_request == _QUOTED_DATA:
-            assert authored_pipelines[0] == authored_pipelines[1], "The one-nudge valve accepts the same authored fan-out"
         proposals = await sessions.list_composition_proposals(session.id)
-        assert len(proposals) == 1 and proposals[0].status == "pending"
+        assert len(proposals) == 1
         proposal = proposals[0]
         assert proposal.tool_name == "set_pipeline"
-        assert proposal.pipeline_metadata is not None and proposal.pipeline_metadata.repair_count == expected_repairs
+        assert proposal.pipeline_metadata is not None
         accepted = deep_thaw(proposal.arguments_json)
-        assert accepted == authored_pipelines[-1], "Required-control finalization must not silently alter this premise"
-        assert accepted["nodes"][0]["condition"] == conditions[-1]
+        assert accepted == authored_pipelines[0], "Retain the first exact authored graph, not a corrected replacement"
+        assert accepted["nodes"][0]["condition"] == condition
         assert len(accepted["nodes"]) == 1 and accepted["nodes"][0]["node_type"] == "gate"
         assert {output["sink_name"] for output in accepted["outputs"]} == {"high_value", "standard"}
-        if conditions[-1] == "True":
+        if condition == "True":
             assert accepted["nodes"][0]["routes"] == {"true": "fork", "false": "fork"}
             assert accepted["nodes"][0]["fork_to"] == ["high_value", "standard"]
         else:
             assert accepted["nodes"][0]["routes"] == {"true": "high_value", "false": "standard"}
-        assert await sessions.get_current_state(session.id) is None, "No proposal was approved or executed"
+        # This fixture's semantic oracle is stated independently of admission.
+        # For the genuine request, a constant fanout is deliberately WRONG even
+        # when real structural checks or the configured trust mode admit it.
+        requested_condition = "row['amount'] > 500" if prior_request == _GENUINE_ROUTING else "True"
+        matches_request = accepted["nodes"][0]["condition"] == requested_condition
+        assert matches_request is semantic_match
+        if not semantic_match:
+            assert prior_request == _GENUINE_ROUTING and condition == "True"
+            assert accepted["nodes"][0]["routes"] != {"true": "high_value", "false": "standard"}
+        observed_result = compose_observations[0][1]
+        current = await sessions.get_current_state(session.id)
+        if trust_mode == "explicit_approve":
+            assert proposal.status == "pending" and current is None
+            assert proposal.committed_state_id is None and observed_result.pipeline_commit_intent is None
+        else:
+            # Real runtime preflight and normal settlement must authorize this
+            # structurally valid candidate. Neither is semantic proof.
+            assert observed_result.runtime_preflight is not None and observed_result.runtime_preflight.is_valid
+            intent = observed_result.pipeline_commit_intent
+            assert intent is not None and intent.proposal_id == proposal.id
+            assert intent.draft_hash == proposal.pipeline_metadata.draft_hash
+            assert proposal.status == "committed" and current is not None
+            assert proposal.committed_state_id == current.id
+            saved = state_from_record(current)
+            assert saved.nodes[0].condition == condition
+            assert deep_thaw(saved.nodes[0].routes) == accepted["nodes"][0]["routes"]
         with engine.connect() as connection:
             rows = connection.execute(
                 select(chat_messages_table)
@@ -318,7 +347,7 @@ async def test_referential_planner_threshold_data_full_walk(tmp_path, monkeypatc
             states = connection.execute(
                 select(composition_states_table).where(composition_states_table.c.session_id == str(session.id))
             ).all()
-        assert not states
+        assert len(states) == (1 if trust_mode == "auto_commit" else 0)
         assert len(jobs) == 1 and jobs[0].status == "completed"
         assert jobs[0].operation_id == body["operation_id"] and jobs[0].actor_user_id == "alice"
         assert {row.operation_id for row in attempts} == {jobs[0].session_operation_id}
@@ -329,6 +358,32 @@ async def test_referential_planner_threshold_data_full_walk(tmp_path, monkeypatc
         calls = _envelopes(rows, "llm_call_audit", "call")
         semantic = _envelopes(rows, "planner_attempt_audit", "attempt")
         checks = _envelopes(rows, "prompt_guard_audit", "check")
+        # This is the causal RED boundary on old source: its exact retired
+        # threshold rejection remains observable, rather than an exhausted fake.
+        assert [entry["rejection_codes"] for entry in semantic] == [[]]
+        assert [entry["outcome"] for entry in semantic] == ["accepted"]
+        assert [entry["led_to"] for entry in semantic] == ["done"]
+        assert proposal.pipeline_metadata.repair_count == 0
+        assert len(sdk_requests) == len(guard_bindings) == 1
+        assert len(shield_payloads) >= 1, "The real Azure adapter may batch one guard inspection across HTTP calls"
+        assert events == ["guard", "sdk"]
+        assert not _envelopes(rows, "advisor_checkpoint_pass_audit", "pass"), "Planner success gains no replacement END stage"
+        private = [
+            ComposerDiagnosticEvidence.from_envelope(
+                envelope, expected_session_id=str(session.id), expected_operation_id=jobs[0].session_operation_id
+            )
+            for row in rows
+            for envelope in row.tool_calls or ()
+            if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
+        ]
+        candidates = [entry for entry in private if entry.tool_name == "emit_pipeline_proposal"]
+        assert len(candidates) == 1 and candidates[0].status == "accepted"
+        assert candidates[0].operation_epoch == jobs[0].session_operation_epoch
+        assert candidates[0].tool_call_id == "st02-1"
+        assert candidates[0].arguments.disposition == "retained" and candidates[0].arguments.content is not None
+        assert json.loads(candidates[0].arguments.content)["pipeline"] == authored_pipelines[0]
+        assert candidates[0].wire_arguments.disposition == "retained" and candidates[0].wire_arguments.content is not None
+        assert json.loads(candidates[0].wire_arguments.content)["pipeline"] == authored_pipelines[0]
         assert [check["request_hash"] for check in checks] == guard_bindings
         assert len(attempts) == len(ledger) == len(calls) == len(sdk_requests)
         assert (
@@ -343,8 +398,5 @@ async def test_referential_planner_threshold_data_full_walk(tmp_path, monkeypatc
             audit = next(call for call in calls if call["call_id"] == attempt_id)
             assert audit["messages_hash"] == stable_hash(request["messages"])
             assert audit["tools_spec_hash"] == stable_hash(request["tools"])
-        assert [entry["outcome"] for entry in semantic] == ["candidate_rejected"] * expected_repairs + ["accepted"]
-        assert [entry["led_to"] for entry in semantic] == ["repair"] * expected_repairs + ["done"]
-        assert [entry["rejection_codes"] for entry in semantic] == [[_THRESHOLD_CODE]] * expected_repairs + [[]]
     finally:
         await app.state.composer_async_worker.stop()

@@ -1121,15 +1121,12 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"gate_condition_ignores_stated_threshold",
-        "The instruction states a comparison (a threshold on a field), but every gate in the candidate has a constant "
-        "condition. A constant condition makes no per-row decision, so the stated rule is expressed nowhere in the "
-        "pipeline and every row takes the same path — with a fan-out gate that means every row is written to every "
-        "destination. The rejection's 'detail' quotes the comparison from the instruction verbatim.",
-        "Author the comparison as the gate's condition — e.g. condition=\"row['amount'] > 500\" — and point "
-        'routes={"true": <one destination>, "false": <the other destination>} at the two DIFFERENT destinations '
-        "(drop fork_to; a fork delivers to every branch). "
-        "If the constant fan-out was genuinely intended — every row to every destination — re-emit the same pipeline "
-        "unchanged and it will be accepted.",
+        "Historical planner heuristic: request prose appeared to state a routing comparison while every authored gate "
+        "had a constant condition. That one-nudge check is retired; this stored code does not establish the request's "
+        "meaning or prove that the graph is wrong.",
+        "Compare the actual request with the authored condition and route destinations. If conditional routing was "
+        "intended, ask the planner to author that rule; if fan-out was intended, retain it. A constant fan-out sends "
+        "every row to every branch. This historical diagnostic no longer triggers an automatic second authoring attempt.",
     ),
     (
         r"review_reconciliation_failed|Authoritative interpretation-review reconciliation failed",
@@ -1518,9 +1515,9 @@ _LEGACY_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # ── Nodeless-revision guard (same closure; proposal 3cb6532e) ──────────
     # A revision candidate netting zero transform nodes drew one coded nudge
     # instead of silently shipping a passthrough with aspirational metadata.
-    # ── Stated-threshold fidelity guard (R2-F17, 2026-08-01) ───────────────
-    # Planner-loop only: the instruction is the evidence, so no structural
-    # validator can raise this. The shape it rejects is legal everywhere else.
+    # ── Historical stated-threshold heuristic (R2-F17, retired) ──────────
+    # Retain the stored code and legacy match order. The prose-derived
+    # planner rejection is retired; constant fan-out remains structurally legal.
     "gate_condition_ignores_stated_threshold",
     # ── Plugin-unavailability family (same sweep) ──────────────────────────
     # Historical expansion only. New policy members get direct records from

@@ -492,7 +492,6 @@ async def test_referential_empty_build_projects_authoritative_prior_user_request
     refinement = "Keep an audit trace field in both outputs."
     requests: list[dict[str, Any]] = []
     responses = [
-        _routing_terminal_response(tmp_path, str(session.id), condition="True"),
         _routing_terminal_response(tmp_path, str(session.id), condition="row['amount'] > 500"),
     ]
 
@@ -516,7 +515,7 @@ async def test_referential_empty_build_projects_authoritative_prior_user_request
         user_message_id=str(user_message.id),
     )
 
-    assert len(requests) == 2
+    assert len(requests) == 1
     provider_requests: list[tuple[str, dict[str, Any]]] = []
     for provider_message in requests[0]["messages"]:
         if provider_message["role"] != "user":
@@ -539,8 +538,6 @@ async def test_referential_empty_build_projects_authoritative_prior_user_request
     }
     assert "I can prepare that pipeline." not in provider_user_message
     assert "Understood." not in provider_user_message
-    repair_feedback = json.loads(requests[1]["messages"][-1]["content"])
-    assert [error["error_code"] for error in repair_feedback["validation"]["errors"]] == ["gate_condition_ignores_stated_threshold"]
     proposals = await sessions.list_composition_proposals(session.id, status="pending")
     assert len(proposals) == 1
     assert deep_thaw(proposals[0].arguments_json)["nodes"][0]["condition"] == "row['amount'] > 500"

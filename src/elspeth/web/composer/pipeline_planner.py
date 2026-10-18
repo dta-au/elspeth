@@ -165,7 +165,6 @@ from elspeth.web.composer.state import (
     ValidationEntry,
     ValidationSummary,
     coalesce_reachability_facts,
-    gate_condition_is_constant,
     route_destination_facts,
 )
 from elspeth.web.composer.tool_error_payloads import INVALID_TOOL_ARGUMENTS_REDACTION_STATUS, wire_argument_repair_message
@@ -2010,195 +2009,6 @@ def _feedback_error_codes(feedback: _PlannerFeedbackWire) -> tuple[str, ...]:
     return tuple(entry["error_code"] for entry in feedback["validation"]["errors"])
 
 
-# A stated routing threshold: a comparison operator, or comparison wording,
-# bound to a NUMBER. Requiring the number is what keeps this conservative —
-# "the transform above the gate" and "source -> sink" are ordinary authoring
-# prose and must never trip the guard. The operator lookbehind rejects arrow
-# and fat-arrow forms outright.
-_THRESHOLD_NUMBER: Final[str] = r"\$?\d+(?:[.,]\d+)*(?!\d)"
-# A number immediately followed by a unit noun measures a LIMIT — prompt
-# length, a row cap, a branch count — not a value a row is routed on. The
-# trailing ``(?!\d)`` on the number above is load-bearing: without it the
-# engine backtracks to a shorter number ("5" out of "50 words") and slips past
-# this lookahead.
-_THRESHOLD_UNIT_NOUN: Final[str] = (
-    r"(?!\s*(?:%|(?:words?|characters?|chars?|rows?|records?|branch|branches|sinks?|nodes?|tokens?|"
-    r"seconds?|secs?|minutes?|ms|milliseconds?|times?|items?|entries|columns?|fields?)\b))"
-)
-_THRESHOLD_QUANTITY: Final[str] = _THRESHOLD_NUMBER + _THRESHOLD_UNIT_NOUN
-_THRESHOLD_OPERATOR: Final[str] = r"(?<![-=<>!])(?:>=|<=|==|>|<)"
-_THRESHOLD_WORDING: Final[str] = (
-    r"(?:greater than|less than|more than|fewer than|at least|at most|no more than|no less than|above|below|over|under)"
-)
-_STATED_THRESHOLD_PATTERN: Final[re.Pattern[str]] = re.compile(
-    rf"[A-Za-z_]\w*\s*{_THRESHOLD_OPERATOR}\s*{_THRESHOLD_QUANTITY}"
-    rf"|{_THRESHOLD_NUMBER}\s*{_THRESHOLD_OPERATOR}\s*[A-Za-z_]\w*"
-    rf"|{_THRESHOLD_WORDING}\s+{_THRESHOLD_QUANTITY}",
-    re.IGNORECASE,
-)
-_ROUTING_THRESHOLD_REVOCATION_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:remove|drop|delete|disable|omit|stop\s+using)\s+(?:the\s+)?(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
-    r"|\bwithout\s+(?:a\s+|the\s+)?(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
-    r"|\bno\s+(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
-    r"|\b(?:do\s+not|don(?:'|\N{RIGHT SINGLE QUOTATION MARK})t)\s+(?:use|apply|keep)\s+"
-    r"(?:the\s+)?(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
-    r"|\b(?:do\s+not|don(?:'|\N{RIGHT SINGLE QUOTATION MARK})t)\s+(?:route|send|split|divert|separate)\b"
-    r"|\b(?:fan(?:\s+out)?|route|send)\s+(?:every|all)\s+rows?\s+(?:to\s+)?(?:both|all|every)\s+(?:the\s+)?sinks?\b",
-    re.IGNORECASE,
-)
-
-
-# Routing intent. A comparison alone is not enough: "summarise each row in
-# under 50 words" and "keep at most 100 rows" bind comparison wording to a
-# number while asking for nothing about routing, and firing on those would
-# tell the model to author a gate condition a correct pipeline never needed —
-# turning a right answer into a wrong one. Both halves must hold.
-_ROUTING_INTENT_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:route|routes|routed|routing|send|sends|sent|go to|goes to|split|splits|gate|divert|diverts|separate|separates)\b",
-    re.IGNORECASE,
-)
-_ROUTING_CONTROL_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:routing\s+)?(?:threshold|gate|condition|filter)\b",
-    re.IGNORECASE,
-)
-# Clause boundaries. "Split the rows into two sinks AND keep at most 100 rows"
-# states a routing action and an unrelated cap; only a comparison in the SAME
-# clause as the routing verb is plausibly the rule that routes.
-_CLAUSE_BOUNDARY_PATTERN: Final[re.Pattern[str]] = re.compile(
-    # ``\.(?!\d)`` splits sentences without splitting decimals: a decimal
-    # point is always followed by a digit, a full stop never is.
-    r"\.(?!\d)|[;:!?\n]|\band\b|\bthen\b|\bbut\b|\bwhile\b|\balso\b",
-    re.IGNORECASE,
-)
-
-
-def _stated_threshold_in(instruction: str) -> str | None:
-    """Return the routing comparison the instruction states, or None.
-
-    Deliberately conservative on three axes, because a false positive here is
-    worse than a miss: the rejection asserts the instruction stated a routing
-    rule and tells the model to author a gate condition, so on a pipeline that
-    is already correct a compliant model makes it wrong — and under a repair
-    budget of one that ends in REPAIR_EXHAUSTED with no proposal at all. A
-    comparison counts only when
-
-    1. an operator (or comparison wording) is bound to a literal number;
-    2. the number is NOT followed by a unit noun (``under 50 words``,
-       ``at most 100 rows``, ``more than 2 branches`` measure a limit, not a
-       row value); and
-    3. it shares a clause with a routing verb.
-
-    Known false negative, accepted: the expression form
-    ``row['amount'] > 500`` is missed, because the ``]`` breaks the
-    ``[A-Za-z_]\\w*`` operand. Widening the operand to swallow bracket
-    subscripts would also swallow ordinary prose ahead of an operator, and
-    false negatives are the safe direction — the non-blocking
-    ``gate_fan_out_advisory`` still names the shape at review.
-    """
-    for clause in _CLAUSE_BOUNDARY_PATTERN.split(instruction):
-        if _ROUTING_INTENT_PATTERN.search(clause) is None:
-            continue
-        match = _STATED_THRESHOLD_PATTERN.search(clause)
-        if match is not None:
-            return match.group(0).strip()
-    return None
-
-
-def _stated_threshold_for_planner_request(
-    intent: str,
-    conversation_context: PlannerConversationContext | None,
-) -> str | None:
-    """Resolve the latest authoritative routing threshold for this request.
-
-    The current user message has precedence. A referential turn may otherwise
-    inherit the latest retained earlier user request.
-    """
-    if _ROUTING_THRESHOLD_REVOCATION_PATTERN.search(intent) is not None:
-        return None
-    current_threshold = _stated_threshold_in(intent)
-    if current_threshold is not None:
-        return current_threshold
-    if _ROUTING_INTENT_PATTERN.search(intent) is not None or _ROUTING_CONTROL_REFERENCE_PATTERN.search(intent) is not None:
-        return None
-    if conversation_context is None:
-        return None
-    retained_requests = conversation_context.prior_user_requests
-    if conversation_context.additional_prior_user_requests_omitted > 0:
-        # The service retains the first request as a provider-visible anchor,
-        # followed by recent tail entries. The omission gap between them may
-        # hide a correction or revocation, so deterministic enforcement must
-        # never scan across that gap back to the anchor.
-        retained_requests = retained_requests[1:]
-    for prior_request in reversed(retained_requests):
-        if _ROUTING_THRESHOLD_REVOCATION_PATTERN.search(prior_request.content) is not None:
-            return None
-        prior_threshold = _stated_threshold_in(prior_request.content)
-        if prior_threshold is not None:
-            return prior_threshold
-        # A newer routing instruction with no safely recognized comparison is
-        # a supersession barrier. Searching past it would revive an older rule
-        # that may have been replaced by an unconditional route or by syntax
-        # the deliberately conservative detector cannot prove. A missed nudge
-        # is safe; enforcing a stale threshold is not.
-        if (
-            _ROUTING_INTENT_PATTERN.search(prior_request.content) is not None
-            or _ROUTING_CONTROL_REFERENCE_PATTERN.search(prior_request.content) is not None
-        ):
-            return None
-    return None
-
-
-def _threshold_homeless_gate_id(pipeline: Mapping[str, Any]) -> str | None:
-    """Return a constant-condition gate id when NO gate carries a real condition.
-
-    Both halves matter. A candidate that authored a row-reading condition
-    somewhere has a home for the stated comparison and is left alone, even if
-    it also contains a constant fan-out gate; only a candidate whose every
-    gate is constant has provably dropped the rule.
-    """
-    gates = [node for node in cast(list[Mapping[str, Any]], pipeline["nodes"]) if node["node_type"] == "gate"]
-    constant_gate_ids = [
-        str(gate["id"])
-        for gate in gates
-        if "condition" in gate and type(gate["condition"]) is str and gate_condition_is_constant(gate["condition"])
-    ]
-    if not constant_gate_ids or len(constant_gate_ids) != len(gates):
-        return None
-    return constant_gate_ids[0]
-
-
-def _stated_threshold_ignored_rejection(state: CompositionState, *, node_id: str, stated: str) -> ToolResult:
-    """Synthesize the coded rejection for a dropped routing threshold.
-
-    AWS acceptance run 2 (R2-F17, elspeth-5c0c09db31): asked to route rows on
-    ``amount > 500``, the planner authored a constant-condition gate forking
-    every row to BOTH sinks. That shape is legal — it is the documented
-    fan-out macro, generated by our own authoring aids — so it can never be a
-    structural rejection. What makes it wrong HERE is the instruction, which
-    only the planner loop can see.
-
-    The message quotes the comparison span from the instruction the planner's
-    own prompt was built from — content already verbatim in its context, the
-    same custody judgment ``plugin_options_invalid`` detail rides on — because
-    a bare code cannot tell the model which rule it dropped.
-    """
-    entry = ValidationEntry(
-        component=f"node:{node_id}",
-        message=(
-            f"Gate '{node_id}' has a constant condition, so it makes no per-row decision, but the "
-            f'instruction states the comparison "{stated}". Every row would take the same path.'
-        ),
-        severity="high",
-        error_code="gate_condition_ignores_stated_threshold",
-    )
-    return ToolResult(
-        success=False,
-        updated_state=state,
-        validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
-        affected_nodes=(node_id,),
-    )
-
-
 def _missing_source_rejection(state: CompositionState) -> ToolResult:
     """Synthesize the coded rejection for a candidate that names no source.
 
@@ -2627,18 +2437,9 @@ def _compile_candidate_feedback(feedback: _CandidateFeedback) -> _PlannerFeedbac
                 "unknown_requirement_id": entry.review_reference.unknown_requirement_id,
                 "valid_requirement_ids": list(entry.review_reference.valid_requirement_ids),
             }
-        if (
-            code
-            in (
-                "plugin_options_invalid",
-                "gate_condition_ignores_stated_threshold",
-            )
-            and not withhold_candidate_facts
-        ):
-            # Same custody judgment: the message quotes only
-            # content the planner itself already holds verbatim — the options
-            # of the candidate it just authored, the comparison span from the
-            # instruction its own prompt was built from.
+        if code == "plugin_options_invalid" and not withhold_candidate_facts:
+            # The message quotes only options from the candidate the planner
+            # itself just authored under the same custody judgment.
             projected["detail"] = entry.message
         if code == "plugin_options_invalid" and not withhold_candidate_facts and plugin_contract_resolver is not None:
             # The detail above names only the VIOLATED keys; the contract names
@@ -3696,10 +3497,6 @@ async def _plan_pipeline_inner(
     repair_count = 0
     prose_nudges = 0
     decline_notice_given = False
-    threshold_nudge_given = False
-    # Computed once: the current instruction and bounded earlier-user context
-    # are fixed for the whole planning request.
-    stated_threshold = _stated_threshold_for_planner_request(intent, conversation_context)
     seen_discovery: set[tuple[str, str]] = set()
     seen_discovery_round = 0
     no_gain_calls_in_round = 0
@@ -4781,27 +4578,6 @@ async def _plan_pipeline_inner(
                 composer_provider=effective_provider,
             )
             try:
-                if not is_hatch_turn and not threshold_nudge_given and stated_threshold is not None:
-                    # Stated-threshold fidelity (R2-F17, elspeth-5c0c09db31).
-                    # The instruction named a comparison and no gate in the
-                    # candidate reads a row to apply it, so the rule was
-                    # dropped: a constant gate forking to several destinations
-                    # writes every row everywhere. Structurally the shape is
-                    # legal — this can only be caught here, where the
-                    # instruction is in scope — so it is ONE coded repair with
-                    # the same omit-valve as the nodeless nudge: re-emitting
-                    # the same pipeline confirms a deliberate fan-out. Never
-                    # on the hatch turn, which gets one clean shot.
-                    homeless_gate_id = _threshold_homeless_gate_id(finalized_pipeline)
-                    if homeless_gate_id is not None:
-                        threshold_nudge_given = True
-                        raise _PipelineCandidateRejected(
-                            _stated_threshold_ignored_rejection(
-                                current_state,
-                                node_id=homeless_gate_id,
-                                stated=stated_threshold,
-                            )
-                        )
                 accepted_plan = await _build_valid_pipeline_plan(
                     pipeline=finalized_pipeline,
                     current_state=current_state,

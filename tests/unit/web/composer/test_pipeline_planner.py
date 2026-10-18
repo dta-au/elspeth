@@ -9538,7 +9538,7 @@ async def test_planner_summary_on_exhaustion_carries_the_full_code_history(
     assert all(entry["codes"] for entry in summary["rejection_history"])
 
 
-# ── Stated-threshold fidelity guard (R2-F17, elspeth-5c0c09db31) ────────────
+# ── Provider-owned routing semantics (retired ST-02 heuristic scenarios) ──
 
 
 def _pipeline_with_constant_gate(data_dir: Path) -> dict[str, Any]:
@@ -9585,8 +9585,22 @@ def _pipeline_with_conditional_gate(data_dir: Path) -> dict[str, Any]:
     return pipeline
 
 
-class TestStatedThresholdDetector:
-    """False-positive posture: the detector fires only on a real comparison."""
+async def _assert_provider_authored_fanout_admitted(tmp_path: Path, tool_context: ToolContext, instruction: str) -> None:
+    """Check input delivery/admission, never semantic correctness of the fanout."""
+    candidate = _pipeline_with_constant_gate(tmp_path)
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": candidate})))
+    recorder = BufferingRecorder()
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, intent=instruction, recorder=recorder)
+    assert len(completion.requests) == len(recorder.llm_calls) == 1
+    assert json.loads(completion.requests[0]["messages"][-1]["content"])["intent"] == instruction
+    assert deep_thaw(proposal.proposal.pipeline) == candidate
+    assert proposal.proposal.repair_count == 0
+    assert [attempt.outcome for attempt in recorder.planner_attempts] == [ComposerPlannerAttemptOutcome.ACCEPTED]
+    assert [attempt.rejection_codes for attempt in recorder.planner_attempts] == [()]
+
+
+class TestRoutingProseAdmission:
+    """Preserve former detector inputs without giving prose a server verdict."""
 
     @pytest.mark.parametrize(
         ("instruction", "expected"),
@@ -9598,41 +9612,34 @@ class TestStatedThresholdDetector:
             ("Split on amount below 100.", "below 100"),
         ],
     )
-    def test_comparison_language_is_detected(self, instruction: str, expected: str) -> None:
-        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
-
-        assert _stated_threshold_in(instruction) == expected
+    @pytest.mark.asyncio
+    async def test_comparison_language_is_delivered_without_server_rejection(
+        self, tmp_path: Path, tool_context: ToolContext, instruction: str, expected: str
+    ) -> None:
+        assert expected in instruction
+        await _assert_provider_authored_fanout_admitted(tmp_path, tool_context, instruction)
 
     @pytest.mark.parametrize(
         "instruction",
         [
-            # Comparison wording bound to a number, but about a LIMIT, not a
-            # route. Firing here would tell a model to author a gate condition
-            # for a pipeline that never asked for one — and a compliant model
-            # would turn a correct fan-out into a wrong pipeline. Under a
-            # repair_budget of 1 that is REPAIR_EXHAUSTED with no proposal.
+            # Retain the former unit-limit and clause-boundary scenarios as
+            # exact provider inputs, not a replacement prose classifier.
             "Summarise each row in under 50 words, then fan out to both sinks.",
             "Truncate descriptions over 40 characters and write both copies.",
             "Keep at most 100 rows and fan every row out to both sinks.",
             "Use a temperature below 0.5 for the summariser.",
-            # The same limit prose alongside a REAL routing verb from
-            # _ROUTING_INTENT_PATTERN — the cases the disjoint-vocabulary
-            # negatives above never exercise. Two independent defences must
-            # hold: the unit noun after the number, and the clause boundary
-            # between the limit and the routing verb.
             "Summarise each row in under 50 words and send the results to the sink.",
             "Split the rows into two sinks and keep at most 100 rows.",
             "Split into more than 2 branches.",
             "Route the summary (limit under 50 words) to both sinks.",
-            # Clause separation alone, with a unit noun that is not listed.
             "Summarise in under 50 milliseconds. Route every row to both sinks.",
         ],
     )
-    def test_limit_prose_is_not_read_as_a_routing_threshold(self, instruction: str) -> None:
-        """Three halves must hold: a comparison, routing intent, same clause, no unit noun."""
-        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
-
-        assert _stated_threshold_in(instruction) is None
+    @pytest.mark.asyncio
+    async def test_limit_prose_reaches_provider_without_server_rejection(
+        self, tmp_path: Path, tool_context: ToolContext, instruction: str
+    ) -> None:
+        await _assert_provider_authored_fanout_admitted(tmp_path, tool_context, instruction)
 
     @pytest.mark.parametrize(
         "instruction",
@@ -9644,26 +9651,26 @@ class TestStatedThresholdDetector:
             "",
         ],
     )
-    def test_prose_without_a_threshold_is_not_detected(self, instruction: str) -> None:
-        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
-
-        assert _stated_threshold_in(instruction) is None
+    @pytest.mark.asyncio
+    async def test_ordinary_prose_is_delivered_and_empty_request_is_still_refused(
+        self, tmp_path: Path, tool_context: ToolContext, instruction: str
+    ) -> None:
+        if instruction:
+            await _assert_provider_authored_fanout_admitted(tmp_path, tool_context, instruction)
+        else:
+            completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})))
+            with pytest.raises(ValueError, match="intent must be a non-empty exact string"):
+                await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, intent=instruction)
+            assert completion.requests == []
 
 
 @pytest.mark.asyncio
-async def test_constant_gate_against_a_stated_threshold_gets_one_coded_nudge_then_valve(
+async def test_constant_gate_against_a_stated_threshold_keeps_wrong_first_candidate(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """AWS acceptance run 2, R2-F17: the stated threshold never reached the gate.
-
-    Asked to route on ``amount > 500``, the planner authored a constant-condition
-    fan-out that would write every row to BOTH sinks. The shape is legal, so it
-    draws ONE coded repair naming the comparison verbatim; re-emitting the same
-    pipeline is the valve for a genuinely intended fan-out.
-    """
+    """Admission is not semantic success: this wrong first graph is no longer nudged."""
     completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
     )
 
@@ -9674,27 +9681,19 @@ async def test_constant_gate_against_a_stated_threshold_gets_one_coded_nudge_the
         intent="Add a gate that routes rows with amount > 500 to high_value and every other row to standard.",
     )
 
-    assert proposal.proposal.repair_count == 1
-    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
-    assert feedback["success"] is False
-    codes = [error["error_code"] for error in feedback["validation"]["errors"]]
-    assert codes == ["gate_condition_ignores_stated_threshold"]
-    error = feedback["validation"]["errors"][0]
-    assert error["explanation"]
-    assert error["suggested_fix"]
-    # The comparison the operator stated, verbatim — without it the planner
-    # cannot author the condition it dropped.
-    assert "amount > 500" in error["detail"]
+    assert proposal.proposal.repair_count == 0 and len(completion.requests) == 1
+    accepted = deep_thaw(proposal.proposal.pipeline)
+    assert accepted == _pipeline_with_constant_gate(tmp_path)
+    assert accepted["nodes"][0]["condition"] != "row['amount'] > 500"
 
 
 @pytest.mark.asyncio
-async def test_referential_freeform_threshold_gets_the_same_coded_nudge(
+async def test_referential_freeform_threshold_keeps_wrong_first_candidate(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """A referential build retains the latest earlier user routing rule."""
+    """The model gets the earlier rule; admission no longer supplies a second chance."""
     completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
     )
 
@@ -9713,10 +9712,14 @@ async def test_referential_freeform_threshold_gets_the_same_coded_nudge(
         ),
     )
 
-    assert proposal.proposal.repair_count == 1
-    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
-    assert [error["error_code"] for error in feedback["validation"]["errors"]] == ["gate_condition_ignores_stated_threshold"]
-    assert "amount > 500" in feedback["validation"]["errors"][0]["detail"]
+    assert proposal.proposal.repair_count == 0 and len(completion.requests) == 1
+    payload = json.loads(completion.requests[0]["messages"][-1]["content"])
+    assert payload["conversation_context"]["prior_user_requests"][0]["content"] == (
+        "Route rows with amount > 500 to high_value and every other row to standard."
+    )
+    accepted = deep_thaw(proposal.proposal.pipeline)
+    assert accepted == _pipeline_with_constant_gate(tmp_path)
+    assert accepted["nodes"][0]["condition"] != "row['amount'] > 500"
 
 
 @pytest.mark.asyncio
