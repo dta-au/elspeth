@@ -1,6 +1,6 @@
 # Composer prompt guard
 
-Version 0.8.7 uses Azure AI Content Safety Prompt Shields in front of Composer
+Version 0.8.9 uses Azure AI Content Safety Prompt Shields in front of Composer
 and advisor model requests. Detection belongs to Azure; ELSPETH sends the
 supported input, enforces its result and records a sanitized authoring audit.
 Graph validation, independent advisor review, credential redaction and operator
@@ -22,7 +22,7 @@ Each guard object has exactly these fields:
 
 | Field | Meaning |
 | --- | --- |
-| `adapter` | `azure_prompt_shields`; may be omitted because it is the only 0.8.7 adapter |
+| `adapter` | `azure_prompt_shields`; may be omitted because it is the only 0.8.9 adapter |
 | `endpoint` | HTTPS resource origin, such as `https://example-resource.cognitiveservices.azure.com`; no path, userinfo, query or fragment |
 | `subscription_key` | Required subscription credential, injected from the deployment's secret store |
 | `timeout_seconds` | Positive number, at most 60 seconds; defaults to 10 seconds shared by all Azure batches for one inspection |
@@ -112,10 +112,10 @@ audit lifecycle.
 
 ## Support boundary
 
-0.8.7 implements Azure text checking with subscription-key authentication.
-Bedrock and GCP adapters are reserved for 0.8.8; open integrations are reserved
-for 0.8.9. The extension interface does not make those APIs configurable in
-0.8.7. Runtime graph prompt-shield/content-safety transforms are configured
+0.8.9 implements Azure text checking with subscription-key authentication.
+Bedrock and GCP adapters and open integrations remain reserved. Their earlier
+planning labels, 0.8.8 and 0.8.9 respectively, do not make those APIs
+configurable in release 0.8.9. Runtime graph prompt-shield/content-safety transforms are configured
 separately and are not executed by this authoring mount.
 
 An API version identifies the Azure protocol, not immutable detector model

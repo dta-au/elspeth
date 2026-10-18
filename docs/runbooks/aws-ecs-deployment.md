@@ -1633,7 +1633,7 @@ approvals, not invented evidence:
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_task_definition": "exact-candidate-task-definition-arn",
   "candidate_doctor_task_definition": "exact-candidate-doctor-task-definition-arn",
-  "candidate_package_version": "0.8.7",
+  "candidate_package_version": "0.8.9",
   "previous_source_sha": "",
   "previous_image_digest": "",
   "previous_task_definition": "",

@@ -895,7 +895,7 @@ wheels = [
 
 [[package]]
 name = "elspeth"
-version = "0.8.7"
+version = "0.8.9"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },

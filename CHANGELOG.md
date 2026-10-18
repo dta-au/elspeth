@@ -4,7 +4,17 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## 0.8.7 - Unreleased (Composer refusal and quota fixes)
+## 0.8.9 - Unreleased (Composer and Azure Container Apps enhancements)
+
+This combined candidate carries the Composer changes prepared for 0.8.7 and
+Azure Container Apps enhancements attributed to 0.8.8.
+
+- **Composer and advisor protection uses Azure Prompt Shields.** Each role has
+  an independent Azure AI Content Safety configuration. Required guard checks
+  precede protected model dispatch and record sanitized decisions; missing
+  configuration, blocked input or unavailable inspection refuses dispatch.
+  Historical advisor prescan audits remain readable. Runtime graph transforms
+  remain separately configured.
 
 - **Refusals retain the correct graph context.** Full-replacement candidate
   refusals exclude errors from the old saved graph; incremental output refusals
@@ -50,6 +60,25 @@ All notable changes to ELSPETH are documented here.
   constant gate, including under auto-commit; no replacement semantic review
   is added. Structural checks and artifact-bound approval retain their
   existing behavior.
+- **Azure Container Apps first-install instructions can be rehearsed offline.**
+  The instructions select an explicit GHCR account, export the transport ceiling
+  required by configuration resolution and distinguish model routing aliases
+  from pricing identities. The application example supplies primary and advisor
+  pricing settings and versioned secret references for both required authoring
+  guard configurations. Command rehearsal does not qualify cloud deployment,
+  guard health or provider access. Existing-service redeploy, transition and
+  rollback holds remain in place.
+- **ACA enforces authenticated PostgreSQL TLS settings.** Startup and deployment
+  doctor require one explicit `sslmode=verify-full` and one `sslrootcert`, either
+  `system` or an absolute CA-file path. Duplicate TLS parameters, legacy
+  `requiressl` and GSS settings other than a single optional `gssencmode=disable`
+  are refused. Correctly URL-escaped credentials remain supported. Existing
+  insecure ACA configurations must be corrected before using this version.
+- **ACA doctor reports TLS before schema initialization.** Sessions and Landscape
+  checks measure each initial preflight connection used for schema inspection.
+  Failed prerequisites or TLS checks prevent schema initialization. Separate
+  initialization/final-verification connections and later web connections remain
+  outside this measurement; it does not establish live Azure acceptance.
 
 Session epoch advances from 76 to 77; Landscape remains at epoch 49. The combined
 contract retains committed graph-review authority over immutable graph snapshots
@@ -63,7 +92,7 @@ cannot share session stores or replicas.
 
 These unreleased notes describe implemented source changes, not completed
 integrated qualification. Automatic image publication from main remains held.
-The 0.8.7 tag and container publication follow successful required checks and
+The 0.8.9 tag and container publication follow successful required checks and
 the protected merge; operator signing and deployment remain separate.
 
 ## 0.8.6 - Candidate (Composer correctness and recovery)

@@ -198,7 +198,7 @@ Defaults measured from the Web settings model at the review baseline
 | External calls from Web runs | `execution_rate_limit` | 60 per minute per service |
 | LLM profile timeout and output tokens | profile settings | 60 seconds; provider default unless set |
 
-**0.8.7 Advisor input-scope change.** Four rendered characters per configured
+**0.8.9 Advisor input-scope change.** Four rendered characters per configured
 input unit is a rough cost proxy, not measured provider tokens. Public hints
 count the complete variable message; backend checkpoints count only optional
 pipeline-summary evidence, retaining mandatory request/candidate, critical

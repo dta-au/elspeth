@@ -9,7 +9,7 @@ The current guidance below supersedes every legacy reset procedure later in
 this document. Those procedures are historical reference only and do not
 apply to the current candidate. They do not authorize a deployment or a reset.
 
-## Current Cutover: 0.8.7 candidate (session epoch 77, Landscape epoch 49)
+## Current Cutover: 0.8.9 candidate (session epoch 77, Landscape epoch 49)
 
 The unreleased candidate uses session epoch 77, retaining epoch 76's authoritative
 committed graph-review facts and adding the container quota representation.

@@ -324,7 +324,7 @@ request/candidate publication evidence and prior review context stay intact;
 they do not spend that optional allowance. A scoped graph review does not
 certify omitted evidence or grant permission to publish a candidate reply.
 
-In 0.8.7 this replaces the inherited complete-variable-message checkpoint
+In 0.8.9 this replaces the inherited complete-variable-message checkpoint
 limit for both default and explicitly configured old values. Required reviews
 with longer mandatory evidence can now reach the provider, increasing cost or
 latency despite unchanged call, retry, output and time limits. Required prompt
