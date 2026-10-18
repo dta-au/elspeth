@@ -377,6 +377,14 @@ class AdvisorCheckpointOwner:
         trigger = cast(str, arguments["trigger"])
         trigger_instructions = "\n\n" + _advisor_context.advisor_system_instructions_for_trigger(trigger)
         system_msg = self._composer_skill_text + trigger_instructions
+        checkpoint_phase: AdvisorCheckpointPhase | None = None
+        if structured_output:
+            if trigger == ADVISOR_TRIGGER_DETERMINISTIC_EARLY:
+                checkpoint_phase = "early"
+            elif trigger == ADVISOR_TRIGGER_DETERMINISTIC_END:
+                checkpoint_phase = "end"
+            else:
+                raise InvariantError("Structured advisor request requires an owned checkpoint trigger")
         # Required fields (trigger, problem_summary, recent_errors,
         # attempted_actions) are validated by _TOOL_REQUIRED_PATHS before this
         # method runs, so direct dict access is sound. schema_excerpt is the
@@ -384,8 +392,11 @@ class AdvisorCheckpointOwner:
         # keep the Tier-3 trust-boundary rules clean.
         user_msg = _advisor_context.build_advisor_user_message(arguments)
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
-        if len(user_msg) > char_cap:
-            raise InvariantError("Advisor input exceeded its admitted complete-message budget")
+        if checkpoint_phase is None:
+            if len(user_msg) > char_cap:
+                raise InvariantError("Advisor input exceeded its admitted complete-message budget")
+        elif _advisor_context.advisor_checkpoint_summary_chars(arguments) > char_cap:
+            raise InvariantError("Advisor optional summary exceeded its admitted checkpoint budget")
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_msg, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION},
@@ -408,14 +419,6 @@ class AdvisorCheckpointOwner:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
-        checkpoint_phase: AdvisorCheckpointPhase | None = None
-        if structured_output:
-            if trigger == ADVISOR_TRIGGER_DETERMINISTIC_EARLY:
-                checkpoint_phase = "early"
-            elif trigger == ADVISOR_TRIGGER_DETERMINISTIC_END:
-                checkpoint_phase = "end"
-            else:
-                raise InvariantError("Structured advisor request requires an owned checkpoint trigger")
         kwargs: dict[str, Any] = build_advisor_request_options(
             model=advisor_model,
             temperature=self._settings.composer_temperature,
@@ -669,7 +672,7 @@ class AdvisorCheckpointOwner:
         """
         pipeline_summary = _advisor_context.summarize_pipeline_for_advisor(state)
         # Keep identity over complete evidence. Only its optional published
-        # prefix is fitted, after every mandatory phase field is assembled.
+        # prefix spends the independent rendered optional-summary allowance.
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
         if phase == "early":
             early_arguments: dict[str, str | list[str] | _advisor_context.AdvisorSummaryParts] = {
@@ -1210,13 +1213,13 @@ class AdvisorCheckpointOwner:
                 call_arguments["_elspeth_advisor_summary_parts"] = _advisor_context.advisor_summary_parts(
                     state, call_arguments["schema_excerpt"]
                 )
-            if len(_advisor_context.build_advisor_user_message(call_arguments)) > char_cap:
+            if _advisor_context.advisor_checkpoint_summary_chars(call_arguments) > char_cap:
                 # Expected size exhaustion is not a completed model review.
                 # Preserve any prior actual call, but spend no further attempt.
                 return AdvisorCheckpointVerdict(
                     ok=False,
                     blocking=False,
-                    findings_text="Review input exceeds the existing advisor budget.",
+                    findings_text="Optional pipeline evidence exceeds the existing advisor summary budget.",
                     failure_class="budget_exhausted",
                     retryable=False,
                 )

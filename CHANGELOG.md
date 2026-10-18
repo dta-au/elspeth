@@ -27,6 +27,19 @@ All notable changes to ELSPETH are documented here.
 - **Automatic titles disable adapter and SDK retries.** Both existing title
   custody modes supply zero retry settings. This does not claim universal
   physical-dispatch accounting under arbitrary dependency fallback settings.
+- **Composer prompt inspection accommodates its supported content limits.**
+  The aggregate byte limit now derives from the existing user-text,
+  document-size and document-count limits, so supported whole content is no
+  longer refused by a smaller aggregate allowance. Azure per-call limits and
+  required fail-closed inspection remain enforced. Policy fingerprints include
+  the numeric limits even when no guard is configured.
+- **Advisor checkpoint budgeting preserves complete review evidence.** The
+  configured checkpoint input allowance now limits the optional summary,
+  retaining the full request, candidate, guidance and evidence with their
+  review binding. Both default and explicit settings relax the previous input
+  cost bound; calls may cost more or take longer. Public Advisor hints retain
+  their complete-message limit. This allowance does not reserve model context
+  tokens or account credit.
 
 Session epoch advances from 76 to 77; Landscape remains at epoch 49. The combined
 contract retains committed graph-review authority over immutable graph snapshots

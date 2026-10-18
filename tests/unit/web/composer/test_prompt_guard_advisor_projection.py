@@ -38,7 +38,7 @@ def test_publication_review_preserves_decoded_guard_projection_and_sentinel_spel
         "publication_review": review,
     }
     rendered = build_advisor_user_message(arguments)
-    assert len(rendered) < 16_000  # Existing default complete-message budget.
+    assert len(rendered) < 16_000  # Fixture also fits the historical complete-message allowance.
     parts = advisor_user_content_parts(arguments)
     assert "".join(part.text for part in parts) == rendered
     assert all(part.trust is None for part in parts)

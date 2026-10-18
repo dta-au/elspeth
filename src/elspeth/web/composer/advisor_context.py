@@ -419,9 +419,9 @@ _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS: Final[int] = 1000
 # (composer_advisor_max_prompt_tokens * 4) that ``_validate_advisor_arguments``
 # enforces on the ``request_advisor_hint`` TOOL path. The EARLY/END checkpoint
 # path builds its arguments in ``_build_checkpoint_arguments`` and fits the
-# complete rendered user message before dispatch. These per-value budgets
-# preserve useful ordinary evidence; the complete-input bound limits their
-# aggregate across nodes. The global 120 cap is deliberately left unchanged
+# rendered optional summary contribution before dispatch. These per-value
+# budgets preserve useful ordinary evidence; the optional-summary bound limits
+# their aggregate across nodes. The global 120 cap is deliberately left unchanged
 # so every non-prompt value stays compact.
 _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS: Final[int] = 1000
 # Option keys whose VALUE is prompt-shaped (free-text the model is told to
@@ -437,8 +437,8 @@ _ADVISOR_SUMMARY_INVALID_QUERIES_MARKER: Final[str] = "<invalid queries>"
 _ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER: Final[str] = "(node-level prompt_template)"
 _ADVISOR_SUMMARY_QUERY_INVALID_TEMPLATE_MARKER: Final[str] = "(template value is not text; plugin validation rejects this node)"
 # Rough provider cost approximation shared by the tool-path argument cap and
-# the checkpoint-path summary bound: ``composer_advisor_max_prompt_tokens``
-# tokens ≈ this many characters.
+# the checkpoint-path optional summary bound. This character proxy does not
+# measure the provider's context window or reserve actual input tokens.
 ADVISOR_CHARS_PER_TOKEN: Final[int] = 4
 # Rubric-legible omission marker for a pipeline summary that exceeds the
 # checkpoint budget: the END rubric reads every ``additional_*_withheld``
@@ -449,35 +449,46 @@ _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER: Final[str] = (
 )
 
 
+def advisor_checkpoint_summary_chars(arguments: Mapping[str, Any]) -> int:
+    """Measure only the optional summary's exact rendered contribution.
+
+    Both renderings retain the same mandatory context. Their difference
+    includes summary redaction, sentinel escaping, fencing and joining newlines,
+    without charging immutable publication evidence to a hint-sized allowance.
+    The result counts characters, not actual provider tokens.
+    """
+    return len(build_advisor_user_message(arguments)) - len(build_advisor_user_message({**arguments, "schema_excerpt": ""}))
+
+
 def bound_advisor_checkpoint_summary(arguments: Mapping[str, Any], char_cap: int) -> str:
-    """Fit optional whole evidence lines against the complete rendered input.
+    """Fit optional whole evidence lines within their rendered allowance.
 
     Mandatory rubric, prior context, user text and publication authority stay
     unchanged. Ordinary fitting input keeps its exact bytes. Otherwise retain
     a known-fitting summary prefix and truthful original-line omission count,
     measuring real redaction, escaping and framing for every candidate.
 
-    If even mandatory context and the omission marker exceed the cap, return
-    that intact minimum: the checkpoint owner refuses it before dispatch.
+    If even the omission marker's rendered contribution exceeds the cap,
+    return it intact: the checkpoint owner refuses it before dispatch.
     A conservative prefix does not establish inspection of withheld values.
     """
     summary = cast(str, arguments["schema_excerpt"])
     bounded = dict(arguments)
-    if len(build_advisor_user_message(bounded)) <= char_cap:
+    if advisor_checkpoint_summary_chars(bounded) <= char_cap:
         return summary
     if not summary:
         return summary
     lines = summary.split("\n")
     bounded_summary = _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(count=len(lines), limit=char_cap)
     bounded["schema_excerpt"] = bounded_summary
-    if len(build_advisor_user_message(bounded)) > char_cap:
+    if advisor_checkpoint_summary_chars(bounded) > char_cap:
         return bounded_summary
     kept: list[str] = []
     for index, line in enumerate(lines[:-1]):
         marker = _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(count=len(lines) - index - 1, limit=char_cap)
         candidate_summary = "\n".join([*kept, line, marker])
         candidate = {**bounded, "schema_excerpt": candidate_summary}
-        if len(build_advisor_user_message(candidate)) > char_cap:
+        if advisor_checkpoint_summary_chars(candidate) > char_cap:
             break
         kept.append(line)
         bounded = candidate

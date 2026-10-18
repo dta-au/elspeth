@@ -758,7 +758,7 @@ files:
     Mapping[str, Any]: 3
     dict[str, Any]: 10
   src/elspeth/web/composer/advisor_context.py:
-    Mapping[str, Any]: 6
+    Mapping[str, Any]: 7
     dict[str, Any]: 1
   src/elspeth/web/composer/advisor_output.py:
     dict[str, object]: 1
@@ -1067,10 +1067,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 760
+  Mapping[str, Any]: 761
   Mapping[str, object]: 315
   MutableMapping[str, Any]: 8
   boundary: 60
   dict[str, Any]: 1078
   dict[str, object]: 395
-  soft: 2556
+  soft: 2557

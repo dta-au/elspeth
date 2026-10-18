@@ -451,7 +451,16 @@ class WebSettings(BaseModel):
             "separately. Operator decision pending.)"
         ),
     )
-    composer_advisor_max_prompt_tokens: int = Field(default=4000, ge=1)
+    composer_advisor_max_prompt_tokens: int = Field(
+        default=4000,
+        ge=1,
+        description=(
+            "Rough input-cost allowance converted to characters at four characters per configured unit. "
+            "Public hints count the complete variable message; backend EARLY/END checkpoints count only "
+            "the rendered optional pipeline summary. Mandatory checkpoint evidence is preserved separately. "
+            "This is not a measured provider-token or context-window limit."
+        ),
+    )
     # 8192 (was 1500): with advisor reasoning enabled the thinking budget
     # shares max_tokens, and Anthropic thinking has a 1024-token floor that
     # must fit inside it — 1500 left medium effort illegal or starved.
