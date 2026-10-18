@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 import structlog
 from hypothesis import example, given, settings
@@ -22,6 +23,7 @@ from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, ru
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
+from tests.fixtures.identities import grant_test_pipeline_user
 from tests.helpers.session_fences import seed_session_operation_fence
 from tests.integration.web.conftest import _make_session
 from tests.property.web.composer.strategies import (
@@ -41,18 +43,37 @@ from tests.property.web.composer.strategies import (
 )
 
 import elspeth.web.composer.tool_batch as composer_tool_batch_module
+from elspeth.contracts.prompt_guard import (
+    PromptGuardContentPart,
+    PromptGuardDecision,
+    PromptGuardRequest,
+    PromptGuardToolArgumentParts,
+)
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.redaction import REDACTED_UNKNOWN_RESPONSE_KEY
 from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.prompt_guard_config import PromptGuardSettings
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+    RequiredWorkSource,
+    RequiredWorkTicket,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -60,6 +81,8 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_va
 
 EVAL_MODEL = "openrouter/openai/gpt-5.5"
 EVAL_USER_ID = "eval-user"
+_CURRENT_REQUEST = "one-turn compose-loop test driver"
+_GUARD_HOST = "property-shield.example.test"
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +118,15 @@ class _ReplayLLM:
         self._responses = list(responses)
 
     async def __call__(
-        self, _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        self,
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         assert self._responses, "No further primary response is supplied by this trace"
         return self._responses.pop(0)
@@ -107,7 +138,15 @@ class _BlockingLLM:
         self.release = asyncio.Event()
 
     async def __call__(
-        self, _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        self,
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         self.entered.set()
         await self.release.wait()
@@ -125,12 +164,25 @@ class _Harness:
     # compose-turn audit persist, exactly as it was before the composer
     # required session-operation authority. No optional-context arm.
     compose_context: SessionOperationContext
+    required_work: RequiredWorkBinding
+    provider_owner: ProviderInvocationOwner
+    guard_policy_fingerprint: str
+    guard_requests: list[PromptGuardRequest]
+    guard_http_requests: list[dict[str, Any]]
+    guard_observers: contextlib.ExitStack
     completed_results: list[ComposeLoopTestResult] = field(default_factory=list)
 
     def release(self) -> None:
         """Release the harness lease; a lost fence means a trace already consumed it."""
-        with contextlib.suppress(SessionOperationFenceLost):
-            self.sessions_service.session_operation_authority.release(self.compose_context)
+        self.required_work.coordinator.assert_completed()
+        try:
+            with contextlib.suppress(SessionOperationFenceLost):
+                self.sessions_service.session_operation_authority.release(self.compose_context)
+        finally:
+            try:
+                self.guard_observers.close()
+            finally:
+                self.sessions_service._engine.dispose()
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +240,7 @@ def _make_llm_response(
 
 
 def _web_settings(data_dir: Path) -> WebSettings:
+    guard = PromptGuardSettings(endpoint=f"https://{_GUARD_HOST}", subscription_key="offline-property-shield")
     return WebSettings(
         data_dir=data_dir,
         composer_model=EVAL_MODEL,
@@ -196,6 +249,9 @@ def _web_settings(data_dir: Path) -> WebSettings:
         composer_timeout_seconds=180.0,
         composer_rate_limit_per_minute=60,
         shareable_link_signing_key=b"\x00" * 32,
+        composer_prompt_guard_mode="required",
+        composer_prompt_guard=guard,
+        composer_advisor_prompt_guard=guard,
     )
 
 
@@ -220,6 +276,7 @@ def _make_harness(tmp_path: Path, *, session_state: SessionState = "empty") -> _
     session_id = str(uuid.uuid4())
     with engine.begin() as conn:
         _make_session(conn, session_id=session_id, user_id=EVAL_USER_ID)
+        grant_test_pipeline_user(conn, identity_id=EVAL_USER_ID)
         # The hand-inserted row needs the released epoch-1 fence the lifecycle
         # method would have written, or every fenced writer reports ``missing``.
         seed_session_operation_fence(conn, session_id, owner_instance_id=sessions_service.session_operation_owner_instance_id)
@@ -230,46 +287,126 @@ def _make_harness(tmp_path: Path, *, session_state: SessionState = "empty") -> _
         owner_instance_id=sessions_service.session_operation_owner_instance_id,
         lease_seconds=sessions_service.session_operation_lease_seconds,
     )
-    service = ComposerServiceImpl.for_trained_operator(
-        catalog=_mock_catalog(),
-        settings=_web_settings(data_dir),
-        sessions_service=sessions_service,
-    )
-    service._telemetry = telemetry  # type: ignore[attr-defined]
-    # The property harness injects DB failures around compose-turn audit
-    # persistence. Skip the service-instance bootstrap upsert so the
-    # one-time skill-history write does not consume those fault injections.
-    service._skill_markdown_history_upserted = True  # type: ignore[attr-defined]
-    if session_state == "has_prior_state":
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO chat_messages "
-                    "(id, session_id, role, content, raw_content, tool_calls, tool_call_id, sequence_no, "
-                    " writer_principal, created_at, composition_state_id, parent_assistant_id) "
-                    "VALUES (:id, :session_id, 'user', 'prior', NULL, NULL, NULL, 1, "
-                    "        'route_user_message', CURRENT_TIMESTAMP, NULL, NULL)"
-                ),
-                {"id": str(uuid.uuid4()), "session_id": session_id},
+    guard_requests: list[PromptGuardRequest] = []
+    guard_http_requests: list[dict[str, Any]] = []
+    guard_observers = contextlib.ExitStack()
+
+    def shield_response(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == _GUARD_HOST
+        payload = json.loads(request.content)
+        assert payload["userPrompt"] == _CURRENT_REQUEST
+        guard_http_requests.append(payload)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _document in payload["documents"]],
+            },
+        )
+
+    def guard_client(settings: PromptGuardSettings) -> AzurePromptGuardClient:
+        client = AzurePromptGuardClient(settings, http_transport=httpx.MockTransport(shield_response))
+        real_inspect = client.inspect
+
+        async def inspect(request: PromptGuardRequest) -> PromptGuardDecision:
+            # Observe the request; only the real Azure adapter supplies its decision.
+            guard_requests.append(request)
+            return await real_inspect(request)
+
+        guard_observers.enter_context(patch.object(client, "inspect", new=inspect))
+        return client
+
+    try:
+        coordinator = RequiredWorkCoordinator(
+            RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, compose_context, invocation_id=str(uuid.uuid4()))
+        )
+        required_work = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+        provider_owner = ProviderInvocationOwner(service=sessions_service, required_work=required_work)
+        with patch("elspeth.web.composer.prompt_guard_clients.build_prompt_guard_client", new=guard_client):
+            service = ComposerServiceImpl.for_trained_operator(
+                catalog=_mock_catalog(),
+                settings=_web_settings(data_dir),
+                sessions_service=sessions_service,
             )
-    return _Harness(service=service, sessions_service=sessions_service, session_id=session_id, compose_context=compose_context)
+        service._telemetry = telemetry  # type: ignore[attr-defined]
+        # The property harness injects DB failures around compose-turn audit
+        # persistence. Skip the service-instance bootstrap upsert so the
+        # one-time skill-history write does not consume those fault injections.
+        service._skill_markdown_history_upserted = True  # type: ignore[attr-defined]
+        if session_state == "has_prior_state":
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO chat_messages "
+                        "(id, session_id, role, content, raw_content, tool_calls, tool_call_id, sequence_no, "
+                        " writer_principal, created_at, composition_state_id, parent_assistant_id) "
+                        "VALUES (:id, :session_id, 'user', 'prior', NULL, NULL, NULL, 1, "
+                        "        'route_user_message', CURRENT_TIMESTAMP, NULL, NULL)"
+                    ),
+                    {"id": str(uuid.uuid4()), "session_id": session_id},
+                )
+        assert service._advisor_prompt_guard_mount is not None
+        return _Harness(
+            service=service,
+            sessions_service=sessions_service,
+            session_id=session_id,
+            compose_context=compose_context,
+            required_work=required_work,
+            provider_owner=provider_owner,
+            guard_policy_fingerprint=service._advisor_prompt_guard_mount.client.policy_fingerprint,
+            guard_requests=guard_requests,
+            guard_http_requests=guard_http_requests,
+            guard_observers=guard_observers,
+        )
+    except BaseException as body:
+        try:
+            try:
+                guard_observers.close()
+            finally:
+                try:
+                    sessions_service.session_operation_authority.release(compose_context)
+                finally:
+                    engine.dispose()
+        except BaseException as cleanup:
+            raise BaseExceptionGroup("Property fixture setup and cleanup outcomes", [body, cleanup]) from None
+        raise
 
 
 async def _run_one_turn(harness: _Harness, llm: Any) -> Any:
     driver = cast(Any, harness.service)
-    result = await driver._run_one_turn_for_test(
-        llm=llm,
-        session_id=harness.session_id,
-        session_operation_context=harness.compose_context,
-        initial_state=CompositionState(
-            source=None,
-            nodes=(),
-            edges=(),
-            outputs=(),
-            metadata=PipelineMetadata(),
-            version=1,
-        ),
-    )
+    real_loop = driver._compose_loop
+
+    async def owned_loop(message: str, *args: Any, **kwargs: Any) -> Any:
+        assert message == _CURRENT_REQUEST
+        assert kwargs["session_id"] == harness.session_id
+        assert kwargs["session_operation_context"] is harness.compose_context
+        assert "required_work" not in kwargs and "provider_owner" not in kwargs and "user_id" not in kwargs
+        harness.required_work.validate_context(harness.compose_context)
+        with prompt_guard_user_scope(message):
+            return await real_loop(
+                message,
+                *args,
+                **kwargs,
+                user_id=EVAL_USER_ID,
+                required_work=harness.required_work,
+                provider_owner=harness.provider_owner,
+            )
+
+    with patch.object(driver, "_compose_loop", new=owned_loop):
+        result = await driver._run_one_turn_for_test(
+            llm=llm,
+            session_id=harness.session_id,
+            session_operation_context=harness.compose_context,
+            message=_CURRENT_REQUEST,
+            initial_state=CompositionState(
+                source=None,
+                nodes=(),
+                edges=(),
+                outputs=(),
+                metadata=PipelineMetadata(),
+                version=1,
+            ),
+        )
     harness.completed_results.append(result)
     return result
 
@@ -296,6 +433,79 @@ def _state_rows(harness: _Harness) -> tuple[Any, ...]:
                 {"session_id": harness.session_id},
             ).fetchall()
         )
+
+
+def _assert_guard_row(harness: _Harness, row: Any) -> None:
+    assert row.role == "audit" and row.session_id == harness.session_id
+    envelopes = json.loads(row.tool_calls)
+    assert len(envelopes) == 1 and envelopes[0]["_kind"] == "prompt_guard_audit"
+    assert json.loads(row.content) == envelopes[0]
+    check = envelopes[0]["check"]
+    assert set(check) == {
+        "schema_version",
+        "audit_id",
+        "operation_id",
+        "operation_epoch",
+        "role",
+        "adapter",
+        "mode",
+        "policy_fingerprint",
+        "request_hash",
+        "disposition",
+        "reason",
+        "started_at",
+        "duration_ms",
+    }
+    assert check["schema_version"] == 1
+    assert str(uuid.UUID(check["audit_id"])) == check["audit_id"]
+    assert check["operation_id"] == harness.compose_context.fence.operation_id
+    assert check["operation_epoch"] == harness.compose_context.fence.operation_epoch
+    assert (check["role"], check["adapter"], check["mode"]) == ("advisor", "azure_prompt_shields", "required")
+    assert (check["disposition"], check["reason"]) == ("allow", "clean")
+    assert len(harness.guard_requests) == 1
+    request = harness.guard_requests[0]
+    assert request.role == "advisor" and request.user_prompt == _CURRENT_REQUEST
+    assert check["policy_fingerprint"] == harness.guard_policy_fingerprint
+    assert check["request_hash"] == request.request_hash
+    assert harness.guard_http_requests
+    assert all(payload["userPrompt"] == _CURRENT_REQUEST for payload in harness.guard_http_requests)
+    assert tuple(document for payload in harness.guard_http_requests for document in payload["documents"]) == request.documents
+
+
+def _provider_accounting_rows(harness: _Harness) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    with harness.sessions_service._engine.connect() as conn:
+        attempts = tuple(
+            conn.execute(
+                text("SELECT * FROM quota_provider_attempts WHERE session_id = :session_id"),
+                {"session_id": harness.session_id},
+            ).fetchall()
+        )
+        ledger = tuple(
+            conn.execute(
+                text("SELECT * FROM token_usage_ledger WHERE session_id = :session_id"),
+                {"session_id": harness.session_id},
+            ).fetchall()
+        )
+    return attempts, ledger
+
+
+def _assert_end_accounting(harness: _Harness, *, settled: bool) -> None:
+    attempts, ledger = _provider_accounting_rows(harness)
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt.identity_id == EVAL_USER_ID and attempt.session_id == harness.session_id
+    assert attempt.source == "composer" and attempt.run_id is None
+    assert attempt.operation_id == harness.compose_context.fence.operation_id
+    assert attempt.operation_epoch == harness.compose_context.fence.operation_epoch
+    assert attempt.lease_token == harness.compose_context.fence.lease_token
+    if not settled:
+        assert attempt.settled_at is None and attempt.ledger_entry_id is None and ledger == ()
+        return
+    assert attempt.settled_at is not None and len(ledger) == 1
+    assert attempt.ledger_entry_id == ledger[0].entry_id
+    assert ledger[0].identity_id == EVAL_USER_ID and ledger[0].session_id == harness.session_id
+    assert ledger[0].source == "composer" and ledger[0].model == harness.service._settings.composer_advisor_model
+    harness.required_work.coordinator.assert_completed()
 
 
 def _assert_no_tool_row_without_parent_assistant(harness: _Harness) -> None:
@@ -436,8 +646,16 @@ async def _drive_trace_async(
     if cancellation_arrival_time == "after_tool_before_sync_dispatch":
         real_persist_async = harness.sessions_service.persist_compose_turn_async
 
-        async def _cancel_before_sync(**_kwargs: Any) -> Any:
-            raise asyncio.CancelledError()
+        async def _cancel_before_sync(**kwargs: Any) -> Any:
+            ticket = kwargs["required_work"]
+            assert type(ticket) is RequiredWorkTicket
+            assert ticket.key.source is RequiredWorkSource.COMPOSE_CHECKPOINT_SQL
+            assert ticket.key.authority.context is harness.compose_context
+            assert kwargs["session_operation_context"] is harness.compose_context
+            cancellation = asyncio.CancelledError()
+            # This stub has not called the dispatcher: no physical work was submitted.
+            ticket.complete_without_submission(cancellation)
+            raise cancellation
 
         harness.sessions_service.persist_compose_turn_async = _cancel_before_sync  # type: ignore[method-assign]
         try:
@@ -610,6 +828,7 @@ def _drive_single_example_trace(
     tmp_path = Path(os.environ.get("PYTEST_TMPDIR", "/tmp")) / f"cl_pp_prop_{uuid.uuid4().hex}"
     tmp_path.mkdir(parents=True, exist_ok=True)
     harness = _make_harness(tmp_path, session_state=session_state)
+    body: BaseException | None = None
     try:
         return _drive_single_example_trace_with(
             harness,
@@ -618,8 +837,16 @@ def _drive_single_example_trace(
             argument_dict=argument_dict,
             failure_injection_point=failure_injection_point,
         )
+    except BaseException as failure:
+        body = failure
+        raise
     finally:
-        harness.release()
+        try:
+            harness.release()
+        except BaseException as cleanup:
+            if body is not None and cleanup is not body:
+                raise BaseExceptionGroup("Property trace body and owned cleanup outcomes", [body, cleanup]) from None
+            raise
 
 
 def _drive_single_example_trace_with(
@@ -633,6 +860,7 @@ def _drive_single_example_trace_with(
     chosen_tool_call = tool_call or ToolCallSpec(name="set_metadata", call_id=f"call_{uuid.uuid4().hex[:12]}")
     chosen_arguments = argument_dict or {"patch": {"name": "property trace"}}
     reviews: list[dict[str, Any]] = []
+    sdk_messages: list[list[dict[str, Any]]] = []
 
     async def unavailable_end(**kwargs: Any) -> Any:
         from litellm import AuthenticationError
@@ -643,6 +871,8 @@ def _drive_single_example_trace_with(
         assert len(reviews) < 1, "Only one nonretryable END SDK refusal is supplied per trace"
         assert "tools" not in kwargs and kwargs["num_retries"] == kwargs["max_retries"] == 0
         assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
+        _assert_guard_row(harness, _chat_rows(harness)[-1])
+        _assert_end_accounting(harness, settled=False)
         payload = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
         review = json.loads(payload.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
         assert review["current_request"] == "one-turn compose-loop test driver" and review["candidate_reply"] == "Done."
@@ -651,6 +881,7 @@ def _drive_single_example_trace_with(
         if states:
             assert review["saved_effects"]["latest_committed_state_id"] == states[-1].id
         reviews.append(review)
+        sdk_messages.append(json.loads(json.dumps(kwargs["messages"])))
         raise AuthenticationError(message="property fixture advisor unavailable", llm_provider="anthropic", model=kwargs["model"])
 
     with (
@@ -680,9 +911,14 @@ def _drive_single_example_trace_with(
             )
     if harness.completed_results:
         assert not cancelled and len(harness.completed_results) == 1 and len(reviews) == 1
-        _assert_completed_trace_ledger(harness, harness.completed_results[0], reviews[0])
+        _assert_end_accounting(harness, settled=True)
+        assert len(sdk_messages) == 1
+        _assert_completed_trace_ledger(harness, harness.completed_results[0], reviews[0], sdk_messages[0])
     else:
         assert reviews == [], "Cancellation or failed atomic persistence must prevent END dispatch"
+        assert sdk_messages == []
+        assert harness.guard_requests == [] and harness.guard_http_requests == []
+        assert _provider_accounting_rows(harness) == ((), ())
     outcome = _TraceOutcome(
         cancellation_arrival_time=cancellation_arrival_time,
         operation_id=harness.compose_context.fence.operation_id,
@@ -700,7 +936,63 @@ def _drive_single_example_trace_with(
     return outcome
 
 
-def _assert_completed_trace_ledger(harness: _Harness, result: ComposeLoopTestResult, review: dict[str, Any]) -> None:
+def _assert_provider_settlement_rows(harness: _Harness, rows: tuple[Any, ...], sdk_messages: list[dict[str, Any]]) -> None:
+    from elspeth.contracts.hashing import stable_hash
+    from elspeth.web.composer.audit import _LLM_CALL_PUBLIC_AUDIT_FIELDS
+    from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
+    from elspeth.web.composer.provider_context import capture_provider_context
+
+    assert len(rows) == 2
+    call_row, request_row = rows
+    assert all(row.role == "audit" and row.session_id == harness.session_id for row in rows)
+    assert all(row.composition_state_id is None and row.tool_call_id is None and row.parent_assistant_id is None for row in rows)
+    assert call_row.content == "Provider call result recorded."
+    envelopes = json.loads(call_row.tool_calls)
+    assert len(envelopes) == 1 and set(envelopes[0]) == {"_kind", "call"}
+    assert envelopes[0]["_kind"] == "llm_call_audit"
+    call = envelopes[0]["call"]
+    assert set(call) == set(_LLM_CALL_PUBLIC_AUDIT_FIELDS)
+    attempts, ledger = _provider_accounting_rows(harness)
+    assert len(attempts) == len(ledger) == 1
+    assert call["call_id"] == attempts[0].attempt_id
+    assert attempts[0].ledger_entry_id == ledger[0].entry_id
+    assert call["model_requested"] == ledger[0].model == harness.service._settings.composer_advisor_model
+    assert (call["status"], call["error_class"], call["error_message"]) == ("auth_error", "AuthenticationError", "AuthenticationError")
+    assert call["model_returned"] is None and call["provider_request_id"] is None and call["finish_reason"] is None
+    assert call["messages_hash"] == stable_hash(sdk_messages)
+    assert call["tools_spec_hash"] is None and call["declared_tool_names"] == []
+
+    assert request_row.content == "Private credential-filtered diagnostic facts"
+    envelopes = json.loads(request_row.tool_calls)
+    assert len(envelopes) == 1
+    request = ComposerDiagnosticEvidence.from_envelope(
+        envelopes[0],
+        expected_session_id=harness.session_id,
+        expected_operation_id=harness.compose_context.fence.operation_id,
+        expected_tool_call_id=attempts[0].attempt_id,
+    )
+    assert request.operation_epoch == harness.compose_context.fence.operation_epoch
+    assert request.evidence_id == diagnostic_evidence_identity("provider-request", attempts[0].attempt_id)
+    assert request.status == "provider_request" and request.tool_name == "composer_provider_context"
+    # Apply the real privacy policy to the actual SDK input; generated text need not always be retainable.
+    expected = capture_provider_context(messages=sdk_messages, tools=None)
+    assert (request.arguments.disposition, request.arguments.content, request.arguments.reasons) == (
+        expected.disposition,
+        expected.canonical,
+        expected.reasons,
+    )
+    assert request.authority_arguments is None
+    assert (request.result.disposition, request.result.content, request.result.reasons) == ("not_returned", None, ())
+    assert (request.wire_arguments.disposition, request.wire_arguments.content, request.wire_arguments.reasons) == (
+        "unavailable",
+        None,
+        ("not_recorded",),
+    )
+
+
+def _assert_completed_trace_ledger(
+    harness: _Harness, result: ComposeLoopTestResult, review: dict[str, Any], sdk_messages: list[dict[str, Any]]
+) -> None:
     from elspeth.contracts.hashing import stable_hash
     from elspeth.web.composer import advisor_policy, no_tool_policy
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
@@ -714,6 +1006,11 @@ def _assert_completed_trace_ledger(harness: _Harness, result: ComposeLoopTestRes
     if prior:
         assert prior[0].content == "prior"
     cohort = rows[len(prior) :]
+    assert [row.role for row in cohort] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit", "audit", "audit", "audit"]
+    _assert_guard_row(harness, cohort[3])
+    _assert_provider_settlement_rows(harness, cohort[4:6], sdk_messages)
+    # Remove only the validated guard and settlement rows; retain the original END oracle verbatim.
+    cohort = (*cohort[:3], *cohort[6:])
     assert [row.role for row in cohort] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit"]
     _assert_private_tool_cohort(cohort[:3], harness.compose_context.fence.operation_id, harness.compose_context.fence.operation_epoch)
     assert cohort[1].composition_state_id == cohort[2].composition_state_id
@@ -996,7 +1293,18 @@ def test_compose_loop_audit_machine_examples(cancellation_arrival_time: Cancella
         "after_response_yielded",
     }:
         if cancellation_arrival_time == "after_response_yielded":
-            assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit"]
+            assert [row.role for row in outcome.rows] == [
+                "assistant",
+                "tool",
+                "audit",
+                "audit",
+                "audit",
+                "audit",
+                "audit",
+                "audit",
+                "audit",
+                "audit",
+            ]
             assert len(outcome.state_rows) == 1 and outcome.state_rows[0].id == outcome.rows[1].composition_state_id
         else:
             assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit"]

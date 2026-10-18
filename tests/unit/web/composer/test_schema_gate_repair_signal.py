@@ -19,6 +19,7 @@ import json
 import tempfile
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
 import pytest
@@ -28,13 +29,17 @@ from elspeth.composer_mcp.server import create_server
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
+from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
 from elspeth.web.composer.audit import VALIDATION_ERROR_MESSAGES
 from elspeth.web.composer.protocol import SchemaViolation, SchemaViolationCode, ToolArgumentError
 from elspeth.web.composer.provider_discovery_response import argument_error_response
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tool_error_payloads import arg_error_payload
 from elspeth.web.composer.tools._dispatch import require_arguments_conform_to_schema, require_schema_valid_arguments
+from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.sessions.protocol import CompositionStateData
 
@@ -108,7 +113,15 @@ class _RecordingComposeLLM(_FakeComposeLLM):
         self.tool_messages: list[dict[str, Any]] = []
 
     async def __call__(
-        self, _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        self,
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         for message in _messages:
             if type(message) is dict and message["role"] == "tool":
@@ -130,12 +143,44 @@ def _raw_call_llm(*, name: str, raw_arguments: str) -> _RecordingComposeLLM:
     return _RecordingComposeLLM((first, _fake_llm_response(content="Done.")))
 
 
+async def _run_schema_turn(
+    service: ComposerServiceImpl,
+    session_id: str,
+    llm: _RecordingComposeLLM,
+    *,
+    current_state_id: str | None = None,
+) -> ComposeLoopTestResult:
+    """Isolate the advisor dependency while preserving real END withholding."""
+    checkpoint = AsyncMock(
+        spec=service._advisor_checkpoint._run_advisor_checkpoint,
+        return_value=AdvisorCheckpointVerdict(
+            ok=False,
+            blocking=False,
+            findings_text="Advisor unavailable in this schema-dispatch unit fixture.",
+            failure_class="unavailable",
+            retryable=False,
+        ),
+    )
+    with patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", new=checkpoint):
+        result = await service._run_one_turn_for_test(llm=llm, session_id=session_id, current_state_id=current_state_id)
+    checkpoint.assert_awaited_once()
+    call = checkpoint.await_args
+    assert call is not None
+    assert call.kwargs["phase"] == "end"
+    assert call.kwargs["user_message"] == "one-turn compose-loop test driver"
+    assert type(call.kwargs["publication_review"]) is AdvisorPublicationReview
+    assert type(result.advisor_gate_decision) is AdvisorGateBlocked
+    assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.UNAVAILABLE
+    assert result.raw_assistant_content != "Done."
+    return result
+
+
 async def _compose_arg_error(
     service: ComposerServiceImpl, session_id: str, *, name: str, arguments: object, current_state_id: str | None = None
 ) -> tuple[dict[str, Any], str]:
     """Run one compose-loop turn with one bad call; return (audited payload, LLM tool-message text)."""
     llm = _raw_call_llm(name=name, raw_arguments=json.dumps(arguments))
-    result = await service._run_one_turn_for_test(llm=llm, session_id=session_id, current_state_id=current_state_id)
+    result = await _run_schema_turn(service, session_id, llm, current_state_id=current_state_id)
     assert len(result.tool_invocations) == 1
     invocation: ComposerToolInvocation = result.tool_invocations[0]
     assert invocation.status is ComposerToolStatus.ARG_ERROR
@@ -249,7 +294,7 @@ async def test_strict_marker_rejection_allows_repaired_tool_call_with_compositio
         )
     )
 
-    result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)
+    result = await _run_schema_turn(fake_composer_service, result_session_id, llm)
 
     assert [(call.tool_call_id, call.status) for call in result.tool_invocations] == [
         ("bad", ComposerToolStatus.ARG_ERROR),

@@ -173,7 +173,6 @@ def test_cumulative_csv_context_is_recovered_and_bound_after_factory_restart(
         resolved = CSVSink._resolve_sink_effect_mode(dict(fresh_sink.config), purpose=SinkEffectExecutionPurpose.RESUME)
         assert resolved is not None and resolved.value == "append"
         fresh_sink.configure_for_resume()
-        assert fresh_sink.validate_output_target().valid
         effect_mode = resolved.value
     executor = SinkExecutor(
         recovered.execution,
@@ -213,6 +212,48 @@ def test_cumulative_csv_context_is_recovered_and_bound_after_factory_restart(
     assert [json.loads(record["row_json"]) for record in records] == rows
     effects = recovered.execution.sink_effects.get_effects_for_run(recovered.run_id)
     assert sorted(effect.stream_sequence for effect in effects) == [0, 1]
+
+    if resume:
+        # Successor inspection selects the actual predecessor target before
+        # append preparation validates it; construction may select a free sibling.
+        expected_headers = (
+            "run_id",
+            "row_id",
+            "token_id",
+            "ingest_sequence",
+            "outcome",
+            "path",
+            "error_hash",
+            "primary_effect_id",
+            "row_json",
+        )
+        validation = fresh_sink.validate_output_target()
+        assert validation.valid
+        assert validation.target_fields == expected_headers
+        published_bytes = target.read_bytes()
+        with target.open(newline="") as stream:
+            csv_rows = list(csv.reader(stream))
+        assert tuple(csv_rows[0]) == expected_headers
+        malformed_headers = (
+            expected_headers[:-1],
+            (expected_headers[1], expected_headers[0], *expected_headers[2:]),
+        )
+        try:
+            for headers in malformed_headers:
+                with target.open("w", newline="") as stream:
+                    writer = csv.writer(stream)
+                    writer.writerow(headers)
+                    writer.writerows(csv_rows[1:])
+                malformed_bytes = target.read_bytes()
+                invalid = fresh_sink.validate_output_target()
+                assert not invalid.valid
+                assert invalid.error_message == "CSV audit-context envelope headers do not match"
+                assert invalid.target_fields == headers
+                assert invalid.schema_fields == expected_headers
+                assert target.read_bytes() == malformed_bytes
+        finally:
+            target.write_bytes(published_bytes)
+        assert target.read_bytes() == published_bytes
 
 
 def test_linked_csv_context_keeps_real_diversion_and_primary_links_across_batches(setup: RecorderSetup, tmp_path: Path):
