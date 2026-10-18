@@ -61,6 +61,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from elspeth_lints.core.ast_dump import stable_ast_dump
 from elspeth_lints.core.ast_walker import (
     PythonFileReadError,
     PythonSyntaxError,
@@ -533,7 +534,7 @@ def _resolve_test_ref(test_ref: str, repo_root: Path) -> _ResolvedTestRef | _Tes
 
 def _fingerprint_test_function(func: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
     """Return a stable fingerprint for the referenced test function AST."""
-    canonical = ast.dump(func, annotate_fields=True, include_attributes=False)
+    canonical = stable_ast_dump(func, annotate_fields=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
