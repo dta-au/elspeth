@@ -933,7 +933,8 @@ class SourceIterationDriver:
                         if check_coordination_latch is not None:
                             check_coordination_latch()
 
-                        # Graceful shutdown — current row fully processed, safe to stop
+                        # The current row is completed or durably retained by
+                        # the scheduler; stop before advancing the source.
                         if shutdown_event is not None and shutdown_event.is_set():
                             interrupted_by_shutdown = True
                             break

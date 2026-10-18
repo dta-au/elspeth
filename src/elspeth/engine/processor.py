@@ -63,6 +63,7 @@ from elspeth.engine.scheduler_drain import (
 from elspeth.engine.scheduler_drain import (
     ProcessorMode,
     SchedulerDrainCoordinator,
+    UnstartedWorkInterrupted,
     is_scheduler_sink_bound_result,
     require_scheduler_outcome,
     require_scheduler_sink_name,
@@ -2439,6 +2440,7 @@ class RowProcessor:
         ctx: PluginContext,
         *,
         attempt_offset: int,
+        allow_unstarted_shutdown: bool = False,
     ) -> tuple[TransformResult, TokenInfo, str | None]:
         """Execute transform with optional retry for transient failures.
 
@@ -2464,6 +2466,8 @@ class RowProcessor:
         Returns:
             Tuple of (TransformResult, updated TokenInfo, error_sink)
         """
+        if allow_unstarted_shutdown and ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            raise UnstartedWorkInterrupted
         if self._retry_manager is None:
             # No retry configured - single attempt
             # Must still catch retryable exceptions and convert to error results
@@ -2515,8 +2519,11 @@ class RowProcessor:
         # DIVERT routing_event to the state that actually failed.
         attempt_tracker = {"current": attempt_offset}
         state_tracker: dict[str, str | None] = {"last_failed_state_id": None}
+        operation_invoked = False
 
         def execute_attempt() -> tuple[TransformResult, TokenInfo, str | None]:
+            nonlocal operation_invoked
+            operation_invoked = True
             attempt = attempt_tracker["current"]
             attempt_tracker["current"] += 1
             # The state id belongs to this attempt, never merely the most
@@ -2559,6 +2566,8 @@ class RowProcessor:
                 shutdown_event=ctx.shutdown_event,
             )
         except InterruptedError as e:
+            if allow_unstarted_shutdown and not operation_invoked and ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                raise UnstartedWorkInterrupted from e
             state_id = stamped_node_state_id(e) or state_tracker["last_failed_state_id"]
             if state_id is None:
                 state_id = self._record_pre_attempt_shutdown_state(

@@ -25,6 +25,7 @@ unchanged. Tests that previously patched
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from elspeth.contracts import RunMode, RunStatus
@@ -226,6 +227,8 @@ class LeaderDrainCoordinator:
                     check_coordination_latch=check_coordination_latch,
                     coordination_token=coordination_token,
                 )
+                if shutdown_event is not None and shutdown_event.is_set():
+                    loop_result = replace(loop_result, interrupted=True)
                 if loop_result.interrupted:
                     break
 
@@ -347,7 +350,7 @@ class LeaderDrainCoordinator:
                         loop_ctx,
                         artifacts.sink_id_map,
                         artifacts.edge_map,
-                        interrupted_by_shutdown=False,
+                        interrupted_by_shutdown=shutdown_event is not None and shutdown_event.is_set(),
                         on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(
                             run_ctx.processor, coordination_token=coordination_token
                         ),
@@ -474,6 +477,8 @@ def run_end_of_input_barrier_flush(
     """
     row_union_executor = processor.row_union_executor
     collector_executor = processor.collector_executor
+    if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+        return
     if not config.aggregation_settings and coalesce_executor is None and row_union_executor is None and collector_executor is None:
         return
 
@@ -489,12 +494,16 @@ def run_end_of_input_barrier_flush(
 
     flush_iteration_bound = config.escalation_fixpoint_bound
     for _ in range(flush_iteration_bound):
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            return
         # §E.2 intake: adopt anything deposited by the final drains (and, on
         # the takeover path, inherited intake-pending rows), release late
         # arrivals (§E.3a), replay durable branch losses (§E.5) — all before
         # the END_OF_SOURCE trigger evaluation below.
         intake_results = processor.run_barrier_intake(ctx)
         accumulate_row_outcomes(intake_results, counters, pending_tokens)
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            return
 
         if config.aggregation_settings:
             flush_result = flush_remaining_aggregation_buffers(
@@ -504,6 +513,8 @@ def run_end_of_input_barrier_flush(
                 pending_tokens=pending_tokens,
             )
             counters.accumulate_flush_result(flush_result)
+            if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                return
 
             # TERMINAL GUARANTEE: After end-of-source flush, all aggregation
             # buffers must be empty. Any remaining tokens would be silently
@@ -526,6 +537,8 @@ def run_end_of_input_barrier_flush(
                 counters=counters,
                 pending_tokens=pending_tokens,
             )
+            if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                return
 
         if row_union_executor is not None:
             flush_row_union_pending(
@@ -534,6 +547,8 @@ def run_end_of_input_barrier_flush(
                 ctx=ctx,
                 counters=counters,
             )
+            if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                return
 
         # No collector flush arm, by design (spec §5): a collector closes on
         # end_of_group only — it has no timeout and nothing to force at EOF.

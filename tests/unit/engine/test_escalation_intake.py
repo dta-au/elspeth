@@ -20,6 +20,7 @@ finding 3).
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -289,6 +290,18 @@ def test_fail_verdict_with_unsettled_roster_defers(nested_intake_harness):
     h.coordinator.run_barrier_intake(h.ctx)
     assert [loss for loss in h.group_losses() if loss.reason == "group_failed"] == []
     h.settle_remaining_member()
+    h.coordinator.run_barrier_intake(h.ctx)
+    assert len([loss for loss in h.group_losses() if loss.reason == "group_failed"]) == 1
+
+
+def test_cancelled_intake_still_persists_a_settled_failure_escalation(nested_intake_harness):
+    h = nested_intake_harness(inner_policy="require_all", outer_policy="require_all")
+    h.fail_inner_group_and_settle_all_members()
+    h.ctx.shutdown_event = threading.Event()
+    h.ctx.shutdown_event.set()
+    h.coordinator.run_barrier_intake(h.ctx)
+    assert len([loss for loss in h.group_losses() if loss.reason == "group_failed"]) == 1
+    h.reark_inner_failure()
     h.coordinator.run_barrier_intake(h.ctx)
     assert len([loss for loss in h.group_losses() if loss.reason == "group_failed"]) == 1
 

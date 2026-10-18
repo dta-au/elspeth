@@ -214,6 +214,9 @@ class _LossReplayExecutor:
         self.replayed = replayed
         self.notified: list[tuple[str, str, str, str, object]] = []
 
+    def has_pending_group_closes(self) -> bool:
+        return False
+
     def has_replayed_member_loss(self, collector_name: str, group_id: str, member_key: str) -> bool:
         return (collector_name, group_id, member_key) in self.replayed
 
@@ -511,15 +514,20 @@ class _SweepExecutor:
     batch of outcomes per call; a scripted exception is raised on that call
     (the real executor stashes undelivered outcomes and re-delivers on retry)."""
 
-    def __init__(self, script: list[tuple[CollectorOutcome, ...] | Exception]) -> None:
+    def __init__(self, script: list[tuple[CollectorOutcome, ...] | Exception], *, pending_closes: bool = False) -> None:
         self.script = list(script)
         self.calls: list[object] = []
+        self.pending_closes = pending_closes
+
+    def has_pending_group_closes(self) -> bool:
+        return self.pending_closes
 
     def flush_restored_complete_groups(self, ctx: object) -> tuple[CollectorOutcome, ...]:
         self.calls.append(ctx)
         step = self.script.pop(0) if self.script else ()
         if isinstance(step, Exception):
             raise step
+        self.pending_closes = False
         return step
 
     def has_replayed_member_loss(self, *args: object) -> bool:
@@ -591,12 +599,15 @@ class TestPostRestoreFlushSweep:
         assert len(executor.calls) == 2
         assert [d.kind for d in retry.dispositions] == [BarrierIntakeDispositionKind.TERMINAL]
 
-    def test_a_raising_disposition_holds_the_remaining_swept_outcomes_for_the_retry(self) -> None:
+    @pytest.mark.parametrize("restored", [False, True], ids=["fresh-deferred", "restored"])
+    def test_a_raising_disposition_holds_the_remaining_swept_outcomes_for_the_retry(
+        self, monkeypatch: pytest.MonkeyPatch, restored: bool
+    ) -> None:
         """22ce94253 review I-1: the executor has durably closed every swept
         group by the time it returns; an outcome whose disposition raises,
         and every outcome after it, must survive to the next pass."""
         outcomes = (self._failure("eg-1", "tok-a"), self._failure("eg-2", "tok-b"), self._failure("eg-3", "tok-c"))
-        executor = _SweepExecutor(script=[outcomes])
+        executor = _SweepExecutor(script=[outcomes], pending_closes=not restored)
         recorder = _Recorder(release=CollectorRelease(items=(), sink_results=()))
         seam = recorder.record_group_member_terminals
         armed = [True]
@@ -607,10 +618,14 @@ class TestPostRestoreFlushSweep:
                 raise LandscapeRecordError("terminal write failed")
             return seam(consumed_tokens, **kwargs)
 
-        recorder.record_group_member_terminals = raising_seam  # type: ignore[method-assign]
+        monkeypatch.setattr(recorder, "record_group_member_terminals", raising_seam)
         scheduler = RecordingScheduler(pending=[])
         coordinator = _coordinator(
-            scheduler=scheduler, executor=executor, recorder=recorder, data_flow=_RecordingDataFlow(), resume_checkpoint_id="ckpt-1"
+            scheduler=scheduler,
+            executor=executor,
+            recorder=recorder,
+            data_flow=_RecordingDataFlow(),
+            resume_checkpoint_id="ckpt-1" if restored else None,
         )
         ctx = PluginContext(run_id="run-1", config={}, landscape=None)
 
@@ -619,7 +634,8 @@ class TestPostRestoreFlushSweep:
 
         assert [c["consumed"] for c in recorder.seam_calls] == [("tok-a",)]
         held = [o.group_id for o in coordinator._undisposed_sweep_outcomes]
-        assert (coordinator._collector_restore_sweep_owed, held) == (True, ["eg-2", "eg-3"])
+        assert (coordinator._collector_restore_sweep_owed, held) == (restored, ["eg-2", "eg-3"])
+        assert executor.has_pending_group_closes() is False
 
         retry = coordinator.run_intake_pass(ctx)
 

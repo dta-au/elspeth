@@ -168,6 +168,9 @@ class RecordingCollectorExecutor:
         self.outcome = outcome
         self.accepted: list[tuple[str, str, object, float]] = []
 
+    def has_pending_group_closes(self) -> bool:
+        return False
+
     def accept(self, token: TokenInfo, collector_name: str, ctx: object, *, arrival_time: float) -> CollectorOutcome:
         self.accepted.append((token.token_id, collector_name, ctx, arrival_time))
         return self.outcome
