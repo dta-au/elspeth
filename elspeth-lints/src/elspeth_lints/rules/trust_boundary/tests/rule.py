@@ -4,9 +4,9 @@ Honesty gate: every ``@trust_boundary`` must carry a ``test_ref`` that points
 to a real pytest node whose own body asserts on raising behaviour, calls the
 decorated symbol through the declared ``source_param``, and is bound by a
 recorded AST fingerprint. If the decorator's ``invariant`` text names a
-Python exception class, the referenced test's raising assertion must name the
-same exception type. This is still not a complete semantic proof that the
-operator prose covers every malformed-input class, but it mechanically rejects
+Python exception class, the referenced test's subject-bearing raising assertion
+must name the same exception type. This is still not a complete semantic proof
+that the operator prose covers every malformed-input class, but it mechanically rejects
 the common attestation lies where the test raises something unrelated or no
 longer exercises the decorated symbol at all. Sub-findings:
 
@@ -345,8 +345,9 @@ def analyze_tree(tree: ast.AST, file_path: str, *, repo_root: Path, package_name
         invariant_exception_names = _exception_names_in_text(invariant) if isinstance(invariant, str) else frozenset()
         if (
             invariant_exception_names
-            and semantics.raised_exception_names
-            and not invariant_exception_names.intersection(semantics.raised_exception_names)
+            and semantics.subject_call_uses_source_param
+            and semantics.subject_raised_exception_names
+            and not invariant_exception_names.intersection(semantics.subject_raised_exception_names)
         ):
             findings.append(
                 make_decorator_finding(
@@ -357,13 +358,14 @@ def analyze_tree(tree: ast.AST, file_path: str, *, repo_root: Path, package_name
                     message=(
                         f"@trust_boundary invariant names exception type(s) "
                         f"{tuple(sorted(invariant_exception_names))!r}, but test_ref {test_ref!r} "
-                        f"raises {tuple(sorted(semantics.raised_exception_names))!r}."
+                        f"names {tuple(sorted(semantics.subject_raised_exception_names))!r} "
+                        "in its subject-bearing raising assertions."
                     ),
                     suggestion=SUGGESTION_INVARIANT_MISMATCH,
                     symbol_context=(func_node.name,),
                 )
             )
-        if invariant_exception_names and not semantics.raised_exception_names:
+        if invariant_exception_names and semantics.subject_call_uses_source_param and not semantics.subject_raised_exception_names:
             findings.append(
                 make_decorator_finding(
                     metadata=RULE_METADATA,
@@ -373,7 +375,7 @@ def analyze_tree(tree: ast.AST, file_path: str, *, repo_root: Path, package_name
                     message=(
                         f"@trust_boundary invariant names exception type(s) "
                         f"{tuple(sorted(invariant_exception_names))!r}, but test_ref {test_ref!r} "
-                        "does not name the exception type in its raising assertion."
+                        "does not name the exception type in its subject-bearing raising assertion."
                     ),
                     suggestion=SUGGESTION_INVARIANT_MISMATCH,
                     symbol_context=(func_node.name,),
@@ -593,7 +595,7 @@ class _TestRefSemantics:
     """Mechanically checkable claims extracted from the referenced test body."""
 
     has_raising_assertion: bool
-    raised_exception_names: frozenset[str]
+    subject_raised_exception_names: frozenset[str]
     subject_call_uses_source_param: bool
 
 
@@ -637,16 +639,18 @@ def _test_ref_semantics(
     shape exists" to "the direct raising shape calls the decorated subject
     through the declared ``source_param`` and names the claimed exception
     type". We still stay deliberately local: imports, fixtures, and helper
-    functions are not followed.
+    functions are not followed. Exception names belong only to assertions
+    that directly own a subject call. A nested assertion owns its callable
+    invocation/body; expressions evaluated before its entry remain visible
+    to the enclosing assertion.
     """
     has_raising = False
-    raised_exception_names: set[str] = set()
+    subject_raised_exception_names: set[str] = set()
     subject_call_uses_source_param = False
     for statement in func.body:
         for child in iter_own_scope(statement):
             if isinstance(child, ast.Call) and _is_raising_call(child.func):
                 has_raising = True
-                raised_exception_names.update(_exception_names_from_raises_call(child))
                 if _raising_call_invokes_subject(
                     child,
                     subject_name=subject_name,
@@ -655,22 +659,29 @@ def _test_ref_semantics(
                     module_class_names=module_class_names,
                 ):
                     subject_call_uses_source_param = True
+                    subject_raised_exception_names.update(_exception_names_from_raises_call(child))
             if isinstance(child, (ast.With, ast.AsyncWith)):
-                for item in child.items:
-                    if isinstance(item.context_expr, ast.Call) and _is_raising_call(item.context_expr.func):
-                        has_raising = True
-                        raised_exception_names.update(_exception_names_from_raises_call(item.context_expr))
-                        if _body_calls_subject_with_source_param(
-                            child.body,
-                            subject_name=subject_name,
-                            source_param=source_param,
-                            source_param_index=source_param_index,
-                            module_class_names=module_class_names,
-                        ):
-                            subject_call_uses_source_param = True
+                raising_contexts = [
+                    item.context_expr
+                    for item in child.items
+                    if isinstance(item.context_expr, ast.Call) and _is_raising_call(item.context_expr.func)
+                ]
+                if raising_contexts:
+                    has_raising = True
+                    if _body_calls_subject_with_source_param(
+                        child.body,
+                        subject_name=subject_name,
+                        source_param=source_param,
+                        source_param_index=source_param_index,
+                        module_class_names=module_class_names,
+                    ):
+                        # Associate the body structurally with the rightmost
+                        # raising manager; exception propagation is not modeled.
+                        subject_call_uses_source_param = True
+                        subject_raised_exception_names.update(_exception_names_from_raises_call(raising_contexts[-1]))
     return _TestRefSemantics(
         has_raising_assertion=has_raising,
-        raised_exception_names=frozenset(raised_exception_names),
+        subject_raised_exception_names=frozenset(subject_raised_exception_names),
         subject_call_uses_source_param=subject_call_uses_source_param,
     )
 
@@ -786,20 +797,51 @@ def _body_calls_subject_with_source_param(
     source_param_index: int | None,
     module_class_names: frozenset[str],
 ) -> bool:
-    """Return True if the with-body directly calls the subject through source_param."""
-    for statement in body:
-        for child in iter_own_scope(statement):
-            if (
-                isinstance(child, ast.Call)
-                and _is_subject_call(child, subject_name)
-                and _call_uses_source_param(
-                    child,
-                    source_param=source_param,
-                    source_param_index=source_param_index,
-                    module_class_names=module_class_names,
-                )
-            ):
-                return True
+    """Return whether this assertion owns a direct subject/source-param call.
+
+    Nested lexical scopes and raising assertions own their own calls. Eager
+    call arguments and context creation before a nested assertion enters
+    remain visible. No reachability or exception propagation is inferred.
+    """
+    pending: list[ast.AST] = list(body)
+    while pending:
+        child = pending.pop()
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda):
+            continue
+        if isinstance(child, ast.GeneratorExp):
+            # Construction evaluates only the first iterable; elements, filters
+            # and later iterables run when the generator is consumed.
+            pending.append(child.generators[0].iter)
+            continue
+        if isinstance(child, ast.Call) and _is_raising_call(child.func):
+            # A callable reference is not an invocation. Actual calls in the
+            # receiver, arguments or keywords run before this assertion starts.
+            pending.extend(ast.iter_child_nodes(child))
+            continue
+        if isinstance(child, ast.With | ast.AsyncWith) and any(
+            isinstance(item.context_expr, ast.Call) and _is_raising_call(item.context_expr.func) for item in child.items
+        ):
+            # Contexts enter left-to-right; only creation through the first
+            # raising manager still belongs to this enclosing assertion.
+            for item in child.items:
+                pending.append(item.context_expr)
+                if isinstance(item.context_expr, ast.Call) and _is_raising_call(item.context_expr.func):
+                    break
+                if item.optional_vars is not None:
+                    pending.append(item.optional_vars)
+            continue
+        if (
+            isinstance(child, ast.Call)
+            and _is_subject_call(child, subject_name)
+            and _call_uses_source_param(
+                child,
+                source_param=source_param,
+                source_param_index=source_param_index,
+                module_class_names=module_class_names,
+            )
+        ):
+            return True
+        pending.extend(ast.iter_child_nodes(child))
     return False
 
 
