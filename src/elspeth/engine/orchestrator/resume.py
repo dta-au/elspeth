@@ -1281,25 +1281,6 @@ class ResumeCoordinator:
                 coordination_token=coordination_token,
             )
 
-            preflight_retry_manager = RetryManager(RuntimeRetryConfig.from_settings(settings.retry)) if settings is not None else None
-            try:
-                # The processor is built and the barrier journal restored (which
-                # mints the work of committed coalesce/aggregation residuals):
-                # every token must now be decided or covered before anything is
-                # re-driven or written to a sink.
-                refuse_unaccounted_resume(factory, coordination_token)
-                run_transform_runtime_preflights(
-                    factory,
-                    run_id,
-                    config,
-                    run_ctx.ctx,
-                    retry_manager=preflight_retry_manager,
-                    shutdown_event=shutdown_event,
-                )
-            except BaseException as pending_exc:
-                cleanup_plugins(config, run_ctx.ctx, include_source=False, pending_exc=pending_exc)
-                raise
-
             loop_ctx = LoopContext(
                 counters=ExecutionCounters(),
                 pending_tokens={name: [] for name in config.sinks},
@@ -1310,6 +1291,34 @@ class ResumeCoordinator:
                 coalesce_executor=run_ctx.coalesce_executor,
                 coalesce_node_map=run_ctx.coalesce_node_map,
             )
+            preflight_retry_manager = RetryManager(RuntimeRetryConfig.from_settings(settings.retry)) if settings is not None else None
+            try:
+                # The processor is built and the barrier journal restored (which
+                # mints the work of committed coalesce/aggregation residuals):
+                # every token must now be decided or covered before anything is
+                # re-driven or written to a sink.
+                refuse_unaccounted_resume(factory, coordination_token)
+                try:
+                    run_transform_runtime_preflights(
+                        factory,
+                        run_id,
+                        config,
+                        run_ctx.ctx,
+                        retry_manager=preflight_retry_manager,
+                        shutdown_event=shutdown_event,
+                        check_coordination_latch=check_coordination_latch,
+                    )
+                except GracefulShutdownError:
+                    # Restore may have remapped batches and rebuilt barrier
+                    # scalars. Retain that state without dispatching work or
+                    # entering the sink path merely to reach its checkpoint.
+                    if check_coordination_latch is not None:
+                        check_coordination_latch()
+                    self._checkpoints.checkpoint_interrupted_progress(loop_ctx, coordination_token=coordination_token)
+                    raise
+            except BaseException as pending_exc:
+                cleanup_plugins(config, run_ctx.ctx, include_source=False, pending_exc=pending_exc)
+                raise
 
             cleanup_pending_exc: BaseException | None = None
             try:

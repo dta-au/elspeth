@@ -173,6 +173,7 @@ class LeaderDrainCoordinator:
                 run_ctx.ctx,
                 retry_manager=preflight_retry_manager,
                 shutdown_event=shutdown_event,
+                check_coordination_latch=check_coordination_latch,
             )
         except BaseException as pending_exc:
             cleanup_plugins(config, run_ctx.ctx, include_source=True, pending_exc=pending_exc)
