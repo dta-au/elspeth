@@ -491,6 +491,11 @@ def _validate_gateway_success_response(
                 # interpolated, even though it's "just a key name".
                 raise LLMClientError("Non-finite value in gateway usage", retryable=False)
     usage = TokenUsage.from_dict(raw_usage)
+    if usage_required and not usage.has_data:
+        raise LLMClientError(
+            "Gateway response contains no valid token counts required by this profile's required_capabilities",
+            retryable=False,
+        )
 
     finish_reason = parse_finish_reason(str(raw_finish_reason)) if raw_finish_reason is not None else None
 
