@@ -1299,17 +1299,27 @@ async def test_failed_terminal_has_one_exact_immutable_retry(operation_store, mo
 @pytest.mark.parametrize("case", ("normal", "retry", "audit_failure", "cancel", "deadline", "lost_fence"))
 async def test_failed_terminal_private_cause_is_atomic_frozen_and_exactly_correlated(operation_store, monkeypatch, case):
     import json
+    from datetime import timedelta
 
     import elspeth.web.sessions.service as service_module
     from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+    from elspeth.web.coordination import composer_operation_authority as job_authority
     from elspeth.web.coordination.contracts import SessionOperationFenceLost
     from elspeth.web.sessions.composer_operation_errors import operation_failure_diagnostic_id, project_composer_operation_error
     from elspeth.web.sessions.models import chat_messages_table
     from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
 
     engine, repository, authority, service, sid = operation_store
+    if case == "deadline":
+        # Keep the one-second job and its live fence stable through setup, then
+        # cross the actual terminal selector's clock at the intended seam.
+        with engine.connect() as conn:
+            controlled_now = job_authority.database_now(conn)
+        monkeypatch.setattr(job_authority, "database_now", lambda _conn: controlled_now)
+        monkeypatch.setattr(service_module, "database_now", lambda _conn: controlled_now)
+        monkeypatch.setattr(repository, "_database_now", lambda _conn: controlled_now)
     record, running = start(operation_store, deadline_seconds=1.0 if case == "deadline" else 180.0)
     original = RuntimeError("B7_PRIVATE_CAUSE_CANARY: late settlement failure")
     capture = ComposerOperationFailureFacts(
@@ -1330,8 +1340,7 @@ async def test_failed_terminal_private_cause_is_atomic_frozen_and_exactly_correl
     if case == "cancel":
         authority.request_cancel(session_id=sid, operation_id=record.operation_id, cancelled_failure=cancelled)
     elif case == "deadline":
-        while authority.get_with_database_now(session_id=sid, operation_id=record.operation_id)[1] < record.deadline_at:
-            await asyncio.sleep(0.01)
+        controlled_now = record.deadline_at + timedelta(microseconds=1)
     elif case == "lost_fence":
         repository.release(running.session_operation_context)
     actual_write = service._write_audit_cohort_on_connection

@@ -3,8 +3,13 @@
 Use this when the selected ELSPETH commit lacks a GHCR image. This publishes
 the shared ELSPETH image used by Azure Container Apps; ACA normally consumes
 a digest-preserving copy in ACR. This procedure stops at GHCR. For the ACR
-copy, doctor Job and revision rollout, continue with
-[the ACA command sheet](command-cheatsheet.md).
+copy on a first install, continue at step 3 of
+[the cold-install runbook](../../../../docs/runbooks/azure-container-apps-cold-install.md).
+The existing-service command sheet is held under the current new-stores-only
+policy; it is not a first-install continuation. Use this GHCR publication
+recipe only when the operator has selected and authorized that registry and
+network route. In an enclave that cannot publish to GHCR, arrange an approved
+image supply route before proceeding; do not silently publish externally.
 
 ## Pin the source
 
@@ -59,8 +64,9 @@ token or put it in a command argument.
 
 ```bash
 gh auth status
-gh auth token --hostname github.com --user johnm-dta |
-  docker login ghcr.io --username johnm-dta --password-stdin
+: "${GHCR_ACCOUNT:?set the GitHub account authorized to write this package}"
+gh auth token --hostname github.com --user "$GHCR_ACCOUNT" |
+  docker login ghcr.io --username "$GHCR_ACCOUNT" --password-stdin
 ```
 
 If `gh auth status` cannot validate a package-write account, stop before

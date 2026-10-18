@@ -10,7 +10,7 @@ refuse (ADR-020 batch posture, made structural).
 
 from __future__ import annotations
 
-import time
+import sqlite3
 
 import pytest
 from sqlalchemy import insert, update
@@ -326,12 +326,11 @@ class TestForkGroupMembership:
 
 class TestForkGroupScale:
     def test_member_grouping_is_linear_in_the_number_of_groups(self) -> None:
-        """The member set of each group is built in one pass over the query result.
+        """Reject #187's quadratic pair rescan using actual group-key comparisons.
 
-        Rescanning every (group, member) pair once per group made the check quadratic:
-        measured on this suite's host, 2k/4k/8k unbound two-arm groups took
-        0.14 s / 0.46 s / 1.84 s, so 16k groups would take about 7 s. A single pass
-        over 32k frames is well under the bound below even on a loaded worker.
+        Keep the real SQL query and 32k frames, but measure the Python grouping
+        work rather than database latency or worker scheduling. Sorting and SQL
+        execution are outside this historical-regression comparison budget.
         """
         groups = 16_000
         db = make_landscape_db()
@@ -360,8 +359,53 @@ class TestForkGroupScale:
                     for arm in ("a", "b")
                 ],
             )
-        started = time.perf_counter()
-        gate = check_group_satisfiability_resumable(db, RUN_ID, _UNBOUND)
-        elapsed = time.perf_counter() - started
+        comparisons = 0
+        decoded_group_keys = 0
+        comparison_budget = 4 * groups
+
+        class GroupKey(str):
+            __hash__ = str.__hash__
+
+            def __str__(self) -> str:
+                # Preserve the observer through production's str(row.group_id).
+                return self
+
+            def __eq__(self, other: object) -> bool:
+                nonlocal comparisons
+                comparisons += 1
+                # Fail fast even if the historical 16k-by-32k rescan returns.
+                assert comparisons <= comparison_budget, f"fork grouping exceeded {comparison_budget} key comparisons"
+                return super().__eq__(other)
+
+        probe = GroupKey("fork-probe")
+        assert probe == GroupKey("fork-probe")
+        assert probe == "fork-probe"
+        assert (probe == "fork-other") is False
+        assert hash(probe) == hash("fork-probe")
+        assert str(probe) is probe
+        comparisons = 0
+
+        def decode_group_key(raw: bytes) -> str:
+            nonlocal decoded_group_keys
+            value = raw.decode()
+            if value.startswith("fork-"):
+                decoded_group_keys += 1
+                return GroupKey(value)
+            return value
+
+        # This fixture's StaticPool reuses one SQLite connection. Instrument
+        # only its group IDs, leaving production builtins and SQL unchanged.
+        with db.engine.connect() as conn:
+            driver = conn.connection.driver_connection
+            assert isinstance(driver, sqlite3.Connection)
+            original_text_factory = driver.text_factory
+            assert original_text_factory is str
+            driver.text_factory = decode_group_key
+            try:
+                gate = check_group_satisfiability_resumable(db, RUN_ID, _UNBOUND)
+            finally:
+                driver.text_factory = original_text_factory
+
         assert gate.check.can_resume
-        assert elapsed < 1.5, f"group satisfiability over {groups} fork groups took {elapsed:.2f}s"
+        assert decoded_group_keys == 2 * groups
+        assert comparisons > 0, "group-key normalization erased the comparison observer"

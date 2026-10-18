@@ -13,7 +13,16 @@ description: >
 
 # Operating the ELSPETH Azure Container Apps container
 
-Use this skill for the ordinary container loop:
+**Current policy: new stores only.** Existing-store redeployment, transition,
+and rollback are held, even if an older compatibility record permits rollback.
+The [existing-service runbook](../../../docs/runbooks/azure-container-apps-existing-service-redeploy.md)
+is the authority. Do not execute the historical existing-service workflow below
+while this hold remains. For an authorized first install, follow the
+[cold-install runbook](../../../docs/runbooks/azure-container-apps-cold-install.md)
+from step 1 using fresh stores; after image publication resume its step 3.
+Do not redirect a first install into the existing-app command sheet.
+
+The historical container loop is:
 
 `code -> targeted tests -> GHCR digest -> registry copy -> doctor Job -> revision -> live checks`
 
@@ -40,8 +49,7 @@ Choose one mode before doing anything:
 
 - **Inspect/diagnose**: read-only `az` queries, probes and Log Analytics.
 - **Publish only**: copy a tested GHCR digest into the registry and pin it.
-- **Deploy existing app**: publish, run the doctor Job, roll a new revision,
-  verify it.
+- **Deploy existing app**: held by the current new-stores-only policy.
 - **Stop/resume**: scale to zero or back without deleting infrastructure.
 - **Bootstrap/destroy environment**: out of scope unless the user explicitly
   asks; that is the cold-install runbook and the acceptance runbook.
@@ -88,13 +96,13 @@ the selected worktree with an explicit `PYTHONPATH` covering `src` and
    and runtime Jobs attach the runtime identity; the web `AZURE_CLIENT_ID`
    must match its client ID. The root provisioner has no identity. Never
    print a value or a resolved reference.
-10. **Rollback is conditional.** Only when the compatibility record says
-    `rollback_permitted: true`; a Scenario A install says `false`, so repair
-    forward.
+10. **Rollback is held.** An older `rollback_permitted: true` record does not
+    override the current new-stores-only policy. Preserve stores and diagnose;
+    do not run an image rollback or an existing-store transition.
 11. **Do not run the full suite by reflex.** Run the tests covering the
     changed surface; the full suite runs once when the body of work is done.
 
-## Normal deploy workflow
+## Historical existing-service workflow — held
 
 For an older shared-identity installation, complete the existing-service
 runbook's **One-time credential isolation migration** first: rotate the owner
@@ -234,9 +242,8 @@ Common interpretations:
 - **Stop:** `az containerapp update --min-replicas 0 --max-replicas 0`.
 - **Resume:** restore the production scale settings and repeat the rollout
   proof.
-- **Rollback:** only when permitted by the compatibility record; activate the
-  previous revision, move 100 % of traffic, deactivate the candidate, repeat
-  the checks.
+- **Rollback:** held, including when an older compatibility record permits it.
+  Do not activate an older image against existing stores.
 - **Destroy:** delete the resource group that owns the environment (the
   acceptance runbook); never delete parts of the dependency graph by hand.
 

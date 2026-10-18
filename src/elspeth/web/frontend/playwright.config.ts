@@ -186,7 +186,9 @@ export default defineConfig({
       // well as the API. Browser-security specs exercise that document path;
       // composerSettingsEnv still controls auth policy and .e2e-data isolation.
       reuseExistingServer: false,
-      timeout: 60_000,
+      // Admin bootstrap and the SPA build share this startup watchdog with
+      // backend readiness; allow their combined cost on shared CI runners.
+      timeout: 180_000,
       stdout: "pipe",
       stderr: "pipe",
       env: composerSettingsEnv,

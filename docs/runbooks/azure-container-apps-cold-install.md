@@ -104,6 +104,38 @@ The bundle is a **disposable-by-default** package for a dedicated resource
 group. It is not a multi-region design and it does not manage the registry
 (the existing registry that CI publishes to is referenced by resource id).
 
+## Offline rehearsal before entering the enclave
+
+With the checkout's existing Python environment and `bash`/`jq` available, run
+the instruction rehearsal before executing any Azure commands:
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+export PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src"
+export LITELLM_LOCAL_MODEL_COST_MAP=True
+REHEARSAL_LOG=$(mktemp /tmp/elspeth-aca-rehearsal-XXXXXX.log)
+if .venv/bin/python -m pytest -n 0 -o "pythonpath=src elspeth-lints/src" \
+    tests/unit/deployment/test_aca_first_install_instructions.py \
+    tests/unit/web/test_azure_container_apps_runbook_contract.py \
+    >"$REHEARSAL_LOG" 2>&1; then
+  cat "$REHEARSAL_LOG"
+else
+  result=$?
+  cat "$REHEARSAL_LOG"
+  exit "$result"
+fi
+```
+
+The tests execute the native-Azure first-install shell instructions with
+synthetic inputs and intercepted external commands, including the final HTTP
+checks. They exercise the real parameter resolver, validator, Job waiter,
+settings loader and local pricing calculation. Negative controls cover missing
+exports, unknown deployment pricing and failed Jobs. They do not compile Bicep,
+build an image, contact a provider or verify cloud permissions. Run the compiled
+bundle tests separately when the approved Bicep compiler is available. Supply
+the enclave's real registry route, Azure identities, model/catalog mappings,
+network access and SSO registration at the operator-input steps below.
+
 ## Prerequisites
 
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
@@ -142,6 +174,7 @@ export AZURE_CORE_OUTPUT=json
 : "${GHCR_DIGEST:?set the published image sha256 digest}"
 : "${ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS:?set the transport ceiling; at most 240 on this platform}"
 test "$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS" -le 240
+export ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS
 
 CANDIDATE_SHA=$(git rev-parse "${DEPLOY_REF}^{commit}")
 DEPLOYMENT_CONFIG_SHA=$(git rev-parse HEAD)
@@ -413,6 +446,17 @@ flat JSON object mapping Bicep parameter names to values, without an ARM
   and uses `AZURE_API_BASE`, `AZURE_API_VERSION`, `AZURE_API_KEY`, and
   `azure/<deployment-name>` Composer models instead; leave both endpoint
   secret-name variables unset for that setup.
+- In `extraEnvironment`, set `ELSPETH_WEB__COMPOSER_PRICING_MODEL` and
+  `ELSPETH_WEB__COMPOSER_ADVISOR_PRICING_MODEL` to the catalog identities of
+  the actual models behind the Azure deployments. Deployment aliases route
+  requests; they are not pricing identities. For example, an Azure deployment
+  of GPT-4o can use `azure/gpt-4o` for pricing while retaining its private
+  deployment name for routing. Choose each role independently and verify that
+  identity in the selected image's bundled LiteLLM cost map. Unknown pricing
+  fails the first Composer request closed with `COST_UNAVAILABLE`, even when
+  startup and the doctor succeed. Do not disable cost admission or substitute
+  an unrelated cheaper model. See the
+  [pricing troubleshooting guide](azure-llm-composer-troubleshooting.md).
 - `authProvider`: choose the actual nonlocal production provider and complete
   its SSO client, issuer and transaction-secret settings in `extraEnvironment`.
   Set `registrationMode=closed`, configure the exact public HTTPS origin and
@@ -424,7 +468,7 @@ flat JSON object mapping Bicep parameter names to values, without an ARM
   `extraEnvironment` with `secretRef`; an environment reference alone does not
   create a secret. Keep secret values out of both parameter files.
 - `ELSPETH_WEB__LLM_PROFILES` in `extraEnvironment`: define at least the
-  standard pipeline profile, including its actual provider/model and
+  standard pipeline profile, including its actual provider/model, `pricing_model`, and
   credential reference. Set `ELSPETH_WEB__DEFAULT_LLM_PROFILE` to that alias.
   Its credential environment variable must have a matching `secretRef` and
   be in `ELSPETH_WEB__SERVER_SECRET_ALLOWLIST` for server credentials. Composer

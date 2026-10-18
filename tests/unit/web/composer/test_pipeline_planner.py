@@ -2523,7 +2523,13 @@ async def test_anthropic_cache_markers_stay_stable_across_discovery_rounds(
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
     )
 
-    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+    # Cache-marker semantics must not race catalog/worker setup under coverage.
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        model_overrides={"timeout_seconds": 60.0},
+    )
 
     marked_system = [request["messages"][0] for request in completion.requests]
     marked_tools = [request["tools"] for request in completion.requests]
