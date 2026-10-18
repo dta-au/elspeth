@@ -2585,7 +2585,11 @@ class CompositionCompletion:
                             else "Correct the reply's unsupported claims using the saved-effect and inspection evidence. "
                             "A prose-only correction is valid; do not mutate the graph merely to satisfy this review. "
                         )
-                        + _advisor_policy.ADVISOR_OUTPUT_CONTRACT_CLAUSE
+                        + (
+                            _advisor_policy.ADVISOR_OUTPUT_CONTRACT_CLAUSE
+                            if verdict.blocking
+                            else _advisor_policy.ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE
+                        )
                         + "]\n"
                         + _advisor_policy.fence_advisor_findings(verdict.findings_text)
                     ),

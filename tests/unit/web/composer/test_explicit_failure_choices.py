@@ -301,7 +301,13 @@ def test_omission_cannot_borrow_a_different_identity_or_node_kind():
     assert not source.success and source.updated_state is state
     node = execute_tool(
         "upsert_node",
-        {"id": "before", "node_type": "aggregation", "plugin": "passthrough", "input": "rows"},
+        {
+            "id": "before",
+            "node_type": "aggregation",
+            "plugin": "passthrough",
+            "input": "rows",
+            "options": {"schema": {"mode": "observed"}},
+        },
         state,
         _mock_catalog(),
         validate_arguments=True,

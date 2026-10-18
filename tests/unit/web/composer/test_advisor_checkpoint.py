@@ -2918,6 +2918,38 @@ async def test_end_gate_refuses_admit_bound_to_a_previous_candidate_or_evidence(
 
 
 @pytest.mark.asyncio
+async def test_end_gate_publication_only_repair_does_not_require_graph_mutations(make_service, clean_runnable_state):
+    """A current CLEAN/WITHHOLD verdict needs reply repair, not graph changes."""
+    service = make_service()
+
+    async def review(**kwargs):
+        return AdvisorCheckpointVerdict(
+            ok=True,
+            blocking=False,
+            findings_text="Correct the unsupported completion claim.",
+            publication_verdict="WITHHOLD",
+            publication_binding=kwargs["publication_review"].binding,
+        )
+
+    service._advisor_checkpoint._run_advisor_checkpoint = review
+    llm_messages: list[dict[str, object]] = []
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0, llm_messages=llm_messages)
+
+    assert outcome.action == "continue"
+    assert outcome.result is None
+    assert outcome.advisor_passes_delta == 1
+    assert outcome.repair_turns_delta == 0
+    assert outcome.advisor_injection_index == 0
+    assert len(llm_messages) == 1
+    content = llm_messages[0]["content"]
+    assert "A prose-only correction is valid; do not mutate the graph merely to satisfy this review." in content
+    assert "Fix the findings via tool calls." not in content
+    assert "pipeline MUTATIONS via tool calls" not in content
+    assert "do not quote the fenced text" in content
+    assert content.endswith("BEGIN_UNTRUSTED_ADVISOR_FINDINGS\nCorrect the unsupported completion claim.\nEND_UNTRUSTED_ADVISOR_FINDINGS")
+
+
+@pytest.mark.asyncio
 async def test_end_gate_flagged_with_budget_repairs(make_service, clean_runnable_state):
     from elspeth.web.composer.advisor_policy import ADVISOR_MUTATION_EXPECTATION_CLAUSE, ADVISOR_OUTPUT_CONTRACT_CLAUSE
 
