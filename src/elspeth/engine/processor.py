@@ -4894,7 +4894,7 @@ class RowProcessor:
         )
 
     def _released_collector_cursor(self, token: TokenInfo) -> tuple[CoalesceName | None, RowUnionName | None, CollectorName | None]:
-        """Barrier cursor for a token a collector just released (spec §7 rules 2/5).
+        """Nearest remaining bound barrier for a release (spec §7 rules 2/5).
 
         ``collect_tokens`` popped the closed group's EXPAND frame and minted
         the release with its OWN release-group EXPAND frame INNERMOST
@@ -4915,8 +4915,9 @@ class RowProcessor:
         which holds no node_state at any declared opener node
         (``collect_tokens`` never calls ``register_expand_group``), so the
         re-derivation classifies it undeclared and the walk moves outward.
-        A release with no remaining bound frame carries no cursor — an
-        ordinary consumer or a sink awaits it.
+        A collector release with no remaining bound frame carries no cursor —
+        an ordinary consumer or a sink awaits it. Coalesce continuations use
+        this same walk before applying their terminal-coalesce fallback.
         """
         for frame in reversed(token.lineage_path):
             if frame.kind is FrameKind.FORK:
@@ -4962,27 +4963,25 @@ class RowProcessor:
     ) -> tuple[CoalesceName | None, RowUnionName | None, CollectorName | None]:
         """Barrier cursor for a coalesce merge's released continuation.
 
-        ``resolve_merged_branch_barrier`` covers the flat case (the completed
-        name, load-bearing for a terminal coalesce's sink resolution) and the
-        nested-fork case (the enclosing branch's own barrier). A coalesce
-        INSIDE A SCOPE is the third shape: the merged token's remaining
-        innermost frame is the scope's bound EXPAND frame, so the
-        continuation is that group's member and must hold at the collector —
-        the collector cursor REPLACES the completed coalesce name (such a
-        coalesce is never terminal: its output has to reach the collector,
-        so the flat name is not load-bearing there). One cursor per item
-        (``WorkItem``'s one-barrier rule).
+        Remaining FORK and EXPAND frames can nest in either order. Walk
+        outward to the nearest bound closer, skipping inert/unbound frames,
+        so an outer fork cannot overtake an inner scope's collector. Carry
+        exactly one cursor (``WorkItem``'s one-barrier rule).
+
+        With no bound closer, retain the completed name for the flat case;
+        terminal-coalesce sink resolution depends on this fallback. A
+        remaining unbound FORK still suppresses it because its branch
+        continues through an ordinary consumer instead.
         """
+        cursor = self._released_collector_cursor(merged_token)
+        if cursor != (None, None, None):
+            return cursor
         coalesce_name, row_union_name = resolve_merged_branch_barrier(
             merged_token.branch_name,
             completed_coalesce_name=completed_coalesce_name,
             branch_to_coalesce=self._branch_to_coalesce,
             branch_to_row_union=self._branch_to_row_union,
         )
-        if merged_token.branch_name is None:
-            enclosing = self._enclosing_collector_cursor(merged_token)
-            if enclosing is not None:
-                return None, None, enclosing
         return coalesce_name, row_union_name, None
 
     def route_collector_release(
