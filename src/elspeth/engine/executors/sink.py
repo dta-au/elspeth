@@ -54,12 +54,14 @@ from elspeth.contracts.sink_effect_http import HTTPSinkEffectCapability, SinkEff
 from elspeth.contracts.sink_effects import (
     SinkEffectAttemptAction,
     SinkEffectAttemptState,
+    SinkEffectAuditContextCapability,
     SinkEffectFinalizationMember,
     SinkEffectInputKind,
     SinkEffectMemberCandidate,
     SinkEffectPipelineMembersInput,
     SinkEffectReservationRequest,
     SinkEffectRole,
+    SinkEffectRoutingContext,
     SinkEffectRuntimeBinding,
 )
 from elspeth.core.canonical import canonical_json as pipeline_canonical_json
@@ -798,6 +800,11 @@ class SinkExecutor:
             "outcome": pending_outcome.outcome.value,
             "path": pending_outcome.path.value,
         }
+        routing_context = (
+            SinkEffectRoutingContext(outcome=pending_outcome.outcome, path=pending_outcome.path, error_hash=pending_outcome.error_hash)
+            if isinstance(sink, SinkEffectAuditContextCapability) and sink.requires_audit_context
+            else None
+        )
         canonical_rows: list[dict[str, object]] = []
         for row in rows:
             normalized = canonical_json_loads(pipeline_canonical_json(row))
@@ -805,7 +812,7 @@ class SinkExecutor:
                 raise OrchestrationInvariantError("sink-effect row canonicalization did not produce a mapping")
             canonical_rows.append(normalized)
         candidates = tuple(
-            SinkEffectMemberCandidate(token_id=token.token_id, row=row, pending_identity=pending_identity)
+            SinkEffectMemberCandidate(token_id=token.token_id, row=row, pending_identity=pending_identity, routing_context=routing_context)
             for token, row in zip(tokens, canonical_rows, strict=True)
         )
         members = resolve_sink_effect_members(self._factory, candidates)  # type: ignore[arg-type]
@@ -1169,6 +1176,16 @@ class SinkExecutor:
                     "primary_effect_id": primary_effect_id_by_token[token.token_id],
                 },
                 primary_effect_id=primary_effect_id_by_token[token.token_id],
+                routing_context=(
+                    SinkEffectRoutingContext(
+                        outcome=TerminalOutcome.TRANSIENT,
+                        path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
+                        error_hash=diversion_error_hashes[index],
+                        primary_effect_id=primary_effect_id_by_token[token.token_id],
+                    )
+                    if isinstance(failsink, SinkEffectAuditContextCapability) and failsink.requires_audit_context
+                    else None
+                ),
             )
             for token, index, _state in primary_divert_states
         )

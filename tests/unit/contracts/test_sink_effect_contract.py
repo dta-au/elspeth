@@ -327,9 +327,10 @@ def test_sink_effect_protocol_has_independent_kind_capability_and_exact_methods(
                 "pending_identity_hash",
                 "member_effect_id",
                 "primary_effect_id",
+                "routing_context",
             ),
         ),
-        (SinkEffectMemberCandidate, ("token_id", "row", "pending_identity", "primary_effect_id")),
+        (SinkEffectMemberCandidate, ("token_id", "row", "pending_identity", "primary_effect_id", "routing_context")),
         (
             SinkEffectIdentity,
             (

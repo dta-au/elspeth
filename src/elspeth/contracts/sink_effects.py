@@ -11,11 +11,11 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, NoReturn, cast, final
+from typing import TYPE_CHECKING, Final, NoReturn, NotRequired, TypedDict, cast, final
 from urllib.parse import parse_qsl, urlsplit
 
 from elspeth.contracts.credential_material import CredentialTraversalPolicy, find_credential_material
-from elspeth.contracts.enums import CallType, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, CallType, TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, require_int
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.results import ArtifactDescriptor, require_no_artifact_uri_credentials
@@ -369,6 +369,60 @@ def _freeze_ordinal_sequence(ordinals_input: Sequence[int], field_name: str) -> 
     return ordinals
 
 
+class SinkEffectPendingIdentity(TypedDict):
+    error_hash: str | None
+    outcome: str
+    path: str
+    primary_effect_id: NotRequired[str]
+
+
+class SinkEffectMembershipEntry(TypedDict):
+    ingest_sequence: int
+    lineage_hash: str
+    ordinal: int
+    payload_hash: str
+    pending_identity_hash: str
+    primary_effect_id: str | None
+    row_id: str
+    token_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class SinkEffectRoutingContext:
+    """Producer-declared disposition and audit reason reference, without diagnostics."""
+
+    outcome: TerminalOutcome
+    path: TerminalPath
+    error_hash: str | None
+    primary_effect_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.outcome) is not TerminalOutcome or type(self.path) is not TerminalPath:
+            raise TypeError("routing context requires exact terminal enums")
+        if (self.outcome, self.path) not in _LEGAL_TERMINAL_PAIRS:
+            raise ValueError("routing context requires a legal terminal pair")
+        requires_error = self.outcome is TerminalOutcome.FAILURE or self.path is TerminalPath.SINK_FALLBACK_TO_FAILSINK
+        if requires_error != (self.error_hash is not None):
+            raise ValueError("routing context error reference does not match its terminal pair")
+        if self.error_hash is not None and (type(self.error_hash) is not str or re.fullmatch(r"[0-9a-f]{16}", self.error_hash) is None):
+            raise ValueError("routing context error reference must be lowercase hex16")
+        if (self.path is TerminalPath.SINK_FALLBACK_TO_FAILSINK) != (self.primary_effect_id is not None):
+            raise ValueError("routing context primary linkage must match sink fallback")
+        if self.primary_effect_id is not None:
+            _require_lower_hex_64(self.primary_effect_id, "primary_effect_id")
+
+    def pending_identity(self) -> SinkEffectPendingIdentity:
+        """Reproduce the existing PRIMARY/FAILSINK identity recipe exactly."""
+        identity: SinkEffectPendingIdentity = {"error_hash": self.error_hash, "outcome": self.outcome.value, "path": self.path.value}
+        if self.primary_effect_id is not None:
+            identity["primary_effect_id"] = self.primary_effect_id
+        return identity
+
+    @property
+    def identity_hash(self) -> str:
+        return sha256(canonical_json(self.pending_identity()).encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class SinkEffectMemberCandidate:
     """One exact sink-boundary row awaiting durable lineage ordering."""
@@ -377,11 +431,14 @@ class SinkEffectMemberCandidate:
     row: Mapping[str, object]
     pending_identity: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
     primary_effect_id: str | None = None
+    routing_context: SinkEffectRoutingContext | None = None
 
     def __post_init__(self) -> None:
         _require_nonempty_string(self.token_id, "token_id")
         if self.primary_effect_id is not None:
             _require_lower_hex_64(self.primary_effect_id, "primary_effect_id")
+        if self.routing_context is not None and type(self.routing_context) is not SinkEffectRoutingContext:
+            raise TypeError("routing_context must be exact SinkEffectRoutingContext or None")
         frozen_row = _freeze_canonical_row_value(self.row, "row")
         if not isinstance(frozen_row, Mapping):
             raise TypeError("row must be a mapping")
@@ -403,6 +460,7 @@ class SinkEffectMember:
     pending_identity_hash: str = field(default=_EMPTY_IDENTITY_HASH)
     member_effect_id: str | None = None
     primary_effect_id: str | None = None
+    routing_context: SinkEffectRoutingContext | None = None
 
     def __post_init__(self) -> None:
         require_int(self.ordinal, "ordinal", min_value=0)
@@ -413,6 +471,13 @@ class SinkEffectMember:
         _require_lower_hex_64(self.lineage_hash, "lineage_hash")
         _require_lower_hex_64(self.payload_hash, "payload_hash")
         _require_lower_hex_64(self.pending_identity_hash, "pending_identity_hash")
+        if self.routing_context is not None:
+            if type(self.routing_context) is not SinkEffectRoutingContext:
+                raise TypeError("routing_context must be exact SinkEffectRoutingContext or None")
+            if self.routing_context.identity_hash != self.pending_identity_hash:
+                raise ValueError("routing context must bind the exact pending identity hash")
+            if self.routing_context.primary_effect_id != self.primary_effect_id:
+                raise ValueError("routing context must match the member primary linkage")
         try:
             lineage = json.loads(self.lineage_json)
         except json.JSONDecodeError as exc:
@@ -1450,6 +1515,14 @@ class SinkEffectContract:
     uses this identity once, then trusts the declared contract directly and
     fails loudly when any required declaration or method is missing.
     """
+
+
+class SinkEffectAuditContextCapability:
+    """Nominal opt-in for an audit-context rendering representation."""
+
+    @property
+    def requires_audit_context(self) -> bool:
+        raise NotImplementedError
 
 
 class MemberSinkEffectCapability:
