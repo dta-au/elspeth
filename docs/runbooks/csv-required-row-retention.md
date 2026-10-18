@@ -65,7 +65,8 @@ inside one CSV cell, including nested values and heterogeneous keys. It is the
 sink-boundary row, which may include transformation or linked-diversion fields;
 it is not a copy of original source bytes or Python numeric spelling.
 
-`outcome` and `path` are the recorded processing categories. `error_hash` is
+`outcome` and `path` are producer-declared processing categories. Landscape
+finalizes the corresponding token outcomes after CSV publication. `error_hash` is
 the authoritative audit reason fingerprint scoped by the run and token; it
 is not a unique diagnostic-record ID or the full diagnostic text. Retain the
 related Landscape evidence to investigate it. Linked sink fallback includes

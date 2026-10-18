@@ -29,6 +29,7 @@ from sqlalchemy import select
 
 from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
@@ -130,7 +131,14 @@ class _Turn:
         responses = [_raw_response(*self.calls), _text_response()]
 
         async def _llm(
-            messages: Any, tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+            messages: Any,
+            tools: Any,
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
         ) -> _AdmittedLLMCompletion:
             self.sent_tool_lists.append(tools)
             return responses.pop(0) if responses else _text_response()

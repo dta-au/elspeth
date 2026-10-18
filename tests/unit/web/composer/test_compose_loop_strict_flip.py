@@ -24,14 +24,19 @@ import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
+from uuid import UUID
 
+import httpx
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
-from elspeth.web.composer.service import ComposerAvailability
+from elspeth.web.composer.prompt_guard import PromptGuardMount
+from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
+from elspeth.web.prompt_guard_config import PromptGuardSettings
 from tests.unit.web.composer._helpers import (
     FakeChoice,
     FakeFunction,
@@ -70,9 +75,70 @@ def _settings(**overrides: Any) -> WebSettings:
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
         "shareable_link_signing_key": b"\x00" * 32,
+        "composer_prompt_guard_mode": "required",
+        "composer_prompt_guard": PromptGuardSettings(
+            endpoint="https://primary-shield.example.test", subscription_key="offline-primary-shield"
+        ),
+        "composer_advisor_prompt_guard": PromptGuardSettings(
+            endpoint="https://advisor-shield.example.test", subscription_key="offline-advisor-shield"
+        ),
     }
     values.update(overrides)
     return WebSettings(**values)
+
+
+def _install_required_azure_guards(monkeypatch: pytest.MonkeyPatch, *, user_prompt: str) -> list[httpx.Request]:
+    """Fake Azure HTTP only; retain the real guard, custody and SQL audit."""
+    requests: list[httpx.Request] = []
+
+    def shield_response(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.host in {"primary-shield.example.test", "advisor-shield.example.test"}
+        assert request.url.path == "/contentsafety/text:shieldPrompt"
+        assert request.url.params["api-version"] == "2024-09-01"
+        payload = json.loads(request.content)
+        assert type(payload) is dict and set(payload) == {"userPrompt", "documents"}
+        assert payload["userPrompt"] == user_prompt
+        assert type(payload["documents"]) is list
+        assert all(type(document) is str for document in payload["documents"])
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _document in payload["documents"]],
+            },
+        )
+
+    def mount(settings: PromptGuardSettings | None) -> PromptGuardMount:
+        assert type(settings) is PromptGuardSettings
+        return PromptGuardMount(AzurePromptGuardClient(settings, http_transport=httpx.MockTransport(shield_response)))
+
+    monkeypatch.setattr("elspeth.web.composer.provider_gateway.build_prompt_guard_mount", mount, raising=True)
+    monkeypatch.setattr("elspeth.web.composer.service.build_prompt_guard_mount", mount, raising=True)
+    return requests
+
+
+async def _assert_required_guard_audits(service: ComposerServiceImpl, session_id: str, *, expected: int) -> None:
+    assert expected > 0
+    sessions = service._sessions_service
+    assert sessions is not None
+    messages = await sessions.get_messages(UUID(session_id), limit=None, include_private_evidence=False)
+    checks = [
+        entry["check"]
+        for message in messages
+        if message.role == "audit" and message.tool_calls is not None
+        for entry in message.tool_calls
+        if entry["_kind"] == "prompt_guard_audit"
+    ]
+    assert len(checks) == expected
+    assert len({check["operation_id"] for check in checks}) == 1
+    assert len({check["operation_epoch"] for check in checks}) == 1
+    assert all(
+        (check["role"], check["adapter"], check["mode"], check["disposition"], check["reason"])
+        == ("composer", "azure_prompt_shields", "required", "allow", "clean")
+        for check in checks
+    )
 
 
 def _empty_state() -> CompositionState:
@@ -107,17 +173,20 @@ def _strict_flags(tools: list[dict[str, Any]]) -> list[object]:
     ids=["openrouter_preferred", "openrouter_off", "default_gpt_5_5", "gpt_5_5_forward_to_endpoint"],
 )
 async def test_compose_turn_sends_and_records_the_resolved_dialect(
-    overrides: dict[str, Any], dialect: ToolContractDialect, strict_count: int
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, Any], dialect: ToolContractDialect, strict_count: int
 ) -> None:
+    shield_requests = _install_required_azure_guards(monkeypatch, user_prompt="Build a CSV pipeline")
     service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_settings(**overrides))
 
     with patch("litellm.acompletion", new_callable=AsyncMock, return_value=_text()) as completion:
         result = await service.compose("Build a CSV pipeline", [], _empty_state(), session_id=session_id)
 
-    # The rootless build request receives one neutral retry; the resolved
-    # dialect must remain consistent on the original call and the repair.
-    assert completion.call_count == len(result.llm_calls) == 2
-    assert result.repair_turns_used == 1
+    assert shield_requests
+    await _assert_required_guard_audits(service, session_id, expected=completion.await_count)
+    # This supplied no-tool reply needs no repair. Check every actual request
+    # rather than requiring the retired lexical retry for a build phrase.
+    assert completion.call_count == len(result.llm_calls) == 1
+    assert result.repair_turns_used == 0
     for request, call in zip(completion.call_args_list, result.llm_calls, strict=True):
         sent = request.kwargs["tools"]
         assert len(sent) == 44
@@ -133,8 +202,9 @@ async def test_compose_turn_sends_and_records_the_resolved_dialect(
 
 
 @pytest.mark.asyncio
-async def test_a_freeform_compose_turn_makes_the_same_provider_calls_on_both_dialects() -> None:
+async def test_a_freeform_compose_turn_makes_the_same_provider_calls_on_both_dialects(monkeypatch: pytest.MonkeyPatch) -> None:
     """Control: a second provider call on the strict path turns this red."""
+    shield_requests = _install_required_azure_guards(monkeypatch, user_prompt="Which models can I use?")
     counts: dict[str, int] = {}
     for label, overrides in (("strict", {}), ("off", {"composer_strict_tools": "off"})):
         service, session_id = _composer_service_with_session(
@@ -143,11 +213,13 @@ async def test_a_freeform_compose_turn_makes_the_same_provider_calls_on_both_dia
         responses = [_tool_turn("list_models", {}), _text()]
         with patch("litellm.acompletion", new_callable=AsyncMock, side_effect=responses) as completion:
             await service.compose("Which models can I use?", [], _empty_state(), session_id=session_id)
+        await _assert_required_guard_audits(service, session_id, expected=completion.await_count)
         flags = _strict_flags(completion.call_args_list[0].kwargs["tools"])
         assert (True in flags) is (label == "strict")
         counts[label] = completion.await_count
 
     assert counts["strict"] == counts["off"] == 2
+    assert shield_requests
 
 
 # ---------------------------------------------------------------- openai_strict counterparts of NONE-only pins
