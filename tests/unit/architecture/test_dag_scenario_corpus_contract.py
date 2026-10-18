@@ -976,7 +976,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # version fields changed; normalized case semantics and every other byte match.
 # 0.8.6 version cut: the same eight runtime-derived fields advance; canonical
 # cases and all other bytes match after engine-version-only normalization.
-EXPECTED_CASE_REGISTRY_SHA256 = "845430e0f91329165bfe124cb5917d46fb51519e5c5db1247af3eb1c2ad899fd"
+# 0.8.9 source admission: the JSON source provenance literal advances to
+# 3f3ae45367ec0636. Reversing that token restores every prior manifest byte;
+# the canonical loader combines it with the candidate's eight 0.8.9 runtime
+# version fields to derive this registry digest from the updated cases.
+EXPECTED_CASE_REGISTRY_SHA256 = "a7f0cf5da4b704b8f171d16c9a7601423eba1cd5753ce9dfac8e114570f0023d"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
