@@ -101,6 +101,16 @@ def _assert_example_pricing(resolved: dict[str, Any]) -> None:
         for entry in resolved["extraEnvironment"]["value"]:
             if "value" in entry:
                 patch.setenv(entry["name"], entry["value"])
+            elif entry["name"] in {"ELSPETH_WEB__COMPOSER_PROMPT_GUARD", "ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD"}:
+                patch.setenv(
+                    entry["name"],
+                    json.dumps(
+                        {
+                            "endpoint": "https://guard.example.test",
+                            "subscription_key": "synthetic-guard-value-for-offline-test",
+                        }
+                    ),
+                )
             else:
                 patch.setenv(entry["name"], "synthetic-secret-value-for-offline-test")
         settings = settings_from_env()

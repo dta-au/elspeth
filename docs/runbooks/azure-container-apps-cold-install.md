@@ -364,6 +364,38 @@ unset PGPASSWORD ELSPETH_SCHEMA_OWNER_PASSWORD ELSPETH_RUNTIME_PASSWORD
 ```
 
 Only the two schema-owner database URLs belong in the schema-owner vault.
+Before protected authoring, configure both Azure AI Content Safety Prompt
+Shields roles. Put one complete guard JSON object in each operator-private file
+`$SECRET_VALUE_DIR/elspeth-composer-prompt-guard` and
+`$SECRET_VALUE_DIR/elspeth-composer-advisor-prompt-guard`. Keep these files mode
+`0600`, outside Git, and populate them through the operator's secret manager.
+Each object contains `adapter: azure_prompt_shields`, the HTTPS Content Safety
+resource-origin `endpoint`, its dedicated `subscription_key`, and optionally
+`timeout_seconds` (a JSON number, default `10.0`). The exact object shape and
+validation rules are in the [Composer prompt guard reference](../reference/composer-prompt-guard.md).
+These are separate from model-provider credentials; neither role inherits the
+other role's guard.
+
+Store each entire JSON object as a versioned secret in the runtime vault:
+
+```bash
+for secret_name in elspeth-composer-prompt-guard elspeth-composer-advisor-prompt-guard; do
+  test -s "$SECRET_VALUE_DIR/$secret_name"
+  az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "$secret_name" \
+    --file "$SECRET_VALUE_DIR/$secret_name" --encoding utf-8 --query id --output tsv \
+    >"$SECRET_VERSION_DIR/$secret_name.version"
+done
+```
+
+The application example uses ACA `secretRef` entries to inject these complete
+objects into `ELSPETH_WEB__COMPOSER_PROMPT_GUARD` and
+`ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD`. The settings loader parses each
+value as JSON; a secret pointer or environment reference inside
+`subscription_key` is not expanded. Leave the default guard mode `required`:
+a missing role disables Composer, and a configured refusal prevents dispatch.
+Configuration and availability do not establish guard service health or detector
+accuracy; qualify the configured resource separately as described in the reference.
+
 Upload the primary/advisor endpoint keys and SSO/provider secrets the same way
 to the runtime vault, recording each returned ID in
 `$SECRET_VERSION_DIR/<secret-name>.version`. The tracked application example
@@ -403,12 +435,16 @@ test ! -e "$APPLICATION_PARAMETERS"
 ENVIRONMENT_DOMAIN=$(jq -er '.environmentDefaultDomain.value' "$OPERATOR_DIR/environment-outputs.json")
 FQDN="elspeth-web.${ENVIRONMENT_DOMAIN}"
 PUBLIC_BASE_URL="https://${FQDN}"
-jq --rawfile azure "$SECRET_VERSION_DIR/elspeth-azure-api-key.version" \
+jq --rawfile guard "$SECRET_VERSION_DIR/elspeth-composer-prompt-guard.version" \
+  --rawfile advisor_guard "$SECRET_VERSION_DIR/elspeth-composer-advisor-prompt-guard.version" \
+  --rawfile azure "$SECRET_VERSION_DIR/elspeth-azure-api-key.version" \
   --rawfile client "$SECRET_VERSION_DIR/elspeth-sso-client-secret.version" \
   --rawfile transaction "$SECRET_VERSION_DIR/elspeth-sso-transaction-secret.version" \
   --arg public_base_url "$PUBLIC_BASE_URL" '
   .extraSecrets |= map(
-    if .name == "azure-api-key" then .keyVaultUrl = ($azure | rtrimstr("\n"))
+    if .name == "composer-prompt-guard" then .keyVaultUrl = ($guard | rtrimstr("\n"))
+    elif .name == "composer-advisor-prompt-guard" then .keyVaultUrl = ($advisor_guard | rtrimstr("\n"))
+    elif .name == "azure-api-key" then .keyVaultUrl = ($azure | rtrimstr("\n"))
     elif .name == "sso-client-secret" then .keyVaultUrl = ($client | rtrimstr("\n"))
     elif .name == "sso-transaction-secret" then .keyVaultUrl = ($transaction | rtrimstr("\n"))
     else . end) |
