@@ -163,6 +163,105 @@ class ContextLengthError(LLMClientError):
         super().__init__(message, retryable=False)
 
 
+@dataclass(frozen=True, slots=True)
+class _UnusableContentFailure:
+    error: LLMClientError
+    audit_type: str
+    audit_category: LLMErrorCategory
+
+
+_ABSENT_COMPLETION_FIELD = object()
+
+
+@trust_boundary(
+    tier=3,
+    source="captured SDK/gateway completion JSON envelope, including frozen mappings and sequences",
+    source_param="raw_response",
+    suppresses=("R1",),
+    invariant=(
+        "returns an owned fixed-message failure for malformed or mismatched optional first-choice JSON evidence; "
+        "never coerces unknown values or grants policy meaning to another message's refusal"
+    ),
+    non_raising=True,
+)
+def classify_unusable_content(
+    *,
+    content: str | None,
+    raw_response: object,
+    sdk_finish_reason: object = _ABSENT_COMPLETION_FIELD,
+) -> _UnusableContentFailure:
+    """Classify null/blank text using only matching first-choice evidence.
+
+    Callers decide whether blank text is admissible. Optional raw fields may
+    be absent, but contradictory or malformed evidence cannot assert refusal.
+    Provider messages and unrecognized values never enter public diagnostics.
+    """
+    malformed = _UnusableContentFailure(
+        LLMClientError("LLM returned unusable content with malformed response evidence"), "LLMClientError", "client"
+    )
+    inconsistent = _UnusableContentFailure(
+        LLMClientError("LLM returned unusable content with inconsistent response evidence"), "LLMClientError", "client"
+    )
+    raw_finish_reason: object = _ABSENT_COMPLETION_FIELD
+    refusal: str | None = None
+    if raw_response is not None:
+        if not isinstance(raw_response, Mapping):
+            return malformed
+        if "choices" in raw_response:
+            choices = raw_response["choices"]
+            if not isinstance(choices, Sequence) or isinstance(choices, str | bytes | bytearray) or not choices:
+                return malformed
+            first_choice = choices[0]
+            if not isinstance(first_choice, Mapping):
+                return malformed
+            if "finish_reason" in first_choice:
+                raw_finish_reason = first_choice["finish_reason"]
+                if raw_finish_reason is not None and not isinstance(raw_finish_reason, str):
+                    return malformed
+            if "message" in first_choice:
+                message = first_choice["message"]
+                if not isinstance(message, Mapping):
+                    return malformed
+                if "content" in message:
+                    raw_content = message["content"]
+                    if raw_content is not None and not isinstance(raw_content, str):
+                        return malformed
+                    if raw_content != content:
+                        return inconsistent
+                    raw_refusal = message.get("refusal")
+                    if isinstance(raw_refusal, str) and raw_refusal.strip():
+                        refusal = raw_refusal
+    finish_reason: object
+    if sdk_finish_reason is not _ABSENT_COMPLETION_FIELD:
+        if sdk_finish_reason is not None and not isinstance(sdk_finish_reason, str):
+            return malformed
+        if raw_finish_reason is not _ABSENT_COMPLETION_FIELD and raw_finish_reason != sdk_finish_reason:
+            return inconsistent
+        finish_reason = sdk_finish_reason
+    else:
+        finish_reason = raw_finish_reason
+    if finish_reason == "content_filter" or refusal is not None:
+        description = "null content" if content is None else "empty content"
+        return _UnusableContentFailure(
+            ContentPolicyError(f"LLM returned {description} with an explicit provider refusal"),
+            "ContentPolicyError",
+            "content_policy",
+        )
+    if finish_reason == "length":
+        return _UnusableContentFailure(
+            LLMClientError("LLM returned empty content after exhausting its output token budget"), "LLMClientError", "client"
+        )
+    if finish_reason == "tool_calls":
+        return _UnusableContentFailure(
+            LLMClientError("LLM returned tool_calls response (not supported by ELSPETH)"),
+            "UnsupportedResponseError",
+            "response_processing",
+        )
+    return _UnusableContentFailure(
+        LLMClientError("LLM returned empty content without an explicit provider refusal"), "LLMClientError", "client"
+    )
+
+
 def public_llm_error_category(error: LLMClientError) -> LLMErrorCategory:
     """Name the public exception behavior retained in an LLM audit error."""
     return error.category
@@ -378,6 +477,7 @@ class AuditedLLMClient(AuditedClientBase):
         llm_call_governance: LLMCallGovernance | None = None,
         max_tokens_param: Literal["max_tokens", "max_completion_tokens"] = "max_tokens",
         call_mode_session: CallModeSession | None = None,
+        require_nonempty_content: bool = False,
     ) -> None:
         """Initialize audited LLM client.
 
@@ -391,6 +491,8 @@ class AuditedLLMClient(AuditedClientBase):
             limiter: Optional rate limiter for throttling requests
             token_id: Optional token identity for telemetry correlation
             operation_id: Optional operation parent for runtime preflight calls
+            require_nonempty_content: Refuse blank text before recording SUCCESS.
+                False preserves the generic client's blank-string contract.
             max_tokens_param: Wire name the output budget is sent and recorded
                 under. Reasoning deployments reject ``max_tokens`` and require
                 ``max_completion_tokens``; the choice is the provider's, never
@@ -414,6 +516,7 @@ class AuditedLLMClient(AuditedClientBase):
         self._pricing_model = pricing_model
         self._max_tokens_param = max_tokens_param
         self._call_mode_session = call_mode_session
+        self._require_nonempty_content = require_nonempty_content
 
     def _replay_completion(
         self,
@@ -1050,63 +1153,12 @@ class AuditedLLMClient(AuditedClientBase):
             )
             raise LLMClientError(error_msg, retryable=False) from attr_exc
 
-        if content is None:
-            # Tool call responses have no text content — ELSPETH does not support
-            # tool_calls, so this is an error (not a fabrication opportunity).
-            # Record the call as ERROR with raw response preserved, then raise.
-            if finish_reason == "tool_calls":
-                error_msg = "LLM returned tool_calls response (not supported by ELSPETH)"
-                response_dto = LLMCallResponse(
-                    content="",  # No text content available
-                    model=response_model,
-                    pricing_model=pricing_model,
-                    provider_cost=provider_cost,
-                    provider_cost_source=provider_cost_source,
-                    usage=usage,
-                    raw_response=raw_response,
-                )
-                self._record_image_call(
-                    messages=messages,
-                    llm_call_attempt=llm_call_attempt,
-                    call_index=call_index,
-                    call_type=CallType.LLM,
-                    status=CallStatus.ERROR,
-                    request_data=request_dto,
-                    response_data=response_dto,
-                    error=LLMCallError(
-                        pricing_model=pricing_model,
-                        provider_cost=provider_cost,
-                        provider_cost_source=provider_cost_source,
-                        type="UnsupportedResponseError",
-                        message=error_msg,
-                        retryable=False,
-                        category="response_processing",
-                    ),
-                    latency_ms=latency_ms,
-                    approved_prompt_artifact_hash=approved_prompt_artifact_hash,
-                    token_usage=usage,
-                )
-                # Telemetry emitted AFTER successful Landscape recording — keeps
-                # unsupported tool_calls failures counted alongside the other
-                # error branches (elspeth-a960d22540).
-                self._emit_telemetry_after_audit(
-                    call_status=CallStatus.ERROR,
-                    latency_ms=latency_ms,
-                    request_data=request_data,
-                    request_payload=request_dto,
-                    response_data=response_dto.to_dict(),
-                    response_payload=response_dto,
-                    token_usage=usage if usage.has_data else None,
-                )
-                raise LLMClientError(error_msg, retryable=False)
-
-            # Record the call BEFORE raising — the LLM call happened and must
-            # appear in the audit trail even though the response is unusable.
-            # Without this, content-filtered calls vanish from the audit trail
-            # and create unexplained call-index gaps.
-            error_msg = "LLM returned null content (likely content-filtered by provider)"
+        if content is None or (isinstance(content, str) and self._require_nonempty_content and not content.strip()):
+            # Admission precedes the authoritative SUCCESS record. Preserve the
+            # observed response and usage even though its text is unusable.
+            failure = classify_unusable_content(content=content, raw_response=raw_response, sdk_finish_reason=finish_reason)
             response_dto = LLMCallResponse(
-                content="",  # Null content normalized for DTO
+                content="" if content is None else content,
                 model=response_model,
                 pricing_model=pricing_model,
                 provider_cost=provider_cost,
@@ -1126,17 +1178,17 @@ class AuditedLLMClient(AuditedClientBase):
                     pricing_model=pricing_model,
                     provider_cost=provider_cost,
                     provider_cost_source=provider_cost_source,
-                    type="ContentPolicyError",
-                    message=error_msg,
+                    type=failure.audit_type,
+                    message=str(failure.error),
                     retryable=False,
-                    category="content_policy",
+                    category=failure.audit_category,
                 ),
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=usage,
             )
 
-            # Telemetry emitted AFTER successful Landscape recording (even for null-content errors)
+            # Telemetry emitted AFTER successful Landscape recording.
             # Unlike SDK errors, we have response data here — the HTTP call succeeded
             response_data = response_dto.to_dict()
             self._emit_telemetry_after_audit(
@@ -1149,7 +1201,7 @@ class AuditedLLMClient(AuditedClientBase):
                 token_usage=usage if usage.has_data else None,
             )
 
-            raise ContentPolicyError(error_msg)
+            raise failure.error
 
         # Tier 3 boundary: validate content is actually str.
         # Provider bugs or SDK schema drift could return non-str content

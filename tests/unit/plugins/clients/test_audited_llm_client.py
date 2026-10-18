@@ -312,8 +312,9 @@ def test_execution_pricing_identity_does_not_change_routing_or_returned_model(co
     )
     with patch.object(litellm, "cost_per_token", return_value=(0.01, 0.02)) as calculator:
         if content is None:
-            with pytest.raises(ContentPolicyError):
+            with pytest.raises(LLMClientError) as error:
                 client.chat_completion(model="operator-datazone-alias", messages=[ChatMessage(role="user", content="Hello")])
+            assert type(error.value) is LLMClientError
         else:
             result = client.chat_completion(model="operator-datazone-alias", messages=[ChatMessage(role="user", content="Hello")])
             assert result.model == "provider-concrete-model"
@@ -1357,11 +1358,10 @@ class TestAuditedLLMClient:
     # Per CONTRIBUTING.md §Code Standards - no backwards compatibility code.
 
     def test_null_content_raises_content_policy_error(self) -> None:
-        """None content from LLM raises ContentPolicyError — not fabricated to "".
+        """Null content with explicit content_filter raises ContentPolicyError.
 
-        The OpenAI API returns content=None when the model refuses (content
-        filtering). Previously this was fabricated to "" via `or ""`, hiding
-        the refusal from the audit trail.
+        Retain the actual provider refusal and its audit evidence rather than
+        fabricating a successful empty string via `or ""`.
         """
         execution = self._create_mock_execution()
 
@@ -1933,9 +1933,9 @@ class TestBug4_1_ContentExtractionRecordsBeforeReraising:
 class TestContentFabrication:
     """Null content from LLM must raise, not fabricate empty string.
 
-    The OpenAI API returns content=None when the model refuses to respond
-    (content filtering). `content or ""` conflates None (refused) with ""
-    (legitimately empty), fabricating data in the audit trail.
+    Explicit content_filter establishes policy refusal in these null cases.
+    `content or ""` would conflate missing text with an admitted empty string,
+    fabricating success in the audit trail.
     """
 
     @staticmethod

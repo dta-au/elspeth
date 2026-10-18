@@ -184,7 +184,7 @@ def test_governance_guards_sdk_and_settles_error_once(preflight: bool, refused: 
 @pytest.mark.parametrize(
     ("content", "finish_reason", "error_type", "error_message"),
     [
-        ("   ", "stop", ContentPolicyError, "empty content"),
+        ("   ", "stop", LLMClientError, "empty content"),
         ("partial", "content_filter", LLMClientError, "unusable finish reason"),
     ],
 )
@@ -210,9 +210,10 @@ def test_runtime_preflight_rejects_unusable_completion(
     )
     provider._underlying_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
 
-    with pytest.raises(error_type, match=error_message):
+    with pytest.raises(error_type, match=error_message) as error:
         provider.runtime_preflight(operation_id="op-1", temperature=None, model="test-model", coordination_token=_LEADER_TOKEN)
 
+    assert type(error.value) is error_type
     assert len(recorder.operation_calls) == 1
     assert recorder.operation_calls[0]["approved_prompt_artifact_hash"] is None
     assert provider._llm_clients == {}
@@ -666,9 +667,8 @@ class TestExecuteQuery:
         assert result.finish_reason is None
         assert result.content == "hi"
 
-    def test_empty_content_raises_content_policy_error(self, provider: AzureLLMProvider) -> None:
-        """Empty string content (from AuditedLLMClient's None→'' conversion)
-        must raise ContentPolicyError, not ValueError from LLMQueryResult invariant."""
+    def test_empty_filtered_content_raises_content_policy_error(self, provider: AzureLLMProvider) -> None:
+        """The post-response guard retains an explicit content_filter refusal."""
         client = FakeLLMClient(
             response=_make_llm_response(
                 content="",
@@ -690,8 +690,8 @@ class TestExecuteQuery:
                 ),
             )
 
-    def test_whitespace_only_content_raises_content_policy_error(self, provider: AzureLLMProvider) -> None:
-        """Whitespace-only content from provider must raise ContentPolicyError."""
+    def test_whitespace_without_refusal_raises_client_error(self, provider: AzureLLMProvider) -> None:
+        """Whitespace alone cannot establish a provider policy refusal."""
         client = FakeLLMClient(
             response=_make_llm_response(
                 content="   ",
@@ -699,7 +699,7 @@ class TestExecuteQuery:
             )
         )
 
-        with _provider_llm_client(provider, client), pytest.raises(ContentPolicyError, match="empty content"):
+        with _provider_llm_client(provider, client), pytest.raises(LLMClientError, match="empty content") as error:
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
@@ -712,10 +712,10 @@ class TestExecuteQuery:
                     token_id="tok-1",
                 ),
             )
+        assert type(error.value) is LLMClientError
 
     def test_empty_content_with_tool_calls_finish_reason(self, provider: AzureLLMProvider) -> None:
-        """Tool-call responses (content=None→'', finish_reason=tool_calls)
-        must raise LLMClientError, not ValueError."""
+        """A supplied historical tool-call response must raise LLMClientError."""
         client = FakeLLMClient(
             response=_make_llm_response(
                 content="",
