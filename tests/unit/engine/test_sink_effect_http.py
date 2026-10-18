@@ -277,21 +277,19 @@ def test_each_durable_member_attempt_gets_fresh_transport_and_revokes_previous_a
 
         assert result.effect.state.value == "finalized"
         assert sink.prepare_calls == 1
-        assert len(http_factory.posts) == len({id(post) for post in http_factory.posts}) == 4
-        assert [post.sends for post in http_factory.posts] == [1, 1, 1, 1]
-        assert sink.revoked_during_next_callback == 3
+        assert len(http_factory.posts) == len({id(post) for post in http_factory.posts}) == 2
+        assert [post.sends for post in http_factory.posts] == [1, 1]
+        assert sink.revoked_during_next_callback == 1
         attempts = recorder.execution.sink_effects.get_attempts_for_run(run_id)
         assert [(attempt.action.value, attempt.member_ordinal, attempt.state.value) for attempt in attempts] == [
             ("inspect", None, "returned"),
-            ("reconcile", 0, "returned"),
             ("commit", 0, "returned"),
-            ("reconcile", 1, "returned"),
             ("commit", 1, "returned"),
         ]
         for post in http_factory.posts:
             with pytest.raises(FrameworkBugError, match="authority was revoked"):
                 post.post_json(SinkEffectHTTPPostRequest({"retained": True}))
-        assert [post.sends for post in http_factory.posts] == [1, 1, 1, 1]
+        assert [post.sends for post in http_factory.posts] == [1, 1]
     finally:
         db.close()
 
@@ -303,6 +301,17 @@ def test_callback_failure_revokes_capability_and_marks_durable_attempt_response_
         recorder = make_factory(db)
         run_id, sink_id, members = _pipeline_members(recorder, 1)
         http_factory = _AttemptFactory(recorder)
+        if action == "status":
+            # Status is a recovery operation: create an actual lost COMMIT
+            # through the public entry before testing its callback failure.
+            with pytest.raises(RuntimeError, match="controlled callback failure"):
+                SinkEffectCoordinator(
+                    factory=recorder,
+                    worker_id="worker-a",
+                    coordination_token=leader_token_for(db, run_id),
+                    http_post_factory=http_factory,
+                    http_environment=SinkEffectHTTPEnvironment(lambda event: None),
+                ).execute(_execution_request(run_id, sink_id, members), _HTTPMemberSink("commit"))
         with pytest.raises(RuntimeError, match="controlled callback failure"):
             SinkEffectCoordinator(
                 factory=recorder,
@@ -311,7 +320,9 @@ def test_callback_failure_revokes_capability_and_marks_durable_attempt_response_
                 http_post_factory=http_factory,
                 http_environment=SinkEffectHTTPEnvironment(lambda event: None),
             ).execute(_execution_request(run_id, sink_id, members), _HTTPMemberSink(action))
-        assert recorder.execution.sink_effects.get_attempts_for_run(run_id)[-1].state.value == "response_lost"
+        last_attempt = recorder.execution.sink_effects.get_attempts_for_run(run_id)[-1]
+        assert last_attempt.action.value == ("reconcile" if action == "status" else "commit")
+        assert last_attempt.state.value == "response_lost"
         post = http_factory.posts[-1]
         assert post.sends == 1
         with pytest.raises(FrameworkBugError, match="authority was revoked"):
@@ -322,11 +333,21 @@ def test_callback_failure_revokes_capability_and_marks_durable_attempt_response_
 
 
 @pytest.mark.parametrize("interrupt", ["shutdown", "lease_takeover", "coordination_latch"])
-def test_changed_authority_after_binding_suppresses_wire_and_preserves_uncertain_attempt(interrupt):
+@pytest.mark.parametrize("recovery", [False, True])
+def test_changed_authority_after_binding_suppresses_wire_and_preserves_uncertain_attempt(interrupt, recovery):
     db = make_landscape_db()
     try:
         recorder = make_factory(db)
         run_id, sink_id, members = _pipeline_members(recorder, 1)
+        if recovery:
+            with pytest.raises(RuntimeError, match="controlled callback failure"):
+                SinkEffectCoordinator(
+                    factory=recorder,
+                    worker_id="worker-a",
+                    coordination_token=leader_token_for(db, run_id),
+                    http_post_factory=_AttemptFactory(recorder),
+                    http_environment=SinkEffectHTTPEnvironment(lambda event: None),
+                ).execute(_execution_request(run_id, sink_id, members), _HTTPMemberSink("commit"))
         shutdown = threading.Event()
         latch_lost = False
 
@@ -384,7 +405,9 @@ def test_changed_authority_after_binding_suppresses_wire_and_preserves_uncertain
         # intent stays unsettled for the next generation's recovery instead
         # of the stale callback writing an authoritative terminal result.
         expected_state = "intent" if interrupt == "lease_takeover" else "response_lost"
-        assert recorder.execution.sink_effects.get_attempts_for_run(run_id)[-1].state.value == expected_state
+        last_attempt = recorder.execution.sink_effects.get_attempts_for_run(run_id)[-1]
+        assert last_attempt.action.value == ("reconcile" if recovery else "commit")
+        assert last_attempt.state.value == expected_state
     finally:
         db.close()
 
@@ -502,18 +525,18 @@ def test_actual_http_and_synthetic_member_results_have_distinct_operation_indice
             http_post_factory=_AuditedFactory(),
             http_environment=SinkEffectHTTPEnvironment(lambda event: None),
         ).execute(_execution_request(run_id, sink_id, members), _HTTPMemberSink())
-        assert route.call_count == 2
+        assert route.call_count == 1
         (operation,) = recorder.execution.get_operations_for_run(run_id)
         calls = recorder.execution.get_operation_calls(operation.operation_id)
-        assert [call.call_index for call in calls] == [0, 1, 2, 3, 4]
-        assert len({call.call_id for call in calls}) == 5
+        assert [call.call_index for call in calls] == [0, 1, 2]
+        assert len({call.call_id for call in calls}) == 3
         assert all(call.operation_id == operation.operation_id and call.state_id is None for call in calls)
-        actual_http_calls = [calls[1], calls[3]]
-        synthetic_calls = [calls[0], calls[2], calls[4]]
+        actual_http_calls = [calls[1]]
+        synthetic_calls = [calls[0], calls[2]]
         assert all(call.request_ref is not None and call.response_ref is not None for call in actual_http_calls)
         assert all(call.request_ref is None and call.response_ref is None for call in synthetic_calls)
         attempts = recorder.execution.sink_effects.get_attempts_for_run(run_id)
-        assert [attempt.action.value for attempt in attempts] == ["inspect", "reconcile", "commit"]
+        assert [attempt.action.value for attempt in attempts] == ["inspect", "commit"]
         assert [attempt.request_hash for attempt in attempts] == [call.request_hash for call in synthetic_calls]
     finally:
         db.close()

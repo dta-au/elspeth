@@ -22,7 +22,13 @@ from elspeth.contracts.enums import CallStatus, CallType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape import LandscapeDB, run_coordination_repository
 from elspeth.core.landscape.execution.calls import CallAuditRepository
-from elspeth.core.landscape.schema import runs_table, sink_effect_members_table, sink_effects_table, token_outcomes_table
+from elspeth.core.landscape.schema import (
+    runs_table,
+    sink_effect_attempts_table,
+    sink_effect_members_table,
+    sink_effects_table,
+    token_outcomes_table,
+)
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionSeam
 from elspeth.plugins.sources.power_automate import PowerAutomateSource
 from tests.e2e.recovery.harness import spawn_database_process_with_pause
@@ -85,6 +91,7 @@ def test_remote_response_loss_reconciles_original_delivery_and_sticky_rejection(
         failed = invoke(tmp_path, pipeline_settings(tmp_path))
     assert failed.exit_code != 0, failed.output
     first_write = flow.requests("write")[0]
+    assert flow.requests("status") == []
     assert len(flow.actions()) == (0 if reject else 1)
     with (
         flow.transport(),
@@ -94,6 +101,7 @@ def test_remote_response_loss_reconciles_original_delivery_and_sticky_rejection(
         resumed = _resume(tmp_path, _run_id(tmp_path))
     assert resumed.exit_code == (2 if reject else 0), resumed.output
     assert len(flow.requests("read")) == 1
+    assert len(flow.requests("status")) == 1
     assert {request["delivery_id"] for request in flow.requests("status")} == {first_write["delivery_id"]}
     assert len(flow.requests("write")) == (2 if reject else 1)
     assert len(flow.actions()) == (0 if reject else 1)
@@ -119,16 +127,35 @@ def test_unknown_remote_evidence_never_resubmits(tmp_path: Path, unknown_reason:
     with flow.transport():
         resumed = _resume(tmp_path, _run_id(tmp_path))
     assert resumed.exit_code != 0, resumed.output
-    assert len(flow.requests("status")) == 2
+    assert len(flow.requests("status")) == 1
     assert flow.requests("write") == [write]
     assert len(flow.actions()) == 1
 
 
-def test_missing_ledger_with_late_pending_write_blocks_initial_resubmit(tmp_path: Path) -> None:
+def test_missing_ledger_with_prior_commit_blocks_late_pending_resubmit(tmp_path: Path) -> None:
     flow = DurablePowerAutomateFlow(tmp_path / "target.db", pages=[[{"record_id": "A", "result": "ok"}]])
     flow.absent_state = "unknown"
     release = Event()
     pending: Future[httpx.Response] | None = None
+
+    def interrupt_before_dispatch(self: SinkEffectCoordinator, seam: SinkEffectExecutionSeam) -> None:
+        if seam is SinkEffectExecutionSeam.BEFORE_EFFECT:
+            raise RuntimeError("controlled publication interruption")
+
+    # A durable COMMIT intent makes recovery conservative even when this
+    # controlled invocation stopped before dispatch. The delayed invocation
+    # below models the uncertainty the durable ledger must protect against.
+    with flow.transport(), patch.object(SinkEffectCoordinator, "_fault", interrupt_before_dispatch):
+        failed = invoke(tmp_path, pipeline_settings(tmp_path))
+    assert failed.exit_code != 0, failed.output
+    assert flow.requests("status") == flow.requests("write") == []
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
+        commits = (
+            connection.execute(select(sink_effect_attempts_table).where(sink_effect_attempts_table.c.action == "commit")).mappings().all()
+        )
+    assert len(commits) == 1
+    assert commits[0]["state"] == "intent"
+    assert commits[0]["member_ordinal"] == 0
 
     def delayed_old_invocation(body: dict[str, object]) -> httpx.Response:
         assert release.wait(timeout=10)
@@ -144,8 +171,8 @@ def test_missing_ledger_with_late_pending_write_blocks_initial_resubmit(tmp_path
         flow.after_status = queue_old_invocation
         try:
             with flow.transport():
-                failed = invoke(tmp_path, pipeline_settings(tmp_path))
-            assert failed.exit_code != 0
+                refused = _resume(tmp_path, _run_id(tmp_path))
+            assert refused.exit_code != 0, refused.output
             assert len(flow.requests("status")) == 1
             assert flow.requests("write") == []
             assert flow.actions() == []
@@ -154,6 +181,16 @@ def test_missing_ledger_with_late_pending_write_blocks_initial_resubmit(tmp_path
         assert pending is not None
         assert pending.result(timeout=5).json()["state"] == "applied"
     assert len(flow.actions()) == len(flow.requests("write")) == 1
+    assert len(flow.requests("status")) == 1
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
+        after = (
+            connection.execute(select(sink_effect_attempts_table).where(sink_effect_attempts_table.c.action == "commit")).mappings().all()
+        )
+    assert len(after) == 1
+    assert after[0]["attempt_id"] == commits[0]["attempt_id"]
+    assert after[0]["state"] == "response_lost"
+    # This proves no resubmission while an old invocation remains possible.
+    # It does not claim automatic reinspection after a settled UNKNOWN result.
 
 
 def test_partial_group_finalized_member_is_skipped_and_equal_rows_have_distinct_ids(tmp_path: Path) -> None:
@@ -182,7 +219,7 @@ def test_partial_group_finalized_member_is_skipped_and_equal_rows_have_distinct_
     assert resumed.exit_code == 0, resumed.output
     assert flow.actions() == before
     assert len(flow.requests("write")) == 2
-    assert len(flow.requests("status")) == 3
+    assert len(flow.requests("status")) == 1
     assert flow.requests("status")[-1]["delivery_id"] == before[1]["delivery_id"]
 
 

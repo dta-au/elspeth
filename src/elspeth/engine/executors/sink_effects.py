@@ -838,43 +838,53 @@ class SinkEffectCoordinator:
                 last_exact = (commit_result, attempt)
                 continue
 
-            latest_lost_commit = self._latest_attempt(
-                plan.effect_id,
-                action=SinkEffectAttemptAction.COMMIT,
-                state=SinkEffectAttemptState.RESPONSE_LOST,
-                member_ordinal=member.ordinal,
+            # Reconciliation resolves a possible earlier publication. A fresh
+            # member must first perform its configured upsert, even if the
+            # target currently differs. Every COMMIT defeats freshness: an
+            # intent may have dispatched, regardless of generation or result.
+            # Unexpected whole-effect history also retains recovery handling.
+            has_commit_history = any(
+                attempt.action is SinkEffectAttemptAction.COMMIT and attempt.member_ordinal in (member.ordinal, None)
+                for attempt in self._effects.get_attempts(plan.effect_id)
             )
-            returned_reconcile = self._returned_attempt(
-                plan.effect_id,
-                action=SinkEffectAttemptAction.RECONCILE,
-                request_hash=self._member_reconcile_request_hash(plan, member),
-                started_after=None if latest_lost_commit is None else latest_lost_commit.started_at,
-                member_ordinal=member.ordinal,
-            )
-            if returned_reconcile is None:
-                reconciliation, reconcile_attempt = self._reconcile_member(
-                    plan,
-                    member,
-                    effect_input,
-                    sink,
-                    ctx,
-                    lease,
-                    heartbeat,
+            if has_commit_history:
+                latest_lost_commit = self._latest_attempt(
+                    plan.effect_id,
+                    action=SinkEffectAttemptAction.COMMIT,
+                    state=SinkEffectAttemptState.RESPONSE_LOST,
+                    member_ordinal=member.ordinal,
+                )
+                returned_reconcile = self._returned_attempt(
+                    plan.effect_id,
+                    action=SinkEffectAttemptAction.RECONCILE,
+                    request_hash=self._member_reconcile_request_hash(plan, member),
+                    started_after=None if latest_lost_commit is None else latest_lost_commit.started_at,
+                    member_ordinal=member.ordinal,
+                )
+                if returned_reconcile is None:
+                    reconciliation, reconcile_attempt = self._reconcile_member(
+                        plan,
+                        member,
+                        effect_input,
+                        sink,
+                        ctx,
+                        lease,
+                        heartbeat,
+                        coordination_token=coordination_token,
+                    )
+                else:
+                    reconciliation, reconcile_attempt = returned_reconcile
+                self._effects.complete_member_result(
+                    reconcile_attempt.attempt_id,
+                    reconciliation,
+                    lease=lease,
                     coordination_token=coordination_token,
                 )
-            else:
-                reconciliation, reconcile_attempt = returned_reconcile
-            self._effects.complete_member_result(
-                reconcile_attempt.attempt_id,
-                reconciliation,
-                lease=lease,
-                coordination_token=coordination_token,
-            )
-            if reconciliation.kind is SinkEffectReconcileKind.UNKNOWN:
-                raise SinkEffectUnknownError(plan.effect_id)
-            if reconciliation.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR:
-                last_exact = (reconciliation, reconcile_attempt)
-                continue
+                if reconciliation.kind is SinkEffectReconcileKind.UNKNOWN:
+                    raise SinkEffectUnknownError(plan.effect_id)
+                if reconciliation.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR:
+                    last_exact = (reconciliation, reconcile_attempt)
+                    continue
 
             commit_result, commit_attempt = self._commit_member(
                 plan,

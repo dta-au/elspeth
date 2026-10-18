@@ -66,7 +66,7 @@ def test_real_pipeline_accounts_candidates_and_audits_exact_http_evidence(tmp_pa
     assert completed["failed"] == 0
     assert [action["data"]["record_id"] for action in flow.actions()] == ["A", "B"]
     assert [request["cursor"] for request in flow.requests("read")] == [None, "1"]
-    assert Counter(request["operation"] for request in flow.requests()) == {"read": 2, "status": 2, "write": 2}
+    assert Counter(request["operation"] for request in flow.requests()) == {"read": 2, "write": 2}
     store = FilesystemPayloadStore(tmp_path / "payloads")
     with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
         calls = connection.execute(select(calls_table)).mappings().all()
@@ -97,7 +97,7 @@ def test_real_pipeline_accounts_candidates_and_audits_exact_http_evidence(tmp_pa
             assert len(decoded) == evidence["decoded_size"]
             http_evidence.append(json.loads(decoded))
             assert call["request_ref"] is not None
-    assert len(http_evidence) == 6
+    assert len(http_evidence) == 4
     assert len(calls) > len(http_evidence)
 
 
@@ -297,6 +297,8 @@ def test_actual_pipeline_routes_source_quarantine_and_sticky_sink_rejection(tmp_
         result = invoke(tmp_path, settings)
     assert result.exit_code == 1, result.output
     assert [action["data"]["record_id"] for action in flow.actions()] == ["A"]
+    assert flow.requests("status") == []
+    assert [request["data"]["record_id"] for request in flow.requests("write")] == ["A", "B"]
     quarantine = [json.loads(line) for line in (tmp_path / "quarantine.jsonl").read_text().splitlines()]
     assert len(quarantine) == 2
     assert {"_raw": None} in quarantine
