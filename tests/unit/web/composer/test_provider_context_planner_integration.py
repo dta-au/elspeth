@@ -179,18 +179,7 @@ async def test_application_projection_boundary_preserves_parts_and_complete_byte
         assert result.state is state and result.graph_recovery_intent.action == "park"
         assert sdk.await_count == len(completion.requests) == 1
         wire = completion.requests[0]
-        assert [row["role"] for row in wire["messages"]] == ["system", "user", "user", "user"]
-        assert wire["messages"][3] == {
-            "role": "user",
-            "content": (
-                "If this request cannot be built with the capabilities available to this planning session, "
-                'reply in plain text starting with "DECLINE: " and state plainly, in the '
-                "user's terms, what is missing. If required artifacts are absent or product requirements "
-                "conflict and no faithful reviewable draft is possible, use the same prefix to explain "
-                "the blocker and ask a focused question. Use that prefix only when you cannot build "
-                "the requested workflow from the available information; otherwise continue with tool calls."
-            ),
-        }
+        assert [row["role"] for row in wire["messages"]] == ["system", "user", "user"]
         payload = json.loads(wire["messages"][2]["content"])
         assert payload["intent"] == user_request
         options = payload["current_state"]["nodes"][0]["options"]

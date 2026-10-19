@@ -516,8 +516,8 @@ def test_nested_llm_queries_keep_complete_semantics_and_effective_interpolation(
     message = build_advisor_user_message(arguments)
     assert template in message and system in message
     assert '"record":"field_11"' in message or "'record': 'field_11'" in message
-    assert "interpolates row fields: [field_11]" in message
-    assert "interpolates row fields: NONE" not in message
+    assert "named row field references: [field_11]" in message
+    assert "named row field references: NONE" not in message
 
 
 def test_graph_redacts_nested_credentials_preserving_ordinary_values_and_blob_identity() -> None:

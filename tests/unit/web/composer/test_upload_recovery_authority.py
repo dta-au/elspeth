@@ -28,6 +28,7 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_llm_response, _make_settings
 
@@ -91,12 +92,10 @@ def _observe_real_end(service, reviews, outcomes):
 
 
 def _assert_end_packet_sent(kwargs, review, message):
-    text = [
-        part
-        for item in kwargs["messages"]
-        for part in ((item["content"],) if isinstance(item["content"], str) else tuple(part["text"] for part in item["content"]))
-    ]
-    assert any(review.provider_payload_json in part for part in text)
+    resolved = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+    assert {key: value for key, value in resolved.items() if key not in {"current_request_ref", "candidate_reply_ref"}} == json.loads(
+        review.provider_payload_json
+    )
     payload = json.loads(review.payload_json)
     assert payload["current_request"] == message
     assert payload["saved_effects"]["saved_revision_count"] == 0
@@ -231,11 +230,10 @@ async def test_authorized_uploaded_build_recovers_through_provider_and_real_tool
                     _assert_end_packet_sent(kwargs, reviews[-1], message)
                     assert json.loads(reviews[-1].payload_json)["candidate_reply"] == "I can build a report from your uploaded CSV."
                 else:
-                    assert any(
-                        reviews[-1].provider_payload_json
-                        in (item["content"] if isinstance(item["content"], str) else "".join(part["text"] for part in item["content"]))
-                        for item in kwargs["messages"]
-                    )
+                    resolved = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+                    assert {
+                        key: value for key, value in resolved.items() if key not in {"current_request_ref", "candidate_reply_ref"}
+                    } == json.loads(reviews[-1].provider_payload_json)
                     packet = json.loads(reviews[-1].payload_json)
                     assert packet["current_request"] == message
                     assert packet["candidate_reply"] == "The CSV report pipeline is configured."
@@ -406,7 +404,7 @@ async def test_saved_validation_blocker_preserves_request_and_readiness(tmp_path
 @pytest.mark.parametrize("repair_authorized", [False, True], ids=["explain_without_changes", "repair_requested"])
 async def test_saved_advisor_findings_preserve_request_and_completion_gate(tmp_path: Path, repair_authorized: bool) -> None:
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+    from tests.helpers.advisor_review import parse_advisor_publication_review
 
     service, session_id = _composer_service_with_session(catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path))
     blob = await _upload(service, session_id, tmp_path)
@@ -464,8 +462,7 @@ async def test_saved_advisor_findings_preserve_request_and_completion_gate(tmp_p
         if kwargs["model"] == service._settings.composer_advisor_model:
             advisor_calls += 1
             assert advisor_calls <= 2, "Only two END responses are supplied"
-            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             reviews.append(review)
             assert review["current_request"] == message
             repaired = repair_authorized and advisor_calls == 2

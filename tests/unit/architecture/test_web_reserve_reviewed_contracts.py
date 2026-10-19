@@ -722,6 +722,36 @@ def _provider_mint_rows(units, sites):
     return {(unit.path, ast.unparse(node)) for unit in units for node in ast.walk(unit.tree) if (unit.path, id(node)) in sites}
 
 
+@pytest.mark.parametrize("fault", ("identity", "clock", "elapsed"))
+def test_provider_mint_contract_binds_attempt_identity_and_database_clock(fault: str) -> None:
+    units = _provider_mint_units()
+    assert provider.provider_mint_local_contracts(units)[0] == []
+    quota = next(unit for unit in units if provider._module(unit) == provider.QUOTA)
+    binder = provider._node(quota, "_bind_attempt_call")
+    assert binder is not None
+    returned = binder.body[-1]
+    assert isinstance(returned, ast.Return) and isinstance(returned.value, ast.Call)
+    field = {"identity": "call_id", "clock": "started_at", "elapsed": "finished_at"}[fault]
+    keyword = next(item for item in returned.value.keywords if item.arg == field)
+    keyword.value = ast.Name(id="foreign", ctx=ast.Load())
+    failures, receipt = provider.provider_mint_local_contracts(units)
+    assert failures == [
+        "provider mint complete producer/retention/caller contract changed elspeth.web.composer.provider_quota:_bind_attempt_call"
+    ]
+    assert receipt is None
+
+
+@pytest.mark.parametrize("binding", ("time", "replace", "timedelta"))
+def test_provider_mint_attempt_clock_dependencies_refuse_import_replacement(binding: str) -> None:
+    units = _provider_mint_units()
+    assert provider.provider_mint_local_contracts(units)[0] == []
+    quota = next(unit for unit in units if provider._module(unit) == provider.QUOTA)
+    quota.tree.body.append(ast.parse(f"from foreign import {binding}").body[0])
+    failures, receipt = provider.provider_mint_local_contracts(units)
+    assert failures == ["provider mint selected constructor/family/binding import origin changed elspeth.web.composer.provider_quota"]
+    assert receipt is None
+
+
 def test_provider_mint_contract_covers_actual_diagnostics_caller_without_closing_common_premises() -> None:
     units = _provider_mint_units()
     failures, receipt = provider.provider_mint_local_contracts(units)

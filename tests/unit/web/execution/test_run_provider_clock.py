@@ -13,7 +13,7 @@ from elspeth.web.execution.provider_clock import RunProviderAttemptClock
 
 
 def test_first_outcome_stamp_crosses_utc_midnight_and_is_stable_under_concurrent_reclassification(monkeypatch) -> None:
-    ticks = Mock(side_effect=[100_000_000_000, 103_500_000_000])
+    ticks = Mock(spec=provider_clock.monotonic_ns, side_effect=[100_000_000_000, 103_500_000_000])
     monkeypatch.setattr(provider_clock, "monotonic_ns", ticks)
     admitted = datetime(2026, 10, 19, 23, 59, 58, tzinfo=UTC)
     clock = RunProviderAttemptClock()
@@ -26,7 +26,9 @@ def test_first_outcome_stamp_crosses_utc_midnight_and_is_stable_under_concurrent
 
 
 def test_separate_attempts_cannot_share_or_replace_clock_binding(monkeypatch) -> None:
-    ticks = Mock(side_effect=[10_000_000_000, 20_000_000_000, 21_000_000_000, 22_000_000_000, 23_000_000_000])
+    ticks = Mock(
+        spec=provider_clock.monotonic_ns, side_effect=[10_000_000_000, 20_000_000_000, 21_000_000_000, 22_000_000_000, 23_000_000_000]
+    )
     monkeypatch.setattr(provider_clock, "monotonic_ns", ticks)
     started = datetime(2026, 10, 19, tzinfo=UTC)
     clock = RunProviderAttemptClock()
@@ -46,7 +48,7 @@ def test_invalid_admission_and_backwards_monotonic_clock_fail_closed(monkeypatch
     clock = RunProviderAttemptClock()
     with pytest.raises(AuditIntegrityError, match="aware timestamp"):
         clock.bind(ProviderAttempt("naive", datetime(2026, 10, 19, tzinfo=UTC).replace(tzinfo=None)))
-    ticks = Mock(side_effect=[20, 10])
+    ticks = Mock(spec=provider_clock.monotonic_ns, side_effect=[20, 10])
     monkeypatch.setattr(provider_clock, "monotonic_ns", ticks)
     clock.bind(ProviderAttempt("one", datetime(2026, 10, 19, tzinfo=UTC)))
     with pytest.raises(AuditIntegrityError, match="moved backwards"):

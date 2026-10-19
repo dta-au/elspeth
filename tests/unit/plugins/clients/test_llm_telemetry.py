@@ -144,6 +144,8 @@ class FakeCallRecorder:
         work_item: TokenWorkItem,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         assert source_call_id is None
         call_kwargs = {
@@ -158,6 +160,8 @@ class FakeCallRecorder:
             "request_ref": request_ref,
             "response_ref": response_ref,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
+            "call_id": call_id,
+            "created_at": created_at,
         }
         if self.record_call_observer is not None:
             self.record_call_observer(call_kwargs)
@@ -183,6 +187,8 @@ class FakeCallRecorder:
         coordination_token: CoordinationToken,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         assert source_call_id is None
         actual_call_index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)
@@ -198,6 +204,8 @@ class FakeCallRecorder:
             "request_ref": request_ref,
             "response_ref": response_ref,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
+            "call_id": call_id,
+            "created_at": created_at,
         }
         if self.record_call_observer is not None:
             self.record_call_observer(call_kwargs)
@@ -208,13 +216,13 @@ class FakeCallRecorder:
 
     def _recorded_call(self, call_kwargs: dict[str, Any]) -> Call:
         return Call(
-            call_id=f"call_{len(self.recorded_calls)}",
+            call_id=call_kwargs["call_id"] if call_kwargs["call_id"] is not None else f"call_{len(self.recorded_calls)}",
             call_index=call_kwargs["call_index"],
             call_type=call_kwargs["call_type"],
             status=call_kwargs["status"],
             request_hash="req_hash_123",
             response_hash="resp_hash_456" if call_kwargs["response_data"] is not None else None,
-            created_at=datetime.now(UTC),
+            created_at=call_kwargs["created_at"] if call_kwargs["created_at"] is not None else datetime.now(UTC),
             state_id=call_kwargs.get("state_id"),
             operation_id=call_kwargs.get("operation_id"),
             latency_ms=call_kwargs["latency_ms"],

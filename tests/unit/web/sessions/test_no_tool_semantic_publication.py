@@ -12,6 +12,7 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import select
 
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_decision import AdvisorGatePassed
@@ -34,9 +35,10 @@ from elspeth.web.sessions.models import (
     token_usage_ledger_table,
 )
 from elspeth.web.sessions.routes._helpers import _composer_history_content
+from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.helpers.composer_operations import message_body, submit_and_settle
 from tests.unit.web.sessions.test_routes import _make_app
-from tests.unit.web.sessions.test_run_composer_turn import _TestSnapshotFactory
+from tests.unit.web.sessions.test_run_composer_turn import _seed_output_only_draft, _TestSnapshotFactory
 
 _FALSE_COMPLETION = "The CSV source is configured and the pipeline is ready."
 _TRUTHFUL_CORRECTION = "I have not configured a source. Please supply the CSV file."
@@ -80,6 +82,7 @@ async def test_real_end_retains_scoped_limitations_after_supported_mutation(monk
     app.state.composer_service = composer
     app.state.plugin_snapshot_factory = _TestSnapshotFactory(app.state.plugin_snapshot_factory)
     session = await sessions.create_session("alice", "Scoped capability limit", "local")
+    baseline = await _seed_output_only_draft(app, sessions, session.id)
     request = 'Follow this specification: "Save a JSON output named report, and perform unavailable operation B."'
     candidate = (
         "Both requested operations are complete."
@@ -114,9 +117,19 @@ async def test_real_end_retains_scoped_limitations_after_supported_mutation(monk
             end_verdicts.append(verdict)
             if publication_case == "changed-decision" and not changed_decision:
                 evidence, review, decision, inputs = stop_reviews[-1]
+                # The candidate and completed feedback advanced the transcript
+                # since this stop was accepted. Change the decision using a
+                # current owned review, rather than replaying stale authority.
+                current_review = evidence.abandonment_context(
+                    request=request,
+                    current_state=inputs["current_state"],
+                    plugin_snapshot=inputs["plugin_snapshot"],
+                    messages=[],
+                )
+                assert current_review.binding != review.binding
                 original_accept(
                     evidence,
-                    review,
+                    current_review,
                     AdvisorAbandonmentResponse(
                         decision=decision.decision,
                         reason="A different prerequisite now blocks the remaining work.",
@@ -198,7 +211,7 @@ async def test_real_end_retains_scoped_limitations_after_supported_mutation(monk
                 )
                 if end:
                     assert any(
-                        isinstance(message["content"], str) and end_inputs[-1].provider_payload_json in message["content"]
+                        isinstance(message["content"], str) and end_inputs[-1].provider_review_context_json() in message["content"]
                         for message in kwargs["messages"]
                     )
         return litellm.ModelResponse(
@@ -216,16 +229,19 @@ async def test_real_end_retains_scoped_limitations_after_supported_mutation(monk
     monkeypatch.setattr(composer._advisor_checkpoint, "_run_advisor_checkpoint", observe_checkpoint)
     monkeypatch.setattr(litellm, "acompletion", complete)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        settled = await submit_and_settle(client, app, path=f"/api/sessions/{session.id}/messages", body=message_body(request))
+        settled = await submit_and_settle(
+            client, app, path=f"/api/sessions/{session.id}/messages", body=message_body(request, state_id=baseline.id)
+        )
     public = settled.result()["message"]["content"]
     assert primary_index == 4
     assert end_inputs and end_verdicts
     assert all(verdict.ok and verdict.blocking for verdict in end_verdicts)
-    with app.state.session_engine.connect() as connection:
-        states = connection.execute(select(composition_states_table).where(composition_states_table.c.session_id == str(session.id))).all()
-    assert len(states) == 2  # The tool checkpoint and the route's post-compose snapshot.
+    states = await sessions.get_state_versions(session.id)
+    assert len(states) == 3  # Prior draft, current tool checkpoint and route snapshot.
     assert all(not state.is_valid for state in states)
-    assert states[0].outputs == states[1].outputs
+    current_states = [state for state in states if state.id != baseline.id]
+    assert len(current_states) == 2 and current_states[0].outputs == current_states[1].outputs
+    assert len(current_states[0].outputs) == 2
     if publication_case == "truthful-partial":
         assert candidate in public
         assert end_verdicts[-1].publication_verdict == "ADMIT"
@@ -318,10 +334,13 @@ async def test_actual_end_semantics_and_each_physical_transition(
     app.state.composer_service = composer
     app.state.plugin_snapshot_factory = _TestSnapshotFactory(app.state.plugin_snapshot_factory)
     session = await sessions.create_session("alice", "Existing authored session", "local")
+    # Correction and saved-blob scenarios exercise the ordinary authoring loop
+    # over an existing output-only draft. Ordinary rootless questions retain
+    # the actual planner surface and its unchanged empty graph.
+    baseline = await _seed_output_only_draft(app, sessions, session.id) if len(primary_replies) > 1 else None
     engine = app.state.session_engine
-    expected_families = [
-        family for _reply in primary_replies for family in (ProviderInvocationFamily.PRIMARY, ProviderInvocationFamily.ADVISOR)
-    ]
+    authoring_family = ProviderInvocationFamily.PRIMARY if baseline is not None else ProviderInvocationFamily.PLANNER
+    expected_families = [family for _reply in primary_replies for family in (authoring_family, ProviderInvocationFamily.ADVISOR)]
     initial_calls = int(create_blob)
     if create_blob:
         expected_families.insert(0, ProviderInvocationFamily.PRIMARY)
@@ -360,7 +379,7 @@ async def test_actual_end_semantics_and_each_physical_transition(
                 .scalars()
                 .all()
             )
-        review_state_ids.append(tuple(saved))
+        review_state_ids.append(tuple(state_id for state_id in saved if baseline is None or state_id != str(baseline.id)))
         verdict = await original_checkpoint(*args, **kwargs)
         assert verdict.publication_binding == review.binding
         reviews.append((review, verdict))
@@ -388,15 +407,16 @@ async def test_actual_end_semantics_and_each_physical_transition(
             ).all()
         assert admitted.settled_at is None and admitted.operation_id == custody.context.fence.operation_id
         checks = _guard_checks(current_rows)
-        expected_role = "composer" if family is ProviderInvocationFamily.PRIMARY else "advisor"
+        expected_role = "advisor" if family is ProviderInvocationFamily.ADVISOR else "composer"
         assert len(checks) == index + 1
         assert checks[-1]["role"] == expected_role and checks[-1]["disposition"] == "allow"
         sdk_trace.append((family, custody.attempt.attempt_id, deepcopy(kwargs)))
         pass_index = (index - initial_calls) // 2
         tool_calls = None
-        if family is ProviderInvocationFamily.PRIMARY:
+        if family is authoring_family:
             assert kwargs["model"] == app.state.settings.composer_model
-            assert "set_pipeline" in {tool["function"]["name"] for tool in kwargs["tools"]}
+            terminal_tool = "set_pipeline" if family is ProviderInvocationFamily.PRIMARY else "emit_pipeline_proposal"
+            assert terminal_tool in {tool["function"]["name"] for tool in kwargs["tools"]}
             assert "response_format" not in kwargs
             if create_blob and index == 0:
                 content = None
@@ -419,9 +439,10 @@ async def test_actual_end_semantics_and_each_physical_transition(
             assert schema["name"] == "advisor_end_response"
             assert "publication_verdict" in schema["schema"]["required"]
             review = review_inputs[-1]
-            assert any(
-                isinstance(message["content"], str) and review.provider_payload_json in message["content"] for message in kwargs["messages"]
-            ), "The actual END SDK request must contain the complete current candidate/request/effect packet"
+            supplied = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+            assert supplied["current_request"] == user_message
+            assert supplied["candidate_reply"] == primary_replies[pass_index]
+            assert supplied["saved_effects"] == json.loads(review.provider_payload_json)["saved_effects"]
             guard_documents = "\n".join(
                 document for host, payload in shield_requests if host == "advisor-shield.example.test" for document in payload["documents"]
             )
@@ -455,14 +476,23 @@ async def test_actual_end_semantics_and_each_physical_transition(
     monkeypatch.setattr(composer, "compose", observe_compose)
     monkeypatch.setattr(litellm, "acompletion", complete)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        settled = await submit_and_settle(client, app, path=f"/api/sessions/{session.id}/messages", body=message_body(user_message))
+        settled = await submit_and_settle(
+            client,
+            app,
+            path=f"/api/sessions/{session.id}/messages",
+            body=message_body(user_message, state_id=baseline.id if baseline is not None else None),
+        )
     public = settled.result()["message"]["content"]
     assert [family for family, _attempt, _kwargs in sdk_trace] == expected_families
     assert [family for _owner, family, _custody in minted] == expected_families
     assert len(compose_results) == 1
     result = compose_results[0]
     assert result.repair_turns_used == 0, "An END prose repair is not a lexical correctness repair"
-    assert not result.state.sources and not result.state.nodes and not result.state.edges and not result.state.outputs
+    assert not result.state.sources and not result.state.nodes and not result.state.edges
+    if baseline is not None:
+        assert result.state.to_dict()["outputs"] == deep_thaw(baseline.outputs)
+    else:
+        assert not result.state.outputs
     if create_blob:
         assert len(result.tool_invocations) == 1
         assert result.tool_invocations[0].tool_name == "create_blob" and result.tool_invocations[0].status.value == "success"
@@ -509,7 +539,12 @@ async def test_actual_end_semantics_and_each_physical_transition(
         assert len(tool_rows) == 1 and tool_rows[0].tool_call_id == "sample-csv-blob"
         assert json.loads(tool_rows[0].content)["success"] is True
     else:
-        assert not blobs and not states and not any(row.role == "tool" for row in rows)
+        assert not blobs and not any(row.role == "tool" for row in rows)
+    if baseline is None:
+        assert not states
+    else:
+        state_versions = await sessions.get_state_versions(session.id)
+        assert state_versions and all(state.outputs == baseline.outputs and not state.sources for state in state_versions)
     assert len(attempts) == len(ledger) == len(call_audits) == len(sdk_trace)
     assert {row.attempt_id for row in attempts} == {attempt for _family, attempt, _kwargs in sdk_trace}
     assert {call["call_id"] for call in call_audits} == {row.attempt_id for row in attempts}
@@ -520,7 +555,7 @@ async def test_actual_end_semantics_and_each_physical_transition(
     assert len({id(owner.required_work.coordinator) for owner, _family, _custody in minted}) == 1
     minted[0][0].required_work.coordinator.assert_completed()
     assert [(check["role"], check["disposition"]) for check in _guard_checks(rows)] == [
-        ("composer" if family is ProviderInvocationFamily.PRIMARY else "advisor", "allow") for family in expected_families
+        ("advisor" if family is ProviderInvocationFamily.ADVISOR else "composer", "allow") for family in expected_families
     ]
     assert shield_requests and any(host == "advisor-shield.example.test" for host, _payload in shield_requests)
     assert [verdict.publication_verdict for _review, verdict in reviews] == list(publication_verdicts)
@@ -533,7 +568,7 @@ async def test_actual_end_semantics_and_each_physical_transition(
         assert evidence["candidate_reply"] == primary_replies[index] and evidence["current_request"] == user_message
         effects = evidence["saved_effects"]
         assert effects["verification"] == "verified" and effects["saved_revision_count"] == len(review_state_ids[index])
-        expected_state_id = review_state_ids[index][-1] if review_state_ids[index] else None
+        expected_state_id = review_state_ids[index][-1] if review_state_ids[index] else str(baseline.id) if baseline is not None else None
         assert effects["latest_committed_state_id"] == effects["latest_verified_state_id"] == expected_state_id
         assert effects["net_changed"] is False and effects["changed_fields"] == []
         assert effects["initial_authored_state_hash"] == effects["latest_verified_authored_state_hash"]

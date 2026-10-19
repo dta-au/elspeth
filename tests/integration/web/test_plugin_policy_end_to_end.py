@@ -531,6 +531,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
             transforms=(SimpleNamespace(plugin=plugin_id.name),),
             aggregations=(),
             collectors=(),
+            collection_probes=(),
             sinks={},
         )
         if plugin_id in snapshot.available:

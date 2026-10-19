@@ -181,21 +181,12 @@ async def test_none_dialect_keeps_todays_rejection_of_a_null_discovery_argument(
 
 
 @pytest.mark.asyncio
-async def test_get_pipeline_state_outside_the_freeform_palette_is_not_decoded(
+async def test_get_pipeline_state_in_the_freeform_palette_is_decoded_and_dispatched(
     tmp_path: Path,
     tool_context: ToolContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """D17: ``get_pipeline_state`` is never in a production palette.
-
-    On openai_strict with the real FREEFORM palette, the parsed call keeps
-    ``component: null`` with no wire facts (``strict_sent=None``,
-    ``wire_conformant=None``). On this palette the discovery no-gain guard
-    then stops the call before dispatch, exactly as on the base (the call
-    supplies no pending information), so it never reaches S here; the next
-    test covers an unsent name that is dispatched. Control: pass the full 19
-    as ``sent_tool_names`` and the null is stripped.
-    """
+    """State rereads remain available and strict nulls decode before dispatch."""
     seen: list[_ParsedToolCall] = []
     real_keys = planner_module.planner_discovery_information_keys
 
@@ -219,13 +210,15 @@ async def test_get_pipeline_state_outside_the_freeform_palette_is_not_decoded(
         model_overrides={**_dialects(_STRICT, _NONE), "model_identifier": _PLANNER_MODEL},
     )
 
-    assert "get_pipeline_state" not in _sent_names(completion.requests[0])
+    assert "get_pipeline_state" in _sent_names(completion.requests[0])
     parsed = [call for call in seen if call.name == "get_pipeline_state"]
     assert parsed
     for call in parsed:
-        assert deep_thaw(call.arguments) == {"component": None}
-        assert (call.strict_sent, call.wire_conformant) == (None, None)
-    assert len(recorder.invocations) == 0
+        assert deep_thaw(call.arguments) == {}
+        assert (call.strict_sent, call.wire_conformant) == (True, True)
+    assert len(recorder.invocations) == 1
+    assert recorder.invocations[0].tool_name == "get_pipeline_state"
+    assert recorder.invocations[0].status is ComposerToolStatus.SUCCESS
 
 
 def test_the_parser_requires_the_dialect_and_the_sent_tool_names() -> None:
@@ -402,10 +395,12 @@ async def test_hatch_turn_uses_the_hatch_dialect_and_endpoint(
     assert hatch_request["model"] == _HATCH_MODEL
     assert hatch_request["api_base"] == "https://advisor-gateway.example.test/v1"
     assert hatch_request["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
-    assert _sent_names(hatch_request) == ["handoff_to_user", "restore_parked_graph", _TERMINAL]
-    assert _strict_keys(hatch_request) == ([True, True, False] if hatch is _STRICT else ["omitted"] * 3)
+    assert _sent_names(hatch_request) == [*PLANNER_DISCOVERY_TOOL_NAMES, "handoff_to_user", "restore_parked_graph", _TERMINAL]
+    assert _strict_keys(hatch_request) == (
+        [True] * (len(PLANNER_DISCOVERY_TOOL_NAMES) + 2) + [False] if hatch is _STRICT else ["omitted"] * len(hatch_request["tools"])
+    )
     assert [call.tool_contract_dialect for call in recorder.llm_calls] == [planner, planner, hatch]
-    assert recorder.llm_calls[2].strict_tool_count == (2 if hatch is _STRICT else 0)
+    assert recorder.llm_calls[2].strict_tool_count == (len(PLANNER_DISCOVERY_TOOL_NAMES) + 2 if hatch is _STRICT else 0)
 
 
 # ---------------------------------------------------------------- the stamp assertion

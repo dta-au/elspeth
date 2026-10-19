@@ -21,6 +21,7 @@ from elspeth.web.execution.completion_gates import (
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.helpers.composer_operations import submit_and_settle
 from tests.unit.web.sessions.test_completion_gate_roundtrip import _green_result
 from tests.unit.web.sessions.test_routes import (
@@ -120,7 +121,6 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
         ADVISOR_GRAPH_REVIEW_AUDIT_KIND,
         AdvisorGraphReviewIdentity,
     )
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.turn_effects import TurnEvidence
@@ -171,8 +171,7 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
         assert kwargs["model"] == app.state.settings.composer_advisor_model
         assert "tools" not in kwargs and kwargs["num_retries"] == kwargs["max_retries"] == 0
         assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
-        payload = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-        review = json.loads(payload.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+        review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
         assert review["current_request"] == "Please retry the review"
         assert review["candidate_reply"] == "Review complete"
         assert review["saved_effects"]["saved_revision_count"] == 0 and review["saved_effects"]["net_changed"] is False
@@ -312,7 +311,6 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["messages", "recompose"])
 async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(tmp_path, route, monkeypatch):
-    import json
 
     import litellm
 
@@ -321,7 +319,6 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
         ADVISOR_GRAPH_REVIEW_AUDIT_KIND,
         AdvisorGraphReviewIdentity,
     )
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.turn_effects import TurnEvidence
@@ -373,8 +370,7 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
                 assert "tools" not in request and request["num_retries"] == request["max_retries"] == 0
                 assert request["response_format"]["json_schema"]["name"] == "advisor_end_response"
                 assert len(attempts) < (1 if expected_cause is AdvisorBlockCause.UNAVAILABLE else 2), "No extra END response is supplied"
-                payload = request["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-                supplied = json.loads(payload.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+                supplied = parse_advisor_publication_review(request["messages"][1]["content"])
                 assert supplied["current_request"] == "Retry review" and supplied["candidate_reply"] == "Review failed"
                 assert supplied["saved_effects"]["saved_revision_count"] == 0 and supplied["saved_effects"]["net_changed"] is False
                 attempts.append(supplied)

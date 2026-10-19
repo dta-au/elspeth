@@ -6131,6 +6131,13 @@ class SessionServiceImpl:
 
         rows = await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync)
 
+        if not include_private_evidence:
+            from elspeth.web.composer.visible_tool_event import VISIBLE_TOOL_EVENT_KIND, VisibleToolEvent
+
+            for row in rows:
+                for envelope in row.tool_calls or ():
+                    if "_kind" in envelope and envelope["_kind"] == VISIBLE_TOOL_EVENT_KIND:
+                        VisibleToolEvent.from_envelope(envelope)
         return [self._row_to_chat_message_record(row, operation_id=row.operation_id) for row in rows]
 
     def count_tool_responses_for_assistant(
@@ -7461,6 +7468,7 @@ class SessionServiceImpl:
     ) -> None:
         """Persist actual terminal call evidence and settle its ledger atomically."""
         from elspeth.web.composer.audit import llm_call_audit_envelope
+        from elspeth.web.composer.visible_tool_event import visible_response_gap
 
         if type(session_operation_context) is not SessionOperationContext:
             _refuse_required_sql(required_work, TypeError("provider settlement requires an owned operation context"))
@@ -7475,8 +7483,13 @@ class SessionServiceImpl:
         with _required_sql_preflight(required_work):
             if type(call) is not ComposerLLMCall or call.call_id is None:
                 raise AuditIntegrityError("A provider checkpoint requires its pending attempt identity")
+            public_call = llm_call_audit_envelope(call)
             drafts: tuple[AuditMessageDraft, ...] = (
-                AuditMessageDraft(role="audit", content="Provider call result recorded.", tool_calls=(llm_call_audit_envelope(call),)),
+                AuditMessageDraft(
+                    role="audit",
+                    content="Provider call result recorded.",
+                    tool_calls=(public_call, visible_response_gap(call, session_operation_context, public_call)),
+                ),
             )
             from elspeth.web.composer.audit_storage import private_diagnostic_drafts
 

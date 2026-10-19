@@ -256,10 +256,10 @@ class TestUnknownToolNameComposeLoopAuditShape:
         import litellm
 
         from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
         from elspeth.web.composer.prompt_guard import PromptGuardMount
         from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
         from elspeth.web.prompt_guard_config import PromptGuardSettings
+        from tests.helpers.advisor_review import parse_advisor_publication_review
 
         catalog = _mock_catalog()
         primary_guard = PromptGuardSettings(endpoint="https://primary-shield.example.test", subscription_key="offline-primary-shield")
@@ -331,8 +331,7 @@ class TestUnknownToolNameComposeLoopAuditShape:
         async def review_clarification(**kwargs: Any) -> Any:
             assert kwargs["model"] == settings.composer_advisor_model
             assert not reviews, "Only one independent END SDK response is supplied"
-            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             reviews.append(review)
             assert review["candidate_reply"] == "Which data source should the pipeline use?"
             assert review["current_request"] == "Build a pipeline"

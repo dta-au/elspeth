@@ -118,17 +118,26 @@ def test_metric_boundaries_propagate_integrity_failures(monkeypatch, error_class
     assert caught.value is failure
 
 
-def test_settled_freeform_audit_message_projects_only_owned_call_facts(monkeypatch) -> None:
+@pytest.mark.parametrize("with_companion", (False, True))
+def test_settled_freeform_audit_message_projects_only_owned_call_facts(monkeypatch, with_companion) -> None:
+    from elspeth.web.composer.visible_tool_event import visible_response_gap
+    from tests.helpers.session_fences import make_compose_context
+
     module = importlib.import_module("elspeth.web.composer.provider_telemetry")
     count = _Instrument()
     duration = _Instrument()
     monkeypatch.setattr(module, "_PROVIDER_CALL_COUNTER", count)
     monkeypatch.setattr(module, "_PROVIDER_CALL_DURATION", duration)
 
+    call = _call(latency_ms=73)
+    public = llm_call_audit_envelope(call)
+    envelopes = [public]
+    if with_companion:
+        envelopes.append(visible_response_gap(call, make_compose_context("provider-metrics"), public))
     module.record_settled_composer_audit_message(
         role="audit",
         writer_principal="compose_loop",
-        tool_calls=[llm_call_audit_envelope(_call(latency_ms=73))],
+        tool_calls=envelopes,
     )
 
     attributes = {"surface": "freeform", "status": "success"}
@@ -147,6 +156,7 @@ def test_non_composer_or_malformed_audit_message_cannot_fabricate_metrics(monkey
         {"role": "user", "writer_principal": "compose_loop", "tool_calls": [valid]},
         {"role": "audit", "writer_principal": "run_diagnostics", "tool_calls": [valid]},
         {"role": "audit", "writer_principal": "compose_loop", "tool_calls": []},
+        {"role": "audit", "writer_principal": "compose_loop", "tool_calls": [valid, {"_kind": "unrelated"}]},
         {
             "role": "audit",
             "writer_principal": "compose_loop",

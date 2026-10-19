@@ -5,6 +5,7 @@ import json
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
@@ -41,6 +42,8 @@ _OPENROUTER_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
 class RecordedAuditCall:
     """Captured audit call from the in-memory test recorder."""
 
+    call_id: str
+    created_at: datetime
     state_id: str | None
     operation_id: str | None
     call_index: int
@@ -89,9 +92,13 @@ class InMemoryAuditWriter:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> RecordedAuditCall:
         assert source_call_id is None
         call = RecordedAuditCall(
+            call_id=call_id if call_id is not None else f"call-{len(self.calls)}",
+            created_at=created_at if created_at is not None else datetime.now(UTC),
             state_id=state_id,
             operation_id=None,
             call_index=call_index,
@@ -126,11 +133,15 @@ class InMemoryAuditWriter:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> RecordedAuditCall:
         assert source_call_id is None
         if call_index is None:
             call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
         call = RecordedAuditCall(
+            call_id=call_id if call_id is not None else f"operation-call-{len(self.operation_calls)}",
+            created_at=created_at if created_at is not None else datetime.now(UTC),
             state_id=None,
             operation_id=operation_id,
             call_index=call_index,

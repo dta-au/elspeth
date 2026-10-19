@@ -76,7 +76,8 @@ def test_planner_request_instruction_carries_the_terminal_contract() -> None:
 
     assert "emit_pipeline_proposal" in PLANNER_TERMINAL_INSTRUCTION
     assert "alone in its turn" in PLANNER_TERMINAL_INSTRUCTION
-    assert "After a rejection, repair and resubmit within the remaining budget" in PLANNER_TERMINAL_INSTRUCTION
+    assert "After a rejection, repair and resubmit the complete proposal" in PLANNER_TERMINAL_INSTRUCTION
+    assert "handoff_to_user or restore_parked_graph alone" in PLANNER_TERMINAL_INSTRUCTION
     assert "set_pipeline" in PLANNER_TERMINAL_INSTRUCTION
 
 

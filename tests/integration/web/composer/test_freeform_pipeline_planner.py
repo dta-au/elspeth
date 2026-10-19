@@ -42,6 +42,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -527,7 +528,7 @@ async def test_referential_empty_build_projects_authoritative_prior_user_request
         if type(payload) is dict and "instruction" in payload and payload["instruction"] == PLANNER_TERMINAL_INSTRUCTION:
             provider_requests.append((provider_message["content"], payload))
     assert len(provider_requests) == 1
-    provider_user_message, provider_payload = provider_requests[0]
+    _provider_user_message, provider_payload = provider_requests[0]
     assert provider_payload["intent"] == message
     assert provider_payload["conversation_context"] == {
         "prior_user_requests": [
@@ -535,9 +536,14 @@ async def test_referential_empty_build_projects_authoritative_prior_user_request
             {"history_index": 2, "content": refinement},
         ],
         "additional_prior_user_requests_omitted": 0,
+        "prior_assistant_messages": [
+            {"history_index": 1, "content": "I can prepare that pipeline."},
+            {"history_index": 3, "content": "Understood."},
+        ],
     }
-    assert "I can prepare that pipeline." not in provider_user_message
-    assert "Understood." not in provider_user_message
+    authoritative_requests = json.dumps(provider_payload["conversation_context"]["prior_user_requests"])
+    assert "I can prepare that pipeline." not in authoritative_requests
+    assert "Understood." not in authoritative_requests
     proposals = await sessions.list_composition_proposals(session.id, status="pending")
     assert len(proposals) == 1
     assert deep_thaw(proposals[0].arguments_json)["nodes"][0]["condition"] == "row['amount'] > 500"
@@ -855,7 +861,7 @@ async def test_auto_commit_cancellation_survives_rejection_failure_and_repeated_
     ],
     ids=["empty-informational", "nonempty-incremental"],
 )
-async def test_requests_outside_empty_mutation_gate_use_ordinary_compose_loop(
+async def test_structural_entry_selects_planner_or_ordinary_compose_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     message: str,
@@ -902,6 +908,38 @@ async def test_requests_outside_empty_mutation_gate_use_ordinary_compose_loop(
     expected = ComposerResult(message="ordinary loop", state=state)
     ordinary_loop = AsyncMock(spec=composer._compose_loop, return_value=expected)
     monkeypatch.setattr(composer, "_compose_loop", ordinary_loop)
+    planner_path = not state.sources
+    provider_requests: list[dict[str, Any]] = []
+    reply = "I can help you plan a pipeline and explain the available plugins."
+
+    async def completion(**kwargs: Any) -> _Response:
+        provider_requests.append(kwargs)
+        if "response_format" in kwargs:
+            assert len(provider_requests) == 2, "Exactly one END follows the planner's informational answer"
+            assert kwargs["model"] == settings.composer_advisor_model
+            assert kwargs.get("tools") is None
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+            assert review["current_request"] == message
+            assert review["candidate_reply"] == reply
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
+            content = json.dumps(
+                {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+            )
+        else:
+            assert len(provider_requests) == 1, "Only one informational planner response is supplied"
+            assert kwargs["model"] == settings.composer_model
+            names = [tool["function"]["name"] for tool in kwargs["tools"]]
+            assert "emit_pipeline_proposal" in names
+            assert "set_pipeline" not in names
+            content = reply
+        return _Response(
+            choices=[_Choice(message=_Message(content=content, tool_calls=[]))],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+            model=kwargs["model"],
+        )
+
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     result = await composer.compose(
         message,
@@ -912,8 +950,17 @@ async def test_requests_outside_empty_mutation_gate_use_ordinary_compose_loop(
         user_message_id=str(user_message.id),
     )
 
-    assert result is expected
-    ordinary_loop.assert_awaited_once()
+    if planner_path:
+        ordinary_loop.assert_not_awaited()
+        assert len(provider_requests) == 2
+        assert result.message.startswith(reply)
+        assert result.state == state
+        with engine.connect() as conn:
+            assert conn.execute(select(composition_states_table)).all() == []
+    else:
+        assert result is expected
+        ordinary_loop.assert_awaited_once()
+        assert provider_requests == []
     assert await sessions.list_composition_proposals(session.id) == []
 
 

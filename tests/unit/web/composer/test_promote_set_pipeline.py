@@ -779,8 +779,10 @@ class TestPromoteSetPipelineArgErrorRouting:
         assert "drop_raw_html_fields" in result.validation.errors[0].message
         assert "pipeline_decision" in result.validation.errors[0].message
 
-    def test_set_pipeline_rejects_cleanup_named_mapper_that_preserves_web_scrape_raw_fields(self) -> None:
-        """A node named as cleanup cannot preserve the exact raw fields it claims to drop."""
+    @pytest.mark.parametrize("mapper_id", ("drop_raw_html_fields", "reshape_result"))
+    @pytest.mark.parametrize("declares_cleanup", (False, True))
+    def test_set_pipeline_checks_declared_cleanup_independently_of_mapper_name(self, mapper_id: str, declares_cleanup: bool) -> None:
+        """Explicit cleanup claims are checked against the declared scraper fields."""
         args = {
             "source": {
                 "plugin": "csv",
@@ -809,7 +811,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                     },
                 },
                 {
-                    "id": "drop_raw_html_fields",
+                    "id": mapper_id,
                     "node_type": "transform",
                     "plugin": "field_mapper",
                     "input": "scraped_rows",
@@ -829,11 +831,21 @@ class TestPromoteSetPipelineArgErrorRouting:
             "outputs": [],
         }
 
+        if declares_cleanup:
+            args["nodes"][1]["options"][INTERPRETATION_REQUIREMENTS_KEY] = [
+                {
+                    "kind": "pipeline_decision",
+                    "user_term": "drop_raw_html_fields",
+                    "draft": "Drop the scraped raw HTML and fingerprint fields before saving the output.",
+                }
+            ]
+
         result = _execute_set_pipeline(args, _empty_state(), ToolContext(catalog=_mock_catalog()))
 
-        assert result.success is False
-        assert "preserves web-scrape raw field" in result.validation.errors[0].message
-        assert "content" in result.validation.errors[0].message
+        assert result.success is not declares_cleanup
+        if declares_cleanup:
+            assert "preserves raw HTML/fingerprint field" in result.validation.errors[0].message
+            assert "content" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_malformed_interpretation_requirements_without_crashing(self) -> None:
         """Malformed review metadata is Tier-3 tool input and must be a clean rejection."""

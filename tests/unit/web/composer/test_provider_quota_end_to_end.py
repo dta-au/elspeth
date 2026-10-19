@@ -61,7 +61,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.fenced_session import IDENTITY_TOKENS_PER_DAY, seed_token_policies
-from tests.helpers.quota_guard import GuardedQuotaTurn, guarded_quota_turn
+from tests.helpers.quota_guard import GuardedQuotaTurn, assert_provider_audit_companion, guarded_quota_turn
 from tests.unit.web.composer.test_pipeline_planner import (
     _budget,
     _custody,
@@ -388,7 +388,9 @@ async def test_legacy_retry_settlement_failure_preserves_original_provider_evide
             DIAGNOSTIC_EVIDENCE_KIND,
             DIAGNOSTIC_EVIDENCE_KIND,
         ]
-        assert all(draft.role == "audit" and len(draft.tool_calls) == 1 for draft in drafts)
+        assert all(draft.role == "audit" for draft in drafts)
+        for draft in drafts:
+            assert_provider_audit_companion(draft.tool_calls, kwargs["session_operation_context"])
         assert dispatches == ["sent"]
         assert drafts[0].tool_calls[0]["call"]["call_id"] == settlement_calls[-1].call_id
         sql_calls.append(settlement_calls[-1])
@@ -483,7 +485,9 @@ async def test_legacy_retry_settlement_failure_preserves_original_provider_evide
             select(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id), chat_messages_table.c.role == "audit")
         ).all()
     assert len(messages) == 3
-    assert all(message.writer_principal == "compose_loop" and len(message.tool_calls) == 1 for message in messages)
+    assert all(message.writer_principal == "compose_loop" for message in messages)
+    for message in messages:
+        assert_provider_audit_companion(message.tool_calls, lease.context)
     (message,) = [row for row in messages if row.tool_calls[0]["_kind"] == "llm_call_audit"]
     private_rows = [row for row in messages if row.tool_calls[0]["_kind"] == DIAGNOSTIC_EVIDENCE_KIND]
     assert len(private_rows) == 2

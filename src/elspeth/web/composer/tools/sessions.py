@@ -157,7 +157,6 @@ from elspeth.web.credential_guard import (
 from elspeth.web.interpretation_state import (
     BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX,
     INTERPRETATION_REQUIREMENTS_KEY,
-    RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX,
     SOURCE_AUTHORING_KEY,
     VAGUE_TERM_UNWIRED_PREFIX,
     InterpretationReviewCapacityError,
@@ -2023,16 +2022,12 @@ def build_set_pipeline_candidate(
         # as a bare 'validation_error' placeholder — the actionable staging
         # instruction was redacted with the message — and the planner converged
         # by dropping every node. The closed code resolves to static guidance
-        # via explain_validation_code. A term-matched row whose draft fails
-        # marker recognition carries its own code: "add the missing row" is the
-        # wrong repair when the row exists and only the draft text is wrong.
+        # via explain_validation_code.
         # An unwired vague_term likewise carries its own code: the repair is
         # wiring a prompt_template_parts interpretation_ref, not restaging
         # (session 4c42a794, 2026-09-01).
         review_contract_code = (
-            "interpretation_review_draft_malformed"
-            if review_contract_error.startswith(RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX)
-            else "vague_term_unwired"
+            "vague_term_unwired"
             if review_contract_error.startswith(VAGUE_TERM_UNWIRED_PREFIX)
             else "interpretation_review_contract_unsatisfied"
         )

@@ -38,35 +38,31 @@ def deferred_model_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("deferred_model_catalog")
 @pytest.mark.parametrize(
-    "initial, followup, no_gain, expected_count",
+    "initial, followup, expected_count",
     [
-        pytest.param({"provider": "anthropic", "limit": 1}, {"provider": "anthropic", "limit": 2}, False, 2, id="truncated-expansion"),
-        pytest.param({}, {"provider": "anthropic", "limit": 2}, False, 2, id="summary-to-identifiers"),
-        pytest.param({"provider": "anthropic", "limit": 2}, {"provider": "openai", "limit": 1}, False, 1, id="other-provider"),
-        pytest.param(
-            {"provider": "anthropic", "limit": 2}, {"provider": "anthropic/model-a", "limit": 1}, True, None, id="complete-subset"
-        ),
-        pytest.param({"provider": "anthropic", "limit": 2}, {"provider": "anthropic", "limit": 10}, True, None, id="complete-expansion"),
-        pytest.param({"provider": "anthropic", "limit": 1}, {"provider": "anthropic", "limit": 1}, True, None, id="exact-repeat"),
-        pytest.param({}, {"limit": 10}, True, None, id="summary-repeat-ignores-limit"),
-        pytest.param({"provider": "openrouter", "limit": 10}, {"provider": "openrouter/", "limit": 10}, True, None, id="live-alias"),
+        pytest.param({"provider": "anthropic", "limit": 1}, {"provider": "anthropic", "limit": 2}, 2, id="truncated-expansion"),
+        pytest.param({}, {"provider": "anthropic", "limit": 2}, 2, id="summary-to-identifiers"),
+        pytest.param({"provider": "anthropic", "limit": 2}, {"provider": "openai", "limit": 1}, 1, id="other-provider"),
+        pytest.param({"provider": "anthropic", "limit": 2}, {"provider": "anthropic/model-a", "limit": 1}, 1, id="complete-subset"),
+        pytest.param({"provider": "anthropic", "limit": 2}, {"provider": "anthropic", "limit": 10}, 2, id="complete-expansion"),
+        pytest.param({"provider": "anthropic", "limit": 1}, {"provider": "anthropic", "limit": 1}, 2, id="exact-repeat"),
+        pytest.param({}, {"limit": 10}, None, id="summary-repeat-ignores-limit"),
+        pytest.param({"provider": "openrouter", "limit": 10}, {"provider": "openrouter/", "limit": 10}, 1, id="live-alias"),
         pytest.param(
             {"provider": "openrouter", "limit": 10},
             {"provider": "openrouter/anthropic", "limit": 10},
-            False,
             1,
             id="live-versus-bundled-prefix",
         ),
-        pytest.param({"provider": "open", "limit": 10}, {"provider": "openrouter", "limit": 10}, False, 1, id="bundled-versus-live"),
-        pytest.param({"provider": "", "limit": 10}, {"provider": "anthropic", "limit": 10}, False, 2, id="prefixless-is-subset"),
+        pytest.param({"provider": "open", "limit": 10}, {"provider": "openrouter", "limit": 10}, 1, id="bundled-versus-live"),
+        pytest.param({"provider": "", "limit": 10}, {"provider": "anthropic", "limit": 10}, 2, id="prefixless-is-subset"),
     ],
 )
-async def test_model_discovery_surface_preserves_gain_by_scope_and_completion(
+async def test_model_discovery_surface_preserves_rereads_and_scope(
     tmp_path: Path,
     tool_context: ToolContext,
     initial: dict,
     followup: dict,
-    no_gain: bool,
     expected_count: int | None,
 ) -> None:
     completion = _ScriptedCompletion(
@@ -80,13 +76,16 @@ async def test_model_discovery_surface_preserves_gain_by_scope_and_completion(
     names = {tool["function"]["name"] for tool in completion.requests[1]["tools"]}
     assert "list_models" in names
     final_tool = [json.loads(message["content"]) for message in completion.requests[2]["messages"] if message["role"] == "tool"][-1]
-    if no_gain:
-        assert final_tool["error_code"] == "DISCOVERY_NO_GAIN"
+    assert final_tool["success"] is True
+    assert "error_code" not in final_tool
+    if expected_count is None:
+        assert final_tool["data"]["providers"] == {"anthropic": 2, "openai": 1, "": 1, "openrouter": 1}
+        assert final_tool["data"]["total_models"] == 5
     else:
-        assert final_tool["success"] is True
         assert final_tool["data"]["count"] == expected_count
-        assert len(final_tool["data"]["models"]) == expected_count
-        assert final_tool["data"]["truncated"] is False
+        limit = followup["limit"] if "limit" in followup else 50
+        assert len(final_tool["data"]["models"]) == min(limit, expected_count)
+        assert final_tool["data"]["truncated"] is (expected_count > limit)
 
 
 def test_model_discovery_request_predicates_keep_partial_scope_unresolved() -> None:
@@ -145,8 +144,6 @@ async def test_model_discovery_completion_uses_selected_response_instead_of_orig
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
 
     final_tool = [json.loads(message["content"]) for message in completion.requests[2]["messages"] if message["role"] == "tool"][-1]
-    if admitted_complete:
-        assert final_tool["error_code"] == "DISCOVERY_NO_GAIN"
-    else:
-        assert final_tool["success"] is True
-        assert final_tool["data"]["models"] == ["anthropic/model-a", "anthropic/model-b"]
+    assert final_tool["success"] is True
+    assert final_tool["data"]["models"] == ["anthropic/model-a", "anthropic/model-b"]
+    assert final_tool["data"]["truncated"] is False

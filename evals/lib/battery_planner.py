@@ -8,7 +8,6 @@ through the Battery and calls into this module; all logic lives here.
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -17,8 +16,6 @@ from typing import Any
 
 from elspeth.contracts.composer_planner_audit import ComposerPlannerCode as PC
 from elspeth.contracts.composer_planner_audit import ComposerPlannerInformationClass as IC
-from elspeth.web.composer import no_tool_policy
-from elspeth.web.composer.no_tool_policy import PipelineMutationIntentDecision, classify_pipeline_mutation_intent
 from elspeth.web.composer.protocol import (
     PIPELINE_STAGED_AUTO_COMMIT_MESSAGE,
     PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE,
@@ -90,14 +87,23 @@ def load_fixture(name: str) -> dict[str, Any]:
 
 
 def classifier_fingerprint() -> str:
-    return hashlib.sha256(Path(inspect.getsourcefile(no_tool_policy) or "").read_bytes()).hexdigest()
+    """Keep the historical report key, binding today's structural router.
+
+    The request classifier has been retired. Offline scoring of existing
+    paired captures remains supported; this fingerprint identifies the
+    current service implementation, without asserting those captures were
+    taken against it.
+    """
+    return hashlib.sha256((REPO / "src/elspeth/web/composer/service.py").read_bytes()).hexdigest()
 
 
 def assert_pair_routes(intent: str) -> None:
-    p = classify_pipeline_mutation_intent(intent)
-    l_ = classify_pipeline_mutation_intent(LOOP_PREFIX + intent)
-    if p is not PipelineMutationIntentDecision.EXPLICIT_MUTATION or l_ is PipelineMutationIntentDecision.EXPLICIT_MUTATION:
-        raise ProbeUnpaired(f"pair does not route P→planner / L→loop: P={p.name} L={l_.name} for {intent[:60]!r}")
+    """Refuse the retired greeting-prefix probe before spending provider calls."""
+    raise ProbeUnpaired(
+        "wording no longer selects the authoring surface; the greeting-prefix "
+        "P/L probe cannot establish different surfaces. Existing captures can "
+        "still be scored offline."
+    )
 
 
 def required_information(args: dict[str, Any]) -> frozenset[str]:
@@ -396,7 +402,7 @@ def score_probe_dir(round_dir: Path) -> dict[str, Any]:
     lines = [
         "# Planner probe (calibration; enters no rate)",
         "",
-        f"classifier fingerprint `{doc['classifier_fingerprint']}`",
+        f"current structural routing fingerprint `{doc['classifier_fingerprint']}` (historical report key: classifier_fingerprint)",
         "",
         (
             f"**NOT COMPARABLE — {len(unpaired)} fixture(s) have no usable pair: {', '.join(unpaired)}.** "

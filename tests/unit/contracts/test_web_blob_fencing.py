@@ -324,8 +324,9 @@ _PRODUCTION_TOP_LEVEL_DEFINITIONS = (
     (ast.FunctionDef, "create_blobs_router"),
 )
 _PRODUCTION_ENDPOINT_POST_ACQUIRE_AST_SHA256 = {
-    "create_blob_upload": "048d344a7d6939fc9ba4163f40b3cbc8356dabea3489180fd06322c36e95a035",
-    "create_blob_inline": "815f01692e5ac0dd77fae4ca3dcfb7caeb0c33995dfb2797c7e1e49ff5ebad8a",
+    # Exact decimal quota response fields changed; lease custody and effects did not.
+    "create_blob_upload": "87a53ffacd366127e3cde8a2888f01219dae7a6480f57f1412b1b3d7ff71ebbb",
+    "create_blob_inline": "68af41a0ab9906e42c27deee68be72cc87c40732ae79f4ad292e1bd6c74b4ae1",
     "get_blob_metadata": "6f5fecde5c973519d1f0f19cd46daa3c95365844275ad8802eb6a1963e5907e1",
     "download_blob_content": "de533132ec1ef83d39add60f4c16b3ac3230ebc0a4142dc5ce36b27357cc40ec",
     "preview_blob_content": "7ccaecad1d53f7b5db494ff1d06e9f23ead181d5b9eca977cae4eab8be957468",
@@ -3235,7 +3236,8 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     # Epoch 68 adds proposal checkpoint rebase reasons.
     # Epoch 75 combines graph recovery with durable authentication families and bound tickets.
     # Epoch 76 requires effective graph-review facts from committed terminal cohorts.
-    assert SESSION_SCHEMA_EPOCH == 77
+    # Epoch 78 binds quota custody and output storage reservations, retaining blob_read.
+    assert SESSION_SCHEMA_EPOCH == 78
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

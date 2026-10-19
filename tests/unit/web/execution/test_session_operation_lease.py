@@ -2369,19 +2369,31 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
             if (
                 isinstance(call.func, ast.Name)
                 and call.func.id == "Orchestrator"
-                and all(_binding_nodes(function, live_nodes, name=name) == () for name in ("Orchestrator", "LLMCallGovernance", "partial"))
+                and all(
+                    _binding_nodes(function, live_nodes, name=name) == ()
+                    for name in ("Orchestrator", "LLMCallGovernance", "partial", "RunProviderAttemptClock")
+                )
             ):
+                expected_clock = ast.parse("provider_clock = RunProviderAttemptClock()").body[0]
+                clock_assignments = [
+                    node for node in live_nodes if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(expected_clock)
+                ]
+                if len(clock_assignments) != 1 or len(_binding_nodes(function, live_nodes, name="provider_clock")) != 1:
+                    continue
                 expected = ast.parse(
                     "LLMCallGovernance("
-                    "before_call=partial(self._admit_run_llm_call, run_uuid, session_operation_lease), "
+                    "before_call=partial(self._admit_run_llm_call, run_uuid, session_operation_lease, clock=provider_clock), "
                     "after_call=partial(self._settle_run_llm_call, run_uuid, session_operation_lease, "
-                    "landscape_db=landscape_db, landscape_run_id=run_id))",
+                    "landscape_db=landscape_db, landscape_run_id=run_id), "
+                    "outcome_timestamp=provider_clock.timestamp_for_outcome)",
                     mode="eval",
                 ).body
                 for keyword in call.keywords:
                     if keyword.arg == "llm_call_governance" and ast.dump(keyword.value) == ast.dump(expected):
                         assert isinstance(keyword.value, ast.Call)
                         for callback in keyword.value.keywords:
+                            if callback.arg == "outcome_timestamp":
+                                continue
                             assert isinstance(callback.value, ast.Call)
                             edge = callback.value.args[0]
                             assert isinstance(edge, ast.Attribute)
@@ -3473,7 +3485,7 @@ def _execution_effect_findings(owner: ast.ClassDef) -> _ExecutionEffectFindings:
     )
 
 
-@pytest.mark.parametrize("mutation", ["none", "lease", "constructor"])
+@pytest.mark.parametrize("mutation", ["none", "lease", "constructor", "clock", "timestamp", "clock_constructor"])
 def test_provider_quota_callback_edges_require_exact_governance_and_transferred_lease(mutation: str) -> None:
     owner = _class_node(ExecutionServiceImpl)
     governance = next(
@@ -3487,6 +3499,20 @@ def test_provider_quota_callback_edges_require_exact_governance_and_transferred_
         callback = governance.keywords[0].value
         assert isinstance(callback, ast.Call)
         callback.args[2] = ast.Name(id="other_lease", ctx=ast.Load())
+    elif mutation == "clock":
+        callback = governance.keywords[0].value
+        assert isinstance(callback, ast.Call)
+        callback.keywords[0].value = ast.Name(id="other_clock", ctx=ast.Load())
+    elif mutation == "timestamp":
+        callback = next(keyword for keyword in governance.keywords if keyword.arg == "outcome_timestamp")
+        callback.value = ast.Name(id="other_clock", ctx=ast.Load())
+    elif mutation == "clock_constructor":
+        clock = next(
+            node
+            for node in ast.walk(owner)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "RunProviderAttemptClock"
+        )
+        clock.func.id = "OtherClock"
     findings = _execution_effect_findings(owner)
     if mutation == "none":
         assert findings.escaped_class_helpers == ()

@@ -37,6 +37,7 @@ from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_to
 from elspeth.web.composer.service import ComposerServiceImpl, _ComposeLoopDiagnostics
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.sessions.models import (
@@ -852,7 +853,7 @@ async def test_internal_completion_control_metadata_refuses_atomically_before_an
         if credential_field == "reasoning_details":
             metadata_value = {"detail": candidate}
         elif credential_field == "thinking_blocks":
-            metadata_value = [{"thinking": candidate}]
+            metadata_value = [{"type": "thinking", "thinking": candidate, "signature": "synthetic-native-signature"}]
         completion = replace(
             completion,
             provider_metadata=replace(completion.provider_metadata, **{credential_field: metadata_value}),
@@ -883,7 +884,8 @@ async def test_internal_completion_control_metadata_refuses_atomically_before_an
             session_id=result_session_id,
         )
 
-    assert caught.value.surface == "composer_provider_response"
+    expected_surface = "composer_provider_thinking" if credential_field == "thinking_blocks" else "composer_provider_response"
+    assert caught.value.surface == expected_surface
     assert candidate not in repr(caught.value.to_payload())
     llm_calls = caught.value.__dict__["llm_calls"]
     assert len(llm_calls) == 1
@@ -2775,7 +2777,7 @@ async def test_step2_redacts_intercepted_advisor_unknown_arguments_before_persis
 
 
 @pytest.mark.asyncio
-async def test_step2_unknown_tool_canary_is_absent_from_actual_persistence(
+async def test_step2_unknown_tool_display_is_redacted_and_visible_evidence_retains_arguments(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
 ) -> None:
@@ -2829,7 +2831,21 @@ async def test_step2_unknown_tool_canary_is_absent_from_actual_persistence(
             ).mappings()
         )
 
-    durable_blob = json.dumps([dict(row) for row in rows], sort_keys=True)
+    # Tool rows carry the complete, credential-filtered visible evidence for
+    # Advisor review beside their separately redacted display content.
+    tool_rows = [row for row in rows if row["role"] == "tool"]
+    assert len(tool_rows) == 1
+    assert len(tool_rows[0]["tool_calls"]) == 1
+    event = VisibleToolEvent.from_envelope(tool_rows[0]["tool_calls"][0])
+    assert event.tool_call_id == "call_unknown_canary"
+    evidence = json.loads(event.payload_json)
+    assert json.loads(evidence["received_arguments"]) == {canary_key: canary_value}
+    assert json.loads(evidence["effective_arguments"]) == {"_redaction_status": "unknown_tool"}
+    display_rows = [
+        {"role": row["role"], "content": row["content"], "tool_calls": row["tool_calls"] if row["role"] == "assistant" else None}
+        for row in rows
+    ]
+    durable_blob = json.dumps(display_rows, sort_keys=True)
     result_blob = json.dumps([invocation.to_dict() for invocation in result.tool_invocations], sort_keys=True)
     assert canary_key not in durable_blob
     assert canary_value not in durable_blob

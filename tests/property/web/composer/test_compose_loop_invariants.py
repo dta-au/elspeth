@@ -864,8 +864,7 @@ def _drive_single_example_trace_with(
 
     async def unavailable_end(**kwargs: Any) -> Any:
         from litellm import AuthenticationError
-
-        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+        from tests.helpers.advisor_review import parse_advisor_publication_review
 
         assert kwargs["model"] == harness.service._settings.composer_advisor_model
         assert len(reviews) < 1, "Only one nonretryable END SDK refusal is supplied per trace"
@@ -873,8 +872,7 @@ def _drive_single_example_trace_with(
         assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
         _assert_guard_row(harness, _chat_rows(harness)[-1])
         _assert_end_accounting(harness, settled=False)
-        payload = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-        review = json.loads(payload.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+        review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
         assert review["current_request"] == "one-turn compose-loop test driver" and review["candidate_reply"] == "Done."
         states = _state_rows(harness)
         assert review["saved_effects"]["saved_revision_count"] == len(states)
@@ -941,6 +939,7 @@ def _assert_provider_settlement_rows(harness: _Harness, rows: tuple[Any, ...], s
     from elspeth.web.composer.audit import _LLM_CALL_PUBLIC_AUDIT_FIELDS
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
     from elspeth.web.composer.provider_context import capture_provider_context
+    from elspeth.web.composer.visible_tool_event import validate_visible_response_gap
 
     assert len(rows) == 2
     call_row, request_row = rows
@@ -948,8 +947,12 @@ def _assert_provider_settlement_rows(harness: _Harness, rows: tuple[Any, ...], s
     assert all(row.composition_state_id is None and row.tool_call_id is None and row.parent_assistant_id is None for row in rows)
     assert call_row.content == "Provider call result recorded."
     envelopes = json.loads(call_row.tool_calls)
-    assert len(envelopes) == 1 and set(envelopes[0]) == {"_kind", "call"}
+    assert len(envelopes) == 2 and set(envelopes[0]) == {"_kind", "call"}
     assert envelopes[0]["_kind"] == "llm_call_audit"
+    validate_visible_response_gap(envelopes[1], envelopes[0])
+    assert envelopes[1]["session_id"] == harness.session_id
+    assert envelopes[1]["operation_id"] == harness.compose_context.fence.operation_id
+    assert envelopes[1]["operation_epoch"] == harness.compose_context.fence.operation_epoch
     call = envelopes[0]["call"]
     assert set(call) == set(_LLM_CALL_PUBLIC_AUDIT_FIELDS)
     attempts, ledger = _provider_accounting_rows(harness)

@@ -1019,7 +1019,9 @@ _EXPECTED_SUBORDINATE_EDGE_COUNT = 154
 # Export retry repair: 154 edges remain; _reserve_export -> _lock_stream moves
 # 30cdda6842ae896d -> 79fef0a1995bd81d because create excludes existing winners.
 # Measured by the gate's scanner against 49c184508: one moved, no arrivals/departures.
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "7ee575f619b21c40b64fbb73541cb1be5508dc32a1bf1dcae95c1b6b72081f92"
+# Durable quota accounting forwards preserve_call_id=explicit_call_id through
+# the existing record_call/record_operation_call -> _insert_allocated_call edges.
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "99e14aae3b82aca256018fc9c4c58da2db08a76ccc8724e47d7291d19d16e94b"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 93
@@ -5818,7 +5820,7 @@ _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operation
 _reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6bc46d9e075c8a4e6"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "4afd04b5fe121b2b46c04177923eda247526d44099f239068f703c49d2f76026",
+    "src/elspeth/web/sessions/composer_turn.py": "ba2337366bfdc9f6c4181a85e8dcf0dc1d3048b405de3855c882d178e96dda52",
     "src/elspeth/web/sessions/composer_async_worker.py": "863285bd0bc2ffb3c7002738834c09e892b479b2b11dd3dff062fe91ea905a2a",
 }
 
@@ -9823,7 +9825,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/core/landscape/execution_repository.py",
             "ExecutionRepository",
-            "1c1c40559024a572d359287fe8afc0d9c4dad76207d2594b6478b37b3e7f214f",
+            "3f7b7a2963e058d5fa2af9a9b400a180ff21028aab537af5b0e7dbb512d0ed34",
         ),
         (
             "src/elspeth/core/landscape/execution/sink_effects.py",
@@ -14361,7 +14363,7 @@ def _raw_attribute_collector(unit: SourceUnit, units: tuple[SourceUnit, ...]) ->
 # These are source bindings, not permissions granted by a filename alone.
 _NEW_LANDSCAPE_STAMP_SOURCES = {
     "src/elspeth/web/schema_probe.py": "c0f27e271e6128ea96a4cb345f32ef4c61bbcdd338aba0a9eaaf1db34447851d",
-    "src/elspeth/core/landscape/database.py": "dee9cbab892223687e425cbc3222b9ede3235f95cbdec1316e3f17e991e35135",
+    "src/elspeth/core/landscape/database.py": "b8da4ed519bbe887140a0a72f040ce264fc4910724c56ca0f55065c2a89653cf",
     "src/elspeth/core/schema_shape.py": "5b32f7faf09a03a7c482b48a092eb0f7cf5811eb927302ad72820fde81ceccb0",
 }
 
@@ -15999,7 +16001,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # guard, journal installation, and database clock path remain unchanged.
     # #298 admits existing SQLite stores read-only before writer bootstrap and
     # changes refusal guidance. Deadline/journal installation order is retained.
-    "src/elspeth/core/landscape/database.py": "93732e93b20b0a30e76f29d259d9ea24b706de7c9cc61173f9b87bbc38ad1438",
+    # Durable quota recovery adds calls.returned_model to required columns;
+    # engine construction and deadline/journal guard ordering are unchanged.
+    "src/elspeth/core/landscape/database.py": "f95f6b921824bb82b58cc754fa86f6c3a46687d892ff810879b5abbb864ce246",
 }
 
 

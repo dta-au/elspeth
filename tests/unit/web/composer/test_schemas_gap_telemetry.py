@@ -23,6 +23,7 @@ from typing import Any
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX
 from elspeth.web.composer.prompts import build_context_string as _build_context_string
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.state import (
@@ -138,8 +139,9 @@ def _three_plugin_state() -> CompositionState:
 
 def _composer_progress(context_str: str) -> dict[str, Any]:
     """Extract the ``composer_progress`` block from a context string payload."""
-    prefix, _, json_text = context_str.partition("\n")
-    assert prefix.startswith("Current pipeline state and session progress")
+    prefix, separator, json_text = context_str.partition("\n")
+    assert prefix == STATE_CONTEXT_PREFIX
+    assert separator == "\n"
     parsed = json.loads(json_text)
     return parsed["composer_progress"]
 

@@ -67,6 +67,8 @@ class _RecordCallRecorder:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         assert token_usage == UNKNOWN_TOKEN_USAGE
         assert source_call_id is None
@@ -83,15 +85,17 @@ class _RecordCallRecorder:
             "response_ref": response_ref,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "token_usage": token_usage,
+            "call_id": call_id,
+            "created_at": created_at,
         }
         self.calls.append(_RecordedCall((), kwargs))
         return Call(
-            call_id=f"test-call-{len(self.calls)}",
+            call_id=call_id if call_id is not None else f"test-call-{len(self.calls)}",
             call_index=call_index,
             call_type=call_type,
             status=status,
             request_hash="test-request-hash",
-            created_at=datetime.now(UTC),
+            created_at=created_at if created_at is not None else datetime.now(UTC),
             state_id=state_id,
             request_ref=request_ref or "test-request-ref-hash",
             response_hash="test-response-hash" if response_data is not None else None,

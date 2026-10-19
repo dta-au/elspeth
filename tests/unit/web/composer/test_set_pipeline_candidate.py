@@ -2884,12 +2884,7 @@ def test_review_contract_rejection_carries_closed_code(tmp_path: Path) -> None:
     assert lead.error_code == "interpretation_review_contract_unsatisfied"
 
 
-def test_term_matched_rephrased_cleanup_draft_carries_malformed_code(tmp_path: Path) -> None:
-    # Tutorial op 18b4cee7 (2026-07-22): a planner that DID author the cleanup
-    # row but paraphrased the draft was told the row was missing — the
-    # "add the row" guidance can never repair a draft-text defect, so the
-    # planner looped to exhaustion. A term-matched, marker-missed row must
-    # carry its own code whose guidance names the draft text as the fix.
+def test_term_matched_rephrased_cleanup_draft_is_accepted(tmp_path: Path) -> None:
     args = _scrape_cleanup_args(tmp_path)
     args["nodes"][1]["options"]["interpretation_requirements"] = [
         {
@@ -2905,10 +2900,12 @@ def test_term_matched_rephrased_cleanup_draft_carries_malformed_code(tmp_path: P
         _trained_context(data_dir=tmp_path),
     )
 
-    assert candidate.acceptable is False
-    lead = candidate.result.validation.errors[0]
-    assert lead.component == "rejected_mutation"
-    assert lead.error_code == "interpretation_review_draft_malformed"
+    assert candidate.acceptable is True
+    assert candidate.result.success is True
+    requirements = candidate.result.updated_state.nodes[1].options["interpretation_requirements"]
+    assert requirements[0]["user_term"] == "drop_raw_html_fields"
+    assert requirements[0]["status"] == "pending"
+    assert requirements[0]["draft"] == args["nodes"][1]["options"]["interpretation_requirements"][0]["draft"]
 
 
 def test_file_sink_write_policy_rejection_carries_closed_code(tmp_path: Path) -> None:

@@ -117,8 +117,8 @@ async def test_csv_schema_rejections_repair_without_replacing_prior_scaffold(
     validation, dispatch, state settlement and durable writes are production.
     """
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
     from elspeth.web.composer.turn_effects import authored_state_hash
+    from tests.helpers.advisor_review import parse_advisor_publication_review
 
     def available(*, model: str, **_kwargs: object) -> ComposerAvailability:
         return ComposerAvailability(available=True, model=model, provider="test")
@@ -226,8 +226,7 @@ async def test_csv_schema_rejections_repair_without_replacing_prior_scaffold(
         if kwargs["model"] == service._settings.composer_advisor_model:
             advisor_calls += 1
             assert advisor_calls == 1, "Only one independent terminal publication review is supplied"
-            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             reviews.append(review)
             assert review["candidate_reply"] == candidate
             assert review["current_request"] == request

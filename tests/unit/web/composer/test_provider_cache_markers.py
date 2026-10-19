@@ -32,6 +32,7 @@ from elspeth.web.composer.llm_response_parsing import (
     apply_anthropic_cache_markers,
     supports_anthropic_prompt_cache_markers,
 )
+from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX
 from tests.unit.web.composer._helpers import (
     _composer_service_with_session,
     _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
@@ -380,7 +381,7 @@ class TestCacheMarkersWiredAtCallSite:
             assert "AUTHORITATIVE REFERENCE DATA" in catalog_context_msg["content"]
             assert catalog_context_msg["cache_control"] == {"type": "ephemeral"}
             assert state_context_msg["role"] == "user"
-            assert state_context_msg["content"].startswith("Current pipeline state and session progress")
+            assert state_context_msg["content"].startswith(STATE_CONTEXT_PREFIX + "\n")
             assert "UNTRUSTED DATA" in state_context_msg["content"]
             assert "cache_control" not in state_context_msg
             assert sent_messages[-1]["cache_control"] == {"type": "ephemeral"}
@@ -513,7 +514,7 @@ class TestCacheMarkersWiredAtCallSite:
             assert sent_messages[1]["role"] == "user"
             assert sent_messages[1]["content"].startswith("Deployment plugin catalog and authoring aids")
             assert "AUTHORITATIVE REFERENCE DATA" in sent_messages[1]["content"]
-            assert sent_messages[2]["content"].startswith("Current pipeline state and session progress")
+            assert sent_messages[2]["content"].startswith(STATE_CONTEXT_PREFIX + "\n")
 
             sent_tools = request["tools"]
             for tool in sent_tools:

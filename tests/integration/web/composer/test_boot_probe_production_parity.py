@@ -39,15 +39,19 @@ from sqlalchemy.pool import StaticPool
 import elspeth.web.composer.pipeline_planner as planner_module
 import elspeth.web.composer.provider_gateway as gateway_module
 from elspeth.plugins.transforms.llm.providers.openrouter import OPENROUTER_APP_REFERER, OPENROUTER_APP_TITLE
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.boot_probe import build_composer_probe_requests, probe_composer_config
+from elspeth.web.composer.pipeline_planner import PLANNER_DISCOVERY_TOOL_NAMES
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
-from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _MODEL = "openrouter/deepseek/deepseek-v4.1-flash"
@@ -148,9 +152,12 @@ async def _capture_production_requests(
     settings: WebSettings,
     *,
     message: str,
+    existing_graph: bool = False,
 ) -> list[dict[str, Any]]:
     """Run one real ``compose()`` turn and return every LiteLLM request it made."""
-    requests, _composer, _result = await _run_production_turn(tmp_path, monkeypatch, settings, message=message)
+    requests, _composer, _result = await _run_production_turn(
+        tmp_path, monkeypatch, settings, message=message, existing_graph=existing_graph
+    )
     return requests
 
 
@@ -161,12 +168,13 @@ async def _run_production_turn(
     *,
     message: str,
     reach_the_hatch: bool = False,
+    existing_graph: bool = False,
 ) -> tuple[list[dict[str, Any]], ComposerServiceImpl, Any]:
     """Run one real ``compose()`` turn; return its LiteLLM requests, the service and the result.
 
-    With ``reach_the_hatch``, every full-palette planner request is answered
+    With ``reach_the_hatch``, every ordinary planner request is answered
     with a discovery call, so the planner exhausts its discovery budget and
-    takes the escape-hatch turn (recovery controls plus proposal), which is answered
+    takes the escape-hatch turn on the configured advisor model, which is answered
     with the terminal proposal.
     """
     engine = create_session_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -176,7 +184,41 @@ async def _run_production_turn(
         grant_test_pipeline_user(conn, identity_id="parity-user")
     sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("parity-user", "Parity", "local")
+    state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    current_state_id = None
+    if existing_graph:
+        source_path = tmp_path / "existing.csv"
+        source_path.write_text("name\nAda\n", encoding="utf-8")
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": str(source_path), "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        serialized = state.to_dict()
+        saved = await sessions.save_composition_state(
+            session.id,
+            CompositionStateData(
+                nodes=serialized["nodes"], sources=serialized["sources"], metadata_=serialized["metadata"], is_valid=False
+            ),
+            provenance="session_seed",
+        )
+        current_state_id = str(saved.id)
     user_message = await sessions.add_message(session.id, "user", message, writer_principal="route_user_message")
+    advisor_history = AdvisorTranscriptHistory.from_records(
+        session_id=str(session.id),
+        actor_user_id="parity-user",
+        current_request_id=str(user_message.id),
+        request=message,
+        records=await sessions.get_messages(session.id),
+    )
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
         lambda **_kwargs: ComposerAvailability(available=True, provider="test", model=_MODEL, reason=None),
@@ -191,9 +233,17 @@ async def _run_production_turn(
 
     async def completion(**kwargs: Any) -> _Response:
         requests.append(kwargs)
-        names = {tool["function"]["name"] for tool in kwargs.get("tools", [])}
-        hatch_names = {"handoff_to_user", "restore_parked_graph", "emit_pipeline_proposal"}
-        if reach_the_hatch and "max_tokens" in kwargs and names != hatch_names:
+        if "response_format" in kwargs:
+            assert kwargs["model"] == settings.composer_advisor_model
+            assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+            assert review["current_request"] == message
+            assert review["candidate_reply"] == "I can help you build a pipeline."
+            content = json.dumps(
+                {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+            )
+            return _Response(choices=[_Choice(message=_Message(content=content, tool_calls=[]))], usage=_usage())
+        if reach_the_hatch and "max_tokens" in kwargs and kwargs["model"] != settings.composer_advisor_model:
             discovery = _ToolCall(id=f"parity-discovery-{len(requests)}", function=_Function(name="list_sources", arguments="{}"))
             return _Response(choices=[_Choice(message=_Message(content=None, tool_calls=[discovery]))], usage=_usage())
         if "tools" in kwargs and any(tool["function"]["name"] == "emit_pipeline_proposal" for tool in kwargs["tools"]):
@@ -215,10 +265,12 @@ async def _run_production_turn(
         result = await composer.compose(
             message,
             [],
-            CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+            state,
             session_id=str(session.id),
+            current_state_id=current_state_id,
             user_id="parity-user",
             user_message_id=str(user_message.id),
+            advisor_history=advisor_history,
         )
     finally:
         engine.dispose()
@@ -290,7 +342,9 @@ def _planner_request(requests: list[dict[str, Any]]) -> dict[str, Any]:
 @pytest.mark.asyncio
 async def test_loop_tools_description_matches_the_fenced_compose_loop_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(tmp_path)
-    production = _loop_request(await _capture_production_requests(tmp_path, monkeypatch, settings, message="What can you help me build?"))
+    production = _loop_request(
+        await _capture_production_requests(tmp_path, monkeypatch, settings, message="What can you help me build?", existing_graph=True)
+    )
     probe = _expected_planner_wire_requests(settings)["loop_tools"]
 
     assert "reasoning" in production, "control: the compared request must carry a reasoning kwarg"
@@ -320,7 +374,9 @@ async def test_planner_tools_description_matches_the_fenced_pipeline_planner_req
 @pytest.mark.asyncio
 async def test_mutation_control_dropped_reasoning_makes_the_loop_comparison_red(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(tmp_path)
-    production = _loop_request(await _capture_production_requests(tmp_path, monkeypatch, settings, message="What can you help me build?"))
+    production = _loop_request(
+        await _capture_production_requests(tmp_path, monkeypatch, settings, message="What can you help me build?", existing_graph=True)
+    )
     monkeypatch.setattr(gateway_module, "apply_reasoning_kwargs", lambda _kwargs, **_ignored: None)
     probe = _expected_planner_wire_requests(settings)["loop_tools"]
 
@@ -406,7 +462,7 @@ async def test_description_and_production_have_the_same_strict_flags_on_a_forwar
 
     settings = _settings(tmp_path, composer_endpoint_base_url=None, composer_endpoint_api_key=None, composer_advisor_model=_ADVISOR)
     loop_production = _loop_request(
-        await _capture_production_requests(tmp_path, monkeypatch, settings, message="What can you help me build?")
+        await _capture_production_requests(tmp_path, monkeypatch, settings, message="What can you help me build?", existing_graph=True)
     )
     planner_requests, composer, _result = await _run_production_turn(
         tmp_path, monkeypatch, settings, message="Build a CSV to JSONL pipeline.", reach_the_hatch=True
@@ -424,11 +480,16 @@ async def test_description_and_production_have_the_same_strict_flags_on_a_forwar
     assert shared
     assert {name: production_planner[name] for name in shared} == {name: probe_planner[name] for name in shared}
     assert set(production_planner.values()) == {True, False}
-    assert (
-        _strict_map(probe["hatch_terminal"]["tools"])
-        == _strict_map(_hatch_request(planner_requests)["tools"])
-        == {"handoff_to_user": True, "restore_parked_graph": True, "emit_pipeline_proposal": False}
-    )
+    hatch_strict = _strict_map(_hatch_request(planner_requests)["tools"])
+    assert hatch_strict == {
+        **dict.fromkeys(PLANNER_DISCOVERY_TOOL_NAMES, True),
+        "handoff_to_user": True,
+        "restore_parked_graph": True,
+        "emit_pipeline_proposal": False,
+    }
+    probe_hatch_strict = _strict_map(probe["hatch_terminal"]["tools"])
+    assert probe_hatch_strict == {"handoff_to_user": True, "restore_parked_graph": True, "emit_pipeline_proposal": False}
+    assert probe_hatch_strict == {name: hatch_strict[name] for name in probe_hatch_strict}
 
 
 @pytest.mark.asyncio
@@ -463,6 +524,7 @@ async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_not_the_planner
     hatch_i = _hatch_request(requests_i)
     assert hatch_i["api_base"] == _PROXY
     assert _strict_map(hatch_i["tools"]) == {
+        **dict.fromkeys(PLANNER_DISCOVERY_TOOL_NAMES, "omitted"),
         "handoff_to_user": "omitted",
         "restore_parked_graph": "omitted",
         "emit_pipeline_proposal": "omitted",
@@ -503,5 +565,10 @@ async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_when_only_the_h
     )
     hatch_ii = _hatch_request(requests_ii)
     assert "api_base" not in hatch_ii
-    assert _strict_map(hatch_ii["tools"]) == {"handoff_to_user": True, "restore_parked_graph": True, "emit_pipeline_proposal": False}
+    assert _strict_map(hatch_ii["tools"]) == {
+        **dict.fromkeys(PLANNER_DISCOVERY_TOOL_NAMES, True),
+        "handoff_to_user": True,
+        "restore_parked_graph": True,
+        "emit_pipeline_proposal": False,
+    }
     assert _hatch_call(recorded_ii).tool_contract_dialect.value == "openai_strict"

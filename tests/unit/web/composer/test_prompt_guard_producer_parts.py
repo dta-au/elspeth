@@ -445,14 +445,14 @@ def test_advisor_decoded_projection_preserves_literal_baseline_summary():
 
     prompt = 'Inspect {{ row.record }}. 境界 😀 "quoted" \\u754c\nnext'
     state = _advisor_projection_state({"prompt_template": prompt})
-    # Independent literal of the immutable a578 display contract, not a
+    # Independent literal of the Advisor evidence display contract, not a
     # comparison between two new renderers of the same changed structure.
     expected = (
         "Pipeline: Untitled Pipeline\nSource: (none set)\nNodes:\n"
         "  - decoded_review: type=transform plugin=llm reads 'records' -> 'answers' on_error=discard "
         "[requires: (none declared)] [options: prompt_template_untrusted_json="
         + json.dumps(prompt)
-        + "] [interpolates row fields: [record]]\nSinks: (none)"
+        + "] [named row field references: [record]]\nSinks: (none)"
     )
     assert summarize_pipeline_for_advisor(state) == expected
     parts = advisor_summary_parts(state, expected).values

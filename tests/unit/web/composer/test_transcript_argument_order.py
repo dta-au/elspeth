@@ -41,6 +41,7 @@ from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import (
     _PROPOSAL_SESSION_ID,
     _harness,
+    _incremental_base_state,
     _inline_pipeline_args,
     _ScriptedLLM,
     _tool_turn,
@@ -50,7 +51,6 @@ from tests.integration.web.composer.test_freeform_required_controls import (
     _textract_llm_mapper_args,
 )
 from tests.unit.web.composer.conftest import _fake_llm_response, _FakeComposeLLM
-from tests.unit.web.composer.test_planner_authoring_aids import _empty_state
 
 _MODEL_ORDER = ["zeta", "alpha"]
 _SOURCE_ORDER = ["zeta_src", "alpha_src"]
@@ -318,7 +318,7 @@ async def test_auto_commit_finalization_replay_keeps_coalesce_order(tmp_path: Pa
         result = await harness.service.compose(
             "Build and apply a Textract to LLM pipeline.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,
@@ -392,7 +392,7 @@ async def test_auto_commit_finalization_replay_keeps_sources_order(tmp_path: Pat
         await harness.service.compose(
             "Build and apply a Textract to LLM pipeline over two manifests.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,
@@ -424,7 +424,7 @@ async def test_explicit_finalization_and_custody_replay_keeps_coalesce_order(tmp
         await harness.service.compose(
             "Build a Textract to LLM pipeline and prepare it for review.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,
@@ -469,7 +469,7 @@ async def test_inline_custody_replay_keeps_coalesce_order(tmp_path: Path, monkey
         result = await harness.service.compose(
             "Prepare this pipeline for review.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,

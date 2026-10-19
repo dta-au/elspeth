@@ -534,7 +534,7 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
     import litellm
 
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+    from tests.helpers.advisor_review import parse_advisor_publication_review
 
     sessions_service = _build_sessions_service(tmp_path)
     session_id = str(uuid4())
@@ -581,8 +581,7 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
             assert "api_key" not in kwargs
             messages = kwargs["messages"]
             assert [message["role"] for message in messages] == ["system", "user"]
-            review_json = messages[1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            review = parse_advisor_publication_review(messages[1]["content"])
             assert len(primary_replies) == 1
             assert review["candidate_reply"] == primary_replies[0]
             assert review["current_request"] == "hello composer-against-gateway"
@@ -679,7 +678,7 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
     import mock.upstream as mock_upstream
 
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+    from tests.helpers.advisor_review import parse_advisor_publication_review
 
     sessions_service = _build_sessions_service(tmp_path)
     session_id = str(uuid4())
@@ -735,8 +734,7 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
             assert len(primary_replies) == len(conversations) == 2
             candidate = primary_replies[1].choices[0].message.content
             assert candidate == "MOCK:" + original_last_text(conversations[1])
-            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             assert review["candidate_reply"] == candidate
             assert review["current_request"] == "USE_TOOL list_sources {}"
             assert review["saved_effects"]["saved_revision_count"] == 0

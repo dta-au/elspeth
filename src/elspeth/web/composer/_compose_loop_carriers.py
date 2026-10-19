@@ -146,7 +146,7 @@ class _AdvisorCallSuccess:
 class _AdvisorProviderFailure:
     """Recognised Tier-3 provider failure that may become tool feedback."""
 
-    error_class: str
+    error_class: str | None
 
 
 @dataclass(frozen=True, slots=True)

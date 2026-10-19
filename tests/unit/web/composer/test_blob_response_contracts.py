@@ -221,6 +221,16 @@ def test_actual_content_producer_preserves_truncation_and_origin_pair(large: boo
         "total_chars": len(text),
         "end_char": end,
         "next_offset_chars": end if large else None,
+        **(
+            {
+                "read_attachment_suggestion": (
+                    "This is a partial page of a large attachment. If you need the whole file, use read_attachment "
+                    "for complete guarded UTF-8 text in one call; it explicitly refuses if the full response cannot fit."
+                )
+            }
+            if large
+            else {}
+        ),
     }
     assert json.dumps(wire) == json.dumps(deep_thaw(result.data))
 

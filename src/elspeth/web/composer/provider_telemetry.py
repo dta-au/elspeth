@@ -14,6 +14,7 @@ from opentelemetry import metrics
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.web.composer.visible_tool_event import VISIBLE_RESPONSE_GAP_KIND, validate_visible_response_gap
 
 ComposerTelemetrySurface = Literal["freeform"]
 ComposerRequestTerminalStatus = Literal["completed", "failed", "timed_out", "cancelled"]
@@ -162,13 +163,18 @@ def record_settled_composer_audit_message(
     if role != "audit" or writer_principal != "compose_loop" or type(tool_calls) not in {list, tuple}:
         return
     exact_tool_calls = cast("list[Mapping[str, object]] | tuple[Mapping[str, object], ...]", tool_calls)
-    if len(exact_tool_calls) != 1:
+    if len(exact_tool_calls) not in {1, 2}:
         return
     envelope = exact_tool_calls[0]
     if type(envelope) not in {dict, MappingProxyType} or set(envelope) != {"_kind", "call"}:
         return
     if envelope["_kind"] != "llm_call_audit":
         return
+    if len(exact_tool_calls) == 2:
+        companion = exact_tool_calls[1]
+        if type(companion) not in {dict, MappingProxyType} or "_kind" not in companion or companion["_kind"] != VISIBLE_RESPONSE_GAP_KIND:
+            return
+        validate_visible_response_gap(companion, envelope)
     raw_call = envelope["call"]
     if type(raw_call) not in {dict, MappingProxyType}:
         return

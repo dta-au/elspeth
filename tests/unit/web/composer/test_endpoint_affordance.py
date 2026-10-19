@@ -84,6 +84,7 @@ async def test_call_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
         "prompt_guard_trusted_message_indexes": frozenset(),
         "prompt_guard_content_parts": None,
         "prompt_guard_tool_argument_parts": None,
+        "prompt_guard_thinking_parts": None,
     }
 
 

@@ -733,21 +733,36 @@ def _resolved_signature(member: Any) -> tuple[tuple[tuple[str, inspect._Paramete
     parameters = tuple(parameter for parameter in signature.parameters.values() if parameter.name != "self")
     for parameter in parameters:
         if (
-            parameter.name == "execution_input"
-            and member
-            in {
-                sessions_protocol.SessionOperationRunMutations.create_pending_run,
-                coordination_repository._RepositoryRunMutations.create_pending_run,
-            }
-        ) or (
-            parameter.name == "approval"
-            and member
-            in {
-                sessions_protocol.SessionOperationRunMutations.assess_start_admission,
-                sessions_protocol.SessionOperationRunMutations.issue_start_permit,
-                coordination_repository._RepositoryRunMutations.assess_start_admission,
-                coordination_repository._RepositoryRunMutations.issue_start_permit,
-            }
+            (
+                parameter.name == "execution_input"
+                and member
+                in {
+                    sessions_protocol.SessionOperationRunMutations.create_pending_run,
+                    coordination_repository._RepositoryRunMutations.create_pending_run,
+                }
+            )
+            or (
+                parameter.name == "remaining_output_storage_bytes"
+                and member
+                in {
+                    sessions_protocol.SessionOperationBlobMutations.retire_blob_replacement,
+                    sessions_protocol.SessionOperationBlobMutations.retire_blob_deletion,
+                    sessions_protocol.SessionOperationBlobMutations.retire_atomic_blob_deletion,
+                    coordination_repository._RepositoryBlobMutations.retire_blob_replacement,
+                    coordination_repository._RepositoryBlobMutations.retire_blob_deletion,
+                    coordination_repository._RepositoryBlobMutations.retire_atomic_blob_deletion,
+                }
+            )
+            or (
+                parameter.name == "approval"
+                and member
+                in {
+                    sessions_protocol.SessionOperationRunMutations.assess_start_admission,
+                    sessions_protocol.SessionOperationRunMutations.issue_start_permit,
+                    coordination_repository._RepositoryRunMutations.assess_start_admission,
+                    coordination_repository._RepositoryRunMutations.issue_start_permit,
+                }
+            )
         ):
             assert parameter.default is None
         else:
@@ -1059,6 +1074,28 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
                     tuple[BlobRecord, ...],
                 ),
+                "list_run_output_storage_paths": (
+                    (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    tuple[str, ...],
+                ),
+                "reserve_run_output_storage": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("target_path", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("size_bytes", inspect.Parameter.KEYWORD_ONLY, int),
+                        ("max_storage_per_session", inspect.Parameter.KEYWORD_ONLY, int),
+                    ),
+                    type(None),
+                ),
+                "reconcile_run_output_storage": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("target_path", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("size_bytes", inspect.Parameter.KEYWORD_ONLY, int),
+                        ("max_storage_per_session", inspect.Parameter.KEYWORD_ONLY, int),
+                    ),
+                    type(None),
+                ),
                 "mark_blob_deletion_staged": (
                     (("plan", inspect.Parameter.KEYWORD_ONLY, BlobDeletionPlan),),
                     BlobDeletionPlan,
@@ -1145,15 +1182,24 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     bool,
                 ),
                 "retire_atomic_blob_deletion": (
-                    (("obligation", inspect.Parameter.KEYWORD_ONLY, BlobAtomicDeletionObligation),),
+                    (
+                        ("obligation", inspect.Parameter.KEYWORD_ONLY, BlobAtomicDeletionObligation),
+                        ("remaining_output_storage_bytes", inspect.Parameter.KEYWORD_ONLY, int | None),
+                    ),
                     bool,
                 ),
                 "retire_blob_deletion": (
-                    (("plan", inspect.Parameter.KEYWORD_ONLY, BlobDeletionPlan),),
+                    (
+                        ("plan", inspect.Parameter.KEYWORD_ONLY, BlobDeletionPlan),
+                        ("remaining_output_storage_bytes", inspect.Parameter.KEYWORD_ONLY, int | None),
+                    ),
                     bool,
                 ),
                 "retire_blob_replacement": (
-                    (("plan", inspect.Parameter.KEYWORD_ONLY, BlobReplacementPlan),),
+                    (
+                        ("plan", inspect.Parameter.KEYWORD_ONLY, BlobReplacementPlan),
+                        ("remaining_output_storage_bytes", inspect.Parameter.KEYWORD_ONLY, int | None),
+                    ),
                     bool,
                 ),
                 "insert_blob_inline_resolutions": (

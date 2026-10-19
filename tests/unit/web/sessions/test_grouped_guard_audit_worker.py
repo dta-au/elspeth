@@ -32,7 +32,7 @@ from elspeth.web.sessions.models import (
 from tests.helpers.composer_operations import message_body, submit_and_settle
 from tests.unit.web.composer.test_service import _create_session_blob_for_test
 from tests.unit.web.sessions.test_routes import _make_app
-from tests.unit.web.sessions.test_run_composer_turn import _TestSnapshotFactory
+from tests.unit.web.sessions.test_run_composer_turn import _seed_output_only_draft, _TestSnapshotFactory
 
 
 def _leaves(failure):
@@ -111,6 +111,7 @@ async def test_actual_worker_preserves_primary_audit_after_advisor_guard_refusal
     app.state.composer_service = composer
     app.state.plugin_snapshot_factory = _TestSnapshotFactory(app.state.plugin_snapshot_factory)
     session = await sessions.create_session("alice", "Existing authored session", "local")
+    baseline = await _seed_output_only_draft(app, sessions, session.id)
     engine = app.state.session_engine
     blob_id = _create_session_blob_for_test(
         engine=engine, session_id=str(session.id), data_dir=tmp_path, filename="input.csv", content="name,score\nada,42\n"
@@ -167,15 +168,27 @@ async def test_actual_worker_preserves_primary_audit_after_advisor_guard_refusal
             }
         )
     expected_tool_ids = tuple(call["id"] for call in tool_calls)
+    clear_tool_id = "clear-grouped-audit-1"
+    clear_calls = [
+        {
+            "id": clear_tool_id,
+            "type": "function",
+            "function": {"name": "remove_output", "arguments": json.dumps({"sink_name": "existing_output"})},
+        }
+    ]
+    expected_primary_calls = 2 if advisor_path == "early" else 1
     sdk_calls = []
 
     async def completion(**kwargs):
         sdk_calls.append(deepcopy(kwargs))
-        assert len(sdk_calls) == 1, "Advisor refusal must not dispatch another SDK request"
+        assert len(sdk_calls) <= expected_primary_calls, "Advisor refusal must not dispatch another SDK request"
         assert "set_pipeline" in {tool["function"]["name"] for tool in kwargs["tools"]}
+        # EARLY is an empty -> nonempty transition. Reach it honestly from
+        # the existing draft, through two real ordinary-loop tool turns.
+        batch = clear_calls if advisor_path == "early" and len(sdk_calls) == 1 else tool_calls
         return litellm.ModelResponse(
             model=kwargs["model"],
-            choices=[{"message": {"role": "assistant", "content": None, "tool_calls": tool_calls}, "finish_reason": "tool_calls"}],
+            choices=[{"message": {"role": "assistant", "content": None, "tool_calls": batch}, "finish_reason": "tool_calls"}],
             usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
         )
 
@@ -226,17 +239,25 @@ async def test_actual_worker_preserves_primary_audit_after_advisor_guard_refusal
                 .where(chat_messages_table.c.session_id == str(session.id), chat_messages_table.c.role.in_(("assistant", "tool")))
                 .order_by(chat_messages_table.c.sequence_no)
             ).all()
-        assert len(states) == 1 and states[0].id == str(witness.state.id)
-        assert [row.role for row in rows] == ["assistant", *["tool"] * len(expected_tool_ids)]
-        assert rows[0].id == assistant_message_id
-        assert tuple(row.tool_call_id for row in rows[1:]) == expected_tool_ids
+        final_checkpoint = advisor_path == "manual" or len(committed) == 1
+        assert bool(expected_state.sources) == final_checkpoint
+        batch_ids = expected_tool_ids if final_checkpoint else (clear_tool_id,)
+        previous_states = {state.id for state in committed[-1][0]} if committed else {str(baseline.id)}
+        assert len(states) == len(previous_states) + 1
+        assert {state.id for state in states} == previous_states | {str(witness.state.id)}
+        batch_rows = rows[-(1 + len(batch_ids)) :]
+        assert [row.role for row in batch_rows] == ["assistant", *["tool"] * len(batch_ids)]
+        assert batch_rows[0].id == assistant_message_id
+        assert tuple(row.tool_call_id for row in batch_rows[1:]) == batch_ids
+        if committed:
+            assert rows[: len(committed[-1][1])] == committed[-1][1], "Earlier committed tool turn must not replay"
         committed.append((states, rows, assistant_message_id, evidence))
         try:
             original_accept(
                 evidence,
                 witness,
                 expected_state=expected_state.with_metadata({"name": "controlled comparison mismatch"})
-                if verification_fails
+                if verification_fails and final_checkpoint
                 else expected_state,
                 tool_call_ids=tool_call_ids,
                 assistant_message_id=assistant_message_id,
@@ -252,16 +273,17 @@ async def test_actual_worker_preserves_primary_audit_after_advisor_guard_refusal
     monkeypatch.setattr(TurnEvidence, "accept_checkpoint", verify_checkpoint)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         settled = await submit_and_settle(
-            # A conversational request takes the ordinary compose-loop surface;
+            # The existing output draft selects the ordinary compose loop;
             # the controlled model response still authors the actual graph.
             client,
             app,
             path=f"/api/sessions/{session.id}/messages",
-            body=message_body("Please review the source data."),
+            body=message_body("Please review the source data.", state_id=baseline.id),
         )
     status, body = settled.error()
     assert status == (500 if verification_fails else 422), body
-    assert len(sdk_calls) == len(guard_originals) == len(service_failures) == len(committed) == len(physically_settled) == 1
+    assert len(sdk_calls) == len(committed) == len(physically_settled) == expected_primary_calls
+    assert len(guard_originals) == len(service_failures) == 1
     leaves = _leaves(service_failures[0])
     refusals = [leaf for leaf in leaves if isinstance(leaf, PromptGuardRefused)]
     assert len(refusals) == 1 and refusals[0].__cause__ is guard_originals[0]
@@ -272,12 +294,12 @@ async def test_actual_worker_preserves_primary_audit_after_advisor_guard_refusal
         assert integrity_originals[0] in leaves
         assert integrity_originals[0].failed_turn is refusals[0].failed_turn
         assert body["error_type"] == "audit_integrity_error"
-        assert body["failed_turn"]["assistant_message_id"] == committed[0][2]
-        assert committed[0][3].effects.verification == "unavailable"
+        assert body["failed_turn"]["assistant_message_id"] == committed[-1][2]
+        assert committed[-1][3].effects.verification == "unavailable"
     else:
         assert body["detail"]["error_type"] == "prompt_guard_blocked"
         assert body["detail"]["audit_id"] == refusals[0].audit_id
-        assert committed[0][3].effects.verification == "verified"
+        assert committed[-1][3].effects.verification == "verified"
     with engine.connect() as connection:
         rows = connection.execute(
             select(chat_messages_table)
@@ -292,8 +314,8 @@ async def test_actual_worker_preserves_primary_audit_after_advisor_guard_refusal
         fence = connection.execute(
             select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(session.id))
         ).one()
-    assert states == committed[0][0]
-    assert [row for row in rows if row.role in ("assistant", "tool")] == committed[0][1], "Committed assistant/tool rows must never replay"
+    assert states == committed[-1][0]
+    assert [row for row in rows if row.role in ("assistant", "tool")] == committed[-1][1], "Committed assistant/tool rows must never replay"
     checks = [
         envelope["check"]
         for row in rows
@@ -301,17 +323,24 @@ async def test_actual_worker_preserves_primary_audit_after_advisor_guard_refusal
         for envelope in (row.tool_calls or ())
         if envelope["_kind"] == "prompt_guard_audit"
     ]
-    assert [(check["role"], check["disposition"]) for check in checks] == [("composer", "allow"), ("advisor", "blocked")]
+    assert [(check["role"], check["disposition"]) for check in checks] == [
+        *[("composer", "allow")] * expected_primary_calls,
+        ("advisor", "blocked"),
+    ]
     assert checks[-1]["audit_id"] == guard_originals[0].audit_id
     assert guard_http and any(advisor for advisor, _payload in guard_http)
-    assert len(attempts) == len(ledger) == 1
-    assert attempts[0].settled_at is not None and attempts[0].ledger_entry_id == ledger[0].entry_id
-    call = physically_settled[0][0]
-    assert call.call_id == attempts[0].attempt_id and ledger[0].prompt_tokens == ledger[0].completion_tokens == 5
+    assert len(attempts) == len(ledger) == expected_primary_calls
+    assert all(attempt.settled_at is not None for attempt in attempts)
+    assert {attempt.ledger_entry_id for attempt in attempts} == {entry.entry_id for entry in ledger}
+    assert all(entry.prompt_tokens == entry.completion_tokens == 5 for entry in ledger)
     final_calls = _call_envelopes(rows)
-    assert len(final_calls) == 1, "Actual route/worker must retain exactly one complete primary llm_call_audit without a manual drain"
-    assert call.status.value == "success" and call.finished_at >= call.started_at
-    assert final_calls[0][1] == deep_thaw(llm_call_audit_envelope(call)["call"])
+    assert len(final_calls) == expected_primary_calls, "Every physical call must retain one complete audit without a manual drain"
+    assert {call["call_id"] for _row, call in final_calls} == {attempt.attempt_id for attempt in attempts}
+    for call, physical_rows in physically_settled:
+        assert call.status.value == "success" and call.finished_at >= call.started_at
+        (terminal,) = [(row, value) for row, value in final_calls if value["call_id"] == call.call_id]
+        assert terminal[1] == deep_thaw(llm_call_audit_envelope(call)["call"])
+        assert terminal in physical_rows
     # This contrast distinguishes an actual durable physical checkpoint from
     # a buffered draft. Do not assume the top-level group is the only carrier.
     checkpoint = physically_settled[0][1]
@@ -330,7 +359,7 @@ async def test_actual_worker_preserves_primary_audit_after_advisor_guard_refusal
                 "physical_checkpoint_audits": len(checkpoint),
                 "final_primary_audits": len(final_calls),
                 "same_checkpoint_row": bool(checkpoint) and checkpoint[0][0].id == final_calls[0][0].id,
-                "call_id": call.call_id,
+                "call_id": physically_settled[0][0].call_id,
                 "audit_row_id": final_calls[0][0].id,
                 "ledger_entry_id": ledger[0].entry_id,
                 "started_at": str(attempts[0].started_at),

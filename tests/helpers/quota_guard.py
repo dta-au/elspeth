@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -17,6 +18,7 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.prompt_guard import PromptGuardMount, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+from elspeth.web.composer.visible_tool_event import VISIBLE_RESPONSE_GAP_KIND, validate_visible_response_gap
 from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
@@ -27,6 +29,22 @@ from elspeth.web.required_work import (
 )
 from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.service import SessionServiceImpl
+
+
+def assert_provider_audit_companion(envelopes: Sequence[Mapping[str, Any]], context: SessionOperationContext) -> None:
+    """Require exact physical-call coverage while keeping other rows singleton."""
+    assert envelopes
+    public = envelopes[0]
+    if public["_kind"] != "llm_call_audit":
+        assert len(envelopes) == 1
+        return
+    assert len(envelopes) == 2
+    gap = envelopes[1]
+    assert gap["_kind"] == VISIBLE_RESPONSE_GAP_KIND
+    validate_visible_response_gap(gap, public)
+    assert gap["session_id"] == context.fence.session_id
+    assert gap["operation_id"] == context.fence.operation_id
+    assert gap["operation_epoch"] == context.fence.operation_epoch
 
 
 @dataclass
@@ -53,7 +71,9 @@ class GuardedQuotaTurn:
         assert rows[: len(self.prior_rows)] == self.prior_rows
         added = rows[len(self.prior_rows) :]
         assert len(added) == guards + calls + private
-        assert all(row.role == "audit" and row.writer_principal == "compose_loop" and len(row.tool_calls) == 1 for row in added)
+        assert all(row.role == "audit" and row.writer_principal == "compose_loop" for row in added)
+        for row in added:
+            assert_provider_audit_companion(row.tool_calls, self.context)
         expected = Counter()
         if guards:
             expected["prompt_guard_audit"] = guards

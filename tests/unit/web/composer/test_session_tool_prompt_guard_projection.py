@@ -39,7 +39,7 @@ from elspeth.web.required_work import (
 from elspeth.web.sessions.models import chat_messages_table, quota_provider_attempts_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.service import SessionServiceImpl
-from tests.unit.web.composer._helpers import _empty_state, _make_settings, _mock_catalog
+from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
 from tests.unit.web.composer.test_pipeline_planner import _plan, _response, _ScriptedCompletion
 
 _USER = "Explain the neutral schema fields."
@@ -202,7 +202,9 @@ def _review_state():
 @pytest.mark.parametrize("reply_only", [False, True], ids=["next-primary", "reply-only"])
 async def test_real_session_review_feedback_keeps_exact_wire_and_decoded_guard_input(invocation, monkeypatch, producer, reply_only):
     current = invocation
-    state = _empty_state() if producer == "missing_state" else _review_state()
+    # The negative case is an unsaved draft with no persisted FK target.
+    # An empty persisted session selects the planner before the session tool.
+    state = _review_state()
     current_state_id = None
     if producer != "missing_state":
         serialized = state.to_dict()
@@ -357,14 +359,14 @@ async def test_session_feedback_boundary_still_refuses_credentials_and_whole_ove
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mixed_discovery", [False, True], ids=["only-no-gain", "mixed-no-gain"])
+@pytest.mark.parametrize("mixed_discovery", [False, True], ids=["only-missing-component", "mixed-missing-component"])
 @pytest.mark.parametrize(
     "component", ["界" * 1700, '"field",' * 800, "\x01" * 1700], ids=["cjk-countercontrol", "dense-quotes", "escaped-control"]
 )
-async def test_real_planner_no_gain_feedback_inspects_unique_prefixed_component(
+async def test_real_planner_missing_component_feedback_inspects_complete_authored_component(
     tmp_path, tool_context, monkeypatch, mixed_discovery, component
 ):
-    unique_evidence = "pipeline.component:" + component
+    unique_evidence = "Component '" + component + "' not found."
     inspected = []
 
     def inspect(request):
@@ -387,7 +389,9 @@ async def test_real_planner_no_gain_feedback_inspects_unique_prefixed_component(
     calls = [("get_pipeline_state", {"component": component})]
     if mixed_discovery:
         calls.append(("get_plugin_schema", {"plugin_type": "transform", "name": "field_mapper"}))
-    completion = _ScriptedCompletion(_response(*calls), AssertionError("No-gain feedback must block before the next physical SDK call"))
+    completion = _ScriptedCompletion(
+        _response(*calls), AssertionError("Missing-component feedback must block before the next physical SDK call")
+    )
     with pytest.raises(PromptGuardRefused) as caught:
         await _plan(
             tmp_path=tmp_path,
@@ -399,5 +403,5 @@ async def test_real_planner_no_gain_feedback_inspects_unique_prefixed_component(
     assert caught.value.disposition == "blocked"
     assert caught.value._decision.reason == "policy_blocked"
     assert len(completion.requests) == 1
-    assert "get_pipeline_state" not in {tool["function"]["name"] for tool in completion.requests[0]["tools"]}
+    assert "get_pipeline_state" in {tool["function"]["name"] for tool in completion.requests[0]["tools"]}
     assert unique_evidence in "\n".join(document for request in inspected for document in request["documents"])

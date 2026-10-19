@@ -43,6 +43,7 @@ from tests.helpers.composer_operations import (
     submit_and_settle,
 )
 from tests.unit.web.sessions.test_routes import _make_app
+from tests.unit.web.sessions.test_run_composer_turn import _seed_output_only_draft
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +56,7 @@ class _Dispatch:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transition", ("initial", "followup", "rootless", "recompose", "authoring"))
+@pytest.mark.parametrize("transition", ("initial", "followup", "source_missing", "recompose", "authoring"))
 async def test_each_real_composer_transition_has_its_own_settled_provider_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transition: str
 ) -> None:
@@ -116,23 +117,23 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
     rootless_prompts = []
     rootless_request = "Build a pipeline from customer complaints."
     rootless_correction = "No pipeline has been configured. Please supply the customer complaints source and desired report."
-    rootless_findings = "The reply claims a ready pipeline, but no composition has been saved for the requested customer complaints report."
+    rootless_findings = "The reply claims a ready pipeline, but the saved output draft has no customer complaints source."
     actual_checkpoint = app.state.composer_service._advisor_checkpoint._run_advisor_checkpoint
     assert actual_checkpoint.__func__ is AdvisorCheckpointOwner._run_advisor_checkpoint
     assert actual_checkpoint.__module__ == "elspeth.web.composer.advisor_checkpoint"
 
     async def observe_checkpoint(*args, **kwargs):
-        if transition == "rootless" and kwargs["phase"] == "end":
+        if transition == "source_missing" and kwargs["phase"] == "end":
             rootless_reviews.append(kwargs["publication_review"])
         verdict = await actual_checkpoint(*args, **kwargs)
-        if transition == "rootless" and kwargs["phase"] == "end":
+        if transition == "source_missing" and kwargs["phase"] == "end":
             assert verdict.publication_binding == rootless_reviews[-1].binding
             rootless_outcomes.append(verdict)
         return verdict
 
     monkeypatch.setattr(app.state.composer_service._advisor_checkpoint, "_run_advisor_checkpoint", observe_checkpoint)
     primary_replies = ["Hello. I can explain pipelines."]
-    if transition == "rootless":
+    if transition == "source_missing":
         primary_replies = ["The pipeline is ready.", rootless_correction]
     if transition == "followup":
         primary_replies.append("Hello again. I can explain pipelines.")
@@ -176,7 +177,12 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
             assert primary_replies, "Unexpected extra primary provider dispatch"
             content = primary_replies.pop(0)
             primary_ordinal = sum(call.model == model for call in dispatches)
-            if transition == "rootless":
+            sent_names = {tool["function"]["name"] for tool in kwargs["tools"]}
+            if transition in {"initial", "recompose"}:
+                assert "emit_pipeline_proposal" in sent_names and "set_pipeline" not in sent_names
+            else:
+                assert "set_pipeline" in sent_names
+            if transition == "source_missing":
                 rootless_prompts.append(deepcopy(kwargs["messages"]))
                 if primary_ordinal == 2:
                     assert len(rootless_reviews) == len(rootless_outcomes) == 1, "PRIMARY repair bypassed actual END"
@@ -250,11 +256,11 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
             payload = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "CLEAN", "note": None}
             if schema_name == "advisor_end_response":
                 payload["publication_verdict"] = "ADMIT"
-                if transition == "rootless":
+                if transition == "source_missing":
                     assert len(rootless_reviews) <= 2
                     review = rootless_reviews[-1]
                     assert any(
-                        review.provider_payload_json
+                        review.provider_review_context_json()
                         in (item["content"] if isinstance(item["content"], str) else "".join(part["text"] for part in item["content"]))
                         for item in kwargs["messages"]
                     )
@@ -264,8 +270,8 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                     assert packet["saved_effects"]["saved_revision_count"] == 0
                     payload["publication_verdict"] = "WITHHOLD" if len(rootless_reviews) == 1 else "ADMIT"
                     payload["findings"] = rootless_findings if len(rootless_reviews) == 1 else ""
-            elif transition == "rootless":
-                raise AssertionError("An unchanged empty rootless turn must not use EARLY")
+            elif transition == "source_missing":
+                raise AssertionError("An unchanged source-less draft turn must not use EARLY")
             content = json.dumps(payload)
         return litellm.ModelResponse(
             id=f"local-{len(dispatches)}",
@@ -292,6 +298,11 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
             created = await client.post("/api/sessions", json={"title": "Per transition evidence"})
             assert created.status_code == 201, created.text
             session_id = created.json()["id"]
+            baseline = None
+            if transition in {"followup", "source_missing", "authoring"}:
+                # Ordinary-loop scenarios start from a real previous draft.
+                # Initial and recompose retain the empty PLANNER -> END path.
+                baseline = await _seed_output_only_draft(app, service, UUID(session_id))
             operation_ids: list[str] = []
             rounds = 2 if transition == "followup" else 1
             for _ in range(rounds):
@@ -308,7 +319,7 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                     body = recompose_body(user.id, operation_id=operation_id)
                 else:
                     path = f"/api/sessions/{session_id}/messages"
-                    content = rootless_request if transition == "rootless" else "Hello"
+                    content = rootless_request if transition == "source_missing" else "Hello"
                     if transition == "authoring":
                         content = "Create a pipeline reading hello from an inline text source and writing the text to CSV."
                     current = await service.get_current_state(UUID(session_id))
@@ -324,9 +335,14 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                 assert this_transition, "transition bypassed the primary provider"
                 assert {call.operation_id for call in this_transition} == {operation_id}
                 assert sum(call.model == app.state.settings.composer_model for call in this_transition) == (
-                    4 if transition == "authoring" else 2 if transition == "rootless" else 1
+                    4 if transition == "authoring" else 2 if transition == "source_missing" else 1
                 ), "transition bypassed the primary provider"
-                if transition == "rootless":
+                if transition in {"initial", "recompose"}:
+                    assert [call.model for call in this_transition] == [
+                        app.state.settings.composer_model,
+                        app.state.settings.composer_advisor_model,
+                    ]
+                if transition == "source_missing":
                     assert [call.model for call in this_transition] == [
                         app.state.settings.composer_model,
                         app.state.settings.composer_advisor_model,
@@ -368,7 +384,7 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                 ("composer" if call.model == app.state.settings.composer_model else "advisor", "allow") for call in dispatches
             ]
             assert shield_requests
-            if transition == "rootless":
+            if transition == "source_missing":
                 assert [outcome.publication_verdict for outcome in rootless_outcomes] == ["WITHHOLD", "ADMIT"]
                 assert rootless_reviews[0].binding != rootless_reviews[1].binding
                 passes = [
@@ -394,7 +410,10 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                     for prompt in rootless_prompts
                     for item in prompt
                 )
-                assert await service.get_current_state(UUID(session_id)) is None
+                current = await service.get_current_state(UUID(session_id))
+                assert current is not None and baseline is not None
+                assert current.id == baseline.id
+                assert not current.sources and current.outputs == baseline.outputs
                 assert any(message.role == "assistant" and message.content.startswith(rootless_correction) for message in messages)
                 assert not any(message.role == "assistant" and "The pipeline is ready." in message.content for message in messages)
                 assert any(

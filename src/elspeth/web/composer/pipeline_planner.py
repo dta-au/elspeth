@@ -15,7 +15,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, suppress
@@ -536,13 +535,6 @@ def _resolved_discovery_information_keys(call: _ParsedToolCall, discovery: Admit
     return (*keys, "model.catalog.complete:" + canonical_json(normalized))
 
 
-def _intent_selected_schema_keys(intent: str) -> frozenset[str]:
-    """Extract only explicit kind-qualified plugin selections from a request."""
-    return frozenset(
-        f"plugin.schema:{kind}/{name}" for kind, name in re.findall(r"\b(source|transform|sink):([a-z0-9][a-z0-9_.-]*)\b", intent.lower())
-    )
-
-
 def _aid_supplied_information(authoring_aids: Mapping[str, Any]) -> frozenset[str]:
     """Return the manifest keys the authoring aids close with complete content.
 
@@ -577,10 +569,11 @@ class PlannerPriorUserRequestDict(TypedDict):
 
 
 class PlannerConversationContextDict(TypedDict):
-    """Bounded earlier-user context supplied to a referential planner turn."""
+    """Earlier requests and separately attributed assistant context."""
 
     prior_user_requests: list[PlannerPriorUserRequestDict]
     additional_prior_user_requests_omitted: int
+    prior_assistant_messages: NotRequired[list[PlannerPriorAssistantMessageDict]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,32 +594,69 @@ class PlannerPriorUserRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class PlannerPriorAssistantMessage:
+    """Earlier assistant prose supplies context, never user-request authority."""
+
+    history_index: int
+    content: str
+
+    def __post_init__(self) -> None:
+        if type(self.history_index) is not int or self.history_index < 0:
+            raise ValueError("history_index must be a non-negative exact integer")
+        if type(self.content) is not str or not self.content.strip():
+            raise ValueError("content must be a non-empty exact string")
+
+    def to_dict(self) -> PlannerPriorAssistantMessageDict:
+        return PlannerPriorAssistantMessageDict(history_index=self.history_index, content=self.content)
+
+
+class PlannerPriorAssistantMessageDict(TypedDict):
+    """Provider projection of assistant prose, separate from human requests."""
+
+    history_index: int
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
 class PlannerConversationContext:
     """Owned, bounded context for resolving a referential current request."""
 
     prior_user_requests: tuple[PlannerPriorUserRequest, ...]
     additional_prior_user_requests_omitted: int = 0
+    prior_assistant_messages: tuple[PlannerPriorAssistantMessage, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.prior_user_requests) is not tuple or any(
             type(request) is not PlannerPriorUserRequest for request in self.prior_user_requests
         ):
             raise TypeError("prior_user_requests must be an exact PlannerPriorUserRequest tuple")
-        if not self.prior_user_requests:
-            raise ValueError("prior_user_requests must not be empty")
+        if type(self.prior_assistant_messages) is not tuple or any(
+            type(message) is not PlannerPriorAssistantMessage for message in self.prior_assistant_messages
+        ):
+            raise TypeError("prior_assistant_messages must be an exact PlannerPriorAssistantMessage tuple")
+        if not self.prior_user_requests and not self.prior_assistant_messages:
+            raise ValueError("planner conversation context must not be empty")
         history_indices = tuple(request.history_index for request in self.prior_user_requests)
         if history_indices != tuple(sorted(set(history_indices))):
             raise ValueError("prior_user_requests history_index values must be unique and increasing")
+        assistant_indices = tuple(message.history_index for message in self.prior_assistant_messages)
+        if assistant_indices != tuple(sorted(set(assistant_indices))):
+            raise ValueError("prior_assistant_messages history_index values must be unique and increasing")
+        if set(history_indices) & set(assistant_indices):
+            raise ValueError("user and assistant history_index values must be distinct")
         if type(self.additional_prior_user_requests_omitted) is not int or self.additional_prior_user_requests_omitted < 0:
             raise ValueError("additional_prior_user_requests_omitted must be a non-negative exact integer")
         if self.additional_prior_user_requests_omitted > 0 and len(self.prior_user_requests) < 2:
             raise ValueError("omitted prior requests require both an anchor and a retained recent request")
 
     def to_dict(self) -> PlannerConversationContextDict:
-        return PlannerConversationContextDict(
+        result = PlannerConversationContextDict(
             prior_user_requests=[request.to_dict() for request in self.prior_user_requests],
             additional_prior_user_requests_omitted=self.additional_prior_user_requests_omitted,
         )
+        if self.prior_assistant_messages:
+            result["prior_assistant_messages"] = [message.to_dict() for message in self.prior_assistant_messages]
+        return result
 
 
 class PipelinePlannerError(RuntimeError):
@@ -653,17 +683,12 @@ class PipelinePlannerError(RuntimeError):
 
 
 class PlannerDeclined(PipelinePlannerError):
-    """Honest decline: the model answered in text on a turn where text is legal.
+    """The model ended authoring with a bounded, nonempty text reply.
 
-    Raised from the overtime escape-hatch turn (any text — the advisor is
-    tool-restricted and taught), and from an ordinary turn once the
-    information manifest shows every declared or requested fact supplied or
-    proven unavailable AND the reply leads with the taught
-    ``_PROSE_DECLINE_MARKER`` — ordinary turns keep the full palette, so
-    marker-less text stays narration and is nudged. ``decline_text`` is the
-    model's own explanation (marker stripped) and is intended to be surfaced
-    to the user as an ordinary assistant message, never as a provider
-    failure.
+    Both ordinary and escape-hatch turns may explain, clarify, or decline
+    without discovery prerequisites. ``decline_text`` retains the model's
+    words verbatim for publication as an ordinary assistant message. The
+    existing disposition name does not classify the reply's semantic intent.
     """
 
     def __init__(self, message: str, *, decline_text: str, continuation_budget: PlannerContinuationBudget | None = None) -> None:
@@ -1715,31 +1740,6 @@ def _parse_json_object(raw: object, *, label: str) -> Mapping[str, Any]:
     return cast(Mapping[str, Any], parsed)
 
 
-# Protocol token an ordinary-turn text decline must lead with. The hatch turn
-# accepts any text because its advisor is tool-restricted and taught by
-# _escape_hatch_notice; an ordinary turn keeps the full palette, so text there
-# is ambiguous between narration and decline and needs this mechanical
-# discriminator, taught by _prose_decline_notice.
-_PROSE_DECLINE_MARKER: Final[str] = "DECLINE:"
-
-
-def _marked_decline_body(content: str, marker: str) -> str | None:
-    """Return the decline body when content leads with marker, else None.
-
-    Removing the protocol token (and its separating whitespace) is
-    classification, not authorship: the returned body is the model's own
-    words verbatim. A bare marker with no body is NOT a decline — there are
-    no server-authored decline words, so an empty body routes to the nudge
-    lane instead of a fallback. The marker is case-sensitive by design; the
-    fail-safe direction is cheap (an uncased attempt costs one nudge).
-    """
-    stripped = content.lstrip()
-    if not stripped.startswith(marker):
-        return None
-    body = stripped[len(marker) :].lstrip()
-    return body if body else None
-
-
 def _unadmitted_prose(response: Any) -> str:
     """Return the text of a reply ``_parse_response_tool_calls`` refused as PROSE_REPLY.
 
@@ -1796,7 +1796,6 @@ def _parse_response_tool_calls(
     *,
     max_tool_calls: int,
     allow_text: bool = False,
-    text_marker: str | None = None,
     dialect: ToolContractDialect,
     sent_tool_names: frozenset[str],
 ) -> tuple[Any, tuple[_ParsedToolCall, ...]]:
@@ -1826,12 +1825,7 @@ def _parse_response_tool_calls(
     raw_calls = _provider_field(message, "tool_calls")
     if type(raw_calls) not in {list, tuple} or not raw_calls:
         content = _provider_field(message, "content")
-        if (
-            allow_text
-            and type(content) is str
-            and content.strip()
-            and (text_marker is None or _marked_decline_body(content, text_marker) is not None)
-        ):
+        if allow_text and type(content) is str and content.strip():
             try:
                 require_bounded_text(content, label="planner text response")
             except JsonBoundaryError:
@@ -1841,10 +1835,8 @@ def _parse_response_tool_calls(
                 pass
             else:
                 return message, ()
-        # The no-tool-call class (prose thinking-aloud, an empty reply,
-        # marker-less text where a marker is required, or a text reply too
-        # large to admit) gets its own code so the loop can nudge-retry it —
-        # mid-plan prose is ordinary LLM behaviour, not provider breakage.
+        # Empty, non-text, or oversized replies get a bounded retry. Ordinary
+        # bounded text is a conversational exit when allow_text is enabled.
         # The loop converts it back to terminal MALFORMED_RESPONSE once the
         # nudge budget is spent; the code never escapes the planner.
         raise PipelinePlannerError("planner response must call a declared tool", code="PROSE_REPLY")
@@ -1929,10 +1921,8 @@ def _terminal_call_not_alone_feedback() -> dict[str, object]:
     }
 
 
-# Bounded retries for the no-tool-call response class, separate from the
-# repair budget: repairs answer candidate rejections, nudges answer a model
-# that thought aloud instead of calling a tool (tutorial session a2513c3c
-# died terminal on a single prose reply with its whole repair budget unspent).
+# Bounded retries for empty, non-text, or oversized responses, separate from
+# the repair budget for candidate rejections.
 _PROSE_NUDGE_BUDGET = 2
 
 # Aggregate ceiling on every plugin contract this request hands the planner —
@@ -1949,7 +1939,8 @@ PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
     "batch it with discovery or another call: a mixed terminal batch executes no calls. "
     "After a rejection, repair and resubmit the complete proposal. At any stage, you may instead call "
     "handoff_to_user or restore_parked_graph alone with your message to end authoring and talk to the user. "
-    "Recovery needs no discovery, candidate capture or validation."
+    "You may also reply in plain text to explain, ask a question, or decline. "
+    "Conversational exits need no discovery, candidate capture or validation."
 )
 
 
@@ -1959,24 +1950,10 @@ def _prose_reply_notice() -> str:
     # model answering each nudge with a discovery call and prosing again,
     # never reaching the terminal tool before the nudge budget spent.
     return (
-        "Your previous reply called no tool. You must respond with a declared tool call — "
+        "Your previous reply called no tool and contained no admissible text. "
+        "Respond with bounded nonempty text or a declared tool call — "
         "if your design is settled, call emit_pipeline_proposal with the complete proposal now; "
         "otherwise continue discovery or call handoff_to_user alone to stop and discuss the blocker."
-    )
-
-
-def _prose_decline_notice() -> str:
-    # Static teaching text only: it names the decline format and nothing
-    # else — no deployment, catalog, or policy facts — so it adds zero
-    # provider egress. Appended once, on the first turn where a text decline
-    # is legal.
-    return (
-        "If this request cannot be built with the capabilities available to this planning session, "
-        f'reply in plain text starting with "{_PROSE_DECLINE_MARKER} " and state plainly, in the '
-        "user's terms, what is missing. If required artifacts are absent or product requirements "
-        "conflict and no faithful reviewable draft is possible, use the same prefix to explain "
-        "the blocker and ask a focused question. Use that prefix only when you cannot build "
-        "the requested workflow from the available information; otherwise continue with tool calls."
     )
 
 
@@ -3473,7 +3450,7 @@ async def _plan_pipeline_inner(
         aid_supplied_information=_aid_supplied_information(authoring_aids),
     )
     information_manifest = discovery_policy.manifest
-    declared_pending_information = frozenset(information_manifest.unresolved) | frozenset(_intent_selected_schema_keys(intent))
+    declared_pending_information = information_manifest.unresolved
     pending_information = set(declared_pending_information)
     tools = planner_tool_definitions(discovery_policy, dialect=model_config.tool_contract_dialect)
     # Only registered schema entries and owned policy metadata are catalog
@@ -3537,7 +3514,6 @@ async def _plan_pipeline_inner(
     composition_turns = 0
     repair_count = 0
     prose_nudges = 0
-    decline_notice_given = False
     argument_retry = AntiAnchorTracker()
     argument_failure_repair_count = repair_count
     last_argument_failure: tuple[str, str] | None = None
@@ -3589,7 +3565,6 @@ async def _plan_pipeline_inner(
         model_override: str | None = None,
         tools_override: list[dict[str, Any]] | None = None,
         allow_text_reply: bool = False,
-        text_reply_marker: str | None = None,
         reasoning_effort: str | None = None,
         attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
         provider_custody: ProviderCallCustody | None = None,
@@ -4070,8 +4045,11 @@ async def _plan_pipeline_inner(
                 parsed_response = _parse_response_tool_calls(
                     response,
                     max_tool_calls=model_config.max_tool_calls_per_turn,
-                    allow_text=allow_text_reply,
-                    text_marker=text_reply_marker,
+                    # Without a stop reason, text at the output cap may be
+                    # incomplete. Keep it in the existing truncation-repair
+                    # path rather than publishing it as a conversational exit.
+                    allow_text=allow_text_reply
+                    and (call.finish_reason is not None or call.completion_tokens < budget_policy.max_completion_tokens),
                     dialect=effective_dialect,
                     sent_tool_names=frozenset(tool["function"]["name"] for tool in active_tools),
                 )
@@ -4135,7 +4113,6 @@ async def _plan_pipeline_inner(
         model_override: str | None = None,
         tools_override: list[dict[str, Any]] | None = None,
         allow_text_reply: bool = False,
-        text_reply_marker: str | None = None,
         reasoning_effort: str | None = None,
         attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
     ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
@@ -4143,7 +4120,6 @@ async def _plan_pipeline_inner(
             model_override=model_override,
             tools_override=tools_override,
             allow_text_reply=allow_text_reply,
-            text_reply_marker=text_reply_marker,
             reasoning_effort=reasoning_effort,
             attempt_phase_hint=attempt_phase_hint,
         )
@@ -4153,7 +4129,6 @@ async def _plan_pipeline_inner(
         model_override: str | None = None,
         tools_override: list[dict[str, Any]] | None = None,
         allow_text_reply: bool = False,
-        text_reply_marker: str | None = None,
         reasoning_effort: str | None = None,
         attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
     ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
@@ -4162,7 +4137,6 @@ async def _plan_pipeline_inner(
                 model_override=model_override,
                 tools_override=tools_override,
                 allow_text_reply=allow_text_reply,
-                text_reply_marker=text_reply_marker,
                 reasoning_effort=reasoning_effort,
                 attempt_phase_hint=attempt_phase_hint,
             )
@@ -4174,7 +4148,6 @@ async def _plan_pipeline_inner(
                         model_override=model_override,
                         tools_override=tools_override,
                         allow_text_reply=allow_text_reply,
-                        text_reply_marker=text_reply_marker,
                         reasoning_effort=reasoning_effort,
                         attempt_phase_hint=attempt_phase_hint,
                         provider_custody=provider_custody,
@@ -4225,8 +4198,10 @@ async def _plan_pipeline_inner(
         transcript_owner.observe_messages(messages)
         transcript = transcript_owner.snapshot().with_request_reference("initial_planner_request.intent")
         hatch_request = dict(provider_request)
-        if conversation_context is not None and transcript_owner.covers_prior_requests(
-            [prior.content for prior in conversation_context.prior_user_requests]
+        if (
+            conversation_context is not None
+            and not conversation_context.prior_assistant_messages
+            and transcript_owner.covers_prior_requests([prior.content for prior in conversation_context.prior_user_requests])
         ):
             hatch_request.pop("conversation_context", None)
         request_text = canonical_json(hatch_request)
@@ -4284,19 +4259,6 @@ async def _plan_pipeline_inner(
 
     while True:
         is_hatch_turn = hatch_error is not None
-        # A text decline is legal on an ordinary turn once catalog.selection
-        # is supplied and no declared or requested information key remains
-        # unresolved — vacuously true on turn 1 for a gapless request, which
-        # permits a one-call decline by design. Because eligible turns keep
-        # the full tool palette, classification requires the taught marker
-        # prefix; marker-less text keeps the nudge treatment. The hatch turn
-        # accepts any text, as taught by its own notice.
-        prose_decline_eligible = information_manifest.supplies(_CATALOG_SELECTION_INFORMATION) and all(
-            information_manifest.covers(key) for key in pending_information
-        )
-        if prose_decline_eligible and not is_hatch_turn and not decline_notice_given:
-            decline_notice_given = True
-            messages.append({"role": "user", "content": _prose_decline_notice()})
         try:
             if is_hatch_turn:
                 assert model_config.escape_hatch_model is not None
@@ -4310,20 +4272,10 @@ async def _plan_pipeline_inner(
                 )
             else:
                 message, calls, audited_call = await call_model(
-                    allow_text_reply=prose_decline_eligible,
-                    text_reply_marker=_PROSE_DECLINE_MARKER,
+                    allow_text_reply=True,
                     reasoning_effort=(
-                        # A prose reply is the model announcing it is at
-                        # emission stage: at discovery effort "low" sonnet-5
-                        # emitted zero reasoning on exactly the turns where
-                        # the terminal proposal was due and narrated the plan
-                        # as prose instead, and this branch could never give
-                        # the first emission turn candidate-level effort —
-                        # candidate effort only engaged after a REJECTED
-                        # candidate (elspeth-b1e85829e9, 2/2 live repro;
-                        # effort=medium produced a real candidate on the same
-                        # repro). Sticky past the first nudge by design: once
-                        # the model has prose-planned, emission is imminent.
+                        # Retain higher reasoning effort after a rejected
+                        # candidate or an unusable no-tool reply.
                         model_config.candidate_reasoning_effort
                         if repair_count > 0 or prose_nudges > 0
                         else model_config.discovery_reasoning_effort
@@ -4337,8 +4289,7 @@ async def _plan_pipeline_inner(
                 trail.finalize_active_exception(exc)
                 raise
             if exc.code == "PROSE_REPLY":
-                # A no-tool-call reply (thinking aloud) mid-plan: nudge the
-                # model back to tool calling on its own bounded budget —
+                # An unusable no-tool reply gets its own bounded retry —
                 # separate from the repair budget, which answers candidate
                 # rejections. Past the budget the puzzle goes to the escape
                 # hatch like every other exhaustion; the terminal
@@ -4427,18 +4378,13 @@ async def _plan_pipeline_inner(
             else ComposerPlannerAttemptPhase.DISCOVERY
         )
         trail.set_active_phase(attempt_phase)
-        if not calls and (is_hatch_turn or prose_decline_eligible):
+        if not calls:
             decline_content = _provider_field(message, "content")
             raw_text = decline_content if type(decline_content) is str else ""
-            # The parser admitted an ordinary-turn text reply only with the
-            # marker present; stripping that protocol token is classification,
-            # and the body is the model's words verbatim. The hatch turn keeps
-            # its any-text rule, content untouched.
-            marker_body = _marked_decline_body(raw_text, _PROSE_DECLINE_MARKER)
             trail.finish_attempt(attempt_phase, "declined", planner_code="DECLINED", led_to="terminal")
             raise PlannerDeclined(
                 "planner escape-hatch advisor declined the request" if is_hatch_turn else "planner declined the request",
-                decline_text=raw_text if is_hatch_turn else (marker_body if marker_body is not None else ""),
+                decline_text=raw_text,
                 continuation_budget=PlannerContinuationBudget(
                     policy=budget_policy,
                     session_id=originating_message.session_id,
@@ -5141,11 +5087,9 @@ async def _plan_pipeline_inner(
                 # rolled back to exactly what they were before it was seen:
                 # its keys entered pending BEFORE dispatch, and a key minted
                 # from bad arguments (plugin_type='node') is otherwise pending
-                # and uncovered forever, which silently revokes the DECLINE:
-                # affordance for the rest of the request. Subtracting the
-                # declared set is what makes this a rollback rather than a
-                # forget: a key the intent or the initial manifest also owes
-                # is still owed after this call fails. Marking the keys
+                # and uncovered forever. Subtracting the declared set makes
+                # this a rollback: a key in the initial manifest remains
+                # pending after this call fails. Marking the keys
                 # available=False instead was rejected -- covers() treats
                 # unavailable as covered, so the corrected retry of the same
                 # key would be refused as DISCOVERY_NO_GAIN.

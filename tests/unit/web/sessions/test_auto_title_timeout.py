@@ -140,8 +140,7 @@ async def test_slow_title_sdk_times_out_before_original_operation_deadline(tmp_p
         assert primary_times == []
     else:
         assert settled.final.json()["status"] == "completed", settled.final.json()
-        # The ordinary empty-graph footer still accompanies the model's reply.
-        assert settled.result()["message"]["content"].startswith("I can help build a pipeline.\n\n---\n\n[ELSPETH-SYSTEM]")
+        assert settled.result()["message"]["content"].startswith("I can help build a pipeline.")
         assert primary_times and primary_times[0] >= title_times[-1]
     assert len(title_kwargs) == 1 and title_kwargs[0]["timeout"] == 5.0
     assert title_kwargs[0]["num_retries"] == title_kwargs[0]["max_retries"] == 0

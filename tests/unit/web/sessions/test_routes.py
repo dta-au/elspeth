@@ -54,6 +54,7 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
 from elspeth.web.composer.diagnostic_evidence import (
     DIAGNOSTIC_EVIDENCE_KIND,
@@ -543,11 +544,21 @@ def _make_composer_mock(
 
 
 def _audit_tool_calls(tool_call_id: str = "call-audit") -> list[dict[str, Any]]:
+    arguments_canonical = "{}"
+    result_canonical = '{"success":true}'
     return [
         {
             "_kind": "audit",
             "invocation": {
                 "tool_call_id": tool_call_id,
+                "tool_name": "preview_pipeline",
+                "status": "success",
+                "arguments_canonical": arguments_canonical,
+                "arguments_hash": hashlib.sha256(arguments_canonical.encode()).hexdigest(),
+                "result_canonical": result_canonical,
+                "result_hash": hashlib.sha256(result_canonical.encode()).hexdigest(),
+                "error_class": None,
+                "error_message": None,
             },
         }
     ]
@@ -672,10 +683,11 @@ class _BlockingRecordingComposer:
         provider_owner=None,
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
+        advisor_history: AdvisorTranscriptHistory | None = None,
     ) -> ComposerResult:
         del state, session_id, current_state_id, user_id, progress, user_message_id
         del session_operation_context, completion_gates, budget_seconds, required_work, provider_owner, recovery_context
-        del retained_operation_context
+        del retained_operation_context, advisor_history
 
         self.calls.append(
             {
@@ -720,9 +732,10 @@ class _ProgressAwareComposer:
         provider_owner=None,
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
+        advisor_history: AdvisorTranscriptHistory | None = None,
     ) -> ComposerResult:
         del message, chat_messages, session_id, current_state_id, user_id, user_message_id, completion_gates, budget_seconds
-        del required_work, provider_owner, recovery_context, retained_operation_context
+        del required_work, provider_owner, recovery_context, retained_operation_context, advisor_history
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
@@ -5962,7 +5975,7 @@ class TestMessageRoutes:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+        from tests.helpers.advisor_review import parse_advisor_publication_review
 
         prompt_canary = "PROMPT_CANARY_9c0b3d"
         option_canary = "OPTION_CANARY_314a7e"
@@ -6128,16 +6141,26 @@ class TestMessageRoutes:
         assert len(provider_requests) == 3
         end_messages = provider_requests[2]["messages"]
         assert [message["role"] for message in end_messages] == ["system", "user"]
-        review_json = end_messages[1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-        review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+        review = parse_advisor_publication_review(end_messages[1]["content"])
         assert review["current_request"] == f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
         assert review["candidate_reply"] == "I cannot safely complete that pipeline."
         assert review["saved_effects"]["saved_revision_count"] == 0
         assert review["saved_effects"]["net_changed"] is False
         advisor_context = json.dumps(provider_requests[1]["messages"])
         assert all(canary in advisor_context for canary in canaries.values())
-        validator_feedback = next(message["content"] for message in reversed(provider_requests[1]["messages"]) if message["role"] == "tool")
-        assert validator_message_canary in validator_feedback
+        transcript_prefix = "Complete available same-session visible conversation evidence."
+        hatch_transcript = next(
+            message["content"]
+            for message in provider_requests[1]["messages"]
+            if message["role"] == "user" and message["content"].startswith(transcript_prefix)
+        )
+        feedback_events = [
+            event
+            for event in json.loads(hatch_transcript.partition("\n")[2])["events"]
+            if event["role"] == "tool" and event["tool_call_id"] == "redaction-candidate"
+        ]
+        assert len(feedback_events) == 1
+        assert validator_message_canary in json.dumps(feedback_events[0])
 
         persisted_messages = asyncio.run(service.get_messages(uuid.UUID(session_id), limit=None))
         private_audit = [
@@ -6931,6 +6954,7 @@ class TestLiteLLMErrorRedaction:
         from sqlalchemy import select
 
         from elspeth.web.sessions.models import quota_provider_attempts_table, token_usage_ledger_table
+        from tests.unit.web.sessions.test_run_composer_turn import _seed_output_only_draft
 
         secret = "UPSTREAM-RESPONSE-BODY-SECRET"
         physical_calls = 0
@@ -6962,6 +6986,8 @@ class TestLiteLLMErrorRedaction:
         created = client.post("/api/sessions", json={"title": "Ordinary retry quota"})
         assert created.status_code == 201
         session_id = uuid.UUID(created.json()["id"])
+
+        asyncio.run(_seed_output_only_draft(app, service, session_id))
 
         response = _settled_composer_response(
             client,
@@ -10903,6 +10929,7 @@ def test_persisted_empty_assistant_prose_is_omitted_from_provider_history(
     from litellm.exceptions import BadGatewayError
 
     from elspeth.web.sessions.routes import _composer_chat_history
+    from tests.unit.web.sessions.test_run_composer_turn import _seed_output_only_draft
 
     app, service = _make_app(tmp_path)
     guard_mount, guard_requests = _install_required_route_prompt_shields(app, monkeypatch)
@@ -10926,6 +10953,9 @@ def test_persisted_empty_assistant_prose_is_omitted_from_provider_history(
     created = client.post("/api/sessions", json={"title": "Empty assistant prose"})
     assert created.status_code == 201, created.text
     session_id = uuid.UUID(created.json()["id"])
+
+    # Exercise the ordinary provider's dialogue projection on an authored draft.
+    asyncio.run(_seed_output_only_draft(app, service, session_id))
 
     operator_suffix = "[ELSPETH-SYSTEM] Operator-facing state summary."
     asyncio.run(service.add_message(session_id, "user", "First request", writer_principal="route_user_message"))
@@ -11143,6 +11173,8 @@ def test_send_message_does_not_replay_audit_tool_rows_to_composer(tmp_path) -> N
     session_resp = client.post("/api/sessions", json={"title": "Chat"})
     session_id = uuid.UUID(session_resp.json()["id"])
 
+    audit_calls = _audit_tool_calls("call-1")
+
     loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(service.add_message(session_id, "user", "Build it", writer_principal="route_user_message"))
@@ -11155,7 +11187,7 @@ def test_send_message_does_not_replay_audit_tool_rows_to_composer(tmp_path) -> N
                 session_id,
                 "audit",
                 '{"success": true}',
-                tool_calls=_audit_tool_calls("call-1"),
+                tool_calls=audit_calls,
                 writer_principal="compose_loop",
             )
         )

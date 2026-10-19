@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -18,6 +19,7 @@ from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
 from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.required_work import (
@@ -27,8 +29,10 @@ from elspeth.web.required_work import (
     RequiredWorkCoordinator,
     RequiredWorkRole,
 )
+from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.sessions.protocol import CompositionStateData
 from tests.helpers.session_fences import fenced_operation_context
-from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_settings, _mock_catalog
+from tests.unit.web.composer._helpers import _composer_service_with_session, _make_settings, _mock_catalog
 from tests.unit.web.composer.test_service import _assert_checkpoint_reply
 
 _BEDROCK_PRIMARY = "bedrock/global.anthropic.claude-sonnet-4-6"
@@ -72,7 +76,9 @@ def _bedrock_service() -> ComposerServiceImpl:
     return ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_bedrock_settings())
 
 
-def _required_bedrock_service(monkeypatch: pytest.MonkeyPatch, *, user_prompt: str) -> tuple[ComposerServiceImpl, str, list[httpx.Request]]:
+def _required_bedrock_service(
+    monkeypatch: pytest.MonkeyPatch, *, user_prompt: str, data_dir: Path | None = None
+) -> tuple[ComposerServiceImpl, str, list[httpx.Request]]:
     """Use the real Azure guard and sessions; fake only its external HTTP."""
     guard_settings = PromptGuardSettings(endpoint="https://bedrock-shield.example.test", subscription_key="offline-bedrock-shield")
     requests: list[httpx.Request] = []
@@ -107,6 +113,8 @@ def _required_bedrock_service(monkeypatch: pytest.MonkeyPatch, *, user_prompt: s
             "composer_advisor_prompt_guard": guard_settings,
         }
     )
+    if data_dir is not None:
+        settings = settings.model_copy(update={"data_dir": data_dir})
     service, session_id = _composer_service_with_session(_mock_catalog(), settings)
     return service, session_id, requests
 
@@ -114,11 +122,12 @@ def _required_bedrock_service(monkeypatch: pytest.MonkeyPatch, *, user_prompt: s
 @pytest.mark.asyncio
 async def test_bedrock_primary_uses_real_service_path_without_static_provider_env(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     import litellm
 
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+    from tests.helpers.advisor_review import parse_advisor_publication_review
 
     _clear_static_provider_keys(monkeypatch)
     captured: list[dict[str, Any]] = []
@@ -135,8 +144,7 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
             content = candidate
         elif model == _BEDROCK_ADVISOR:
             assert [item["model"] for item in captured] == [_BEDROCK_PRIMARY, _BEDROCK_ADVISOR], "Only one independent END is supplied"
-            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             reviews.append(review)
             assert review["candidate_reply"] == candidate
             assert review["current_request"] == "No pipeline changes are needed."
@@ -157,7 +165,36 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     # Fake only the native SDK seam, after custody/callback handling. END
     # request construction, strict parser, binding and durable audit run.
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
-    service, session_id, shield_requests = _required_bedrock_service(monkeypatch, user_prompt="No pipeline changes are needed.")
+    service, session_id, shield_requests = _required_bedrock_service(
+        monkeypatch, user_prompt="No pipeline changes are needed.", data_dir=tmp_path
+    )
+    source_path = tmp_path / "blobs" / session_id / "existing.csv"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("value\n1\n", encoding="utf-8")
+    output_path = tmp_path / "outputs" / session_id / "existing.jsonl"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="existing_output",
+            options={"path": str(source_path), "schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        ),
+        nodes=(),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="existing_output",
+                plugin="json",
+                options={"path": str(output_path), "format": "jsonl", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    assert baseline.validate().is_valid
+    baseline_payload = baseline.to_dict()
 
     availability = service.get_availability()
     assert availability.available is True
@@ -168,6 +205,20 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     try:
         with fenced_operation_context(engine, session_id) as context:
             sessions = service._require_sessions_service()
+            initial = await sessions.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=baseline_payload["sources"],
+                    nodes=baseline_payload["nodes"],
+                    edges=baseline_payload["edges"],
+                    outputs=baseline_payload["outputs"],
+                    metadata_=baseline_payload["metadata"],
+                    is_valid=True,
+                    validation_errors=[],
+                ),
+                provenance="session_seed",
+                session_operation_context=context,
+            )
             user_message = await sessions.add_message(
                 UUID(session_id),
                 "user",
@@ -183,8 +234,9 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
             result = await service.compose(
                 "No pipeline changes are needed.",
                 [],
-                _empty_state(),
+                state_from_record(initial),
                 session_id=session_id,
+                current_state_id=str(initial.id),
                 session_operation_context=context,
                 user_message_id=str(user_message.id),
                 required_work=binding,

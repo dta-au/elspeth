@@ -176,7 +176,11 @@ async def test_bound_end_preserves_mandatory_evidence_beyond_hint_allowance(
     assert allowance == 16_000
     assert 0 < len(complete_text) - len(mandatory_text) <= allowance
     assert (len(mandatory_text) > allowance) is large
-    assert review.provider_payload_json in complete_text
+    from tests.helpers.advisor_review import parse_advisor_publication_review
+
+    rendered_review = parse_advisor_publication_review(complete_text)
+    assert rendered_review["current_request"] == request
+    assert rendered_review["candidate_reply"] == candidate
     assert "customer_reference" in complete_text
     sdk_calls = []
 
@@ -279,7 +283,16 @@ async def test_bound_end_preserves_mandatory_evidence_beyond_hint_allowance(
     parts = advisor_user_content_parts(complete)
     assert "".join(part.text for part in parts) == complete_text
     inspected = "\n".join(document for body in shield_bodies for document in body["documents"])
-    assert request in inspected and candidate in inspected
+    inspection_values = [part.inspection_text if part.inspection_text is not None else part.text for part in parts]
+    assert request in "".join(inspection_values) and candidate in "".join(inspection_values)
+    # Complete producer units retain their order and bytes at the detector.
+    # Framing between units can split a request across document boundaries.
+    cursor = 0
+    for index, value in enumerate(inspection_values):
+        unit = f"Message 1, content part {index}:\n{value}"
+        position = inspected.find(unit, cursor)
+        assert position >= 0, f"Prompt guard omitted or reordered content part {index}"
+        cursor = position + len(unit)
     with engine.connect() as connection:
         attempt = connection.execute(select(quota_provider_attempts_table)).one()
         usage = connection.execute(select(token_usage_ledger_table)).one()

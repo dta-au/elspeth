@@ -976,7 +976,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # version fields changed; normalized case semantics and every other byte match.
 # 0.8.6 version cut: the same eight runtime-derived fields advance; canonical
 # cases and all other bytes match after engine-version-only normalization.
-EXPECTED_CASE_REGISTRY_SHA256 = "845430e0f91329165bfe124cb5917d46fb51519e5c5db1247af3eb1c2ad899fd"
+# 2026-10-20: d82dc0df8 refreshed three ValueTransform source_file_hash values
+# in union-collision-fail. Canonical case comparison against 03594a269 confirms
+# every other field is unchanged; restoring those values reproduces the old pin.
+EXPECTED_CASE_REGISTRY_SHA256 = "69b81fc4685a5fe70c2deabb8c6d68e2332905e5cf11241d4e99e6547d3118f1"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -261,8 +261,6 @@ async def _await_tool_turn_with_deferred_cancellation[T](
 _ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
 _is_pending_interpretation_handoff = _no_tool_policy.is_pending_interpretation_handoff
 _state_is_structurally_empty = _no_tool_policy.state_is_structurally_empty
-_classify_pipeline_mutation_intent = _no_tool_policy.classify_pipeline_mutation_intent
-_PipelineMutationIntentDecision = _no_tool_policy.PipelineMutationIntentDecision
 
 
 _ADVISOR_ATTEMPTED_ACTIONS_MAX_ITEMS: Final[int] = 8
@@ -1229,50 +1227,21 @@ class ComposerServiceImpl:
                 turn_evidence.transcript.use_blob_reader(read_advisor_history_blob)
             plugin_snapshot, policy_catalog = self._policy_context.build(user_id)
             try:
-                # Which authoring surface a request gets is decided here, and the
-                # two are not equivalent: the planner is one bounded call, the
-                # compose loop is an iterative turn/wall-clock budget. Nothing else
-                # records the choice — the `surface` dimension on Composer
-                # telemetry records the authoring choice, not a session mode —
-                # so without this line a session's posture cannot be reconstructed
-                # after the fact (elspeth-7da4e52344). Booleans and closed vocab
-                # only: the message itself is Tier-3 authored text and must not be
-                # logged.
+                # Route by graph/session prerequisites. The provider decides
+                # whether the request calls for authoring, explanation, or a
+                # question; user wording does not select its tool surface.
                 state_is_empty = _state_is_structurally_empty(state)
-                # Short-circuit on state_is_empty exactly as the original inline
-                # condition did, so the classifier stays a first-turn-only cost
-                # rather than running on every compose request. None in the log
-                # means "not evaluated" — a non-empty state already decided this.
-                intent_is_explicit_mutation = (
-                    _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
-                    if state_is_empty
-                    else None
-                )
                 planner_eligible = (
-                    state_is_empty
-                    and intent_is_explicit_mutation is True
-                    and self._sessions_service is not None
-                    and session_id is not None
-                    and user_message_id is not None
+                    state_is_empty and self._sessions_service is not None and session_id is not None and user_message_id is not None
                 )
                 slog.info(
                     "composer_authoring_surface_selected",
                     authoring_surface="planner" if planner_eligible else "compose_loop",
                     state_is_structurally_empty=state_is_empty,
-                    intent_is_explicit_mutation=intent_is_explicit_mutation,
                     session_id=session_id,
                 )
-                # Repeated rather than branching on ``planner_eligible`` so the
-                # ``is not None`` conjuncts narrow ``session_id`` /
-                # ``user_message_id`` for the call below. Every conjunct here is a
-                # cached boolean or a None check — the classifier does not re-run.
-                if (
-                    state_is_empty
-                    and intent_is_explicit_mutation is True
-                    and self._sessions_service is not None
-                    and session_id is not None
-                    and user_message_id is not None
-                ):
+                # Repeat prerequisites to narrow the optional IDs for the call.
+                if state_is_empty and self._sessions_service is not None and session_id is not None and user_message_id is not None:
                     planner_budget_seconds = deadline - asyncio.get_event_loop().time()
                     if planner_budget_seconds <= 0:
                         raise ComposerConvergenceError.capture(

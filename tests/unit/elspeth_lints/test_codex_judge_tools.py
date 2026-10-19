@@ -218,7 +218,9 @@ def test_git_search_preserves_tracked_and_new_code_while_skipping_ignored_artifa
 
 
 def test_git_enumeration_failure_does_not_fall_back_to_ignored_artifacts(tmp_path: Path) -> None:
-    (tmp_path / ".git").mkdir()
+    # An empty .git directory lets Git discover an ancestor checkout. A broken
+    # gitfile stops discovery here even when tmp_path lives inside a repository.
+    (tmp_path / ".git").write_text("gitdir: missing-git-dir\n", encoding="utf-8")
     scope = AgentToolScope(allowed_roots=(tmp_path,), cwd=tmp_path, max_turns=4)
     with pytest.raises(ValueError, match="cannot enumerate checkout evidence"):
         _grep_files(scope, {"pattern": "anything", "output_mode": "count"})

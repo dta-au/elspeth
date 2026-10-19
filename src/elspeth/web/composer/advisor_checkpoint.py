@@ -360,8 +360,8 @@ class AdvisorCheckpointOwner:
             )
         except TimeoutError:
             raise
-        except AdvisorAbandonmentContextUnavailable:
-            return _AdvisorProviderFailure(error_class="AbandonmentReviewContextUnavailable")
+        except AdvisorAbandonmentContextUnavailable as exc:
+            return _AdvisorProviderFailure(error_class=type(exc).__name__)
         except advisor_provider_failure_types() as exc:
             return _AdvisorProviderFailure(error_class=type(exc).__name__)
         except Exception as exc:
@@ -369,7 +369,7 @@ class AdvisorCheckpointOwner:
         if is_abandonment:
             decision = parse_advisor_abandonment_response(guidance)
             if decision is None:
-                return _AdvisorProviderFailure(error_class="MalformedAbandonmentDecision")
+                return _AdvisorProviderFailure(error_class=None)
             return _AdvisorCallSuccess(guidance=guidance, metadata=metadata, abandonment_response=decision)
         return _AdvisorCallSuccess(guidance=guidance, metadata=metadata)
 
@@ -786,15 +786,14 @@ class AdvisorCheckpointOwner:
                 "Use each LLM node's visible effective prompt text (its prompt_template, or in "
                 "multi-query mode each queries.<name>.template plus the shared system_prompt; a "
                 "prompt_template_in_use marker says which of those the node-level template still "
-                "serves) and its listed, "
-                "length-independent interpolated row fields to check one concrete degeneracy: "
-                "FLAG when the supplied evidence shows that the prompt interpolates no varying "
-                "content, or asks the model to judge a page or record from a URL or identifier "
-                "alone — it will fabricate or repeat one answer for every row. Do NOT flag "
-                "identical results that simply reflect "
-                "genuinely-similar inputs; the defect is a prompt that cannot see the "
-                "per-row data, not a question whose true answer happens to be similar "
-                "across rows. "
+                "serves), its listed named row field references and other visible inputs to "
+                "assess whether the model has the information needed for the requested task. "
+                "Absence of named field references does not establish absence of row input: "
+                "whole-row operations and dynamic access may still provide it. "
+                "Constant tasks and tasks about identifiers can be legitimate. Do not flag a "
+                "prompt merely because it is constant, uses only a URL or identifier, or can "
+                "produce identical answers across rows. FLAG only a concrete mismatch between "
+                "the requested task and the available inputs, grounded in the supplied evidence. "
                 "Do not infer or verify constraints whose required value is withheld, omitted, or "
                 "truncated. Deterministic validation, not this advisor, owns full pipeline and schema "
                 "correctness outside the supplied evidence. Missing prior history or reference text is an evidence gap, "

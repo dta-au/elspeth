@@ -1181,22 +1181,20 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"interpretation_review_draft_malformed|cleanup review draft is malformed",
-        "The cleanup node's interpretation_requirements row IS present and its user_term matches the registered decision kind, but the draft text fails marker recognition — the contract recognizes the draft only when it contains both 'raw html' and 'fingerprint'. Do NOT add another row; the fix is the draft text alone.",
-        "On the existing cleanup row, replace ONLY the draft string with the canonical draft, copied verbatim without rephrasing: "
-        f'"{RAW_HTML_CLEANUP_REVIEW_DRAFT}". '
-        "Keep the row's user_term and every other pipeline detail unchanged, and re-emit the FULL set_pipeline call.",
+        "Historical cleanup-draft diagnostic: an earlier implementation rejected review drafts that did not contain specific phrases. "
+        "That prose predicate is retired; this stored code does not establish a defect in the current review or mapping.",
+        "Keep the registered pipeline_decision user_term and describe the intended cleanup in the draft. "
+        "Check the actual field_mapper mapping against the declared web_scrape raw fields. Preserve review provenance "
+        "and artifact binding when repairing a candidate.",
     ),
     (
         r"interpretation_review_contract_unsatisfied|drops web-scrape raw field",
         "A cleanup node that drops web-scrape raw fields (field_mapper with select_only=true) must stage an interpretation review recording that decision before the pipeline is accepted. "
-        "The row is recognized ONLY when user_term is the registered decision kind and the draft text names both the raw HTML and the fingerprint fields — a paraphrased draft is NOT recognized and this same code fires again.",
-        # The literal minimal delta (tutorial op 18b4cee7: four generations
-        # looped on this code because free-text drafts fail the contract's
-        # marker recognition). Quote the registered user_term and the
-        # canonical draft VERBATIM so a copy-paste repair always lands.
-        "On the cleanup field_mapper node, add options.interpretation_requirements — a SIBLING of mapping, never inside it — containing exactly this entry: "
+        "The structured pipeline_decision kind and registered user_term identify the review; the actual mapping and declared producer fields determine its effects.",
+        "On the cleanup field_mapper node, add options.interpretation_requirements — a SIBLING of mapping, never inside it. "
+        f"Use kind 'pipeline_decision' and user_term {RAW_HTML_CLEANUP_USER_TERM!r} exactly. "
+        "Write the draft in your own words to describe the fields being dropped. Example review row: "
         f'{{"kind": "pipeline_decision", "user_term": "{RAW_HTML_CLEANUP_USER_TERM}", "draft": "{RAW_HTML_CLEANUP_REVIEW_DRAFT}"}}. '
-        "Copy the user_term and draft strings verbatim — do not rephrase the draft. "
         "Then re-emit the FULL set_pipeline call with that requirement in place; rejected set_pipeline calls do not persist partial nodes.",
     ),
     (

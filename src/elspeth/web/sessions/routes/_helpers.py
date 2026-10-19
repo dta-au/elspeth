@@ -610,6 +610,11 @@ def _message_response(
 
     if msg.tool_calls is not None and any(is_diagnostic_evidence_envelope(envelope) for envelope in msg.tool_calls):
         raise AuditIntegrityError("Private Composer evidence cannot be projected into a public message")
+    from elspeth.web.composer.visible_tool_event import VISIBLE_TOOL_EVENT_KIND, VisibleToolEvent
+
+    for envelope in msg.tool_calls or ():
+        if "_kind" in envelope and envelope["_kind"] == VISIBLE_TOOL_EVENT_KIND:
+            VisibleToolEvent.from_envelope(envelope)
     tool_calls = deep_thaw(msg.tool_calls) if msg.tool_calls is not None else None
     if tool_calls is not None and tool_outcomes:
         stamped: list[Any] = []

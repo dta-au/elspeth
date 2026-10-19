@@ -2055,6 +2055,13 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 
 _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
     ReviewedWriter(
+        path="tests/testcontainer/web/test_quota_authority_postgres.py",
+        enclosing_symbol="test_container_storage_serializes_cross_identity_output_reservations",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="PostgreSQL aggregate storage contention fixture seeds each identity's version-1 state as the run FK parent.",
+    ),
+    ReviewedWriter(
         path="tests/testcontainer/web/test_schema_probe_postgres.py",
         enclosing_symbol="test_private_transcript_sql_on_postgres_preserves_custody_without_hydration",
         table="chat_messages",

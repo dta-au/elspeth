@@ -2868,7 +2868,7 @@ async def test_create_pending_pipeline_decision_rejects_raw_html_mapping_preserv
         session_id,
         CompositionStateData(
             source=None,
-            nodes=[cleanup_node],
+            nodes=[_web_scrape_node(content_field="content", fingerprint_field="content_fingerprint"), cleanup_node],
             metadata_={"name": "Phase 5b Test", "description": ""},
             is_valid=True,
         ),

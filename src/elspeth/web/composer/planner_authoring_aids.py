@@ -625,15 +625,16 @@ def _content_safety_rules(*, safety_plugin: str, auto_wired: bool = True) -> lis
 
 
 def _raw_html_cleanup_rules(*, untrusted_producers: tuple[str, ...]) -> list[str]:
-    """Keep the exact registered review row; plugin discovery teaches cleanup."""
+    """Teach the structured review identity and a descriptive draft example."""
     producers = " or ".join(sorted(untrusted_producers))
     return [
         f"When a field_mapper with select_only=true drops {producers} raw fields "
         "(raw content / fingerprint) before the sink, stage the cleanup review ON "
         "THAT field_mapper node: one pending pipeline_decision entry in its "
         "options.interpretation_requirements (a SIBLING of mapping, never inside it).",
-        f'Use exactly: {{"kind": "pipeline_decision", "user_term": "{RAW_HTML_CLEANUP_USER_TERM}", "draft": "{RAW_HTML_CLEANUP_REVIEW_DRAFT}"}} '
-        "— copy the user_term and draft strings verbatim.",
+        f"Use kind 'pipeline_decision' and user_term {RAW_HTML_CLEANUP_USER_TERM!r} exactly. "
+        "Write the draft in your own words to describe the fields being dropped. "
+        f'Example review row: {{"kind": "pipeline_decision", "user_term": "{RAW_HTML_CLEANUP_USER_TERM}", "draft": "{RAW_HTML_CLEANUP_REVIEW_DRAFT}"}}.',
         "An explicit user instruction to drop the fields does NOT waive the row — it records that decision for the audit trail.",
     ]
 

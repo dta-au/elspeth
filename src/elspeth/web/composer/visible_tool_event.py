@@ -13,11 +13,16 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Final, final
 
+from pydantic import JsonValue
+
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.web.composer.bounded_json import bounded_json_loads
+from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.validation import _redact_sensitive_content
 
@@ -28,6 +33,38 @@ VISIBLE_RESPONSE_GAP_KIND: Final = "composer_visible_response_gap"
 
 def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _unique_json_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
+    document = dict(pairs)
+    if len(document) != len(pairs):
+        raise ValueError("Visible tool evidence contains duplicate JSON keys")
+    return document
+
+
+def _inline_custody_safe_text(value: str) -> tuple[str | None, str | None]:
+    """Project private inline values before retaining ordinary pipeline evidence."""
+    changed = False
+
+    def project_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
+        nonlocal changed
+        document = _unique_json_object(pairs)
+        if "inline_blob" not in document:
+            return document
+        projected = dict(inline_custody_audit_projection(document))
+        changed = changed or projected != document
+        return projected
+
+    try:
+        # The hook removes private values before the decoded UTF-8 check. Even
+        # an invalid surrogate inside an inline draft cannot escape in public
+        # evidence, while ordinary sibling fields remain available.
+        projected = bounded_json_loads(value, label="visible pipeline evidence", object_pairs_hook=project_object)
+    except ValueError:
+        return None, "inline_custody_projection_unavailable"
+    if type(projected) is not dict:
+        return None, "inline_custody_projection_unavailable"
+    return (json.dumps(projected, ensure_ascii=False) if changed else value), None
 
 
 @final
@@ -76,7 +113,22 @@ class VisibleToolEvent:
                 continue
             if type(value) is not str:
                 raise AuditIntegrityError("Visible tool evidence requires exact serialized strings")
+            if tool_name in {"set_pipeline", "emit_pipeline_proposal"}:
+                value, gap = _inline_custody_safe_text(value)
+                if gap is not None:
+                    content[name] = None
+                    gaps.append(name + "_" + gap)
+                    continue
+                assert value is not None
             redacted = _redact_sensitive_content(value)
+            if tool_name in {"set_pipeline", "emit_pipeline_proposal"}:
+                projected_redacted, gap = _inline_custody_safe_text(redacted)
+                if gap is not None:
+                    content[name] = None
+                    gaps.append(name + "_credential_redaction_invalid_json")
+                    continue
+                assert projected_redacted is not None
+                redacted = projected_redacted
             try:
                 require_no_credential_material(
                     redacted,
@@ -188,9 +240,15 @@ class VisibleToolEvent:
         ):
             raise AuditIntegrityError("Visible tool event has invalid stored field types")
         result = cls(**values)
-        if result.payload_hash != _hash(result.payload_json):
+        try:
+            payload_hash = _hash(result.payload_json)
+        except UnicodeEncodeError as exc:
+            raise AuditIntegrityError("Visible tool event stored payload is not valid UTF-8") from exc
+        if result.payload_hash != payload_hash:
             raise AuditIntegrityError("Visible tool event lost its exact body binding")
-        payload = json.loads(result.payload_json)
+        payload, parse_error = parse_json_strict(result.payload_json)
+        if parse_error is not None:
+            raise AuditIntegrityError("Visible tool event stored payload is not strict JSON")
         if (
             type(payload) is not dict
             or set(payload) != {"received_arguments", "effective_arguments", "selected_result", "availability_gaps"}
@@ -202,6 +260,24 @@ class VisibleToolEvent:
             or any(type(item) is not str for item in payload["availability_gaps"])
         ):
             raise AuditIntegrityError("Visible tool event has invalid stored content fields")
+        try:
+            for name in ("received_arguments", "effective_arguments", "selected_result"):
+                if payload[name] is not None:
+                    payload[name].encode("utf-8")
+            for gap in payload["availability_gaps"]:
+                gap.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise AuditIntegrityError("Visible tool event stored payload contains text that is not valid UTF-8") from exc
+        if result.tool_name in {"set_pipeline", "emit_pipeline_proposal"}:
+            for name in ("received_arguments", "effective_arguments", "selected_result"):
+                original = payload[name]
+                if original is not None:
+                    projected, gap = _inline_custody_safe_text(original)
+                    if gap is not None or projected != original:
+                        raise AuditIntegrityError(
+                            "Historical visible tool evidence contains unsafe or unparseable inline custody data; "
+                            "public replay is refused while the original audit record is retained"
+                        )
         return result
 
 

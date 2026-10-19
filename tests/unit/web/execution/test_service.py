@@ -452,6 +452,7 @@ def _mock_pipeline_settings() -> _ModelCopyNamespace:
         transforms=[],
         aggregations=[],
         collectors=[],
+        collection_probes=[],
         sinks={"primary": SimpleNamespace(plugin="json", options={})},
         gates=[],
         coalesce=[],

@@ -738,10 +738,11 @@ class TestRunWritesGoThroughTheAuthorityFacet:
         assert by_id[written.id].size_bytes == len(content)
         assert by_id[written.id].content_hash == content_hash(content)
         assert by_id[unwritten.id].status == "error"
-        # Two fenced output-set reads precede one metadata write per blob.
+        # Two fenced output-set reads precede one metadata write per blob;
+        # the final fenced storage-path read reconciles durable reservations.
         # File guards also revalidate the same authority between byte effects.
         assert len(blob_updates) == 2
-        assert recorder.mutations == [execute, execute, execute, execute]
+        assert recorder.mutations == [execute, execute, execute, execute, execute]
         assert recorder.standalone_cas
         assert all(context == execute for context in recorder.standalone_cas)
         with db_engine.connect() as conn:
@@ -798,10 +799,10 @@ class TestRunWritesGoThroughTheAuthorityFacet:
         assert failure.blob_id == reserved.id
         assert failure.exc_type == "BlobQuotaExceededError"
         assert failure.detail == str(BlobQuotaExceededError(str(session_id), current_bytes=0, limit_bytes=8))
-        # Both output listings, the quota-refused ready mutation and the error
-        # mutation use the reserving EXECUTE authority. Every filesystem guard
-        # also revalidates that exact context.
-        assert recorder.mutations == [execute, execute, execute, execute]
+        # Both output listings, the quota-refused ready mutation, the error
+        # mutation, and the final storage-path read use the reserving EXECUTE
+        # authority. Every filesystem guard also revalidates that exact context.
+        assert recorder.mutations == [execute, execute, execute, execute, execute]
         assert recorder.standalone_cas
         assert all(context == execute for context in recorder.standalone_cas)
         with db_engine.connect() as conn:

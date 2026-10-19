@@ -1745,7 +1745,8 @@ def test_pipeline_decision_boundary_rejects_missing_requirement() -> None:
         _assert_affected_component(state, "drop_raw_html", InterpretationKind.PIPELINE_DECISION, "drop_raw_html_fields")
 
 
-def test_pipeline_decision_boundary_rejects_raw_html_mapping_preservation() -> None:
+@pytest.mark.parametrize("declares_preserved_fields", (False, True))
+def test_pipeline_decision_boundary_uses_declared_raw_fields(declares_preserved_fields: bool) -> None:
     node = _pipeline_decision_review_node()
     options = dict(node.options)
     options["mapping"] = {
@@ -1754,9 +1755,16 @@ def test_pipeline_decision_boundary_rejects_raw_html_mapping_preservation() -> N
         "content_fingerprint": "content_fingerprint",
         "primary_colours": "primary_colours",
     }
-    state = _state_with(replace(node, options=options))
+    state = _state_with_web_scrape_cleanup(
+        replace(node, options=options),
+        content_field="content" if declares_preserved_fields else "page_body",
+        fingerprint_field="content_fingerprint" if declares_preserved_fields else "page_hash",
+    )
 
-    with pytest.raises(ToolArgumentError, match=r"without preserved raw HTML/fingerprint fields"):
+    if declares_preserved_fields:
+        with pytest.raises(ToolArgumentError, match=r"without preserved raw HTML/fingerprint fields"):
+            _assert_affected_component(state, "drop_raw_html", InterpretationKind.PIPELINE_DECISION, "drop_raw_html_fields")
+    else:
         _assert_affected_component(state, "drop_raw_html", InterpretationKind.PIPELINE_DECISION, "drop_raw_html_fields")
 
 

@@ -823,7 +823,7 @@ def _node_effective_prompt_templates(node: NodeSpec) -> list[str]:
     well-formed query's ``template`` override, or the node-level template for
     a query without one — mirroring ``LLMConfig``'s own field extraction over
     the same union. A node-level template no query falls back to is dead and
-    is NOT included: the degeneracy signal must describe the prompts the model
+    is NOT included: the field evidence must describe the prompts the model
     will see, not a slot that never renders. A query whose ``template`` is
     present but not a string contributes nothing (neither text nor the
     node-level template): plugin schema validation rejects the node, the same
@@ -987,8 +987,8 @@ def _pipeline_advisor_summary_units(
                 PromptGuardContentPart(_redact_sensitive_content((", " if index else "") + field)) for index, field in enumerate(required)
             ) or (PromptGuardContentPart("(none declared)"),)
             control_parts = _render_node_control_flow_parts(node)
-            # LLM nodes get a length-independent degeneracy signal: which row
-            # fields their prompt interpolates (or NONE). An LLM node is a
+            # LLM nodes get a length-independent named-field inventory. This
+            # does not establish whether other row input is used. An LLM node is a
             # transform whose plugin is ``llm`` (node_type is never "llm").
             is_llm = node.plugin == "llm"
             interpolation_parts = (
@@ -1400,8 +1400,8 @@ def _node_required_input_fields(node: NodeSpec) -> list[str]:
 def _node_prompt_template(node: NodeSpec) -> str | None:
     """Return a node's ``prompt_template`` from the flat or nested options shape.
 
-    Mirrors :func:`_node_required_input_fields`' fallback so the degeneracy
-    signal reflects the prompt the plugin will actually use. Coerces only string
+    Mirrors :func:`_node_required_input_fields`' fallback so the field evidence
+    reflects the prompt the plugin will actually use. Coerces only string
     values; anything else (or absence) yields ``None``. Never raises.
     """
     raw: Any = node.options.get("prompt_template")
@@ -1413,14 +1413,16 @@ def _node_prompt_template(node: NodeSpec) -> str | None:
 
 
 def _interpolated_row_fields(prompt_template: str) -> list[str]:
-    """Distinct ``row`` fields the prompt interpolates, sorted for determinism.
+    """Distinct named ``row`` field references, sorted for determinism.
 
-    Uses the engine's own :func:`extract_jinja2_fields` so the degeneracy signal
-    matches the interpolation syntax the LLM plugin actually accepts and the live
+    Uses the engine's own :func:`extract_jinja2_fields` so the named accesses
+    match the interpolation syntax the LLM plugin actually accepts and the live
     composer skill teaches — BOTH ``{{ row.field }}`` and ``{{ row['field'] }}``
     (a bespoke dot-only regex would mis-annotate a valid bracket-syntax prompt as
     having no fields, producing a false FLAG at the end gate). Scans the FULL
-    prompt, never the truncated render, so the signal is length-independent.
+    prompt, never the truncated render, so the inventory is length-independent.
+    Whole-row operations and unresolved dynamic accesses need not name a field;
+    an empty extraction does not establish absent row input.
 
     A malformed Jinja2 template propagates its parse error to the caller, which
     must render an explicit incomplete-analysis signal. It cannot be treated as
@@ -1430,29 +1432,26 @@ def _interpolated_row_fields(prompt_template: str) -> list[str]:
 
 
 def _render_interpolated_row_fields_parts(node: NodeSpec) -> tuple[str, ...]:
-    """Render the length-independent degeneracy signal for an LLM node.
+    """Render a length-independent inventory of named row-field references.
 
-    ``interpolates row fields: [url, content]`` when the prompts reference row
-    fields; ``interpolates row fields: NONE`` (rendered loudly) when they do
-    not — a prompt that sees no per-row data will fabricate or repeat one answer
-    for every row. Computed over the union of the node's EFFECTIVE templates
+    An empty extraction is explicitly limited: whole-row operations or dynamic
+    accesses can still supply row input, and prompt adequacy depends on the
+    requested task and other inputs. Computed over the node's EFFECTIVE templates
     (:func:`_node_effective_prompt_templates`): in multi-query mode that is the
     per-query overrides plus the node-level template only where a query falls
-    back to it, so a dead node-level prompt can neither mask a degenerate query
-    template nor be reported as degenerate itself. A node with no effective
-    prompt at all reads NONE. If any effective template cannot be parsed, the
-    field union is unknown rather than a complete list or a known absence.
+    back to it, so an unused node-level prompt contributes no references. If
+    any effective template cannot be parsed, the named field union is unknown.
     """
     fields: set[str] = set()
     for prompt in _node_effective_prompt_templates(node):
         try:
             fields.update(_interpolated_row_fields(prompt))
         except TemplateSyntaxError:
-            return ("interpolates row fields: UNKNOWN (invalid template syntax)",)
+            return ("named row field references: UNKNOWN (invalid template syntax)",)
     if not fields:
-        return ("interpolates row fields: NONE",)
+        return ("named row field references: NONE (not proof of absent row input)",)
     return (
-        "interpolates row fields: [",
+        "named row field references: [",
         *((", " if index else "") + field for index, field in enumerate(sorted(fields))),
         "]",
     )

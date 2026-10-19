@@ -498,10 +498,13 @@ async def test_planner_argument_error_persists_through_the_compose_loop(
     # The existing compose adapter owns the one COMPOSE lease and provider owner.
     # The earlier human-message harness lease is already released; no second
     # owner or test-only turn driver crosses the physical terminal advisor seam.
+    # An existing authored coalesce keeps this malformed replacement on the
+    # ordinary dispatch surface while retaining the originating user custody.
+    initial_state = _state(("a", "b"))
     result = await service.compose(
         message,
         [],
-        CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        initial_state,
         session_id=result_session_id,
         user_id="phase3-test-user",
         user_message_id=str(human.id),
@@ -511,6 +514,7 @@ async def test_planner_argument_error_persists_through_the_compose_loop(
     assert len(invocations) == 1
     invocation = invocations[0]
     assert invocation.status.value == "arg_error"
+    assert result.state == initial_state
     assert invocation.authority_arguments_canonical is not None
     # Persistence validates both argument bindings and restores the authority
     # projection (audit_storage._validated_invocation_arguments). The dispatch

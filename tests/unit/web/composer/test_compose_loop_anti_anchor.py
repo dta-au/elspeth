@@ -27,7 +27,6 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
-from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope, replay_composer_control_message
 from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
 from elspeth.web.composer.protocol import SchemaViolation, SchemaViolationCode, ToolArgumentError
@@ -95,8 +94,9 @@ def _review_terminal_reply(service: ComposerServiceImpl, expected_reply: str):
         assert kwargs.get("tools") is None
         assert "response_format" in kwargs
         assert not reviews, "Only one terminal END response is supplied"
-        summary = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-        review = json.loads(summary.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+        from tests.helpers.advisor_review import parse_advisor_publication_review
+
+        review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
         assert review["current_request"] == "Build something"
         assert review["candidate_reply"] == expected_reply
         reviews.append(review)
@@ -281,7 +281,7 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
     assert "byte-identical" in hint_text or "identical" in hint_text
     assert "same error" not in hint_text
     assert "will keep failing" not in hint_text
-    retry_event = next(event for event in events if event.headline == "ELSPETH detected a no-progress retry pattern.")
+    retry_event = next(event for event in events if event.headline == "ELSPETH observed three failed calls to the same tool.")
     assert retry_event.evidence[0] == "The last 3 tool calls used identical arguments and failed."
     reported = [json.loads(invocation.result_canonical)["validation_errors"][0]["type"] for invocation in result.tool_invocations]
     assert reported == [code.value for code in (categories if different_errors else (categories[0],) * 3)]
@@ -508,7 +508,7 @@ async def test_three_distinct_arg_error_failures_inject_drift_hint_before_fourth
     assert len(hint_messages) == 1
     hint_text = hint_messages[0]["content"]
     assert "set_metadata" in hint_text
-    assert "drift" in hint_text.lower()
+    assert "error details and validation changes were not compared" in hint_text
     assert "different arguments" in hint_text
 
 

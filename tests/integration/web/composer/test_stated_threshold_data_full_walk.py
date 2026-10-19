@@ -219,8 +219,9 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
         assert payload["conversation_context"] == {
             "prior_user_requests": [{"history_index": 0, "content": prior_request}],
             "additional_prior_user_requests_omitted": 0,
+            "prior_assistant_messages": [{"history_index": 1, "content": _ASSISTANT_DISTRACTOR}],
         }
-        assert _ASSISTANT_DISTRACTOR not in json.dumps(payload)
+        assert _ASSISTANT_DISTRACTOR not in json.dumps(payload["conversation_context"]["prior_user_requests"])
         assert len(mint_observations) == ordinal + 1
         _owner, custody = mint_observations[-1]
         assert custody.attempt is not None

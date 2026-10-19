@@ -503,7 +503,7 @@ async def test_success_records_provider_reasoning_metadata() -> None:
     service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     state = _empty_state()
     reasoning_details = [{"type": "reasoning.text", "text": "selected set_pipeline"}]
-    thinking_blocks = [{"type": "thinking", "thinking": "checked required output options"}]
+    thinking_blocks = [{"type": "thinking", "thinking": "checked required output options", "signature": "synthetic-native-signature"}]
     llm_response = _make_llm_response(
         content="Done.",
         reasoning_tokens=12,

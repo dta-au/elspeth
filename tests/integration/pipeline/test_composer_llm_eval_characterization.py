@@ -67,8 +67,10 @@ from elspeth.web.execution.validation import validate_pipeline_for_trained_opera
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
+from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import quota_provider_attempts_table
+from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
@@ -329,9 +331,30 @@ async def _run_owned_replay_for_characterization(
     """
     sessions = service._require_sessions_service()
     message = "one-turn compose-loop test driver"
+    source_path = service._settings.data_dir / "blobs" / session_id / "existing.csv"
+    output_path = service._settings.data_dir / "outputs" / session_id / "existing.jsonl"
+    _write_scenario_csv(source_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline = _direct_source_state(source_path, output_path)
+    assert baseline.validate().is_valid
+    payload = baseline.to_dict()
     # This ordinary ingress lease is released before the compose adapter acquires
     # its sole turn lease/coordinator/provider owner.
     async with acquire_compose_context(sessions, session_id) as ingress:
+        initial = await sessions.save_composition_state(
+            UUID(session_id),
+            CompositionStateData(
+                sources=payload["sources"],
+                nodes=payload["nodes"],
+                edges=payload["edges"],
+                outputs=payload["outputs"],
+                metadata_=payload["metadata"],
+                is_valid=True,
+                validation_errors=[],
+            ),
+            provenance="session_seed",
+            session_operation_context=ingress,
+        )
         human = await sessions.add_message(
             UUID(session_id), "user", message, writer_principal="route_user_message", session_operation_context=ingress
         )
@@ -365,8 +388,9 @@ async def _run_owned_replay_for_characterization(
         result = await service.compose(
             message,
             [],
-            CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+            state_from_record(initial),
             session_id=session_id,
+            current_state_id=str(initial.id),
             user_id=EVAL_USER_ID,
             user_message_id=str(human.id),
         )

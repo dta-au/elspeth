@@ -576,7 +576,15 @@ def test_unreviewed_field_mapper_drop_of_web_scrape_raw_fields_blocks_execution(
     assert result.sites[0].kind is InterpretationKind.PIPELINE_DECISION
 
 
-def test_term_matched_cleanup_row_with_rephrased_draft_is_malformed_not_absent() -> None:
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "Drop the scraped raw HTML and fingerprint fields before saving the output.",
+        "Drop the scraped HTML content and fingerprint columns before the sink.",
+        "Delete the source markup and content digest before saving.",
+    ],
+)
+def test_cleanup_review_identity_does_not_depend_on_draft_wording(draft: str) -> None:
     state = _state_with_web_scrape_cleanup_node(
         {
             "mapping": {
@@ -590,7 +598,7 @@ def test_term_matched_cleanup_row_with_rephrased_draft_is_malformed_not_absent()
                     "kind": "pipeline_decision",
                     "user_term": RAW_HTML_CLEANUP_USER_TERM,
                     "status": "pending",
-                    "draft": "Drop the scraped HTML content and fingerprint columns before the sink.",
+                    "draft": draft,
                     "event_id": None,
                     "accepted_value": None,
                     "accepted_artifact_hash": None,
@@ -600,14 +608,53 @@ def test_term_matched_cleanup_row_with_rephrased_draft_is_malformed_not_absent()
         }
     )
 
-    contract_error = raw_html_cleanup_review_contract_error(state)
+    assert raw_html_cleanup_review_contract_error(state) is None
+    result = materialize_state_for_execution(state)
+    assert isinstance(result, InterpretationReviewPending)
+    assert [(site.component_id, site.user_term, site.kind) for site in result.sites] == [
+        ("drop_raw_html", RAW_HTML_CLEANUP_USER_TERM, InterpretationKind.PIPELINE_DECISION)
+    ]
 
-    assert contract_error is not None
-    assert "malformed" in contract_error
-    assert "raw html" in contract_error
-    assert "fingerprint" in contract_error
-    assert "copy" in contract_error.lower()
-    assert "Stage a pending pipeline_decision" not in contract_error
+
+@pytest.mark.parametrize("field_name", ["summary", "content", "html_word_count", "fingerprint_similarity_score"])
+@pytest.mark.parametrize("rename", [False, True], ids=["source-name", "target-name"])
+def test_cleanup_review_allows_fields_not_declared_raw_by_producer(field_name: str, rename: bool) -> None:
+    options = _pipeline_decision_options()
+    options["mapping"] = {"summary": field_name} if rename else {field_name: "summary"}
+    state = _state_with_web_scrape_cleanup_node(options)
+    scrape = replace(state.nodes[0], options={"content_field": "page_body", "fingerprint_field": "page_hash"})
+    state = replace(state, nodes=(scrape, state.nodes[1]))
+
+    assert raw_html_cleanup_review_contract_error(state) is None
+
+
+@pytest.mark.parametrize("node_id", ["select_fields", "clean_customer_names", "draw_summary", "drop_duplicates"])
+def test_mapper_identifier_does_not_declare_cleanup_intent(node_id: str) -> None:
+    state = _state_with_web_scrape_cleanup_node({"mapping": {"content": "content"}, "select_only": True})
+    state = replace(state, nodes=(state.nodes[0], replace(state.nodes[1], id=node_id)))
+
+    assert raw_html_cleanup_review_contract_error(state) is None
+    assert interpretation_sites(state) == ()
+
+
+@pytest.mark.parametrize("field_name", ["page_body", "page_hash"])
+def test_cleanup_review_rejects_declared_raw_field_despite_paraphrased_draft(field_name: str) -> None:
+    options = _pipeline_decision_options()
+    options["mapping"] = {field_name: "summary"}
+    requirements = options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert isinstance(requirements, list)
+    requirement = dict(requirements[0])
+    requirement["draft"] = "Delete the source markup and content digest before saving."
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [requirement]
+    state = _state_with_web_scrape_cleanup_node(options)
+    scrape = replace(state.nodes[0], options={"content_field": "page_body", "fingerprint_field": "page_hash"})
+    state = replace(state, nodes=(scrape, state.nodes[1]))
+
+    error = raw_html_cleanup_review_contract_error(state)
+
+    assert error is not None
+    assert "preserves raw HTML/fingerprint field" in error
+    assert field_name in error
 
 
 def test_unrelated_pipeline_decision_does_not_satisfy_raw_html_cleanup_review() -> None:
@@ -1343,6 +1390,30 @@ def test_resolved_pipeline_decision_requires_matching_node_hash() -> None:
     assert materialized.nodes[0].options["mapping"] == strip_authoring_options(reviewed.nodes[0].options)["mapping"]
 
 
+@pytest.mark.parametrize("drift", [False, True], ids=["accepted-artifact", "changed-artifact"])
+def test_resolved_cleanup_paraphrase_remains_bound_to_reviewed_mapping(drift: bool) -> None:
+    options = _pipeline_decision_options(status="resolved")
+    requirements = options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert isinstance(requirements, list)
+    requirement = dict(requirements[0])
+    requirement["draft"] = "Delete the source markup and content digest before saving."
+    requirement["accepted_value"] = requirement["draft"]
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [requirement]
+    reviewed = _state_with_web_scrape_cleanup_node(options)
+    requirement["accepted_artifact_hash"] = pipeline_decision_artifact_hash(
+        reviewed.nodes[1], reviewed.nodes, user_term=RAW_HTML_CLEANUP_USER_TERM
+    )
+    if drift:
+        options["mapping"] = {"url": "renamed_url"}
+    state = _state_with_web_scrape_cleanup_node(options)
+
+    if drift:
+        with pytest.raises(ValueError, match="pipeline-decision review hash drifted"):
+            materialize_state_for_execution(state)
+    else:
+        assert isinstance(materialize_state_for_execution(state), CompositionState)
+
+
 def test_display_title_does_not_change_approved_pipeline_decision_artifact() -> None:
     reviewed = _state_with_cleanup_node(_pipeline_decision_options())
     artifact_hash = pipeline_decision_artifact_hash(reviewed.nodes[0], reviewed.nodes, user_term=RAW_HTML_CLEANUP_USER_TERM)
@@ -1365,35 +1436,20 @@ def test_resolved_pipeline_decision_hash_drift_fails_closed() -> None:
 
 
 def test_resolved_raw_html_cleanup_decision_rejects_mapping_that_preserves_raw_fields() -> None:
-    reviewed = _state_with_cleanup_node(_pipeline_decision_options())
-    bad_options = dict(reviewed.nodes[0].options)
+    bad_options = _pipeline_decision_options(status="resolved")
     bad_options["mapping"] = {
         "url": "url",
         "content": "content",
         "content_fingerprint": "content_fingerprint",
         "primary_colours": "primary_colours",
     }
-    clean_options = strip_authoring_options(bad_options)
-    artifact_hash = stable_hash(
-        {
-            "id": "drop_raw_html",
-            "node_type": "transform",
-            "plugin": "field_mapper",
-            "input": "scored_rows",
-            "on_success": "clean_rows",
-            "on_error": "stop",
-            "options": clean_options,
-        }
-    )
-    state = _state_with_cleanup_node(bad_options)
-    requirement = dict(state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0])
-    requirement["status"] = "resolved"
-    requirement["event_id"] = "event-raw-html-drop"
-    requirement["accepted_value"] = requirement["draft"]
+    reviewed = _state_with_web_scrape_cleanup_node(bad_options)
+    artifact_hash = pipeline_decision_artifact_hash(reviewed.nodes[1], reviewed.nodes, user_term=RAW_HTML_CLEANUP_USER_TERM)
+    requirement = dict(reviewed.nodes[1].options[INTERPRETATION_REQUIREMENTS_KEY][0])
     requirement["accepted_artifact_hash"] = artifact_hash
-    patched_options = dict(state.nodes[0].options)
+    patched_options = dict(bad_options)
     patched_options[INTERPRETATION_REQUIREMENTS_KEY] = [requirement]
-    state = _state_with_cleanup_node(patched_options)
+    state = _state_with_web_scrape_cleanup_node(patched_options)
 
     with pytest.raises(ValueError, match="preserves raw HTML/fingerprint field"):
         materialize_state_for_execution(state)

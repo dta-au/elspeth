@@ -28,12 +28,14 @@ from elspeth.contracts.session_operation import SessionOperationContext, Session
 from elspeth.web.composer import provider_gateway, tool_batch
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome, _DispatchOutcome
+from elspeth.web.composer.advisor_request import advisor_feedback_payload
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.prompt_guard_rendering import json_content_parts
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl, _reply_only_messages
+from elspeth.web.composer.state import SourceSpec
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.prompt_guard_config import PromptGuardSettings
@@ -205,6 +207,16 @@ def _completion(*, content: str | None = None, name: str | None = None, argument
 async def _produce_feedback(
     current: _Invocation, monkeypatch: pytest.MonkeyPatch, producer: Literal["advisor", "argument_error"]
 ) -> tuple[dict[str, Any], str, int]:
+    # Persisted empty sessions enter the planner. Exercise the normal tool loop
+    # against an ordinary existing draft while retaining its physical custody.
+    state = _empty_state().with_source(
+        SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={"path": str(Path(current.service._data_dir) / "input.csv"), "schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        )
+    )
     guidance = "GUIDANCE_START " + "界" * 1500 + '\n"quoted field" https://catalog.example.test GUIDANCE_END'
     name = "request_advisor_hint" if producer == "advisor" else "未知の道具"
     error = f"Tool '{name}' arguments must be a JSON object, got list."
@@ -238,7 +250,7 @@ async def _produce_feedback(
         await current.service.compose(
             _USER,
             [],
-            _empty_state(),
+            state,
             session_id=current.context.fence.session_id,
             user_id="phase3-test-user",
             user_message_id=current.user_message_id,
@@ -261,7 +273,7 @@ async def _produce_feedback(
     assert "".join(part.text for part in parts) == tool["content"]
     assert all(part.trust is None for part in parts)
     dispatch = current.dispatches[0]
-    assert dispatch.state == _empty_state()
+    assert dispatch.state == state
     assert dispatch.plugin_crash is None and dispatch.advisor_failure is None
     outcome = dispatch.tool_outcomes[0]
     if producer == "advisor":
@@ -271,7 +283,8 @@ async def _produce_feedback(
         assert payload["budget_used"] == 1 and payload["budget_remaining"] == 3
         assert payload["model"] == _ADVISOR
         assert payload["prompt_tokens"] == 3 and payload["completion_tokens"] == 2
-        assert tool["content"] == json.dumps(payload)
+        assert tool["content"] == json.dumps(advisor_feedback_payload(payload))
+        assert {"budget_used", "budget_remaining"}.isdisjoint(json.loads(tool["content"]))
         assert not dispatch.turn_has_mutation and not dispatch.turn_has_discovery
         assert dispatch.private_invocations[0].status is ComposerToolStatus.SUCCESS
     else:

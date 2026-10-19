@@ -28,6 +28,7 @@ from typing import Any
 
 import pytest
 
+from elspeth_lints.core.ast_dump import stable_ast_dump
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.tree_gate import iter_gate_files
@@ -3343,7 +3344,51 @@ def _scan_sources(sources: dict[str, str]) -> tuple[ClockViolation, ...]:
                 proven_database_parameters=proven_database_parameters,
             ).scan()
         )
-    return tuple(sorted(set(violations)))
+    forensic_transfers = _reviewed_call_created_at_transfers(sources)
+    return tuple(sorted(set(violations) - forensic_transfers))
+
+
+def _reviewed_call_created_at_transfers(sources: dict[str, str]) -> set[ClockViolation]:
+    """Exact audit-only timestamp forwards; custody still uses the callee's DB fence.
+
+    Pin both facades and the complete final callee. Any new authority use,
+    changed receiver, or altered forwarding body withdraws this admission.
+    """
+    reviewed = {
+        (
+            "src/elspeth/core/landscape/execution/calls.py",
+            "CallAuditRepository.record_operation_call",
+        ): "6ce94f10b9bbe8f2238b96765b2e47f2433853ade1053a3747310f9dd3d96a0b",
+        (
+            "src/elspeth/core/landscape/execution_repository.py",
+            "ExecutionRepository.record_operation_call",
+        ): "d469b287eba0cb373c6fa251cac80e6f679294f073c266f1e04dae68e1acf9d2",
+        (
+            "src/elspeth/core/landscape/plugin_audit_writer.py",
+            "PluginAuditWriterAdapter.record_operation_call",
+        ): "76cc2b3f0c5fba2a703bdbeba8725c4d7a31b537ba37451edb8cd5f6ab757d12",
+    }
+    paths = {path for path, _symbol in reviewed}
+    if not paths <= sources.keys():
+        return set()
+    records = {
+        (record.path, record.symbol): record
+        for record in _function_records({path: sources[path] for path in paths})
+        if (record.path, record.symbol) in reviewed
+    }
+    if records.keys() != reviewed.keys() or any(
+        hashlib.sha256(stable_ast_dump(records[key].node).encode()).hexdigest() != digest for key, digest in reviewed.items()
+    ):
+        return set()
+    return {
+        ClockViolation(record.path, record.symbol, keyword.value.lineno, "caller-clock-forwarding", "record_operation_call")
+        for record in records.values()
+        if record.symbol != "CallAuditRepository.record_operation_call"
+        for call in ast.walk(record.node)
+        if isinstance(call, ast.Call) and _terminal_name(call.func) == "record_operation_call"
+        for keyword in call.keywords
+        if keyword.arg == "created_at" and isinstance(keyword.value, ast.Name) and keyword.value.id == "created_at"
+    }
 
 
 def _scan_production(paths: Iterable[str] | None = None) -> tuple[ClockViolation, ...]:
@@ -7861,6 +7906,44 @@ def test_clock_inventory_covers_every_required_decision_family() -> None:
 def test_landscape_authority_has_no_process_or_caller_clock_ingress() -> None:
     violations = tuple(violation for violation in _scan_production() if violation.kind != "missing-database-time")
     assert not violations, "Landscape authority still trusts caller/process time:\n" + _format_violations(violations)
+
+
+@pytest.mark.parametrize("mutation", ["authority_use", "foreign_forward", "renamed_keyword"])
+def test_call_created_at_admission_withdraws_when_reviewed_audit_seam_changes(mutation: str) -> None:
+    paths = (
+        "src/elspeth/core/landscape/execution/calls.py",
+        "src/elspeth/core/landscape/execution_repository.py",
+        "src/elspeth/core/landscape/plugin_audit_writer.py",
+        # Discovery follows the actual fenced call into its clock authority.
+        "src/elspeth/core/landscape/run_coordination_repository.py",
+        "src/elspeth/core/landscape/database_clock.py",
+    )
+    sources = {path: (_ROOT / path).read_text(encoding="utf-8") for path in paths}
+    discovered = {(boundary.path, boundary.symbol) for boundary in _discover_authority_boundaries(sources)}
+    assert (paths[0], "CallAuditRepository.record_operation_call") in discovered
+    assert (paths[3], "fenced_leader_transaction") in discovered
+    admitted = _reviewed_call_created_at_transfers(sources)
+    assert len(admitted) == 2
+    assert not [violation for violation in _scan_sources(sources) if violation.kind == "caller-clock-forwarding"]
+    if mutation == "authority_use":
+        marker = "        timestamp = now() if created_at is None else created_at"
+        assert marker in sources[paths[0]]
+        sources[paths[0]] = sources[paths[0]].replace(
+            marker,
+            marker + "\n        conn.execute(update(run_workers_table).values(heartbeat_expires_at=created_at))",
+        )
+    else:
+        before = "created_at=created_at,"
+        assert before in sources[paths[1]]
+        sources[paths[1]] = sources[paths[1]].replace(
+            before, "created_at=foreign_timestamp," if mutation == "foreign_forward" else "deadline=created_at,"
+        )
+    assert _reviewed_call_created_at_transfers(sources) == set()
+    assert {violation.kind for violation in _scan_sources(sources)} & {
+        "caller-clock-forwarding",
+        "forensic-clock-authority",
+        "missing-database-time",
+    }
 
 
 def test_every_clock_sensitive_decision_uses_landscape_database_time() -> None:

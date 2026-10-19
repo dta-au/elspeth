@@ -141,7 +141,6 @@ def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -
     memo = LockCheckedMemo({"old-snapshot": {"key": "old-value"}})
     monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO", memo)
     monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO_MAX", 1)
-    monkeypatch.setattr(planner_authoring_aids, "read_openrouter_catalog_snapshot_id", lambda: ("catalog-sha", "live"))
 
     def build(_catalog: object) -> dict[str, str]:
         assert not planner_authoring_aids._AIDS_MEMO_LOCK.locked()
@@ -155,7 +154,7 @@ def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -
 
     assert first == second == {"key": "value"}
     assert first is not second
-    assert dict(memo) == {"snapshot:live:catalog-sha": {"key": "value"}}
+    assert dict(memo) == {"snapshot": {"key": "value"}}
 
 
 @pytest.mark.parametrize("snapshot_hashes", [["same"] * 4, ["one", "two", "three", "four"]])
@@ -1218,7 +1217,9 @@ class TestExemplarDomainDisjointness:
         assert section["set_pipeline_exemplar"] == {"pipeline": fork_coalesce_exemplar_args(view)}
         rules = " ".join(section["rules"])
         assert "SHAPE SELECTION" in rules  # run-3 E1: selection rule, not preference
-        assert "queries map (multi_query)" in rules  # run-3 E1: both shapes taught, selection by input variance
+        assert "SINGLE llm node with named queries" in rules
+        assert "query_input_mode: ordered" in rules
+        assert "fork/coalesce when branch settings, inputs or processing chains differ" in rules
 
 
 class TestDiscoveryDigest:
@@ -1405,42 +1406,21 @@ class TestDiscoveryDigest:
         with pytest.raises(RuntimeError, match="discovery_digest_budget_invariant"):
             discovery_digest(view, summaries=summaries)
 
-    def test_three_selected_plugin_contracts_fit_the_canonical_utf8_budget(self) -> None:
-        """The budget is read from the runtime constant, never restated here.
+    @pytest.mark.parametrize("name", ["web_scrape", "llm", "field_mapper"])
+    def test_selected_plugin_schema_remains_available_when_compact_attachment_budget_is_spent(self, name: str) -> None:
+        """Targeted discovery retains the admitted schema after aggregate compaction fills."""
+        from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+        from elspeth.web.composer.pipeline_planner import _ParsedToolCall, _serialize_provider_discovery_result
 
-        A hard-coded ``48 * 1024`` has teeth in both directions: raise the
-        constant to unblock the planner and this test still fails, so it reads
-        as a broken fix; lower it and this test passes while the planner
-        refuses real contracts. Importing it means this test tracks whatever
-        the planner actually enforces.
-
-        Was RED for elspeth-623c69c59f: the three contracts aggregated to
-        50,365 bytes against a 49,152-byte budget, so the planner refused the
-        third ``get_plugin_schema`` call with
-        ``schema_contract_budget_exceeded``. No single contract exceeded the
-        budget — ``llm`` alone was 39,093 bytes, 79.5% of it — so it was an
-        aggregate overflow, not one oversized contract.
-
-        Green since ``_collapse_uniform_variant_fields`` stopped the projection
-        re-emitting a discriminated union's shared knobs once per variant. The
-        constant was NOT raised — it is a ratchet, loosening it silently buys
-        room for the next option pair to overflow again, and it is the
-        developer's call, not a lane's. If this goes red again, shrink the
-        contract; do not raise the budget. The post-fix totals are deliberately
-        not restated here: this assertion does not enforce them, and the
-        pre-fix pair above already rotted by two bytes between the ticket's
-        summary and its own measurement table.
-        """
-        from elspeth.core.canonical import canonical_json
-        from elspeth.web.composer.pipeline_planner import _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES
-
-        view, _snapshot = _trained_view()
-        contracts = [
-            planner_authoring_aids.planner_plugin_contract(view.get_schema("transform", name)).to_dict()
-            for name in ("web_scrape", "llm", "field_mapper")
-        ]
-
-        assert len(canonical_json(contracts).encode("utf-8")) <= _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES
+        view, snapshot = _trained_view()
+        arguments = {"plugin_type": "transform", "name": name}
+        result = _dispatch_tool("get_plugin_schema", arguments, _empty_state(), view, plugin_snapshot=snapshot)
+        assert result.success
+        admitted = admit_discovery_result("get_plugin_schema", result)
+        call = _ParsedToolCall("schema-call", "get_plugin_schema", json.dumps(arguments), arguments)
+        serialized = _serialize_provider_discovery_result(call=call, result=admitted, schema_contract_budget_remaining=0)
+        assert serialized == serialize_admitted_discovery_result(admitted)
+        assert json.loads(serialized)["success"] is True
 
     def test_text_sink_digest_entry_states_the_multiline_prohibition(self) -> None:
         """The exact g11 regression anchor, held on the stable token only.
@@ -1591,15 +1571,7 @@ def _llmless_view() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot, Any]
 
 
 class TestModelCatalogAid:
-    """F3: every llm-node intent bought a deployment-static catalog with a turn.
-
-    ``list_models`` is two-mode — unfiltered it returns provider names and
-    counts plus a hint to call again with a provider, so an author that did not
-    already know the provider paid TWO turns for a catalog that is fixed for
-    the process. The aid restates both modes from the same accessors, so the
-    tests below are parity tests against the real tool rather than restatements
-    of its filter rule.
-    """
+    """The compatibility catalog matches discovery but stays outside cached aids."""
 
     def test_provider_summary_matches_the_models_listing_unfiltered_mode(self) -> None:
         view, snapshot = _trained_view()
@@ -1757,82 +1729,43 @@ class TestModelCatalogAid:
         assert settled[-1]["models_omitted"]
         assert settled[0]["models_by_provider"]
 
-    def test_payload_carries_the_catalog_only_where_an_llm_surface_is_visible(self) -> None:
+    def test_payload_defers_literal_model_catalogs_on_every_surface(self) -> None:
         view, _snapshot = _trained_view()
         llmless, _llmless_snapshot, profiles = _llmless_view()
 
-        assert build_planner_authoring_aids(view)["model_catalog"]["catalog"] == planner_model_catalog()
+        assert "model_catalog" not in build_planner_authoring_aids(view)
         assert "model_catalog" not in build_planner_authoring_aids(llmless)
         # After the build, not only after the helper's own probe: a registry
         # touch during the sweep is what would put a mock repr in a digest.
         assert profiles.mock_calls == []
 
-    def test_guidance_names_the_closed_provenance_and_the_deferral_marker(self) -> None:
+    def test_guidance_requires_fresh_model_discovery_for_literal_identifiers(self) -> None:
         view, _snapshot = _trained_view()
 
-        guidance = build_planner_authoring_aids(view)["model_catalog"]["guidance"]
+        guidance = build_planner_authoring_aids(view)["discovery_digest"]["guidance"]
+        assert "Literal model identifiers come only from a fresh list_models result, never from training" in guidance
+        assert "Usable operator-profile aliases are already listed for each plugin" in guidance
+        assert "profile-bound authoring needs no model-catalog lookup" in guidance
 
-        assert "no discovery call" in guidance
-        assert "authorable_providers" in guidance
-        assert "models_omitted" in guidance
-        assert "details_via" in guidance
-        assert "Never invent a slug" in guidance
-        assert "catalog list_models serves" in guidance
-        assert "provider_model_counts and total_models include every known provider" in guidance
-        assert "absence from models_by_provider means identifiers were not carried" in guidance
-        assert "closed llm provider-option set" in guidance
-        assert "only its identifiers are carried or authorable" in guidance
-        assert "no catalogued identifiers" in guidance
-        assert "operator-configured" in guidance
-        assert "over-budget provider with model_count and details_via" in guidance
-        assert "follow that marker before binding its slug" in guidance
-        assert "recall one from training" in guidance
-        assert "preflight rejects an unserved slug" in guidance
-
-    def test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory(
+    def test_a_profile_bound_slug_is_absent_from_aids_while_public_catalog_remains_discoverable(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The operator's binding stays private; the public catalog stays public.
-
-        ``_source_only_profile_view`` binds ``anthropic/claude-sonnet-4.6``
-        privately through the ``sonnet`` alias, and the public profile
-        projection deliberately hides ``model``. That slug is also an ordinary
-        member of OpenRouter's public catalog, which ``list_models`` already
-        returns in full to this same planner — so carrying the catalog
-        discloses nothing about which member the operator chose. What proves it
-        is that the carried list is the public reader's whole content, never a
-        deployment-selected subset.
-        """
+        """Private profile bindings do not enter aids even when publicly listed."""
         public_models = frozenset({"anthropic/claude-sonnet-4.6", "openai/gpt-4o"})
         monkeypatch.setattr(planner_authoring_aids, "get_catalog_values", lambda _catalog: public_models)
         view, _snapshot = _source_only_profile_view(tmp_path)
 
         aids = build_planner_authoring_aids(view)
-        carried = aids["model_catalog"]["catalog"]["models_by_provider"]["openrouter"]
-
-        # The profile view's catalog is the profile-free one, key for key: a
-        # leak that landed under some OTHER provider key could never reach the
-        # prompt either, whatever it was.
-        assert aids["model_catalog"]["catalog"] == planner_model_catalog()
-        assert carried == sorted(public_models)
-        assert "anthropic/claude-sonnet-4.6" in carried
-        without_public_inventory = json.loads(json.dumps(aids))
-        without_public_inventory["model_catalog"]["catalog"]["models_by_provider"] = {}
-        assert "anthropic/claude-sonnet-4.6" not in json.dumps(without_public_inventory)
+        assert "model_catalog" not in aids
+        assert planner_model_catalog()["models_by_provider"]["openrouter"] == sorted(public_models)
+        assert "anthropic/claude-sonnet-4.6" not in json.dumps(aids)
         assert "OPENROUTER_API_KEY" not in json.dumps(aids)
 
-    def test_memo_keys_on_the_model_catalog_identity_not_the_snapshot_alone(
+    def test_memo_keys_on_policy_snapshot_while_models_are_discovered_separately(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A catalog primed after the first build must not serve the old aids.
-
-        The OpenRouter catalog is a process-global the boot lifespan primes,
-        and no plugin-policy snapshot covers it — so a memo keyed on
-        ``snapshot_hash`` alone would pin the pre-prime catalog for the
-        process lifetime. Reverting the key to the snapshot hash makes the
-        second build below return the first build's payload.
-        """
+        """Catalog priming cannot change aids; a policy snapshot change must."""
         builds: list[str] = []
         identity = ["bundled-sha", "bundled"]
 
@@ -1841,24 +1774,22 @@ class TestModelCatalogAid:
             return {"purpose": identity[0]}
 
         monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", build)
-        monkeypatch.setattr(
-            planner_authoring_aids,
-            "read_openrouter_catalog_snapshot_id",
-            lambda: (identity[0], identity[1]),
-        )
         catalog: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="one-policy-snapshot"))
 
         first = planner_authoring_aids.build_planner_authoring_aids(catalog)
         repeat = planner_authoring_aids.build_planner_authoring_aids(catalog)
         identity[0], identity[1] = "live-sha", "live"
         after_prime = planner_authoring_aids.build_planner_authoring_aids(catalog)
+        changed_policy: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="another-policy-snapshot"))
+        after_policy_change = planner_authoring_aids.build_planner_authoring_aids(changed_policy)
 
         assert first == repeat == {"purpose": "bundled-sha"}
-        assert after_prime == {"purpose": "live-sha"}
+        assert after_prime == first
+        assert after_policy_change == {"purpose": "live-sha"}
         assert builds == ["bundled-sha", "live-sha"]
         assert sorted(planner_authoring_aids._AIDS_MEMO) == [
-            "one-policy-snapshot:bundled:bundled-sha",
-            "one-policy-snapshot:live:live-sha",
+            "another-policy-snapshot",
+            "one-policy-snapshot",
         ]
 
 
@@ -2342,56 +2273,39 @@ class TestModelCustody:
 
 
 class TestLlmSourceGenerationAid:
-    def test_source_only_generation_uses_llm_source_without_transform_advice(self, tmp_path: Path) -> None:
+    def test_source_only_generation_omits_control_guidance_without_required_safety(self, tmp_path: Path) -> None:
         view, _snapshot = _source_only_profile_view(tmp_path)
 
         aids = build_planner_authoring_aids(view)
-        rendered = " ".join(aids["llm_source_generation"]["rules"])
+        assert "llm_source_generation" not in aids
+        assert "llm_output_contract" not in aids
+        assert any(entry["name"] == "llm" for entry in aids["discovery_digest"]["plugins"]["sources"])
+        assert all(entry["name"] != "llm" for entry in aids["discovery_digest"]["plugins"]["transforms"])
 
-        assert "source:llm" in rendered
-        assert "generation-first" in rendered
-        assert "transform:llm" not in rendered
-        assert "seed" in rendered
-        assert "exactly one" in rendered
-        assert "incoming row" in rendered
+    def test_source_generation_option_contract_is_discovered_from_the_profile_schema(self, tmp_path: Path) -> None:
+        from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 
-    def test_source_generation_names_output_and_value_source_contract(self, tmp_path: Path) -> None:
-        view, _snapshot = _source_only_profile_view(tmp_path)
+        view, snapshot = _source_only_profile_view(tmp_path)
+        result = _dispatch_tool(
+            "get_plugin_schema", {"plugin_type": "source", "name": "llm"}, _empty_state(), view, plugin_snapshot=snapshot
+        )
+        assert result.success
+        serialized = serialize_admitted_discovery_result(admit_discovery_result("get_plugin_schema", result))
+        assert "response_field" in serialized
+        schema = view.get_schema("source", "llm")
+        assert "prompt_template" in schema.json_schema["properties"]
+        assert "profile" in schema.json_schema["properties"]
 
-        rendered = " ".join(build_planner_authoring_aids(view)["llm_source_generation"]["rules"])
-
-        assert "response_field" in rendered
-        assert "_usage" in rendered
-        assert "_model" in rendered
-        assert "lookup" in rendered
-        assert "{{ row" in rendered
-        assert "sonnet" in rendered
-        assert "provider/model/credential" in rendered
-
-    def test_source_generation_marks_model_catalog_as_refreshable_session_snapshot(self, tmp_path: Path) -> None:
+    def test_source_generation_requires_fresh_model_discovery_without_private_bindings(self, tmp_path: Path) -> None:
         view, _snapshot = _source_only_profile_view(tmp_path)
 
         aids = build_planner_authoring_aids(view)
-        rendered = " ".join(aids["llm_source_generation"]["rules"])
         guidance = aids["discovery_digest"]["guidance"]
-
-        assert "list_models" in rendered
-        assert "session snapshot" in rendered
-        assert "stale" in rendered
-        assert "list_models" in guidance
-        assert "session snapshot" in guidance
-        assert "stale" in guidance
-        # The operator's profile binds a concrete model privately and the
-        # public profile projection hides it. That slug is separately an
-        # ordinary member of OpenRouter's public catalog, which the served
-        # model_catalog section carries whole — so the canary blanks the public
-        # identifier lists and still holds over every other section, including
-        # that catalog's own counts, guidance and omission markers. The
-        # discrimination itself is pinned by
-        # TestModelCatalogAid.test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory.
-        without_public_inventory = json.loads(json.dumps(aids))
-        without_public_inventory["model_catalog"]["catalog"]["models_by_provider"] = {}
-        assert "anthropic/claude-sonnet-4.6" not in json.dumps(without_public_inventory)
+        assert "fresh list_models result" in guidance
+        assert "never from training" in guidance
+        assert "profile-bound authoring needs no model-catalog lookup" in guidance
+        assert "model_catalog" not in aids
+        assert "anthropic/claude-sonnet-4.6" not in json.dumps(aids)
 
     def test_source_generation_requires_discard_when_content_safety_is_required(self, tmp_path: Path) -> None:
         view, _snapshot = _source_only_profile_view(tmp_path, content_safety_required=True)
@@ -2401,8 +2315,8 @@ class TestLlmSourceGenerationAid:
         assert "on_validation_failure" in rendered
         assert "discard" in rendered
         assert "REQUIRES" in rendered
-        assert "Prompt Shield" in rendered
-        assert "not applicable" in rendered
+        assert "aws_bedrock_content_safety" in rendered
+        assert "non-discard source validation exit cannot be placed downstream" in rendered
 
     def test_source_digest_has_source_profile_alias_and_public_required_options(self, tmp_path: Path) -> None:
         view, _snapshot = _source_only_profile_view(tmp_path)
@@ -2581,9 +2495,7 @@ class TestRun2PackEdits:
         assert "options.path" in rendered  # G4: where a discovered blobs/ path goes
         assert "blob_id" in rendered
 
-    def test_raw_html_cleanup_rules_quote_the_constants_verbatim(self) -> None:
-        # G6: the cleanup draft ships verbatim next to the shield draft — the
-        # aids are the verbatim-constants channel (imported, drift-proof).
+    def test_raw_html_cleanup_rules_require_structured_identity_but_allow_draft_paraphrases(self) -> None:
         from elspeth.web.interpretation_state import (
             RAW_HTML_CLEANUP_REVIEW_DRAFT,
             RAW_HTML_CLEANUP_USER_TERM,
@@ -2594,6 +2506,9 @@ class TestRun2PackEdits:
         assert RAW_HTML_CLEANUP_USER_TERM in rendered
         assert RAW_HTML_CLEANUP_REVIEW_DRAFT in rendered
         assert "field_mapper" in rendered  # attachment point
+        assert "Write the draft in your own words" in rendered
+        assert "Example review row:" in rendered
+        assert "copy the user_term and draft strings verbatim" not in rendered
 
     def test_detailed_llm_hints_are_not_copied_into_the_selection_digest(self) -> None:
         view, _snapshot = _trained_view()
@@ -2630,7 +2545,7 @@ class TestRun3PackEdits:
         view, _snapshot = _trained_view()
         rendered = "\n".join(build_planner_authoring_aids(view)["fork_coalesce"]["rules"])
         assert "SHAPE SELECTION" in rendered
-        assert "SAME input field" in rendered
+        assert "SAME row" in rendered
         assert "compatible node-wide model, system prompt and sampling settings" in rendered
         assert "Preserve requested separate branches even when their input is the same" in rendered
 
@@ -2640,12 +2555,20 @@ class TestRun3PackEdits:
         assert "<query_key>_<response_field>" in rendered
         assert "<query_key>_<suffix>" in rendered
 
-    def test_http_identity_rules_bind_or_omit_never_invent(self) -> None:
-        view, _snapshot = _trained_view()
-        rendered = "\n".join(build_planner_authoring_aids(view)["web_scrape_http_identity"]["rules"])
-        assert "OMIT the http block" in rendered
-        assert "reserved-list-only" in rendered
-        assert "NEVER invent" in rendered
+    def test_http_identity_guidance_is_discovered_from_the_plugin(self) -> None:
+        view, snapshot = _trained_view()
+        assert "web_scrape_http_identity" not in build_planner_authoring_aids(view)
+        result = _dispatch_tool(
+            "get_plugin_assistance",
+            {"plugin_type": "transform", "plugin_name": "web_scrape"},
+            _empty_state(),
+            view,
+            plugin_snapshot=snapshot,
+        )
+        assert result.success
+        rendered = json.dumps(result.to_dict())
+        assert "http.abuse_contact and http.scraping_reason are mandatory" in rendered
+        assert "operator must declare them, not the model" in rendered
 
     def test_llm_digest_entry_carries_the_live_profile_aliases(self, tmp_path: Path) -> None:
         view, _snapshot = _profile_view(tmp_path)

@@ -130,6 +130,7 @@ async def test_no_recorder_owned_provider_failure_private_checkpoint_is_atomic(t
         RequiredWorkCoordinator,
         RequiredWorkRole,
     )
+    from tests.helpers.quota_guard import assert_provider_audit_companion
     from tests.unit.web.composer.test_llm_sampling_config import _settings
     from tests.unit.web.sessions.test_token_usage_adapters import _ledger, _quota_service
 
@@ -215,7 +216,9 @@ async def test_no_recorder_owned_provider_failure_private_checkpoint_is_atomic(t
             assert caught.value is original_failure
         rows = await service.get_messages(session.id, limit=None)
         assert len(guard_requests) == 1 and guard_requests[0]["userPrompt"] == "ordinary request"
-        assert all(row.role == "audit" and len(row.tool_calls) == 1 for row in rows)
+        assert all(row.role == "audit" for row in rows)
+        for row in rows:
+            assert_provider_audit_companion(row.tool_calls, context)
         assert [row.tool_calls[0]["_kind"] for row in rows] == {
             "rollback": ["prompt_guard_audit"],
             "success_in_except": ["prompt_guard_audit", "llm_call_audit", "composer_diagnostic_evidence"],

@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
-from elspeth.contracts.errors import ComposerOwnedSettlementFailure
+from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND
@@ -22,9 +22,44 @@ from elspeth.web.composer.provider_quota import (
     quota_provider_calls,
 )
 from elspeth.web.sessions.models import chat_messages_table, quota_provider_attempts_table, token_usage_ledger_table
-from tests.helpers.quota_guard import guarded_quota_turn
+from tests.helpers.quota_guard import assert_provider_audit_companion, guarded_quota_turn
 from tests.unit.web.composer.test_llm_sampling_config import _settings
 from tests.unit.web.sessions.test_token_usage_adapters import _quota_service
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra", "kind", "hash", "session", "operation", "epoch", "call"))
+def test_checkpoint_companion_oracle_refuses_drift(mutation):
+    from dataclasses import replace
+
+    from elspeth.web.composer.audit import llm_call_audit_envelope
+    from elspeth.web.composer.visible_tool_event import visible_response_gap
+    from tests.helpers.session_fences import make_compose_context
+    from tests.unit.web.sessions.test_composer_provider_telemetry import _call
+
+    context = make_compose_context("companion-oracle")
+    call = replace(_call(), call_id="actual-call")
+    public = llm_call_audit_envelope(call)
+    gap = visible_response_gap(call, context, public)
+    envelopes = [public, gap]
+    assert_provider_audit_companion(envelopes, context)
+    if mutation == "missing":
+        envelopes.pop()
+    elif mutation == "extra":
+        envelopes.append(dict(gap))
+    elif mutation == "kind":
+        gap["_kind"] = "unreviewed-companion"
+    elif mutation == "hash":
+        gap["public_call_hash"] = "0" * 64
+    elif mutation == "session":
+        gap["session_id"] = "another-session"
+    elif mutation == "operation":
+        gap["operation_id"] = "another-operation"
+    elif mutation == "epoch":
+        gap["operation_epoch"] += 1
+    else:
+        public["call"]["provider_request_id"] = "another-provider-request"
+    with pytest.raises((AssertionError, AuditIntegrityError)):
+        assert_provider_audit_companion(envelopes, context)
 
 
 @pytest.mark.asyncio
@@ -58,7 +93,8 @@ async def test_actual_settlement_writer_failure_only_wraps_required_scope(tmp_pa
 
     def fail_settlement_cohort(*args, **kwargs):
         drafts = kwargs["drafts"]
-        assert all(len(draft.tool_calls) == 1 for draft in drafts)
+        for draft in drafts:
+            assert_provider_audit_companion(draft.tool_calls, context)
         kinds = [draft.tool_calls[0]["_kind"] for draft in drafts]
         if kinds == ["prompt_guard_audit"]:
             assert required and physical == [] and writes == []

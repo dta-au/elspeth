@@ -67,12 +67,6 @@ from elspeth.web.composer.no_tool_policy import (
     ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE as _ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE,
 )
 from elspeth.web.composer.no_tool_policy import (
-    PipelineMutationIntentDecision as _PipelineMutationIntentDecision,
-)
-from elspeth.web.composer.no_tool_policy import (
-    classify_pipeline_mutation_intent as _classify_pipeline_mutation_intent,
-)
-from elspeth.web.composer.no_tool_policy import (
     compose_advisor_pending_handoff_message as _compose_advisor_pending_handoff_message,
 )
 from elspeth.web.composer.no_tool_policy import (
@@ -90,12 +84,6 @@ from elspeth.web.composer.no_tool_policy import (
 )
 from elspeth.web.composer.no_tool_policy import (
     is_pending_interpretation_handoff as _is_pending_interpretation_handoff,
-)
-from elspeth.web.composer.no_tool_policy import (
-    last_failure_was_pre_state_interpretation_review as _last_failure_was_pre_state_interpretation_review,
-)
-from elspeth.web.composer.no_tool_policy import (
-    pre_state_interpretation_review_repair_message as _pre_state_interpretation_review_repair_message,
 )
 from elspeth.web.composer.no_tool_policy import (
     state_is_structurally_empty as _state_is_structurally_empty,
@@ -1600,24 +1588,6 @@ class CompositionCompletion:
                 completion_gates=completion_gates,
                 provider_owner=provider_owner,
             )
-        if (
-            not confirmed_stop
-            and repair_turns_used < _MAX_REPAIR_TURNS
-            and _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
-            and _state_is_structurally_empty(state)
-            and _last_failure_was_pre_state_interpretation_review(recorder.invocations)
-        ):
-            llm_messages.append(
-                {
-                    "role": "user",
-                    "content": _pre_state_interpretation_review_repair_message(
-                        next_turn=repair_turns_used + 1,
-                        max_repair_turns=_MAX_REPAIR_TURNS,
-                    ),
-                }
-            )
-            return _TerminateOutcome(action="continue", repair_turns_delta=1)
-
         if not confirmed_stop and repair_turns_used < _MAX_REPAIR_TURNS:
             missing_interpretation_sites = await self._interpretation_surfacing._missing_pending_interpretation_review_sites(
                 state,

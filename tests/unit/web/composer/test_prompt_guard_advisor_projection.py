@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 
 from elspeth.web.composer.advisor_context import (
-    _ADVISOR_UNTRUSTED_SUMMARY_BEGIN,
-    _ADVISOR_UNTRUSTED_SUMMARY_END,
     _neutralize_untrusted_summary_sentinels,
     advisor_user_content_parts,
     build_advisor_user_message,
@@ -14,6 +12,7 @@ from elspeth.web.composer.advisor_context import (
 from elspeth.web.composer.prompt_guard import _request
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.composer.turn_effects import TurnEvidence
+from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.unit.web.composer._helpers import _empty_state
 
 
@@ -47,8 +46,7 @@ def test_publication_review_preserves_decoded_guard_projection_and_sentinel_spel
     inspected = "\n".join(part.inspection_text if part.inspection_text is not None else part.text for part in parts)
     assert wanted in inspected
     # The wire uses two backslashes to encode the same single decoded splice.
-    payload_text = rendered.split(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1].rsplit("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0]
-    assert json.loads(payload_text)["candidate_reply"] == wanted
+    assert parse_advisor_publication_review(rendered)["candidate_reply"] == wanted
     assert max(len(part.text) for part in parts) > 10_000
     request, supported = _request(
         policy_fingerprint="a" * 64,

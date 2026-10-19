@@ -68,6 +68,7 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerHandoff,
     PlannerModelConfig,
     PlannerOriginatingMessage,
+    PlannerPriorAssistantMessage,
     PlannerPriorUserRequest,
     PlannerRequestLifecycle,
     plan_pipeline,
@@ -193,18 +194,20 @@ def _freeform_planner_conversation_context(
     message: str,
     messages: list[ComposerHistoryMessage],
 ) -> PlannerConversationContext | None:
-    """Preserve authoritative earlier user requests for the planner.
+    """Preserve earlier user requests and assistant conversation separately.
 
     Empty-state planning receives the current message separately as its
     custody-bearing ``PlannerOriginatingMessage``. This projection carries
-    only preceding user-authored requests, including earlier amendments;
-    assistant prose is model synthesis, not intent authority, and is excluded.
+    preceding user-authored requests, including earlier amendments. Assistant
+    prose is retained separately so answers to clarifying questions have their
+    context; it is model synthesis and never user-request authority.
     A fresh-looking build instruction can still depend on an earlier
     restriction. Preserve every authenticated request in chronological order;
     the planner's exact request-byte bound refuses an oversized packet before
     any provider call instead of silently losing requirements.
     """
     prior_requests: list[PlannerPriorUserRequest] = []
+    prior_assistant_messages: list[PlannerPriorAssistantMessage] = []
     for history_index, history_message in enumerate(messages):
         if type(history_message) is not dict:
             raise InvariantError("composer chat history entries must be exact dictionaries")
@@ -214,6 +217,12 @@ def _freeform_planner_conversation_context(
         # must crash, so membership and value are checked separately rather
         # than letting a `.get()` default fold present-but-invalid into absent.
         if COMPOSER_HISTORY_USER_AUTHORED_KEY not in history_message:
+            if history_message["role"] == "assistant":
+                content = history_message["content"]
+                if type(content) is not str:
+                    raise InvariantError("composer assistant chat history content must be an exact string")
+                if content.strip():
+                    prior_assistant_messages.append(PlannerPriorAssistantMessage(history_index=history_index, content=content))
             continue
         authorship = history_message[COMPOSER_HISTORY_USER_AUTHORED_KEY]
         if authorship is not True or "role" not in history_message or history_message["role"] != "user":
@@ -223,10 +232,11 @@ def _freeform_planner_conversation_context(
             raise InvariantError("composer user chat history content must be a non-empty exact string")
         prior_requests.append(PlannerPriorUserRequest(history_index=history_index, content=content))
 
-    if not prior_requests:
+    if not prior_requests and not prior_assistant_messages:
         return None
     return PlannerConversationContext(
         prior_user_requests=tuple(prior_requests),
+        prior_assistant_messages=tuple(prior_assistant_messages),
     )
 
 
@@ -1187,10 +1197,7 @@ class PlanningApplication:
                 recovery_audit_drafts=drafts,
             )
         except PlannerDeclined as declined:
-            # Honest decline — from an ordinary manifest-satisfied turn
-            # led by the taught DECLINE: marker, or from the escape-hatch
-            # advisor turn, which accepts any text: a successful
-            # conversational outcome, not a provider failure. Mirror the
+            # The provider chose a conversational outcome. Mirror the
             # success path's audit persistence, then surface the model's own
             # words as the assistant message.
             await self._persist_pipeline_planner_audit(

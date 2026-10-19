@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import httpx
@@ -43,6 +44,8 @@ def telemetry_sink():
 
 @dataclass
 class RecordedCall:
+    call_id: str
+    created_at: datetime
     state_id: str | None
     operation_id: str | None
     call_index: int
@@ -90,11 +93,15 @@ class FakeCallRecorder:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> RecordedCall:
         assert source_call_id is None
         del approved_prompt_artifact_hash
         assert token_usage == UNKNOWN_TOKEN_USAGE
         call = RecordedCall(
+            call_id=call_id if call_id is not None else f"call-{len(self.calls)}",
+            created_at=created_at if created_at is not None else datetime.now(UTC),
             state_id=state_id,
             operation_id=None,
             call_index=call_index,
@@ -128,12 +135,16 @@ class FakeCallRecorder:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> RecordedCall:
         assert source_call_id is None
         del approved_prompt_artifact_hash
         assert token_usage == UNKNOWN_TOKEN_USAGE
         index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)
         call = RecordedCall(
+            call_id=call_id if call_id is not None else f"operation-call-{len(self.calls)}",
+            created_at=created_at if created_at is not None else datetime.now(UTC),
             state_id=None,
             operation_id=operation_id,
             call_index=index,

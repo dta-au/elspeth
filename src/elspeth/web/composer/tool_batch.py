@@ -1192,6 +1192,12 @@ async def run_tool_batch(
         if mixed_abandonment_batch:
             detail = "cannot_complete must be the only tool call in its batch; every call in this batch was refused before effects."
             category = ToolArgumentErrorCategory.MODEL_VALIDATION
+            rejection = ToolArgumentError(
+                argument="tool_calls",
+                expected="cannot_complete as the only call in its batch",
+                actual_type="mixed tool-call batch",
+                category=category,
+            )
             payload = {"status": "ARG_ERROR", "error": detail, "error_category": category.value}
             audit = begin_dispatch(
                 tool_call.id,
@@ -1205,12 +1211,12 @@ async def run_tool_batch(
             recorder.record_private_tool_authoring(private_authorings_by_call[tool_call.id])
             recorder.record(
                 finish_arg_error(
-                    audit, error_class="ToolArgumentError", error_category=category, error_message=detail, error_payload=payload
+                    audit, error_class=type(rejection).__name__, error_category=category, error_message=detail, error_payload=payload
                 )
             )
             _append_tool_outcome(
                 response=None,
-                error_class="ToolArgumentError",
+                error_class=type(rejection).__name__,
                 error_category=category,
                 error_message=detail,
                 post_version=state.version,

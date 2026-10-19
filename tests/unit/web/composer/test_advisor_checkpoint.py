@@ -4636,16 +4636,16 @@ async def test_end_gate_reviews_prose_on_structurally_empty_state(make_service, 
 
 
 # ---------------------------------------------------------------------------
-# Parts B & C: degeneracy-aware advisor summary + END sign-off rubric.
+# Parts B & C: named-field advisor evidence + task-conditioned END rubric.
 #
 # B1: prompt-shaped keys get a larger render budget so the advisor sees the
 #     whole prompt (rubric anchors + output contract), while ordinary values
 #     stay capped at the 120-char budget.
-# B2: LLM nodes annotate which row fields their prompt interpolates (length
-#     -independent degeneracy signal), or NONE when there are no row refs.
+# B2: LLM nodes annotate named row-field references over complete templates;
+#     an empty extraction cannot prove that no row input is used.
 # B-cap: even with several ~1000-char prompts the rendered END user-message
 #        stays under the composer_advisor_max_prompt_tokens char_cap.
-# C: the END problem_summary carries the degenerate-output directive (and the
+# C: the END problem_summary carries the task-conditioned review rubric (and the
 #    early one does not); the system message owns the output contract.
 # ---------------------------------------------------------------------------
 
@@ -4991,9 +4991,9 @@ def test_summarize_annotates_interpolated_row_fields(simple_state):
     )
     state = simple_state.with_node(node)
     summary = summarize_pipeline_for_advisor(state)
-    assert "interpolates row fields:" in summary
+    assert "named row field references:" in summary
     # Order-tolerant: both fields present in the bracketed list.
-    annotation_line = next(line for line in summary.splitlines() if "interpolates row fields:" in line)
+    annotation_line = next(line for line in summary.splitlines() if "named row field references:" in line)
     assert "url" in annotation_line
     assert "content" in annotation_line
     assert "NONE" not in annotation_line
@@ -5012,20 +5012,32 @@ def test_summarize_annotates_bracket_subscript_row_fields(simple_state):
     )
     state = simple_state.with_node(node)
     summary = summarize_pipeline_for_advisor(state)
-    annotation_line = next(line for line in summary.splitlines() if "interpolates row fields:" in line)
+    annotation_line = next(line for line in summary.splitlines() if "named row field references:" in line)
     assert "content" in annotation_line
     assert "url" in annotation_line
     assert "NONE" not in annotation_line
 
 
-def test_summarize_annotates_no_row_fields_loudly(simple_state):
-    """B2: an LLM node whose prompt has no row refs is flagged NONE."""
+@pytest.mark.parametrize(
+    "prompt_template",
+    [
+        "Summarize all fields: {{ row | dictsort }}",
+        "Summarize the record: {{ dict(row) }}",
+        "Summarize the selected value: {{ row[row | first] }}",
+        "Answer the same fixed question for each row: what is 2+2?",
+    ],
+    ids=["whole-row-filter", "whole-row-builtin", "dynamic-access", "constant-control"],
+)
+def test_summarize_empty_named_fields_does_not_claim_absent_row_input(simple_state, prompt_template):
+    """Named-field extraction cannot distinguish whole-row input from constants."""
     from elspeth.web.composer.advisor_context import summarize_pipeline_for_advisor
 
-    node = _llm_node("rate", prompt_template="Rate how cool government web pages are.")
+    node = _llm_node("rate", prompt_template=prompt_template)
     state = simple_state.with_node(node)
     summary = summarize_pipeline_for_advisor(state)
-    assert "interpolates row fields: NONE" in summary
+    assert "named row field references: NONE (not proof of absent row input)" in summary
+    assert json.dumps(prompt_template) in summary
+    assert "interpolates row fields: NONE" not in summary
 
 
 def test_summarize_marks_malformed_prompt_interpolation_unknown(simple_state):
@@ -5033,10 +5045,10 @@ def test_summarize_marks_malformed_prompt_interpolation_unknown(simple_state):
 
     node = _llm_node("rate", prompt_template="Rate {{ row.content ")
     summary = summarize_pipeline_for_advisor(simple_state.with_node(node))
-    line = next(line for line in summary.splitlines() if "interpolates row fields:" in line)
+    line = next(line for line in summary.splitlines() if "named row field references:" in line)
 
-    assert "interpolates row fields: UNKNOWN (invalid template syntax)" in line
-    assert "interpolates row fields: NONE" not in line
+    assert "named row field references: UNKNOWN (invalid template syntax)" in line
+    assert "named row field references: NONE" not in line
 
 
 def test_interpolation_evidence_propagates_unrelated_extraction_failure(monkeypatch):
@@ -5072,7 +5084,7 @@ def test_summarize_reads_prompt_from_nested_options(simple_state):
     )
     state = simple_state.with_node(node)
     summary = summarize_pipeline_for_advisor(state)
-    annotation_line = next(line for line in summary.splitlines() if "interpolates row fields:" in line)
+    annotation_line = next(line for line in summary.splitlines() if "named row field references:" in line)
     assert "title" in annotation_line
 
 
@@ -5113,9 +5125,8 @@ def test_summary_with_many_large_prompts_stays_under_char_cap():
     assert optional_chars < char_cap, f"{optional_chars} >= {char_cap}; no headroom"
 
 
-def test_end_checkpoint_problem_summary_carries_degeneracy_rubric(make_service, simple_state):
-    """C: the END problem_summary appends the degenerate-output directive, the
-    early one does not; output instructions belong to the system message."""
+def test_end_checkpoint_problem_summary_conditions_input_review_on_requested_task(make_service, simple_state):
+    """Prompt adequacy is a model judgment against the task and all visible inputs."""
     service = make_service()
     end_args = service._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=simple_state)
     early_args = service._advisor_checkpoint._build_checkpoint_arguments(phase="early", state=simple_state)
@@ -5127,8 +5138,13 @@ def test_end_checkpoint_problem_summary_carries_degeneracy_rubric(make_service, 
     # Multi-query nodes: the directive must not name prompt_template alone, or
     # a node whose node-level template is marked "not used" reads as exempt.
     assert "each queries.<name>.template plus the shared system_prompt" in end_summary
-    assert "length-independent interpolated row fields" in end_summary
-    assert "fabricate" in end_summary
+    assert "named row field references" in end_summary
+    assert "other visible inputs" in end_summary
+    assert "requested task" in end_summary
+    assert "Constant tasks and tasks about identifiers can be legitimate" in end_summary
+    assert "Absence of named field references does not establish absence of row input" in end_summary
+    assert "FLAG when the supplied evidence shows that the prompt interpolates no varying" not in end_summary
+    assert "it will fabricate or repeat one answer" not in end_summary
     for summary in (end_summary, early_summary):
         assert "Start your reply" not in summary
         assert "CATEGORY:" not in summary
@@ -5137,6 +5153,33 @@ def test_end_checkpoint_problem_summary_carries_degeneracy_rubric(make_service, 
 
     assert "visible effective prompt text" not in early_summary
     assert "fabricate" not in early_summary
+
+
+@pytest.mark.parametrize(
+    ("user_request", "prompt_template"),
+    [
+        (
+            "For every row answer the fixed question what is 2+2.",
+            "Answer the same fixed question for each row: what is 2+2?",
+        ),
+        (
+            "Classify each identifier by its spelling, without looking up the record.",
+            "Classify the spelling of this identifier: {{ row.identifier }}",
+        ),
+    ],
+    ids=["constant-task", "identifier-task"],
+)
+def test_end_review_preserves_legitimate_constant_and_identifier_tasks(make_service, simple_state, user_request, prompt_template):
+    from elspeth.web.composer.advisor_context import build_advisor_user_message
+
+    state = simple_state.with_node(_llm_node("classify", prompt_template=prompt_template))
+    arguments = make_service()._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=state, user_message=user_request)
+    wire_message = build_advisor_user_message(arguments)
+
+    assert user_request in wire_message
+    assert json.dumps(prompt_template) in wire_message
+    assert "Constant tasks and tasks about identifiers can be legitimate" in wire_message
+    assert "FLAG only a concrete mismatch between the requested task and the available inputs" in wire_message
 
 
 # ---------------------------------------------------------------------------
@@ -6068,21 +6111,21 @@ def test_summarize_malformed_queries_option_is_marked_not_rendered(simple_state)
 
 
 def test_summarize_interpolated_row_fields_reads_effective_query_templates(simple_state):
-    """The degeneracy signal is computed over the templates that render, not the dead slot."""
+    """Named references describe effective templates, not an unused prompt slot."""
     from elspeth.web.composer.advisor_context import summarize_pipeline_for_advisor
 
     # Dead node-level prompt interpolates a row field; the live query templates
-    # interpolate NOTHING — this is the real degeneracy and must read NONE.
+    # have no named references: report only that extraction fact.
     queries = {
         "good_pair": {"input_fields": {"colour": "colour"}, "template": "Name any colour pair."},
         "hex_code": {"input_fields": {"colour": "colour"}, "template": "Name any hex code."},
     }
     summary = summarize_pipeline_for_advisor(simple_state.with_node(_multi_query_llm_node(queries=queries)))
-    assert "interpolates row fields: NONE" in _node_line(summary, "colour_questions")
+    assert "named row field references: NONE (not proof of absent row input)" in _node_line(summary, "colour_questions")
 
     # Converse: dead node-level prompt with no row refs, live templates with them.
     summary = summarize_pipeline_for_advisor(simple_state.with_node(_multi_query_llm_node(prompt_template="Answer in one short reply.")))
-    assert "interpolates row fields: [colour]" in _node_line(summary, "colour_questions")
+    assert "named row field references: [colour]" in _node_line(summary, "colour_questions")
 
 
 def test_summarize_malformed_query_template_cannot_hide_behind_valid_sibling(simple_state):
@@ -6095,8 +6138,8 @@ def test_summarize_malformed_query_template_cannot_hide_behind_valid_sibling(sim
     summary = summarize_pipeline_for_advisor(simple_state.with_node(_multi_query_llm_node(queries=queries)))
     line = _node_line(summary, "colour_questions")
 
-    assert "interpolates row fields: UNKNOWN (invalid template syntax)" in line
-    assert "interpolates row fields: [colour]" not in line
+    assert "named row field references: UNKNOWN (invalid template syntax)" in line
+    assert "named row field references: [colour]" not in line
 
 
 def test_advisor_render_keeps_the_complete_multi_query_prompt_vocabulary():
@@ -6150,7 +6193,7 @@ def test_summarize_preserves_non_llm_queries_without_inventing_prompt_semantics(
     assert "queries." not in line
     assert "prompt_template_in_use" not in line
     assert "<invalid queries>" not in line
-    assert "interpolates row fields" not in line
+    assert "named row field references" not in line
     assert _advisor_query_option_values(options) == []
 
 
@@ -6167,8 +6210,8 @@ def test_summarize_llm_queries_without_parent_template_retain_their_own_contract
         assert json.dumps(query["template"], ensure_ascii=False) in line
         assert f"queries.{name}.input_fields=" in line
     assert "prompt_template_in_use=not used (every query supplies its own template)" in line
-    # The degeneracy signal still reads the effective (override) templates.
-    assert "interpolates row fields: [colour]" in line
+    # Named references still describe the effective (override) templates.
+    assert "named row field references: [colour]" in line
 
 
 # ---------------------------------------------------------------------------
@@ -6632,7 +6675,10 @@ async def test_checkpoint_unrepresentable_graph_is_unavailable_without_provider_
         raise AdvisorGraphCoverageUnavailable("Redaction made distinct authored keys ambiguous")
 
     monkeypatch.setattr("elspeth.web.composer.advisor_context.summarize_pipeline_for_advisor", refuse)
-    dispatch = AsyncMock(side_effect=AssertionError("No provider call is allowed for an unrepresentable graph"))
+    dispatch = AsyncMock(
+        spec=service._advisor_checkpoint._call_advisor_with_audit,
+        side_effect=AssertionError("No provider call is allowed for an unrepresentable graph"),
+    )
     monkeypatch.setattr(service._advisor_checkpoint, "_call_advisor_with_audit", dispatch)
     verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
         phase="end", state=simple_state, session_id=None, recorder=make_recorder()

@@ -3125,19 +3125,11 @@ async def test_pending_interpretation_event_with_duplicate_placeholder_forces_pr
 
 
 @pytest.mark.asyncio
-async def test_missing_state_interpretation_review_arg_error_forces_staging_retry(
+async def test_missing_state_interpretation_review_arg_error_guides_provider_staging_retry(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
 ) -> None:
-    """A build-style request must not stop after calling review too early.
-
-    The live model sometimes tries ``request_interpretation_review`` before
-    any composition state exists, receives the missing-current-state ARG_ERROR,
-    then emits prose saying it needs to stage the workflow first. For a
-    build-style user request, that prose is not a valid stopping point: the
-    compose loop should inject a repair instruction and continue so the model
-    can call ``set_pipeline`` and then retry the review tool.
-    """
+    """The provider can use the missing-state error to stage and retry review."""
     composer = _build_composer(tmp_path, sessions_service)
     session_id = uuid4()
     with sessions_service._engine.begin() as conn:
@@ -3152,7 +3144,17 @@ async def test_missing_state_interpretation_review_arg_error_forces_staging_retr
             )
         )
 
-    llm = _ScriptedLLM(
+    class _PrerequisiteAwareLLM(_ScriptedLLM):
+        async def __call__(self, messages: list[dict[str, Any]], tools: Any, **kwargs: Any) -> Any:
+            if len(self.messages) == 1:
+                feedback = [item for item in messages if item["role"] == "tool" and item["tool_call_id"] == "call_too_soon"]
+                assert len(feedback) == 1
+                assert "composition_state_id" in feedback[0]["content"]
+                assert "persisted composition state" in feedback[0]["content"]
+                assert "wait for its tool result" in feedback[0]["content"]
+            return await super().__call__(messages, tools, **kwargs)
+
+    llm = _PrerequisiteAwareLLM(
         [
             _fake_response_with_tool_call(
                 tool_call_id="call_too_soon",
@@ -3164,7 +3166,6 @@ async def test_missing_state_interpretation_review_arg_error_forces_staging_retr
                     "llm_draft": "modern and useful.",
                 },
             ),
-            _fake_text_response("I need to stage the LLM node first."),
             _fake_response_with_tool_call(
                 tool_call_id="call_set_pipeline",
                 tool_name="set_pipeline",

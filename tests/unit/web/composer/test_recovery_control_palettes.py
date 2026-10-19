@@ -327,7 +327,8 @@ async def test_final_preview_reply_still_accepts_recovery_without_advisor_reentr
         result = await service.compose("Preview the current pipeline and explain the result.", [], state, session_id=session_id)
     assert completion.call_count == 2 + int(after_advisor_repair)
     assert {tool["function"]["name"] for tool in advertised[0]} >= _CONTROL_NAMES
-    assert {tool["function"]["name"] for tool in advertised[-1]} == _CONTROL_NAMES
+    assert advertised[-1] == advertised[0]
+    assert {tool["function"]["name"] for tool in advertised[-1]} >= _CONTROL_NAMES | {"preview_pipeline", "set_metadata"}
     assert advisor.call_count == int(after_advisor_repair)
     requalify.assert_not_called()
     assert result.graph_recovery_intent is not None

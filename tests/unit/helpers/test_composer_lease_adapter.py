@@ -13,6 +13,7 @@ from tests.helpers.session_fences import fenced_operation_context
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
 
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult, RetainedOperationContext
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
@@ -36,6 +37,13 @@ async def test_adapter_forwards_exact_remaining_budget_and_owned_provider_pair(t
     history = []
     calls = []
     recovery = GraphRecoveryContext(None, 0, None, 0, False)
+    advisor_history = AdvisorTranscriptHistory.from_records(
+        session_id=harness.session_id,
+        actor_user_id="proposal-prevalidation-user",
+        current_request_id=harness.user_message_id,
+        request="Build a reviewed pipeline.",
+        records=await harness.sessions.get_messages(UUID(harness.session_id), limit=None, include_private_evidence=False),
+    )
 
     async def capture(
         self,
@@ -54,8 +62,11 @@ async def test_adapter_forwards_exact_remaining_budget_and_owned_provider_pair(t
         provider_owner=None,
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
+        advisor_history: AdvisorTranscriptHistory | None = None,
     ):
-        calls.append((self, message, messages, state, session_operation_context, budget_seconds, required_work, provider_owner))
+        calls.append(
+            (self, message, messages, state, session_operation_context, budget_seconds, required_work, provider_owner, advisor_history)
+        )
         assert recovery_context is recovery
         assert retained_operation_context is None
         return ComposerResult(message="Captured adapter forwarding.", state=state)
@@ -81,6 +92,7 @@ async def test_adapter_forwards_exact_remaining_budget_and_owned_provider_pair(t
                 required_work=work,
                 provider_owner=owner,
                 recovery_context=recovery,
+                advisor_history=advisor_history,
             )
             assert result.state is state
             assert len(calls) == 1
@@ -93,6 +105,7 @@ async def test_adapter_forwards_exact_remaining_budget_and_owned_provider_pair(t
             assert supplied[6] is work
             assert supplied[7] is owner
             assert supplied[7].required_work is supplied[6]
+            assert supplied[8] is advisor_history
             # A borrowed live authority is forwarded, never replaced/closed.
             harness.sessions.session_operation_authority.compare_and_swap(context)
             with pytest.raises(TypeError, match="budget_seconds_typo"):
@@ -134,6 +147,7 @@ async def test_adapter_legacy_call_preserves_budget_and_closes_actual_owned_leas
         provider_owner=None,
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
+        advisor_history: AdvisorTranscriptHistory | None = None,
     ):
         contexts.append(session_operation_context)
         budgets.append(budget_seconds)
@@ -146,6 +160,7 @@ async def test_adapter_legacy_call_preserves_budget_and_closes_actual_owned_leas
         bindings.append(required_work)
         assert recovery_context is None
         assert retained_operation_context is None
+        assert advisor_history is None
         self._sessions_service.session_operation_authority.compare_and_swap(session_operation_context)
         return ComposerResult(message="Captured legacy forwarding.", state=state)
 
@@ -201,8 +216,10 @@ async def test_adapter_preserves_original_body_and_close_outcomes(tmp_path, monk
         provider_owner=None,
         recovery_context=None,
         retained_operation_context=None,
+        advisor_history: AdvisorTranscriptHistory | None = None,
     ):
         assert type(required_work) is RequiredWorkBinding
+        assert advisor_history is None
         assert type(provider_owner) is ProviderInvocationOwner
         assert provider_owner.required_work is required_work
         assert provider_owner.service is self._sessions_service
