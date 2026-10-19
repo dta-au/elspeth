@@ -24,10 +24,11 @@ from elspeth.web.coordination.contracts import (
     SessionOperationKind,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.execution.accounting import load_run_accounting_from_db
 from elspeth.web.execution.schemas import CancelledData, CompletedData, FailedData, RunAccounting
-from elspeth.web.execution.service import close_execute_lease_before_transfer
+from elspeth.web.execution.service import _run_token_usage_entries, close_execute_lease_before_transfer
 from elspeth.web.sessions.protocol import (
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     RunRecord,
@@ -48,6 +49,7 @@ class RecoveryObservation:
     status: RunStatus | None
     live_leader: bool
     accounting: RunAccounting | None
+    token_usage_entries: tuple[TokenUsageEntry, ...] = ()
 
 
 def observe_run(landscape_url: str, run_id: str, *, create_tables: bool, passphrase: str | None = None) -> RecoveryObservation:
@@ -56,15 +58,17 @@ def observe_run(landscape_url: str, run_id: str, *, create_tables: bool, passphr
         run = repositories.run_lifecycle.get_run(run_id)
         if run is None:
             return RecoveryObservation(None, False, None)
+        entries = _run_token_usage_entries(db, landscape_run_id=run_id)
         if run.status == RunStatus.RUNNING:
-            return RecoveryObservation(run.status, repositories.run_coordination.live_leader(run_id=run_id) is not None, None)
+            return RecoveryObservation(run.status, repositories.run_coordination.live_leader(run_id=run_id) is not None, None, entries)
         if run.status in {RunStatus.FAILED, RunStatus.INTERRUPTED}:
             return RecoveryObservation(
                 run.status,
                 repositories.run_coordination.live_leader(run_id=run_id) is not None,
                 load_run_accounting_from_db(db, landscape_run_id=run_id),
+                entries,
             )
-        return RecoveryObservation(run.status, False, load_run_accounting_from_db(db, landscape_run_id=run_id))
+        return RecoveryObservation(run.status, False, load_run_accounting_from_db(db, landscape_run_id=run_id), entries)
 
 
 def project_terminal(transaction: SessionOperationMutationTransaction, *, run: RunRecord, observation: RecoveryObservation) -> None:
@@ -169,6 +173,7 @@ class RunRecoveryCoordinator:
     async def _reconcile_terminal(self, run: RunRecord, observation: RecoveryObservation, lease: SessionOperationLease) -> None:
         if not await self._rebind(run, lease):
             return
+        await self._reconcile_token_usage(run, observation, lease)
         await run_sync_in_worker(
             self._sessions.session_operation_authority.mutate,
             lease.context,
@@ -184,6 +189,22 @@ class RunRecoveryCoordinator:
                 self._sessions.session_operation_authority.mutate,
                 lease.context,
                 lambda tx: tx.runs.mark_recovery_outputs_finalized(run_id=run.id),
+            )
+
+    async def _reconcile_token_usage(self, run: RunRecord, observation: RecoveryObservation, lease: SessionOperationLease) -> None:
+        """Replay exact durable call identities before releasing recovery custody.
+
+        A missing physical outcome remains pending; absence is never evidence
+        of zero spend. Governed outcomes use their admitted attempt identity,
+        so the ledger writer can settle them without process-local state.
+        """
+        if observation.token_usage_entries:
+            lease.guard_external_effect()
+            await self._sessions.record_token_usage(
+                session_operation_context=lease.context,
+                source="run",
+                run_id=run.id,
+                entries=observation.token_usage_entries,
             )
 
     def _reconcile_resumable_terminal(
@@ -229,6 +250,7 @@ class RunRecoveryCoordinator:
                         current.status,
                         False,
                         load_run_accounting_from_db(db, landscape_run_id=str(run.id)),
+                        _run_token_usage_entries(db, landscape_run_id=str(run.id)),
                     )
                     lease.guard_external_effect()
                     asyncio.run_coroutine_threadsafe(self._reconcile_terminal(run, observation, lease), loop).result()
@@ -277,6 +299,7 @@ class RunRecoveryCoordinator:
             if run.saga_state is RunSagaState.ADMISSION_REFUSAL_PENDING:
                 if not await self._rebind(run, lease):
                     return
+                await self._reconcile_token_usage(run, observation, lease)
                 transferred = await self._execution.recover_run(run, lease, resume_existing=observation.status is not None)
                 return
             if observation.status is not None and observation.status != RunStatus.RUNNING:
@@ -299,6 +322,7 @@ class RunRecoveryCoordinator:
                 return
             if not await self._rebind(run, lease):
                 return
+            await self._reconcile_token_usage(run, observation, lease)
             if observation.status is None and await self._sessions.get_run_execution_input(run.id) is None:
                 await run_sync_in_worker(
                     self._sessions.session_operation_authority.mutate,

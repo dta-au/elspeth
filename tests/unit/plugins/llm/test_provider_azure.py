@@ -131,7 +131,7 @@ class FakeAuditRecorder:
     def record_operation_call(self, **call: Any) -> SimpleNamespace:
         self.operation_calls.append(call)
         return SimpleNamespace(
-            call_id=f"operation-call-{len(self.operation_calls)}",
+            call_id=call.get("call_id") or f"operation-call-{len(self.operation_calls)}",
             request_ref=f"operation-request-{len(self.operation_calls)}",
             response_ref=f"operation-response-{len(self.operation_calls)}",
         )
@@ -151,7 +151,7 @@ def test_governance_guards_sdk_and_settles_error_once(preflight: bool, refused: 
 
     def after(attempt_id: str, call_id: str) -> None:
         assert attempt_id == "attempt-azure"
-        assert call_id == "operation-call-1"
+        assert call_id == attempt_id
         assert len(recorder.operation_calls) == 1
         events.append("after")
 

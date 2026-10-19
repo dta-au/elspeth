@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from sqlalchemy import func, select, text, update
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.blobs import StorageAccountingUnavailableError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
@@ -1057,6 +1058,39 @@ def _read_composition_state_provenances(service: SessionServiceImpl, session_id:
 
 class TestForkEndpoint:
     """Route-level tests for POST /api/sessions/{id}/fork."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("phase", ["staging", "blob_copy"])
+    async def test_fork_storage_accounting_outage_returns_and_replays_503(self, tmp_path, phase: str) -> None:
+        """Both pre-child and staged failures preserve the accounting refusal."""
+        app, service, blob_service = _make_fork_app(tmp_path)
+        session = await service.create_session("alice", "Original", "local")
+        msg = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
+        body = {
+            "operation_id": str(uuid.uuid4()),
+            "from_message_id": str(msg.id),
+            "new_message_content": "Go edited",
+        }
+        target = service if phase == "staging" else blob_service
+        method = "fork_session" if phase == "staging" else "copy_blobs_for_fork"
+        with patch.object(target, method, side_effect=StorageAccountingUnavailableError(str(session.id))) as failing:
+            client = TestClient(app)
+            response = client.post(f"/api/sessions/{session.id}/fork", json=body)
+            replay = client.post(f"/api/sessions/{session.id}/fork", json=body)
+        assert response.status_code == replay.status_code == 503
+        assert (
+            response.json()
+            == replay.json()
+            == {
+                "detail": {
+                    "error_type": "session_operation_terminal_failure",
+                    "failure_code": "storage_accounting_unavailable",
+                    "detail": "Storage accounting is unavailable. Try again later.",
+                }
+            }
+        )
+        assert failing.call_count == 1
+        assert len(await service.list_sessions("alice", "local")) == 1
 
     @pytest.mark.asyncio
     async def test_partial_copy_stale_worker_takeover_completes_without_stale_cleanup(self, tmp_path) -> None:

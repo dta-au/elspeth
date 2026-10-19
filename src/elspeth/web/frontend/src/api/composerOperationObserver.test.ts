@@ -22,6 +22,31 @@ beforeEach(() => {
 });
 afterEach(() => { detachComposerObservers(); vi.useRealTimers(); purgeComposerCustody(); });
 describe("one durable operation observer", () => {
+  it.each(["rate_limited", "composer_queue_full"])("settles a structured %s refusal without observing or resubmitting", async (errorType) => {
+    const client = await vi.importActual<typeof import("./client")>("./client");
+    vi.mocked(api.isDefinitiveComposerRefusal).mockImplementation(client.isDefinitiveComposerRefusal);
+    const refusal = { status: 429, error_type: errorType, detail: "Retry later.", retry_after: 60 };
+    vi.mocked(api.submitComposerOperation).mockRejectedValueOnce(refusal);
+    await expect(submitAndObserveComposerOperation(descriptor())).rejects.toEqual(refusal);
+    expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+    expect(api.fetchComposerOperation).not.toHaveBeenCalled();
+    expect(api.fetchComposerOperationStream).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a generic gateway 429 under the same immutable submission", async () => {
+    vi.useFakeTimers();
+    const client = await vi.importActual<typeof import("./client")>("./client");
+    vi.mocked(api.isDefinitiveComposerRefusal).mockImplementation(client.isDefinitiveComposerRefusal);
+    vi.mocked(api.submitComposerOperation).mockRejectedValueOnce({ status: 429, detail: "Gateway busy" });
+    vi.mocked(api.fetchComposerOperation).mockResolvedValueOnce({ kind: "operation_missing" }).mockResolvedValue(snapshot());
+    const observing = submitAndObserveComposerOperation(descriptor());
+    await vi.advanceTimersByTimeAsync(1000);
+    await observing;
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.submitComposerOperation).mock.calls[1][0]).toEqual(vi.mocked(api.submitComposerOperation).mock.calls[0][0]);
+  });
+
   it.each([
     ["http_error", "admission_refused", "admission_refused"],
     ["http_error", undefined, undefined],

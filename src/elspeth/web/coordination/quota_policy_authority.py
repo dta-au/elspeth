@@ -18,14 +18,18 @@ from sqlalchemy.engine import Connection, Engine
 
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.identity_authority import IdentityAdminActor
-from elspeth.web.coordination.quota_authority import ActiveQuotaPolicies, ContainerQuotaPolicyRow, QuotaPolicyRow, utc_day_start
+from elspeth.web.coordination.quota_authority import (
+    ActiveQuotaPolicies,
+    ContainerQuotaPolicyRow,
+    QuotaPolicyRow,
+    storage_bytes_used_on_connection,
+    utc_day_start,
+)
 from elspeth.web.sessions.models import (
-    blobs_table,
     identities_table,
     identity_roles_table,
     quota_policies_table,
     quota_provider_attempts_table,
-    sessions_table,
     token_usage_ledger_table,
 )
 
@@ -42,6 +46,9 @@ class IdentityQuotaStatus:
     container_policy: ContainerQuotaPolicyRow | None
     tokens_used_today: int | None
     storage_bytes_used: int
+    policy_state: Literal["active", "never_issued", "suspended"]
+    container_tokens_used_today: int | None
+    container_storage_bytes_used: int
 
 
 @final
@@ -104,18 +111,6 @@ class ContainerQuotaPolicyConflict(QuotaPolicyRefusal):
     pass
 
 
-def _storage_bytes_used_on_connection(connection: Connection, *, identity_id: str) -> int:
-    """Count every live blob row held by the identity across its sessions."""
-    total = connection.execute(
-        select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0))
-        .select_from(blobs_table.join(sessions_table, sessions_table.c.id == blobs_table.c.session_id))
-        .where(sessions_table.c.user_id == identity_id)
-    ).scalar_one()
-    if type(total) is not int:
-        raise RuntimeError("identity storage total is not an exact integer")
-    return total
-
-
 def _policy(row: Any) -> QuotaPolicyRow | None:
     if row is None:
         return None
@@ -144,7 +139,7 @@ def _active_policies_on_connection(conn: Connection, *, identity_id: str) -> Act
     )
 
 
-def _daily_tokens_on_connection(conn: Connection, *, identity_id: str, now: datetime) -> int | None:
+def _daily_tokens_on_connection(conn: Connection, *, identity_id: str | None, now: datetime) -> int | None:
     """Mirror R14's UTC-day measure, including unsettled and unknown usage."""
     day_start = utc_day_start(now)
     pending = quota_provider_attempts_table.c
@@ -152,7 +147,7 @@ def _daily_tokens_on_connection(conn: Connection, *, identity_id: str, now: date
         conn.execute(
             select(pending.attempt_id)
             .where(
-                pending.identity_id == identity_id,
+                pending.identity_id.is_not(None) if identity_id is None else pending.identity_id == identity_id,
                 pending.started_at >= day_start,
                 pending.started_at < day_start + timedelta(days=1),
                 pending.settled_at.is_(None),
@@ -170,7 +165,11 @@ def _daily_tokens_on_connection(conn: Connection, *, identity_id: str, now: date
             func.count().label("row_count"),
             func.coalesce(func.sum(unknown), 0).label("unknown_count"),
             func.coalesce(func.sum(measured), 0).label("measured_total"),
-        ).where(ledger.identity_id == identity_id, ledger.recorded_at >= day_start, ledger.recorded_at < day_start + timedelta(days=1))
+        ).where(
+            ledger.identity_id.is_not(None) if identity_id is None else ledger.identity_id == identity_id,
+            ledger.recorded_at >= day_start,
+            ledger.recorded_at < day_start + timedelta(days=1),
+        )
     ).one()
     if row.row_count == 0:
         return 0
@@ -181,12 +180,19 @@ def _daily_tokens_on_connection(conn: Connection, *, identity_id: str, now: date
 
 def _status_on_connection(conn: Connection, *, identity_id: str, now: datetime) -> IdentityQuotaStatus:
     policies = _active_policies_on_connection(conn, identity_id=identity_id)
+    has_history = (
+        conn.execute(select(quota_policies_table.c.policy_id).where(quota_policies_table.c.identity_id == identity_id).limit(1)).first()
+        is not None
+    )
     return IdentityQuotaStatus(
         identity_id=identity_id,
         identity_policy=policies.identity,
         container_policy=policies.container,
         tokens_used_today=_daily_tokens_on_connection(conn, identity_id=identity_id, now=now),
-        storage_bytes_used=_storage_bytes_used_on_connection(conn, identity_id=identity_id),
+        storage_bytes_used=storage_bytes_used_on_connection(conn, identity_id=identity_id),
+        policy_state="active" if policies.identity is not None else "suspended" if has_history else "never_issued",
+        container_tokens_used_today=_daily_tokens_on_connection(conn, identity_id=None, now=now),
+        container_storage_bytes_used=storage_bytes_used_on_connection(conn, identity_id=None),
     )
 
 
@@ -201,6 +207,7 @@ class RepositoryQuotaPolicyAuthority:
         self,
         *,
         tokens_per_day: int | None,
+        storage_bytes: int | None = None,
         record: Callable[[ContainerQuotaPolicyRow], None],
     ) -> ContainerQuotaPolicyRow | None:
         """Create an absent configured ceiling, or verify without changing policy.
@@ -210,6 +217,8 @@ class RepositoryQuotaPolicyAuthority:
         another replica's policy. Absent configuration never revokes a row.
         """
         if tokens_per_day is not None and (type(tokens_per_day) is not int or not 1 <= tokens_per_day <= MAX_QUOTA_VALUE):
+            raise QuotaValueOutOfRange(f"quota value must be an integer between 1 and {MAX_QUOTA_VALUE}")
+        if storage_bytes is not None and (type(storage_bytes) is not int or not 1 <= storage_bytes <= MAX_QUOTA_VALUE):
             raise QuotaValueOutOfRange(f"quota value must be an integer between 1 and {MAX_QUOTA_VALUE}")
         if not callable(record):
             raise TypeError("record must be callable")
@@ -229,19 +238,21 @@ class RepositoryQuotaPolicyAuthority:
                 current = rows[0]
                 if current.set_by_actor == "config" and tokens_per_day is not None and current.tokens_per_day != tokens_per_day:
                     raise ContainerQuotaPolicyConflict("configured container token cap conflicts with the active config-owned policy")
+                if current.set_by_actor == "config" and storage_bytes is not None and current.storage_bytes != storage_bytes:
+                    raise ContainerQuotaPolicyConflict("configured container storage cap conflicts with the active config-owned policy")
                 return ContainerQuotaPolicyRow(
                     policy_id=current.policy_id, tokens_per_day=current.tokens_per_day, storage_bytes=current.storage_bytes
                 )
-            if tokens_per_day is None:
+            if tokens_per_day is None and storage_bytes is None:
                 return None
             now = database_now(conn)
-            policy = ContainerQuotaPolicyRow(policy_id=str(uuid.uuid4()), tokens_per_day=tokens_per_day, storage_bytes=None)
+            policy = ContainerQuotaPolicyRow(policy_id=str(uuid.uuid4()), tokens_per_day=tokens_per_day, storage_bytes=storage_bytes)
             conn.execute(
                 insert(quota_policies_table).values(
                     policy_id=policy.policy_id,
                     identity_id=None,
                     tokens_per_day=policy.tokens_per_day,
-                    storage_bytes=None,
+                    storage_bytes=storage_bytes,
                     set_by_identity_id=None,
                     set_by_actor="config",
                     set_at=now,
@@ -313,8 +324,26 @@ class RepositoryQuotaPolicyAuthority:
             .with_for_update()
         ).one_or_none()
         previous = _policy(current)
-        tokens_per_day = value if dimension == "tokens" else (previous.tokens_per_day if previous is not None else default_tokens_per_day)
-        storage_bytes = value if dimension == "storage" else (previous.storage_bytes if previous is not None else default_storage_bytes)
+        # Revocation suspends admission but does not erase the last allowance.
+        # Reissuing one dimension restores the other even if defaults were removed.
+        baseline = current
+        if baseline is None:
+            baseline = conn.execute(
+                select(quota_policies_table)
+                .where(quota_policies_table.c.identity_id == identity_id)
+                .order_by(quota_policies_table.c.set_at.desc(), quota_policies_table.c.policy_id.desc())
+                .limit(1)
+            ).one_or_none()
+        # Database timestamps can tie (notably SQLite's millisecond clock).
+        # Serialize a logical policy order under the already-held identity lock
+        # so later restoration never guesses between two different allowances.
+        policy_time = now
+        if baseline is not None:
+            baseline_time = baseline.set_at.replace(tzinfo=UTC) if baseline.set_at.tzinfo is None else baseline.set_at.astimezone(UTC)
+            if policy_time <= baseline_time:
+                policy_time = baseline_time + timedelta(microseconds=1)
+        tokens_per_day = value if dimension == "tokens" else (baseline.tokens_per_day if baseline is not None else default_tokens_per_day)
+        storage_bytes = value if dimension == "storage" else (baseline.storage_bytes if baseline is not None else default_storage_bytes)
         if tokens_per_day is None or storage_bytes is None:
             raise QuotaDefaultMissing(
                 "personal caps are not enabled on this deployment; an operator enables them by setting both "
@@ -322,7 +351,9 @@ class RepositoryQuotaPolicyAuthority:
                 "in the server configuration"
             )
         if current is not None:
-            conn.execute(update(quota_policies_table).where(quota_policies_table.c.policy_id == current.policy_id).values(revoked_at=now))
+            conn.execute(
+                update(quota_policies_table).where(quota_policies_table.c.policy_id == current.policy_id).values(revoked_at=policy_time)
+            )
         policy_id = str(uuid.uuid4())
         conn.execute(
             insert(quota_policies_table).values(
@@ -330,10 +361,10 @@ class RepositoryQuotaPolicyAuthority:
                 identity_id=identity_id,
                 tokens_per_day=tokens_per_day,
                 storage_bytes=storage_bytes,
-                dual_control_above_tokens=None if current is None else current.dual_control_above_tokens,
+                dual_control_above_tokens=None if baseline is None else baseline.dual_control_above_tokens,
                 set_by_identity_id=actor.identity_id,
                 set_by_actor="identity",
-                set_at=now,
+                set_at=policy_time,
                 revoked_at=None,
             )
         )

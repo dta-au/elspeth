@@ -407,7 +407,7 @@ describe("People & access journeys", () => {
   // ── Usage & limits ──────────────────────────────────────────────────────
 
   it("shows usage, a personal cap and the shared ceiling for one person, and unknown as unknown", async () => {
-    vi.mocked(workflow.fetchIdentityQuota).mockResolvedValue({ identity_id: "jane-id", tokens_per_day: null, tokens_used_today: null, container_tokens_per_day: 5000, storage_bytes: null, storage_bytes_used: 0, container_storage_bytes: null } as never);
+    vi.mocked(workflow.fetchIdentityQuota).mockResolvedValue({ identity_id: "jane-id", tokens_per_day: null, tokens_used_today: null, container_tokens_per_day: "5000", storage_bytes: null, storage_bytes_used: "0", container_storage_bytes: null, policy_state: "never_issued", can_edit: true, container_tokens_used_today: null, container_storage_bytes_used: "0" });
     await openPerson(/Jane Doe/);
     // Opening a person costs no quota read: limits load when their section is opened.
     expect(workflow.fetchIdentityQuota).not.toHaveBeenCalled();
@@ -424,7 +424,7 @@ describe("People & access journeys", () => {
     await userEvent.click(await screen.findByRole("tab", { name: "Usage & limits" }));
     const region = await screen.findByRole("region", { name: "Usage and limits for Jane Doe" });
     expect(await within(region).findByRole("alert")).toBeInTheDocument();
-    vi.mocked(workflow.fetchIdentityQuota).mockResolvedValue({ identity_id: "jane-id", tokens_per_day: 100, tokens_used_today: 0, container_tokens_per_day: null, storage_bytes: null, storage_bytes_used: 0, container_storage_bytes: null } as never);
+    vi.mocked(workflow.fetchIdentityQuota).mockResolvedValue({ identity_id: "jane-id", tokens_per_day: "100", tokens_used_today: "0", container_tokens_per_day: null, storage_bytes: null, storage_bytes_used: "0", container_storage_bytes: null, policy_state: "active", can_edit: true, container_tokens_used_today: "0", container_storage_bytes_used: "0" });
     await userEvent.click(within(region).getByRole("button", { name: "Retry" }));
     expect(await within(region).findByText(/Tokens per day: 100 \(0 used today/)).toBeInTheDocument();
   });

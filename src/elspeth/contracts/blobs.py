@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import ClassVar, Literal, Protocol, get_args
@@ -324,7 +325,7 @@ class IdentityStorageQuotaExceededError(BlobQuotaExceededError):
     """The identity's live blobs would exceed its cap or the container ceiling."""
 
     _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset(
-        {"session_id", "current_bytes", "limit_bytes", "identity_id", "cap", "ceiling", "usage", "additional_bytes"}
+        {"session_id", "current_bytes", "limit_bytes", "identity_id", "cap", "ceiling", "usage", "additional_bytes", "scope"}
     )
 
     def __init__(
@@ -336,14 +337,21 @@ class IdentityStorageQuotaExceededError(BlobQuotaExceededError):
         ceiling: int | None,
         usage: int,
         additional_bytes: int,
+        scope: Literal["identity", "container"] | None = None,
     ) -> None:
         bounds = [bound for bound in (cap, ceiling) if bound is not None]
         if not bounds:
             raise ValueError("IdentityStorageQuotaExceededError requires a cap or ceiling")
-        limit = min(bounds)
+        if scope is None:
+            # Legacy direct callers supplied one shared measure for both bounds.
+            scope = "container" if cap is None or (ceiling is not None and ceiling < cap) else "identity"
+        limit = cap if scope == "identity" else ceiling
+        if limit is None:
+            raise ValueError("Storage refusal scope requires its matching limit")
+        subject = f"Identity {identity_id}" if scope == "identity" else "Shared container"
         BlobError.__init__(
             self,
-            f"Identity {identity_id} blob storage ({usage} bytes) plus {additional_bytes} bytes would exceed its storage quota ({limit} bytes)",
+            f"{subject} blob storage ({usage} bytes) plus {additional_bytes} bytes would exceed its storage quota ({limit} bytes)",
         )
         self.session_id = session_id
         self.current_bytes = usage
@@ -353,6 +361,7 @@ class IdentityStorageQuotaExceededError(BlobQuotaExceededError):
         self.ceiling = ceiling
         self.usage = usage
         self.additional_bytes = additional_bytes
+        self.scope = scope
 
 
 class StorageAccountingUnavailableError(BlobError):
@@ -655,6 +664,12 @@ class BlobServiceProtocol(Protocol):
         cleanup while the operation still owns its staged child, allowing the
         caller to settle the final failure reason exactly once afterward.
         """
+        ...
+
+    def run_output_write_admission(
+        self, run_id: UUID, *, session_operation_context: SessionOperationContext
+    ) -> AbstractContextManager[None]:
+        """Bind every local output write to durable, pre-write capacity."""
         ...
 
     async def finalize_run_output_blobs(

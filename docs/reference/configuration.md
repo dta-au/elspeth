@@ -586,9 +586,34 @@ stating it can still break the glass.
 |-------|------|----------|---------|-------------|
 | `sso_admin_subjects` | JSON array of strings | No | `[]` | Provider `sub` claims that may seed the first `admin` role at first login, and **only** while the container has zero active human admins. The gate is a live count re-evaluated at every login, not a record that a bootstrap has happened, so the list **re-arms** if the container ever returns to zero active human admins. Delete it once the first administrator is activated. Entries are matched exactly and are not validated at load |
 | `quota_container_tokens_per_day` | int | No | - | Optional container-wide token ceiling, distinct from the per-identity default. Must be greater than 0. Configuring it turns the quota system on, so both `quota_default_*` settings are then required. Enforced for every chargeable LLM operation when configured |
-| `quota_container_storage_bytes` | int | No | - | Optional container-wide storage ceiling. Must be greater than 0. Configuring it turns the quota system on, so both `quota_default_*` settings are then required. Validated only; no runtime path reads it in this release |
+| `quota_container_storage_bytes` | int | No | - | Optional container-wide storage ceiling over aggregate retained and reserved bytes across identities. Must be greater than 0. Configuring it turns the quota system on, so both `quota_default_*` settings are then required. Provisioned before serving; independent of the container token ceiling |
 | `identity_dormancy_days` | int | No | `90` | Dormancy window for an activated identity (R9). A login by an `active` identity whose previous login is **older than** this many days drops it back to `pending` with `disable_reason='dormant'`, writes an `identity_disabled` audit row, and refuses the login at the admission gate; an administrator must re-activate it. A re-pend takes the identity's **admission**, not its roles, quota or org-tree edges — the same posture R3's rebound disable takes — so re-activating it restores the access it already held, whichever role the administrator picks (including `none`), and the `identity_activated` audit row names those retained roles in its metadata. Use `POST /api/auth/admin/roles/{role_id}/revoke` to remove one; activation is not a way to strip authority. Exactly this many days is still admitted. An identity that has never logged in (`last_login_at` is NULL — a pre-provisioned row) is not dormant, and becomes measurable from its second login. The **last active human administrator is exempt** (D34): they are not re-pended and their login proceeds, so a single-admin container cannot walk itself to zero administrators by being left alone; the exemption writes its own `auth_events` row (`identity_disabled` with `outcome='failure'` and `failure_category='dormancy_last_admin_exempt'`). Must be greater than 0 |
 | `identity_pending_retention_days` | int | No | `90` | Retention for a never-activated pending identity. `POST /api/auth/admin/identities/purge-pending` reads this configured value, deletes at most 200 rows strictly older than the database-time cutoff, and records the exact deleted identities in the authentication audit trail. The request cannot override the setting. Must be greater than 0 |
+
+Quota configuration accepts positive signed-64-bit integers through `2**63-1`.
+The quota administration API returns quantities as decimal strings so browsers
+do not round valid values; request bodies accept decimal strings across that
+range and legacy exact JSON integers through `2**53-1`. Consumers must adapt
+their response parsing. A revoked policy suspends new chargeable work rather
+than granting an unlimited allowance; existing durable policies remain editable
+even after their issuance defaults are removed.
+
+Storage usage includes retained run outputs and admitted output/stage reservations,
+as well as uploaded blobs, across the identity's sessions. The container ceiling
+uses the aggregate across identities. Archiving a session retains its run artifacts
+and does not reclaim that allowance. Deleting an unneeded uploaded blob through
+the file manager can free its own bytes; it does not delete generic run artifacts.
+Those artifacts currently have no user-facing purge action. Ask an administrator
+about raising the allowance or the deployment's supported retention procedures.
+Do not delete database rows or backing files by hand to alter quota accounting.
+
+Web execution refuses embedded storage that cannot obey these byte reservations:
+local SQLite `database` sinks, `chroma_sink` with `mode: persistent`, and persistent
+Chroma retrieval or collection probes. Existing Web graphs using those modes must
+change before they can run. Remote PostgreSQL sinks and Chroma `client` mode are
+unaffected by this storage restriction, subject to the existing plugin policy and
+security restrictions; this does not relax the Chroma security advisory. Standalone
+CLI plugin behavior is unchanged.
 
 Dormancy applies to both local and SSO identities. Administrator reactivation
 starts a fresh dormancy window: the later of the previous login and activation
@@ -2617,7 +2642,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 49
+### Landscape schema epoch 50
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -2699,15 +2724,21 @@ covering scheduler work. Epoch-47 stores must be recreated.
 Epoch 49 admits `pending_identities_purged` to the closed authentication audit
 event vocabulary. The explicit administrator purge records the configured
 retention window and the exact identities deleted in each bounded batch.
-Epoch-48 stores must be recreated.
+That historical boundary required a new schema.
+Epoch 50 adds durable provider-attempt identity to run-call evidence so quota
+settlement can recover without an in-memory attempt/call mapping. It also retains
+nullable `calls.returned_model` independently of response payload retention.
+Exported row-call and operation-call records include an additive nullable
+`returned_model` field; consumers enforcing a closed export shape must admit it.
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-49, either automatically at startup or through an operator migration command.
-Stop and uninstall the old deployment, archive or export evidence when policy
-requires it, delete/recreate the Landscape database, then reinstall and
-initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
-remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-49 database.
+50, either automatically at startup or through an operator migration command.
+Preserve incompatible stores and their compatible prior application access;
+this candidate refuses them before incompatible writes. Provision an explicitly
+new, object-free target for a fresh installation. This grants no authority to
+delete, recreate, restamp or downgrade existing stores. PostgreSQL schema-owner
+and runtime/DML roles remain separate. Code that understands only an older epoch
+must not be rolled back over an epoch-50 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

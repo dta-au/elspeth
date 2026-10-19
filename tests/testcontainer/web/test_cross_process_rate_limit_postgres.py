@@ -14,7 +14,7 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine, func, select, update
 from tests.helpers.postgres_target import postgres_test_target
 
-from elspeth.web.coordination.rate_limit_authority import RepositoryRateLimitAuthority
+from elspeth.web.coordination.rate_limit_authority import RateLimitPolicyMismatchError, RepositoryRateLimitAuthority
 from elspeth.web.middleware.rate_limit import SharedRateLimiter
 from elspeth.web.sessions.models import rate_limit_buckets_table, rate_limit_events_table
 
@@ -104,6 +104,20 @@ def test_scopes_privacy_expiration_and_retry(rate_url: str) -> None:
             now = conn.execute(select(func.clock_timestamp())).scalar_one()
             conn.execute(update(rate_limit_events_table).values(expires_at=now - timedelta(seconds=1)))
         assert authority.admit(scope="composer", subject=subject, limit=1).allowed
+    finally:
+        engine.dispose()
+
+
+def test_replicas_cannot_change_an_active_bucket_policy(rate_url: str) -> None:
+    engine = create_engine(rate_url)
+    try:
+        authority = RepositoryRateLimitAuthority(engine, signing_key=_KEY)
+        subject = str(uuid4())
+        assert authority.admit(scope="auth", subject=subject, limit=1).allowed
+        for limit, window in [(5, 60), (1, 120)]:
+            with pytest.raises(RateLimitPolicyMismatchError):
+                authority.admit(scope="auth", subject=subject, limit=limit, window_seconds=window)
+        assert not authority.admit(scope="auth", subject=subject, limit=1).allowed
     finally:
         engine.dispose()
 
@@ -201,7 +215,7 @@ def test_cleanup_is_bounded_and_cascades_only_expired_buckets(rate_url: str) -> 
                 digest = hashlib.sha256(str(index).encode()).hexdigest()
                 conn.execute(
                     insert(rate_limit_buckets_table).values(
-                        subject_digest=digest, window_seconds=60, updated_at=expired, expires_at=expired
+                        subject_digest=digest, window_seconds=60, request_limit=1, updated_at=expired, expires_at=expired
                     )
                 )
                 conn.execute(

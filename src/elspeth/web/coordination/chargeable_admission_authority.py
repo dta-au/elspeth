@@ -85,7 +85,8 @@ class RepositoryChargeableAdmissionAuthority:
             )
         policies = RepositoryQuotaAuthority.active_policy(connection_token, identity_id=session.user_id)
         identity_policy = policies.identity
-        container_policy = policies.container
+        # A container policy can constrain storage without constraining tokens.
+        container_policy = policies.container if policies.container is not None and policies.container.tokens_per_day is not None else None
         # An administrator may explicitly revoke an identity's allowance.
         # A container-only regime still admits identities that were never
         # issued a person policy; historical revocation is the distinguishing
@@ -155,7 +156,10 @@ class RepositoryChargeableAdmissionAuthority:
         ceiling = container_policy.tokens_per_day if container_policy is not None else None
         identity_exceeded = identity_policy is not None and identity_usage is not None and identity_usage >= identity_policy.tokens_per_day
         container_exceeded = (
-            container_policy is not None and container_usage is not None and container_usage >= container_policy.tokens_per_day
+            container_policy is not None
+            and container_policy.tokens_per_day is not None
+            and container_usage is not None
+            and container_usage >= container_policy.tokens_per_day
         )
         exceeded = identity_exceeded or container_exceeded
         if identity_exceeded:
@@ -163,7 +167,9 @@ class RepositoryChargeableAdmissionAuthority:
         elif container_exceeded:
             usage = container_usage
         elif identity_policy is not None and (
-            container_policy is None or identity_policy.tokens_per_day <= container_policy.tokens_per_day
+            container_policy is None
+            or container_policy.tokens_per_day is None
+            or identity_policy.tokens_per_day <= container_policy.tokens_per_day
         ):
             usage = identity_usage
         else:

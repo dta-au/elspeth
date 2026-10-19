@@ -5192,7 +5192,7 @@ async def test_planner_physical_helper_refuses_missing_custody_even_with_live_fe
         with engine.connect() as connection:
             before = [dict(row) for row in connection.execute(select(chat_messages_table)).mappings()]
         with fenced_operation_context(engine, origin.session_id) as context, patch.object(litellm, "acompletion", new=completion):
-            with pytest.raises(AuditIntegrityError, match="exact mount and fenced invocation custody"):
+            with pytest.raises(AuditIntegrityError, match="Physical provider requires exact explicit custody"):
                 await pipeline_planner._litellm_acompletion(
                     prompt_guard_mount=None,
                     prompt_guard_mode=mode,

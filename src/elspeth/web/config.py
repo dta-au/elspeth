@@ -9,13 +9,24 @@ import types
 import typing
 from collections.abc import Mapping
 from decimal import Decimal
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, SecretBytes, SecretStr, ValidationError, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretBytes,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
@@ -100,6 +111,33 @@ DeploymentTarget = Literal[
     "kubernetes",
 ]
 DeploymentStateMode = Literal["auto", "sqlite-single", "external-postgresql"]
+
+
+def validate_trusted_proxy_hosts(hosts: tuple[str, ...]) -> tuple[str, ...]:
+    """Admit explicit numeric forwarding peers without Uvicorn's wildcard form."""
+    normalized: list[str] = []
+    for host in hosts:
+        if host != host.strip() or "%" in host:
+            raise ValueError("trusted_proxy_hosts entries must be numeric IP addresses or strict CIDR networks")
+        try:
+            network = ip_network(host, strict=True)
+        except ValueError:
+            raise ValueError("trusted_proxy_hosts entries must be numeric IP addresses or strict CIDR networks") from None
+        if network.prefixlen == 0 or network.network_address.is_multicast or network.network_address.is_unspecified:
+            raise ValueError("trusted_proxy_hosts must not include wildcard, unspecified, or multicast peers")
+        normalized.append(str(network) if "/" in host else str(network.network_address))
+    return tuple(normalized)
+
+
+def trusted_proxy_hosts_from_env() -> tuple[str, ...]:
+    """Read the server transport setting before the application factory runs.
+
+    The CLI must configure Uvicorn itself; loading all application settings here
+    would duplicate the factory's startup validation and secret loading.
+    """
+    raw = os.environ.get("ELSPETH_WEB__TRUSTED_PROXY_HOSTS", "[]")
+    hosts = TypeAdapter(tuple[str, ...]).validate_json(raw)
+    return validate_trusted_proxy_hosts(hosts)
 
 
 def _allow_insecure_test_keys(host: str) -> bool:
@@ -194,6 +232,9 @@ class WebSettings(BaseModel):
 
     host: str = "127.0.0.1"
     port: int = Field(default=8451, ge=1, le=65535)
+    # No forwarding headers are trusted until the operator names the actual
+    # connecting proxy peers. This also overrides Uvicorn's ambient defaults.
+    trusted_proxy_hosts: tuple[str, ...] = ()
     auth_provider: AuthProviderType = "local"
     # ``default`` preserves current behavior; deployment-specific state rules
     # are resolved by web/deployment_contract.py.
@@ -765,6 +806,11 @@ class WebSettings(BaseModel):
         if not v.strip():
             raise ValueError("must not be blank (omit the field or set to a non-empty value)")
         return v
+
+    @field_validator("trusted_proxy_hosts")
+    @classmethod
+    def _validate_trusted_proxy_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return validate_trusted_proxy_hosts(value)
 
     @field_validator("compartment_id")
     @classmethod
@@ -1479,6 +1525,7 @@ def resolve_session_db_url(*, data_dir: Path, session_db_url: str | None) -> str
 _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
     {
         "cors_origins",
+        "trusted_proxy_hosts",
         "server_secret_allowlist",
         # Both arrive from the ECS task definition as JSON, so they decode the
         # same way every other collection setting does.

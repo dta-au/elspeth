@@ -46,7 +46,7 @@ describe("PeopleAccessDialog", () => {
     vi.mocked(people.fetchPersonLabels).mockResolvedValue([]);
     vi.mocked(admin.listRoles).mockResolvedValue({ roles: [roleView()], limit: 50, offset: 0 });
     vi.mocked(admin.listRelationships).mockResolvedValue({ relationships: [], limit: 50, offset: 0 });
-    vi.mocked(workflow.fetchIdentityQuota).mockResolvedValue({ identity_id: "jane-id", tokens_per_day: 1000, tokens_used_today: 10, container_tokens_per_day: 5000, storage_bytes: null, storage_bytes_used: 0, container_storage_bytes: null } as never);
+    vi.mocked(workflow.fetchIdentityQuota).mockResolvedValue({ identity_id: "jane-id", tokens_per_day: "1000", tokens_used_today: "10", container_tokens_per_day: "5000", storage_bytes: null, storage_bytes_used: "0", container_storage_bytes: null, policy_state: "active", can_edit: true, container_tokens_used_today: "10", container_storage_bytes_used: "0" });
   });
 
   function open(): ReturnType<typeof render> {

@@ -119,7 +119,15 @@ def _validate_row(row: RowMapping, *, session_id: str, operation_id: str) -> Non
             or row["result_state_id"] is not None
             or row["result_session_id"] is not None
             or row["failure_code"]
-            not in ("stale_conflict", "integrity_error", "custody_error", "quota_exceeded", "operation_failed", "request_cancelled")
+            not in (
+                "stale_conflict",
+                "integrity_error",
+                "custody_error",
+                "quota_exceeded",
+                "storage_accounting_unavailable",
+                "operation_failed",
+                "request_cancelled",
+            )
             or type(row["failure_diagnostics"]) not in (list, type(None))
         ):
             raise AuditIntegrityError("Tier 1: operation receipt failed bundle is invalid")
@@ -459,6 +467,7 @@ def settle_operation_receipt(
             "integrity_error",
             "custody_error",
             "quota_exceeded",
+            "storage_accounting_unavailable",
             "operation_failed",
             "request_cancelled",
         ):

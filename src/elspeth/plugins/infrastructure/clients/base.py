@@ -176,6 +176,11 @@ class AuditedClientBase:
         forwards it here. ``None`` for non-LLM calls and for LLM transforms
         that never went through an interpretation surface.
         """
+        created_at = (
+            self._llm_call_governance.timestamp_for_outcome(llm_call_attempt)
+            if call_type is CallType.LLM and self._llm_call_governance is not None and source_call_id is None
+            else None
+        )
         if self._operation_id is not None:
             call = self._execution.record_operation_call(
                 coordination_token=self._require_coordination_token(),
@@ -190,6 +195,8 @@ class AuditedClientBase:
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=token_usage,
                 source_call_id=source_call_id,
+                call_id=llm_call_attempt if source_call_id is None and call_type is CallType.LLM else None,
+                created_at=created_at,
             )
             if call_type is CallType.LLM and self._llm_call_governance is not None and source_call_id is None:
                 if llm_call_attempt is None:
@@ -212,6 +219,8 @@ class AuditedClientBase:
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
             source_call_id=source_call_id,
+            call_id=llm_call_attempt if source_call_id is None and call_type is CallType.LLM else None,
+            created_at=created_at,
         )
         if call_type is CallType.LLM and self._llm_call_governance is not None and source_call_id is None:
             if llm_call_attempt is None:

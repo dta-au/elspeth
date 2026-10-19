@@ -34,6 +34,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from typing import Any, Literal, final
 
@@ -56,6 +57,7 @@ from elspeth.web.coordination.mutation_connection_registry import (
 from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
+    output_storage_reservations_table,
     quota_policies_table,
     quota_provider_attempts_table,
     runs_table,
@@ -109,7 +111,7 @@ class QuotaPolicyRow:
 @dataclass(frozen=True, slots=True)
 class ContainerQuotaPolicyRow:
     policy_id: str
-    tokens_per_day: int
+    tokens_per_day: int | None
     storage_bytes: int | None
 
 
@@ -136,6 +138,8 @@ class QuotaExceeded:
     usage: int
     identity_policy_id: str | None
     container_policy_id: str | None
+    scope: Literal["identity", "container"] | None = None
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +222,8 @@ def settle_provider_attempt_on_connection(connection: Connection, *, session_id:
             or attempt.ledger_entry_id != entry_id
             or previous.identity_id != attempt.identity_id
             or previous.session_id != session_id
+            or previous.source != attempt.source
+            or previous.run_id != attempt.run_id
             or previous.prompt_tokens != entry.prompt_tokens
             or previous.completion_tokens != entry.completion_tokens
             or previous.cached_prompt_tokens != entry.cached_prompt_tokens
@@ -574,6 +580,8 @@ def record_token_usage_on_connection(
             if (
                 previous.identity_id != owner.user_id
                 or previous.session_id != session_id
+                or previous.source != source
+                or previous.run_id != run_id
                 or previous.model != entry.model
                 or previous.prompt_tokens != entry.prompt_tokens
                 or previous.completion_tokens != entry.completion_tokens
@@ -702,6 +710,76 @@ def refuse_unrecorded_quota_exceeded(outcome: QuotaExceeded) -> None:
     raise AuditIntegrityError(f"quota_exceeded refusal for identity {outcome.identity_id} has no auth audit writer wired")
 
 
+def _storage_aggregate_integer(value: object) -> int:
+    """Normalize the supported database aggregate representations exactly.
+
+    PostgreSQL returns NUMERIC for SUM(BIGINT), whereas SQLite returns an
+    integer. Admit only finite integral Decimal values, retaining arbitrary
+    precision rather than truncating or overflowing a large aggregate.
+    """
+    if type(value) is Decimal:
+        if not value.is_finite() or value != value.to_integral_value():
+            raise AuditIntegrityError("Tier 1: storage totals must be non-negative exact integers")
+        value = int(value)
+    if type(value) is not int or value < 0:
+        raise AuditIntegrityError("Tier 1: storage totals must be non-negative exact integers")
+    return value
+
+
+def storage_bytes_used_on_connection(connection: Connection, *, identity_id: str | None) -> int:
+    """Measure retained blobs and admitted output bytes from the same snapshot.
+
+    A reservation already represented by a blob contributes only excess bytes.
+    Pending output reservations are real admitted storage even before a file
+    becomes a published run output, and must remain charged after a crash.
+    """
+    blob_query = select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).select_from(
+        blobs_table.join(sessions_table, sessions_table.c.id == blobs_table.c.session_id)
+    )
+    reservation = output_storage_reservations_table.c
+    blob_coverage = (
+        select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0))
+        .where(blobs_table.c.storage_path == reservation.target_path)
+        .correlate(output_storage_reservations_table)
+        .scalar_subquery()
+    )
+    reservation_excess = case((reservation.size_bytes > blob_coverage, reservation.size_bytes - blob_coverage), else_=0)
+    reservation_query = select(func.coalesce(func.sum(reservation_excess), 0)).select_from(
+        output_storage_reservations_table.join(sessions_table, sessions_table.c.id == reservation.session_id)
+    )
+    if identity_id is not None:
+        blob_query = blob_query.where(sessions_table.c.user_id == identity_id)
+        reservation_query = reservation_query.where(sessions_table.c.user_id == identity_id)
+    blob_bytes = _storage_aggregate_integer(connection.execute(blob_query).scalar_one())
+    reserved_bytes = _storage_aggregate_integer(connection.execute(reservation_query).scalar_one())
+    return blob_bytes + reserved_bytes
+
+
+def session_storage_bytes_on_connection(connection: Connection, *, session_id: str) -> int:
+    """Include admitted sink output storage in the per-session bound."""
+    reservation = output_storage_reservations_table.c
+    blob_coverage = (
+        select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0))
+        .where(blobs_table.c.storage_path == reservation.target_path)
+        .correlate(output_storage_reservations_table)
+        .scalar_subquery()
+    )
+    reservation_excess = case((reservation.size_bytes > blob_coverage, reservation.size_bytes - blob_coverage), else_=0)
+    blob_bytes = _storage_aggregate_integer(
+        connection.execute(
+            select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == session_id)
+        ).scalar_one()
+    )
+    reserved_bytes = _storage_aggregate_integer(
+        connection.execute(
+            select(func.coalesce(func.sum(reservation_excess), 0)).where(
+                reservation.session_id == session_id,
+            )
+        ).scalar_one()
+    )
+    return blob_bytes + reserved_bytes
+
+
 def _active_policy_rows(connection: Connection, *, identity_id: str, for_update: bool) -> ActiveQuotaPolicies:
     policy = quota_policies_table.c
     identity_query = select(policy.policy_id, policy.tokens_per_day, policy.storage_bytes).where(
@@ -735,7 +813,11 @@ def admit_storage_bytes_on_connection(
     operation: StorageAdmissionOperation,
     record: Callable[[QuotaExceeded], None],
 ) -> StorageAdmission:
-    """Admit net growth against live identity and container storage, without a policy lock."""
+    """Admit growth against personal and aggregate container bytes.
+
+    The policy locks remain held until the caller commits its reservation.
+    Every byte-producing path must reserve its growth in that transaction.
+    """
     if operation not in _STORAGE_ADMISSION_OPERATIONS:
         raise ValueError(f"Invalid storage admission operation {operation!r}")
     if type(additional_bytes) is not int:
@@ -750,7 +832,7 @@ def admit_storage_bytes_on_connection(
             raise AuditIntegrityError("Storage admission names a session that does not exist")
         if additional_bytes <= 0:
             return StorageAdmission(identity_id=owner.user_id, additional_bytes=additional_bytes, usage=None, cap=None, ceiling=None)
-        policies = _active_policy_rows(connection, identity_id=owner.user_id, for_update=False)
+        policies = _active_policy_rows(connection, identity_id=owner.user_id, for_update=True)
         if policies.identity is None:
             # An explicitly revoked identity allowance suspends byte growth.
             # A never-issued identity can still use a container-only regime.
@@ -763,19 +845,27 @@ def admit_storage_bytes_on_connection(
                 raise StorageAccountingUnavailableError(session_id)
         if policies.identity is None and (policies.container is None or policies.container.storage_bytes is None):
             return StorageAdmission(identity_id=owner.user_id, additional_bytes=additional_bytes, usage=None, cap=None, ceiling=None)
-        usage = connection.execute(
-            select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0))
-            .select_from(blobs_table.join(sessions_table, sessions_table.c.id == blobs_table.c.session_id))
-            .where(sessions_table.c.user_id == owner.user_id)
-        ).scalar_one()
+        usage = storage_bytes_used_on_connection(connection, identity_id=owner.user_id)
+        container_usage = (
+            storage_bytes_used_on_connection(connection, identity_id=None)
+            if policies.container is not None and policies.container.storage_bytes is not None
+            else None
+        )
     except SQLAlchemyError as exc:
         raise StorageAccountingUnavailableError(session_id) from exc
     if type(usage) is not int:
         raise AuditIntegrityError(f"Tier 1: identity storage total must be an exact integer, got {type(usage).__name__}")
     cap = policies.identity.storage_bytes if policies.identity is not None else None
     ceiling = policies.container.storage_bytes if policies.container is not None else None
-    limit = min(bound for bound in (cap, ceiling) if bound is not None)
-    if usage + additional_bytes > limit:
+    if container_usage is not None and type(container_usage) is not int:
+        raise AuditIntegrityError("Tier 1: container storage total must be an exact integer")
+    personal_exceeded = cap is not None and usage + additional_bytes > cap
+    container_exceeded = ceiling is not None and container_usage is not None and container_usage + additional_bytes > ceiling
+    if container_exceeded and not personal_exceeded and container_usage is not None:
+        usage = container_usage
+    if personal_exceeded or container_exceeded:
+        scope: Literal["identity", "container"] = "identity" if personal_exceeded else "container"
+        limit = cap if personal_exceeded else ceiling
         record(
             QuotaExceeded(
                 identity_id=owner.user_id,
@@ -787,6 +877,8 @@ def admit_storage_bytes_on_connection(
                 usage=usage,
                 identity_policy_id=policies.identity.policy_id if policies.identity is not None else None,
                 container_policy_id=policies.container.policy_id if policies.container is not None else None,
+                scope=scope,
+                limit=limit,
             )
         )
         raise IdentityStorageQuotaExceededError(
@@ -796,5 +888,6 @@ def admit_storage_bytes_on_connection(
             ceiling=ceiling,
             usage=usage,
             additional_bytes=additional_bytes,
+            scope=scope,
         )
     return StorageAdmission(identity_id=owner.user_id, additional_bytes=additional_bytes, usage=usage, cap=cap, ceiling=ceiling)

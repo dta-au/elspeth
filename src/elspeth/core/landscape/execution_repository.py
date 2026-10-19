@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, overload
@@ -625,6 +626,8 @@ class ExecutionRepository:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         """Record an external call for a node state."""
         return self.calls.record_call(
@@ -643,6 +646,8 @@ class ExecutionRepository:
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
             source_call_id=source_call_id,
+            call_id=call_id,
+            created_at=created_at,
         )
 
     # === Operations (Source/Sink I/O) ===
@@ -706,6 +711,8 @@ class ExecutionRepository:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         """Record an external call made during an operation."""
         return self.calls.record_operation_call(
@@ -723,6 +730,8 @@ class ExecutionRepository:
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
             source_call_id=source_call_id,
+            call_id=call_id,
+            created_at=created_at,
         )
 
     def record_verification_decision(

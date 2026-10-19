@@ -1729,31 +1729,34 @@ class AuthAuditRecorder:
                 )
 
     def record_container_quota_set(self, *, provider: AuthProviderType, policy: ContainerQuotaPolicyRow) -> None:
-        """Record a configured token ceiling without inventing a granting identity."""
+        """Record configured dimensions without inventing absent ceilings."""
         with self._open_landscape(AuthAuditOperation.QUOTA_SET) as db:
-            self._auth_audit(db).record_auth_event(
-                event_type="quota_set",
-                outcome="success",
-                provider=provider,
-                identity_id=None,
-                user_id=None,
-                username=None,
-                failure_category=None,
-                request_id=None,
-                client_host=None,
-                user_agent=None,
-                metadata={
-                    "actor": "config",
-                    "source": "config",
-                    "scope": "container",
-                    "action": "set",
-                    "dimension": "tokens",
-                    "cap": policy.tokens_per_day,
-                    "tokens_per_day": policy.tokens_per_day,
-                    "storage_bytes": policy.storage_bytes,
-                    "policy_id": policy.policy_id,
-                },
-            )
+            for dimension, cap in (("tokens", policy.tokens_per_day), ("storage", policy.storage_bytes)):
+                if cap is None:
+                    continue
+                self._auth_audit(db).record_auth_event(
+                    event_type="quota_set",
+                    outcome="success",
+                    provider=provider,
+                    identity_id=None,
+                    user_id=None,
+                    username=None,
+                    failure_category=None,
+                    request_id=None,
+                    client_host=None,
+                    user_agent=None,
+                    metadata={
+                        "actor": "config",
+                        "source": "config",
+                        "scope": "container",
+                        "action": "set",
+                        "dimension": dimension,
+                        "cap": cap,
+                        "tokens_per_day": policy.tokens_per_day,
+                        "storage_bytes": policy.storage_bytes,
+                        "policy_id": policy.policy_id,
+                    },
+                )
 
     def record_quota_exceeded(self, outcome: QuotaExceeded) -> None:
         """Write the ``quota_exceeded`` row: dimension, cap, ceiling in force and measured usage (spec :834).
@@ -1778,6 +1781,7 @@ class AuthAuditRecorder:
                 metadata={
                     "actor": "system",
                     "operation": outcome.operation,
+                    **({"scope": outcome.scope, "limit": outcome.limit} if outcome.scope is not None else {}),
                     "dimension": outcome.dimension,
                     "cap": outcome.cap,
                     "ceiling": outcome.ceiling,

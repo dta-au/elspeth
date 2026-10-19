@@ -1,4 +1,4 @@
-"""Combined epoch-77 admission preserves/refuses its distinct predecessors.
+"""Epoch-78 admission preserves/refuses its distinct predecessors.
 
 Fixtures are isolated synthetic stores. Historical epochs emulate declared
 reader identities; they do not execute old binaries or establish conversion.
@@ -19,7 +19,14 @@ from sqlalchemy.schema import Table
 
 from elspeth.web.sessions import schema
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH, identities_table, quota_policies_table
+from elspeth.web.sessions.models import (
+    SESSION_SCHEMA_EPOCH,
+    identities_table,
+    metadata,
+    quota_policies_table,
+    quota_provider_attempts_table,
+    token_usage_ledger_table,
+)
 from tests.fixtures.identities import ensure_test_identity
 
 Shape = Literal[
@@ -171,15 +178,15 @@ def _assert_live_wal_preserved(path: Path, before: Snapshot, after: Snapshot) ->
 
 @pytest.mark.parametrize(
     ("epoch", "shape"),
-    [(75, "predecessor"), (76, "predecessor"), (76, "current")],
-    ids=["main75", "graph-review76", "quota-only76"],
+    [(75, "predecessor"), (76, "predecessor"), (76, "current"), (77, "current")],
+    ids=["main75", "graph-review76", "quota-only76", "integrated77"],
 )
 @pytest.mark.parametrize("identity_only", [False, True], ids=["sqlite-header", "identity-row"])
 @pytest.mark.parametrize("entry", ["factory", "initializer", "probe"])
-def test_epoch77_refuses_both_predecessor_contracts_without_any_store_change(
+def test_current_epoch_refuses_predecessor_contracts_without_any_store_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, epoch: int, shape: Shape, identity_only: bool, entry: str
 ) -> None:
-    assert SESSION_SCHEMA_EPOCH == schema._COORDINATION_HARD_CUT_EPOCH == 77
+    assert SESSION_SCHEMA_EPOCH == schema._COORDINATION_HARD_CUT_EPOCH == 78
     path = tmp_path / "predecessor.db"
     _source_store(path, epoch=epoch, shape=shape, identity_only=identity_only, monkeypatch=monkeypatch)
     before = _snapshot(path)
@@ -206,20 +213,20 @@ def test_epoch77_refuses_both_predecessor_contracts_without_any_store_change(
     "shape",
     ["storage_nullable", "identity_storage_check", "slot_nullable", "slot_default", "slot_check", "singleton_key", "singleton_predicate"],
 )
-def test_epoch77_matching_identity_refuses_wrong_quota_shape_and_preserves_rows(
+def test_current_epoch_matching_identity_refuses_wrong_quota_shape_and_preserves_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: Shape
 ) -> None:
     path = tmp_path / "wrong-shape.db"
-    _source_store(path, epoch=77, shape=shape, identity_only=False, monkeypatch=monkeypatch)
+    _source_store(path, epoch=SESSION_SCHEMA_EPOCH, shape=shape, identity_only=False, monkeypatch=monkeypatch)
     before = _snapshot(path)
     with pytest.raises(schema.SessionSchemaError, match="Preserve this store unchanged"):
         create_session_engine(f"sqlite:///{path}")
     assert _snapshot(path) == before
 
 
-def test_epoch77_exact_quota_shape_and_numeric_history_remain_admitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_current_epoch_exact_quota_shape_and_numeric_history_remain_admitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "current.db"
-    _source_store(path, epoch=77, shape="current", identity_only=False, monkeypatch=monkeypatch, journal_mode="wal")
+    _source_store(path, epoch=SESSION_SCHEMA_EPOCH, shape="current", identity_only=False, monkeypatch=monkeypatch, journal_mode="wal")
     before = _snapshot(path)
     engine = create_session_engine(f"sqlite:///{path}")
     try:
@@ -233,6 +240,44 @@ def test_epoch77_exact_quota_shape_and_numeric_history_remain_admitted(tmp_path:
     assert isinstance(
         next(c for c in quota_policies_table.constraints if c.name == "ck_quota_policies_identity_storage_required"), CheckConstraint
     )
+
+
+@pytest.mark.parametrize(
+    ("table_name", "constraint_name"),
+    [
+        ("token_usage_ledger", "ck_token_usage_ledger_prompt_nonnegative"),
+        ("token_usage_ledger", "ck_token_usage_ledger_run"),
+        ("token_usage_ledger", "uq_token_usage_ledger_custody"),
+        ("quota_provider_attempts", "fk_quota_provider_attempts_ledger_custody"),
+        ("quota_provider_attempts", "fk_quota_provider_attempts_ledger_run"),
+        ("quota_provider_attempts", "uq_quota_provider_attempts_ledger_entry"),
+    ],
+)
+def test_current_epoch_refuses_missing_quota_integrity_constraints_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, table_name: str, constraint_name: str
+) -> None:
+    path = tmp_path / "missing-integrity.db"
+    _source_store(path, epoch=SESSION_SCHEMA_EPOCH, shape="current", identity_only=False, monkeypatch=monkeypatch)
+    replacement = MetaData()
+    for table in metadata.tables.values():
+        table.to_metadata(replacement)
+    changed = replacement.tables[table_name]
+    changed.constraints.remove(next(constraint for constraint in changed.constraints if constraint.name == constraint_name))
+    engine = create_session_engine(f"sqlite:///{path}")
+    with engine.begin() as conn:
+        quota_provider_attempts_table.drop(conn)
+        token_usage_ledger_table.drop(conn)
+        replacement.tables["token_usage_ledger"].create(conn)
+        replacement.tables["quota_provider_attempts"].create(conn)
+    engine.dispose()
+    # The intentional mutation used the ordinary WAL writer. Return this
+    # synthetic fixture to static mode before measuring refusal preservation.
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
+    before = _snapshot(path)
+    with pytest.raises(schema.SessionSchemaError, match="Preserve this store unchanged"):
+        create_session_engine(f"sqlite:///{path}")
+    assert _snapshot(path) == before
 
 
 @pytest.mark.parametrize(("epoch", "shape"), [(75, "predecessor"), (77, "identity_storage_check")])
@@ -254,7 +299,7 @@ def test_factory_refusal_observes_committed_wal_facts_and_preserves_live_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, fault: str
 ) -> None:
     path = tmp_path / "live-wal.db"
-    _source_store(path, epoch=77, shape="current", identity_only=False, monkeypatch=monkeypatch, journal_mode="wal")
+    _source_store(path, epoch=SESSION_SCHEMA_EPOCH, shape="current", identity_only=False, monkeypatch=monkeypatch, journal_mode="wal")
     writer_engine = create_session_engine(f"sqlite:///{path}")
     try:
         assert schema.probe_current_schema(writer_engine) is True

@@ -57,7 +57,9 @@ def test_epoch_is_forty_seven() -> None:
     # Epoch 48 gives source quarantine a durable PENDING_SINK handoff, deletes
     # source-row replay, and admits the resume_refused coordination event.
     # Epoch 49 adds the pending-identity purge event to the closed auth trail.
-    assert SQLITE_SCHEMA_EPOCH == 49
+    # Epoch 50 retains provider-returned model attribution with call outcomes.
+    assert SQLITE_SCHEMA_EPOCH == 50
+    assert ("calls", "returned_model") in set(_REQUIRED_COLUMNS)
     assert ("rows", "source_contract_json") in set(_REQUIRED_COLUMNS)
     assert ("node_states", "ix_node_states_run") in set(_REQUIRED_INDEXES)
     index = next(index for index in call_verifications_table.indexes if index.name == "ix_call_verifications_run")

@@ -120,3 +120,23 @@ def test_identity_storage_remains_mandatory(engine: Engine) -> None:
                 policy_id="identity", identity_id="alice", tokens_per_day=500, storage_bytes=None, set_by_actor="system", set_at=NOW
             )
         )
+
+
+@pytest.mark.parametrize("tokens", [None, 500])
+def test_configured_storage_is_provisioned_without_inventing_token_bound(engine: Engine, tokens: int | None) -> None:
+    recorded = []
+    authority = RepositoryQuotaPolicyAuthority(engine)
+    first = authority.ensure_container_token_policy(tokens_per_day=tokens, storage_bytes=8192, record=recorded.append)
+    second = authority.ensure_container_token_policy(tokens_per_day=tokens, storage_bytes=8192, record=recorded.append)
+    assert first is not None and first == second
+    assert (first.tokens_per_day, first.storage_bytes) == (tokens, 8192)
+    assert recorded == [first]
+
+
+def test_configured_storage_drift_preserves_existing_row(engine: Engine) -> None:
+    _seed(engine)
+    authority = RepositoryQuotaPolicyAuthority(engine)
+    with pytest.raises(QuotaPolicyRefusal, match="storage cap conflicts"):
+        authority.ensure_container_token_policy(tokens_per_day=500, storage_bytes=801, record=lambda _policy: None)
+    with engine.connect() as conn:
+        assert conn.execute(select(quota_policies_table.c.storage_bytes)).scalar_one() == 800

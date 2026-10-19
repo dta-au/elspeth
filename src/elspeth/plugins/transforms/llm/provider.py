@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol, TypedDict, runtime_checkable
 
@@ -164,6 +165,8 @@ class LLMAuditParent:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         call_mode_session: CallModeSession | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         """Record a semantic call under this validated parent."""
         source_call_id: str | None = None
@@ -204,6 +207,8 @@ class LLMAuditParent:
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=token_usage,
                 source_call_id=source_call_id,
+                call_id=call_id,
+                created_at=created_at,
             )
         else:
             if self.state_id is None:
@@ -222,6 +227,8 @@ class LLMAuditParent:
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=token_usage,
                 source_call_id=source_call_id,
+                call_id=call_id,
+                created_at=created_at,
             )
         if call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
             call_mode_session.verify_call(

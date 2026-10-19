@@ -44,6 +44,7 @@ from elspeth.web.composer.provider_quota import (
     ProviderInvocationFamily,
     composer_quota_scope,
     provider_call_scope,
+    quota_provider_calls,
 )
 from elspeth.web.coordination import chargeable_admission_authority, quota_authority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -312,12 +313,17 @@ async def test_second_planning_call_503_settles_before_quota_refuses_retry(
     assert recorder.llm_calls[1].error_class == "ServiceUnavailableError"
     assert secret not in repr(recorder.llm_calls)
     with engine.connect() as connection:
-        attempts = connection.execute(select(quota_provider_attempts_table).order_by(quota_provider_attempts_table.c.started_at)).all()
-        usage = connection.execute(select(token_usage_ledger_table).order_by(token_usage_ledger_table.c.recorded_at)).all()
+        attempts = connection.execute(select(quota_provider_attempts_table)).all()
+        usage = connection.execute(select(token_usage_ledger_table)).all()
     assert len(attempts) == len(usage) == 2
     assert all(attempt.settled_at is not None for attempt in attempts)
-    assert [call.call_id for call in recorder.llm_calls] == [attempt.attempt_id for attempt in attempts]
-    assert usage[1].prompt_tokens is None and usage[1].completion_tokens is None
+    assert {call.call_id for call in recorder.llm_calls} == {attempt.attempt_id for attempt in attempts}
+    attempts_by_id = {attempt.attempt_id: attempt for attempt in attempts}
+    usage_by_id = {entry.entry_id: entry for entry in usage}
+    success_usage = usage_by_id[attempts_by_id[recorder.llm_calls[0].call_id].ledger_entry_id]
+    failure_usage = usage_by_id[attempts_by_id[recorder.llm_calls[1].call_id].ledger_entry_id]
+    assert (success_usage.prompt_tokens, success_usage.completion_tokens) == (10, 5)
+    assert failure_usage.prompt_tokens is None and failure_usage.completion_tokens is None
 
     # The settled unknown usage remains authoritative for a fresh operation.
     async with await _lease(service, session.id) as fresh:
@@ -569,6 +575,146 @@ async def test_utc_midnight_reopens_daily_allowance_without_retiming_old_usage(q
     assert usage[0].recorded_at.replace(tzinfo=UTC) == before_midnight
     assert usage[1].recorded_at.replace(tzinfo=UTC) == before_midnight + timedelta(seconds=1)
     assert dispatches == ["sent", "sent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replica_skew", [timedelta(days=-1), timedelta(days=1)])
+async def test_provider_chronology_uses_database_origin_and_monotonic_duration(
+    quota_service, monkeypatch: pytest.MonkeyPatch, replica_skew: timedelta
+) -> None:
+    """A skewed replica neither strands spent work nor moves it to another UTC day."""
+    engine, service, _ = quota_service
+    session = await service.create_session(user_id="alice", title="Clock domains", auth_provider_type="local")
+    database_start = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+    monkeypatch.setattr(quota_authority, "database_now", lambda _: database_start)
+    dispatches: list[str] = []
+
+    async def provider(**kwargs: Any) -> None:
+        dispatches.append("sent")
+
+    monkeypatch.setattr("litellm.acompletion", provider)
+    async with await _lease(service, session.id) as lease:
+        with guarded_quota_turn(engine, service, lease.context) as turn:
+            custody = turn.owner.mint(ProviderInvocationFamily.PRIMARY)
+            messages = [{"role": "user", "content": turn.user_prompt}]
+            async with provider_call_scope(custody):
+                await _litellm_acompletion(
+                    model="test/model",
+                    messages=messages,
+                    prompt_guard_mount=turn.mount,
+                    prompt_guard_mode="required",
+                    prompt_guard_role="composer",
+                    provider_custody=custody,
+                )
+                with patch("elspeth.web.composer.llm_response_parsing.time.monotonic_ns", return_value=custody._admitted_ns + 2_500_000):
+                    call = build_llm_call_record(
+                        model_requested="test/model",
+                        messages=messages,
+                        tools=None,
+                        status=ComposerLLMCallStatus.SUCCESS,
+                        started_at=database_start + replica_skew,
+                        # Guard/admission latency precedes the database attempt.
+                        started_ns=custody._admitted_ns - 1_000_000_000,
+                        temperature=None,
+                        seed=None,
+                        provider_custody=custody,
+                    )
+                # Bind explicitly, as caller-side usage admission may refine the call.
+                call = custody.bind_call(dataclasses.replace(call, prompt_tokens=17, completion_tokens=3))
+            turn.assert_audit(guards=1, calls=1, private=0)
+            assert call.started_at == database_start
+            assert call.finished_at == database_start + timedelta(microseconds=2500)
+            assert call.latency_ms == 1002
+            # Exact replay retains the authoritative timestamp, rather than reading a new clock.
+            await service.finish_provider_attempt(session_operation_context=lease.context, call=call)
+    with engine.connect() as connection:
+        attempt = connection.execute(select(quota_provider_attempts_table)).one()
+        usage = connection.execute(select(token_usage_ledger_table)).one()
+    assert attempt.settled_at is not None
+    assert usage.recorded_at.replace(tzinfo=UTC) == call.finished_at
+    assert (usage.prompt_tokens, usage.completion_tokens) == (17, 3)
+    assert dispatches == ["sent"]
+
+
+@pytest.mark.asyncio
+async def test_custody_free_gateway_refuses_before_admission_or_callback(quota_service, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The retired gateway fallback cannot strand quota intent behind a callback."""
+    engine, service, _ = quota_service
+    session = await service.create_session(user_id="alice", title="No legacy gateway", auth_provider_type="local")
+    events: list[str] = []
+
+    def refuse() -> None:
+        events.append("callback")
+        raise RuntimeError("continuation budget exhausted")
+
+    async def provider(**kwargs: Any) -> None:
+        events.append("provider")
+
+    monkeypatch.setattr("litellm.acompletion", provider)
+
+    @quota_provider_calls
+    async def invoke() -> None:
+        await _litellm_acompletion(
+            model="test/model",
+            messages=[{"role": "user", "content": "Build a pipeline"}],
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
+            on_provider_dispatch=refuse,
+        )
+
+    async with await _lease(service, session.id) as lease:
+        with composer_quota_scope(service, lease.context), pytest.raises(AuditIntegrityError, match="requires exact explicit custody"):
+            await invoke()
+    assert events == []
+    with engine.connect() as connection:
+        assert connection.execute(select(quota_provider_attempts_table)).all() == []
+        assert connection.execute(select(token_usage_ledger_table)).all() == []
+
+
+@pytest.mark.asyncio
+async def test_callback_refusal_settles_owned_undispatched_attempt_at_zero(quota_service, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real callback rejection writes an undispatched audit, never a fictitious call."""
+    engine, service, _ = quota_service
+    session = await service.create_session(user_id="alice", title="Callback refusal", auth_provider_type="local")
+    events: list[str] = []
+    refusal = RuntimeError("continuation budget exhausted")
+
+    def refuse() -> None:
+        events.append("callback")
+        raise refusal
+
+    async def provider(**kwargs: Any) -> None:
+        events.append("provider")
+
+    monkeypatch.setattr("litellm.acompletion", provider)
+    async with await _lease(service, session.id) as lease:
+        with guarded_quota_turn(engine, service, lease.context) as turn:
+            custody = turn.owner.mint(ProviderInvocationFamily.ADVISOR)
+            with pytest.raises(RuntimeError) as caught:
+                async with provider_call_scope(custody):
+                    await _litellm_acompletion(
+                        model="test/model",
+                        messages=[{"role": "user", "content": turn.user_prompt}],
+                        prompt_guard_mount=turn.mount,
+                        prompt_guard_mode="required",
+                        prompt_guard_role="composer",
+                        provider_custody=custody,
+                        on_provider_dispatch=refuse,
+                    )
+            assert caught.value is refusal
+            assert custody.attempt is None
+    with engine.connect() as connection:
+        attempt = connection.execute(select(quota_provider_attempts_table)).one()
+        usage = connection.execute(select(token_usage_ledger_table)).one()
+        messages = connection.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).all()
+    assert events == ["callback"]
+    assert attempt.settled_at is not None and attempt.ledger_entry_id == usage.entry_id
+    assert (usage.prompt_tokens, usage.completion_tokens) == (0, 0)
+    assert len(messages) == 2
+    assert messages[0].tool_calls[0]["_kind"] == "prompt_guard_audit"
+    assert messages[1].tool_calls is None
+    assert '"kind":"provider_attempt.cancelled_before_dispatch"' in messages[1].content
 
 
 @pytest.mark.asyncio

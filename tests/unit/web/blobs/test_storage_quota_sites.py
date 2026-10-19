@@ -204,12 +204,61 @@ def test_upload_http_refusal_carries_identity_storage_measurement(
             "error_type": "storage_quota_exceeded",
             "detail": "Identity test-user blob storage (90 bytes) plus 11 bytes would exceed its storage quota (100 bytes)",
             "dimension": "storage",
-            "cap": 100,
+            "scope": "identity",
+            "limit": "100",
+            "cap": "100",
             "ceiling": None,
-            "usage": 90,
+            "usage": "90",
         }
     }
     assert [(row.operation, row.usage, row.cap) for row in recorded] == [("blob_create", 90, 100)]
+
+
+@pytest.mark.parametrize("route", ["multipart", "inline"])
+def test_shared_storage_refusal_binds_aggregate_usage_to_shared_limit(
+    db_engine: Engine, tmp_path: Path, recorded: list[QuotaExceeded], route: str
+) -> None:
+    client = SyncASGITestClient(_quota_app(db_engine, tmp_path, recorded))
+    created = client.post("/api/sessions", json={"title": "quota"})
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    _seed_cap(db_engine, 100)
+    _occupy(db_engine, 10)
+    _occupy(db_engine, 985)
+    with db_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="other-user")
+        other_session = conn.execute(select(blobs_table.c.session_id).where(blobs_table.c.size_bytes == 985)).scalar_one()
+        conn.execute(update(sessions_table).where(sessions_table.c.id == other_session).values(user_id="other-user"))
+        conn.execute(
+            insert(quota_policies_table).values(
+                policy_id="shared-storage",
+                identity_id=None,
+                tokens_per_day=10000,
+                storage_bytes=1000,
+                set_by_actor="operator",
+                set_by_identity_id=None,
+                set_at=NOW,
+            )
+        )
+    if route == "multipart":
+        response = client.post(f"/api/sessions/{session_id}/blobs", files={"file": ("note.txt", io.BytesIO(b"0123456789"), "text/plain")})
+    else:
+        response = client.post(
+            f"/api/sessions/{session_id}/blobs/inline", json={"filename": "note.txt", "content": "0123456789", "mime_type": "text/plain"}
+        )
+    assert response.status_code == 413
+    detail = response.json()["detail"]
+    assert {key: detail[key] for key in ("error_type", "dimension", "scope", "cap", "ceiling", "usage", "limit")} == {
+        "error_type": "storage_quota_exceeded",
+        "dimension": "storage",
+        "scope": "container",
+        "cap": "100",
+        "ceiling": "1000",
+        "usage": "995",
+        "limit": "1000",
+    }
+    assert "Shared container" in detail["detail"]
+    assert [(row.usage, row.scope) for row in recorded] == [(995, "container")]
 
 
 def test_upload_http_refuses_when_storage_accounting_is_unavailable(

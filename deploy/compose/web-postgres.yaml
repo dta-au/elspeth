@@ -2,6 +2,9 @@
 
 x-web-environment: &web-environment
   ELSPETH_WEB__HOST: 0.0.0.0
+  # Host nginx connects through the bridge gateway. Trust that one address;
+  # other containers on this network cannot supply client identity headers.
+  ELSPETH_WEB__TRUSTED_PROXY_HOSTS: '["${ELSPETH_COMPOSE_GATEWAY:-172.30.85.1}"]'
   ELSPETH_WEB__DEPLOYMENT_TARGET: docker-compose
   ELSPETH_WEB__DEPLOYMENT_STATE_MODE: external-postgresql
   ELSPETH_WEB__DATA_DIR: /app/state/data
@@ -68,7 +71,7 @@ services:
       ELSPETH_WEB__SESSION_DB_URL: postgresql+psycopg://elspeth_session_runtime:${POSTGRES_SESSION_RUNTIME_PASSWORD:?POSTGRES_SESSION_RUNTIME_PASSWORD required}@postgres:5432/elspeth_sessions
       ELSPETH_WEB__LANDSCAPE_URL: postgresql+psycopg://elspeth_landscape_runtime:${POSTGRES_LANDSCAPE_RUNTIME_PASSWORD:?POSTGRES_LANDSCAPE_RUNTIME_PASSWORD required}@postgres:5432/elspeth_landscape
     ports:
-      - "8451:8451"
+      - "127.0.0.1:8451:8451"
     volumes:
       - elspeth_state:/app/state
     depends_on:
@@ -90,3 +93,10 @@ services:
 
 volumes:
   elspeth_state:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${ELSPETH_COMPOSE_SUBNET:-172.30.85.0/24}
+          gateway: ${ELSPETH_COMPOSE_GATEWAY:-172.30.85.1}

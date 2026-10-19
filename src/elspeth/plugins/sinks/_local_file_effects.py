@@ -9,10 +9,12 @@ inode.  Reconciliation therefore treats that case as UNKNOWN.
 from __future__ import annotations
 
 import fcntl
+import glob
 import hashlib
 import os
 import stat
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -42,6 +44,59 @@ DEFAULT_MAX_ROWS: Final = 10_000_000
 DEFAULT_LOCK_TIMEOUT_SECONDS: Final = 5.0
 _COPY_CHUNK_BYTES: Final = 64 * 1024
 _EVIDENCE_SCHEMA: Final = "local-file-effect-plan-v1"
+
+# Web admission is bound to session-owned directories rather than thread-local
+# state: sink preparation may run in engine worker threads. CLI callers have no
+# registered authority and retain their configured local-effect byte bounds.
+_storage_admission_lock = threading.RLock()
+_storage_admissions: dict[Path, Callable[[Path, int], None]] = {}
+
+
+@contextmanager
+def local_file_storage_admission(roots: Sequence[Path], admit: Callable[[Path, int], None]) -> Iterator[None]:
+    """Bind pre-write storage admission to exact owned output directories."""
+    normalized = tuple(root.resolve(strict=False) for root in roots)
+    with _storage_admission_lock:
+        for root in normalized:
+            if any(root.is_relative_to(existing) or existing.is_relative_to(root) for existing in _storage_admissions):
+                raise LocalFilePreconditionError("local output storage authority overlaps an active writer")
+        for root in normalized:
+            _storage_admissions[root] = admit
+    try:
+        yield
+    finally:
+        with _storage_admission_lock:
+            for root in normalized:
+                del _storage_admissions[root]
+
+
+def local_file_storage_bytes(target: Path) -> int:
+    """Measure retained target and recoverable staging bodies for one target."""
+    name = glob.escape(target.name)
+    candidates = {
+        target,
+        *target.parent.glob(f".{name}.elspeth-*.stage"),
+        *target.parent.glob(f"..{name}.elspeth-*.stage.*.building"),
+    }
+    total = 0
+    for candidate in candidates:
+        try:
+            result = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(result.st_mode):
+            raise LocalFilePreconditionError("local output storage is not a regular file")
+        total += result.st_size
+    return total
+
+
+def _admit_local_file_storage(target: Path, *, size_bytes: int | None = None) -> None:
+    with _storage_admission_lock:
+        authorities = tuple(admit for root, admit in _storage_admissions.items() if target.is_relative_to(root))
+    if len(authorities) > 1:
+        raise LocalFilePreconditionError("local output has ambiguous storage authority")
+    if authorities:
+        authorities[0](target, local_file_storage_bytes(target) if size_bytes is None else size_bytes)
 
 
 class LocalFileEffectError(RuntimeError):
@@ -430,6 +485,8 @@ def prepare_local_effect(
     target, predecessor, predecessor_declared = _inspection_snapshot(inspection, effect_id=effect_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     cleanup_stale_local_effect_building_files(target.parent)
+    existing_storage_bytes = local_file_storage_bytes(target)
+    _admit_local_file_storage(target, size_bytes=existing_storage_bytes)
     staging = _staging_path(target, effect_id)
     lock = _lock_path(target)
     descriptor_fd: int | None = None
@@ -449,6 +506,9 @@ def prepare_local_effect(
                 total += len(chunk)
                 if total > max_bytes:
                     raise LocalFileEffectLimitError(f"byte limit exceeded: {total} > {max_bytes}")
+                # Include the full predecessor and staging body. Buffered writes
+                # may not yet appear in stat(), so use the cumulative count.
+                _admit_local_file_storage(target, size_bytes=existing_storage_bytes + total)
                 stream.write(chunk)
                 digest.update(chunk)
             stream.flush()
@@ -459,6 +519,7 @@ def prepare_local_effect(
         if not staged.exists or staged.content_hash != digest.hexdigest() or staged.size_bytes != total or staged.file_id is None:
             raise LocalFilePreconditionError("staged file identity diverged after atomic installation")
         _fsync_directory(target.parent)
+        _admit_local_file_storage(target)
     except BaseException:
         if descriptor_fd is not None:
             os.close(descriptor_fd)
@@ -466,6 +527,7 @@ def prepare_local_effect(
             building.unlink(missing_ok=True)
         if staged is not None:
             _remove_exact_staging(staging, staged)
+        _admit_local_file_storage(target)
         raise
 
     assert staged.content_hash is not None and staged.size_bytes is not None and staged.file_id is not None
@@ -545,6 +607,7 @@ def prepare_local_effect(
     if descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION:
         staging.unlink()
         _fsync_directory(staging.parent)
+        _admit_local_file_storage(target)
     try:
         return SinkEffectPlan(
             effect_id=effect_id,
@@ -681,6 +744,7 @@ def commit_local_effect(
             file_id=evidence.staged_file_id,
         ):
             raise LocalFilePreconditionError("published target does not retain the planned staged file identity")
+        _admit_local_file_storage(target)
     return SinkEffectCommitResult(
         descriptor=expected,
         evidence={"file_id": evidence.staged_file_id, "publication": "atomic_replace"},
@@ -775,6 +839,8 @@ __all__ = [
     "continuation_emission",
     "inspect_local_effect",
     "iter_path_chunks",
+    "local_file_storage_admission",
+    "local_file_storage_bytes",
     "predecessor_local_path",
     "prepare_local_effect",
     "reconcile_local_effect",

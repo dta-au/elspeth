@@ -577,6 +577,10 @@ class OpenRouterLLMProvider:
             latency_ms=(time.perf_counter() - started_at) * 1000,
             approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
             call_mode_session=self._call_mode_session,
+            call_id=attempt_id,
+            created_at=self._llm_call_governance.timestamp_for_outcome(attempt_id)
+            if self._llm_call_governance is not None and attempt_id is not None
+            else None,
         )
         if self._llm_call_governance is not None and (
             self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY
@@ -618,6 +622,10 @@ class OpenRouterLLMProvider:
             latency_ms=(time.perf_counter() - started_at) * 1000,
             approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
             call_mode_session=self._call_mode_session,
+            call_id=attempt_id,
+            created_at=self._llm_call_governance.timestamp_for_outcome(attempt_id)
+            if self._llm_call_governance is not None and attempt_id is not None
+            else None,
         )
         if self._llm_call_governance is not None and (
             self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY
