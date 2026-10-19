@@ -9838,7 +9838,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/engine/executors/sink_effects.py",
             "SinkEffectCoordinator",
-            "36144567275d843ac27be3fb2b1681b43b673eb93d147999b4ee7ddf0f802b7e",
+            "e02b95605111afa607819b7a84b05bbe3481df8586d0a5577e8081e63fcda8c3",
         ),
     )
     indexed = {unit.path: unit for unit in units}
@@ -9888,6 +9888,18 @@ def _reserve_sink_effect_disjoint_receipts(units):
         ):
             return ["sink-effect owner source shape changed " + name], frozenset()
         owners[name] = (path, owner)
+    # Disposition restoration reaches an additional read-only evidence resolver.
+    # Bind its imports and complete body; the common origin proof below must
+    # still refuse replacement callables and outside receiver effects.
+    read_dependency_path = "src/elspeth/engine/executors/sink_disposition_reason.py"
+    read_dependency = indexed.get(read_dependency_path)
+    if read_dependency is None:
+        return ["sink-effect read dependency source missing " + read_dependency_path], frozenset()
+    if (
+        hashlib.sha256(stable_ast_dump(read_dependency.tree).encode("utf-8")).hexdigest()
+        != "f30f7b887cdb4e5283d7da738e08228246d85c1e41c4955d2d2db63dfe909af7"
+    ):
+        return ["sink-effect read dependency source changed " + read_dependency_path], frozenset()
     protected_sink_fields = {
         "_execution",
         "_payload_store",
@@ -10575,6 +10587,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         "normal_no_fault_hook_callers": frozenset(no_fault_hook_callers),
         "request_constructors": frozenset(inline_requests),
         "normal_callback_sources": frozenset(callback_nodes),
+        "read_dependency_origins": frozenset({"elspeth.engine.executors.sink_disposition_reason.resolve_sink_disposition_reason"}),
     }
 
 
@@ -11300,8 +11313,9 @@ def _reserve_supported_boundary(units):
     # New transfer receipts require the same cross-module rebinding/reflection
     # protection as every other selected supplier, not only local body pins.
     origins.update(_reserve_RETAINED_FAILURE_ORIGINS)
+    origins.update(sink_receipt["read_dependency_origins"])
     guarded_classes = set()
-    guarded_functions = set()
+    guarded_functions = set(sink_receipt["read_dependency_origins"])
     for path, guard in _reserve_full_source_guards().items():
         if not guard["protected_exports"]:
             continue
