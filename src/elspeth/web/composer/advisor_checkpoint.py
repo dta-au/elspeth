@@ -435,7 +435,7 @@ class AdvisorCheckpointOwner:
             review = arguments["abandonment_context"]
             if type(review) is not AdvisorAbandonmentReview:
                 raise InvariantError("Advisor abandonment context lacks producer ownership")
-            messages.extend(review.provider_messages())
+            messages.extend(dict(message) for message in review.provider_messages())
         if self._composer_skill_text and supports_anthropic_prompt_cache_markers(advisor_model):
             messages[0]["content"] = [
                 {"type": "text", "text": self._composer_skill_text, "cache_control": {"type": "ephemeral"}},

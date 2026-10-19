@@ -994,6 +994,12 @@ allowed_dict_patterns:
   # untyped external-library completion surface, not a contract this codebase
   # owns the shape of.
   - "src/elspeth/web/composer/provider_gateway.py:_apply_openrouter_usage_accounting:kwargs"
+  # Native thinking augments an external LiteLLM message while preserving all
+  # existing wire fields and producer guard partitions. The native blocks are
+  # admitted separately by parse_native_thinking_blocks; this helper does not
+  # claim ownership of LiteLLM's open message schema.
+  - "src/elspeth/web/composer/provider_thinking.py:attach_provider_thinking:message"
+  - "src/elspeth/web/composer/provider_thinking.py:attach_provider_thinking:return"
   # Secret tool handlers — same pattern as above, LLM-provided arguments
   - "src/elspeth/web/composer/tools/secrets.py:_handle_list_secret_refs:arguments"
   - "src/elspeth/web/composer/tools/secrets.py:_handle_validate_secret_ref:arguments"
@@ -1031,6 +1037,9 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/blobs.py:_execute_update_blob:arguments"
   - "src/elspeth/web/composer/tools/blobs.py:_execute_delete_blob:arguments"
   - "src/elspeth/web/composer/tools/blobs.py:_execute_get_blob_content:arguments"
+  # Same LLM-owned arguments as the paged reader above; parsed immediately
+  # through ReadAttachmentArgumentsModel before any blob access.
+  - "src/elspeth/web/composer/tools/blobs.py:_execute_read_attachment:arguments"
   - "src/elspeth/web/composer/tools/blobs.py:_execute_wire_blob_inline_ref:arguments"
   - "src/elspeth/web/composer/tools/generation.py:_execute_diff_pipeline:args"
   - "src/elspeth/web/composer/tools/sessions.py:_execute_get_pipeline_state:args"

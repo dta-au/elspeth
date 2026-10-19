@@ -48,6 +48,7 @@ MODULES = {
 # Target mutation scores per module
 THRESHOLDS = {
     "canonical.py": 95,
+    "landscape": 90,
     "landscape/recorder.py": 90,
     "landscape/exporter.py": 90,
     "landscape/models.py": 90,
@@ -174,7 +175,8 @@ def calculate_score(module_path: str) -> tuple[int, int, float] | None:
             if mutant_id <= 0 or mutant_id in all_ids:
                 return None
             all_ids.add(mutant_id)
-            if Path(case.attrib["file"]).resolve() == target:
+            case_path = Path(case.attrib["file"]).resolve()
+            if case_path == target or target in case_path.parents:
                 module_ids.add(mutant_id)
         if not module_ids:
             return None
@@ -274,22 +276,24 @@ def main() -> int:
             print("❌ Could not read mutation results")
             return 1
 
-        # Check threshold if strict mode
+        # Advisory runs still need a real, non-empty mutant inventory. A CLI
+        # error or an empty report is not successful quality telemetry.
+        score_data = calculate_score(module)
+        if score_data is None:
+            print(f"❌ Missing or invalid mutation score for {module}")
+            return 1
+        killed, total, score = score_data
+        print(f"\n📈 Score: {score:.1f}% ({killed}/{total} killed)")
+
+        # Only strict mode enforces a score threshold.
         if args.strict:
-            score_data = calculate_score(module)
-            if score_data is None:
-                print(f"❌ Missing or invalid mutation score for {module}")
-                return 1
+            threshold = thresholds_by_path.get((CORE_PATH / module).resolve(), 80)
+            print(f"📊 Threshold: {threshold}%")
+            if score < threshold:
+                print(f"❌ FAILED: Score {score:.1f}% below {threshold}% threshold")
+                exit_code = 2
             else:
-                killed, total, score = score_data
-                threshold = thresholds_by_path.get((CORE_PATH / module).resolve(), 80)
-                print(f"\n📈 Score: {score:.1f}% ({killed}/{total} killed)")
-                print(f"📊 Threshold: {threshold}%")
-                if score < threshold:
-                    print(f"❌ FAILED: Score {score:.1f}% below {threshold}% threshold")
-                    exit_code = 2
-                else:
-                    print(f"✅ PASSED: Score {score:.1f}% meets {threshold}% threshold")
+                print(f"✅ PASSED: Score {score:.1f}% meets {threshold}% threshold")
 
     print("\n" + "=" * 60)
     print("💡 Tips:")

@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_DOCUMENTS, PROMPT_GUARD_MAX_TEXT_CHARACTERS
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import prompt_guard_clients
 from elspeth.web.composer.availability import ComposerAvailability
@@ -64,18 +64,18 @@ def _remote_response(request: httpx.Request, *, outcome: str, requests: list[htt
     ("case", "mounted", "mode", "expected_status", "expected_code", "expected_reason", "expected_http_calls"),
     [
         ("user_unit", False, "debug-when-unconfigured", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
-        ("document_count", False, "debug-when-unconfigured", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
+        ("document_unit", False, "debug-when-unconfigured", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
         ("user_unit", True, "required", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
-        ("document_count", True, "required", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
+        ("document_unit", True, "required", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
         ("unavailable", True, "required", 503, "prompt_guard_unavailable", "service_error", 1),
         ("blocked", True, "debug-when-unconfigured", 422, "prompt_guard_blocked", "policy_blocked", 1),
         ("unconfigured", False, "required", 503, "prompt_guard_unavailable", "guard_not_configured", 0),
     ],
     ids=[
         "local-user-debug",
-        "local-aggregate-debug",
+        "local-document-debug",
         "local-user-required",
-        "local-aggregate-required",
+        "local-document-required",
         "azure-unavailable",
         "azure-blocked",
         "required-unconfigured",
@@ -96,13 +96,10 @@ async def test_actual_guard_refusal_preserves_local_cause_and_remote_fail_closed
     messages = []
     if case == "user_unit":
         user = "u" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1)
-    elif case == "document_count":
-        # Every complete unit fits; their count exceeds the existing envelope.
-        messages = [
-            {"role": "assistant", "content": "d" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS - 100)}
-            for _index in range(PROMPT_GUARD_MAX_DOCUMENTS + 1)
-        ]
-        assert all(len(json.dumps(message, separators=(",", ":"))) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for message in messages)
+    elif case == "document_unit":
+        # An indivisible evidence document exceeds one physical call's limit.
+        messages = [{"role": "assistant", "content": "d" * PROMPT_GUARD_MAX_TEXT_CHARACTERS}]
+        assert len(json.dumps(messages[0], separators=(",", ":"))) > PROMPT_GUARD_MAX_TEXT_CHARACTERS
     messages.append({"role": "user", "content": user})
 
     with pytest.raises(PromptGuardRefused) as caught:

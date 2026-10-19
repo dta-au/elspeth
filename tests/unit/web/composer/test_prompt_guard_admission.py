@@ -202,22 +202,14 @@ async def test_unconfigured_fingerprint_binds_every_input_limit_and_mode(authori
         "mode": mode,
         "max_prompt_characters": prompt_guard.PROMPT_GUARD_MAX_TEXT_CHARACTERS,
         "max_document_characters": prompt_guard.PROMPT_GUARD_MAX_TEXT_CHARACTERS,
-        "max_documents": prompt_guard.PROMPT_GUARD_MAX_DOCUMENTS,
-        "max_input_utf8_bytes": prompt_guard.PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
     }
     assert baseline["policy_fingerprint"] == hashlib.sha256(json.dumps(expected_policy, sort_keys=True).encode("utf-8")).hexdigest()
-    for changed_limit in ("characters", "documents", "bytes"):
-        with monkeypatch.context() as change:
-            if changed_limit == "characters":
-                change.setattr(prompt_guard, "PROMPT_GUARD_MAX_TEXT_CHARACTERS", 9_999)
-            elif changed_limit == "documents":
-                change.setattr(prompt_guard, "PROMPT_GUARD_MAX_DOCUMENTS", 127)
-            else:
-                change.setattr(prompt_guard, "PROMPT_GUARD_MAX_INPUT_UTF8_BYTES", 5_159_999)
-            updated = await check()
-        assert updated["policy_fingerprint"] != baseline["policy_fingerprint"]
-        assert updated["request_hash"] != baseline["request_hash"]
-        assert updated["disposition"] == baseline["disposition"]
+    with monkeypatch.context() as change:
+        change.setattr(prompt_guard, "PROMPT_GUARD_MAX_TEXT_CHARACTERS", 9_999)
+        updated = await check()
+    assert updated["policy_fingerprint"] != baseline["policy_fingerprint"]
+    assert updated["request_hash"] != baseline["request_hash"]
+    assert updated["disposition"] == baseline["disposition"]
     coordinator.assert_completed()
 
 

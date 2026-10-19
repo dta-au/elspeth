@@ -14,8 +14,6 @@ from sqlalchemy import select
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
-    PROMPT_GUARD_MAX_DOCUMENTS,
-    PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
     PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
     PROMPT_GUARD_TRUST_KEY,
@@ -292,11 +290,11 @@ async def test_complete_large_reply_context_uses_real_guard_before_fenced_sdk(au
     request, supported = requests[0]
     assert supported
     assert request.user_prompt == user
-    assert len(request.documents) <= PROMPT_GUARD_MAX_DOCUMENTS
+    assert request.documents
     assert all(len(unit) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for unit in units[0])
     assert all(len(document) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in request.documents)
     size = len(user.encode("utf-8")) + sum(len(document.encode("utf-8")) for document in request.documents)
-    assert 262_144 < size <= PROMPT_GUARD_MAX_INPUT_UTF8_BYTES
+    assert size > 262_144
     assert "\n".join(request.documents) == "\n".join(units[0])
     complete_inspection = "\n".join(units[0])
     assert all(f"COMPLETE_EVIDENCE_{index:02}:" + "x" * 8500 in complete_inspection for index in range(40))
@@ -343,7 +341,7 @@ async def test_complete_large_reply_context_uses_real_guard_before_fenced_sdk(au
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
 @pytest.mark.parametrize("configured", [False, True])
-@pytest.mark.parametrize("kind", ["atomic", "document_count", "user", "surrogate_user", "surrogate_part"])
+@pytest.mark.parametrize("kind", ["atomic", "oversized_part", "user", "surrogate_user", "surrogate_part"])
 async def test_unrepresentable_input_is_audited_without_truncation_or_transport(authority, mode, configured, kind):
     engine, _service, owner, coordinator = authority
     custody = owner.mint(ProviderInvocationFamily.PRIMARY)
@@ -352,8 +350,9 @@ async def test_unrepresentable_input_is_audited_without_truncation_or_transport(
     parts = None
     if kind == "atomic":
         messages = [{"role": "tool", "content": "x" * 10_001}]
-    elif kind == "document_count":
-        messages = [{"role": "tool", "content": "x" * 9000} for _ in range(129)]
+    elif kind == "oversized_part":
+        messages = [{"role": "tool", "content": "x" * 10_001}]
+        parts = ((PromptGuardContentPart("x" * 10_001),),)
     elif kind == "user":
         user = "x" * 10_001
     elif kind == "surrogate_user":

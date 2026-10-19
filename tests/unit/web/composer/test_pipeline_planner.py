@@ -44,8 +44,6 @@ from elspeth.contracts.composer_planner_audit import (
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import (
-    PROMPT_GUARD_MAX_DOCUMENTS,
-    PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
     PromptGuardClient,
     PromptGuardDecision,
@@ -917,6 +915,7 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
         "list_transforms",
         "preview_pipeline",
         "get_blob_content",
+        "read_attachment",
         "get_blob_metadata",
         "inspect_source",
         "list_blobs",
@@ -939,6 +938,24 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
     serialized = canonical_json(terminal)
     assert "rationale" not in serialized
     assert '"base"' not in serialized
+
+
+def test_whole_attachment_discovery_is_audited_as_blob_content() -> None:
+    arguments = {"blob_id": "00000000-0000-4000-8000-000000000001"}
+    call = pipeline_planner._ParsedToolCall("attachment", "read_attachment", canonical_json(arguments), arguments)
+    keys = pipeline_planner.planner_discovery_information_keys(call)
+    assert keys == ('blob.attachment:["00000000-0000-4000-8000-000000000001",null]',)
+    assert pipeline_planner._planner_information_classes(keys) == (ComposerPlannerInformationClass.BLOB_CONTENT,)
+    manifest = pipeline_planner.PlannerInformationManifest(supplied=frozenset()).with_result(keys, available=False)
+    assert manifest.unavailable == frozenset(keys)
+
+
+@pytest.mark.parametrize("key", ["blob.attachment_typo:[]", "unregistered:[]"])
+def test_unknown_planner_information_prefix_is_refused(key: str) -> None:
+    with pytest.raises(AuditIntegrityError, match="unknown information class"):
+        pipeline_planner._planner_information_class(key)
+    with pytest.raises(ValueError, match="unknown key"):
+        pipeline_planner.PlannerInformationManifest(supplied=frozenset({key}))
 
 
 def test_planner_has_no_request_selected_terminal_contract() -> None:
@@ -2321,6 +2338,7 @@ _DISCOVERY_TEST_ARGUMENTS: Mapping[str, Mapping[str, Any]] = {
     "list_transforms": {},
     "preview_pipeline": {},
     "get_blob_content": {"blob_id": "00000000-0000-4000-8000-000000000001"},
+    "read_attachment": {"blob_id": "00000000-0000-4000-8000-000000000001"},
     "get_blob_metadata": {"blob_id": "00000000-0000-4000-8000-000000000001"},
     "inspect_source": {"blob_id": "00000000-0000-4000-8000-000000000001"},
     "list_blobs": {},
@@ -2421,10 +2439,10 @@ async def test_full_discovery_batch_preserves_complete_results_above_old_aggrega
     request, supported = guard_requests[1]
     assert supported is True
     assert len(request.user_prompt) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
-    assert len(request.documents) <= PROMPT_GUARD_MAX_DOCUMENTS
+    assert request.documents
     assert all(len(document) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in request.documents)
     inspected_bytes = len(request.user_prompt.encode("utf-8")) + sum(len(document.encode("utf-8")) for document in request.documents)
-    assert 262_144 < inspected_bytes <= PROMPT_GUARD_MAX_INPUT_UTF8_BYTES
+    assert inspected_bytes > 262_144
     assert len(completion.requests) == len(recorder.llm_calls) == 2
     assert all(call.status is ComposerLLMCallStatus.SUCCESS for call in recorder.llm_calls)
     assert len({call.call_id for call in recorder.llm_calls}) == 2
@@ -4988,8 +5006,6 @@ def _assert_debug_guard_audit(row: dict[str, Any], context: SessionOperationCont
                     "mode": "debug-when-unconfigured",
                     "max_prompt_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
                     "max_document_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
-                    "max_documents": PROMPT_GUARD_MAX_DOCUMENTS,
-                    "max_input_utf8_bytes": PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
                 },
                 sort_keys=True,
             ).encode("utf-8")

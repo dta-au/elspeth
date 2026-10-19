@@ -17,6 +17,7 @@ from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase
 from elspeth.web.composer.advisor_context import (
     ADVISOR_CHARS_PER_TOKEN,
+    _pipeline_advisor_summary_units,
     advisor_checkpoint_summary_chars,
     advisor_user_content_parts,
     build_advisor_user_message,
@@ -131,6 +132,11 @@ def _component(summary: str, identity: str) -> str:
     return next(line for line in summary.splitlines() if line.startswith(f"  - {identity}:"))
 
 
+def _optional_summary_chars(arguments, state: CompositionState) -> int:
+    required = "\n".join("".join(part.text for part in unit) for unit in _pipeline_advisor_summary_units(state, include_optional=False))
+    return advisor_checkpoint_summary_chars(arguments) - advisor_checkpoint_summary_chars({**arguments, "schema_excerpt": required})
+
+
 def _canonical(text: str) -> str:
     """Ignore serialization whitespace/quotes, preserving synthetic value order."""
     compact = re.sub(r"\s+", "", text.replace('"', "'"))
@@ -169,7 +175,7 @@ def test_checkpoint_keeps_every_component_before_optional_prompt_prose(phase: Ad
         assert f"  - {node.id}:" in excerpt, f"Advisor lost node {node.id}"
     for output in state.outputs:
         assert f"  - {output.name}:" in excerpt, f"Advisor lost sink {output.name}"
-    assert advisor_checkpoint_summary_chars(arguments) <= 4000 * ADVISOR_CHARS_PER_TOKEN
+    assert 0 <= _optional_summary_chars(arguments, state) <= 4000 * ADVISOR_CHARS_PER_TOKEN
     assert "additional_evidence_lines_withheld" not in excerpt
     _assert_mapper_contract(excerpt)
     message = build_advisor_user_message(arguments)
@@ -244,32 +250,47 @@ def test_gate_evidence_preserves_condition_route_bindings_and_fork_order() -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
-async def test_required_graph_coverage_overflow_refuses_before_any_advisor_dispatch(
+async def test_required_graph_larger_than_optional_allowance_reaches_advisor_complete(
     monkeypatch: pytest.MonkeyPatch, phase: AdvisorCheckpointPhase
 ) -> None:
-    owner = _owner(allowance=500)
+    owner = _owner(allowance=1)
     calls: list[object] = []
     completed_passes: list[object] = []
 
-    async def forbidden_dispatch(self: AdvisorCheckpointOwner, *args: object, **kwargs: object) -> None:
-        calls.append(args)
-        raise AssertionError("Incomplete graph evidence must not reach an Advisor provider")
+    state = _graph()
 
-    monkeypatch.setattr(AdvisorCheckpointOwner, "_call_advisor_with_audit", forbidden_dispatch)
+    async def dispatch(self: AdvisorCheckpointOwner, arguments, **kwargs):
+        calls.append(arguments)
+        _assert_mapper_contract(arguments["schema_excerpt"])
+        assert advisor_checkpoint_summary_chars(arguments) > ADVISOR_CHARS_PER_TOKEN
+        assert 0 <= _optional_summary_chars(arguments, state) <= ADVISOR_CHARS_PER_TOKEN
+        kwargs["on_provider_dispatch"]()
+        reply = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}
+        if phase == "end":
+            reply["publication_verdict"] = "ADMIT"
+        return json.dumps(reply), None
+
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_call_advisor_with_audit", dispatch)
 
     async def record_completed_pass(**kwargs: object) -> None:
         completed_passes.append(kwargs)
 
     monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", record_completed_pass)
-    verdict = await owner._run_advisor_checkpoint(phase=phase, state=_graph(), session_id=None, recorder=None)
-    assert calls == []
-    assert completed_passes == []
-    assert verdict.ok is False
-    assert verdict.blocking is False
-    assert verdict.failure_class == "budget_exhausted"
-    assert verdict.retryable is False
-    assert verdict.publication_verdict is None and verdict.publication_binding is None
-    assert "graph" in verdict.findings_text.lower() and "evidence" in verdict.findings_text.lower()
+    review = TurnEvidence(
+        session_id=None,
+        session_operation_context=None,
+        request_id="large-required-graph",
+        request="Review this graph.",
+        initial_state_id=None,
+        initial_state=state,
+    ).review_candidate(candidate="Review the supplied graph.", request="Review this graph.", current_state=state)
+    verdict = await owner._run_advisor_checkpoint(
+        phase=phase, state=state, session_id=None, recorder=None, publication_review=review if phase == "end" else None
+    )
+    assert len(calls) == len(completed_passes) == 1
+    assert verdict.ok and not verdict.blocking
+    if phase == "end":
+        assert verdict.publication_verdict == "ADMIT" and verdict.publication_binding == review.binding
 
 
 def test_projection_keeps_secret_storage_values_and_arbitrary_http_headers_withheld() -> None:
@@ -414,5 +435,5 @@ async def test_format_retry_keeps_complete_fitted_structural_facts(monkeypatch: 
         assert isinstance(excerpt, str)
         _assert_mapper_contract(excerpt)
         assert "  - step_09:" in excerpt and "  - failures:" in excerpt
-        assert advisor_checkpoint_summary_chars(arguments) <= 4000 * ADVISOR_CHARS_PER_TOKEN
+        assert 0 <= _optional_summary_chars(arguments, state) <= 4000 * ADVISOR_CHARS_PER_TOKEN
         assert "".join(part.text for part in advisor_user_content_parts(arguments)) == build_advisor_user_message(arguments)

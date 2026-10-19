@@ -244,6 +244,7 @@ def _valid_information_key(key: str) -> bool:
             "blob.metadata:",
             "blob.inspection:",
             "blob.content:",
+            "blob.attachment:",
             "validation.code:",
             "secret.reference:",
             "model.catalog.",
@@ -1187,6 +1188,7 @@ _PLANNER_INFORMATION_PREFIXES: Final[tuple[tuple[str, ComposerPlannerInformation
     ("blob.metadata:", ComposerPlannerInformationClass.BLOB_METADATA),
     ("blob.inspection:", ComposerPlannerInformationClass.BLOB_INSPECTION),
     ("blob.content:", ComposerPlannerInformationClass.BLOB_CONTENT),
+    ("blob.attachment:", ComposerPlannerInformationClass.BLOB_CONTENT),
     ("secret.reference:", ComposerPlannerInformationClass.SECRET_REFERENCE),
     ("validation.code:", ComposerPlannerInformationClass.VALIDATION_CODE),
 )

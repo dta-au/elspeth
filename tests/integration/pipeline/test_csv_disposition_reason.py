@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from elspeth.contracts import RoutingMode, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts import RoutingMode, RunStatus, SinkName, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import NodeStateCompleted
 from elspeth.contracts.errors import SinkEffectCapabilityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
@@ -70,12 +70,15 @@ def _configuration(target: Path, *, error_only: bool = False, mixed: bool = Fals
     )
 
 
-def test_boolean_gate_retention_has_verified_disposition_without_an_error(tmp_path: Path, payload_store) -> None:
+@pytest.mark.parametrize("default_effect_first", [False, True])
+def test_boolean_gate_retention_has_verified_disposition_without_an_error(tmp_path: Path, payload_store, default_effect_first) -> None:
     target = tmp_path / "retained.csv"
     config, ordinary = _configuration(target)
+    graph = build_production_graph(config)
+    sink_ids = graph.get_sink_id_map()
     db = make_landscape_db()
     try:
-        result = Orchestrator(db).run(config, graph=build_production_graph(config), payload_store=payload_store)
+        result = Orchestrator(db).run(config, graph=graph, payload_store=payload_store)
         assert result.status is RunStatus.COMPLETED
         assert result.rows_failed == 0
         assert [row["id"] for row in ordinary.results] == ["third"]
@@ -87,6 +90,16 @@ def test_boolean_gate_retention_has_verified_disposition_without_an_error(tmp_pa
         factory = make_factory(db, payload_store=payload_store)
         effects = factory.execution.sink_effects.get_effects_for_run(result.run_id)
         assert effects
+        # The repository orders by hashed stream identity, not logical sink.
+        # Exercise both orders explicitly so a positional lookup cannot pass
+        # merely because this run happened to hash the retained stream first.
+        effects = tuple(
+            sorted(effects, key=lambda effect: effect.sink_node_id == sink_ids[SinkName("retained")], reverse=not default_effect_first)
+        )
+        assert effects[0].sink_node_id == sink_ids[SinkName("default" if default_effect_first else "retained")]
+        retained_effects = [effect for effect in effects if effect.sink_node_id == sink_ids[SinkName("retained")]]
+        assert retained_effects
+        retained_sink_node_id = retained_effects[0].sink_node_id
         for record in records:
             assert record["outcome"] == TerminalOutcome.SUCCESS.value
             assert record["path"] == TerminalPath.GATE_ROUTED.value
@@ -105,7 +118,7 @@ def test_boolean_gate_retention_has_verified_disposition_without_an_error(tmp_pa
                 run_id=result.run_id,
                 token_id=record["token_id"],
                 row_id=record["row_id"],
-                sink_node_id=effects[0].sink_node_id,
+                sink_node_id=retained_sink_node_id,
                 sink_name="retained",
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.GATE_ROUTED,

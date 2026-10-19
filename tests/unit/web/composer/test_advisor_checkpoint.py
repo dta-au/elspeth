@@ -45,7 +45,11 @@ from elspeth.web.composer import provider_gateway
 from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage
 from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner, AdvisorCheckpointVerdict
-from elspeth.web.composer.advisor_context import _node_required_input_fields
+from elspeth.web.composer.advisor_context import (
+    _node_required_input_fields,
+    _pipeline_advisor_summary_units,
+    advisor_checkpoint_summary_chars,
+)
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGatePassed, AdvisorSignoffGateFact
 from elspeth.web.composer.advisor_policy import ADVISOR_MALFORMED_USER_DETAIL, ADVISOR_UNAVAILABLE_USER_DETAIL
 from elspeth.web.composer.audit import BufferingRecorder
@@ -1113,7 +1117,8 @@ def test_end_advisor_prompt_scopes_bounded_and_withheld_evidence(make_service) -
     assert "CLEAN means only that no blocking defect is visible in the supplied advisory evidence" in (
         advisor_system_instructions_for_trigger(arguments["trigger"])
     )
-    assert "'additional_fields_withheld': 1" in prompt
+    assert all(f'"name":"field_{index}"' in prompt for index in range(9))
+    assert "additional_fields_withheld" not in arguments["schema_excerpt"]
     assert "values withheld: blob_ref, path" in prompt
 
 
@@ -1360,7 +1365,7 @@ def test_summarize_renders_dynamic_field_contract_values() -> None:
     assert "content_field=page_content" in summary
     assert "fingerprint_field=page_fp" in summary
     assert "response_field=summary" in summary
-    assert "mapping={'url': 'url', 'summary': 'summary'}" in summary
+    assert 'mapping={"url":"url","summary":"summary"}' in summary
     assert "select_only=True" in summary
 
 
@@ -1484,9 +1489,9 @@ def test_summarize_renders_complete_textract_contract_and_changes_with_committed
     sink_line = next(line for line in summary.splitlines() if "analysed_documents: plugin=json" in line)
 
     assert "schema=" in source_line
-    assert "'mode': 'fixed'" in source_line
-    assert "{'name': 'doc_bucket', 'type': 'str', 'required': True, 'nullable': False}" in source_line
-    assert "{'name': 'doc_key', 'type': 'int', 'required': False, 'nullable': True}" in source_line
+    assert '"mode":"fixed"' in source_line
+    assert '{"name":"doc_bucket","type":"str","required":true,"nullable":false}' in source_line
+    assert '{"name":"doc_key","type":"int","required":false,"nullable":true}' in source_line
     assert "bucket_field=doc_bucket" in node_line
     assert "key_field=doc_key" in node_line
     assert "text_field=extracted_text" in node_line
@@ -1523,9 +1528,9 @@ def test_summarize_renders_complete_textract_contract_and_changes_with_committed
     changed_node_line = next(line for line in changed_summary.splitlines() if "analyse_document" in line)
 
     assert summary != changed_summary
-    assert "'mode': 'flexible'" in changed_source_line
-    assert "{'name': 'doc_bucket', 'type': 'str', 'required': False, 'nullable': True}" in changed_source_line
-    assert "{'name': 'doc_key', 'type': 'int', 'required': True, 'nullable': False}" in changed_source_line
+    assert '"mode":"flexible"' in changed_source_line
+    assert '{"name":"doc_bucket","type":"str","required":false,"nullable":true}' in changed_source_line
+    assert '{"name":"doc_key","type":"int","required":true,"nullable":false}' in changed_source_line
     assert "text_field=ocr_text" in changed_node_line
     assert "page_count_field=page_total" in changed_node_line
     assert "document_locator_field=alternate_locator" in changed_node_line
@@ -1566,7 +1571,7 @@ def test_render_schema_preserves_sanctioned_observed_contract_lists_only() -> No
         }
     )
 
-    for schema_fact in ("'mode': 'observed'", "doc_bucket", "doc_key", "trace_id"):
+    for schema_fact in ('"mode":"observed"', "doc_bucket", "doc_key", "trace_id"):
         assert schema_fact in rendered
     assert "withheld" not in rendered
     assert _OPAQUE_SCHEMA_INJECTION_SENTINEL not in rendered
@@ -1593,7 +1598,7 @@ def test_render_schema_canonicalizes_field_type_flexible_contract() -> None:
         }
     )
 
-    for schema_fact in ("'mode': 'flexible'", "'name': 'doc_bucket'", "'type': 'str'", "'required': True"):
+    for schema_fact in ('"mode":"flexible"', '"name":"doc_bucket"', '"type":"str"', '"required":true'):
         assert schema_fact in rendered
     assert "withheld" not in rendered
     assert "field_type" not in rendered
@@ -1933,10 +1938,10 @@ def test_repair_instruction_offers_a_published_way_out() -> None:
 
     # The anti-lookup wording from elspeth-71617f1d21 stays.
     assert "lookup-only calls is not a fix" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
-    # The exit is named, covers a decision only the user can make, and ends the turn.
-    assert "decision only the user can make" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
-    assert "make no change" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
-    assert "That reply ends the turn." in ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    # A missing decision or inability is reviewed before stopping authoring.
+    assert "call request_advisor_hint alone" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    assert "trigger=cannot_complete and the observed evidence" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    assert "on STOP_CONFIRMED, explain the blocker or ask the focused question" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
     # Neither clause promises the reply reaches the user: on a blocked turn it
     # does, but a no-tool reply after which pass 2 returns CLEAN falls through
     # to finalize and case 5 (``_replace_advisor_repair_public_result``)
@@ -4865,14 +4870,8 @@ def test_render_options_untruncates_prompt_but_caps_other_values():
     assert "xxxxxxxxxx" in expr_value  # it really is the (truncated) expression
 
 
-def test_render_options_bounds_schema_by_complete_field_count():
-    from elspeth.web.composer.advisor_context import (
-        _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS,
-        _ADVISOR_SUMMARY_VALUE_MAX_CHARS,
-        _render_options_for_advisor,
-    )
-
-    expected_max_fields = 8
+def test_render_options_preserves_every_complete_schema_field():
+    from elspeth.web.composer.advisor_context import _render_options_for_advisor
 
     schema = {
         "mode": "fixed",
@@ -4890,23 +4889,14 @@ def test_render_options_bounds_schema_by_complete_field_count():
     rendered = _render_options_for_advisor({"schema": schema})
     schema_value = rendered.removeprefix("options: schema=")
 
-    assert _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS > _ADVISOR_SUMMARY_VALUE_MAX_CHARS
-    for index in range(expected_max_fields):
-        complete_triple = f"{{'name': 'field_{index:03d}', 'type': 'str', 'required': True, 'nullable': False}}"
-        assert complete_triple in schema_value
-    assert f"'field_{expected_max_fields:03d}'" not in schema_value
-    assert f"'additional_fields_withheld': {100 - expected_max_fields}" in schema_value
-    assert len(schema_value) <= _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS
+    assert json.loads(schema_value) == schema
     assert not schema_value.endswith("…")
 
 
-def test_render_options_schema_hard_bound_never_slices_an_oversized_field_triple():
-    from elspeth.web.composer.advisor_context import (
-        _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS,
-        _render_options_for_advisor,
-    )
+def test_render_options_never_slices_a_long_required_field_contract():
+    from elspeth.web.composer.advisor_context import _render_options_for_advisor
 
-    oversized_name = "field_" + ("x" * (_ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS * 2))
+    oversized_name = "field_" + "x" * 4000
     schema = {
         "mode": "fixed",
         "fields": [
@@ -4922,9 +4912,8 @@ def test_render_options_schema_hard_bound_never_slices_an_oversized_field_triple
     rendered = _render_options_for_advisor({"schema": schema})
     schema_value = rendered.removeprefix("options: schema=")
 
-    assert len(schema_value) <= _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS
-    assert oversized_name not in schema_value
-    assert "'additional_fields_withheld': 1" in schema_value
+    assert json.loads(schema_value) == schema
+    assert oversized_name in schema_value
     assert "…" not in schema_value
 
 
@@ -5463,23 +5452,11 @@ def test_advisor_control_flow_scan_and_render_share_one_derived_field_set() -> N
     ]
 
 
-def test_advisor_rubric_makes_the_withheld_schema_entry_case_satisfiable(make_service, simple_state) -> None:
-    """elspeth-eacfec09a6 item 5: the field-9 obligation must be SATISFIABLE.
+def test_checkpoint_keeps_schema_fields_beyond_eight_for_review(make_service, simple_state) -> None:
+    """The ninth field is required evidence, including its type and presence."""
+    from elspeth.web.composer.advisor_context import build_advisor_user_message
 
-    A >8-field schema renders eight field contracts plus an in-value
-    ``additional_fields_withheld`` counter; field 9's name never appears. The
-    rubric's escape clause named only "Keys listed under values withheld" —
-    the NAME-ONLY segment from ``_render_options_for_advisor``, a different
-    mechanism — so a rubric that commands verification of every named value
-    left the counter unexplained and the withheld entry readable as absence.
-
-    This couples the rendered evidence to the rubric text: it is not enough
-    that the counter renders (existence); the rubric must name the counter
-    mechanism so the advisor can satisfy the obligation.
-    """
-    from elspeth.web.composer.advisor_context import _ADVISOR_SUMMARY_SCHEMA_MAX_FIELDS, build_advisor_user_message
-
-    field_count = _ADVISOR_SUMMARY_SCHEMA_MAX_FIELDS + 1
+    field_count = 9
     schema = {
         "mode": "fixed",
         "fields": [{"name": f"field_{index:03d}", "type": "str", "required": True, "nullable": False} for index in range(field_count)],
@@ -5503,14 +5480,9 @@ def test_advisor_rubric_makes_the_withheld_schema_entry_case_satisfiable(make_se
     arguments = make_service()._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=state, user_message="build it")
     prompt = build_advisor_user_message(arguments)
 
-    # The evidence: eight contracts shown, the ninth withheld but COUNTED.
-    assert "'field_000'" in prompt
-    assert f"'field_{_ADVISOR_SUMMARY_SCHEMA_MAX_FIELDS:03d}'" not in prompt
-    assert "'additional_fields_withheld': 1" in prompt
-
-    # The rubric must name the in-value counter mechanism, not only the
-    # name-only "values withheld" key list, or the obligation is unsatisfiable.
-    assert "additional_fields_withheld" in prompt
+    for index in range(field_count):
+        assert f'{{"name":"field_{index:03d}","type":"str","required":true,"nullable":false}}' in prompt
+    assert "additional_fields_withheld" not in arguments["schema_excerpt"]
     assert "values withheld" in prompt
 
 
@@ -6011,18 +5983,11 @@ def test_summarize_renders_list_form_queries_by_name(simple_state):
     assert "queries.hex_code.template_untrusted_json=" in line
 
 
-def test_summarize_bounds_query_templates_with_explicit_withheld_count(simple_state):
-    """More queries than the render bound: the rest are counted, never silently dropped.
+def test_summarize_preserves_every_query_template_and_input_mapping(simple_state):
+    """More than eight queries retain their complete field bindings."""
+    from elspeth.web.composer.advisor_context import summarize_pipeline_for_advisor
 
-    The rubric reads ``additional_*_withheld`` as "that many further entries
-    exist but are not shown", so the omission is rubric-legible by construction.
-    """
-    from elspeth.web.composer.advisor_context import (
-        _ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES,
-        summarize_pipeline_for_advisor,
-    )
-
-    total = _ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES + 2
+    total = 10
     queries = {
         f"q{index:02d}": {"input_fields": {"colour": "colour"}, "template": f"Question {index} about {{{{ row.colour }}}}."}
         for index in range(total)
@@ -6031,8 +5996,11 @@ def test_summarize_bounds_query_templates_with_explicit_withheld_count(simple_st
     line = _node_line(summary, "colour_questions")
 
     rendered = [f"q{index:02d}" for index in range(total) if f"queries.q{index:02d}.template_untrusted_json=" in line]
-    assert len(rendered) == _ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES
-    assert "additional_queries_withheld=2" in line
+    assert rendered == [f"q{index:02d}" for index in range(total)]
+    for index in range(total):
+        assert f"queries.q{index:02d}.input_fields={{'colour': 'colour'}}" in line
+        assert f"Question {index} about {{{{ row.colour }}}}." in line
+    assert "additional_queries_withheld" not in line
 
 
 def test_summarize_malformed_queries_option_is_marked_not_rendered(simple_state):
@@ -6132,7 +6100,7 @@ def test_summarize_keeps_non_prompt_queries_name_only(simple_state):
     assert _advisor_query_option_values(options) == []
 
 
-def test_summarize_llm_queries_without_node_prompt_template_stay_name_only(simple_state):
+def test_summarize_llm_queries_without_parent_template_retain_their_own_contracts(simple_state):
     """Mid-authoring llm node: queries present, node-level prompt_template not yet set."""
     from elspeth.web.composer.advisor_context import summarize_pipeline_for_advisor
 
@@ -6140,8 +6108,11 @@ def test_summarize_llm_queries_without_node_prompt_template_stay_name_only(simpl
     node = dataclass_replace(_multi_query_llm_node(), options=options)
     line = _node_line(summarize_pipeline_for_advisor(simple_state.with_node(node)), "colour_questions")
 
-    assert "queries" in _withheld_keys(line)
-    assert "prompt_template_in_use" not in line
+    for name, query in options["queries"].items():
+        assert f"queries.{name}.template_untrusted_json=" in line
+        assert json.dumps(query["template"], ensure_ascii=False) in line
+        assert f"queries.{name}.input_fields=" in line
+    assert "prompt_template_in_use=not used (every query supplies its own template)" in line
     # The degeneracy signal still reads the effective (override) templates.
     assert "interpolates row fields: [colour]" in line
 
@@ -6163,12 +6134,15 @@ def _pathological_multi_query_state(simple_state: CompositionState, node_count: 
     return state
 
 
-def test_checkpoint_excerpt_is_bounded_by_whole_lines_with_a_withheld_count(make_service, simple_state):
-    """A pipeline of near-cap multi-query nodes yields an excerpt at or under the
-    budget, made of exact summary lines plus one rubric-legible withheld marker."""
+def _optional_summary_chars(arguments, state: CompositionState) -> int:
+    required = "\n".join("".join(part.text for part in unit) for unit in _pipeline_advisor_summary_units(state, include_optional=False))
+    return advisor_checkpoint_summary_chars(arguments) - advisor_checkpoint_summary_chars({**arguments, "schema_excerpt": required})
+
+
+def test_checkpoint_retains_required_graph_and_bounds_optional_prose(make_service, simple_state):
+    """The allowance limits optional prose after every required graph record."""
     from elspeth.web.composer.advisor_context import (
         ADVISOR_CHARS_PER_TOKEN,
-        advisor_checkpoint_summary_chars,
         summarize_pipeline_for_advisor,
     )
 
@@ -6181,15 +6155,15 @@ def test_checkpoint_excerpt_is_bounded_by_whole_lines_with_a_withheld_count(make
     for phase in ("early", "end"):
         arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase=phase, state=state)
         excerpt = arguments["schema_excerpt"]
-        assert advisor_checkpoint_summary_chars(arguments) <= char_cap
-        assert len(excerpt) <= char_cap
-        *kept, marker = excerpt.split("\n")
-        full_lines = full_summary.split("\n")
-        # Kept lines are an exact prefix of the full summary — never a sliced line.
-        assert kept == full_lines[: len(kept)]
-        assert len(kept) < len(full_lines)
-        assert marker.startswith(f"additional_evidence_lines_withheld={len(full_lines) - len(kept)} ")
-        assert f"advisor budget of {char_cap} chars" in marker
+        assert 0 <= _optional_summary_chars(arguments, state) <= char_cap
+        assert len(excerpt) > char_cap
+        for node in state.nodes:
+            line = _node_line(excerpt, node.id)
+            if node.id.startswith("node_"):
+                for index in range(8):
+                    assert f"queries.q{index:02d}.input_fields={{'colour': 'colour'}}" in line
+        assert "optional_prose_units_withheld=" in excerpt
+        assert "additional_evidence_lines_withheld" not in excerpt
 
 
 def test_checkpoint_excerpt_is_byte_identical_when_within_budget(make_service, simple_state):
@@ -6308,8 +6282,6 @@ async def test_actual_checkpoint_dispatch_and_retry_fit_optional_summary(
     make_service, simple_state, monkeypatch, physical_advisor, phase, first
 ):
     from elspeth.web.composer.advisor_context import (
-        _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER,
-        advisor_checkpoint_summary_chars,
         build_advisor_user_message,
         summarize_pipeline_for_advisor,
     )
@@ -6330,39 +6302,23 @@ async def test_actual_checkpoint_dispatch_and_retry_fit_optional_summary(
     build_kwargs = {"phase": phase, "state": state}
     if phase == "end":
         build_kwargs["publication_review"] = fenced["publication_review"]
-    if first in {"schema", "contract"}:
-        # End the first input immediately after a real whole-line boundary.
-        # The same owned review is mandatory in both this premise and dispatch.
-        probe = service._advisor_checkpoint._build_checkpoint_arguments(**build_kwargs)
-        lines = full.split("\n")
-        kept = lines[: next(index for index, line in enumerate(lines, 1) if "node_00" in line)]
-        cap = service._settings.composer_advisor_max_prompt_tokens * 4
-        for _ in range(3):
-            marker = _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(count=len(lines) - len(kept), limit=cap)
-            prefix = "\n".join([*kept, marker])
-            measured = advisor_checkpoint_summary_chars({**probe, "schema_excerpt": prefix})
-            cap = ((measured + 3) // 4) * 4
-        service._advisor_checkpoint._settings = _make_settings(composer_advisor_max_prompt_tokens=cap // 4)
     cap = service._advisor_checkpoint._settings.composer_advisor_max_prompt_tokens * 4
     arguments = service._advisor_checkpoint._build_checkpoint_arguments(**build_kwargs)
-    assert advisor_checkpoint_summary_chars(arguments) <= cap
-    assert advisor_checkpoint_summary_chars({**arguments, "schema_excerpt": full}) > cap
+    assert 0 <= _optional_summary_chars(arguments, state) <= cap
+    assert _optional_summary_chars({**arguments, "schema_excerpt": full}, state) > cap
+    assert all(f"  - {node.id}:" in arguments["schema_excerpt"] for node in state.nodes)
     if first in {"schema", "contract"}:
         unfitted_retry = advisor_arguments_with_format_reprompt(arguments, schema_valid=first == "contract")
         assert advisor_checkpoint_summary_chars(unfitted_retry) == advisor_checkpoint_summary_chars(arguments)
         assert len(build_advisor_user_message(unfitted_retry)) > len(build_advisor_user_message(arguments))
-        minimum_retry = {
-            **unfitted_retry,
-            "schema_excerpt": _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(count=len(full.split("\n")), limit=cap),
-        }
-        assert advisor_checkpoint_summary_chars(minimum_retry) <= cap
+        assert 0 <= _optional_summary_chars(unfitted_retry, state) <= cap
 
     with prompt_guard_user_scope(""):
         verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=state, recorder=recorder, **fenced)
 
     assert verdict.ok and not verdict.blocking
     assert len(calls) == (1 if first == "clean" else 2)
-    assert advisor_checkpoint_summary_chars(arguments) <= cap
+    assert 0 <= _optional_summary_chars(arguments, state) <= cap
     assert calls[0]["messages"][1]["content"] == build_advisor_user_message(arguments)
     assert len(recorder.llm_calls) == len(calls)
     record = service._sessions_service.add_message.await_args_list[0].kwargs["tool_calls"][0]["pass"]
@@ -6382,13 +6338,14 @@ async def test_actual_checkpoint_dispatch_and_retry_fit_optional_summary(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_large_checkpoint_body_without_publication_fits_real_wire(make_service, simple_state, monkeypatch, physical_advisor, phase):
-    from elspeth.web.composer.advisor_context import advisor_checkpoint_summary_chars, build_advisor_user_message
+    from elspeth.web.composer.advisor_context import build_advisor_user_message
 
     service = make_service()
     physical_advisor.bind(service)
     reply = _checkpoint_reply(publication_verdict="WITHHOLD", findings="Omitted evidence.") if phase == "end" else _checkpoint_reply()
     calls = _install_budget_advisor_transport(monkeypatch, [reply])
-    arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase=phase, state=_pathological_multi_query_state(simple_state))
+    state = _pathological_multi_query_state(simple_state)
+    arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase=phase, state=state)
     assert "user_message" not in arguments and "publication_review" not in arguments
     recorder = make_recorder()
     with prompt_guard_user_scope(""):
@@ -6396,7 +6353,7 @@ async def test_large_checkpoint_body_without_publication_fits_real_wire(make_ser
             arguments, recorder=recorder, structured_output=True, provider_owner=physical_advisor.owner
         )
     assert guidance == reply and len(calls) == 1 and len(recorder.llm_calls) == 1
-    assert advisor_checkpoint_summary_chars(arguments) <= service._settings.composer_advisor_max_prompt_tokens * 4
+    assert 0 <= _optional_summary_chars(arguments, state) <= service._settings.composer_advisor_max_prompt_tokens * 4
     assert calls[0]["messages"][1]["content"] == build_advisor_user_message(arguments)
     # This qualifies wire budgeting, not the separately defective unbound
     # public END wrapper's completed-pass publication contract.
@@ -6480,85 +6437,8 @@ async def test_unsent_format_retry_keeps_first_actual_call_without_completed_rev
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("phase", ["early", "end"])
-async def test_optional_summary_overflow_is_not_a_completed_review(make_service, simple_state, monkeypatch, phase):
-    service = make_service()
-    service._advisor_checkpoint._settings = _make_settings(composer_advisor_max_prompt_tokens=1)
-    calls = _install_budget_advisor_transport(monkeypatch, [])
-    recorder = make_recorder()
-    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-        phase=phase, state=simple_state, recorder=recorder, **_fenced_session(service)
-    )
-    assert (verdict.ok, verdict.blocking, verdict.failure_class, verdict.retryable) == (False, False, "budget_exhausted", False)
-    assert "Optional pipeline evidence" in verdict.findings_text
-    assert verdict.publication_verdict is None and verdict.publication_binding is None
-    assert calls == [] and recorder.llm_calls == ()
-    service._sessions_service.add_message.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_optional_summary_refusal_preserves_continuation_reservation(make_service, simple_state, monkeypatch):
-    from decimal import Decimal
-
-    from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerContinuationBudget
-    from elspeth.web.composer.turn_effects import TurnEvidence
-
-    service = make_service(composer_advisor_max_prompt_tokens=1)
-    fenced = _fenced_session(service)
-    request = "Explain this graph. " + "a" * 17000
-    evidence = TurnEvidence(
-        session_id=fenced["session_id"],
-        session_operation_context=fenced["session_operation_context"],
-        request_id="smk06-continuation",
-        request=request,
-        initial_state_id=None,
-        initial_state=simple_state,
-    )
-    review = evidence.review_candidate(candidate="A concise reply", request=request, current_state=simple_state)
-    budget = PlannerContinuationBudget(
-        policy=PlannerBudgetPolicy(2, 1_000_000, 100, Decimal("1")),
-        session_id=fenced["session_id"],
-        request_id="smk06-continuation",
-        request_hash=stable_hash(request),
-        provider_owner=None,
-        evidence_owner=evidence,
-        deadline=asyncio.get_running_loop().time() + 60,
-        reserved_calls=0,
-        validated_cost=Decimal("0"),
-        cost_known=True,
-    )
-    budget.validate_for(
-        session_id=fenced["session_id"],
-        request_id="smk06-continuation",
-        request=request,
-        provider_owner=None,
-        evidence_owner=evidence,
-    )
-    budget.bind_publication(review)
-    calls = _install_budget_advisor_transport(monkeypatch, [])
-    recorder = make_recorder()
-    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-        phase="end",
-        state=simple_state,
-        user_message=request,
-        publication_review=review,
-        continuation_budget=budget,
-        recorder=recorder,
-        **fenced,
-    )
-    assert verdict.failure_class == "budget_exhausted" and not verdict.retryable
-    assert "Optional pipeline evidence" in verdict.findings_text
-    assert budget.reserved_calls == 0 and budget.validated_cost == Decimal("0")
-    assert calls == [] and recorder.llm_calls == ()
-    service._sessions_service.add_message.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("required_scope", [False, True])
-@pytest.mark.parametrize("structured_output", [False, True])
-async def test_final_advisor_dispatch_guard_precedes_provider_and_audit(
-    make_service, simple_state, monkeypatch, required_scope, structured_output
-):
+async def test_public_hint_dispatch_guard_precedes_provider_and_audit(make_service, simple_state, monkeypatch, required_scope):
     from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.required_work import (
         RequiredAuthorityKind,
@@ -6585,14 +6465,14 @@ async def test_final_advisor_dispatch_guard_precedes_provider_and_audit(
         service=service._sessions_service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
     )
     arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase="early", state=simple_state)
-    arguments["schema_excerpt" if structured_output else "problem_summary"] = "x" * 16001
+    arguments["problem_summary"] = "x" * 16001
     calls = _install_budget_advisor_transport(monkeypatch, [_checkpoint_reply()])
     recorder = make_recorder()
-    with pytest.raises(InvariantError, match="optional summary" if structured_output else "complete-message budget"):
+    with pytest.raises(InvariantError, match="complete-message budget"):
         await service._advisor_checkpoint._call_advisor_with_audit(
             arguments,
             recorder=recorder,
-            structured_output=structured_output,
+            structured_output=False,
             provider_owner=owner if required_scope else None,
         )
     assert calls == [] and recorder.llm_calls == () and coordinator.tickets == ()
@@ -6642,40 +6522,9 @@ async def test_standalone_signoff_keeps_missing_publication_binding_integrity_re
     assert not any(row.tool_calls and row.tool_calls[0]["_kind"] == "advisor_checkpoint_pass_audit" for row in rows)
 
 
-@pytest.mark.asyncio
-async def test_public_signoff_refuses_optional_summary_before_dispatch(make_service, simple_state, monkeypatch):
-    from elspeth.contracts.chargeable_admission import AdmissionPolicyEvidence, ChargeableAdmissionDecision, QuotaDisposition
-    from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
-
-    service = make_service()
-    fenced = _fenced_session(service)
-    service._sessions_service.assess_chargeable_operation = _AsyncRecorder(
-        return_value=ChargeableAdmissionDecision(
-            refusal_reason=None,
-            evidence=AdmissionPolicyEvidence(quota_disposition=QuotaDisposition.NOT_CONFIGURED, secret_wiring_hash="a" * 64),
-        )
-    )
-    service._advisor_checkpoint._chargeable_admission = ComposerChargeableAdmission(service._sessions_service)
-    service._advisor_checkpoint._settings = _make_settings(composer_advisor_max_prompt_tokens=1)
-    calls = _install_budget_advisor_transport(monkeypatch, [])
-    verdict = await service._advisor_checkpoint.run_signoff_checkpoint(
-        state=simple_state,
-        recorder=make_recorder(),
-        user_message="Review supplied evidence.",
-        **fenced,
-    )
-    assert verdict.failure_class == "budget_exhausted" and not verdict.retryable
-    assert "Optional pipeline evidence" in verdict.findings_text
-    assert calls == []
-    assert service._sessions_service.assess_chargeable_operation.await_count == 1
-    service._sessions_service.begin_provider_attempt.assert_not_called()
-    service._sessions_service.add_message.assert_not_awaited()
-
-
-def test_budgeted_end_retains_mandatory_context_and_exposes_tail_visibility_limit(make_service, simple_state):
+def test_budgeted_end_retains_mandatory_context_and_tail_graph_facts(make_service, simple_state):
     from elspeth.web.composer._compose_loop_carriers import _AdvisorReviewState
     from elspeth.web.composer.advisor_context import (
-        advisor_checkpoint_summary_chars,
         build_advisor_user_message,
         summarize_pipeline_for_advisor,
     )
@@ -6720,11 +6569,8 @@ def test_budgeted_end_retains_mandatory_context_and_exposes_tail_visibility_limi
         publication_review=review,
     )
     full = summarize_pipeline_for_advisor(state)
-    *kept, marker = arguments["schema_excerpt"].split("\n")
-    assert kept == full.split("\n")[: len(kept)]
-    assert marker.startswith(f"additional_evidence_lines_withheld={len(full.split(chr(10))) - len(kept)} ")
     assert "late_model_canary" in full and "late_sink_field_canary" in full
-    assert "late_model_canary" not in arguments["schema_excerpt"] and "late_sink_field_canary" not in arguments["schema_excerpt"]
+    assert "late_model_canary" in arguments["schema_excerpt"] and "late_sink_field_canary" in arguments["schema_excerpt"]
     assert f"Current evidence identity: {stable_hash({'advisor_evidence': full})}." in arguments["problem_summary"]
     assert "prior_evidence" in arguments["problem_summary"] and len(arguments["recent_errors"]) == 5
     assert arguments["attempted_actions"] == [
@@ -6732,7 +6578,7 @@ def test_budgeted_end_retains_mandatory_context_and_exposes_tail_visibility_limi
     ]
     assert arguments["user_message"] == request and arguments["publication_review"] is review
     prompt = build_advisor_user_message(arguments)
-    assert advisor_checkpoint_summary_chars(arguments) <= 16000 and review.provider_payload_json in prompt
+    assert 0 <= _optional_summary_chars(arguments, state) <= 16000 and review.provider_payload_json in prompt
     assert "late_model_canary" not in review.provider_payload_json and "late_sink_field_canary" not in review.provider_payload_json
     fitting = dataclass_replace(state, nodes=(tail,))
     visible = service._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=fitting)["schema_excerpt"]

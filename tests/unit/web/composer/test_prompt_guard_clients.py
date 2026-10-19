@@ -9,8 +9,7 @@ import httpx
 import pytest
 
 from elspeth.contracts.prompt_guard import (
-    PROMPT_GUARD_MAX_DOCUMENTS,
-    PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
+    PROMPT_GUARD_MAX_DOCUMENTS_PER_CALL,
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
     PromptGuardRequest,
 )
@@ -99,17 +98,20 @@ async def test_azure_batches_whole_documents_without_truncation() -> None:
     returned = tuple(document for body in observed for document in body["documents"])
     assert returned == documents
     assert len(observed) == 3
+    assert [len(body["documents"]) for body in observed] == [1, 5, 2]
+    assert all(len(body["documents"]) <= PROMPT_GUARD_MAX_DOCUMENTS_PER_CALL for body in observed)
+    assert all(sum(len(document) for document in body["documents"]) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for body in observed)
     assert all(body["userPrompt"] == "Build an ordinary graph" for body in observed)
 
 
 @pytest.mark.asyncio
-async def test_azure_accepts_complete_declared_utf8_envelope_without_changing_call_limits() -> None:
+async def test_azure_accepts_history_beyond_old_logical_limits_without_changing_call_limits() -> None:
     from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 
     user = "\U0001f680" * PROMPT_GUARD_MAX_TEXT_CHARACTERS
-    documents = tuple(chr(0x1F300 + index) * PROMPT_GUARD_MAX_TEXT_CHARACTERS for index in range(PROMPT_GUARD_MAX_DOCUMENTS))
+    documents = tuple(chr(0x1F300 + index) * PROMPT_GUARD_MAX_TEXT_CHARACTERS for index in range(129))
     inspected_bytes = len(user.encode("utf-8")) + sum(len(document.encode("utf-8")) for document in documents)
-    assert inspected_bytes == 5_160_000
+    assert inspected_bytes == 5_200_000
     observed: list[dict[str, object]] = []
 
     def serve(request: httpx.Request) -> httpx.Response:
@@ -124,8 +126,7 @@ async def test_azure_accepts_complete_declared_utf8_envelope_without_changing_ca
     result = await client.inspect(_request(user=user, documents=documents))
     assert (result.disposition, result.reason) == ("allow", "clean")
     assert tuple(document for body in observed for document in body["documents"]) == documents
-    assert len(observed) == PROMPT_GUARD_MAX_DOCUMENTS
-    assert inspected_bytes == PROMPT_GUARD_MAX_INPUT_UTF8_BYTES
+    assert len(observed) == 129
 
 
 @pytest.mark.asyncio
@@ -134,7 +135,6 @@ async def test_azure_accepts_complete_declared_utf8_envelope_without_changing_ca
     [
         _request(user="u" * 10001),
         _request(documents=("d" * 10001,)),
-        _request(documents=("d",) * 129),
         _request(user="\ud800"),
         _request(documents=("\ud800",)),
         _request(user="", documents=()),

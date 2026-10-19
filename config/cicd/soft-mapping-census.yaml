@@ -93,7 +93,7 @@ files:
   src/elspeth/contracts/preflight.py:
     Mapping[str, Any]: 1
   src/elspeth/contracts/prompt_guard.py:
-    Mapping[str, Any]: 4
+    Mapping[str, Any]: 5
     dict[str, Any]: 3
   src/elspeth/contracts/results.py:
     dict[str, Any]: 2
@@ -759,19 +759,22 @@ files:
   src/elspeth/web/composer/_validation_probe.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 1
+  src/elspeth/web/composer/advisor_abandonment.py:
+    Mapping[str, Any]: 1
   src/elspeth/web/composer/advisor_checkpoint.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 10
   src/elspeth/web/composer/advisor_context.py:
-    Mapping[str, Any]: 8
+    Mapping[str, Any]: 10
     dict[str, Any]: 1
   src/elspeth/web/composer/advisor_output.py:
-    dict[str, object]: 1
+    dict[str, object]: 2
   src/elspeth/web/composer/advisor_policy.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 1
   src/elspeth/web/composer/advisor_request.py:
-    dict[str, object]: 2
+    Mapping[str, object]: 1
+    dict[str, object]: 3
   src/elspeth/web/composer/audit.py:
     Mapping[str, Any]: 8
     dict[str, Any]: 4
@@ -841,6 +844,8 @@ files:
     dict[str, Any]: 10
   src/elspeth/web/composer/provider_telemetry.py:
     Mapping[str, object]: 1
+  src/elspeth/web/composer/provider_thinking.py:
+    dict[str, Any]: 2
   src/elspeth/web/composer/reasoning.py:
     dict[str, object]: 1
   src/elspeth/web/composer/recovery_controls.py:
@@ -900,7 +905,7 @@ files:
     Mapping[str, Any]: 2
   src/elspeth/web/composer/tools/blobs.py:
     boundary: 3
-    dict[str, Any]: 11
+    dict[str, Any]: 12
   src/elspeth/web/composer/tools/declarations.py:
     Mapping[str, Any]: 4
   src/elspeth/web/composer/tools/generation.py:
@@ -939,7 +944,7 @@ files:
     Mapping[str, Any]: 3
     dict[str, Any]: 1
   src/elspeth/web/composer/turn_effects.py:
-    Mapping[str, Any]: 2
+    Mapping[str, Any]: 3
   src/elspeth/web/composer/tutorial_models.py:
     dict[str, Any]: 1
   src/elspeth/web/composer/tutorial_service.py:
@@ -1072,10 +1077,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 762
-  Mapping[str, object]: 316
+  Mapping[str, Any]: 767
+  Mapping[str, object]: 317
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1080
-  dict[str, object]: 396
-  soft: 2562
+  dict[str, Any]: 1083
+  dict[str, object]: 398
+  soft: 2573

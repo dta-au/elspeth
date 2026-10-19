@@ -125,8 +125,16 @@ def test_non_strict_survivors_are_not_an_infrastructure_error(monkeypatch: pytes
     assert invoke(monkeypatch, strict=False, run_code=2, killed=0) == 0
 
 
-def test_zero_mutants_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert invoke(monkeypatch, killed=0, total=0) == 1
+@pytest.mark.parametrize("strict", [False, True])
+def test_zero_mutants_fails_closed(monkeypatch: pytest.MonkeyPatch, strict: bool) -> None:
+    assert invoke(monkeypatch, killed=0, total=0, strict=strict) == 1
+
+
+@pytest.mark.parametrize(("strict", "killed", "expected"), [(False, 17, 0), (True, 17, 2), (True, 18, 0), (True, 20, 0)])
+def test_directory_inventory_includes_descendants_and_honors_its_threshold(
+    monkeypatch: pytest.MonkeyPatch, strict: bool, killed: int, expected: int
+) -> None:
+    assert invoke(monkeypatch, strict=strict, module="landscape/", xml=report(0, other=20), killed=killed) == expected
 
 
 def test_missing_module_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
