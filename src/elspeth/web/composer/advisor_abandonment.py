@@ -11,7 +11,6 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
-    PROMPT_GUARD_TRUST_KEY,
     PromptGuardContentPart,
     PromptGuardTrust,
     detach_prompt_guard_evidence,
@@ -101,9 +100,7 @@ def build_abandonment_review(
         {
             "available_ids": sorted(str(item) for item in plugin_snapshot.available),
             "prohibited_ids": sorted(
-                str(item.plugin_id)
-                for item in plugin_snapshot.unavailable
-                if item.reason is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
+                str(item.plugin_id) for item in plugin_snapshot.unavailable if item.reason is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
             ),
             "usable_profile_aliases": {str(item): list(aliases) for item, aliases in plugin_snapshot.usable_profile_aliases},
             "catalog_scope": "Available in this request; absence does not establish an engine capability gap.",

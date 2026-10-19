@@ -68,8 +68,8 @@ from elspeth.web.blobs.service import (
     content_hash,
     sanitize_filename,
 )
-from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer._attachment_response import READ_ATTACHMENT_RESPONSE_CONTRACT
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     READ_ATTACHMENT_MAX_UTF8_BYTES,
     BlobReadSuggestion,

@@ -378,6 +378,10 @@ outputs under the node's shared system/model configuration.
 Per-query structured extraction checks types before a dependent query runs;
 node-level `result_checks` run after all queries. Keep a separate node boundary
 when a required check must run before another model call.
+Preserve each field's requested meaning when writing postconditions. Validate
+independent outputs independently; never copy a score-to-verdict relationship
+from one question/query group into another unless the request specifies it for
+that group.
 No query publishes a partial output row. Failure discards local results and
 routes the original entry row, while completed provider calls and charges remain.
 Recovery restarts at the node boundary and may repeat calls.

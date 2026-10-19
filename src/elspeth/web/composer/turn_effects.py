@@ -24,9 +24,9 @@ from elspeth.web.composer.redaction import GetBlobContentDataModel
 from elspeth.web.composer.source_inspection import SourceKind, facts_from_dict
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._registry import response_contract_for
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions._persist_payload import CommittedCheckpointWitness
 from elspeth.web.sessions.converters import state_from_record
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.validation import _redact_sensitive_content
 
 CHECKPOINT_CHANGED_SCOPE: Final = (
@@ -683,7 +683,10 @@ class TurnEvidence:
         }
         if self._abandonment_review is not None:
             stop_review, stop_decision = self._abandonment_review
-            if stop_review.graph_hash == stable_hash(current_state.to_dict()) and stop_review.registration_revision == self._registration_revision:
+            if (
+                stop_review.graph_hash == stable_hash(current_state.to_dict())
+                and stop_review.registration_revision == self._registration_revision
+            ):
                 payload["authoring_stop_review"] = {
                     "binding": stop_review.binding,
                     "policy_snapshot_hash": stop_review.policy_hash,

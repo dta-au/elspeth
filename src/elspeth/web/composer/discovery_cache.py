@@ -10,8 +10,8 @@ from pydantic import BaseModel
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
-from elspeth.web.composer._attachment_response import AdmittedAttachmentResponse
 from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.composer._attachment_response import AdmittedAttachmentResponse
 from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
 from elspeth.web.composer.response_contracts import AdmittedResponse

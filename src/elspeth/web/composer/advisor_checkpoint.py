@@ -38,6 +38,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdvisorProviderFailure,
     _AdvisorReviewState,
 )
+from elspeth.web.composer.advisor_abandonment import AdvisorAbandonmentContextUnavailable, AdvisorAbandonmentReview
 from elspeth.web.composer.advisor_audit import (
     AdvisorCheckpointPassRecord,
     AdvisorTerminalBlockReason,
@@ -46,7 +47,6 @@ from elspeth.web.composer.advisor_audit import (
     persist_advisor_terminal_publication,
 )
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase, AdvisorCheckpointVerdictSource
-from elspeth.web.composer.advisor_abandonment import AdvisorAbandonmentContextUnavailable, AdvisorAbandonmentReview
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorSignoffGateFact
 from elspeth.web.composer.advisor_output import (
     AdvisorEndResponse,
@@ -418,11 +418,10 @@ class AdvisorCheckpointOwner:
         # keep the Tier-3 trust-boundary rules clean.
         user_msg = _advisor_context.build_advisor_user_message(arguments)
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
-        if checkpoint_phase is None:
-            if len(user_msg) > char_cap:
-                raise InvariantError("Advisor input exceeded its admitted complete-message budget")
-        elif _advisor_context.advisor_checkpoint_summary_chars(arguments) > char_cap:
-            raise InvariantError("Advisor optional summary exceeded its admitted checkpoint budget")
+        if checkpoint_phase is None and len(user_msg) > char_cap:
+            raise InvariantError("Advisor input exceeded its admitted complete-message budget")
+        # Checkpoint builders retain the complete required graph and fit only
+        # optional additions. The public hint's allowance is not a graph cap.
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_msg, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION},
@@ -1264,16 +1263,6 @@ class AdvisorCheckpointOwner:
                     "schema_excerpt": "".join(part.text for part in summary_parts.values),
                     "_elspeth_advisor_summary_parts": summary_parts,
                 }
-            if _advisor_context.advisor_checkpoint_summary_chars(call_arguments) > char_cap:
-                # Expected size exhaustion is not a completed model review.
-                # Preserve any prior actual call, but spend no further attempt.
-                return AdvisorCheckpointVerdict(
-                    ok=False,
-                    blocking=False,
-                    findings_text="Complete required graph evidence exceeds the existing advisor summary budget.",
-                    failure_class="budget_exhausted",
-                    retryable=False,
-                )
             if continuation_budget is not None and not continuation_budget.reserve_attempt(now=_compose_deadline_time()):
                 return continuation_withheld()
             remaining: float | None = None

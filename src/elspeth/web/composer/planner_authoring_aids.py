@@ -2740,9 +2740,7 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
         }
         aids["llm_output_contract"] = {"rules": _llm_output_contract_rules(output_control=required_output_control)}
     if "llm" in visible["source"] and required_output_control is not None:
-        aids["llm_source_generation"] = {
-            "rules": _llm_source_generation_rules(output_control=required_output_control)
-        }
+        aids["llm_source_generation"] = {"rules": _llm_source_generation_rules(output_control=required_output_control)}
     aids["review_registry"] = {
         # Imported from interpretation_state so the taught vocabulary can
         # never drift from the resolve-time registry (52322ebe1 discipline).

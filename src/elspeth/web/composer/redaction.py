@@ -3432,6 +3432,7 @@ class ReadAttachmentDataModel(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")
 
+
 class ReadAttachmentResponseModel(BaseModel):
     """Sensitive full-file text and recoverable failures share a closed envelope."""
 

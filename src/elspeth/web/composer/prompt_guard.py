@@ -21,8 +21,6 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import is_lower_sha256_hex
 from elspeth.contracts.prompt_guard import (
-    PROMPT_GUARD_MAX_DOCUMENTS,
-    PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
     PromptGuardClient,
     PromptGuardContentPart,
@@ -327,15 +325,14 @@ def _request(
                         supported = False
     packed = _pack_documents(documents)
     try:
-        size = len(user.encode("utf-8")) + sum(len(document.encode("utf-8")) for document in packed)
+        user.encode("utf-8")
+        for document in packed:
+            document.encode("utf-8")
     except UnicodeEncodeError:
         supported = False
-    else:
-        supported = supported and size <= PROMPT_GUARD_MAX_INPUT_UTF8_BYTES
     supported = (
         supported
         and len(user) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
-        and len(packed) <= PROMPT_GUARD_MAX_DOCUMENTS
         and all(len(document) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in packed)
         and bool(user or any(packed))
     )
@@ -441,8 +438,6 @@ async def enforce_prompt_guard(
                     "mode": mode,
                     "max_prompt_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
                     "max_document_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
-                    "max_documents": PROMPT_GUARD_MAX_DOCUMENTS,
-                    "max_input_utf8_bytes": PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
                 },
                 sort_keys=True,
             ).encode("utf-8")

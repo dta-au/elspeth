@@ -1980,35 +1980,36 @@ def _escape_hatch_notice() -> str:
     )
 
 
-def _assistant_tool_calls_message(
-    message: Any, calls: tuple[_ParsedToolCall, ...], *, thinking_blocks: object = None
-) -> dict[str, Any]:
+def _assistant_tool_calls_message(message: Any, calls: tuple[_ParsedToolCall, ...], *, thinking_blocks: object = None) -> dict[str, Any]:
     from elspeth.web.composer.provider_thinking import attach_provider_thinking
 
-    replay = attach_provider_thinking({
-        "role": "assistant",
-        "content": _provider_field(message, "content"),
-        "tool_calls": [
-            {
-                "id": call.call_id,
-                "type": "function",
-                "function": {
-                    "name": call.name,
-                    "arguments": canonical_json(
-                        {"_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS, "error_class": "ToolArgumentError"}
-                    )
-                    if call.wire_error is not None
-                    else call.raw_arguments,
-                },
-            }
-            for call in calls
-        ],
-        PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY: tuple(
-            PromptGuardToolArgumentParts(index, json_argument_content_parts(call.raw_arguments))
-            for index, call in enumerate(calls)
-            if call.wire_error is None
-        ),
-    }, thinking_blocks)
+    replay = attach_provider_thinking(
+        {
+            "role": "assistant",
+            "content": _provider_field(message, "content"),
+            "tool_calls": [
+                {
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": canonical_json(
+                            {"_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS, "error_class": "ToolArgumentError"}
+                        )
+                        if call.wire_error is not None
+                        else call.raw_arguments,
+                    },
+                }
+                for call in calls
+            ],
+            PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY: tuple(
+                PromptGuardToolArgumentParts(index, json_argument_content_parts(call.raw_arguments))
+                for index, call in enumerate(calls)
+                if call.wire_error is None
+            ),
+        },
+        thinking_blocks,
+    )
     if "thinking_blocks" in replay and any(call.wire_error is not None for call in calls):
         raise PipelinePlannerError("Native thinking cannot be replayed with rewritten tool arguments", code="MALFORMED_RESPONSE")
     return replay

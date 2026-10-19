@@ -18,9 +18,9 @@ from elspeth.contracts.credential_material import find_credential_material, is_s
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES, JsonBoundaryError, JsonTraversalBudget
 from elspeth.web.composer.diagnostic_evidence import _POLICY, _decode, _DuplicateKeys, _project
-from elspeth.web.composer.redaction import MANIFEST
-from elspeth.web.composer.provider_thinking import native_thinking_blocks
 from elspeth.web.composer.protocol import ComposerAdmissionRefused
+from elspeth.web.composer.provider_thinking import native_thinking_blocks
+from elspeth.web.composer.redaction import MANIFEST
 
 _DATA_URL = re.compile(r"\bdata:[^,\s]*,", re.IGNORECASE)
 

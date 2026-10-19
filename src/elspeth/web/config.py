@@ -457,7 +457,8 @@ class WebSettings(BaseModel):
         description=(
             "Rough input-cost allowance converted to characters at four characters per configured unit. "
             "Public hints count the complete variable message; backend EARLY/END checkpoints count only "
-            "the rendered optional pipeline summary. Mandatory checkpoint evidence is preserved separately. "
+            "optional prose added above the complete required graph. Mandatory graph and checkpoint evidence "
+            "is always retained and is not capped by this allowance. "
             "This is not a measured provider-token or context-window limit."
         ),
     )

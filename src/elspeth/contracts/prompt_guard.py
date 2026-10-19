@@ -24,11 +24,11 @@ PROMPT_GUARD_TRUST_KEY = "_elspeth_prompt_guard_trust"
 PROMPT_GUARD_CONTENT_PARTS_KEY = "_elspeth_prompt_guard_content_parts"
 PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY = "_elspeth_prompt_guard_tool_argument_parts"
 PROMPT_GUARD_THINKING_PARTS_KEY = "_elspeth_prompt_guard_thinking_parts"
+# Azure Prompt Shields limits each physical call, not the complete authoring
+# history. Longer inspection runs are sent in as many calls as required.
+# https://learn.microsoft.com/en-us/azure/ai-services/content-safety/region-availability#service-limits
 PROMPT_GUARD_MAX_TEXT_CHARACTERS = 10_000
-PROMPT_GUARD_MAX_DOCUMENTS = 128
-# One user prompt plus complete packed documents, with at most four UTF-8
-# bytes per valid character. Azure's per-call limits are enforced separately.
-PROMPT_GUARD_MAX_INPUT_UTF8_BYTES = (PROMPT_GUARD_MAX_DOCUMENTS + 1) * PROMPT_GUARD_MAX_TEXT_CHARACTERS * 4
+PROMPT_GUARD_MAX_DOCUMENTS_PER_CALL = 5
 
 
 class PromptGuardTrust(Enum):
@@ -150,9 +150,12 @@ def detach_prompt_guard_evidence(messages: Sequence[Mapping[str, Any]]) -> Detac
             {
                 key: value
                 for key, value in message.items()
-                if key not in (
-                    PROMPT_GUARD_TRUST_KEY, PROMPT_GUARD_CONTENT_PARTS_KEY,
-                    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY, PROMPT_GUARD_THINKING_PARTS_KEY,
+                if key
+                not in (
+                    PROMPT_GUARD_TRUST_KEY,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY,
+                    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
+                    PROMPT_GUARD_THINKING_PARTS_KEY,
                 )
             }
         )

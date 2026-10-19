@@ -517,7 +517,20 @@ async def _litellm_acompletion(
             current if current is not None else forwarded
             for current, forwarded in zip(thinking_parts, prompt_guard_thinking_parts, strict=True)
         )
-    require_no_credential_material(kwargs["messages"], surface="composer_provider_request")
+    credential_messages = []
+    for message in kwargs["messages"]:
+        if "thinking_blocks" in message:
+            from elspeth.web.composer.provider_thinking import native_thinking_blocks
+
+            if message["role"] != "assistant":
+                raise AuditIntegrityError("Provider thinking belongs to an assistant message")
+            # Scan complete native fields under their closed grammar before
+            # applying generic control-content bounds to the other fields.
+            native_thinking_blocks(message["thinking_blocks"])
+            credential_messages.append({key: value for key, value in message.items() if key != "thinking_blocks"})
+        else:
+            credential_messages.append(message)
+    require_no_credential_material(credential_messages, surface="composer_provider_request")
     await enforce_prompt_guard(
         mount=prompt_guard_mount,
         mode=prompt_guard_mode,

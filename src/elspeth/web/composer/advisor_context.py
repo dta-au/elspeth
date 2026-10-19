@@ -304,21 +304,23 @@ def _join_advisor_summary_units(units: tuple[tuple[PromptGuardContentPart, ...],
 def fit_advisor_checkpoint_summary(state: CompositionState, arguments: Mapping[str, Any], char_cap: int) -> AdvisorSummaryParts:
     """Reserve complete structural evidence before selecting optional prose.
 
-    The allowance measures the exact redacted, fenced contribution used by the
-    provider request. Required records are atomic as a set: an oversized graph
-    is unavailable for model review, never a partially visible successful pass.
+    The configured cost allowance applies only to optional additions above the
+    complete structural graph. Required evidence is always retained; actual
+    provider request/context limits remain the provider boundary's concern.
     """
-    full = _join_advisor_summary_units(_pipeline_advisor_summary_units(state))
-
-    def fits(parts: AdvisorSummaryParts) -> bool:
-        return advisor_checkpoint_summary_chars({**arguments, "schema_excerpt": "".join(part.text for part in parts.values)}) <= char_cap
-
-    if fits(full):
-        return full
     required_units = _pipeline_advisor_summary_units(state, include_optional=False)
     required = _join_advisor_summary_units(required_units)
-    if not fits(required):
-        raise AdvisorGraphCoverageUnavailable("Complete required graph evidence exceeds the existing advisor summary budget.")
+    required_chars = advisor_checkpoint_summary_chars({**arguments, "schema_excerpt": "".join(part.text for part in required.values)})
+    optional_limit = required_chars + char_cap
+
+    def fits(parts: AdvisorSummaryParts) -> bool:
+        return (
+            advisor_checkpoint_summary_chars({**arguments, "schema_excerpt": "".join(part.text for part in parts.values)}) <= optional_limit
+        )
+
+    full = _join_advisor_summary_units(_pipeline_advisor_summary_units(state))
+    if fits(full):
+        return full
     optional = _optional_advisor_summary_units(state)
     selected = list(required_units)
     # Reserve the longest omission count throughout optional selection.
@@ -543,12 +545,6 @@ _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS: Final[int] = 1000
 # Option keys whose VALUE is prompt-shaped (free-text the model is told to
 # follow). Rendered with the larger budget above.
 _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS: Final[frozenset[str]] = frozenset({"prompt_template", "template", "system_prompt"})
-# A multi-query node renders at most this many per-query templates (each on
-# the prompt budget); the remainder is counted under
-# ``additional_queries_withheld`` so the omission is rubric-legible — the END
-# rubric reads every ``additional_*_withheld`` count as "that many further
-# entries exist but are not shown" and forbids a FLAG on them.
-_ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES: Final[int] = 8
 _ADVISOR_SUMMARY_INVALID_QUERIES_MARKER: Final[str] = "<invalid queries>"
 _ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER: Final[str] = "(node-level prompt_template)"
 _ADVISOR_SUMMARY_QUERY_INVALID_TEMPLATE_MARKER: Final[str] = "(template value is not text; plugin validation rejects this node)"
@@ -625,7 +621,7 @@ def bound_advisor_checkpoint_summary(arguments: Mapping[str, Any], char_cap: int
         "bounds the rendered entries with an explicit withheld count, and never raises"
     ),
 )
-def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, str, bool]]:
+def _advisor_query_option_values(options: Mapping[str, Any], *, plugin: str | None = None) -> list[tuple[str, str, bool]]:
     """ONE source of truth for a multi-query LLM node's prompt evidence surface.
 
     Yields ``(key, text, prose_shaped)`` triples used by the bounded renderer.
@@ -634,8 +630,7 @@ def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, 
 
     Per well-formed query entry (mapping form keyed by name, or list form
     carrying ``name`` — :func:`_well_formed_query_entries` is the composer's
-    single reading of that shape), in authoring order, up to
-    :data:`_ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES`:
+    single reading of that shape), in authoring order:
 
     * ``queries.<name>.input_fields`` — the variable-to-column binding,
       structural;
@@ -651,8 +646,7 @@ def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, 
       (``interpretation_state.multi_query_prompt_surface_from_options``)
       carries it as ``InvalidQueryTemplate`` and prints the same fact.
 
-    Then ``additional_queries_withheld`` when entries were cut, and
-    ``prompt_template_in_use`` naming which queries render the node-level
+    Then ``prompt_template_in_use`` naming which queries render the node-level
     template — or stating that none does. The plugin's effective-template rule
     (``LLMConfig._validate_template_variable_bindings``: override wins, the
     node-level template renders only for queries without one) is what makes
@@ -664,17 +658,15 @@ def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, 
     owns reporting the malformation. Absent ``queries`` yields nothing —
     single-prompt mode carries no marker at all.
 
-    The expansion describes how ``queries`` relate to a node-level
-    ``prompt_template``, so it applies only when that template is present as
-    a string. ``queries`` is not an LLM-only key: the AWS Textract transforms
-    carry a ``queries`` list of document questions with no prompt at all, and
-    expanding those would publish false prompt-surface markers ("queries
-    without their own template: #0, #1") about a plugin that has no templates.
-    Without a node-level template the key keeps today's name-only treatment
-    (the caller lists it under ``values withheld``). Never raises.
+    Known LLM nodes may supply every template at query level, with no node-level
+    template. Callers pass the plugin identity so these mappings remain visible
+    without inventing prompt surfaces for unrelated plugins such as Textract.
+    A caller without that identity retains the existing node-template signal.
+    Required query bindings are never limited by a prose template count.
     """
     raw = options.get("queries")
-    if raw is None or not isinstance(options.get("prompt_template"), str):
+    node_template = options.get("prompt_template")
+    if raw is None or (plugin != "llm" and not isinstance(node_template, str)):
         return []
     entries = _well_formed_query_entries(raw)
     if not entries:
@@ -684,7 +676,7 @@ def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, 
     any_invalid_template = any(
         entry.get("template") is not None and not isinstance(entry.get("template"), str) for _label, entry in entries
     )
-    for label, entry in entries[:_ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES]:
+    for label, entry in entries:
         input_fields = entry.get("input_fields")
         if isinstance(input_fields, Mapping):
             values.append((f"queries.{label}.input_fields", str(dict(input_fields)), False))
@@ -692,21 +684,17 @@ def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, 
         if isinstance(override, str):
             values.append((f"queries.{label}.template", override, True))
         elif override is None:
-            node_template_users.append(label)
-            values.append((f"queries.{label}.template", _ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER, False))
+            if isinstance(node_template, str):
+                node_template_users.append(label)
+                values.append((f"queries.{label}.template", _ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER, False))
+            else:
+                any_invalid_template = True
+                values.append((f"queries.{label}.template", _ADVISOR_SUMMARY_QUERY_INVALID_TEMPLATE_MARKER, False))
         else:
             # Present but not a string: plugin schema validation rejects the
             # node, so it is not rendered as prose and not a node-template
             # user — state the fact instead of skipping silently.
             values.append((f"queries.{label}.template", _ADVISOR_SUMMARY_QUERY_INVALID_TEMPLATE_MARKER, False))
-    withheld = len(entries) - _ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES
-    if withheld > 0:
-        values.append(("additional_queries_withheld", str(withheld), False))
-        # Queries beyond the bound may still fall back to the node template;
-        # count them so the in-use marker stays truthful.
-        for label, entry in entries[_ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES:]:
-            if entry.get("template") is None:
-                node_template_users.append(label)
     # Fact-register wording ("not used" / "used by"), never an editorial
     # "dead"/"leftover": the rubric owns prompt correctness, not composer
     # hygiene, and a judgement word primes the advisor to FLAG an inert but
@@ -939,16 +927,16 @@ def _optional_advisor_summary_units(state: CompositionState) -> tuple[tuple[Prom
     if state.metadata.description:
         units.append((PromptGuardContentPart(f"Intent (stated): {state.metadata.description}"),))
     components = (
-        *((f"source {name}", source.options) for name, source in state.sources.items()),
-        *((f"node {node.id}", node.options) for node in state.nodes),
-        *((f"sink {output.name}", output.options) for output in state.outputs),
+        *((f"source {name}", source.plugin, source.options) for name, source in state.sources.items()),
+        *((f"node {node.id}", node.plugin, node.options) for node in state.nodes),
+        *((f"sink {output.name}", output.plugin, output.options) for output in state.outputs),
     )
-    for label, options in components:
+    for label, plugin, options in components:
         for key in sorted(_ADVISOR_SUMMARY_PROMPT_VALUE_KEYS):
             if key in options:
                 units.append((PromptGuardContentPart(f"Optional {label}: "), *_render_options_for_advisor_parts({key: options[key]})))
         if "queries" in options:
-            for query_key, text, prose_shaped in _advisor_query_option_values(options):
+            for query_key, text, prose_shaped in _advisor_query_option_values(options, plugin=plugin):
                 if prose_shaped:
                     rendered = truncate_advisor_text(text, _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS)
                     units.append(
@@ -1121,10 +1109,9 @@ def _render_options_for_advisor_parts(
             if key == "queries":
                 # Per-query prompt surface: one entry per triple, prompt-shaped
                 # texts on the prompt budget with the untrusted-JSON framing,
-                # structural bindings and markers on the compact cap. An empty
-                # expansion (no node-level prompt_template — e.g. a Textract
-                # queries list) keeps the key name-only.
-                expansion = _advisor_query_option_values(options)
+                # structural bindings and markers retained completely. An
+                # unrelated plugin's queries list stays name-only.
+                expansion = _advisor_query_option_values(options, plugin=plugin)
                 if not expansion:
                     name_only.append(key)
                     continue

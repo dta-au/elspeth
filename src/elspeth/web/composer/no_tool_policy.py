@@ -1571,5 +1571,4 @@ def pre_state_interpretation_review_repair_message(*, next_turn: int, max_repair
         "affected LLM transform with prompt_template containing the "
         "{{interpretation:<term>}} placeholder. Wait for that tool result, "
         "then call request_interpretation_review again. "
-        f"This is forced repair turn {next_turn} of {max_repair_turns}."
     )

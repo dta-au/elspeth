@@ -1070,21 +1070,24 @@ async def run_tool_batch(
     from elspeth.web.composer.provider_thinking import attach_provider_thinking
 
     llm_messages.append(
-        attach_provider_thinking({
-            "role": "assistant",
-            "content": assistant_message.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in assistant_tool_calls
-            ],
-        }, completion.provider_metadata.thinking_blocks)
+        attach_provider_thinking(
+            {
+                "role": "assistant",
+                "content": assistant_message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in assistant_tool_calls
+                ],
+            },
+            completion.provider_metadata.thinking_blocks,
+        )
     )
 
     # Execute each tool call, tracking whether this turn has
@@ -1199,7 +1202,9 @@ async def run_tool_batch(
             )
             recorder.record_private_tool_authoring(private_authorings_by_call[tool_call.id])
             recorder.record(
-                finish_arg_error(audit, error_class="ToolArgumentError", error_category=category, error_message=detail, error_payload=payload)
+                finish_arg_error(
+                    audit, error_class="ToolArgumentError", error_category=category, error_message=detail, error_payload=payload
+                )
             )
             _append_tool_outcome(
                 response=None,
@@ -1209,10 +1214,14 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             tool_feedback_json = json.dumps(payload)
-            llm_messages.append({
-                "role": "tool", "tool_call_id": tool_call.id, "content": tool_feedback_json,
-                PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-            })
+            llm_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
+                }
+            )
             turn_has_discovery = True
             all_cache_hits = False
             continue
@@ -3285,7 +3294,11 @@ async def run_tool_batch(
         result_json = (
             serialize_admitted_discovery_result(admitted_result) if admitted_result is not None else _serialize_tool_result(result)
         )
-        if tool_name in {"get_blob_content", "read_attachment", "inspect_source"} and admitted_result is not None and ctx.turn_evidence is not None:
+        if (
+            tool_name in {"get_blob_content", "read_attachment", "inspect_source"}
+            and admitted_result is not None
+            and ctx.turn_evidence is not None
+        ):
             ctx.turn_evidence.register_blob_page(
                 tool_call_id=tool_call.id,
                 admitted=admitted_result,

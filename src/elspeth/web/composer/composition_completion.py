@@ -344,7 +344,6 @@ def _pending_interpretation_review_repair_message(
         "with an interpretation_requirements entry whose kind is 'pipeline_decision', "
         f"user_term is {PROMPT_SHIELD_USER_TERM!r}, and draft is {PROMPT_SHIELD_WARNING_DRAFT!r}; if the "
         "workflow cannot add the shield, keep going with the warning instead of blocking. "
-        f"This is interpretation review turn {next_turn} of {_MAX_REPAIR_TURNS}."
     )
 
 
@@ -369,7 +368,6 @@ def _rate_capped_vague_term_fallback_message(
         "options.prompt_template and remove the pending vague_term interpretation_requirements "
         "entry and its prompt wiring (its interpretation_ref prompt_template_parts entry or "
         "its {{interpretation:<term>}} token) from the target LLM node. "
-        f"This is interpretation review turn {next_turn} of {_MAX_REPAIR_TURNS}."
     )
 
 
@@ -815,7 +813,6 @@ def _compose_preflight_repair_message(runtime_result: ValidationResult, *, next_
         rendered.append("1. The pipeline failed runtime preflight validation and cannot run as configured.")
 
     budget_note = (
-        f"This is runtime review turn {next_turn} of {_MAX_REPAIR_TURNS}. "
         "If the user's active request authorizes changes, fix the named violation through the appropriate composer tool "
         "(patch_node_options or upsert_node for a node, patch_source_options for a source, "
         "patch_output_options for a sink), then use preview_pipeline to verify it before claiming the draft is ready. "
@@ -1098,9 +1095,7 @@ class CompositionCompletion:
         for i, d in enumerate(blocking[:3], start=1):
             rendered.append(f"{i}. [{d['code']}] {d['message']}\n   Suggested repair: {d['suggested_repair']}")
 
-        next_turn = repair_turns_used + 1
         budget_note = (
-            f"This is proof review turn {next_turn} of {_MAX_REPAIR_TURNS}. "
             "If the user's active request authorizes changes, apply the appropriate repair through the declared tools "
             "and use preview_pipeline to verify it before claiming the draft is ready. "
             "If the user asks for explanation or says not to make changes, answer that request without changing the pipeline. "
@@ -1709,19 +1704,23 @@ class CompositionCompletion:
         # proof gate (more-specific blob diagnostics first) and BEFORE the
         # advisor gate (the frontier advisor only reviews a mechanically valid
         # pipeline — same rationale as the orphan pre-check below).
-        if not confirmed_stop and proof_runtime_preflight is None and await self._attempt_preflight_repair(
-            state=state,
-            llm_messages=llm_messages,
-            user_id=user_id,
-            session_id=session_id,
-            last_runtime_preflight=last_runtime_preflight,
-            runtime_preflight_cache=runtime_preflight_cache,
-            initial_version=initial_version,
-            session_scope=session_scope,
-            recorder=recorder,
-            repair_turns_used=repair_turns_used,
-            plugin_snapshot=plugin_snapshot,
-            session_operation_context=session_operation_context,
+        if (
+            not confirmed_stop
+            and proof_runtime_preflight is None
+            and await self._attempt_preflight_repair(
+                state=state,
+                llm_messages=llm_messages,
+                user_id=user_id,
+                session_id=session_id,
+                last_runtime_preflight=last_runtime_preflight,
+                runtime_preflight_cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                recorder=recorder,
+                repair_turns_used=repair_turns_used,
+                plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
+            )
         ):
             return _TerminateOutcome(action="continue", repair_turns_delta=1)
 
