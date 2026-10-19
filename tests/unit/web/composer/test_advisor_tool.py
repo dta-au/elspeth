@@ -289,7 +289,7 @@ def test_advisor_tool_exposed() -> None:
     assert "request_advisor_hint" in names
     advisor = next(t for t in tools if t["function"]["name"] == "request_advisor_hint")
     assert advisor["function"]["description"], "advisor tool needs a description"
-    assert "ADVICE" in advisor["function"]["description"], "description must steer the LLM that the reply is advice not config"
+    assert "advice" in advisor["function"]["description"].lower(), "description must steer the LLM that the reply is advice not config"
 
 
 def test_advisor_tool_schema_requires_trigger_and_mentions_proactive_criteria() -> None:
@@ -309,12 +309,14 @@ def test_advisor_tool_schema_requires_trigger_and_mentions_proactive_criteria() 
     assert trigger_schema["enum"] == [
         "proactive_security_safety",
         "proactive_red_listed_plugin",
+        "cannot_complete",
     ]
 
     description = advisor["description"]
     assert "security" in description
     assert "red-listed" in description
-    assert "before `set_pipeline`" in description
+    assert "before set_pipeline" in description
+    assert "CONTINUE_WITH_LIMITATION" in description
 
 
 def test_advisor_argument_validation_rejects_unknown_keys() -> None:
@@ -402,6 +404,44 @@ def test_advisor_tool_excluded_from_cli_mcp_allowlist() -> None:
 
 
 # --- 3. Compose-loop happy path (advisor returns guidance) ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision_kind", ["CONTINUE_WITH_LIMITATION", "STOP_CONFIRMED"])
+async def test_scoped_advisor_limitation_keeps_the_tool_result_actionable(decision_kind):
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings(budget=3))
+    decision = {
+        "decision": decision_kind,
+        "reason": (
+            "The requested external operation is unavailable, but source inspection is supported."
+            if decision_kind == "CONTINUE_WITH_LIMITATION"
+            else "All remaining work requires the unavailable external operation."
+        ),
+        "next_action": "Inspect the source schema." if decision_kind == "CONTINUE_WITH_LIMITATION" else None,
+        "question": None,
+    }
+    with (
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as primary,
+        patch("litellm.acompletion", new_callable=AsyncMock) as advisor,
+    ):
+        primary.side_effect = [
+            _make_advisor_tool_call("scoped-review", trigger="cannot_complete"),
+            _make_text_only_response("The external operation is unavailable; source inspection remains supported."),
+        ]
+        advisor.return_value = _make_advisor_response(json.dumps(decision))
+        result = await service.compose(
+            "Inspect the source and explain the unavailable operation.", [], _empty_state(), session_id=session_id
+        )
+    invocation = next(item for item in result.tool_invocations if item.tool_name == "request_advisor_hint")
+    payload = json.loads(_result_canonical(invocation))
+    assert payload["status"] == "SUCCESS"
+    assert payload["abandonment_decision"] == decision_kind
+    if decision_kind == "CONTINUE_WITH_LIMITATION":
+        assert decision["next_action"] in payload["guidance"]
+        assert "Stop authoring this request" not in payload["note"]
+        assert "limitation" in payload["note"]
+    else:
+        assert "Stop authoring this request" in payload["note"]
 
 
 @pytest.mark.asyncio
@@ -755,13 +795,11 @@ async def test_budget_exhaustion_returns_structured_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
-    """BUDGET_EXHAUSTED advisor turns must still be bounded by loop budget.
+async def test_exhausted_advisor_turn_preserves_discovery_accounting_and_deadline() -> None:
+    """A refused hint is accounted without reinstating the removed turn cap.
 
-    Successful advisor guidance is budgeted separately so the primary model
-    can read it. A policy refusal is different: no guidance was produced, and
-    repeated calls must converge via the generic discovery-turn guard rather
-    than spinning until the wall-clock compose timeout.
+    The primary model can continue after the refusal. A subsequent provider
+    timeout still terminates the request and retains the durable refusal.
     """
     catalog = _mock_catalog()
     settings = WebSettings(
@@ -788,14 +826,15 @@ async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
     ):
         mock_llm.side_effect = [
             _make_advisor_tool_call("call_budget_exhausted"),
-            _make_text_only_response("would incorrectly continue"),
+            TimeoutError(),
         ]
         await service.compose("help me", [], state, session_id=session_id)
 
-    assert exc_info.value.tool_invocations == ()
+    assert tuple(inv.tool_call_id for inv in exc_info.value.tool_invocations) == ("call_budget_exhausted",)
     durable_responses = _persisted_tool_responses(service, session_id)
-    assert exc_info.value.budget_exhausted == "discovery"
-    assert mock_llm.call_count == 1
+    assert exc_info.value.budget_exhausted == "timeout"
+    assert exc_info.value.max_turns == 1
+    assert mock_llm.call_count == 2
     assert mock_acompletion.call_count == 0
     invocations = [inv for inv in durable_responses if inv["tool_name"] == "request_advisor_hint"]
     assert len(invocations) == 1
@@ -1078,7 +1117,7 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
 
 
 @pytest.mark.asyncio
-async def test_advisor_just_below_floor_is_truthful_discovery_without_state_changes() -> None:
+async def test_advisor_just_below_floor_preserves_accounting_and_allows_primary_continuation() -> None:
     catalog = _mock_catalog()
     service, session_id = _composer_service_with_session(
         catalog=catalog,
@@ -1103,14 +1142,15 @@ async def test_advisor_just_below_floor_is_truthful_discovery_without_state_chan
     ):
         mock_llm.side_effect = [
             _make_advisor_tool_call("call_too_close"),
-            _make_text_only_response("must not reach a second model turn"),
+            TimeoutError(),
         ]
         await service.compose("help me", [], _empty_state(), session_id=session_id)
 
-    assert exc_info.value.tool_invocations == ()
+    assert tuple(inv.tool_call_id for inv in exc_info.value.tool_invocations) == ("call_too_close",)
     durable_responses = _persisted_tool_responses(service, session_id)
-    assert exc_info.value.budget_exhausted == "discovery"
-    assert mock_llm.call_count == 1
+    assert exc_info.value.budget_exhausted == "timeout"
+    assert exc_info.value.max_turns == 1
+    assert mock_llm.call_count == 2
     assert mock_advisor.await_count == 0
     assert tuple(tracker._failures) == initial_failures
     invocations = [inv for inv in durable_responses if inv["tool_name"] == "request_advisor_hint"]

@@ -15,11 +15,13 @@ from sqlalchemy import select
 from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_decision import AdvisorGatePassed
+from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.prompt_guard_config import PromptGuardSettings
@@ -49,6 +51,188 @@ _ORDINARY_REQUESTS = (
     "I make heavy use of CSV files.",
     'What does "build a pipeline" mean?',
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publication_case", ["truthful-partial", "overclaim", "changed-decision"])
+async def test_real_end_retains_scoped_limitations_after_supported_mutation(monkeypatch, real_route_app, publication_case):
+    app, sessions = real_route_app
+    app.state.settings = app.state.settings.model_copy(
+        update={
+            "composer_model": "openai/gpt-4.1-mini",
+            "composer_endpoint_base_url": "https://offline-model.example.test/v1",
+            "composer_endpoint_api_key": SecretStr("offline-primary-key"),  # secret-scan: allow-this-line
+            "composer_advisor_model": "openai/gpt-4.1",
+            "composer_advisor_endpoint_base_url": "https://offline-model.example.test/v1",
+            "composer_advisor_endpoint_api_key": SecretStr("offline-advisor-key"),  # secret-scan: allow-this-line
+            "composer_prompt_guard_mode": "debug-when-unconfigured",
+            "composer_prompt_guard": None,
+            "composer_advisor_prompt_guard": None,
+        }
+    )
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, provider="test", model=kwargs["model"]),
+    )
+    composer = ComposerServiceImpl.for_trained_operator(
+        create_catalog_service(), app.state.settings, sessions_service=sessions, session_engine=app.state.session_engine
+    )
+    app.state.composer_service = composer
+    app.state.plugin_snapshot_factory = _TestSnapshotFactory(app.state.plugin_snapshot_factory)
+    session = await sessions.create_session("alice", "Scoped capability limit", "local")
+    request = 'Follow this specification: "Save a JSON output named report, and perform unavailable operation B."'
+    candidate = (
+        "Both requested operations are complete."
+        if publication_case == "overclaim"
+        else "The report output is saved. Operation B is unavailable; this partial draft is not ready to run."
+    )
+    primary_index = 0
+    stop_reviews = []
+    end_inputs = []
+    end_verdicts = []
+    changed_decision = False
+    original_accept = TurnEvidence.accept_abandonment
+    original_checkpoint = composer._advisor_checkpoint._run_advisor_checkpoint
+    assert original_checkpoint.__func__ is AdvisorCheckpointOwner._run_advisor_checkpoint
+
+    def observe_accept(evidence, review, decision, **kwargs):
+        original_accept(evidence, review, decision, **kwargs)
+        stop_reviews.append((evidence, review, decision, kwargs))
+
+    async def observe_checkpoint(*args, **kwargs):
+        nonlocal changed_decision
+        if kwargs["phase"] == "end":
+            packet = kwargs["publication_review"]
+            end_inputs.append(packet)
+            payload = json.loads(packet.payload_json)
+            assert payload["saved_effects"]["saved_revision_count"] == 1
+            assert len(payload["historical_authoring_limitations"]) == 1
+            assert payload["historical_authoring_limitations"][0]["decision"] == "CONTINUE_WITH_LIMITATION"
+            assert payload["authoring_stop_review"]["decision"] == "STOP_CONFIRMED"
+        verdict = await original_checkpoint(*args, **kwargs)
+        if kwargs["phase"] == "end":
+            end_verdicts.append(verdict)
+            if publication_case == "changed-decision" and not changed_decision:
+                evidence, review, decision, inputs = stop_reviews[-1]
+                original_accept(
+                    evidence,
+                    review,
+                    AdvisorAbandonmentResponse(
+                        decision=decision.decision,
+                        reason="A different prerequisite now blocks the remaining work.",
+                        next_action=None,
+                        question="Which prerequisite is intended?",
+                    ),
+                    **inputs,
+                )
+                changed_decision = True
+        return verdict
+
+    async def complete(**kwargs):
+        nonlocal primary_index
+        tool_calls = None
+        if kwargs["model"] == app.state.settings.composer_model:
+            primary_index += 1
+            assert primary_index <= 4, "A confirmed whole-request stop must not restart authoring"
+            if primary_index in (1, 3):
+                name = "request_advisor_hint"
+                arguments = {
+                    "trigger": "cannot_complete",
+                    "problem_summary": "Operation B is unavailable; inspect remaining supported work.",
+                    "recent_errors": [],
+                    "attempted_actions": [],
+                }
+            elif primary_index == 2:
+                name = "set_output"
+                arguments = {
+                    "sink_name": "report",
+                    "plugin": "json",
+                    "options": {
+                        "path": "outputs/report.jsonl",
+                        "schema": {"mode": "observed"},
+                        "format": "jsonl",
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    "on_write_failure": "discard",
+                }
+            if primary_index < 4:
+                content = None
+                tool_calls = [
+                    {
+                        "id": f"supported-work-{primary_index}",
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    }
+                ]
+            else:
+                content = candidate
+        else:
+            schema_name = kwargs["response_format"]["json_schema"]["name"]
+            if schema_name == "advisor_abandonment_response":
+                content = json.dumps(
+                    {
+                        "decision": "CONTINUE_WITH_LIMITATION" if primary_index == 1 else "STOP_CONFIRMED",
+                        "reason": "Operation B is unavailable; save the supported output first."
+                        if primary_index == 1
+                        else "The output is saved; all remaining requested work requires unavailable operation B.",
+                        "next_action": "Call set_output to save the report output." if primary_index == 1 else None,
+                        "question": None,
+                    }
+                )
+            else:
+                end = schema_name == "advisor_end_response"
+                content = json.dumps(
+                    {
+                        "verdict": "FLAGGED" if end else "CLEAN",
+                        "category": "request_not_met" if end else "other",
+                        "steps": ["report"] if end else [],
+                        "findings": "Operation B remains unavailable; the partial graph is not executable." if end else "",
+                        "note": "The saved draft remains incomplete." if end else None,
+                        **(
+                            {"publication_verdict": "WITHHOLD" if publication_case == "overclaim" or changed_decision else "ADMIT"}
+                            if end
+                            else {}
+                        ),
+                    }
+                )
+                if end:
+                    assert any(
+                        isinstance(message["content"], str) and end_inputs[-1].provider_payload_json in message["content"]
+                        for message in kwargs["messages"]
+                    )
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            choices=[
+                {
+                    "message": {"role": "assistant", "content": content, "tool_calls": tool_calls},
+                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                }
+            ],
+            usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+        )
+
+    monkeypatch.setattr(TurnEvidence, "accept_abandonment", observe_accept)
+    monkeypatch.setattr(composer._advisor_checkpoint, "_run_advisor_checkpoint", observe_checkpoint)
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        settled = await submit_and_settle(client, app, path=f"/api/sessions/{session.id}/messages", body=message_body(request))
+    public = settled.result()["message"]["content"]
+    assert primary_index == 4
+    assert end_inputs and end_verdicts
+    assert all(verdict.ok and verdict.blocking for verdict in end_verdicts)
+    with app.state.session_engine.connect() as connection:
+        states = connection.execute(select(composition_states_table).where(composition_states_table.c.session_id == str(session.id))).all()
+    assert len(states) == 2  # The tool checkpoint and the route's post-compose snapshot.
+    assert all(not state.is_valid for state in states)
+    assert states[0].outputs == states[1].outputs
+    if publication_case == "truthful-partial":
+        assert candidate in public
+        assert end_verdicts[-1].publication_verdict == "ADMIT"
+    else:
+        assert candidate not in public
+    if publication_case == "changed-decision":
+        assert changed_decision
 
 
 def _guard_checks(rows):

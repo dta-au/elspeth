@@ -1941,7 +1941,8 @@ def test_repair_instruction_offers_a_published_way_out() -> None:
     # A missing decision or inability is reviewed before stopping authoring.
     assert "call request_advisor_hint alone" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
     assert "trigger=cannot_complete and the observed evidence" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
-    assert "on STOP_CONFIRMED, explain the blocker or ask the focused question" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    assert "CONTINUE_WITH_LIMITATION" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    assert "no remaining authorized useful action can proceed" in ADVISOR_MUTATION_EXPECTATION_CLAUSE
     # Neither clause promises the reply reaches the user: on a blocked turn it
     # does, but a no-tool reply after which pass 2 returns CLEAN falls through
     # to finalize and case 5 (``_replace_advisor_repair_public_result``)

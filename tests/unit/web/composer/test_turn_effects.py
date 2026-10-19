@@ -11,11 +11,13 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCal
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 from elspeth.web.composer.protocol import RetainedOperationContext
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.turn_effects import TurnEvidence
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions._persist_payload import CommittedCheckpointWitness
 from elspeth.web.sessions.protocol import CompositionStateRecord
 
@@ -259,6 +261,113 @@ def _evidence():
         initial_state_id=None,
         initial_state=_state(),
     )
+
+
+def _abandonment_snapshot(seed="policy"):
+    return PluginAvailabilitySnapshot.create(
+        policy_hash=stable_hash(seed),
+        principal_scope="user:test",
+        available=frozenset(),
+        unavailable=(),
+        selected=(),
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint=stable_hash("generation"),
+    )
+
+
+def test_scoped_limitation_survives_supported_work_without_authorizing_a_request_stop():
+    evidence = _evidence()
+    snapshot = _abandonment_snapshot()
+    review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=snapshot, messages=())
+    decision = AdvisorAbandonmentResponse(
+        decision="CONTINUE_WITH_LIMITATION",
+        reason="Operation B is unavailable; contact private@example.test.",
+        next_action="Complete supported operation A.",
+        question=None,
+    )
+    evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=snapshot)
+    assert not evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=snapshot)
+    evidence.invalidate_abandonment()
+    changed = _state("Supported A completed", version=2)
+    evidence.accept_checkpoint(
+        _witness(changed), expected_state=changed, tool_call_ids=("supported-action",), assistant_message_id=str(uuid4())
+    )
+    publication = evidence.review_candidate(candidate="A is saved; B remains unavailable.", request="Inspect", current_state=changed)
+    payload = json.loads(publication.payload_json)
+    provider = json.loads(publication.provider_payload_json)
+    limitations = payload["historical_authoring_limitations"]
+    assert len(limitations) == 1
+    assert limitations[0]["binding"] == review.binding
+    assert limitations[0]["reviewed_graph_hash"] == review.graph_hash
+    assert limitations[0]["reason"] == decision.reason
+    assert "private@example.test" not in provider["historical_authoring_limitations"][0]["reason"]
+    assert "authoring_stop_review" not in payload
+    assert not evidence.confirmed_abandonment(current_state=changed, plugin_snapshot=snapshot)
+    other = _evidence().review_candidate(candidate="A is saved; B remains unavailable.", request="Inspect", current_state=changed)
+    assert "historical_authoring_limitations" not in json.loads(other.payload_json)
+
+
+@pytest.mark.parametrize("decision_kind", ["CONTINUE_WITH_LIMITATION", "STOP_CONFIRMED"])
+def test_advisor_decision_changes_bind_publication_and_semantic_repair(decision_kind):
+    evidence = _evidence()
+    snapshot = _abandonment_snapshot()
+    review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=snapshot, messages=())
+    publications = []
+    for reason in ("Capability B is unavailable.", "Prerequisite C is unavailable."):
+        decision = AdvisorAbandonmentResponse(
+            decision=decision_kind,
+            reason=reason,
+            next_action="Complete supported A." if decision_kind == "CONTINUE_WITH_LIMITATION" else None,
+            question=None,
+        )
+        evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=snapshot)
+        publications.append(evidence.review_candidate(candidate="Here is the current result.", request="Inspect", current_state=_state()))
+    assert publications[0].binding != publications[1].binding
+    assert publications[0].semantic_repair_key != publications[1].semantic_repair_key
+    payload = json.loads(publications[1].payload_json)
+    if decision_kind == "CONTINUE_WITH_LIMITATION":
+        assert len(payload["historical_authoring_limitations"]) == 1
+    assert evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=snapshot) is (decision_kind == "STOP_CONFIRMED")
+
+
+def test_repeated_limitation_review_is_not_semantic_repair_progress():
+    evidence = _evidence()
+    snapshot = _abandonment_snapshot()
+    decision = AdvisorAbandonmentResponse(
+        decision="CONTINUE_WITH_LIMITATION", reason="B is unavailable.", next_action="Complete A.", question=None
+    )
+    publications = []
+    for messages in ((), ({"role": "user", "content": "The same capability evidence was reviewed again."},)):
+        review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=snapshot, messages=messages)
+        evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=snapshot)
+        publications.append(
+            evidence.review_candidate(candidate="A remains to do; B is unavailable.", request="Inspect", current_state=_state())
+        )
+    assert publications[0].binding != publications[1].binding
+    assert publications[0].semantic_repair_key == publications[1].semantic_repair_key
+    assert len(json.loads(publications[1].payload_json)["historical_authoring_limitations"]) == 2
+
+
+@pytest.mark.parametrize("stale_part", ["graph", "policy", "request", "revision"])
+def test_abandonment_scopes_refuse_stale_or_different_request_evidence(stale_part):
+    evidence = _evidence()
+    snapshot = _abandonment_snapshot()
+    review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=snapshot, messages=())
+    if stale_part == "request":
+        review = replace(review, request_scope=(SID, CONTEXT.fence.operation_id, "another-request"))
+    elif stale_part == "revision":
+        review = replace(review, registration_revision=review.registration_revision + 1)
+    decision = AdvisorAbandonmentResponse(
+        decision="STOP_CONFIRMED", reason="All remaining work requires the missing input.", next_action=None, question="Which input?"
+    )
+    with pytest.raises(AuditIntegrityError, match="stale evidence"):
+        evidence.accept_abandonment(
+            review,
+            decision,
+            current_state=_state("Different") if stale_part == "graph" else _state(),
+            plugin_snapshot=_abandonment_snapshot("other") if stale_part == "policy" else snapshot,
+        )
 
 
 def _page(start, end, *, total=6, content_hash="a" * 64):

@@ -286,7 +286,8 @@ ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
     "answer that request without changing the pipeline; the advisor block still prevents completion. "
     "For a specific missing decision or suspected technical inability, call request_advisor_hint alone "
     "with trigger=cannot_complete and the observed evidence. On CONTINUE, take the supported next action; "
-    "on STOP_CONFIRMED, explain the blocker or ask the focused question. For a large remaining graph "
+    "on CONTINUE_WITH_LIMITATION, retain the precise limit and complete the supported work. STOP_CONFIRMED applies only "
+    "when no remaining authorized useful action can proceed; explain that blocker or ask the focused question. For a large remaining graph "
     "or concern about disconnected intermediate parts, use smaller coherent mutations and compatible "
     "multi-query nodes where the request permits grouping, then continue from the saved state. "
 )

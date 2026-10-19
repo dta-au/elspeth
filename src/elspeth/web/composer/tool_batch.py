@@ -2637,12 +2637,20 @@ async def run_tool_batch(
                     success_payload["guidance"] += "\nSupported next action: " + decision.next_action
                 if decision.question is not None:
                     success_payload["guidance"] += "\nQuestion for the user: " + decision.question
-                success_payload["note"] = (
-                    "Stop authoring this request. Explain the confirmed limit or ask the precise question; "
-                    "preserve the draft and do not claim completion. The final reply still receives ordinary END review."
-                    if decision.decision == "STOP_CONFIRMED"
-                    else "Continue with the advisor's supported action. This is not pipeline completion or graph clearance."
-                )
+                if decision.decision == "STOP_CONFIRMED":
+                    success_payload["note"] = (
+                        "Stop authoring this request: no remaining authorized useful action can proceed. Explain the confirmed limit "
+                        "or ask the precise question; preserve the draft and do not claim completion. The final reply still receives ordinary END review."
+                    )
+                elif decision.decision == "CONTINUE_WITH_LIMITATION":
+                    success_payload["note"] = (
+                        "Continue the supported work with the advisor's next action. Retain the precise limitation for final review; "
+                        "it does not stop the whole request or establish pipeline completion or graph clearance."
+                    )
+                else:
+                    success_payload["note"] = (
+                        "Continue with the advisor's supported action. This is not pipeline completion or graph clearance."
+                    )
             recorder.record(
                 finish_success(
                     audit,

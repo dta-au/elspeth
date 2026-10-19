@@ -64,7 +64,7 @@ class AdvisorAbandonmentResponse(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    decision: Literal["STOP_CONFIRMED", "CONTINUE"]
+    decision: Literal["STOP_CONFIRMED", "CONTINUE", "CONTINUE_WITH_LIMITATION"]
     reason: str = Field(min_length=1, max_length=2000)
     next_action: str | None = Field(max_length=2000)
     question: str | None = Field(max_length=2000)
@@ -80,8 +80,8 @@ class AdvisorAbandonmentResponse(BaseModel):
 
     @model_validator(mode="after")
     def require_actionable_decision(self) -> AdvisorAbandonmentResponse:
-        if self.decision == "CONTINUE" and (self.next_action is None or self.question is not None):
-            raise ValueError("CONTINUE requires a supported action, not a question for the user")
+        if self.decision in ("CONTINUE", "CONTINUE_WITH_LIMITATION") and (self.next_action is None or self.question is not None):
+            raise ValueError("A continuation requires a supported action, not a question for the user")
         if self.decision == "STOP_CONFIRMED" and self.next_action is not None:
             raise ValueError("A confirmed stop must not require another authoring action")
         return self

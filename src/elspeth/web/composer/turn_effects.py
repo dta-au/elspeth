@@ -55,6 +55,30 @@ def authored_state_hash(state: CompositionState) -> str:
     return stable_hash(payload)
 
 
+def _abandonment_decision_projection(
+    review: AdvisorAbandonmentReview,
+    decision: AdvisorAbandonmentResponse,
+    *,
+    redact_text: bool = False,
+    semantic: bool = False,
+) -> dict[str, JsonValue]:
+    """Retain decision meaning without treating historical advice as authority."""
+    projection: dict[str, JsonValue] = {
+        "reviewed_graph_hash": review.graph_hash,
+        "policy_snapshot_hash": review.policy_hash,
+        "decision": decision.decision,
+        "reason": _redact_sensitive_content(decision.reason) if redact_text else decision.reason,
+        "next_action": (
+            _redact_sensitive_content(decision.next_action) if redact_text and decision.next_action is not None else decision.next_action
+        ),
+        "question": _redact_sensitive_content(decision.question) if redact_text and decision.question is not None else decision.question,
+    }
+    if not semantic:
+        projection["binding"] = review.binding
+        projection["evidence_revision"] = review.registration_revision
+    return projection
+
+
 def _changed_fields(before: CompositionState, after: CompositionState) -> tuple[str, ...]:
     """Compare owned states without exposing intermediate dynamic projections."""
     projections = [state.to_dict() for state in (before, after)]
@@ -243,6 +267,7 @@ class TurnEvidence:
     """One request's private evidence owner; snapshots never cross requests."""
 
     __slots__ = (
+        "_abandonment_limitations",
         "_abandonment_review",
         "_conflicting_page_ids",
         "_current_calls",
@@ -283,6 +308,7 @@ class TurnEvidence:
         self.request_id = request_id
         self.request_hash = stable_hash(request)
         self._abandonment_review: tuple[AdvisorAbandonmentReview, AdvisorAbandonmentResponse] | None = None
+        self._abandonment_limitations: dict[str, tuple[AdvisorAbandonmentReview, AdvisorAbandonmentResponse]] = {}
         if retained_operation_context is not None:
             if type(retained_operation_context) is not RetainedOperationContext:
                 raise TypeError("Turn evidence requires owned retained operation history")
@@ -571,6 +597,8 @@ class TurnEvidence:
         ):
             raise AuditIntegrityError("Abandonment confirmation belongs to stale evidence")
         self._abandonment_review = (review, decision)
+        if decision.decision == "CONTINUE_WITH_LIMITATION":
+            self._abandonment_limitations[review.binding] = (review, decision)
 
     def confirmed_abandonment(self, *, current_state: CompositionState, plugin_snapshot: PluginAvailabilitySnapshot | None) -> bool:
         if self._abandonment_review is None or plugin_snapshot is None:
@@ -600,7 +628,7 @@ class TurnEvidence:
         # still covers the complete evidence and complete candidate/request.
         field_limit = 64
 
-        def inspection(scope: DeliveryScope | None) -> list[dict[str, JsonValue]]:
+        def inspection(scope: DeliveryScope | None) -> list[JsonValue]:
             coverage = self.historical_inspection_coverage() if scope is None else self.inspection_coverage(scope)
             return [
                 {
@@ -658,7 +686,8 @@ class TurnEvidence:
                 "source_metadata_historically_delivered": semantic_source_metadata(None),
             }
 
-        payload = {
+        current_call = self._current_calls[scope]
+        payload: dict[str, JsonValue] = {
             "candidate_reply": candidate,
             "current_request": request,
             "current_graph_hash": authored_state_hash(current_state),
@@ -670,33 +699,44 @@ class TurnEvidence:
                 "initial_authored_state_hash": effects.initial_authored_state_hash,
                 "latest_verified_authored_state_hash": effects.latest_authored_state_hash,
                 "net_changed": effects.net_changed,
-                "changed_fields": fields[:field_limit] if fields is not None else None,
+                "changed_fields": list(fields[:field_limit]) if fields is not None else None,
                 "changed_fields_omitted": max(0, len(fields) - field_limit) if fields is not None else None,
             },
             "inspection": {
-                "current_candidate_call": self._current_calls[scope],
+                "current_candidate_call": list(current_call) if current_call is not None else None,
                 "currently_available": inspection(scope),
                 "historically_delivered": inspection(None),
                 "semantic_equivalence_established": False,
                 **source_metadata_projection,
             },
         }
+        authoring_decisions: dict[str, JsonValue] = {}
+        semantic_authoring_decisions: dict[str, JsonValue] = {}
+        if self._abandonment_limitations:
+            authoring_decisions["historical_authoring_limitations"] = [
+                _abandonment_decision_projection(review, decision) for review, decision in self._abandonment_limitations.values()
+            ]
+            semantic_limitations: list[JsonValue] = []
+            for review, decision in self._abandonment_limitations.values():
+                limitation = _abandonment_decision_projection(review, decision, semantic=True)
+                if limitation not in semantic_limitations:
+                    semantic_limitations.append(limitation)
+            semantic_authoring_decisions["historical_authoring_limitations"] = sorted(semantic_limitations, key=stable_hash)
         if self._abandonment_review is not None:
             stop_review, stop_decision = self._abandonment_review
             if (
                 stop_review.graph_hash == stable_hash(current_state.to_dict())
                 and stop_review.registration_revision == self._registration_revision
             ):
-                payload["authoring_stop_review"] = {
-                    "binding": stop_review.binding,
-                    "policy_snapshot_hash": stop_review.policy_hash,
-                    **stop_decision.model_dump(mode="json"),
-                }
+                authoring_decisions["authoring_stop_review"] = _abandonment_decision_projection(stop_review, stop_decision)
+                semantic_authoring_decisions["authoring_stop_review"] = _abandonment_decision_projection(
+                    stop_review, stop_decision, semantic=True
+                )
+        payload.update(authoring_decisions)
         if self._retained_history is not None:
             payload.update(json.loads(self._retained_history))
         # Preserve owned identities; only authored/provider text is PII-shaped
         # prose. Scrubbing serialized JSON also corrupts numeric digest runs.
-        current_call = self._current_calls[scope]
         provider_payload = payload | {
             "candidate_reply": _redact_sensitive_content(candidate),
             "current_request": _redact_sensitive_content(request),
@@ -709,12 +749,14 @@ class TurnEvidence:
                 )
             },
         }
-        if "authoring_stop_review" in payload:
-            stop_projection = dict(payload["authoring_stop_review"])
-            for key in ("reason", "next_action", "question"):
-                if type(stop_projection[key]) is str:
-                    stop_projection[key] = _redact_sensitive_content(stop_projection[key])
-            provider_payload["authoring_stop_review"] = stop_projection
+        if "authoring_stop_review" in authoring_decisions:
+            assert self._abandonment_review is not None
+            provider_payload["authoring_stop_review"] = _abandonment_decision_projection(*self._abandonment_review, redact_text=True)
+        if self._abandonment_limitations:
+            provider_payload["historical_authoring_limitations"] = [
+                _abandonment_decision_projection(review, decision, redact_text=True)
+                for review, decision in self._abandonment_limitations.values()
+            ]
         if self._retained_history is not None:
             history = json.loads(self._retained_history)["retained_operation_history"]
             provider_payload["retained_operation_history"] = history | {
@@ -735,7 +777,13 @@ class TurnEvidence:
                 }
             )
         binding = stable_hash(
-            {"candidate": candidate, "request": request, "evidence": evidence_identity, "current_graph": authored_state_hash(current_state)}
+            {
+                "candidate": candidate,
+                "request": request,
+                "evidence": evidence_identity,
+                "current_graph": authored_state_hash(current_state),
+                "authoring_decisions": authoring_decisions,
+            }
         )
         # Repair progress excludes transport identities. Publication permission
         # still requires the exact binding above, including its physical call.
@@ -760,6 +808,7 @@ class TurnEvidence:
                 # This separate history projection is supplied to the advisor;
                 # it never fills a gap in currently available content.
                 "historically_delivered": inspection(None),
+                "authoring_decisions": semantic_authoring_decisions,
                 **semantic_source_metadata_projection,
             }
         )
