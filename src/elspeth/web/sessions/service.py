@@ -1938,6 +1938,22 @@ class SessionServiceImpl:
         # turn: an id naming no persisted tool row would orphan the reason.
         # Same pre-transaction posture as the transcript validation above.
         tool_row_ids = {row.tool_call_id for row in redacted_tool_rows}
+        from elspeth.web.composer.visible_tool_event import VisibleToolEvent
+
+        assistant_calls_by_id = {call["id"]: call for call in redacted_assistant_tool_calls}
+        for tool_row in redacted_tool_rows:
+            if tool_row.visible_event is not None:
+                if type(tool_row.visible_event) is not VisibleToolEvent or writer_principal != "compose_loop":
+                    raise AuditIntegrityError("Visible tool evidence lacks its exact producer")
+                call = assistant_calls_by_id[tool_row.tool_call_id]
+                tool_row.visible_event.validate(
+                    context=session_operation_context,
+                    session_id=session_id,
+                    tool_call_id=tool_row.tool_call_id,
+                    tool_name=call["function"]["name"],
+                    display_arguments=call["function"]["arguments"],
+                    display_result=tool_row.content,
+                )
         if (tool_row_ids or private_tool_evidence) and writer_principal != "compose_loop":
             raise AuditIntegrityError("private tool evidence requires compose_loop writer custody")
         from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
@@ -2092,7 +2108,9 @@ class SessionServiceImpl:
                             role="tool",
                             content=tool_row.content,
                             raw_content=None,
-                            tool_calls=None,
+                            tool_calls=[tool_row.visible_event.with_parent(assistant_id).to_envelope()]
+                            if tool_row.visible_event is not None
+                            else None,
                             sequence_no=base_seq + 2 * offset - 1,
                             writer_principal=writer_principal,
                             composition_state_id=state_id,
@@ -5777,6 +5795,16 @@ class SessionServiceImpl:
         sid = str(session_id)
         csid = str(composition_state_id) if composition_state_id else None
         pid = str(parent_assistant_id) if parent_assistant_id else None
+        from elspeth.web.composer.visible_tool_event import validate_visible_audit_row
+
+        validate_visible_audit_row(
+            envelopes=tuple(tool_calls or ()),
+            content=content,
+            role=role,
+            writer_principal=writer_principal,
+            session_id=sid,
+            context=session_operation_context,
+        )
         msg_id_holder: dict[str, str] = {}
         sequence_holder: dict[str, int] = {}
 
@@ -9673,6 +9701,17 @@ class SessionServiceImpl:
         effective_state_ids = tuple(d.effective_composition_state_id(csid) for d in drafts)
         if not drafts:
             return ()
+        from elspeth.web.composer.visible_tool_event import validate_visible_audit_row
+
+        for draft in drafts:
+            validate_visible_audit_row(
+                envelopes=tuple(draft.tool_calls or ()),
+                content=draft.content,
+                role=draft.role,
+                writer_principal=writer_principal,
+                session_id=sid,
+                context=session_operation_context,
+            )
         self._assert_session_write_lock_held(
             conn,
             sid,

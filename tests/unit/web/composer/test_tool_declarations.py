@@ -839,25 +839,24 @@ class TestStep3MutationTierMigration:
         assert "rows missing a promised column quarantine; the run continues" not in skill
 
     def test_core_skill_keeps_the_full_rebuild_steer_scoped_to_new_builds(self) -> None:
-        """The new edit row must not read as licence for tool-by-tool NEW builds.
-
-        The 2026-07-22 stress test (planner_authoring_aids:13-14) found 0 of 6
-        cold planners converged constructing a new pipeline tool-by-tool, which
-        is why the batching section exists. Widening the edit table must leave
-        that steer intact and explicitly bounded to new builds.
-        """
+        """Staged new builds do not turn focused existing-pipeline edits into rebuilds."""
         # Prose is hard-wrapped, so match on whitespace-normalized text: a
         # reflow must not read as a doctrine change.
         skill = " ".join(
             (Path(__file__).parents[4] / "src/elspeth/web/composer/skills/pipeline_composer.md").read_text(encoding="utf-8").split()
         )
 
-        assert "governs NEW builds only" in skill
-        assert "Do not build a complex new pipeline tool-by-tool" in skill
-        assert "not by switching into a one-component-at-a-time construction loop" in skill
-        # The carve-out is what keeps the prohibition from reading as general.
-        assert "Editing a pipeline that already exists is not a new build" in skill
-        assert "A new build never walks this table row by row" in skill
+        assert "Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches" in skill
+        assert "The narrower tools also support staged construction of a new pipeline" in skill
+        assert "Preserve existing components when extending a saved draft" in skill
+        assert "use a full replacement only when you can supply the exact current bindings and the requested complete state" in skill
+        assert "Make an option-only edit to an existing node | `patch_node_options`" in skill
+        assert "Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge`" in skill
+        assert (
+            "Follow focused repair diagnostics without discarding already verified components or narrowing the requested final topology"
+            in skill
+        )
+        assert "For edits to an existing pipeline, continue to choose the narrowest supported tool" in skill
 
     def test_upsert_node_required(self) -> None:
         defn = self._get("upsert_node")

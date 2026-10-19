@@ -19,7 +19,7 @@ from collections.abc import Callable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
-from typing import Annotated, Any, Literal, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, TypeAliasType, Union, get_args, get_origin
 
 from pydantic import (
     BaseModel,
@@ -635,9 +635,16 @@ def _unwrap_annotated(field_type: Any, metadata: tuple[Any, ...]) -> tuple[Any, 
 
 
 def _normalise(field_type: Any, metadata: tuple[Any, ...]) -> tuple[Any, tuple[Any, ...]]:
-    """Repeatedly unwrap Annotated layers until a non-Annotated type remains."""
-    while get_origin(field_type) is Annotated:
-        field_type, metadata = _unwrap_annotated(field_type, metadata)
+    """Expose owned aliases and Annotated metadata without granting scalar trust."""
+    aliases: set[TypeAliasType] = set()
+    while isinstance(field_type, TypeAliasType) or get_origin(field_type) is Annotated:
+        if isinstance(field_type, TypeAliasType):
+            if field_type in aliases:
+                raise ValueError("Recursive redaction type alias cannot be inspected")
+            aliases.add(field_type)
+            field_type = field_type.__value__
+        else:
+            field_type, metadata = _unwrap_annotated(field_type, metadata)
     return field_type, metadata
 
 

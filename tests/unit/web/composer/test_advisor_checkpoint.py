@@ -946,7 +946,8 @@ async def test_run_advisor_checkpoint_end_threads_user_message(make_service, sim
         user_message="Use a strictly fixed schema, not a flexible one.",
     )
     args = service._advisor_checkpoint._call_advisor_with_audit.call_args.args[0]
-    assert args["user_message"] == "Use a strictly fixed schema, not a flexible one."
+    assert "user_message" not in args
+    assert args["advisor_transcript"].request == "Use a strictly fixed schema, not a flexible one."
     assert ("Within that scope, quote each explicit configuration constraint visible in the user's complete request") in args[
         "problem_summary"
     ]
@@ -1107,7 +1108,7 @@ def test_end_advisor_prompt_scopes_bounded_and_withheld_evidence(make_service) -
     )
     prompt = build_advisor_user_message(arguments)
 
-    assert arguments["user_message"] == oversized
+    assert "user_message" not in arguments and arguments["advisor_transcript"].request == oversized
     assert "Complete original user request" in prompt
     assert "Do not infer or verify constraints whose required value is withheld, omitted, or truncated" in prompt
     assert "Deterministic validation, not this advisor" in prompt
@@ -1129,7 +1130,7 @@ def test_build_checkpoint_arguments_end_preserves_long_user_message(make_service
 
     args = service._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=simple_state, user_message=oversized)
 
-    assert args["user_message"] == oversized
+    assert "user_message" not in args and args["advisor_transcript"].request == oversized
 
 
 def test_build_checkpoint_arguments_end_omits_blank_user_message(make_service, simple_state):
@@ -6455,6 +6456,242 @@ async def test_actual_advisor_receives_whole_current_request_once(
     assert "".join(part.text for part in parts) == prepared
     assert all(part.trust is None for part in parts)
     assert max(len(part.inspection_text if part.inspection_text is not None else part.text) for part in parts) < 10_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["early", "end", "manual", "cannot_complete"])
+async def test_actual_advisor_entry_receives_visible_history_once_and_no_native_or_static_replay(
+    make_service,
+    simple_state,
+    monkeypatch,
+    physical_advisor,
+    entry,
+):
+    from datetime import UTC, datetime
+
+    from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
+    from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
+    from elspeth.web.composer.turn_effects import TurnEvidence
+    from elspeth.web.sessions.protocol import ChatMessageRecord
+
+    service = make_service()
+    request = "CURRENT_FULL_REQUEST " + "required text " * 300 + "CURRENT_TAIL"
+    fenced = physical_advisor.bind(service, request=request)
+    sid, request_id = uuid.UUID(fenced["session_id"]), str(uuid.uuid4())
+    previous = ChatMessageRecord(
+        id=uuid.uuid4(),
+        session_id=sid,
+        role="user",
+        content="Earlier normative instruction: use GENERIC_LABEL.",
+        created_at=datetime.now(UTC),
+        writer_principal="route_user_message",
+        sequence_no=1,
+    )
+    current = ChatMessageRecord(
+        id=uuid.UUID(request_id),
+        session_id=sid,
+        role="user",
+        content=request,
+        created_at=datetime.now(UTC),
+        writer_principal="route_user_message",
+        sequence_no=2,
+    )
+    history = AdvisorTranscriptHistory.from_records(
+        session_id=str(sid),
+        actor_user_id="actor",
+        current_request_id=request_id,
+        request=request,
+        records=(previous, current),
+    )
+    evidence = TurnEvidence(
+        session_id=str(sid),
+        session_operation_context=fenced["session_operation_context"],
+        request_id=request_id,
+        request=request,
+        initial_state_id=None,
+        initial_state=simple_state,
+        actor_user_id="actor",
+        advisor_history=history,
+    )
+    messages = [{"role": "system", "content": "STATIC_INTERNAL_REPLAY_CANARY"}]
+    evidence.transcript.begin_messages(messages)
+    messages.append(
+        {"role": "assistant", "content": "VISIBLE_COMPOSER_CANARY", "thinking_blocks": [{"thinking": "NATIVE_EXCLUDED_CANARY"}]}
+    )
+    evidence.transcript.observe_messages(messages)
+    snapshot = evidence.transcript.snapshot()
+    reply = (
+        _checkpoint_reply(publication_verdict="WITHHOLD", findings="Reply must state its evidence scope.")
+        if entry == "end"
+        else _checkpoint_reply()
+    )
+    if entry == "manual":
+        reply = "A concrete supported hint."
+    elif entry == "cannot_complete":
+        reply = json.dumps(
+            {"decision": "CONTINUE", "reason": "Useful supported work remains.", "next_action": "Inspect the source.", "question": None}
+        )
+    calls = _install_budget_advisor_transport(monkeypatch, [reply])
+    with prompt_guard_user_scope(""):
+        if entry in {"early", "end"}:
+            review = (
+                evidence.review_candidate(candidate="CANDIDATE_CANARY", request=request, current_state=simple_state)
+                if entry == "end"
+                else None
+            )
+            await service._advisor_checkpoint._run_advisor_checkpoint(
+                phase=entry,
+                state=simple_state,
+                session_id=str(sid),
+                recorder=make_recorder(),
+                provider_owner=physical_advisor.owner,
+                session_operation_context=fenced["session_operation_context"],
+                publication_review=review,
+                advisor_transcript=snapshot if entry == "early" else None,
+            )
+        else:
+            trigger = "cannot_complete" if entry == "cannot_complete" else "proactive_security_safety"
+            abandonment = None
+            if entry == "cannot_complete":
+                policy, _catalog = service._policy_context.build(None)
+                abandonment = evidence.abandonment_context(
+                    request=request, current_state=simple_state, plugin_snapshot=policy, messages=messages
+                )
+            await service._advisor_checkpoint._call_advisor_for_tool(
+                RequestAdvisorHintArgumentsModel(
+                    trigger=trigger, problem_summary="Review the actual visible evidence.", recent_errors=[], attempted_actions=[]
+                ),
+                recorder=make_recorder(),
+                provider_owner=physical_advisor.owner,
+                advisor_transcript=snapshot,
+                abandonment_context=abandonment,
+            )
+    prepared = "\n".join(message["content"] for message in calls[0]["messages"][1:])
+    assert prepared.count(request) == 1
+    assert prepared.count(previous.content) == 1
+    assert prepared.count("VISIBLE_COMPOSER_CANARY") == 1
+    assert "STATIC_INTERNAL_REPLAY_CANARY" not in prepared and "NATIVE_EXCLUDED_CANARY" not in prepared
+    assert prepared.index("CURRENT_FULL_REQUEST") < prepared.index("Earlier normative instruction")
+    assert "current_request_ref" in prepared
+
+
+@pytest.mark.asyncio
+async def test_actual_advisor_large_transcript_retains_one_complete_body_through_physical_gateway(
+    make_service,
+    simple_state,
+    monkeypatch,
+    physical_advisor,
+):
+    from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
+    from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
+
+    service = make_service()
+    physical_advisor.bind(service)
+    owner = AdvisorTranscriptOwner(request="Review the actual visible work")
+    owner.begin_messages([])
+    messages = [
+        {
+            "role": "tool",
+            "tool_call_id": f"read-{index}",
+            "content": json.dumps({"content": "Generic reference text. " * 1500 + f"REFERENCE_TAIL_{index}"}),
+        }
+        for index in range(10)
+    ]
+    owner.observe_messages(messages)
+    snapshot = owner.snapshot()
+    assert len(snapshot.provider_json.encode()) > 262_144
+    calls = _install_budget_advisor_transport(monkeypatch, ["A supported hint."])
+    with prompt_guard_user_scope(""):
+        await service._advisor_checkpoint._call_advisor_for_tool(
+            RequestAdvisorHintArgumentsModel(
+                trigger="proactive_security_safety",
+                problem_summary="Inspect all supplied evidence.",
+                recent_errors=[],
+                attempted_actions=[],
+            ),
+            recorder=make_recorder(),
+            provider_owner=physical_advisor.owner,
+            advisor_transcript=snapshot,
+            current_state=simple_state,
+        )
+    assert len(calls) == 1
+    assert len(calls[0]["messages"]) == 2
+    body = calls[0]["messages"][1]["content"]
+    assert snapshot.provider_json in body
+    assert all(body.count(f"REFERENCE_TAIL_{index}") == 1 for index in range(10))
+    assert "prepared_advisor_content" not in calls[0]  # private custody never goes on the wire
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_unrepresentable_graph_is_unavailable_without_provider_dispatch(make_service, simple_state, monkeypatch):
+    from elspeth.web.composer.advisor_context import AdvisorGraphCoverageUnavailable
+
+    service = make_service()
+
+    def refuse(_state):
+        raise AdvisorGraphCoverageUnavailable("Redaction made distinct authored keys ambiguous")
+
+    monkeypatch.setattr("elspeth.web.composer.advisor_context.summarize_pipeline_for_advisor", refuse)
+    dispatch = AsyncMock(side_effect=AssertionError("No provider call is allowed for an unrepresentable graph"))
+    monkeypatch.setattr(service._advisor_checkpoint, "_call_advisor_with_audit", dispatch)
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, session_id=None, recorder=make_recorder()
+    )
+    assert verdict.failure_class == "unavailable" and verdict.retryable is False
+    assert verdict.findings_text == "Complete required graph evidence could not be represented safely."
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_actual_end_request_contains_recovered_normative_tail_and_guard_inspects_it(
+    make_service,
+    simple_state,
+    monkeypatch,
+    physical_advisor,
+):
+    from elspeth.web.composer.advisor_context import advisor_user_content_parts
+    from elspeth.web.composer.prompt_guard import _request
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    from .test_advisor_transcript import _read_history
+
+    service = make_service()
+    fenced = physical_advisor.bind(service, request="Continue")
+    history, metadata, raw, text = _read_history(session_id=uuid.UUID(fenced["session_id"]))
+    evidence = TurnEvidence(
+        session_id=fenced["session_id"],
+        session_operation_context=fenced["session_operation_context"],
+        request_id=history.request_id,
+        request="Continue",
+        initial_state_id=None,
+        initial_state=simple_state,
+        actor_user_id="actor",
+        advisor_history=history,
+    )
+    evidence.transcript.use_blob_reader(lambda selected: (metadata, raw) if selected == metadata["id"] else None)
+    review = evidence.review_candidate(candidate="Explain the current draft.", request="Continue", current_state=simple_state)
+    arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=simple_state, publication_review=review)
+    calls = _install_budget_advisor_transport(
+        monkeypatch, [_checkpoint_reply(publication_verdict="WITHHOLD", findings="Review the supplied evidence.")]
+    )
+    with prompt_guard_user_scope(""):
+        await service._advisor_checkpoint._call_advisor_with_audit(
+            arguments, recorder=make_recorder(), structured_output=True, provider_owner=physical_advisor.owner
+        )
+    body = calls[0]["messages"][1]["content"]
+    assert text in body and body.count("REFERENCE_TAIL_CANARY") == 1
+    parts = advisor_user_content_parts(arguments)
+    guard, supported = _request(
+        policy_fingerprint="f" * 64,
+        role="advisor",
+        messages=[{"role": "user", "content": body}],
+        tools=(),
+        user_prompt="",
+        trusted_message_indexes=frozenset(),
+        content_parts=(parts,),
+    )
+    assert supported and all(len(document) <= 10_000 for document in guard.documents)
+    assert any("REFERENCE_TAIL_CANARY" in document for document in guard.documents)
 
 
 @pytest.mark.asyncio

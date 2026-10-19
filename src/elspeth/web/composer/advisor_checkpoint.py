@@ -47,6 +47,7 @@ from elspeth.web.composer.advisor_audit import (
     persist_advisor_terminal_publication,
 )
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase, AdvisorCheckpointVerdictSource
+from elspeth.web.composer.advisor_content import PreparedAdvisorContent
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorSignoffGateFact
 from elspeth.web.composer.advisor_output import (
     AdvisorEndResponse,
@@ -55,6 +56,7 @@ from elspeth.web.composer.advisor_output import (
     sanitize_advisor_note,
 )
 from elspeth.web.composer.advisor_request import build_advisor_request_options
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner, AdvisorVisibleTranscript
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.invariants import InvariantError
@@ -106,7 +108,7 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_CANNOT_COMPLETE, RequestAdvisorHintArgumentsModel
-from elspeth.web.composer.turn_effects import AdvisorPublicationReview
+from elspeth.web.composer.turn_effects import AdvisorPublicationReview, TurnEvidence
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.completion_gates import completion_gate_fingerprint
 from elspeth.web.execution.schemas import ValidationResult
@@ -310,6 +312,8 @@ class AdvisorCheckpointOwner:
         timeout: float | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         abandonment_context: AdvisorAbandonmentReview | None = None,
+        advisor_transcript: AdvisorVisibleTranscript | None = None,
+        current_state: CompositionState | None = None,
     ) -> _AdvisorCallOutcome:
         """Classify an advisor call without suppressing controlled-code faults.
 
@@ -321,14 +325,32 @@ class AdvisorCheckpointOwner:
         first-party exception is re-raised.
         """
         internal_request = dict(arguments.to_internal_request())
+        if advisor_transcript is not None:
+            if type(advisor_transcript) is not AdvisorVisibleTranscript:
+                raise TypeError("Advisor hint requires an owned visible transcript")
+            internal_request["advisor_transcript"] = advisor_transcript
         is_abandonment = arguments.trigger == ADVISOR_TRIGGER_CANNOT_COMPLETE
         if is_abandonment:
             if type(abandonment_context) is not AdvisorAbandonmentReview:
                 raise InvariantError("Abandonment review requires the actual request-owned evidence")
+            if abandonment_context.transcript_binding is not None and (
+                advisor_transcript is None or advisor_transcript.binding != abandonment_context.transcript_binding
+            ):
+                raise InvariantError("Abandonment review differs from the actual visible transcript")
             internal_request["abandonment_context"] = abandonment_context
         elif abandonment_context is not None:
             raise InvariantError("Proactive advice cannot acquire an abandonment review")
         try:
+            if current_state is not None:
+                if type(current_state) is not CompositionState:
+                    raise TypeError("Advisor hint graph must be the owned current state")
+                summary = _advisor_context.fit_advisor_checkpoint_summary(
+                    current_state,
+                    internal_request,
+                    self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN,
+                )
+                internal_request["schema_excerpt"] = "".join(part.text for part in summary.values)
+                internal_request["_elspeth_advisor_summary_parts"] = summary
             guidance, metadata = await self._call_advisor_with_audit(
                 internal_request,
                 recorder=recorder,
@@ -417,7 +439,7 @@ class AdvisorCheckpointOwner:
         # keep the Tier-3 trust-boundary rules clean.
         user_msg = _advisor_context.build_advisor_user_message(arguments)
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
-        if checkpoint_phase is None and len(user_msg) > char_cap:
+        if checkpoint_phase is None and "advisor_transcript" not in arguments and len(user_msg) > char_cap:
             raise InvariantError("Advisor input exceeded its admitted complete-message budget")
         # Checkpoint builders retain the complete required graph and fit only
         # optional additions. The public hint's allowance is not a graph cap.
@@ -477,6 +499,11 @@ class AdvisorCheckpointOwner:
                     prompt_guard_role="advisor",
                     prompt_guard_trusted_message_indexes=trusted_indexes,
                     prompt_guard_content_parts=guard_evidence.content_parts,
+                    prepared_advisor_content=tuple(
+                        PreparedAdvisorContent(index, message["content"])
+                        for index, message in enumerate(messages)
+                        if message["role"] == "user"
+                    ),
                     **kwargs,
                 ),
                 timeout=effective_timeout,
@@ -680,6 +707,7 @@ class AdvisorCheckpointOwner:
         user_message: str | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
         publication_review: AdvisorPublicationReview | None = None,
+        advisor_transcript: AdvisorVisibleTranscript | None = None,
     ) -> dict[str, Any]:
         """Synthesize the (Tier-1, trusted) advisor ``arguments`` for a checkpoint.
 
@@ -698,10 +726,12 @@ class AdvisorCheckpointOwner:
         Required request text is not part of the optional graph-prose allowance.
         """
         pipeline_summary = _advisor_context.summarize_pipeline_for_advisor(state)
+        if publication_review is None and advisor_transcript is None and user_message is not None:
+            advisor_transcript = AdvisorTranscriptOwner(request=user_message).snapshot()
         # Identity covers complete evidence, before optional prose fitting.
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
         if phase == "early":
-            early_arguments: dict[str, str | list[str] | _advisor_context.AdvisorSummaryParts] = {
+            early_arguments: dict[str, Any] = {
                 "trigger": ADVISOR_TRIGGER_DETERMINISTIC_EARLY,
                 "problem_summary": (
                     "Review this pipeline APPROACH early (it was just established). "
@@ -713,6 +743,8 @@ class AdvisorCheckpointOwner:
                 "attempted_actions": [],
                 "schema_excerpt": pipeline_summary,
             }
+            if advisor_transcript is not None:
+                early_arguments["advisor_transcript"] = advisor_transcript
             summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, early_arguments, char_cap)
             early_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
             early_arguments["_elspeth_advisor_summary_parts"] = summary_parts
@@ -785,6 +817,8 @@ class AdvisorCheckpointOwner:
             if type(publication_review) is not AdvisorPublicationReview:
                 raise TypeError("END publication review must be an owned snapshot")
             end_arguments["publication_review"] = publication_review
+        elif advisor_transcript is not None:
+            end_arguments["advisor_transcript"] = advisor_transcript
         elif user_message is not None and user_message.strip():
             end_arguments["user_message"] = user_message
         summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap)
@@ -1118,6 +1152,7 @@ class AdvisorCheckpointOwner:
         session_operation_context: SessionOperationContext | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         publication_review: AdvisorPublicationReview | None = None,
+        advisor_transcript: AdvisorVisibleTranscript | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
     ) -> AdvisorCheckpointVerdict:
         """Backend-initiated deterministic advisor checkpoint (early|end).
@@ -1211,8 +1246,8 @@ class AdvisorCheckpointOwner:
             return AdvisorCheckpointVerdict(
                 ok=False,
                 blocking=False,
-                findings_text="Complete required graph evidence exceeds the existing advisor summary budget.",
-                failure_class="budget_exhausted",
+                findings_text="Complete required graph evidence could not be represented safely.",
+                failure_class="unavailable",
                 retryable=False,
             )
 
@@ -1224,6 +1259,7 @@ class AdvisorCheckpointOwner:
                 user_message=user_message,
                 advisor_review_state=advisor_review_state,
                 publication_review=publication_review,
+                advisor_transcript=advisor_transcript,
             )
         except _advisor_context.AdvisorGraphCoverageUnavailable:
             return graph_coverage_withheld()
@@ -1410,6 +1446,7 @@ class AdvisorCheckpointOwner:
         deadline: float | None = None,
         session_operation_context: SessionOperationContext | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        turn_evidence: TurnEvidence | None = None,
     ) -> bool:
         """Run the EARLY advisory checkpoint on the empty->non-empty pipeline
         TRANSITION (structurally <= once per session). Advisory only: inject the
@@ -1419,6 +1456,8 @@ class AdvisorCheckpointOwner:
             return False
         if not state_is_structurally_empty(prev_state):
             return False  # pipeline was already non-empty before this turn (or resumed session)
+        if turn_evidence is not None:
+            turn_evidence.transcript.observe_messages(llm_messages)
         verdict = await self._run_advisor_checkpoint(
             phase="early",
             state=state,
@@ -1428,6 +1467,7 @@ class AdvisorCheckpointOwner:
             deadline=deadline,
             session_operation_context=session_operation_context,
             provider_owner=provider_owner,
+            advisor_transcript=turn_evidence.transcript.snapshot() if turn_evidence is not None else None,
         )
         if verdict.ok and verdict.blocking:
             # ok and blocking => free advisor text (or the backend pre-scan

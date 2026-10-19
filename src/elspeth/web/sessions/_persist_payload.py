@@ -14,6 +14,7 @@ from typing import Any, Literal, final
 from uuid import UUID
 
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.sessions.protocol import ChatMessageRole, CompositionStateData, CompositionStateRecord
 
 
@@ -147,6 +148,7 @@ class RedactedToolRow:
     tool_call_id: str
     content: str  # JSON-serialised redacted response
     composition_state_payload: StatePayload | None  # set iff state advanced
+    visible_event: VisibleToolEvent | None = None
 
 
 @dataclass(frozen=True, slots=True)

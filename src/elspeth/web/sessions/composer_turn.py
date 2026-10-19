@@ -67,6 +67,7 @@ from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_requ
 from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord, compartment_ingress_record
 from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
 from elspeth.web.composer.advisor_decision import AdvisorGateBlocked, AdvisorGatePassed
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.audit import ComposerToolCancellation, ComposerToolFailure
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.invariants import InvariantError
@@ -89,6 +90,7 @@ from elspeth.web.composer.protocol import (
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.state import ValidationSummary
+from elspeth.web.composer.visible_tool_event import visible_response_gap
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
@@ -736,11 +738,12 @@ def _turn_audit_cohort_drafts(
                 composition_state_id=str(llm_composition_state_id) if llm_composition_state_id is not None else None,
             )
         )
+        public_call = llm_call_audit_envelope(call)
         drafts.append(
             AuditMessageDraft(
                 role="audit",
                 content=llm_call_audit_summary(call),
-                tool_calls=(llm_call_audit_envelope(call),),
+                tool_calls=(public_call, visible_response_gap(call, session_operation_context, public_call)),
                 composition_state_id=str(llm_composition_state_id) if llm_composition_state_id is not None else None,
             )
         )
@@ -1496,6 +1499,13 @@ async def _run_composer_turn(
                     provider_owner=provider_owner,
                     recovery_context=recovery_context,
                     retained_operation_context=retained_operation_context,
+                    advisor_history=AdvisorTranscriptHistory.from_records(
+                        session_id=str(turn.session_id),
+                        actor_user_id=turn.actor_user_id,
+                        current_request_id=str(turn_user_message_id),
+                        request=message_text,
+                        records=records,
+                    ),
                 )
             # F-B2/C2: first statement after compose() returns.
             observation.compose_result = result

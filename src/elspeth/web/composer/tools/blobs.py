@@ -412,8 +412,8 @@ class BlobCreatePayload(TypedDict):
     originated_in: Literal["this_tool_call"]
 
 
-class BlobContentPayload(TypedDict):
-    """Closed dict shape for the get_blob_content tool's success result data.
+class AttachmentContentPayload(TypedDict):
+    """Closed common content/provenance fields shared by both text readers.
 
     ``created_by`` and ``creation_modality`` are the read-back half of the
     self-authorship marker on :class:`BlobCreatePayload` (elspeth-47eba5cced).
@@ -448,8 +448,6 @@ class BlobContentPayload(TypedDict):
     content the assistant really did invent.
     """
 
-    read_attachment_suggestion: NotRequired[BlobReadSuggestion]
-
     blob_id: str
     filename: str
     mime_type: str
@@ -463,6 +461,12 @@ class BlobContentPayload(TypedDict):
     start_char: int
     end_char: int
     next_offset_chars: int | None
+
+
+class BlobContentPayload(AttachmentContentPayload):
+    """The paged reader alone can suggest switching to complete delivery."""
+
+    read_attachment_suggestion: NotRequired[BlobReadSuggestion]
 
 
 def _blob_row_to_tool_dict(row: Any) -> BlobToolRecord:
@@ -2057,7 +2061,7 @@ def _execute_get_blob_content(
     if start_char > total_chars:
         return _failure_result(state, "Blob content offset exceeds its decoded character length.")
 
-    payload: BlobContentPayload = {
+    payload: AttachmentContentPayload = {
         "blob_id": blob_id,
         "filename": blob["filename"],
         "mime_type": blob["mime_type"],
@@ -2086,7 +2090,7 @@ def _execute_get_blob_content(
     result = _discovery_result(state, payload)
 
     def page(end_char: int) -> tuple[ToolResult, int]:
-        page_payload: BlobContentPayload = {
+        page_payload: AttachmentContentPayload = {
             **payload,
             "content": content[start_char:end_char],
             "end_char": end_char,
@@ -2094,11 +2098,16 @@ def _execute_get_blob_content(
             "next_offset_chars": end_char if end_char < total_chars else None,
         }
         if end_char < total_chars:
-            page_payload["read_attachment_suggestion"] = (
-                "This is a partial page of a large attachment. If you need the whole file, use read_attachment "
-                "for complete guarded UTF-8 text in one call; it explicitly refuses if the full response cannot fit."
-            )
-        candidate = replace(result, data=page_payload)
+            hinted_page: BlobContentPayload = {
+                **page_payload,
+                "read_attachment_suggestion": (
+                    "This is a partial page of a large attachment. If you need the whole file, use read_attachment "
+                    "for complete guarded UTF-8 text in one call; it explicitly refuses if the full response cannot fit."
+                ),
+            }
+            candidate = replace(result, data=hinted_page)
+        else:
+            candidate = replace(result, data=page_payload)
         # Use the actual selected provider serializer, including validation,
         # metadata and JSON escaping. Keep each complete page small enough
         # for guard evidence framing without slicing a guard input unit. This
@@ -2204,7 +2213,7 @@ def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState,
         raise AuditIntegrityError("Ready blob content has no verified hash")
     if validated.expected_content_hash is not None and not hmac.compare_digest(validated.expected_content_hash, verified_hash):
         return _failure_result(state, "Blob content changed; restart inspection with its current content hash.")
-    payload: BlobContentPayload = {
+    payload: AttachmentContentPayload = {
         "blob_id": blob_id,
         "filename": blob["filename"],
         "mime_type": blob["mime_type"],

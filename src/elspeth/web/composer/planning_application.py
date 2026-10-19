@@ -102,6 +102,7 @@ from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import RuntimePreflight
+from elspeth.web.composer.visible_tool_event import VisibleToolEvent, visible_response_gap
 from elspeth.web.composer.withheld_replies import WithheldReply, withheld_reply_envelope
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -342,6 +343,7 @@ class PlanningApplication:
         withheld_replies: tuple[WithheldReply, ...],
         private_candidates: tuple[PrivatePlannerCandidate, ...],
         session_operation_context: SessionOperationContext | None,
+        visible_tool_events: tuple[tuple[ComposerToolInvocation, VisibleToolEvent], ...] = (),
     ) -> tuple[AuditMessageDraft, ...]:
         """Build required planner evidence without writing or touching graph state.
 
@@ -364,11 +366,12 @@ class PlanningApplication:
                 if session_operation_context is None:
                     raise AuditIntegrityError("planner diagnostics require operation authority")
                 drafts.extend(private_diagnostic_drafts(record, context=session_operation_context))
+                public_call = llm_call_audit_envelope(record)
                 drafts.append(
                     AuditMessageDraft(
                         role="audit",
                         content=llm_call_audit_summary(record),
-                        tool_calls=(llm_call_audit_envelope(record),),
+                        tool_calls=(public_call, visible_response_gap(record, session_operation_context, public_call)),
                     )
                 )
             else:
@@ -388,11 +391,25 @@ class PlanningApplication:
                 private_tool_invocation_draft(invocation, session_id=str(session_id), session_operation_context=session_operation_context)
             )
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            companions = [event for recorded, event in visible_tool_events if recorded is invocation]
+            if len(companions) > 1:
+                raise AuditIntegrityError("Planner tool event repeats its ordinary visible companion")
+            if companions:
+                visible = companions[0]
+                display_invocation = cast(dict[str, Any], envelope["invocation"])
+                visible.validate(
+                    context=session_operation_context,
+                    session_id=str(session_id),
+                    tool_call_id=invocation.tool_call_id,
+                    tool_name=invocation.tool_name,
+                    display_arguments=display_invocation["arguments_canonical"],
+                    display_result=content,
+                )
             drafts.append(
                 AuditMessageDraft(
                     role="audit",
                     content=content,
-                    tool_calls=(envelope,),
+                    tool_calls=(envelope, companions[0].to_envelope()) if companions else (envelope,),
                 )
             )
         for withheld in withheld_replies:
@@ -442,6 +459,7 @@ class PlanningApplication:
         private_candidates: tuple[PrivatePlannerCandidate, ...],
         session_operation_context: SessionOperationContext | None,
         required_work: RequiredWorkBinding | None = None,
+        visible_tool_events: tuple[tuple[ComposerToolInvocation, VisibleToolEvent], ...] = (),
     ) -> None:
         """Settle the planner evidence cohort before creating proposal authority."""
         if session_operation_context is None:
@@ -454,6 +472,7 @@ class PlanningApplication:
             withheld_replies=withheld_replies,
             private_candidates=private_candidates,
             session_operation_context=session_operation_context,
+            visible_tool_events=visible_tool_events,
         )
         sessions = self._sessions_service
         audit_sql = audit_projection = None
@@ -595,6 +614,7 @@ class PlanningApplication:
         planner_private_candidates: tuple[PrivatePlannerCandidate, ...],
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         required_work: RequiredWorkBinding | None = None,
+        visible_tool_events: tuple[tuple[ComposerToolInvocation, VisibleToolEvent], ...] = (),
     ) -> ComposerResult:
         """Persist planner evidence, then create one reviewable proposal row.
 
@@ -626,6 +646,7 @@ class PlanningApplication:
             private_candidates=planner_private_candidates,
             session_operation_context=session_operation_context,
             required_work=required_work,
+            visible_tool_events=visible_tool_events,
         )
         arguments = cast(dict[str, Any], deep_thaw(plan.proposal.pipeline))
         redacted_arguments = redact_tool_call_arguments(
@@ -1157,6 +1178,7 @@ class PlanningApplication:
                 withheld_replies=recorder.withheld_replies[planner_withheld_start:],
                 private_candidates=(),
                 session_operation_context=session_operation_context,
+                visible_tool_events=recorder.visible_tool_events,
             )
             return ComposerResult(
                 message=handoff.intent.message,
@@ -1181,6 +1203,7 @@ class PlanningApplication:
                 private_candidates=recorder.private_candidates[planner_private_start:],
                 session_operation_context=session_operation_context,
                 required_work=required_work,
+                visible_tool_events=recorder.visible_tool_events,
             )
             decline_message = declined.decline_text.strip() or (
                 "I could not find a way to build this pipeline with the available components."
@@ -1214,6 +1237,7 @@ class PlanningApplication:
                     private_candidates=recorder.private_candidates[planner_private_start:],
                     session_operation_context=session_operation_context,
                     required_work=required_work,
+                    visible_tool_events=recorder.visible_tool_events,
                 )
             )
             if deferred is not None:
@@ -1244,6 +1268,7 @@ class PlanningApplication:
                     private_candidates=recorder.private_candidates[planner_private_start:],
                     session_operation_context=session_operation_context,
                     required_work=required_work,
+                    visible_tool_events=recorder.visible_tool_events,
                 ),
                 deferred=exc if type(exc) is asyncio.CancelledError else None,
             )
@@ -1270,4 +1295,5 @@ class PlanningApplication:
             planner_private_candidates=recorder.private_candidates[planner_private_start:],
             plugin_snapshot=plugin_snapshot,
             required_work=required_work,
+            visible_tool_events=recorder.visible_tool_events,
         )

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
     from elspeth.contracts.prompt_guard import PromptGuardMode
     from elspeth.contracts.session_operation import SessionOperationContext
+    from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
     from elspeth.web.composer.prompt_guard import PromptGuardMount
@@ -1772,6 +1773,7 @@ class ComposerService(Protocol):
         provider_owner: ProviderInvocationOwner | None = None,
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
+        advisor_history: AdvisorTranscriptHistory | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 

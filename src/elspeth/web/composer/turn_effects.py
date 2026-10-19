@@ -19,6 +19,7 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer._attachment_response import CompleteAttachmentDataModel
 from elspeth.web.composer.advisor_abandonment import AdvisorAbandonmentReview, build_abandonment_review
 from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory, AdvisorTranscriptOwner, AdvisorVisibleTranscript
 from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult, serialize_admitted_discovery_result
 from elspeth.web.composer.protocol import RetainedOperationContext
 from elspeth.web.composer.redaction import GetBlobContentDataModel
@@ -191,6 +192,8 @@ class AdvisorPublicationReview:
     semantic_repair_key: str
     payload_json: str = field(repr=False)
     provider_payload_json: str = field(repr=False)
+    transcript: AdvisorVisibleTranscript | None = field(default=None, repr=False)
+    candidate_event_id: str | None = None
 
     def current_request_text(self) -> str:
         """The complete centrally redacted request owned by this snapshot."""
@@ -201,6 +204,9 @@ class AdvisorPublicationReview:
         payload = json.loads(self.provider_payload_json)
         del payload["current_request"]
         payload["current_request_ref"] = "complete_original_user_request_section"
+        if self.candidate_event_id is not None:
+            del payload["candidate_reply"]
+            payload["candidate_reply_ref"] = {"visible_transcript_event_id": self.candidate_event_id}
         return json.dumps(payload, ensure_ascii=False)
 
     def untrusted_content_parts(self) -> tuple[PromptGuardContentPart, ...]:
@@ -287,6 +293,7 @@ class TurnEvidence:
     __slots__ = (
         "_abandonment_limitations",
         "_abandonment_review",
+        "_abandonment_transcript_binding",
         "_conflicting_page_ids",
         "_current_calls",
         "_current_pages",
@@ -301,6 +308,7 @@ class TurnEvidence:
         "request_hash",
         "request_id",
         "session_id",
+        "transcript",
     )
 
     def __init__(
@@ -314,6 +322,7 @@ class TurnEvidence:
         initial_state: CompositionState,
         retained_operation_context: RetainedOperationContext | None = None,
         actor_user_id: str | None = None,
+        advisor_history: AdvisorTranscriptHistory | None = None,
     ) -> None:
         if type(initial_state) is not CompositionState or type(request_id) is not str or not request_id:
             raise TypeError("Turn evidence requires an owned initial state and request identity")
@@ -325,7 +334,13 @@ class TurnEvidence:
         self.operation_id = session_operation_context.fence.operation_id if session_operation_context is not None else None
         self.request_id = request_id
         self.request_hash = stable_hash(request)
+        if advisor_history is not None:
+            if type(advisor_history) is not AdvisorTranscriptHistory:
+                raise TypeError("Advisor history requires an owned authenticated snapshot")
+            advisor_history.validate_for(session_id=session_id, actor_user_id=actor_user_id, request_id=request_id, request=request)
+        self.transcript = AdvisorTranscriptOwner(request=request, history=advisor_history)
         self._abandonment_review: tuple[AdvisorAbandonmentReview, AdvisorAbandonmentResponse] | None = None
+        self._abandonment_transcript_binding: str | None = None
         self._abandonment_limitations: dict[str, tuple[AdvisorAbandonmentReview, AdvisorAbandonmentResponse]] = {}
         if retained_operation_context is not None:
             if type(retained_operation_context) is not RetainedOperationContext:
@@ -560,6 +575,7 @@ class TurnEvidence:
         self._delivery_generations[attempt.scope] += 1
         for page in attempt.pages:
             self._historical_pages[page.tool_call_id] = page
+            self.transcript.confirm_read_delivery(tool_call_id=page.tool_call_id, provider_call_id=call_id)
         return True
 
     def current_call_id(self, scope: DeliveryScope) -> str | None:
@@ -575,6 +591,7 @@ class TurnEvidence:
     def invalidate_abandonment(self) -> None:
         """A new tool batch resumes work and cannot reuse an earlier stop."""
         self._abandonment_review = None
+        self._abandonment_transcript_binding = None
 
     def abandonment_context(
         self,
@@ -586,6 +603,7 @@ class TurnEvidence:
     ) -> AdvisorAbandonmentReview:
         if stable_hash(request) != self.request_hash:
             raise AuditIntegrityError("Abandonment review belongs to another user request")
+        self.transcript.observe_messages(messages)
         return build_abandonment_review(
             request=request,
             state=current_state,
@@ -594,6 +612,7 @@ class TurnEvidence:
             request_identity=self.identity,
             request_scope=(self.session_id, self.operation_id, self.request_id),
             registration_revision=self._registration_revision,
+            visible_transcript=self.transcript.snapshot(),
         )
 
     def accept_abandonment(
@@ -606,17 +625,49 @@ class TurnEvidence:
     ) -> None:
         if type(review) is not AdvisorAbandonmentReview or type(decision) is not AdvisorAbandonmentResponse:
             raise AuditIntegrityError("Abandonment confirmation lacks owned review and response")
+        transcript_binding = self.transcript.snapshot().binding
         if (
             review.request_scope != (self.session_id, self.operation_id, self.request_id)
             or review.request_hash != self.request_hash
             or review.graph_hash != stable_hash(current_state.to_dict())
             or review.policy_hash != plugin_snapshot.snapshot_hash
             or review.registration_revision != self._registration_revision
+            or (review.transcript_binding is not None and review.transcript_binding != transcript_binding)
         ):
             raise AuditIntegrityError("Abandonment confirmation belongs to stale evidence")
         self._abandonment_review = (review, decision)
+        self._abandonment_transcript_binding = transcript_binding
         if decision.decision == "CONTINUE_WITH_LIMITATION":
             self._abandonment_limitations[review.binding] = (review, decision)
+
+    def seal_abandonment_feedback(self, review: AdvisorAbandonmentReview, message: Mapping[str, Any]) -> None:
+        """Bind only this reviewed Advisor call's own completed feedback.
+
+        No later tool, visible control or history change acquires this exception.
+        The producer calls this synchronously when appending the actual result.
+        """
+        if self._abandonment_review is None or self._abandonment_review[0] is not review:
+            raise AuditIntegrityError("Abandonment feedback lacks its accepted review")
+        if self._abandonment_transcript_binding != self.transcript.snapshot().binding:
+            raise AuditIntegrityError("Abandonment feedback follows stale evidence")
+        payload = json.loads(message["content"])
+        calls = [
+            call
+            for event in json.loads(self.transcript.snapshot().provider_json)["events"]
+            if event["source"] == "current_request" and event["role"] == "assistant"
+            for call in event.get("tool_calls", [])
+            if call["tool_call_id"] == message.get("tool_call_id") and call["tool_name"] == "request_advisor_hint"
+        ]
+        if (
+            message.get("role") != "tool"
+            or len(calls) != 1
+            or payload.get("status") != "SUCCESS"
+            or payload.get("review_binding") != review.binding
+            or payload.get("abandonment_decision") != self._abandonment_review[1].decision
+        ):
+            raise AuditIntegrityError("Abandonment feedback does not complete the reviewed Advisor call")
+        self.transcript.observe_messages((message,))
+        self._abandonment_transcript_binding = self.transcript.snapshot().binding
 
     def confirmed_abandonment(self, *, current_state: CompositionState, plugin_snapshot: PluginAvailabilitySnapshot | None) -> bool:
         if self._abandonment_review is None or plugin_snapshot is None:
@@ -629,6 +680,7 @@ class TurnEvidence:
             and review.graph_hash == stable_hash(current_state.to_dict())
             and review.policy_hash == plugin_snapshot.snapshot_hash
             and review.registration_revision == self._registration_revision
+            and self._abandonment_transcript_binding == self.transcript.snapshot().binding
         )
 
     def review_candidate(
@@ -640,6 +692,7 @@ class TurnEvidence:
             raise TypeError("Publication review requires the owned current state and candidate text")
         if scope not in ("primary", "planner"):
             raise TypeError("Publication review requires an owned delivery scope")
+        transcript = self.transcript.snapshot()
         effects = self.effects
         fields = effects.changed_fields
         # A bounded projection exposes omission explicitly. The binding below
@@ -745,6 +798,7 @@ class TurnEvidence:
             if (
                 stop_review.graph_hash == stable_hash(current_state.to_dict())
                 and stop_review.registration_revision == self._registration_revision
+                and self._abandonment_transcript_binding == transcript.binding
             ):
                 authoring_decisions["authoring_stop_review"] = _abandonment_decision_projection(stop_review, stop_decision)
                 semantic_authoring_decisions["authoring_stop_review"] = _abandonment_decision_projection(
@@ -801,6 +855,7 @@ class TurnEvidence:
                 "evidence": evidence_identity,
                 "current_graph": authored_state_hash(current_state),
                 "authoring_decisions": authoring_decisions,
+                "visible_transcript": transcript.binding,
             }
         )
         # Repair progress excludes transport identities. Publication permission
@@ -827,6 +882,7 @@ class TurnEvidence:
                 # it never fills a gap in currently available content.
                 "historically_delivered": inspection(None),
                 "authoring_decisions": semantic_authoring_decisions,
+                "visible_transcript_evidence": transcript.semantic_binding,
                 **semantic_source_metadata_projection,
             }
         )
@@ -837,6 +893,8 @@ class TurnEvidence:
             semantic_repair_key=semantic_repair_key,
             payload_json=json.dumps(payload, ensure_ascii=False),
             provider_payload_json=json.dumps(provider_payload, ensure_ascii=False),
+            transcript=transcript,
+            candidate_event_id=self.transcript.candidate_event_id(provider_call_id=self.current_call_id(scope), candidate=candidate),
         )
 
     def accept_checkpoint(

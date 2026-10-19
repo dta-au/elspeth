@@ -1094,6 +1094,8 @@ async def run_tool_batch(
     # budgeted discovery or mutation work. Advisor-only turns are
     # intentionally neither: they spend the advisor-specific budget,
     # not the generic discovery/composition turn budgets.
+    if ctx.turn_evidence is not None:
+        ctx.turn_evidence.transcript.observe_messages(llm_messages)
     turn_has_mutation = False
     turn_has_discovery = False
     all_cache_hits = True
@@ -2435,6 +2437,8 @@ async def run_tool_batch(
 
             abandonment_context = None
             try:
+                if ctx.turn_evidence is not None:
+                    ctx.turn_evidence.transcript.observe_messages(llm_messages)
                 if advisor_arg_error.trigger == ADVISOR_TRIGGER_CANNOT_COMPLETE:
                     if ctx.turn_evidence is None or user_message_content is None:
                         raise AuditIntegrityError("Abandonment review requires current request-owned evidence")
@@ -2451,6 +2455,8 @@ async def run_tool_batch(
                         timeout=effective_advisor_timeout,
                         provider_owner=ctx.provider_owner,
                         abandonment_context=abandonment_context,
+                        advisor_transcript=ctx.turn_evidence.transcript.snapshot() if ctx.turn_evidence is not None else None,
+                        current_state=state,
                     ),
                     audit=audit,
                     recorder=recorder,
@@ -2607,6 +2613,39 @@ async def run_tool_batch(
             guidance = advisor_outcome.guidance
             advisor_meta = advisor_outcome.metadata
 
+            abandonment_decision = None
+            review_binding = None
+            advisor_note = (
+                "ADVICE only — call the appropriate mutation tool to "
+                "apply any change. Do not echo this guidance back as "
+                "configuration without verifying it against the schema."
+            )
+            if advisor_outcome.abandonment_response is not None:
+                if abandonment_context is None or ctx.turn_evidence is None:
+                    raise AuditIntegrityError("Abandonment decision lost its request-owned context")
+                decision = advisor_outcome.abandonment_response
+                ctx.turn_evidence.accept_abandonment(
+                    abandonment_context, decision, current_state=state, plugin_snapshot=ctx.plugin_snapshot
+                )
+                abandonment_decision = decision.decision
+                review_binding = abandonment_context.binding
+                guidance = decision.reason
+                if decision.next_action is not None:
+                    guidance += "\nSupported next action: " + decision.next_action
+                if decision.question is not None:
+                    guidance += "\nQuestion for the user: " + decision.question
+                if decision.decision == "STOP_CONFIRMED":
+                    advisor_note = (
+                        "Stop authoring this request: no remaining authorized useful action can proceed. Explain the confirmed limit "
+                        "or ask the precise question; preserve the draft and do not claim completion. The final reply still receives ordinary END review."
+                    )
+                elif decision.decision == "CONTINUE_WITH_LIMITATION":
+                    advisor_note = (
+                        "Continue the supported work with the advisor's next action. Retain the precise limitation for final review; "
+                        "it does not stop the whole request or establish pipeline completion or graph clearance."
+                    )
+                else:
+                    advisor_note = "Continue with the advisor's supported action. This is not pipeline completion or graph clearance."
             success_payload = {
                 "status": "SUCCESS",
                 "guidance": guidance,
@@ -2617,40 +2656,10 @@ async def run_tool_batch(
                 "advisor_latency_ms": advisor_meta["latency_ms"],
                 "budget_used": advisor_calls_used,
                 "budget_remaining": budget - advisor_calls_used,
-                "note": (
-                    "ADVICE only — call the appropriate mutation tool to "
-                    "apply any change. Do not echo this guidance back as "
-                    "configuration without verifying it against the schema."
-                ),
+                "note": advisor_note,
+                "abandonment_decision": abandonment_decision,
+                "review_binding": review_binding,
             }
-            if advisor_outcome.abandonment_response is not None:
-                if abandonment_context is None or ctx.turn_evidence is None:
-                    raise AuditIntegrityError("Abandonment decision lost its request-owned context")
-                decision = advisor_outcome.abandonment_response
-                ctx.turn_evidence.accept_abandonment(
-                    abandonment_context, decision, current_state=state, plugin_snapshot=ctx.plugin_snapshot
-                )
-                success_payload["abandonment_decision"] = decision.decision
-                success_payload["review_binding"] = abandonment_context.binding
-                success_payload["guidance"] = decision.reason
-                if decision.next_action is not None:
-                    success_payload["guidance"] += "\nSupported next action: " + decision.next_action
-                if decision.question is not None:
-                    success_payload["guidance"] += "\nQuestion for the user: " + decision.question
-                if decision.decision == "STOP_CONFIRMED":
-                    success_payload["note"] = (
-                        "Stop authoring this request: no remaining authorized useful action can proceed. Explain the confirmed limit "
-                        "or ask the precise question; preserve the draft and do not claim completion. The final reply still receives ordinary END review."
-                    )
-                elif decision.decision == "CONTINUE_WITH_LIMITATION":
-                    success_payload["note"] = (
-                        "Continue the supported work with the advisor's next action. Retain the precise limitation for final review; "
-                        "it does not stop the whole request or establish pipeline completion or graph clearance."
-                    )
-                else:
-                    success_payload["note"] = (
-                        "Continue with the advisor's supported action. This is not pipeline completion or graph clearance."
-                    )
             recorder.record(
                 finish_success(
                     audit,
@@ -2671,14 +2680,15 @@ async def run_tool_batch(
             # stale advisor anchor count.
             anti_anchor.record_success()
             tool_feedback_json = json.dumps(advisor_feedback_payload(success_payload))
-            llm_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_feedback_json,
-                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                }
-            )
+            feedback_message = {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": tool_feedback_json,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
+            }
+            if abandonment_context is not None and ctx.turn_evidence is not None:
+                ctx.turn_evidence.seal_abandonment_feedback(abandonment_context, feedback_message)
+            llm_messages.append(feedback_message)
             continue
 
         # Session-aware async tool dispatch.

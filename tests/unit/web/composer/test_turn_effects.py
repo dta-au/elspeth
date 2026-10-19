@@ -39,7 +39,7 @@ def test_publication_provider_projection_preserves_digest_and_scrubs_text(monkey
     message = build_advisor_user_message(
         {"trigger": "test", "problem_summary": "test", "recent_errors": [], "attempted_actions": [], "publication_review": review}
     )
-    assert message.count(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) == message.count(_ADVISOR_UNTRUSTED_SUMMARY_END) == 2
+    assert message.count(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) == message.count(_ADVISOR_UNTRUSTED_SUMMARY_END) == 3
     wire = message.rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1].split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0]
     payload = json.loads(wire)
     assert payload["current_graph_hash"] == digest
@@ -368,6 +368,57 @@ def test_abandonment_scopes_refuse_stale_or_different_request_evidence(stale_par
             current_state=_state("Different") if stale_part == "graph" else _state(),
             plugin_snapshot=_abandonment_snapshot("other") if stale_part == "policy" else snapshot,
         )
+
+
+@pytest.mark.parametrize("change", ["schema", "control"])
+def test_abandonment_refuses_transcript_only_changes_at_acceptance_and_current_use(change):
+    evidence = _evidence()
+    policy = _abandonment_snapshot()
+    review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=policy, messages=())
+    decision = AdvisorAbandonmentResponse(decision="STOP_CONFIRMED", reason="A required input is absent.", next_action=None, question=None)
+    evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=policy)
+    assert evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=policy)
+    message = (
+        {"role": "tool", "tool_call_id": "new-schema", "content": json.dumps({"success": True, "data": {"field": "new_fact"}})}
+        if change == "schema"
+        else {"role": "user", "content": "A newly supplied backend fact"}
+    )
+    evidence.transcript.observe_messages((message,))
+    assert not evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=policy)
+    with pytest.raises(AuditIntegrityError, match="stale evidence"):
+        evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=policy)
+    publication = evidence.review_candidate(candidate="A truthful status", request="Inspect", current_state=_state())
+    assert "authoring_stop_review" not in json.loads(publication.payload_json)
+
+
+def test_only_exact_reviewed_advisor_feedback_can_extend_the_stop_boundary():
+    evidence = _evidence()
+    policy = _abandonment_snapshot()
+    request = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "reviewed-advisor", "type": "function", "function": {"name": "request_advisor_hint", "arguments": "{}"}}],
+    }
+    review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=policy, messages=(request,))
+    decision = AdvisorAbandonmentResponse(decision="STOP_CONFIRMED", reason="A required input is absent.", next_action=None, question=None)
+    evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=policy)
+    feedback = {
+        "role": "tool",
+        "tool_call_id": "reviewed-advisor",
+        "content": json.dumps(
+            {
+                "status": "SUCCESS",
+                "review_binding": review.binding,
+                "abandonment_decision": "STOP_CONFIRMED",
+            }
+        ),
+    }
+    with pytest.raises(AuditIntegrityError):
+        evidence.seal_abandonment_feedback(review, feedback | {"tool_call_id": "another-call"})
+    evidence.seal_abandonment_feedback(review, feedback)
+    assert evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=policy)
+    evidence.transcript.observe_messages(({"role": "user", "content": "Subsequent visible evidence"},))
+    assert not evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=policy)
 
 
 def _page(start, end, *, total=6, content_hash="a" * 64):

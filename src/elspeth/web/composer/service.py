@@ -81,6 +81,7 @@ from elspeth.web.composer.advisor_checkpoint import (
 from elspeth.web.composer.advisor_decision import (
     AdvisorGateDecision,
 )
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.application_policy import PluginPolicyContextFactory
 from elspeth.web.composer.audit import BufferingRecorder, ComposerToolCancellation, ComposerToolFailure
@@ -1127,6 +1128,7 @@ class ComposerServiceImpl:
         provider_owner: ProviderInvocationOwner | None = None,
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
+        advisor_history: AdvisorTranscriptHistory | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -1206,7 +1208,25 @@ class ComposerServiceImpl:
                 initial_state=state,
                 retained_operation_context=retained_operation_context,
                 actor_user_id=user_id,
+                advisor_history=advisor_history,
             )
+            if self._session_engine is not None and session_id is not None and session_operation_context is not None:
+                from elspeth.web.composer.tools.blobs import _locked_read_ready_blob
+
+                history_engine = self._session_engine
+
+                def read_advisor_history_blob(blob_id: str) -> tuple[Mapping[str, Any], bytes] | None:
+                    record, raw = _locked_read_ready_blob(
+                        history_engine,
+                        session_id,
+                        blob_id,
+                        data_dir=self._data_dir,
+                        session_operation_context=session_operation_context,
+                        session_operation_authority=self._require_sessions_service().session_operation_authority,
+                    )
+                    return (record, raw) if record is not None and raw is not None else None
+
+                turn_evidence.transcript.use_blob_reader(read_advisor_history_blob)
             plugin_snapshot, policy_catalog = self._policy_context.build(user_id)
             try:
                 # Which authoring surface a request gets is decided here, and the
@@ -1445,6 +1465,7 @@ class ComposerServiceImpl:
         selected_messages, selected_tools = deepcopy(messages), deepcopy(tools)
         delivery = None
         if turn_evidence is not None:
+            turn_evidence.transcript.observe_messages(messages)
             marked_messages, marked_tools = selected_messages, selected_tools
             if supports_anthropic_prompt_cache_markers(self._model):
                 marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(
@@ -2469,6 +2490,7 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
         )
+        turn_evidence.transcript.begin_messages(llm_messages)
         tools = composer_loop_tool_definitions(self._planner_dialect)
         if recovery_context is not None:
             llm_messages.append({"role": "system", "content": recovery_context_message(recovery_context)})
@@ -2814,6 +2836,7 @@ class ComposerServiceImpl:
                                 deadline=deadline,
                                 session_operation_context=session_operation_context,
                                 provider_owner=provider_owner,
+                                turn_evidence=turn_evidence,
                             )
                         except _AdvisorCheckpointComposeDeadlineExpired:
                             # The driver converts this signal after persistence
@@ -2830,6 +2853,7 @@ class ComposerServiceImpl:
                     # A successful tool remains successful; the separate
                     # checkpoint failure propagates after this mandatory work.
                     early_advisor_context_introduced = len(llm_messages) > early_advisor_message_count
+                    turn_evidence.transcript.observe_messages(llm_messages)
                     persist_result = await self._persist_turn_audit(
                         tool_outcomes=dispatch_result.tool_outcomes,
                         decoded_args_by_call_id=dispatch_result.decoded_args_by_call_id,

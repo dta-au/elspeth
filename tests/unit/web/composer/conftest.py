@@ -72,6 +72,7 @@ F6 follow-up: drift guard added per ``docs/composer/evidence/composer-phase-2-fo
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -105,6 +106,9 @@ from elspeth.web.composer.redaction import (
     GetBlobContentArgumentsModel,
     GetBlobContentDataModel,
     GetBlobContentResponseModel,
+    ReadAttachmentArgumentsModel,
+    ReadAttachmentDataModel,
+    ReadAttachmentResponseModel,
     SetPipelineArgumentsModel,
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
@@ -266,6 +270,43 @@ def _get_blob_content_data_strategy(draw: st.DrawFn) -> GetBlobContentDataModel:
     )
 
 
+@st.composite
+def _read_attachment_arguments_strategy(draw: st.DrawFn) -> ReadAttachmentArgumentsModel:
+    arguments = {"blob_id": draw(st.text())}
+    if draw(st.booleans()):
+        arguments["expected_content_hash"] = draw(st.one_of(st.none(), _BLOB_HASH_STRATEGY))
+    return ReadAttachmentArgumentsModel.model_validate(arguments)
+
+
+@st.composite
+def _read_attachment_data_strategy(draw: st.DrawFn) -> ReadAttachmentDataModel:
+    content = draw(st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=64))
+    raw = content.encode("utf-8")
+    return ReadAttachmentDataModel(
+        blob_id=draw(st.text()),
+        filename=draw(st.text()),
+        mime_type=draw(st.text()),
+        content=content,
+        truncated=False,
+        size_bytes=len(raw),
+        content_hash=hashlib.sha256(raw).hexdigest(),
+        total_chars=len(content),
+        start_char=0,
+        end_char=len(content),
+        next_offset_chars=None,
+        created_by=draw(st.sampled_from(sorted(BLOB_CREATORS))),
+        creation_modality=draw(st.sampled_from(tuple(modality.value for modality in CreationModality))),
+    )
+
+
+def _read_attachment_response_strategy() -> st.SearchStrategy[ReadAttachmentResponseModel]:
+    data = st.from_type(ReadAttachmentDataModel)
+    return st.one_of(
+        st.builds(ReadAttachmentResponseModel, success=st.just(True), data=data),
+        st.builds(ReadAttachmentResponseModel, success=st.just(False), data=st.one_of(st.none(), data)),
+    )
+
+
 def _set_pipeline_source_strategy() -> st.SearchStrategy[_SetPipelineSourceModel]:
     return st.builds(
         _SetPipelineSourceModel,
@@ -405,6 +446,9 @@ st.register_type_strategy(CreateBlobArgumentsModel, _create_blob_strategy())
 st.register_type_strategy(GetBlobContentArgumentsModel, _get_blob_content_arguments_strategy())
 st.register_type_strategy(GetBlobContentDataModel, _get_blob_content_data_strategy())
 st.register_type_strategy(GetBlobContentResponseModel, _get_blob_content_response_strategy())
+st.register_type_strategy(ReadAttachmentArgumentsModel, _read_attachment_arguments_strategy())
+st.register_type_strategy(ReadAttachmentDataModel, _read_attachment_data_strategy())
+st.register_type_strategy(ReadAttachmentResponseModel, _read_attachment_response_strategy())
 st.register_type_strategy(_SetPipelineSourceModel, _set_pipeline_source_strategy())
 st.register_type_strategy(_SetPipelineNamedSourceModel, _set_pipeline_named_source_strategy())
 st.register_type_strategy(_PipelineNodeModel, _pipeline_node_strategy())

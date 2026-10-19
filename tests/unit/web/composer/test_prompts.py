@@ -653,20 +653,28 @@ class TestBuildSystemPrompt:
         assert result == SYSTEM_PROMPT
 
     def test_core_skill_batches_complex_new_pipeline_builds(self) -> None:
-        """Complex new builds must steer the model away from granular mutation loops."""
+        """Large builds save coherent batches and continue to the requested topology."""
         result = build_system_prompt(None)
         flattened = " ".join(result.split())
 
         assert "### Complex New Pipeline Batching" in result
-        assert "three or more components" in flattened
-        assert "two or more workflow patterns" in flattened
-        assert "submit one `set_pipeline`" in flattened
-        assert "Do not build a complex new pipeline tool-by-tool" in flattened
-        # The prohibition is scoped to new builds so the edit table's
-        # add/rewire row cannot read as licence for a construction loop
-        # (elspeth-ee89aca5d0); the steer itself must survive that scoping.
-        assert "governs NEW builds only" in flattened
-        assert "Editing a pipeline that already exists is not a new build" in flattened
+        assert "After establishing source facts and loading the selected components' live schemas" in flattened
+        assert "Use one complete `set_pipeline` when the requested graph fits a concise call" in flattened
+        assert "For a larger graph or substantial component configuration, use bounded batches" in flattened
+        assert "`set_source`, `set_output`, `upsert_node`, `upsert_edge`, and focused option patches" in flattened
+        assert "instead of holding the entire build in one large generation" in flattened
+        assert "Honor the user's requested construction order, including a connected source/output first when requested" in flattened
+        assert "Persist real components through the advertised tools; a prose plan is not a saved checkpoint" in flattened
+        assert "Continue from each saved batch within the same request until the entire requested workflow is present" in flattened
+        assert "A saved source/output scaffold is an intermediate draft, never completion" in flattened
+        assert "Do not end or ask the user to continue merely because a construction batch succeeded" in flattened
+        assert (
+            "Surface interpretation reviews only after the full requested topology is present and other validation errors are resolved"
+            in flattened
+        )
+        assert "Do not build a complex new pipeline tool-by-tool" not in flattened
+        assert "three or more components" not in flattened
+        assert "two or more workflow patterns" not in flattened
         assert "`classify -> enrich -> route`" in flattened
         assert "`classify -> aggregate -> cross-tab`" in flattened
         assert "`split/expand -> gate-route per branch`" in flattened
@@ -708,7 +716,16 @@ class TestBuildSystemPrompt:
         assert "Never re-type the artifact into the tool call" in flattened
         assert "Do not report a source-review handoff mismatch merely because there is no transform node named `source`" in flattened
         assert "never summarize, reformat, or describe it as" in flattened
-        assert "Do not treat a missing or mismatched review handoff as a product blocker" in flattened
+        assert "A missing or mismatched handoff is not a product blocker when the matching pending requirement exists" in flattened
+        assert "retry its exact kind, `user_term` and `draft`" in flattened
+        assert "mutation's `applied_component` first to find the exact pending requirement" in flattened
+        assert (
+            "when that mutation omitted the echo or its echo does not cover the affected component, call `get_pipeline_state`" in flattened
+        )
+        assert "Then retry only if a matching pending requirement exists, using its exact draft" in flattened
+        assert "If it is resolved, continue without another review call" in flattened
+        assert "If it is absent, establish whether the current change actually requires a new review before staging one" in flattened
+        assert "missing-pending-site rejection alone is not evidence that a review is needed" in flattened
         assert "Before stopping, enumerate pending `interpretation_requirements` from the source and from every node" in flattened
         assert 'Use `affected_node_id="source"` for requirements stored on `source.options.interpretation_requirements`' in flattened
         assert "For persisted review kinds, if review handoff fails for a staged requirement" in flattened
@@ -761,18 +778,32 @@ class TestBuildSystemPrompt:
         assert "Do not infer sink behavior from the source plugin's name or from static format lore" in flattened
 
     def test_core_skill_requires_draft_first_on_opening_build_turns(self) -> None:
-        """Under-specified opening build asks should mutate state before waiting."""
+        """Act on supplied facts without inventing a draft around a material gap."""
         result = build_system_prompt(None)
         flattened = " ".join(result.split())
 
         assert "Opening build turns are action turns" in flattened
-        assert "If the latest user message contains any concrete artifact" in flattened
-        assert "build a plausible draft pipeline before asking for confirmation" in flattened
-        assert "column list, example file path, workflow shape, output filename, or target rubric" in flattened
-        assert "Name missing assumptions after the mutation" in flattened
-        assert "Explain-only responses are reserved for turns where the user explicitly asks for explanation" in flattened
-        assert "If a required file, credential, or connection detail is absent" in flattened
-        assert "commit the buildable scaffold with a named gap" in flattened
+        assert "Build a faithful draft from the supplied facts when supported progress is possible" in flattened
+        assert "Resolve material requirements conflicts before treating a draft as complete" in flattened
+        assert (
+            "ask a focused product question or choose an explicit, reviewable interpretation only when it preserves the requested work"
+            in flattened
+        )
+        assert "A missing workbook does not authorize inventing its sheets or columns" in flattened
+        assert "Read supplied normative instructions and relevant references through the tools before deciding what is missing" in flattened
+        assert "supplied-but-unread material is not a missing product fact" in flattened
+        assert (
+            "The LLM must author the pipeline and every judgement; code may only serialize or validate the resulting judgements"
+            in flattened
+        )
+        assert (
+            "When no faithful reviewable draft is possible, state the named blocker and ask the smallest question that resolves it"
+            in flattened
+        )
+        assert "Do not build a misleading scaffold first or require an impossibility proof" in flattened
+        assert "start the no-tool reply with exactly `CLARIFY:` followed by the concrete question" in flattened
+        assert "Do not use it to hide a failed build or bypass pending reviews and validation" in flattened
+        assert "build a plausible draft pipeline before asking for confirmation" not in flattened
 
     def test_core_skill_rejects_plugin_contract_whiplash(self) -> None:
         """Selection and detailed contracts remain stable at their own tiers."""
@@ -796,9 +827,17 @@ class TestBuildSystemPrompt:
         assert "that prompt template is LLM-authored" in result
         assert "Did I choose a scoring scale?" in result
         assert "Did I define how a subjective user criterion will be operationalized?" in result
-        assert "Before any mutation that creates or updates an LLM prompt you wrote" in result
-        assert "the LLM node options must already contain a pending" in flattened
-        assert "Do not stop with prose saying the rubric is part of the reviewed prompt" in flattened
+        assert "audit your own choices before staging the node" in flattened
+        assert (
+            'If the answer to any question is yes, stage a pending `kind="vague_term"` requirement on that same LLM node before `set_pipeline`'
+            in flattened
+        )
+        assert (
+            "in that SAME `set_pipeline`, set `prompt_template_parts` on the node with an `interpretation_ref` slot wiring that requirement"
+            in flattened
+        )
+        assert "`request_interpretation_review` after the state mutation succeeds" in flattened
+        assert "Such semantics need their own review card even when they would otherwise appear only as wording in the prompt" in flattened
         assert "LLM node preflight has four independent review checks" in result
         assert "Every create, update, upsert, or patch of an LLM node with a `prompt_template` must repeat this preflight" in flattened
         assert "carry forward existing pending LLM interpretation requirements and add any missing ones" in flattened
@@ -814,15 +853,18 @@ class TestBuildSystemPrompt:
         assert "category boundary" in result
         assert '"tall" can be objective when the user gives "over 190 cm"' in result
         assert 'choose "over 6 ft" or "top quartile"' in result
-        assert "Prompt-template review is not a substitute" in result
+        assert "decide eligibility for `vague_term` independently of eligibility for `llm_prompt_template`" in flattened
         assert "Construction pattern for an LLM-authored scoring prompt" in result
-        assert "Wire the authored semantics into the prompt as a substitution slot" in result
+        assert "The authored definition must occupy a substitution slot so the operator's approved value governs the run" in flattened
         assert '"kind": "vague_term"' in result
         assert '"kind": "interpretation_ref"' in result
         assert "prompt_template_parts" in result
         assert "the exact scale/rubric/cutoff/category semantics you authored" in result
-        assert "Do not omit the `vague_term` entry" in result
-        assert "never fixed prose" in result
+        assert "Fixed prose and a staged `draft` alone do not satisfy the wiring requirement" in flattened
+        assert "The criterion meaning belongs in the slot, not baked into the fixed text" in flattened
+        assert "Preserve user-supplied scales and rules literally; do not present them as choices you authored" in flattened
+        assert "does not by itself require a `vague_term` review" in flattened
+        assert "never send an empty or placeholder prompt" in flattened
         assert "If your prompt asks the model to return a score, rating, rank, class, or pass/fail result" in flattened
         assert "that output shape is authored judgement semantics when you chose the scale" in flattened
         assert "decide eligibility for `vague_term` independently" in result
@@ -955,9 +997,11 @@ class TestBuildSystemPrompt:
         assert "This includes source requirements such as `invented_source`" in flattened
         assert "the raw-content cleanup requirement is staged when required" in flattened
         assert (
-            "the prompt-injection shield recommendation review is staged when untrusted internet content flows directly into an LLM"
+            "the prompt-injection shield recommendation review is staged wherever untrusted or externally controlled content flows into an LLM"
             in flattened
         )
+        assert "Operator upload/custody does not make third-party dataset cells trusted LLM instructions" in flattened
+        assert "Apply this recommendation to every LLM consumer of those cells, including later consumers" in flattened
         assert "no non-review validation errors remain" in flattened
         assert "Do not stop in pending-review state when schema contract, missing field, or unreferenced output errors remain" in flattened
         assert "Do not tell the user review cards are waiting for a partial pipeline" in flattened

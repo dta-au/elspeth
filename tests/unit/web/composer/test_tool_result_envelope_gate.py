@@ -3219,6 +3219,8 @@ _ADVISOR_ENVELOPE_PAYLOADS: dict[str, tuple[str, ...]] = {
         "budget_used",
         "budget_remaining",
         "note",
+        "abandonment_decision",
+        "review_binding",
     ),
 }
 

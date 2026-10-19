@@ -102,6 +102,24 @@ def _is_non_redaction_eligible_scalar(field_type: object) -> bool:
     return get_origin(field_type) is Literal
 
 
+def test_alias_normalization_exposes_literal_and_sensitive_metadata_without_admitting_any():
+    type ClosedChoice = Literal["complete", "page"]
+    type SecretText = Annotated[str, Sensitive()]
+    type OpaqueValue = Any
+
+    class AliasedModel(BaseModel):
+        choice: ClosedChoice
+        secret: SecretText
+        opaque: OpaqueValue
+
+    nodes = {node.path: node for node in walk_model_schema(AliasedModel)}
+    assert nodes["choice"].field_type == Literal["complete", "page"]
+    assert _is_non_redaction_eligible_scalar(nodes["choice"].field_type)
+    assert any(isinstance(marker, _SensitiveMarker) for marker in nodes["secret"].metadata)
+    assert nodes["opaque"].field_type is Any
+    assert not _is_non_redaction_eligible_scalar(nodes["opaque"].field_type)
+
+
 # ---------------------------------------------------------------------------
 # Assertion 1 (§4.4.1, Task 9).
 #

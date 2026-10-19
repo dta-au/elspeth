@@ -35,6 +35,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedLLMProviderMetadata,
     _AdmittedToolBatch,
 )
+from elspeth.web.composer.advisor_content import PreparedAdvisorContent, scan_prepared_advisor_content
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import (
     admit_llm_provider_metadata,
@@ -458,6 +459,7 @@ async def _litellm_acompletion(
     prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
     prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+    prepared_advisor_content: tuple[PreparedAdvisorContent, ...] | None = None,
     provider_custody: ProviderCallCustody | None = None,
     on_provider_dispatch: Callable[[], None] | None = None,
     **kwargs: Any,
@@ -517,7 +519,7 @@ async def _litellm_acompletion(
             current if current is not None else forwarded
             for current, forwarded in zip(thinking_parts, prompt_guard_thinking_parts, strict=True)
         )
-    credential_messages = []
+    credential_messages: list[Mapping[str, Any]] = []
     for message in kwargs["messages"]:
         if "thinking_blocks" in message:
             from elspeth.web.composer.provider_thinking import native_thinking_blocks
@@ -530,6 +532,8 @@ async def _litellm_acompletion(
             credential_messages.append({key: value for key, value in message.items() if key != "thinking_blocks"})
         else:
             credential_messages.append(message)
+    if prepared_advisor_content is not None:
+        credential_messages = scan_prepared_advisor_content(credential_messages, prepared_advisor_content, role=prompt_guard_role)
     require_no_credential_material(credential_messages, surface="composer_provider_request")
     await enforce_prompt_guard(
         mount=prompt_guard_mount,

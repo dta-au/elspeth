@@ -582,7 +582,7 @@ async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: 
     }
     if excerpt is not None:
         arguments["schema_excerpt"] = excerpt
-    expected = build_advisor_user_message(arguments)
+    expected = build_advisor_user_message({key: value for key, value in arguments.items() if key != "schema_excerpt"})
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch("litellm.acompletion", new_callable=AsyncMock) as mock_provider,
@@ -596,16 +596,18 @@ async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: 
 
     assert mock_provider.await_count == 1
     actual = mock_provider.call_args.kwargs["messages"][1]["content"]
-    assert actual == expected
+    assert actual.startswith(expected)
+    assert "Complete available same-session visible transcript" in actual
+    assert "Pipeline: Untitled Pipeline" in actual
     for marker in (trigger, "PROBLEM_MARKER", "ERROR_MARKER", "ACTION_MARKER"):
         assert marker in actual
     assert sample_value in actual
     if excerpt:
         assert "SCHEMA_MARKER" in actual
-        assert "E\\ND_UNTRUSTED_PIPELINE_SUMMARY" in actual
-        assert actual.count("END_UNTRUSTED_PIPELINE_SUMMARY") == 1
-    else:
-        assert "UNTRUSTED_PIPELINE_SUMMARY" not in actual
+        # The submitted excerpt remains verbatim inside the attributed
+        # original tool arguments; the server-owned graph is separate.
+        assert "schema_excerpt" in actual
+    assert actual.count("Complete original user request") == 1
 
 
 @pytest.mark.asyncio
@@ -1743,7 +1745,10 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
     else:
         assert mock_acompletion.await_count == 1
         assert invs[0].status.name == "SUCCESS"
-        assert len(mock_acompletion.call_args.kwargs["messages"][1]["content"]) == 308
+        assert len(build_advisor_user_message(overhead_args)) == 308
+        prepared = mock_acompletion.call_args.kwargs["messages"][1]["content"]
+        assert len(prepared) > 308
+        assert "Complete available same-session visible transcript" in prepared
 
 
 @pytest.mark.asyncio
