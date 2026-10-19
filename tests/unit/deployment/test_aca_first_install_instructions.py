@@ -10,16 +10,53 @@ import json
 import re
 import subprocess
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 SKILL = ROOT / ".agents/skills/operating-azure-container-apps"
 COLD = ROOT / "docs/runbooks/azure-container-apps-cold-install.md"
+ARCHIVED_FACTS_LINK = (
+    "https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/"
+    "docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md"
+)
 
 
 def _blocks(path: Path) -> list[str]:
     return re.findall(r"```bash\n(.*?)```", path.read_text(), re.DOTALL)
+
+
+def _assert_markdown_target(path: Path, target: str) -> None:
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc:
+        # Pin the same immutable authority as the ACA runbook contract. CI's
+        # shallow checkout need not contain this historical blob locally.
+        assert target == ARCHIVED_FACTS_LINK, f"Unexpected archive link: {target}"
+    else:
+        assert (path.parent / target).resolve().is_file(), target
+
+
+@pytest.mark.parametrize("target", ["SKILL.md", ARCHIVED_FACTS_LINK], ids=["local", "immutable-archive"])
+def test_skill_markdown_target_accepts_existing_documents(target: str) -> None:
+    _assert_markdown_target(SKILL / "SKILL.md", target)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "references/missing-document-control.md",
+        ARCHIVED_FACTS_LINK.replace("github.com", "example.com"),
+        ARCHIVED_FACTS_LINK.replace("58b25d524d9c5a2550b0f895ea8f70e1dea9ea51", "main"),
+        ARCHIVED_FACTS_LINK.replace("platform-facts.md", "missing-document-control.md"),
+        ARCHIVED_FACTS_LINK.replace("https://", "http://"),
+        ARCHIVED_FACTS_LINK.replace("https:", ""),
+    ],
+    ids=["missing-local", "wrong-host", "mutable-ref", "wrong-path", "insecure-scheme", "scheme-relative"],
+)
+def test_skill_markdown_target_rejects_broken_or_unapproved_documents(target: str) -> None:
+    with pytest.raises(AssertionError):
+        _assert_markdown_target(SKILL / "SKILL.md", target)
 
 
 @pytest.mark.parametrize("account", ["enclave-builder", "second-builder"])
@@ -52,7 +89,7 @@ def test_skill_routes_first_install_and_preserves_existing_store_hold() -> None:
         assert "Current policy: new stores only." in text
         assert "rollback are held, even if an older compatibility record permits rollback" in " ".join(text.split())
         for target in re.findall(r"\]\(([^)]+\.md)\)", text):
-            assert (path.parent / target).resolve().is_file(), target
+            _assert_markdown_target(path, target)
     build = (SKILL / "references/build-and-push-ghcr.md").read_text()
     assert "continue at step 3" in build
     assert "johnm-dta" not in build
