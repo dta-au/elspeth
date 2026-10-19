@@ -55,10 +55,20 @@ _ADVISOR_END_PUBLICATION_INSTRUCTIONS: Final[str] = (
     "- Return all six required fields, including publication_verdict=ADMIT or WITHHOLD.\n"
     "- Review the ENTIRE candidate reply against the current user request, saved-effect evidence and CURRENT "
     "candidate inspection coverage. Historical delivery or a full-file hash does not establish current inspection.\n"
-    "- ADMIT only when the exact candidate's claims are supported. WITHHOLD unsupported completion, equivalence "
+    "- ADMIT only when the exact candidate's claims are supported and the reply addresses the current request. WITHHOLD unsupported completion, equivalence "
     "or no-rebuild claims and any candidate whose required evidence is unavailable or omitted. "
     "WITHHOLD requires nonempty findings, even with graph verdict CLEAN.\n"
-    "- Publication and graph readiness are independent. A truthful explanation or Q&A can receive ADMIT with no edits "
+    "- For an authorized build or edit, WITHHOLD a premature checkpoint reply when required work remains and the "
+    "evidence exposes available next steps. Truthfully admitting incompleteness, promising later work or offering "
+    "to continue does not satisfy that action request. A page limit or unread available required attachment is "
+    "not a missing prerequisite; name the next supported inspection or authoring action in findings.\n"
+    "- A user-requested explanation, status answer or bounded stage can receive ADMIT when responsive. An otherwise "
+    "responsive handoff can also receive ADMIT at an evidenced required user decision, approval, observed request-time "
+    "or finite-budget boundary, or genuinely unavailable prerequisite/capability. Require the actual observed limit "
+    "and unfinished scope for a budget handoff; never infer exhaustion merely from unread material. "
+    "Do not require execution or approval the user has not authorized, and "
+    "do not treat uninspected available information as an unavailable capability.\n"
+    "- Publication and graph readiness are independent. A responsive truthful explanation or Q&A can receive ADMIT with no edits "
     "or a FLAGGED/blocked/empty graph. This grants no graph clearance and cannot erase pending or orphan constraints.\n"
     "- CLEAN with WITHHOLD keeps steps empty and note null; explain the prose/evidence objection in findings. "
     "Do not invent a graph defect to withhold prose. Full inspection alone never proves semantic equivalence."
@@ -246,6 +256,58 @@ class AdvisorSummaryParts:
             type(value) is not PromptGuardContentPart or value.trust is not None for value in self.values
         ):
             raise InvariantError("Advisor summary requires owned untrusted semantic units")
+
+
+class AdvisorGraphCoverageUnavailable(ValueError):
+    """The complete required graph projection cannot fit the review allowance."""
+
+
+def _join_advisor_summary_units(units: tuple[tuple[PromptGuardContentPart, ...], ...]) -> AdvisorSummaryParts:
+    return AdvisorSummaryParts(
+        tuple(
+            _prefix_advisor_summary_part(part, "\n" if section_index and part_index == 0 else "")
+            for section_index, section in enumerate(units)
+            for part_index, part in enumerate(section)
+        )
+    )
+
+
+def fit_advisor_checkpoint_summary(state: CompositionState, arguments: Mapping[str, Any], char_cap: int) -> AdvisorSummaryParts:
+    """Reserve complete structural evidence before selecting optional prose.
+
+    The allowance measures the exact redacted, fenced contribution used by the
+    provider request. Required records are atomic as a set: an oversized graph
+    is unavailable for model review, never a partially visible successful pass.
+    """
+    full = _join_advisor_summary_units(_pipeline_advisor_summary_units(state))
+
+    def fits(parts: AdvisorSummaryParts) -> bool:
+        return advisor_checkpoint_summary_chars({**arguments, "schema_excerpt": "".join(part.text for part in parts.values)}) <= char_cap
+
+    if fits(full):
+        return full
+    required_units = _pipeline_advisor_summary_units(state, include_optional=False)
+    required = _join_advisor_summary_units(required_units)
+    if not fits(required):
+        raise AdvisorGraphCoverageUnavailable("Complete required graph evidence exceeds the existing advisor summary budget.")
+    optional = _optional_advisor_summary_units(state)
+    selected = list(required_units)
+    # Reserve the longest omission count throughout optional selection.
+    marker = ((PromptGuardContentPart(f"optional_prose_units_withheld={len(optional)}"),),) if optional else ()
+    for unit in optional:
+        candidate = _join_advisor_summary_units((*selected, unit, *marker))
+        if fits(candidate):
+            selected.append(unit)
+        else:
+            # Continue after a large unit: a later smaller complete prompt may fit.
+            continue
+    withheld = len(optional) - (len(selected) - len(required_units))
+    if withheld:
+        marker = (PromptGuardContentPart(f"optional_prose_units_withheld={withheld}"),)
+        with_marker = _join_advisor_summary_units((*selected, marker))
+        if fits(with_marker):
+            return with_marker
+    return _join_advisor_summary_units(tuple(selected))
 
 
 def _prefix_advisor_summary_part(part: PromptGuardContentPart, prefix: str) -> PromptGuardContentPart:
@@ -436,12 +498,6 @@ _ADVISOR_SUMMARY_SECRET_KEY_MARKERS: Final[tuple[str, ...]] = (
     "token",
 )
 _ADVISOR_SUMMARY_VALUE_MAX_CHARS: Final[int] = 120
-# Schema evidence is bounded structurally: at most this many complete field
-# definitions and contract-list entries are emitted. The character cap is a
-# defense-in-depth total bound; it never slices a field definition.
-_ADVISOR_SUMMARY_SCHEMA_MAX_FIELDS: Final[int] = 8
-_ADVISOR_SUMMARY_SCHEMA_MAX_CONTRACT_FIELDS: Final[int] = 8
-_ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS: Final[int] = 1000
 # Prompt-shaped option values (``prompt_template``/``template``/
 # ``system_prompt`` and each per-query template) get a much larger render
 # budget so the advisor sees the WHOLE prompt — its rubric anchors and (for
@@ -452,8 +508,8 @@ _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS: Final[int] = 1000
 # path builds its arguments in ``_build_checkpoint_arguments`` and fits the
 # rendered optional summary contribution before dispatch. These per-value
 # budgets preserve useful ordinary evidence; the optional-summary bound limits
-# their aggregate across nodes. The global 120 cap is deliberately left unchanged
-# so every non-prompt value stays compact.
+# their aggregate across nodes. Required schema, field and routing records are
+# complete; optional scalar intent retains the compact 120-character cap.
 _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS: Final[int] = 1000
 # Option keys whose VALUE is prompt-shaped (free-text the model is told to
 # follow). Rendered with the larger budget above.
@@ -699,7 +755,7 @@ def _advisor_summary_renders_option_value(key: str) -> bool:
     invariant=(
         "parses through ELSPETH-owned SchemaConfig and renders only its canonical mode, "
         "field contracts, and sanctioned contract-field lists; unknown nested values are "
-        "discarded, malformed schemas yield a fixed marker, and output is bounded"
+        "discarded, malformed schemas yield a fixed marker, and complete output is fitted atomically by the checkpoint"
     ),
 )
 def _render_schema_for_advisor(raw_schema: object) -> str:
@@ -711,74 +767,23 @@ def _render_schema_for_advisor(raw_schema: object) -> str:
     except ValueError:
         return "<invalid schema>"
 
-    # Install every omission counter before selecting evidence so the budget
-    # calculation reserves room to state exactly what was withheld. Entries
-    # are added atomically; a long identifier can exclude a whole entry but
-    # can never leave a misleading half-rendered field contract.
-    projection: dict[str, Any] = {"mode": schema.mode}
-    fields = [field.to_dict() for field in schema.fields] if schema.fields is not None else None
-    if fields is None:
-        projection["fields"] = None
-    else:
-        projection["fields"] = []
-        if fields:
-            projection["additional_fields_withheld"] = len(fields)
-
-    contract_values: dict[str, list[str]] = {}
+    projection: dict[str, Any] = {
+        "mode": schema.mode,
+        "fields": [field.to_dict() for field in schema.fields] if schema.fields is not None else None,
+    }
     for key, raw_values in (
         ("guaranteed_fields", schema.guaranteed_fields),
         ("required_fields", schema.required_fields),
         ("audit_fields", schema.audit_fields),
     ):
-        if raw_values is None:
-            continue
-        values = list(raw_values)
-        contract_values[key] = values
-        projection[key] = []
-        if values:
-            projection[f"additional_{key}_withheld"] = len(values)
-
-    included_fields: list[dict[str, str | bool]] = []
-    for field in (fields or [])[:_ADVISOR_SUMMARY_SCHEMA_MAX_FIELDS]:
-        candidate_fields = [*included_fields, field]
-        candidate = dict(projection)
-        candidate["fields"] = candidate_fields
-        remaining = len(fields or []) - len(candidate_fields)
-        if remaining:
-            candidate["additional_fields_withheld"] = remaining
-        else:
-            del candidate["additional_fields_withheld"]
-        if len(str(candidate)) > _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS:
-            break
-        projection = candidate
-        included_fields = candidate_fields
-
-    for key, values in contract_values.items():
-        included_values: list[str] = []
-        for value in values[:_ADVISOR_SUMMARY_SCHEMA_MAX_CONTRACT_FIELDS]:
-            candidate_values = [*included_values, value]
-            candidate = dict(projection)
-            candidate[key] = candidate_values
-            remaining = len(values) - len(candidate_values)
-            withheld_key = f"additional_{key}_withheld"
-            if remaining:
-                candidate[withheld_key] = remaining
-            else:
-                del candidate[withheld_key]
-            if len(str(candidate)) > _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS:
-                break
-            projection = candidate
-            included_values = candidate_values
-
-    rendered = str(projection)
-    if len(rendered) > _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS:
-        # The fixed-key, empty-list projection is well below the cap. Keep an
-        # explicit fail-closed fallback if those owned constants ever drift.
-        return "<schema evidence exceeds advisor bound>"
-    return rendered
+        if raw_values is not None:
+            projection[key] = list(raw_values)
+    return json.dumps(projection, separators=(",", ":"))
 
 
-def _pipeline_advisor_summary_units(state: CompositionState) -> tuple[tuple[PromptGuardContentPart, ...], ...]:
+def _pipeline_advisor_summary_units(
+    state: CompositionState, *, include_optional: bool = True
+) -> tuple[tuple[PromptGuardContentPart, ...], ...]:
     """Render pipeline display sections with their owned evidence boundaries.
 
     Produces descriptive text the advisor can reason about for BOTH halves of
@@ -807,7 +812,7 @@ def _pipeline_advisor_summary_units(state: CompositionState) -> tuple[tuple[Prom
 
     if state.metadata.name:
         lines.append((PromptGuardContentPart(f"Pipeline: {state.metadata.name}"),))
-    if state.metadata.description:
+    if state.metadata.description and include_optional:
         lines.append((PromptGuardContentPart(f"Intent (stated): {state.metadata.description}"),))
 
     # Sources.
@@ -821,7 +826,9 @@ def _pipeline_advisor_summary_units(state: CompositionState) -> tuple[tuple[Prom
                     PromptGuardContentPart(
                         f"{label}: plugin={source.plugin} -> '{source.on_success}' on_validation_failure={source.on_validation_failure} ["
                     ),
-                    *_render_options_for_advisor_parts(source.options),
+                    *_render_options_for_advisor_parts(
+                        source.options, plugin=source.plugin, component="source", include_optional=include_optional
+                    ),
                     PromptGuardContentPart("]"),
                 )
             )
@@ -838,8 +845,7 @@ def _pipeline_advisor_summary_units(state: CompositionState) -> tuple[tuple[Prom
             required_parts = tuple(PromptGuardContentPart((", " if index else "") + field) for index, field in enumerate(required)) or (
                 PromptGuardContentPart("(none declared)"),
             )
-            control = _render_node_control_flow(node)
-            control_suffix = f" {control}" if control else ""
+            control_parts = _render_node_control_flow_parts(node)
             # LLM nodes get a length-independent degeneracy signal: which row
             # fields their prompt interpolates (or NONE). An LLM node is a
             # transform whose plugin is ``llm`` (node_type is never "llm").
@@ -857,12 +863,13 @@ def _pipeline_advisor_summary_units(state: CompositionState) -> tuple[tuple[Prom
                 (
                     PromptGuardContentPart(
                         f"  - {node.id}: type={node.node_type} plugin={plugin} "
-                        f"reads '{node.input}' -> '{on_success}' on_error={node.on_error or '-'}{control_suffix} "
-                        "[requires: "
+                        f"reads '{node.input}' -> '{on_success}' on_error={node.on_error or '-'}"
                     ),
+                    *control_parts,
+                    PromptGuardContentPart(" [requires: "),
                     *required_parts,
                     PromptGuardContentPart("] ["),
-                    *_render_options_for_advisor_parts(node.options),
+                    *_render_options_for_advisor_parts(node.options, plugin=node.plugin, include_optional=include_optional),
                     PromptGuardContentPart("]"),
                     *interpolation_parts,
                 )
@@ -877,12 +884,53 @@ def _pipeline_advisor_summary_units(state: CompositionState) -> tuple[tuple[Prom
             lines.append(
                 (
                     PromptGuardContentPart(f"  - {output.name}: plugin={output.plugin} on_write_failure={output.on_write_failure} ["),
-                    *_render_options_for_advisor_parts(output.options),
+                    *_render_options_for_advisor_parts(
+                        output.options, plugin=output.plugin, component="sink", include_optional=include_optional
+                    ),
                     PromptGuardContentPart("]"),
                 )
             )
 
+    if state.edges:
+        lines.append((PromptGuardContentPart("Edges:"),))
+        for edge in state.edges:
+            lines.append(
+                (
+                    PromptGuardContentPart(
+                        f"  - {edge.id}: from={edge.from_node} to={edge.to_node} type={edge.edge_type} label={edge.label}"
+                    ),
+                )
+            )
     return tuple(lines)
+
+
+def _optional_advisor_summary_units(state: CompositionState) -> tuple[tuple[PromptGuardContentPart, ...], ...]:
+    """Whole authored prose units, considered only after required graph facts."""
+    units: list[tuple[PromptGuardContentPart, ...]] = []
+    if state.metadata.description:
+        units.append((PromptGuardContentPart(f"Intent (stated): {state.metadata.description}"),))
+    components = (
+        *((f"source {name}", source.options) for name, source in state.sources.items()),
+        *((f"node {node.id}", node.options) for node in state.nodes),
+        *((f"sink {output.name}", output.options) for output in state.outputs),
+    )
+    for label, options in components:
+        for key in sorted(_ADVISOR_SUMMARY_PROMPT_VALUE_KEYS):
+            if key in options:
+                units.append((PromptGuardContentPart(f"Optional {label}: "), *_render_options_for_advisor_parts({key: options[key]})))
+        if "queries" in options:
+            for query_key, text, prose_shaped in _advisor_query_option_values(options):
+                if prose_shaped:
+                    rendered = truncate_advisor_text(text, _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS)
+                    units.append(
+                        (
+                            PromptGuardContentPart(
+                                f"Optional {label}: {query_key}_untrusted_json={json.dumps(rendered)}",
+                                inspection_text=f'Optional {label}: {query_key}_untrusted_json="{rendered}"',
+                            ),
+                        )
+                    )
+    return tuple(units)
 
 
 def _pipeline_advisor_summary_sections(state: CompositionState) -> tuple[str, ...]:
@@ -903,50 +951,143 @@ def _advisor_control_flow_fields(node: NodeSpec) -> list[tuple[str, str, str]]:
     that final outbound evidence rather than a separate approximation of it.
 
     These are top-level :class:`NodeSpec` scalars/maps, not ``options``, and
-    none of them carry secrets, so values are rendered rather than withheld.
+    none of them carry credentials, so values are rendered rather than withheld
+    and still pass through the common outbound redactor.
     """
     fields: list[tuple[str, str, str]] = []
     if node.condition is not None:
         fields.append(("condition", "gate condition", str(node.condition)))
     if node.routes is not None:
-        fields.append(("routes", "gate routes", str(dict(node.routes))))
+        fields.append(("routes", "gate routes", json.dumps(dict(node.routes), separators=(",", ":"))))
     if node.fork_to is not None:
-        fields.append(("fork_to", "gate fork_to", str(list(node.fork_to))))
+        fields.append(("fork_to", "gate fork_to", json.dumps(list(node.fork_to), separators=(",", ":"))))
+    if node.branches is not None:
+        branches = dict(node.branches) if isinstance(node.branches, Mapping) else list(node.branches)
+        fields.append(("branches", "barrier branches", json.dumps(branches, separators=(",", ":"))))
     if node.policy is not None:
         fields.append(("policy", "coalesce policy", node.policy))
     if node.merge is not None:
         fields.append(("merge", "coalesce merge", node.merge))
     if node.trigger is not None:
-        fields.append(("trigger", "aggregation trigger", str(dict(node.trigger))))
+        fields.append(("trigger", "aggregation trigger", json.dumps(dict(node.trigger), separators=(",", ":"))))
     if node.output_mode is not None:
         fields.append(("output_mode", "aggregation output_mode", node.output_mode))
+    if node.expected_output_count is not None:
+        fields.append(("expected_output_count", "aggregation expected output count", str(node.expected_output_count)))
+    if node.timeout_seconds is not None:
+        fields.append(("timeout_seconds", "barrier timeout", str(node.timeout_seconds)))
+    if node.scope_name is not None:
+        fields.append(("scope_name", "collector scope name", node.scope_name))
+    if node.scope_opener is not None:
+        fields.append(("scope_opener", "collector scope opener", node.scope_opener))
+    if node.scope_policy is not None:
+        fields.append(("scope_policy", "collector scope policy", node.scope_policy))
     return fields
 
 
 def _render_node_control_flow(node: NodeSpec) -> str:
     """Render a node's intent-bearing control-flow fields (gate/coalesce/agg).
 
-    Derives the field set from :func:`_advisor_control_flow_fields` so the
-    rendered surface and the scanned surface cannot drift apart. Every value is
-    truncated to the compact cap; before elspeth-eacfec09a6 ``fork_to``,
-    ``policy``, ``merge`` and ``output_mode`` were interpolated unbounded.
+    Derives the complete field set from :func:`_advisor_control_flow_fields`;
+    the checkpoint fits these required records atomically with the graph.
     """
-    return " ".join(f"{label}={truncate_advisor_text(value)}" for label, _evidence_label, value in _advisor_control_flow_fields(node))
+    return " ".join(f"{label}={value}" for label, _evidence_label, value in _advisor_control_flow_fields(node))
 
 
-def _render_options_for_advisor_parts(options: Mapping[str, Any]) -> tuple[PromptGuardContentPart, ...]:
+def _render_node_control_flow_parts(node: NodeSpec) -> tuple[PromptGuardContentPart, ...]:
+    parts: list[PromptGuardContentPart] = []
+    for label, _evidence_label, value in _advisor_control_flow_fields(node):
+        if label in {"routes", "fork_to", "branches", "trigger"}:
+            parts.extend((PromptGuardContentPart(f" {label}="), *json_content_parts(value, separators=(",", ":"))))
+        else:
+            parts.append(PromptGuardContentPart(f" {label}={value}"))
+    return tuple(parts)
+
+
+@observation_boundary(
+    tier=3,
+    source="web-authored field bindings or CSV display-header mapping",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant="accepts only a mapping whose complete keys and values are strings, copies it in authoring order, and discards malformed nesting",
+)
+def _advisor_string_mapping(value: object) -> dict[str, str] | None:
+    """Parse a closed field/display mapping; never expose arbitrary nesting."""
+    if isinstance(value, Mapping) and all(type(key) is str and type(item) is str for key, item in value.items()):
+        return dict(value)
+    return None
+
+
+@observation_boundary(
+    tier=3,
+    source="web-authored CSV schema mode and display-header choice",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="selects only fixed provenance descriptions from recognized schema modes and the original-header marker; never renders arbitrary option values",
+)
+def _csv_header_provenance(options: Mapping[str, Any]) -> str:
+    raw_schema = options.get("schema")
+    mode = raw_schema.get("mode") if isinstance(raw_schema, Mapping) else None
+    if mode == "fixed":
+        order = "schema field order"
+    elif mode == "flexible":
+        order = "schema field order, then runtime extra-field order"
+    else:
+        order = "runtime row-key order (not established by authored schema)"
+    headers = options.get("headers", "normalized")
+    display = (
+        "original display names require runtime/source resolution"
+        if headers == "original"
+        else "headers change display names, not field order"
+    )
+    return f"CSV order: {order}; {display}"
+
+
+def _render_options_for_advisor_parts(
+    options: Mapping[str, Any], *, plugin: str | None = None, component: str = "node", include_optional: bool = True
+) -> tuple[PromptGuardContentPart, ...]:
     """Retain complete rendered option/query values with their owned separators.
 
     The schema key is parsed into an ELSPETH-owned closed structural projection;
-    other allowlisted intent-bearing keys and non-secret ``*_field`` contracts
-    show a truncated value. Every other key is explicitly named as present
-    with its value withheld. Never raises.
+    Required field bindings and CSV display headers are complete. Other
+    allowlisted intent-bearing values remain compact; unknown values remain
+    explicitly withheld. Authored JSON strings retain decoded guard evidence.
     """
     if not options:
         return (PromptGuardContentPart("no options"),)
-    value_parts: list[PromptGuardContentPart] = []
+    value_parts: list[tuple[PromptGuardContentPart, ...]] = []
     name_only: list[str] = []
     for key in sorted(options.keys()):
+        if key == "mapping" and plugin != "field_mapper":
+            name_only.append(key)
+            continue
+        if (key == "mapping" and plugin == "field_mapper") or (key == "field_mapping" and component == "source"):
+            mapping = _advisor_string_mapping(options[key])
+            if mapping is None:
+                value_parts.append((PromptGuardContentPart(f"{key}=<invalid field mapping>"),))
+            else:
+                value_parts.append(
+                    (
+                        PromptGuardContentPart(f"{key}="),
+                        *json_content_parts(json.dumps(mapping, separators=(",", ":")), separators=(",", ":")),
+                    )
+                )
+            continue
+        if key == "headers" and component == "sink" and plugin == "csv":
+            raw_headers = options[key]
+            headers = _advisor_string_mapping(raw_headers)
+            if headers is not None:
+                value_parts.append(
+                    (
+                        PromptGuardContentPart("headers="),
+                        *json_content_parts(json.dumps(headers, separators=(",", ":")), separators=(",", ":")),
+                    )
+                )
+            elif raw_headers in ("normalized", "original"):
+                value_parts.append((PromptGuardContentPart(f"headers={raw_headers}"),))
+            else:
+                value_parts.append((PromptGuardContentPart("headers=<invalid CSV headers>"),))
+            continue
         if _advisor_summary_renders_option_value(key):
             if key == "queries":
                 # Per-query prompt surface: one entry per triple, prompt-shaped
@@ -960,40 +1101,58 @@ def _render_options_for_advisor_parts(options: Mapping[str, Any]) -> tuple[Promp
                     continue
                 for query_key, text, prose_shaped in expansion:
                     if prose_shaped:
+                        if not include_optional:
+                            name_only.append(query_key)
+                            continue
                         rendered = truncate_advisor_text(text, _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS)
                         value_parts.append(
-                            PromptGuardContentPart(
-                                f"{query_key}_untrusted_json={json.dumps(rendered)}",
-                                inspection_text=f'{query_key}_untrusted_json="{rendered}"',
+                            (
+                                PromptGuardContentPart(
+                                    f"{query_key}_untrusted_json={json.dumps(rendered)}",
+                                    inspection_text=f'{query_key}_untrusted_json="{rendered}"',
+                                ),
                             )
                         )
                     else:
-                        value_parts.append(PromptGuardContentPart(f"{query_key}={truncate_advisor_text(text)}"))
+                        value_parts.append((PromptGuardContentPart(f"{query_key}={text}"),))
                 continue
             if key == "schema":
                 rendered = _render_schema_for_advisor(options[key])
+                if rendered.startswith("{"):
+                    value_parts.append((PromptGuardContentPart("schema="), *json_content_parts(rendered, separators=(",", ":"))))
+                    continue
             elif key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
+                if not include_optional:
+                    name_only.append(key)
+                    continue
                 limit = _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS
                 rendered = truncate_advisor_text(str(options[key]), limit)
             else:
-                limit = _ADVISOR_SUMMARY_VALUE_MAX_CHARS
-                rendered = truncate_advisor_text(str(options[key]), limit)
+                rendered = str(options[key])
+                if key not in {"column", "columns", "field", "fields", "select_only"} and not key.endswith("_field"):
+                    rendered = truncate_advisor_text(rendered)
             if key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
                 value_parts.append(
-                    PromptGuardContentPart(
-                        f"{key}_untrusted_json={json.dumps(rendered)}",
-                        inspection_text=f'{key}_untrusted_json="{rendered}"',
+                    (
+                        PromptGuardContentPart(
+                            f"{key}_untrusted_json={json.dumps(rendered)}",
+                            inspection_text=f'{key}_untrusted_json="{rendered}"',
+                        ),
                     )
                 )
             else:
-                value_parts.append(PromptGuardContentPart(f"{key}={rendered}"))
+                value_parts.append((PromptGuardContentPart(f"{key}={rendered}"),))
         else:
             name_only.append(key)
     segments: list[PromptGuardContentPart] = []
     for index, value in enumerate(value_parts):
-        segments.append(_prefix_advisor_summary_part(value, ", " if index else "options: "))
+        segments.extend((_prefix_advisor_summary_part(value[0], ", " if index else "options: "), *value[1:]))
     if name_only:
         segments.append(PromptGuardContentPart(("; " if value_parts else "") + "values withheld: " + ", ".join(name_only)))
+    if component == "sink" and plugin == "csv" and options:
+        if "headers" not in options:
+            segments.append(PromptGuardContentPart("; headers=normalized (default)"))
+        segments.append(PromptGuardContentPart("; " + _csv_header_provenance(options)))
     return tuple(segments)
 
 

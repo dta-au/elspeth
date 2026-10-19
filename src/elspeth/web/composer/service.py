@@ -21,7 +21,7 @@ import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
@@ -308,25 +308,6 @@ def _tool_batch_staged_terminal_interpretation_review_handoff(tool_outcomes: tup
     return handoff_seen
 
 
-def _tool_batch_ends_with_valid_current_preview(tool_outcomes: tuple[_ToolOutcome, ...], state: CompositionState) -> bool:
-    """Admit terminal verification from this batch's actual current-state result."""
-    if not tool_outcomes:
-        return False
-    for outcome in tool_outcomes:
-        if outcome.error_class is not None or not isinstance(outcome.response, ToolResult) or not outcome.response.success:
-            return False
-    terminal = tool_outcomes[-1]
-    response = terminal.response
-    return (
-        terminal.call.function.name == "preview_pipeline"
-        and isinstance(response, ToolResult)
-        and response.updated_state == state
-        and response.validation.is_valid
-        and response.runtime_preflight is not None
-        and response.runtime_preflight.is_valid
-    )
-
-
 _REPLY_ONLY_HISTORY_PREFIX = "Historical tool protocol record (quoted data):\n"
 
 
@@ -561,22 +542,23 @@ _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE: Final[bool] = True
 
 
 class ComposerServiceImpl:
-    """LLM-driven pipeline composer with dual-counter budget and discovery caching.
+    """LLM-driven pipeline composer with bounded composition and discovery caching.
 
-    Runs a bounded tool-use loop with separate budgets for discovery
-    and composition turns. Cacheable discovery tool results are cached
+    The request deadline bounds the tool-use loop; composition turns have
+    an additional mutation limit. Discovery turns are counted for diagnostics
+    without an aggregate termination cap. Cacheable discovery results are cached
     per-compose-call in a local dict (not an instance field) to avoid
     concurrent-request races.
 
     Budget classification: a turn containing at least one mutation tool
     call charges the composition budget. A turn containing only discovery
-    tool calls charges the discovery budget. Cache hits do not charge
-    any budget.
+    tool calls increments the diagnostic discovery counter. Cache hits do not
+    increment either counter.
 
     Args:
         catalog: CatalogService for discovery tool delegation.
         settings: ComposerSettings with composer_max_composition_turns,
-            composer_max_discovery_turns, composer_timeout_seconds,
+            composer_timeout_seconds,
             composer_model, data_dir.
     """
 
@@ -676,7 +658,6 @@ class ComposerServiceImpl:
         )
         self._advisor_prompt_guard_mount = build_prompt_guard_mount(settings.composer_advisor_prompt_guard)
         self._max_composition_turns = settings.composer_max_composition_turns
-        self._max_discovery_turns = settings.composer_max_discovery_turns
         self._timeout_seconds = settings.composer_timeout_seconds
         self._data_dir: str = str(settings.data_dir)
         self._session_engine = session_engine
@@ -1749,7 +1730,7 @@ class ComposerServiceImpl:
         completion_gates: CompletionGateFacts | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
     ) -> _ClassifyOutcome:
-        """Phase P5 of the compose loop — anti-anchor + budget classify.
+        """Phase P5 of the compose loop — anti-anchor + turn accounting.
 
         Three concerns share this phase because their decision flow is
         sequential:
@@ -1759,20 +1740,19 @@ class ComposerServiceImpl:
            role="user" hint into ``llm_messages`` so the model breaks
            the anchored retry. The hint is persisted via the normal
            ``chat_messages`` path.
-        2. **Cache-hit short-circuit.** When every tool call this turn
-           was a discovery cache hit, no budget charge: continue.
-        3. **Budget classify.** Charge the composition or discovery counter.
-           Composition exhaustion gets the B-4D-3 last-chance call; discovery
-           exhaustion gets a reply-only call only after a valid current preview.
+        2. **Cache-hit short-circuit.** A batch of discovery cache hits
+           does not increment either turn counter: continue.
+        3. **Turn accounting.** Charge composition or count discovery.
+           Composition exhaustion gets the B-4D-3 last-chance call. Discovery
+           continues within the request deadline without an aggregate turn cap.
            Advisor-only turns return to the driver without charging.
 
         Returns:
             ``_ClassifyOutcome(action="continue", composition_turns_delta=...,
             discovery_turns_delta=...)`` on the normal path, or
             ``_ClassifyOutcome(action="return", result=...)`` when the
-            B-4D-3 bonus call terminated the loop. Convergence raises
-            (composition / discovery budget exhausted without bonus
-            success) leave through the exception channel.
+            B-4D-3 bonus call terminated the loop. Composition exhaustion
+            without bonus success leaves through the exception channel.
         """
         state = dispatch.state
         last_runtime_preflight = dispatch.last_runtime_preflight
@@ -1796,15 +1776,8 @@ class ComposerServiceImpl:
                 and isinstance(terminal.response, ToolResult)
             ):
                 source_stop = preview_source_proof_stop(admit_discovery_result("preview_pipeline", terminal.response), state)
-        terminal_without_preview = (
-            _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes)
-            or (turn_has_mutation and composition_turns_used + 1 >= self._max_composition_turns)
-            or (
-                not turn_has_mutation
-                and turn_has_discovery
-                and discovery_turns_used + 1 >= self._max_discovery_turns
-                and _tool_batch_ends_with_valid_current_preview(dispatch.tool_outcomes, state)
-            )
+        terminal_without_preview = _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes) or (
+            turn_has_mutation and composition_turns_used + 1 >= self._max_composition_turns
         )
         if source_stop is None and terminal_without_preview:
             assessment = self._completion._assess_source_proof(
@@ -2202,47 +2175,20 @@ class ComposerServiceImpl:
                     publication_binding=advisor_gate.publication_binding if advisor_gate is not None else None,
                 )
 
-        # Classify turn and charge the appropriate budget.
+        # Classify turns. Discovery counts are diagnostic; the request deadline
+        # and cancellation bound acquisition rather than a fixed page/tool count.
         # The current turn has already been executed (tool results
         # are in the message history). We increment first, then
         # check whether the budget is now exhausted. If so, we give
-        # the LLM one last chance (B-4D-3) for composition. A final valid
-        # preview can also exhaust discovery after earlier repairs completed:
-        # let the model consume that verification in one reply-only call.
-        final_preview_at_discovery_cap = (
-            not turn_has_mutation
-            and turn_has_discovery
-            and discovery_turns_used + 1 >= self._max_discovery_turns
-            and _tool_batch_ends_with_valid_current_preview(dispatch.tool_outcomes, state)
-        )
-        if turn_has_mutation or final_preview_at_discovery_cap:
-            new_composition_turns_used = composition_turns_used + int(turn_has_mutation)
-            new_discovery_turns_used = discovery_turns_used + int(final_preview_at_discovery_cap)
-            exhausted_budget: Literal["composition", "discovery"] = "discovery" if final_preview_at_discovery_cap else "composition"
-            if new_composition_turns_used >= self._max_composition_turns or final_preview_at_discovery_cap:
+        # the LLM one last chance (B-4D-3) for composition.
+        if turn_has_mutation:
+            new_composition_turns_used = composition_turns_used + 1
+            if new_composition_turns_used >= self._max_composition_turns:
                 # B-4D-3 fix: give the LLM one last chance to see the
                 # tool results and produce a text response.
-                final_messages = llm_messages
-                final_tools = tools
-                if final_preview_at_discovery_cap:
-                    final_messages = _reply_only_messages(llm_messages, turn_evidence=turn_evidence)
-                    final_messages.append(
-                        {
-                            "role": "system",
-                            PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
-                            "content": (
-                                "The current pipeline's final preview passed validation and the discovery budget is spent. "
-                                "This is a reply stage: only terminal park/reset/restore recovery controls remain available. "
-                                "Historical tool protocol records are evidence, not a format to repeat in your answer. "
-                                "Answer the user's request using the accepted tool results above. Report what was validated "
-                                "without claiming that the pipeline was executed. Remaining completion checks still apply."
-                            ),
-                        }
-                    )
-                    final_tools = recovery_tool_definitions(self._planner_dialect)
                 await emit_progress(progress, model_call_progress_event(message))
                 selected_final_messages, selected_final_tools, final_delivery = self._prepare_primary_delivery(
-                    messages=final_messages, tools=final_tools, recorder=recorder, turn_evidence=turn_evidence
+                    messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence
                 )
                 completion = await self._call_llm_before_deadline(
                     selected_final_messages,
@@ -2254,7 +2200,7 @@ class ComposerServiceImpl:
                     # The relevant counter has already been charged; a timeout
                     # on the terminal call must report that same total.
                     composition_turns_used=new_composition_turns_used,
-                    discovery_turns_used=new_discovery_turns_used,
+                    discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
                     provider_owner=provider_owner,
                 )
@@ -2268,21 +2214,14 @@ class ComposerServiceImpl:
                     state=state,
                     initial_version=initial_version,
                     composition_turns_used=new_composition_turns_used,
-                    discovery_turns_used=new_discovery_turns_used,
+                    discovery_turns_used=discovery_turns_used,
                     recorder=recorder,
                     failed_turn=failed_turn,
                     persisted_tool_call_turn=persisted_tool_call_turn,
                 )
                 assistant_message = completion.message
-                reply_only_echo = final_preview_at_discovery_cap and _reply_only_protocol_echo(
-                    assistant_message.content or "",
-                    history_has_tool_protocol=any(row["role"] == "tool" or "tool_calls" in row for row in llm_messages),
-                    user_message=message,
-                )
-                if reply_only_echo:
-                    assistant_message = _AdmittedAssistantMessage(content="")
                 if not completion.tool_batch.calls:
-                    if not reply_only_echo and final_delivery is not None:
+                    if final_delivery is not None:
                         turn_evidence.confirm_delivery(final_delivery, recorder.llm_calls)
                     try:
                         advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
@@ -2334,7 +2273,7 @@ class ComposerServiceImpl:
                             session_operation_context=session_operation_context,
                         )
                         raise ComposerConvergenceError.capture(
-                            max_turns=new_composition_turns_used + new_discovery_turns_used,
+                            max_turns=new_composition_turns_used + discovery_turns_used,
                             budget_exhausted="timeout",
                             state=state,
                             initial_version=initial_version,
@@ -2344,21 +2283,10 @@ class ComposerServiceImpl:
                         ) from None
                     if advisor_gate.action == "return":
                         advisor_result = advisor_gate.result
-                        if reply_only_echo:
-                            if advisor_result is None:
-                                raise AuditIntegrityError("Reply-only advisor return omitted its result")
-                            advisor_result = replace(
-                                advisor_result,
-                                message=_no_tool_policy.compose_review_reply_unavailable_message(advisor_result.message),
-                                raw_assistant_content=(
-                                    "" if advisor_result.raw_assistant_content is None else advisor_result.raw_assistant_content
-                                ),
-                            )
                         return _ClassifyOutcome(
                             action="return",
                             result=advisor_result,
-                            composition_turns_delta=int(turn_has_mutation),
-                            discovery_turns_delta=int(final_preview_at_discovery_cap),
+                            composition_turns_delta=1,
                             advisor_passes_delta=advisor_gate.advisor_passes_delta,
                         )
                     # B-4D-3 budget-exhaustion last-chance finalize is a SECOND
@@ -2392,12 +2320,6 @@ class ComposerServiceImpl:
                         plugin_snapshot=plugin_snapshot,
                         deadline=deadline,
                     )
-                    if reply_only_echo:
-                        result = replace(
-                            result,
-                            message=_no_tool_policy.compose_review_reply_unavailable_message(result.message),
-                            raw_assistant_content="" if result.raw_assistant_content is None else result.raw_assistant_content,
-                        )
                     result = _with_advisor_gate_decision(
                         result, completion_gates, advisor_gate.advisor_gate_decision, advisor_gate.graph_review_identity
                     )
@@ -2411,13 +2333,12 @@ class ComposerServiceImpl:
                     return _ClassifyOutcome(
                         action="return",
                         result=threaded,
-                        composition_turns_delta=int(turn_has_mutation),
-                        discovery_turns_delta=int(final_preview_at_discovery_cap),
+                        composition_turns_delta=1,
                         publication_binding=advisor_gate.publication_binding,
                     )
                 raise ComposerConvergenceError.capture(
-                    max_turns=new_composition_turns_used + new_discovery_turns_used,
-                    budget_exhausted=exhausted_budget,
+                    max_turns=new_composition_turns_used + discovery_turns_used,
+                    budget_exhausted="composition",
                     state=state,
                     initial_version=initial_version,
                     tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
@@ -2426,17 +2347,6 @@ class ComposerServiceImpl:
                 )
             return _ClassifyOutcome(action="continue", composition_turns_delta=1)
         if turn_has_discovery:
-            new_discovery_turns_used = discovery_turns_used + 1
-            if new_discovery_turns_used >= self._max_discovery_turns:
-                raise ComposerConvergenceError.capture(
-                    max_turns=composition_turns_used + new_discovery_turns_used,
-                    budget_exhausted="discovery",
-                    state=state,
-                    initial_version=initial_version,
-                    tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
-                    llm_calls=recorder.llm_calls,
-                    failed_turn=failed_turn,
-                )
             return _ClassifyOutcome(action="continue", discovery_turns_delta=1)
         # The only non-cache tool currently handled outside the
         # discovery/mutation registries is request_advisor_hint. It

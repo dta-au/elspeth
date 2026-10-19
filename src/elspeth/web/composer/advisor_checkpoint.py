@@ -671,8 +671,7 @@ class AdvisorCheckpointOwner:
         topology/field-contract coherence because it receives no user intent.
         """
         pipeline_summary = _advisor_context.summarize_pipeline_for_advisor(state)
-        # Keep identity over complete evidence. Only its optional published
-        # prefix spends the independent rendered optional-summary allowance.
+        # Identity covers complete evidence, before optional prose fitting.
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
         if phase == "early":
             early_arguments: dict[str, str | list[str] | _advisor_context.AdvisorSummaryParts] = {
@@ -687,9 +686,9 @@ class AdvisorCheckpointOwner:
                 "attempted_actions": [],
                 "schema_excerpt": pipeline_summary,
             }
-            bounded_summary = _advisor_context.bound_advisor_checkpoint_summary(early_arguments, char_cap)
-            early_arguments["schema_excerpt"] = bounded_summary
-            early_arguments["_elspeth_advisor_summary_parts"] = _advisor_context.advisor_summary_parts(state, bounded_summary)
+            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, early_arguments, char_cap)
+            early_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
+            early_arguments["_elspeth_advisor_summary_parts"] = summary_parts
             return early_arguments
         review_state = advisor_review_state or _AdvisorReviewState()
         current_evidence_hash = stable_hash({"advisor_evidence": pipeline_summary})
@@ -760,8 +759,9 @@ class AdvisorCheckpointOwner:
             if type(publication_review) is not AdvisorPublicationReview:
                 raise TypeError("END publication review must be an owned snapshot")
             end_arguments["publication_review"] = publication_review
-        end_arguments["schema_excerpt"] = _advisor_context.bound_advisor_checkpoint_summary(end_arguments, char_cap)
-        end_arguments["_elspeth_advisor_summary_parts"] = _advisor_context.advisor_summary_parts(state, end_arguments["schema_excerpt"])
+        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap)
+        end_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
+        end_arguments["_elspeth_advisor_summary_parts"] = summary_parts
         return end_arguments
 
     def _advisor_blocked_result(
@@ -1178,14 +1178,27 @@ class AdvisorCheckpointOwner:
             )
             return verdict
 
+        def graph_coverage_withheld() -> AdvisorCheckpointVerdict:
+            # Size refusal is not a completed model review or an ADMIT binding.
+            return AdvisorCheckpointVerdict(
+                ok=False,
+                blocking=False,
+                findings_text="Complete required graph evidence exceeds the existing advisor summary budget.",
+                failure_class="budget_exhausted",
+                retryable=False,
+            )
+
         await emit_progress(progress, advisor_checkpoint_progress_event(phase))
-        arguments = self._build_checkpoint_arguments(
-            phase=phase,
-            state=state,
-            user_message=user_message,
-            advisor_review_state=advisor_review_state,
-            publication_review=publication_review,
-        )
+        try:
+            arguments = self._build_checkpoint_arguments(
+                phase=phase,
+                state=state,
+                user_message=user_message,
+                advisor_review_state=advisor_review_state,
+                publication_review=publication_review,
+            )
+        except _advisor_context.AdvisorGraphCoverageUnavailable:
+            return graph_coverage_withheld()
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
         attempts = 2  # bounded retry; the underlying call wraps its own timeout
         provider_failures: tuple[type[Exception], ...] = (TimeoutError, ConnectionError, *advisor_provider_failure_types())
@@ -1206,20 +1219,24 @@ class AdvisorCheckpointOwner:
 
         for _ in range(attempts):
             if format_reprompt_pending:
-                # Refit the ORIGINAL evidence, not a prefix whose omission
-                # marker would be mistaken for an original evidence line.
-                call_arguments = {**call_arguments, "schema_excerpt": _advisor_context.summarize_pipeline_for_advisor(state)}
-                call_arguments["schema_excerpt"] = _advisor_context.bound_advisor_checkpoint_summary(call_arguments, char_cap)
-                call_arguments["_elspeth_advisor_summary_parts"] = _advisor_context.advisor_summary_parts(
-                    state, call_arguments["schema_excerpt"]
-                )
+                # The format instruction can change rendered budget overhead.
+                # Refit the same complete saved graph, never a fitted prefix.
+                try:
+                    summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, call_arguments, char_cap)
+                except _advisor_context.AdvisorGraphCoverageUnavailable:
+                    return graph_coverage_withheld()
+                call_arguments = {
+                    **call_arguments,
+                    "schema_excerpt": "".join(part.text for part in summary_parts.values),
+                    "_elspeth_advisor_summary_parts": summary_parts,
+                }
             if _advisor_context.advisor_checkpoint_summary_chars(call_arguments) > char_cap:
                 # Expected size exhaustion is not a completed model review.
                 # Preserve any prior actual call, but spend no further attempt.
                 return AdvisorCheckpointVerdict(
                     ok=False,
                     blocking=False,
-                    findings_text="Optional pipeline evidence exceeds the existing advisor summary budget.",
+                    findings_text="Complete required graph evidence exceeds the existing advisor summary budget.",
                     failure_class="budget_exhausted",
                     retryable=False,
                 )
