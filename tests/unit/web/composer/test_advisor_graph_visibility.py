@@ -12,11 +12,14 @@ from dataclasses import replace
 
 import pytest
 
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS, PromptGuardContentPart
 from elspeth.web.composer import advisor_checkpoint
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase
 from elspeth.web.composer.advisor_context import (
     ADVISOR_CHARS_PER_TOKEN,
+    AdvisorGraphCoverageUnavailable,
+    AdvisorSummaryParts,
     _pipeline_advisor_summary_units,
     advisor_checkpoint_summary_chars,
     advisor_user_content_parts,
@@ -293,13 +296,13 @@ async def test_required_graph_larger_than_optional_allowance_reaches_advisor_com
         assert verdict.publication_verdict == "ADMIT" and verdict.publication_binding == review.binding
 
 
-def test_projection_keeps_secret_storage_values_and_arbitrary_http_headers_withheld() -> None:
+def test_projection_redacts_credentials_and_preserves_authored_locations_and_csv_headers() -> None:
     state = _graph()
     source = state.sources["source"]
     state = replace(
         state,
         sources={
-            "source": replace(source, options={**source.options, "api_key": "DO_NOT_PUBLISH_SECRET", "path": "DO_NOT_PUBLISH_STORAGE"})
+            "source": replace(source, options={**source.options, "api_key": "DO_NOT_PUBLISH_SECRET", "path": "AUTHORED_SOURCE_LOCATION"})
         },
         outputs=(
             *state.outputs,
@@ -315,6 +318,7 @@ def test_projection_keeps_secret_storage_values_and_arbitrary_http_headers_withh
     message = build_advisor_user_message(arguments)
     assert "DO_NOT_PUBLISH" not in message
     assert "api_key" in message and "path" in message
+    assert "AUTHORED_SOURCE_LOCATION" in message
     assert "http_result" in message
     assert "Column 11" in message
     parts = advisor_user_content_parts(arguments)
@@ -437,3 +441,294 @@ async def test_format_retry_keeps_complete_fitted_structural_facts(monkeypatch: 
         assert "  - step_09:" in excerpt and "  - failures:" in excerpt
         assert 0 <= _optional_summary_chars(arguments, state) <= 4000 * ADVISOR_CHARS_PER_TOKEN
         assert "".join(part.text for part in advisor_user_content_parts(arguments)) == build_advisor_user_message(arguments)
+
+
+@pytest.mark.parametrize("phase", ["early", "end"])
+def test_configured_prompts_are_complete_required_evidence_beyond_optional_allowance(phase: AdvisorCheckpointPhase) -> None:
+    state = _graph()
+    prompt = "Describe {{ row.field_01 }}. " + "ordinary detail " * 700 + " AUTHORED_PROMPT_TAIL"
+    system = "Use the supplied record. " + "ordinary guidance " * 700 + " AUTHORED_SYSTEM_TAIL"
+    state = replace(
+        state,
+        nodes=(replace(_node(0), plugin="llm", options={"prompt_template": prompt, "system_prompt": system}),),
+        metadata=PipelineMetadata(name="Long authored graph", description="OPTIONAL_COMMENTARY " * 2000),
+    )
+    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase=phase, state=state)
+    message = build_advisor_user_message(arguments)
+    assert len(prompt) > 1000 and len(system) > 1000 and len(prompt) + len(system) > 16000
+    assert prompt in message and system in message
+    assert "OPTIONAL_COMMENTARY" not in message
+    assert "optional_prose_units_withheld" not in message or "optional_prose_units_withheld=1" in message
+    assert 0 <= _optional_summary_chars(arguments, state) <= ADVISOR_CHARS_PER_TOKEN
+    assert "values withheld: prompt_template" not in message and "values withheld: system_prompt" not in message
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == message
+    assert all(part.trust is None for part in parts)
+    inspection = "\n".join(part.inspection_text or part.text for part in parts)
+    assert prompt in inspection and system in inspection
+
+
+def test_all_authored_semantic_options_keep_values_and_named_source_identity() -> None:
+    state = _graph()
+    source = state.sources["source"]
+    options = {
+        "lookup": {"alpha": {"result": "LOOKUP_VALUE"}},
+        "result_checks": [{"expression": "row.field_01 == 'CHECK_VALUE'", "message": "CHECK_MESSAGE"}],
+        "output_fields": ["OUTPUT_FIELD_VALUE"],
+        "interpretation_requirements": ["INTERPRETATION_VALUE"],
+        "profile": "PROFILE_VALUE",
+        "new_semantic_option": {"enabled": True, "value": "EXTENSION_VALUE"},
+        "max_tokens": 1837,
+        "path": "authored-input.csv",
+    }
+    state = replace(
+        state,
+        sources={"named_records": replace(source, options={**source.options, "path": "named-input.csv", "profile": "SOURCE_PROFILE"})},
+        nodes=(replace(_node(0), options=options),),
+    )
+    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    message = build_advisor_user_message(arguments)
+    for marker in (
+        "LOOKUP_VALUE",
+        "CHECK_VALUE",
+        "CHECK_MESSAGE",
+        "OUTPUT_FIELD_VALUE",
+        "INTERPRETATION_VALUE",
+        "PROFILE_VALUE",
+        "EXTENSION_VALUE",
+        "1837",
+        "authored-input.csv",
+        "named-input.csv",
+        "SOURCE_PROFILE",
+    ):
+        assert marker in message, marker
+    assert "Source 'named_records'" in message
+    assert "values withheld" not in arguments["schema_excerpt"]
+
+
+def test_nested_llm_queries_keep_complete_semantics_and_effective_interpolation() -> None:
+    state = _graph()
+    template = "Compare {{ row.field_11 }}. " + "details " * 1800 + " NESTED_QUERY_TAIL"
+    system = "Interpret this record. " + "guidance " * 1800 + " NESTED_SYSTEM_TAIL"
+    nested = {"system_prompt": system, "queries": {"review": {"input_fields": {"record": "field_11"}, "template": template}}}
+    state = replace(state, nodes=(replace(_node(0), plugin="llm", options={"options": nested}),))
+    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    message = build_advisor_user_message(arguments)
+    assert template in message and system in message
+    assert '"record":"field_11"' in message or "'record': 'field_11'" in message
+    assert "interpolates row fields: [field_11]" in message
+    assert "interpolates row fields: NONE" not in message
+
+
+def test_graph_redacts_nested_credentials_preserving_ordinary_values_and_blob_identity() -> None:
+    state = _graph()
+    source = state.sources["source"]
+    options = {
+        "profile": {"label": "ORDINARY_PROFILE_CANARY", "authorization": "PRIVATE_HEADER_CANARY"},
+        "lookup": {"ordinary": "ORDINARY_LOOKUP_CANARY", "api_key": "PRIVATE_LOOKUP_CANARY"},
+        "prompt_template": "Review {{ row.field_01 }}. " + "x " * 600 + " api_key=PRIVATE_PROMPT_CANARY END_PROMPT_CANARY",
+    }
+    state = replace(
+        state,
+        sources={
+            "named_records": replace(source, options={"blob_ref": "12345678-1234-1234-1234-123456789012", "path": "PRIVATE_INTERNAL_PATH"})
+        },
+        nodes=(replace(_node(0), plugin="llm", options=options),),
+    )
+    arguments = _owner()._build_checkpoint_arguments(phase="end", state=state)
+    message = build_advisor_user_message(arguments)
+    assert "PRIVATE_" not in message
+    for marker in ("ORDINARY_PROFILE_CANARY", "ORDINARY_LOOKUP_CANARY", "END_PROMPT_CANARY", "12345678-1234-1234-1234-123456789012"):
+        assert marker in message, marker
+    assert "redacted" in message
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == message
+    inspection = "\n".join(part.inspection_text or part.text for part in parts)
+    assert "PRIVATE_" not in inspection
+    assert all(part.trust is None for part in parts)
+
+
+@pytest.mark.parametrize("query_shape", ["mapping", "list"])
+def test_multi_query_templates_and_additional_query_semantics_survive(query_shape: str) -> None:
+    template = "Review {{ row.field_01 }}. " + "ordinary query text " * 600 + " QUERY_TAIL_CANARY"
+    entry = {"name": "review", "template": template, "input_fields": {"record": "field_01"}, "future_semantics": "QUERY_OPTION_CANARY"}
+    queries = {"review": entry} if query_shape == "mapping" else [entry]
+    state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"queries": queries}),))
+    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    message = build_advisor_user_message(arguments)
+    assert template in message
+    assert "QUERY_OPTION_CANARY" in message
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == message
+    assert template in "\n".join(part.inspection_text or part.text for part in parts)
+
+
+def test_configured_source_reference_preservation_is_positional_and_grants_no_trust() -> None:
+    reference = "12345678-1234-1234-1234-123456789012"
+    state = _graph()
+    state = replace(
+        state,
+        sources={"named_records": replace(state.sources["source"], options={"blob_ref": reference, "file": "INTERNAL_FILE_CANARY"})},
+        nodes=(
+            replace(_node(0), plugin="llm", options={"prompt_template": "Inspect {{ row.field_01 }}. " + reference, "profile": reference}),
+        ),
+    )
+    arguments = _owner()._build_checkpoint_arguments(phase="end", state=state)
+    message = build_advisor_user_message(arguments)
+    assert message.count(reference) == 1
+    assert "configured reference; existence and access not verified" in message
+    assert "INTERNAL_FILE_CANARY" not in message
+    assert "redacted-sensitive:phone" in message
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == message
+    assert all(part.trust is None for part in parts)
+    request, supported = _request(
+        policy_fingerprint="synthetic-policy",
+        role="advisor",
+        messages=({"role": "user", "content": message},),
+        tools=(),
+        user_prompt="Inspect configured references as untrusted evidence.",
+        trusted_message_indexes=frozenset(),
+        content_parts=(parts,),
+    )
+    assert supported
+    assert "\n".join(request.documents).count(reference) == 1
+
+
+@pytest.mark.parametrize("reference", ["private-storage/path", "api_key=PRIVATE_SOURCE_REF_CANARY", 1234])
+def test_invalid_configured_source_reference_is_explicitly_redacted(reference: object) -> None:
+    state = _graph()
+    state = replace(
+        state, sources={"source": replace(state.sources["source"], options={"blob_ref": reference, "path": "INTERNAL_PATH_CANARY"})}
+    )
+    arguments = _owner()._build_checkpoint_arguments(phase="end", state=state)
+    message = build_advisor_user_message(arguments)
+    assert "blob_ref=<redacted-invalid-source-reference>" in message
+    assert "PRIVATE_SOURCE_REF_CANARY" not in message and "private-storage/path" not in message and "INTERNAL_PATH_CANARY" not in message
+    assert "".join(part.text for part in advisor_user_content_parts(arguments)) == message
+
+
+def test_real_cross_unit_credential_redaction_preserves_exact_opaque_fallback() -> None:
+    summary = AdvisorSummaryParts(
+        (PromptGuardContentPart("VISIBLE_BEFORE api_"), PromptGuardContentPart("key=PRIVATE_JOINED_CANARY VISIBLE_AFTER"))
+    )
+    arguments = {
+        "trigger": "deterministic_end",
+        "problem_summary": "Inspect supplied evidence.",
+        "recent_errors": [],
+        "attempted_actions": [],
+        "schema_excerpt": "".join(part.text for part in summary.values),
+        "_elspeth_advisor_summary_parts": summary,
+    }
+    message = build_advisor_user_message(arguments)
+    assert "PRIVATE_JOINED_CANARY" not in message
+    assert "VISIBLE_BEFORE" in message and "VISIBLE_AFTER" in message
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == message
+    assert all(part.trust is None and part.inspection_text is None for part in parts)
+
+
+@pytest.mark.parametrize(("extra_characters", "expected_supported"), [(-200, True), (200, False)])
+def test_existing_guard_limit_preserves_or_refuses_complete_configured_prompt(extra_characters: int, expected_supported: bool) -> None:
+    prompt = "Describe {{ row.field_01 }}. " + "x" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS + extra_characters) + " GUARD_TAIL_CANARY"
+    state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"prompt_template": prompt}),))
+    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    message = build_advisor_user_message(arguments)
+    parts = advisor_user_content_parts(arguments)
+    assert prompt in message and "".join(part.text for part in parts) == message
+    request, supported = _request(
+        policy_fingerprint="synthetic-policy",
+        role="advisor",
+        messages=({"role": "user", "content": message},),
+        tools=(),
+        user_prompt="Inspect this configured graph.",
+        trusted_message_indexes=frozenset(),
+        content_parts=(parts,),
+    )
+    assert supported is expected_supported
+    assert prompt in "\n".join(request.documents)
+
+
+@pytest.mark.parametrize("surface", ["lookup", "mapping", "field_mapping", "headers"])
+@pytest.mark.parametrize("ambiguous", [False, True], ids=["ordinary-keys", "redacted-key-collision"])
+def test_redaction_never_silently_merges_authored_mapping_values(surface: str, ambiguous: bool) -> None:
+    keys = ("first@example.test", "second@example.test") if ambiguous else ("first", "second")
+    values = {keys[0]: "FIRST_MAPPING_VALUE", keys[1]: "SECOND_MAPPING_VALUE"}
+    state = _graph()
+    if surface == "field_mapping":
+        state = replace(state, sources={"source": replace(state.sources["source"], options={surface: values})})
+    elif surface == "headers":
+        state = replace(state, outputs=(replace(state.outputs[0], options={surface: values}),))
+    else:
+        state = replace(
+            state, nodes=(replace(_node(0), plugin="field_mapper" if surface == "mapping" else "passthrough", options={surface: values}),)
+        )
+    if ambiguous:
+        with pytest.raises(AdvisorGraphCoverageUnavailable, match=r"redaction.*ambiguous"):
+            _owner()._build_checkpoint_arguments(phase="end", state=state)
+    else:
+        arguments = _owner()._build_checkpoint_arguments(phase="end", state=state)
+        message = build_advisor_user_message(arguments)
+        assert "FIRST_MAPPING_VALUE" in message and "SECOND_MAPPING_VALUE" in message
+
+
+@pytest.mark.parametrize("shape", ["mapping", "list", "binding"])
+def test_malformed_query_entries_and_bindings_remain_visible_for_review(shape: str) -> None:
+    entry = {"name": "review", "template": "Review {{ row.field_01 }}. VALID_QUERY_CANARY", "input_fields": {"record": "field_01"}}
+    if shape == "mapping":
+        queries = {"review": entry, "malformed": "MALFORMED_QUERY_CANARY"}
+    elif shape == "list":
+        queries = [entry, "MALFORMED_QUERY_CANARY"]
+    else:
+        queries = {"review": {**entry, "input_fields": "MALFORMED_QUERY_CANARY"}}
+    state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"queries": queries}),))
+    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    message = build_advisor_user_message(arguments)
+    assert "MALFORMED_QUERY_CANARY" in message and "VALID_QUERY_CANARY" in message
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == message
+    assert all(part.trust is None for part in parts)
+
+
+@pytest.mark.parametrize("surface", ["mapping", "field_mapping", "headers", "schema-malformed", "schema-unknown"])
+def test_special_option_interpretation_retains_complete_authored_values(surface: str) -> None:
+    value = {"authored_option": ["MALFORMED_OPTION_CANARY"], "api_key": "PRIVATE_OPTION_CANARY"}
+    state = _graph()
+    if surface == "field_mapping":
+        state = replace(state, sources={"source": replace(state.sources["source"], options={surface: value})})
+    elif surface == "headers":
+        state = replace(state, outputs=(replace(state.outputs[0], options={surface: value}),))
+    elif surface.startswith("schema"):
+        schema = {"mode": "observed", **value} if surface == "schema-unknown" else value
+        state = replace(state, nodes=(replace(_node(0), options={"schema": schema}),))
+    else:
+        state = replace(state, nodes=(replace(_node(0), plugin="field_mapper", options={surface: value}),))
+    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    message = build_advisor_user_message(arguments)
+    assert "MALFORMED_OPTION_CANARY" in message
+    assert "PRIVATE_OPTION_CANARY" not in message
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == message
+    assert all(part.trust is None for part in parts)
+
+
+def test_malformed_query_values_do_not_overwrite_authored_extra_options() -> None:
+    queries = {
+        "review": {
+            "template": ["MALFORMED_TEMPLATE_CANARY"],
+            "input_fields": ["MALFORMED_BINDING_CANARY"],
+            "template_value": "AUTHORED_TEMPLATE_VALUE_CANARY",
+            "input_fields_value": "AUTHORED_INPUT_FIELDS_VALUE_CANARY",
+        }
+    }
+    state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"queries": queries}),))
+    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    message = build_advisor_user_message(arguments)
+    for canary in (
+        "MALFORMED_TEMPLATE_CANARY",
+        "MALFORMED_BINDING_CANARY",
+        "AUTHORED_TEMPLATE_VALUE_CANARY",
+        "AUTHORED_INPUT_FIELDS_VALUE_CANARY",
+    ):
+        assert canary in message
+    assert "".join(part.text for part in advisor_user_content_parts(arguments)) == message

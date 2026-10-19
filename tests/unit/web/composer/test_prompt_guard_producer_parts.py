@@ -250,11 +250,9 @@ async def test_real_advisor_uses_lossless_producer_parts(invocation, monkeypatch
 async def test_real_advisor_inspects_individual_evidence_values_without_changing_summary(invocation, monkeypatch, azure, phase, shape):
     from elspeth.plugins.transforms.llm.base import LLMConfig
     from elspeth.web.composer.advisor_context import (
-        ADVISOR_CHARS_PER_TOKEN,
         advisor_user_content_parts,
         build_advisor_user_message,
         summarize_pipeline_for_advisor,
-        truncate_advisor_text,
     )
     from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
 
@@ -322,8 +320,7 @@ async def test_real_advisor_inspects_individual_evidence_values_without_changing
     service = _guarded_service(invocation, monkeypatch, advisor_client=client)
     advisor = service._advisor_checkpoint
     summary = summarize_pipeline_for_advisor(state)
-    cap = service._settings.composer_advisor_max_prompt_tokens * ADVISOR_CHARS_PER_TOKEN
-    assert 10_000 < len(summary) < cap
+    assert len(summary) > 10_000
     arguments = advisor._build_checkpoint_arguments(phase=phase, state=state, user_message=_USER)
     assert arguments["schema_excerpt"] == summary
     original = build_advisor_user_message(arguments)
@@ -341,10 +338,10 @@ async def test_real_advisor_inspects_individual_evidence_values_without_changing
     documents = [document for body in sent for document in body["documents"]]
     assert all(len(document) <= guard_contracts.PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in documents)
     inspected = "\n".join(documents)
-    assert f'"{truncate_advisor_text(options["system_prompt"], 1000)}"' in inspected
-    assert f'"{truncate_advisor_text(options["prompt_template"], 1000)}"' in inspected
+    assert f'"{options["system_prompt"]}"' in inspected
+    assert f'"{options["prompt_template"]}"' in inspected
     if "queries" in options:
-        assert all(f'"{truncate_advisor_text(query["template"], 1000)}"' in inspected for query in options["queries"].values())
+        assert all(f'"{query["template"]}"' in inspected for query in options["queries"].values())
         if shape == "interpolated_fields":
             assert all(field in inspected for field in interpolated_fields)
     else:

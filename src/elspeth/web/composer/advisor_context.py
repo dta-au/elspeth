@@ -7,15 +7,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final, cast
+from uuid import UUID
 
 from jinja2 import TemplateSyntaxError
+from pydantic import JsonValue
 
+from elspeth.contracts.credential_material import REDACTED_CREDENTIAL_TEXT, is_secret_field, scrub_credential_material
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.templates import extract_jinja2_fields
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.prompt_guard_rendering import json_content_parts
+from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import CompositionState, NodeSpec, _well_formed_query_entries
 from elspeth.web.composer.tools.sessions import (
     ADVISOR_TRIGGER_CANNOT_COMPLETE,
@@ -257,7 +262,18 @@ def _advisor_user_sections(arguments: Mapping[str, Any]) -> tuple[str, ...]:
         # Sentinel-neutralized for the same reason as ``user_message`` above:
         # the excerpt carries user-authored ``prompt_template``/``template``
         # option text, which can equally embed the fence sentinel.
-        schema_excerpt = _neutralize_untrusted_summary_sentinels(_redact_sensitive_content(cast(str, arguments["schema_excerpt"])))
+        schema_excerpt = cast(str, arguments["schema_excerpt"])
+        if "_elspeth_advisor_summary_parts" in arguments:
+            summary = arguments["_elspeth_advisor_summary_parts"]
+            if type(summary) is not AdvisorSummaryParts:
+                raise InvariantError("Advisor summary parts lack producer ownership")
+            if "".join(part.text for part in summary.values) == schema_excerpt:
+                schema_excerpt = _redact_advisor_summary(summary)
+            else:
+                schema_excerpt = _redact_sensitive_content(schema_excerpt)
+        else:
+            schema_excerpt = _redact_sensitive_content(schema_excerpt)
+        schema_excerpt = _neutralize_untrusted_summary_sentinels(schema_excerpt)
         user_msg_parts.append(
             "\n"
             + _ADVISOR_UNTRUSTED_SUMMARY_HEADER
@@ -294,50 +310,130 @@ def build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class _AdvisorConfiguredSourceReferenceSpan:
+    """A parsed declared reference position, without an existence/access claim."""
+
+    start: int
+    end: int
+    reference: UUID
+
+
+@dataclass(frozen=True, slots=True)
 class AdvisorSummaryParts:
     """Semantic summary units retained only by the deterministic producer."""
 
     values: tuple[PromptGuardContentPart, ...]
+    configured_source_reference_spans: tuple[_AdvisorConfiguredSourceReferenceSpan, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.values) is not tuple or any(
             type(value) is not PromptGuardContentPart or value.trust is not None for value in self.values
         ):
             raise InvariantError("Advisor summary requires owned untrusted semantic units")
+        text = "".join(value.text for value in self.values)
+        previous_end = 0
+        if type(self.configured_source_reference_spans) is not tuple:
+            raise InvariantError("Advisor source references require owned spans")
+        for span in self.configured_source_reference_spans:
+            if (
+                type(span) is not _AdvisorConfiguredSourceReferenceSpan
+                or type(span.reference) is not UUID
+                or not previous_end <= span.start < span.end <= len(text)
+                or text[span.start : span.end] != str(span.reference)
+            ):
+                raise InvariantError("Advisor configured source reference does not cover its exact parsed value")
+            previous_end = span.end
+
+
+def _redact_advisor_summary(summary: AdvisorSummaryParts) -> str:
+    """Redact the whole section, preserving only parsed source-reference spans.
+
+    Equal strings elsewhere stay under the normal policy. A configured reference
+    grants no guard trust, proves no blob existence, and permits no blob access.
+    """
+    text = "".join(part.text for part in summary.values)
+    replacements: list[tuple[str, str]] = []
+    for index, span in reversed(tuple(enumerate(summary.configured_source_reference_spans))):
+        marker = f"<advisor-configured-source-reference:{index}>"
+        while marker in text:
+            marker = "<" + marker + ">"
+        replacements.append((marker, str(span.reference)))
+        text = text[: span.start] + marker + text[span.end :]
+    text = _redact_sensitive_content(text)
+    for marker, reference in replacements:
+        text = text.replace(marker, reference)
+    return text
+
+
+def _redacted_advisor_summary_parts(summary: AdvisorSummaryParts) -> tuple[PromptGuardContentPart, ...]:
+    """Keep exact reference spans; whole-section changes still use the opaque fallback."""
+    spans = {(span.start, span.end) for span in summary.configured_source_reference_spans}
+    result: list[PromptGuardContentPart] = []
+    offset = 0
+    for part in summary.values:
+        end = offset + len(part.text)
+        identity = (offset, end) in spans
+        result.append(
+            PromptGuardContentPart(
+                part.text if identity else _redact_sensitive_content(part.text),
+                inspection_text=(_redact_sensitive_content(part.inspection_text) if part.inspection_text is not None else None),
+            )
+        )
+        offset = end
+    return tuple(result)
 
 
 class AdvisorGraphCoverageUnavailable(ValueError):
-    """The complete required graph projection cannot fit the review allowance."""
+    """Complete required graph evidence cannot be represented safely."""
 
 
-def _join_advisor_summary_units(units: tuple[tuple[PromptGuardContentPart, ...], ...]) -> AdvisorSummaryParts:
-    return AdvisorSummaryParts(
-        tuple(
-            _prefix_advisor_summary_part(part, "\n" if section_index and part_index == 0 else "")
-            for section_index, section in enumerate(units)
-            for part_index, part in enumerate(section)
-        )
-    )
+def _join_advisor_summary_units(
+    units: tuple[tuple[PromptGuardContentPart, ...], ...],
+    configured_source_references: tuple[tuple[PromptGuardContentPart, UUID], ...] = (),
+) -> AdvisorSummaryParts:
+    references = {id(part): reference for part, reference in configured_source_references}
+    parts: list[PromptGuardContentPart] = []
+    spans: list[_AdvisorConfiguredSourceReferenceSpan] = []
+    offset = 0
+    for section_index, section in enumerate(units):
+        for part_index, part in enumerate(section):
+            prefix = "\n" if section_index and part_index == 0 else ""
+            parts.append(_prefix_advisor_summary_part(part, prefix))
+            if id(part) in references:
+                spans.append(
+                    _AdvisorConfiguredSourceReferenceSpan(offset + len(prefix), offset + len(prefix) + len(part.text), references[id(part)])
+                )
+            offset += len(prefix) + len(part.text)
+    return AdvisorSummaryParts(tuple(parts), tuple(spans))
 
 
 def fit_advisor_checkpoint_summary(state: CompositionState, arguments: Mapping[str, Any], char_cap: int) -> AdvisorSummaryParts:
-    """Reserve complete structural evidence before selecting optional prose.
+    """Reserve complete configured graph evidence before optional commentary.
 
     The configured cost allowance applies only to optional additions above the
-    complete structural graph. Required evidence is always retained; actual
+    complete graph, including every authored prompt and semantic option value.
+    Required evidence is always retained; actual
     provider request/context limits remain the provider boundary's concern.
     """
-    required_units = _pipeline_advisor_summary_units(state, include_optional=False)
-    required = _join_advisor_summary_units(required_units)
-    required_chars = advisor_checkpoint_summary_chars({**arguments, "schema_excerpt": "".join(part.text for part in required.values)})
+    required_references: list[tuple[PromptGuardContentPart, UUID]] = []
+    required_units = _pipeline_advisor_summary_units(state, include_optional=False, configured_source_references=required_references)
+    required = _join_advisor_summary_units(required_units, tuple(required_references))
+    required_chars = advisor_checkpoint_summary_chars(
+        {**arguments, "schema_excerpt": "".join(part.text for part in required.values), "_elspeth_advisor_summary_parts": required}
+    )
     optional_limit = required_chars + char_cap
 
     def fits(parts: AdvisorSummaryParts) -> bool:
         return (
-            advisor_checkpoint_summary_chars({**arguments, "schema_excerpt": "".join(part.text for part in parts.values)}) <= optional_limit
+            advisor_checkpoint_summary_chars(
+                {**arguments, "schema_excerpt": "".join(part.text for part in parts.values), "_elspeth_advisor_summary_parts": parts}
+            )
+            <= optional_limit
         )
 
-    full = _join_advisor_summary_units(_pipeline_advisor_summary_units(state))
+    full_references: list[tuple[PromptGuardContentPart, UUID]] = []
+    full_units = _pipeline_advisor_summary_units(state, configured_source_references=full_references)
+    full = _join_advisor_summary_units(full_units, tuple(full_references))
     if fits(full):
         return full
     optional = _optional_advisor_summary_units(state)
@@ -345,19 +441,19 @@ def fit_advisor_checkpoint_summary(state: CompositionState, arguments: Mapping[s
     # Reserve the longest omission count throughout optional selection.
     marker = ((PromptGuardContentPart(f"optional_prose_units_withheld={len(optional)}"),),) if optional else ()
     for unit in optional:
-        candidate = _join_advisor_summary_units((*selected, unit, *marker))
+        candidate = _join_advisor_summary_units((*selected, unit, *marker), tuple(required_references))
         if fits(candidate):
             selected.append(unit)
         else:
-            # Continue after a large unit: a later smaller complete prompt may fit.
+            # A later smaller commentary unit may still fit.
             continue
     withheld = len(optional) - (len(selected) - len(required_units))
     if withheld:
         withheld_marker = (PromptGuardContentPart(f"optional_prose_units_withheld={withheld}"),)
-        with_marker = _join_advisor_summary_units((*selected, withheld_marker))
+        with_marker = _join_advisor_summary_units((*selected, withheld_marker), tuple(required_references))
         if fits(with_marker):
             return with_marker
-    return _join_advisor_summary_units(tuple(selected))
+    return _join_advisor_summary_units(tuple(selected), tuple(required_references))
 
 
 def _prefix_advisor_summary_part(part: PromptGuardContentPart, prefix: str) -> PromptGuardContentPart:
@@ -377,9 +473,12 @@ def advisor_summary_parts(state: CompositionState, published: str) -> AdvisorSum
     """
     remaining = published
     selected: list[PromptGuardContentPart] = []
+    references: list[tuple[PromptGuardContentPart, UUID]] = []
+    summary_units = _pipeline_advisor_summary_units(state, configured_source_references=references)
+    full = _join_advisor_summary_units(summary_units, tuple(references))
     units = (
         _prefix_advisor_summary_part(part, "\n" if section_index and part_index == 0 else "")
-        for section_index, section in enumerate(_pipeline_advisor_summary_units(state))
+        for section_index, section in enumerate(summary_units)
         for part_index, part in enumerate(section)
     )
     for unit in units:
@@ -387,11 +486,14 @@ def advisor_summary_parts(state: CompositionState, published: str) -> AdvisorSum
             break
         selected.append(unit)
         remaining = remaining[len(unit.text) :]
+    matched_length = len(published) - len(remaining)
     if remaining:
         selected.append(PromptGuardContentPart(remaining))
     if "".join(part.text for part in selected) != published:
         raise InvariantError("Advisor summary parts changed published evidence")
-    return AdvisorSummaryParts(tuple(selected))
+    return AdvisorSummaryParts(
+        tuple(selected), tuple(span for span in full.configured_source_reference_spans if span.end <= matched_length)
+    )
 
 
 def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuardContentPart, ...]:
@@ -440,14 +542,12 @@ def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuar
                 PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_HEADER + "\n" + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n"),
                 *(
                     PromptGuardContentPart(
-                        _neutralize_untrusted_summary_sentinels(_redact_sensitive_content(value.text)),
+                        _neutralize_untrusted_summary_sentinels(value.text),
                         inspection_text=(
-                            _neutralize_untrusted_summary_sentinels(_redact_sensitive_content(value.inspection_text))
-                            if value.inspection_text is not None
-                            else None
+                            _neutralize_untrusted_summary_sentinels(value.inspection_text) if value.inspection_text is not None else None
                         ),
                     )
-                    for value in summary.values
+                    for value in _redacted_advisor_summary_parts(summary)
                 ),
                 PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END),
             )
@@ -483,88 +583,11 @@ def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuar
     return tuple(result)
 
 
-# Salient, intent-bearing option keys whose VALUES are rendered (compactly) in
-# the advisor summary so the reviewer can judge topology/intent — not just
-# field contracts. Deliberately excludes secret-shaped keys (api_key, token,
-# password, …) and storage carriers (path, file, blob_ref): those are surfaced
-# as key-names-only, never as values, so the summary cannot leak credentials or
-# internal storage locations (the schema_excerpt field is further redacted on
-# the audit path regardless).
-_ADVISOR_SUMMARY_VALUE_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "model",
-        "prompt_template",
-        "template",
-        # The rest of an LLM node's prompt surface. A multi-query node sends
-        # each query's ``template`` override (the node-level ``prompt_template``
-        # renders only for queries without one) under one ``system_prompt``;
-        # withholding them left the END gate judging a prompt that never runs
-        # and blind to a repair landing in the prompts that do (session
-        # 94f6f00c, 2026-09-13). ``queries`` is expanded per query by
-        # ``_advisor_query_option_values``, never rendered as one blob.
-        "queries",
-        "system_prompt",
-        "column",
-        "columns",
-        "field",
-        "fields",
-        "format",
-        "schema",
-        "output_field",
-        "expression",
-        "operation",
-        "aggregation",
-        # Dynamic field contracts.  These values are non-secret and determine
-        # which fields a plugin produces or consumes; hiding them forces the
-        # advisor to guess plugin defaults and can create false mismatches.
-        "url_field",
-        "content_field",
-        "fingerprint_field",
-        "response_field",
-        "mapping",
-        "select_only",
-        "bucket_field",
-        "key_field",
-        "text_field",
-        "page_count_field",
-        "feature_types",
-        "region",
-        "collision_policy",
-        "require_all_rows",
-        "include_audit_context",
-        "include_error_reason",
-        "include_disposition_reason",
-    }
-)
-# Generic field-contract keys evolve with the plugin catalog. Render their
-# values structurally instead of maintaining one per-plugin allowlist entry,
-# while preserving name-only treatment for keys that are themselves
-# secret-shaped. A value such as ``secret_field=...`` is not advisor evidence.
-_ADVISOR_SUMMARY_SECRET_KEY_MARKERS: Final[tuple[str, ...]] = (
-    "access_key",
-    "api_key",
-    "credential",
-    "password",
-    "private_key",
-    "secret",
-    "token",
-)
+# This compact cap is for diagnostic snippets only. Configured graph semantics
+# are required evidence and never use a display allowlist or per-value cap.
 _ADVISOR_SUMMARY_VALUE_MAX_CHARS: Final[int] = 120
-# Prompt-shaped option values (``prompt_template``/``template``/
-# ``system_prompt`` and each per-query template) get a much larger render
-# budget so the advisor sees the WHOLE prompt — its rubric anchors and (for
-# the degeneracy check) its row-field interpolations — not just the opening
-# line. Sized so one prompt sits well under the per-call char_cap
-# (composer_advisor_max_prompt_tokens * 4) that ``_validate_advisor_arguments``
-# enforces on the ``request_advisor_hint`` TOOL path. The EARLY/END checkpoint
-# path builds its arguments in ``_build_checkpoint_arguments`` and fits the
-# rendered optional summary contribution before dispatch. These per-value
-# budgets preserve useful ordinary evidence; the optional-summary bound limits
-# their aggregate across nodes. Required schema, field and routing records are
-# complete; optional scalar intent retains the compact 120-character cap.
-_ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS: Final[int] = 1000
 # Option keys whose VALUE is prompt-shaped (free-text the model is told to
-# follow). Rendered with the larger budget above.
+# follow), rendered in full with decoded untrusted guard evidence.
 _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS: Final[frozenset[str]] = frozenset({"prompt_template", "template", "system_prompt"})
 _ADVISOR_SUMMARY_INVALID_QUERIES_MARKER: Final[str] = "<invalid queries>"
 _ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER: Final[str] = "(node-level prompt_template)"
@@ -639,13 +662,13 @@ def bound_advisor_checkpoint_summary(arguments: Mapping[str, Any], char_cap: int
         "override as prose-shaped and each input_fields mapping as structural, substitutes fixed "
         "markers for a fallback-to-node-template query, for a query whose template is present but "
         "not a string (never counted as a node-template user), and for a malformed queries value, "
-        "bounds the rendered entries with an explicit withheld count, and never raises"
+        "returns complete well-formed query bindings and template text without display clipping, and never raises"
     ),
 )
 def _advisor_query_option_values(options: Mapping[str, Any], *, plugin: str | None = None) -> list[tuple[str, str, bool]]:
     """ONE source of truth for a multi-query LLM node's prompt evidence surface.
 
-    Yields ``(key, text, prose_shaped)`` triples used by the bounded renderer.
+    Yields ``(key, text, prose_shaped)`` triples used by the complete renderer.
     The dedicated guard checks the complete actual outbound evidence; this
     projection does not classify injection text.
 
@@ -764,6 +787,10 @@ def _node_effective_prompt_templates(node: NodeSpec) -> list[str]:
     """
     node_template = _node_prompt_template(node)
     raw_queries = node.options.get("queries")
+    if raw_queries is None:
+        nested = node.options.get("options")
+        if isinstance(nested, Mapping):
+            raw_queries = nested.get("queries")
     entries = _well_formed_query_entries(raw_queries) if raw_queries is not None else ()
     if not entries:
         return [node_template] if node_template is not None else []
@@ -777,12 +804,36 @@ def _node_effective_prompt_templates(node: NodeSpec) -> list[str]:
     return templates
 
 
-def _advisor_summary_renders_option_value(key: str) -> bool:
-    """Whether an option value is safe and useful as advisor evidence."""
-    if key in _ADVISOR_SUMMARY_VALUE_KEYS:
-        return True
-    lowered = key.casefold()
-    return key.endswith("_field") and not any(marker in lowered for marker in _ADVISOR_SUMMARY_SECRET_KEY_MARKERS)
+def _advisor_option_value(value: object, *, key: str | None = None) -> JsonValue:
+    """Copy complete authored JSON through the shared credential policy.
+
+    Only recognized sensitive fields/material are replaced. Parsed top-level
+    source references have a separate producer-owned positional projection.
+    Unsupported owned state refuses instead of silently publishing a partial graph.
+    """
+    if key is not None and is_secret_field(key):
+        # Object framing keeps repeated whole-section credential redaction
+        # idempotent: a scalar sentinel still resembles a credential assignment.
+        return {"redacted": REDACTED_CREDENTIAL_TEXT}
+    if isinstance(value, Mapping):
+        projected: dict[str, JsonValue] = {}
+        for child_key, child in value.items():
+            if type(child_key) is not str:
+                raise InvariantError("Advisor graph option keys must be strings")
+            redacted_key = cast(str, _advisor_option_value(child_key))
+            if redacted_key in projected:
+                raise AdvisorGraphCoverageUnavailable("Advisor graph redaction made option keys ambiguous")
+            projected[redacted_key] = _advisor_option_value(child, key=child_key)
+        return projected
+    if isinstance(value, list | tuple):
+        return [_advisor_option_value(child) for child in value]
+    if type(value) is str:
+        # Scalar-only use avoids the audit scrubber's container-size policy:
+        # configured collections are never replaced merely for being large.
+        return cast(str, scrub_credential_material(_redact_sensitive_content(value)))
+    if value is None or type(value) in (bool, int, float):
+        return cast(JsonValue, value)
+    raise InvariantError("Advisor graph contains an unsupported option value")
 
 
 @observation_boundary(
@@ -820,7 +871,10 @@ def _render_schema_for_advisor(raw_schema: object) -> str:
 
 
 def _pipeline_advisor_summary_units(
-    state: CompositionState, *, include_optional: bool = True
+    state: CompositionState,
+    *,
+    include_optional: bool = True,
+    configured_source_references: list[tuple[PromptGuardContentPart, UUID]] | None = None,
 ) -> tuple[tuple[PromptGuardContentPart, ...], ...]:
     """Render pipeline display sections with their owned evidence boundaries.
 
@@ -831,16 +885,14 @@ def _pipeline_advisor_summary_units(
       connection points;
     * intent / control flow — the salient structural settings (gate
       ``condition``/``routes``/``fork_to``, coalesce ``policy``/``merge``,
-      aggregation ``trigger``/``output_mode``) plus an allowlisted set of
-      intent-bearing option *values* (``model``, ``prompt_template``, selected
-      columns, …);
+      aggregation ``trigger``/``output_mode``) plus every authored option
+      value, including complete effective system/user prompts;
     * field contract — each node's declared ``required_input_fields``.
 
-    Redaction safety: allowlisted non-secret keys and honest ``*_field``
-    contracts have their values rendered (truncated); every other option is
-    explicitly marked present with its value withheld, so credentials and
-    storage paths cannot leak — even before the audit-path redactor runs on
-    the ``schema_excerpt`` field.
+    Credential values are centrally redacted before rendering. The existing
+    source-storage policy hides internal path/file carriers for blob-backed
+    sources while preserving the blob identity and ordinary authored paths.
+    Only descriptive commentary is optional; configured semantics are required.
 
     Defensive against partial states: the EARLY checkpoint fires on the
     empty->non-empty transition, so ``source``/``nodes``/``outputs`` may each
@@ -849,9 +901,9 @@ def _pipeline_advisor_summary_units(
     lines: list[tuple[PromptGuardContentPart, ...]] = []
 
     if state.metadata.name:
-        lines.append((PromptGuardContentPart(f"Pipeline: {state.metadata.name}"),))
+        lines.append((PromptGuardContentPart(_redact_sensitive_content(f"Pipeline: {state.metadata.name}")),))
     if state.metadata.description and include_optional:
-        lines.append((PromptGuardContentPart(f"Intent (stated): {state.metadata.description}"),))
+        lines.append((PromptGuardContentPart(_redact_sensitive_content(f"Intent (stated): {state.metadata.description}")),))
 
     # Sources.
     if not state.sources:
@@ -862,10 +914,16 @@ def _pipeline_advisor_summary_units(
             lines.append(
                 (
                     PromptGuardContentPart(
-                        f"{label}: plugin={source.plugin} -> '{source.on_success}' on_validation_failure={source.on_validation_failure} ["
+                        _redact_sensitive_content(
+                            f"{label}: plugin={source.plugin} -> '{source.on_success}' on_validation_failure={source.on_validation_failure} ["
+                        )
                     ),
                     *_render_options_for_advisor_parts(
-                        source.options, plugin=source.plugin, component="source", include_optional=include_optional
+                        source.options,
+                        plugin=source.plugin,
+                        component="source",
+                        include_optional=include_optional,
+                        configured_source_references=configured_source_references,
                     ),
                     PromptGuardContentPart("]"),
                 )
@@ -880,9 +938,9 @@ def _pipeline_advisor_summary_units(
             plugin = node.plugin if node.plugin is not None else "-"
             on_success = node.on_success if node.on_success is not None else "-"
             required = _node_required_input_fields(node)
-            required_parts = tuple(PromptGuardContentPart((", " if index else "") + field) for index, field in enumerate(required)) or (
-                PromptGuardContentPart("(none declared)"),
-            )
+            required_parts = tuple(
+                PromptGuardContentPart(_redact_sensitive_content((", " if index else "") + field)) for index, field in enumerate(required)
+            ) or (PromptGuardContentPart("(none declared)"),)
             control_parts = _render_node_control_flow_parts(node)
             # LLM nodes get a length-independent degeneracy signal: which row
             # fields their prompt interpolates (or NONE). An LLM node is a
@@ -891,7 +949,7 @@ def _pipeline_advisor_summary_units(
             interpolation_parts = (
                 (
                     PromptGuardContentPart(" ["),
-                    *(PromptGuardContentPart(part) for part in _render_interpolated_row_fields_parts(node)),
+                    *(PromptGuardContentPart(_redact_sensitive_content(part)) for part in _render_interpolated_row_fields_parts(node)),
                     PromptGuardContentPart("]"),
                 )
                 if is_llm
@@ -900,8 +958,10 @@ def _pipeline_advisor_summary_units(
             lines.append(
                 (
                     PromptGuardContentPart(
-                        f"  - {node.id}: type={node.node_type} plugin={plugin} "
-                        f"reads '{node.input}' -> '{on_success}' on_error={node.on_error or '-'}"
+                        _redact_sensitive_content(
+                            f"  - {node.id}: type={node.node_type} plugin={plugin} "
+                            f"reads '{node.input}' -> '{on_success}' on_error={node.on_error or '-'}"
+                        )
                     ),
                     *control_parts,
                     PromptGuardContentPart(" [requires: "),
@@ -921,7 +981,9 @@ def _pipeline_advisor_summary_units(
         for output in state.outputs:
             lines.append(
                 (
-                    PromptGuardContentPart(f"  - {output.name}: plugin={output.plugin} on_write_failure={output.on_write_failure} ["),
+                    PromptGuardContentPart(
+                        _redact_sensitive_content(f"  - {output.name}: plugin={output.plugin} on_write_failure={output.on_write_failure} [")
+                    ),
                     *_render_options_for_advisor_parts(
                         output.options, plugin=output.plugin, component="sink", include_optional=include_optional
                     ),
@@ -935,7 +997,9 @@ def _pipeline_advisor_summary_units(
             lines.append(
                 (
                     PromptGuardContentPart(
-                        f"  - {edge.id}: from={edge.from_node} to={edge.to_node} type={edge.edge_type} label={edge.label}"
+                        _redact_sensitive_content(
+                            f"  - {edge.id}: from={edge.from_node} to={edge.to_node} type={edge.edge_type} label={edge.label}"
+                        )
                     ),
                 )
             )
@@ -943,31 +1007,10 @@ def _pipeline_advisor_summary_units(
 
 
 def _optional_advisor_summary_units(state: CompositionState) -> tuple[tuple[PromptGuardContentPart, ...], ...]:
-    """Whole authored prose units, considered only after required graph facts."""
+    """Commentary only; every configured prompt/option belongs to the graph."""
     units: list[tuple[PromptGuardContentPart, ...]] = []
     if state.metadata.description:
-        units.append((PromptGuardContentPart(f"Intent (stated): {state.metadata.description}"),))
-    components = (
-        *((f"source {name}", source.plugin, source.options) for name, source in state.sources.items()),
-        *((f"node {node.id}", node.plugin, node.options) for node in state.nodes),
-        *((f"sink {output.name}", output.plugin, output.options) for output in state.outputs),
-    )
-    for label, plugin, options in components:
-        for key in sorted(_ADVISOR_SUMMARY_PROMPT_VALUE_KEYS):
-            if key in options:
-                units.append((PromptGuardContentPart(f"Optional {label}: "), *_render_options_for_advisor_parts({key: options[key]})))
-        if "queries" in options:
-            for query_key, text, prose_shaped in _advisor_query_option_values(options, plugin=plugin):
-                if prose_shaped:
-                    rendered = truncate_advisor_text(text, _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS)
-                    units.append(
-                        (
-                            PromptGuardContentPart(
-                                f"Optional {label}: {query_key}_untrusted_json={json.dumps(rendered)}",
-                                inspection_text=f'Optional {label}: {query_key}_untrusted_json="{rendered}"',
-                            ),
-                        )
-                    )
+        units.append((PromptGuardContentPart(_redact_sensitive_content(f"Intent (stated): {state.metadata.description}")),))
     return tuple(units)
 
 
@@ -1035,6 +1078,7 @@ def _render_node_control_flow(node: NodeSpec) -> str:
 def _render_node_control_flow_parts(node: NodeSpec) -> tuple[PromptGuardContentPart, ...]:
     parts: list[PromptGuardContentPart] = []
     for label, _evidence_label, value in _advisor_control_flow_fields(node):
+        value = _redact_sensitive_content(value)
         if label in {"routes", "fork_to", "branches", "trigger"}:
             parts.extend((PromptGuardContentPart(f" {label}="), *json_content_parts(value, separators=(",", ":"))))
         else:
@@ -1054,6 +1098,17 @@ def _advisor_string_mapping(value: object) -> dict[str, str] | None:
     if isinstance(value, Mapping) and all(type(key) is str and type(item) is str for key, item in value.items()):
         return dict(value)
     return None
+
+
+def _redacted_advisor_string_mapping(mapping: dict[str, str]) -> dict[str, str]:
+    """Preserve every binding or refuse when redaction erases key distinctions."""
+    result: dict[str, str] = {}
+    for name, value in mapping.items():
+        redacted_name = cast(str, _advisor_option_value(name))
+        if redacted_name in result:
+            raise AdvisorGraphCoverageUnavailable("Advisor graph redaction made mapping keys ambiguous")
+        result[redacted_name] = cast(str, _advisor_option_value(value))
+    return result
 
 
 @observation_boundary(
@@ -1082,28 +1137,60 @@ def _csv_header_provenance(options: Mapping[str, Any]) -> str:
 
 
 def _render_options_for_advisor_parts(
-    options: Mapping[str, Any], *, plugin: str | None = None, component: str = "node", include_optional: bool = True
+    options: Mapping[str, Any],
+    *,
+    plugin: str | None = None,
+    component: str = "node",
+    include_optional: bool = True,
+    configured_source_references: list[tuple[PromptGuardContentPart, UUID]] | None = None,
 ) -> tuple[PromptGuardContentPart, ...]:
-    """Retain complete rendered option/query values with their owned separators.
+    """Render every configured option, centrally redacted, in complete units.
 
-    The schema key is parsed into an ELSPETH-owned closed structural projection;
-    Required field bindings and CSV display headers are complete. Other
-    allowlisted intent-bearing values remain compact; unknown values remain
-    explicitly withheld. Authored JSON strings retain decoded guard evidence.
+    ``include_optional`` never removes configured prompts or option values.
+    Authored strings retain decoded, entirely untrusted guard evidence.
     """
     if not options:
         return (PromptGuardContentPart("no options"),)
+    if component == "source":
+        options = redact_source_storage_path({"source": {"options": deep_thaw(options)}})["source"]["options"]
     value_parts: list[tuple[PromptGuardContentPart, ...]] = []
-    name_only: list[str] = []
     for key in sorted(options.keys()):
-        if key == "mapping" and plugin != "field_mapper":
-            name_only.append(key)
+        if key == "blob_ref" and component == "source":
+            raw_reference = options[key]
+            reference = None
+            if type(raw_reference) is str:
+                try:
+                    parsed = UUID(raw_reference)
+                    if str(parsed) == raw_reference:
+                        reference = parsed
+                except ValueError:
+                    pass
+            if reference is None:
+                value_parts.append((PromptGuardContentPart("blob_ref=<redacted-invalid-source-reference>"),))
+            else:
+                reference_part = PromptGuardContentPart(str(reference))
+                value_parts.append(
+                    (
+                        PromptGuardContentPart("blob_ref="),
+                        reference_part,
+                        PromptGuardContentPart(" (configured reference; existence and access not verified)"),
+                    )
+                )
+                if configured_source_references is not None:
+                    configured_source_references.append((reference_part, reference))
             continue
         if (key == "mapping" and plugin == "field_mapper") or (key == "field_mapping" and component == "source"):
             mapping = _advisor_string_mapping(options[key])
             if mapping is None:
-                value_parts.append((PromptGuardContentPart(f"{key}=<invalid field mapping>"),))
+                safe_mapping = _advisor_option_value(options[key], key=key)
+                value_parts.append(
+                    (
+                        PromptGuardContentPart(f"{key}=<invalid field mapping>; authored value="),
+                        *json_content_parts(json.dumps(safe_mapping, separators=(",", ":")), separators=(",", ":")),
+                    )
+                )
             else:
+                mapping = _redacted_advisor_string_mapping(mapping)
                 value_parts.append(
                     (
                         PromptGuardContentPart(f"{key}="),
@@ -1115,6 +1202,7 @@ def _render_options_for_advisor_parts(
             raw_headers = options[key]
             headers = _advisor_string_mapping(raw_headers)
             if headers is not None:
+                headers = _redacted_advisor_string_mapping(headers)
                 value_parts.append(
                     (
                         PromptGuardContentPart("headers="),
@@ -1124,68 +1212,88 @@ def _render_options_for_advisor_parts(
             elif raw_headers in ("normalized", "original"):
                 value_parts.append((PromptGuardContentPart(f"headers={raw_headers}"),))
             else:
-                value_parts.append((PromptGuardContentPart("headers=<invalid CSV headers>"),))
+                safe_headers = _advisor_option_value(raw_headers, key=key)
+                value_parts.append(
+                    (
+                        PromptGuardContentPart("headers=<invalid CSV headers>; authored value="),
+                        *json_content_parts(json.dumps(safe_headers, separators=(",", ":")), separators=(",", ":")),
+                    )
+                )
             continue
-        if _advisor_summary_renders_option_value(key):
-            if key == "queries":
-                # Per-query prompt surface: one entry per triple, prompt-shaped
-                # texts on the prompt budget with the untrusted-JSON framing,
-                # structural bindings and markers retained completely. An
-                # unrelated plugin's queries list stays name-only.
-                expansion = _advisor_query_option_values(options, plugin=plugin)
-                if not expansion:
-                    name_only.append(key)
-                    continue
+        safe_value = _advisor_option_value(options[key], key=key)
+        display_key = cast(str, _advisor_option_value(key))
+        if key == "queries":
+            safe_options = {**options, "queries": safe_value}
+            expansion = _advisor_query_option_values(safe_options, plugin=plugin)
+            entries = _well_formed_query_entries(safe_value)
+            complete_entries = isinstance(safe_value, dict | list) and len(entries) == len(safe_value)
+            if expansion and expansion[0][1] != _ADVISOR_SUMMARY_INVALID_QUERIES_MARKER and complete_entries:
                 for query_key, text, prose_shaped in expansion:
                     if prose_shaped:
-                        if not include_optional:
-                            name_only.append(query_key)
-                            continue
-                        rendered = truncate_advisor_text(text, _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS)
                         value_parts.append(
                             (
                                 PromptGuardContentPart(
-                                    f"{query_key}_untrusted_json={json.dumps(rendered)}",
-                                    inspection_text=f'{query_key}_untrusted_json="{rendered}"',
+                                    f"{query_key}_untrusted_json={json.dumps(text)}",
+                                    inspection_text=f'{query_key}_untrusted_json="{text}"',
                                 ),
                             )
                         )
                     else:
                         value_parts.append((PromptGuardContentPart(f"{query_key}={text}"),))
+                for label, entry in entries:
+                    extra = {name: value for name, value in entry.items() if name not in {"input_fields", "template"}}
+                    if "input_fields" in entry and _advisor_string_mapping(entry["input_fields"]) is None:
+                        extra["input_fields"] = entry["input_fields"]
+                    if "template" in entry and entry["template"] is not None and type(entry["template"]) is not str:
+                        extra["template"] = entry["template"]
+                    if extra:
+                        value_parts.append(
+                            (
+                                PromptGuardContentPart(f"queries.{label}.additional_options="),
+                                *json_content_parts(json.dumps(extra, separators=(",", ":")), separators=(",", ":")),
+                            )
+                        )
                 continue
-            if key == "schema":
-                rendered = _render_schema_for_advisor(options[key])
-                if rendered.startswith("{"):
-                    value_parts.append((PromptGuardContentPart("schema="), *json_content_parts(rendered, separators=(",", ":"))))
-                    continue
-            elif key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
-                if not include_optional:
-                    name_only.append(key)
-                    continue
-                limit = _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS
-                rendered = truncate_advisor_text(str(options[key]), limit)
+            if expansion:
+                value_parts.append((PromptGuardContentPart(f"queries={_ADVISOR_SUMMARY_INVALID_QUERIES_MARKER}"),))
+                display_key = "queries_value"
+        if key == "schema":
+            rendered = _redact_sensitive_content(_render_schema_for_advisor(options[key]))
+            if rendered.startswith("{"):
+                value_parts.append((PromptGuardContentPart("schema="), *json_content_parts(rendered, separators=(",", ":"))))
             else:
-                rendered = str(options[key])
-                if key not in {"column", "columns", "field", "fields", "select_only"} and not key.endswith("_field"):
-                    rendered = truncate_advisor_text(rendered)
-            if key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
+                value_parts.append((PromptGuardContentPart(f"schema={rendered}"),))
+            value_parts.append(
+                (
+                    PromptGuardContentPart("schema authored value="),
+                    *json_content_parts(json.dumps(safe_value, separators=(",", ":")), separators=(",", ":")),
+                )
+            )
+            continue
+        if key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
+            if type(safe_value) is str:
                 value_parts.append(
                     (
                         PromptGuardContentPart(
-                            f"{key}_untrusted_json={json.dumps(rendered)}",
-                            inspection_text=f'{key}_untrusted_json="{rendered}"',
+                            f"{display_key}_untrusted_json={json.dumps(safe_value)}",
+                            inspection_text=f'{display_key}_untrusted_json="{safe_value}"',
                         ),
                     )
                 )
             else:
-                value_parts.append((PromptGuardContentPart(f"{key}={rendered}"),))
+                value_parts.append((PromptGuardContentPart(f"{display_key}_untrusted_json="), *json_content_parts(json.dumps(safe_value))))
+        elif isinstance(safe_value, dict | list):
+            value_parts.append(
+                (
+                    PromptGuardContentPart(f"{display_key}="),
+                    *json_content_parts(json.dumps(safe_value, separators=(",", ":"), allow_nan=False), separators=(",", ":")),
+                )
+            )
         else:
-            name_only.append(key)
+            value_parts.append((PromptGuardContentPart(f"{display_key}={safe_value}"),))
     segments: list[PromptGuardContentPart] = []
     for index, value in enumerate(value_parts):
         segments.extend((_prefix_advisor_summary_part(value[0], ", " if index else "options: "), *value[1:]))
-    if name_only:
-        segments.append(PromptGuardContentPart(("; " if value_parts else "") + "values withheld: " + ", ".join(name_only)))
     if component == "sink" and plugin == "csv" and options:
         if "headers" not in options:
             segments.append(PromptGuardContentPart("; headers=normalized (default)"))
@@ -1199,12 +1307,7 @@ def _render_options_for_advisor(options: Mapping[str, Any]) -> str:
 
 
 def truncate_advisor_text(value: str, limit: int = _ADVISOR_SUMMARY_VALUE_MAX_CHARS) -> str:
-    """Bound a rendered value so the summary stays compact. Never raises.
-
-    ``limit`` defaults to the global compact cap; prompt-shaped keys pass the
-    larger schema/prompt budgets so the advisor sees complete ordinary field
-    contracts and the whole prompt. Every other call site is unaffected.
-    """
+    """Bound optional diagnostic text; never use this for configured graph data."""
     if len(value) <= limit:
         return value
     return value[: limit - 1] + "…"

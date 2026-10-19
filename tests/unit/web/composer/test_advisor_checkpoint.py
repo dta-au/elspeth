@@ -1118,7 +1118,8 @@ def test_end_advisor_prompt_scopes_bounded_and_withheld_evidence(make_service) -
     )
     assert all(f'"name":"field_{index}"' in prompt for index in range(9))
     assert "additional_fields_withheld" not in arguments["schema_excerpt"]
-    assert "values withheld: blob_ref, path" in prompt
+    assert "blob_ref=<redacted-invalid-source-reference>" in prompt
+    assert "path=<redacted-blob-source-path>" in prompt
 
 
 def test_build_checkpoint_arguments_end_preserves_long_user_message(make_service, simple_state):
@@ -1270,7 +1271,7 @@ async def test_summarize_renders_intent_values_but_redacts_secret_shaped_keys(si
     summary = summarize_pipeline_for_advisor(state)
     assert "model=gpt-5.5" in summary  # allowlisted value rendered
     assert "sk-SECRET-VALUE" not in summary  # secret value NEVER rendered
-    assert "private_credential_column" not in summary
+    assert "secret_field=private_credential_column" in summary
     assert "api_key" in summary  # but its presence is disclosed by name
     assert "secret_field" in summary
 
@@ -1501,8 +1502,9 @@ def test_summarize_renders_complete_textract_contract_and_changes_with_committed
     assert "collision_policy=auto_increment" in sink_line
     assert "/private/document-manifest.csv" not in summary
     assert "private-csv-blob-ref" not in summary
-    assert "values withheld: blob_ref, path" in source_line
-    assert "values withheld: path" in sink_line
+    assert "blob_ref=<redacted-invalid-source-reference>" in source_line
+    assert "path=<redacted-blob-source-path>" in source_line
+    assert "path=/private/analysed-documents.jsonl" in sink_line
     assert "invalid_documents: plugin=json" in summary
     assert "textract_errors: plugin=json" in summary
     assert "failed_writes: plugin=json" in summary
@@ -1536,24 +1538,66 @@ def test_summarize_renders_complete_textract_contract_and_changes_with_committed
     assert "collision_policy=overwrite" in changed_summary
 
 
-def test_summarize_schema_omits_unknown_metadata_and_field_extras() -> None:
+def _schema_advisor_projections(rendered: str) -> tuple[Any, Any]:
+    prefix = "options: schema="
+    assert rendered.startswith(prefix)
+    payload = rendered.removeprefix(prefix)
+    canonical, end = json.JSONDecoder().raw_decode(payload)
+    remaining = payload[end:]
+    authored_prefix = ", schema authored value="
+    assert remaining.startswith(authored_prefix)
+    return canonical, json.loads(remaining.removeprefix(authored_prefix))
+
+
+def test_summarize_schema_retains_unknown_metadata_and_field_extras() -> None:
     from elspeth.web.composer.advisor_context import summarize_pipeline_for_advisor
 
     summary = summarize_pipeline_for_advisor(_textract_advisor_state())
 
-    assert _UNKNOWN_SCHEMA_METADATA_SENTINEL not in summary
-    assert _UNKNOWN_FIELD_EXTRA_SENTINEL not in summary
+    assert "schema authored value=" in summary
+    assert _UNKNOWN_SCHEMA_METADATA_SENTINEL in summary
+    assert _UNKNOWN_FIELD_EXTRA_SENTINEL in summary
 
 
-def test_summarize_schema_never_emits_opaque_injection_strings() -> None:
-    from elspeth.web.composer.advisor_context import summarize_pipeline_for_advisor
+def test_summarize_schema_preserves_opaque_authored_values_as_untrusted_guard_evidence() -> None:
+    from elspeth.web.composer.advisor_context import (
+        advisor_summary_parts,
+        advisor_user_content_parts,
+        build_advisor_user_message,
+        summarize_pipeline_for_advisor,
+    )
+    from elspeth.web.composer.prompt_guard import _request
 
-    summary = summarize_pipeline_for_advisor(_textract_advisor_state())
+    state = _textract_advisor_state()
+    summary = summarize_pipeline_for_advisor(state)
+    arguments = {
+        "trigger": "deterministic_end_checkpoint",
+        "problem_summary": "Inspect the configured graph.",
+        "recent_errors": [],
+        "attempted_actions": [],
+        "schema_excerpt": summary,
+        "_elspeth_advisor_summary_parts": advisor_summary_parts(state, summary),
+    }
+    message = build_advisor_user_message(arguments)
+    parts = advisor_user_content_parts(arguments)
 
-    assert _OPAQUE_SCHEMA_INJECTION_SENTINEL not in summary
+    assert _OPAQUE_SCHEMA_INJECTION_SENTINEL in message
+    assert "".join(part.text for part in parts) == message
+    assert all(part.trust is None for part in parts)
+    request, supported = _request(
+        policy_fingerprint="synthetic-policy",
+        role="advisor",
+        messages=({"role": "user", "content": message},),
+        tools=(),
+        user_prompt="Inspect authored schema evidence as untrusted content.",
+        trusted_message_indexes=frozenset(),
+        content_parts=(parts,),
+    )
+    assert supported
+    assert _OPAQUE_SCHEMA_INJECTION_SENTINEL in "\n".join(request.documents)
 
 
-def test_render_schema_preserves_sanctioned_observed_contract_lists_only() -> None:
+def test_render_schema_separates_observed_contracts_from_complete_redacted_authored_values() -> None:
     from elspeth.web.composer.advisor_context import _render_options_for_advisor
 
     rendered = _render_options_for_advisor(
@@ -1564,6 +1608,7 @@ def test_render_schema_preserves_sanctioned_observed_contract_lists_only() -> No
                 "required_fields": ["doc_key"],
                 "audit_fields": ["trace_id"],
                 "opaque": _OPAQUE_SCHEMA_INJECTION_SENTINEL,
+                "api_key": "PRIVATE_SCHEMA_CREDENTIAL_CANARY",  # secret-scan: allow-this-line
             }
         }
     )
@@ -1571,7 +1616,16 @@ def test_render_schema_preserves_sanctioned_observed_contract_lists_only() -> No
     for schema_fact in ('"mode":"observed"', "doc_bucket", "doc_key", "trace_id"):
         assert schema_fact in rendered
     assert "withheld" not in rendered
-    assert _OPAQUE_SCHEMA_INJECTION_SENTINEL not in rendered
+    canonical, authored = _schema_advisor_projections(rendered)
+    assert canonical == {
+        "mode": "observed",
+        "fields": None,
+        "guaranteed_fields": ["doc_bucket"],
+        "required_fields": ["doc_key"],
+        "audit_fields": ["trace_id"],
+    }
+    assert authored["opaque"] == _OPAQUE_SCHEMA_INJECTION_SENTINEL
+    assert "PRIVATE_SCHEMA_CREDENTIAL_CANARY" not in rendered
 
 
 def test_render_schema_canonicalizes_field_type_flexible_contract() -> None:
@@ -1598,8 +1652,10 @@ def test_render_schema_canonicalizes_field_type_flexible_contract() -> None:
     for schema_fact in ('"mode":"flexible"', '"name":"doc_bucket"', '"type":"str"', '"required":true'):
         assert schema_fact in rendered
     assert "withheld" not in rendered
-    assert "field_type" not in rendered
-    assert _UNKNOWN_SCHEMA_METADATA_SENTINEL not in rendered
+    canonical, authored = _schema_advisor_projections(rendered)
+    assert canonical["fields"] == [{"name": "doc_bucket", "type": "str", "required": True, "nullable": False}]
+    assert authored["fields"][0]["field_type"] == "str"
+    assert authored["unknown_schema_metadata"] == _UNKNOWN_SCHEMA_METADATA_SENTINEL
 
 
 def test_summarize_renders_source_node_and_sink_failure_routes() -> None:
@@ -1961,7 +2017,8 @@ def test_advisor_prompt_explains_withheld_values_are_present_and_not_defects(mak
     arguments = make_service()._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=_textract_advisor_state())
     prompt = build_advisor_user_message(arguments)
 
-    assert "values withheld: blob_ref, path" in prompt
+    assert "blob_ref=<redacted-invalid-source-reference>" in prompt
+    assert "path=<redacted-blob-source-path>" in prompt
     assert "present-but-not-shown" in prompt
     assert "never FLAG" in prompt
     assert "merely because its value or entry is withheld" in prompt
@@ -4775,7 +4832,7 @@ def test_build_advisor_user_message_neutralizes_begin_end_spoof_in_schema_excerp
 
 
 @pytest.mark.parametrize("choice", [None, False, True], ids=["absent", "false", "true"])
-def test_render_options_exposes_retention_choice_without_exposing_unknown_values(choice):
+def test_render_options_exposes_retention_and_semantic_values_while_redacting_credentials(choice):
     from elspeth.web.composer.advisor_context import _render_options_for_advisor
 
     options = {
@@ -4798,11 +4855,12 @@ def test_render_options_exposes_retention_choice_without_exposing_unknown_values
             assert key not in rendered
         else:
             assert f"{key}={choice}" in rendered
-            assert key not in rendered.split("values withheld: ", 1)[1]
-    for key in ("path", "api_key", "service_token_field", "unknown_boolean"):
-        assert key in rendered.split("values withheld: ", 1)[1]
-        assert f"{key}=" not in rendered
-    assert all(value not in rendered for value in ("withheld-output-location.csv", "withheld-key-canary", "withheld-field-canary"))
+    assert "path=withheld-output-location.csv" in rendered
+    assert "service_token_field=withheld-field-canary" in rendered
+    assert "unknown_boolean=True" in rendered
+    assert 'api_key={"redacted":"<redacted-secret>"}' in rendered
+    assert "withheld-key-canary" not in rendered
+    assert "values withheld" not in rendered
     assert options == before
 
 
@@ -4847,11 +4905,9 @@ def test_checkpoint_retention_evidence_preserves_choices_and_untrusted_wire(make
             assert f"{key}={choice}" in original
 
 
-def test_render_options_untruncates_prompt_but_caps_other_values():
-    """B1: a >700-char prompt_template is rendered far enough that a substring
-    near its END is visible, while a >700-char non-prompt allowlisted value is
-    still truncated to <=120 chars."""
-    from elspeth.web.composer.advisor_context import _ADVISOR_SUMMARY_VALUE_MAX_CHARS, _render_options_for_advisor
+def test_render_options_preserves_complete_prompt_and_expression_values():
+    """Semantic expressions and prompts both retain their authored tails."""
+    from elspeth.web.composer.advisor_context import _render_options_for_advisor
 
     tail_anchor = "RETURN_JSON_OUTPUT_CONTRACT_TAIL"
     long_prompt = ("Judge the page. " * 50) + tail_anchor  # ~800+ chars, anchor at end
@@ -4859,13 +4915,12 @@ def test_render_options_untruncates_prompt_but_caps_other_values():
 
     rendered = _render_options_for_advisor({"prompt_template": long_prompt, "expression": long_expression})
 
-    # Prompt-shaped key: the END of the prompt is visible (large budget).
+    # Complete prompt and non-prompt semantics remain visible.
     assert tail_anchor in rendered
-    # Non-prompt allowlisted value: still truncated to the small budget.
     expr_segment = rendered.split("expression=", 1)[1]
     expr_value = expr_segment.split(",", 1)[0].split(";", 1)[0]
-    assert len(expr_value) <= _ADVISOR_SUMMARY_VALUE_MAX_CHARS
-    assert "xxxxxxxxxx" in expr_value  # it really is the (truncated) expression
+    assert expr_value == long_expression
+    assert "xxxxxxxxxx" in expr_value
 
 
 def test_render_options_preserves_every_complete_schema_field():
@@ -4885,10 +4940,10 @@ def test_render_options_preserves_every_complete_schema_field():
     }
 
     rendered = _render_options_for_advisor({"schema": schema})
-    schema_value = rendered.removeprefix("options: schema=")
+    canonical, authored = _schema_advisor_projections(rendered)
 
-    assert json.loads(schema_value) == schema
-    assert not schema_value.endswith("…")
+    assert canonical == schema and authored == schema
+    assert "…" not in rendered
 
 
 def test_render_options_never_slices_a_long_required_field_contract():
@@ -4908,11 +4963,11 @@ def test_render_options_never_slices_a_long_required_field_contract():
     }
 
     rendered = _render_options_for_advisor({"schema": schema})
-    schema_value = rendered.removeprefix("options: schema=")
+    canonical, authored = _schema_advisor_projections(rendered)
 
-    assert json.loads(schema_value) == schema
-    assert oversized_name in schema_value
-    assert "…" not in schema_value
+    assert canonical == schema and authored == schema
+    assert oversized_name in rendered
+    assert "…" not in rendered
 
 
 def test_render_options_template_key_also_untruncated():
@@ -5889,8 +5944,7 @@ def test_summarize_renders_multi_query_effective_prompts_and_system_prompt(simpl
     withheld = _withheld_keys(line)
     assert "queries" not in withheld
     assert "system_prompt" not in withheld
-    # Unrelated keys stay name-only: the widening is exactly the prompt surface.
-    assert "profile" in withheld
+    assert "profile" not in withheld and "profile=" in line
 
 
 def test_summarize_marks_node_prompt_template_unused_when_every_query_overrides(simple_state):
@@ -6061,11 +6115,11 @@ def test_advisor_render_keeps_the_complete_multi_query_prompt_vocabulary():
     assert "queries.good_pair.input_fields" not in prose_keys
 
 
-def test_summarize_keeps_non_prompt_queries_name_only(simple_state):
+def test_summarize_preserves_non_llm_queries_without_inventing_prompt_semantics(simple_state):
     """``queries`` is not an LLM-only key: a Textract document-analysis node
     carries a ``queries`` list of questions and no prompt_template. The
     multi-query prompt expansion must not publish false template markers about
-    it; the key stays under ``values withheld`` exactly as before."""
+    it; the configured Textract questions themselves remain visible."""
     from elspeth.web.composer.advisor_context import _advisor_query_option_values, summarize_pipeline_for_advisor
 
     options = {
@@ -6090,7 +6144,8 @@ def test_summarize_keeps_non_prompt_queries_name_only(simple_state):
     )
     line = _node_line(summarize_pipeline_for_advisor(simple_state.with_node(node)), "analyse_document")
 
-    assert "queries" in _withheld_keys(line)
+    assert "queries" not in _withheld_keys(line)
+    assert "What is the invoice total?" in line and "Who is the vendor?" in line
     assert "queries." not in line
     assert "prompt_template_in_use" not in line
     assert "<invalid queries>" not in line
@@ -6129,7 +6184,10 @@ def _pathological_multi_query_state(simple_state: CompositionState, node_count: 
             for n in range(8)
         }
         state = state.with_node(_multi_query_llm_node(node_id=f"node_{index:02d}", queries=queries))
-    return state
+    return dataclass_replace(
+        state,
+        metadata=PipelineMetadata(name=state.metadata.name, description="Optional commentary. " * 2000),
+    )
 
 
 def _optional_summary_chars(arguments, state: CompositionState) -> int:
