@@ -4,6 +4,7 @@ This repair candidate starts from `0b13686a647481761839310013663cdd9b8df5df`
 (version 0.8.9). Commit `47860b0227f23298e275803e4dd4afd3e30cf139`
 repairs the original delegated qualification failures. The subsequent test-only
 follow-up repairs the 16 wider planner consumers exposed by that checkpoint.
+The wire consumer follow-up below repairs the subsequent projection/decode drift.
 The integrator owns the canonical full gate; these focused results do not
 qualify the entire candidate.
 
@@ -30,7 +31,7 @@ Its obsolete unit matrix was retired. Integration coverage now retains ordinary
 authoring after preview and checks real deadline refusal, original-state
 immutability, preview evidence, tool-call identity, and inspection custody.
 
-## Validation
+## Original checkpoint validation
 
 All local Python execution used the isolated environment and both worktree
 source roots, with serial pytest and CPU affinity 0–3. Python is 3.14.3; CI's
@@ -97,3 +98,32 @@ No remaining red is known in this delegated focused set. Root-owned Advisor
 scoped-stop work and integrated qualification remain separate. No production
 code changed after `47860b022`; no broad suite, PostgreSQL gate, live provider
 acceptance, Gate1 prompt sequence, merge, push, or deployment was performed.
+
+## Wire consumer follow-up
+
+Starting from `b08b4f0b227fe71741cb4200c1f9c72dd76b09fc`, a focused run
+reproduced five stale wire-projection assertions (five failed, 37 passed),
+plus the adjacent decode seed-inventory failure. The live registry and pure
+normalizer measure 43 tools, 33 strict-capable tools, 17 promoted null paths,
+five already-nullable semantic positions, and 18 ledger entries.
+
+The exact test inventories now include `read_attachment`, its optional
+`expected_content_hash`, and `inspect_source.encoding`. The encoding's
+`minLength: 1` and `maxLength: 128` remain enforced by semantic admission;
+strict wire projection carries these limits in ledger description text.
+Both description sentences and the fail-closed missing-description control
+are covered. The dependent decode fixtures provide a schema-valid attachment
+seed, a 64-character lowercase hexadecimal hash, and `utf-8-sig` encoding.
+Existing null/non-null, omission, round-trip, and Hypothesis controls therefore
+exercise both new positions without weakening dialect boundaries.
+
+The two wire test modules complete with exit 0: 297 passed. Explicit encoding
+controls admit null and lengths 1 and 128, and refuse lengths 0 and 129 at
+semantic admission on both dialects, even when strict wire classification is
+valid. Unknown-tool, malformed-envelope, unsupported-keyword, missing teaching,
+and exact-limit refusal controls remain. Production code is unchanged.
+
+Canonical contracts and the live-tree masquerade/mock-discipline gate selection
+also complete with exit 0 (four gate cases passed). Ruff, formatting, and
+whitespace checks pass. Evidence remains in the private lane's `wire-*.log`
+files and `wire-inventory.json`; no broad suite or runtime execution was added.
