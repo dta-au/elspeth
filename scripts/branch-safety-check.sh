@@ -142,7 +142,9 @@ report INFO worktree "staged=$n_staged unstaged=$n_unstaged untracked=$n_untrack
 
 STAGED_FILES="$(git diff --cached --name-only)"
 if [ -n "$STAGED_FILES" ]; then
-    bad="$(grep -E '^\.claude/(lanes|handovers|red-team|worktrees)/|\.(log|done|pid)$|(^|/)(dry-run|dryrun)[^/]*$|^\.elspeth/' <<<"$STAGED_FILES" || true)"
+    # This tracked manifest is durable rotation evidence, not a runtime log.
+    # Its staged contents still pass through the blob and secret scans below.
+    bad="$(grep -Fxv '.elspeth/rotations.log' <<<"$STAGED_FILES" | grep -E '^\.claude/(lanes|handovers|red-team|worktrees)/|\.(log|done|pid)$|(^|/)(dry-run|dryrun)[^/]*$|^\.elspeth/' || true)"
     if [ -n "$bad" ]; then report FAIL staged-paths "artefact paths staged: $(tr '\n' ' ' <<<"$bad")" "git diff --cached --name-only"
     else report PASS staged-paths "no lane/log/artefact paths in the staged set" "git diff --cached --name-only"; fi
 
