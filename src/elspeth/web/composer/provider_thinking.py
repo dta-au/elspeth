@@ -28,7 +28,7 @@ def parse_native_thinking_blocks(value: object) -> list[dict[str, str]]:
     if type(value) not in (list, tuple):
         raise ComposerAdmissionRefused("Provider thinking state is not a complete native block list.")
     result: list[dict[str, str]] = []
-    for block in value:
+    for block in cast(list[object] | tuple[object, ...], value):
         if not isinstance(block, Mapping):
             raise ComposerAdmissionRefused("Provider thinking state contains an invalid block.")
         if block.get("type") == "thinking":
