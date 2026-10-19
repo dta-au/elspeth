@@ -237,6 +237,14 @@ test.describe("Composer workspace visual baselines", () => {
       TALL_DIALOG_NODE_COUNT + 2,
     );
     try {
+      // This full-page oracle includes the live readiness banner behind the
+      // dialog. Missing required prompt guards take precedence over missing
+      // provider credentials in the hermetic Playwright deployment.
+      await expect(
+        page.getByTestId("app-notice-primary").locator(".app-notice-primary-message"),
+      ).toHaveText(
+        "Service unavailable: Composer is unavailable: required prompt guard configuration is missing for composer, advisor.",
+      );
       await expect(composer.runPipeline()).toBeEnabled();
       await composer.runPipeline().click();
       const dialog = page.getByRole("alertdialog", { name: "Run pipeline" });
