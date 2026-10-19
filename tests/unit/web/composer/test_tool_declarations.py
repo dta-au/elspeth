@@ -1029,7 +1029,7 @@ class TestStep3BlobDiscoveryTierMigration:
         from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS
 
         names = {d.name for d in _REGISTERED_TOOLS if d.kind is ToolKind.BLOB_DISCOVERY}
-        assert names == {"list_blobs", "list_composer_blobs", "get_blob_metadata", "get_blob_content", "inspect_source"}
+        assert names == {"list_blobs", "list_composer_blobs", "get_blob_metadata", "get_blob_content", "read_attachment", "inspect_source"}
 
     def test_wire_blob_inline_ref(self) -> None:
         from elspeth.web.composer.tools._common import _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE

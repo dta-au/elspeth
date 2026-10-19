@@ -7,7 +7,7 @@ import functools
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 import structlog
@@ -57,7 +57,6 @@ from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls
 from elspeth.web.composer.no_tool_policy import (
     is_pending_interpretation_handoff,
-    is_referential_pipeline_mutation_intent,
     state_is_structurally_empty,
 )
 from elspeth.web.composer.pipeline_planner import (
@@ -118,7 +117,6 @@ from elspeth.web.sessions.pipeline_rejection_custody import (
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, RedactedPipelineArguments, SessionServiceProtocol
 
 slog = structlog.get_logger()
-_FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS: Final[int] = 8
 
 
 async def _await_pipeline_staging_write_with_deferred_cancellation[T](
@@ -194,19 +192,17 @@ def _freeform_planner_conversation_context(
     message: str,
     messages: list[ComposerHistoryMessage],
 ) -> PlannerConversationContext | None:
-    """Project bounded, authoritative earlier user requests for the planner.
+    """Preserve authoritative earlier user requests for the planner.
 
     Empty-state planning receives the current message separately as its
     custody-bearing ``PlannerOriginatingMessage``. This projection carries
-    only preceding user-authored requests needed to resolve a referential turn;
+    only preceding user-authored requests, including earlier amendments;
     assistant prose is model synthesis, not intent authority, and is excluded.
-    The first request plus the seven most recent requests survive long
-    histories, with an explicit omission count. The planner's existing exact
-    request-byte budget remains the final provider-call bound.
+    A fresh-looking build instruction can still depend on an earlier
+    restriction. Preserve every authenticated request in chronological order;
+    the planner's exact request-byte bound refuses an oversized packet before
+    any provider call instead of silently losing requirements.
     """
-    if not is_referential_pipeline_mutation_intent(message):
-        return None
-
     prior_requests: list[PlannerPriorUserRequest] = []
     for history_index, history_message in enumerate(messages):
         if type(history_message) is not dict:
@@ -228,16 +224,8 @@ def _freeform_planner_conversation_context(
 
     if not prior_requests:
         return None
-    if len(prior_requests) <= _FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS:
-        retained = tuple(prior_requests)
-        omitted = 0
-    else:
-        tail_count = _FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS - 1
-        retained = (prior_requests[0], *prior_requests[-tail_count:])
-        omitted = len(prior_requests) - len(retained)
     return PlannerConversationContext(
-        prior_user_requests=retained,
-        additional_prior_user_requests_omitted=omitted,
+        prior_user_requests=tuple(prior_requests),
     )
 
 

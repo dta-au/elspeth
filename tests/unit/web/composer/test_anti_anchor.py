@@ -70,11 +70,12 @@ def test_tracker_fires_on_three_same_tool_drift_failures() -> None:
     assert tracker.should_fire() is True
     hint = tracker.build_hint()
     assert "set_pipeline" in hint
-    assert "drift" in hint.lower()
+    assert "not compared" in hint
+    assert "drift without convergence" not in hint.lower()
     assert "different arguments" in hint
 
 
-def test_drift_hint_names_splice_for_one_node_linear_insertions() -> None:
+def test_different_arguments_do_not_prescribe_an_unmeasured_strategy_change() -> None:
     failures = deque(
         [
             ("set_pipeline", "hash-a"),
@@ -86,9 +87,9 @@ def test_drift_hint_names_splice_for_one_node_linear_insertions() -> None:
 
     hint = build_drift_hint(failures)
 
-    assert "one-node linear insertion" in hint
-    assert "splice_transform" in hint
-    assert "full-replacement payloads" in hint
+    assert "different arguments" in hint
+    assert "actual tool results" in hint
+    assert "choose a new repair strategy" not in hint
 
 
 def test_drift_hint_forbids_reproducing_prior_literal_values() -> None:

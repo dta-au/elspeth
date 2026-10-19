@@ -1,13 +1,14 @@
-"""§7.7 anti-anchor hints: break LLM retry loops with no progress.
+"""§7.7 hints for observed repeated tool failures.
 
 When the composer LLM retries the same tool with the same canonical arguments
-three times in a row, it has stopped reading new evidence — a context-anchored
-loop. The original §7.7 repair targeted that byte-identical pattern. Later
+three times in a row, the tracker can report that repeated failure pattern.
+It does not measure whether the model read new evidence. The original §7.7
+repair targeted that byte-identical pattern. Later
 audit of the captured Tier 1 final cohort RED (`53bc3cf2-…`, see
 `notes/composer-tier1.5-step-c-diagnosis-2026-05-06.md`) proved the actual
 payloads were distinct: the model drifted across failed `set_pipeline` calls,
 then surrendered to a text-only "I'm stuck" reply. The tracker therefore covers
-both anchored identity and same-tool drift without progress.
+both argument identity and same-tool failures with different arguments.
 
 The fix is small: after N=3 consecutive identical failures, inject a
 `role="user"` message before the next LLM call telling the model to enumerate
@@ -34,12 +35,10 @@ Detection criteria (deliberately conservative):
 - Three-in-a-row means: the LAST 3 entries in the bounded failure deque are
   all the same `(tool_name, hash)` pair. Earlier non-matching entries do not
   poison the trigger; the deque length is bounded so stale entries age out.
-- Drift without convergence means: the LAST 3 entries are failures for the same
-  tool but at least two distinct argument hashes. The model is changing payloads
-  but not making progress, so it needs a different repair strategy rather than
-  more small variations.
-- Any tool *success* clears the deque immediately. The system has, by
-  definition, just made progress.
+- Different-argument failure means: the LAST 3 entries are failures for the same
+  tool but at least two distinct argument hashes. Error details and validation
+  changes are not compared, so this does not establish repair progress.
+- Any tool *success* clears the failure window immediately.
 """
 
 from __future__ import annotations
@@ -64,7 +63,7 @@ def should_inject_hint(failures: FailureDeque) -> bool:
 
 
 def should_inject_drift_hint(failures: FailureDeque) -> bool:
-    """Return True iff the same tool has failed with drifting payloads."""
+    """Return True iff the same tool failed with differing argument hashes."""
     if len(failures) < _RETRY_THRESHOLD:
         return False
     last = list(failures)[-_RETRY_THRESHOLD:]
@@ -103,23 +102,21 @@ def build_anti_anchor_hint(failures: FailureDeque) -> str:
 
 
 def build_drift_hint(failures: FailureDeque) -> str:
-    """Compose a hint for same-tool drift without convergence."""
+    """Report observed failures without inferring their errors or progress."""
     if not should_inject_drift_hint(failures):
         raise ValueError("build_drift_hint requires 3 same-tool failures with different arguments")
     tool_name = failures[-1][0]
     return (
         f"[ELSPETH-SYSTEM-HINT] Your last {_RETRY_THRESHOLD} calls to `{tool_name}` "
-        "all failed while sending different arguments. This is drift without convergence: "
-        "small payload variations are not escaping the validator failure. "
-        "Before the next attempt, stop varying fields opportunistically and choose a new repair strategy: "
+        "all failed while sending different arguments. The error details and validation changes were not compared; "
+        "these observations alone do not establish whether the repairs made progress. "
+        "Use the actual tool results to decide the next step. When discussing them, "
         "reason only about field names, types, shapes, allowed keys, and cardinality; "
         "do not repeat, quote, summarize, or otherwise reproduce literal values from the failed payloads in assistant prose; "
         "(a) compare the last failed payloads structurally against the validator-named fields, "
         "(b) re-read the relevant schema or assistance result if the expected shape is unclear, "
-        "(c) rebuild the complete requested topology in one coherent payload, or "
-        "(d) surface a named gap if the requested shape is unsupported by the available tools. "
-        "When the goal is a one-node linear insertion, switch to `splice_transform` instead of "
-        "varying full-replacement payloads."
+        "(c) continue the repair justified by that evidence, or "
+        "(d) surface a named gap if the requested shape is unsupported by the available tools."
     )
 
 
@@ -142,7 +139,7 @@ class AntiAnchorTracker:
         self._categories.append(category)
 
     def record_success(self) -> None:
-        """Clear the deque. Any tool success means we have made progress."""
+        """Clear the preceding failure window after a successful tool call."""
         self._failures.clear()
         self._categories.clear()
 
@@ -174,13 +171,10 @@ class AntiAnchorTracker:
             }
             for category in list(self._categories)[-_RETRY_THRESHOLD:]
         ):
-            pattern = (
-                "with different arguments (drift without convergence)"
-                if should_inject_drift_hint(self._failures)
-                else "with byte-identical arguments"
-            )
+            pattern = "with different arguments" if should_inject_drift_hint(self._failures) else "with byte-identical arguments"
             return (
                 f"[ELSPETH-SYSTEM-HINT] Your last {_RETRY_THRESHOLD} calls to `{self._failures[-1][0]}` failed {pattern}. "
+                "The error details and validation changes were not compared; these observations alone do not establish repair progress. "
                 "Re-read the specific reported rule and repair guidance. "
                 "Correct only that issue; preserve valid pipeline topology and document content. "
                 "Do not repeat, quote, summarize, or otherwise reproduce any literal values from prior arguments or errors in assistant prose. "

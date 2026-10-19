@@ -1143,7 +1143,7 @@ def _composer_to_thread_uses_test_worker(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr("asyncio.to_thread", test_to_thread)
 
 
-def test_freeform_planner_context_is_bounded_with_explicit_omission_custody() -> None:
+def test_freeform_planner_context_preserves_every_authenticated_request() -> None:
     messages = [
         {
             "role": "user",
@@ -1158,6 +1158,8 @@ def test_freeform_planner_context_is_bounded_with_explicit_omission_custody() ->
     assert context is not None
     assert [(request.history_index, request.content) for request in context.prior_user_requests] == [
         (0, "request-0"),
+        (1, "request-1"),
+        (2, "request-2"),
         (3, "request-3"),
         (4, "request-4"),
         (5, "request-5"),
@@ -1166,7 +1168,7 @@ def test_freeform_planner_context_is_bounded_with_explicit_omission_custody() ->
         (8, "request-8"),
         (9, "request-9"),
     ]
-    assert context.additional_prior_user_requests_omitted == 2
+    assert context.additional_prior_user_requests_omitted == 0
 
 
 @pytest.mark.parametrize(

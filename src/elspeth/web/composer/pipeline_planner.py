@@ -134,9 +134,6 @@ from elspeth.web.composer.protocol import RetainedOperationContext, ToolArgument
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_discovery_response import (
     argument_error_response,
-    closed_provider_envelope,
-    schema_budget_failure,
-    schema_projection_failure,
 )
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
@@ -343,15 +340,13 @@ class PlannerInformationManifest:
 
 @dataclass(frozen=True, slots=True)
 class PlannerDiscoveryPolicy:
-    """Immutable palette derived from one request's exact information gaps."""
+    """Read-only discovery affordances plus one request's evidence manifest."""
 
     manifest: PlannerInformationManifest
     discovery_tool_names: tuple[str, ...]
     unresolved_classes: tuple[str, ...]
-    # Keys the request's authoring aids closed with complete content. Unlike
-    # every other supplied key, an aid-closed key keeps its palette tool
-    # advertised: the tool is the parity check for served content and the
-    # escape for a deployment whose next request lands on a deferral arm.
+    # Keys the request's authoring aids closed with complete content. These
+    # facts describe supplied evidence; all read tools remain available.
     aid_supplied_information: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
@@ -377,16 +372,9 @@ class PlannerDiscoveryPolicy:
             unavailable=unavailable,
             unresolved=detail_gaps,
         )
-        # list_models / get_expression_grammar deliberately never join
-        # ``omitted``: an aid-supplied key changes what the manifest claims,
-        # not which tools the palette offers.
-        omitted = {"get_pipeline_state", *set(_CATALOG_DETAIL_INFORMATION_BY_TOOL) - set(required_catalog_detail_tools)}
-        if unavailable:
-            omitted.add("preview_pipeline")
-        names = tuple(name for name in PLANNER_DISCOVERY_TOOL_NAMES if name not in omitted)
         return cls(
             manifest=manifest,
-            discovery_tool_names=names,
+            discovery_tool_names=PLANNER_DISCOVERY_TOOL_NAMES,
             unresolved_classes=(
                 "plugin.schema",
                 "plugin.assistance",
@@ -400,22 +388,12 @@ class PlannerDiscoveryPolicy:
             aid_supplied_information=aid_supplied_information,
         )
 
-    def _retains_tool(self, manifest: PlannerInformationManifest, name: str) -> bool:
-        if name == "list_models":
-            # A provider summary or a complete provider subset cannot close
-            # discovery of the rest of the catalog. Complete aids keep the
-            # existing parity affordance advertised.
-            return "model.catalog" in self.aid_supplied_information or not manifest.covers("model.catalog")
-        keys = _tool_information_keys(name, {})
-        if keys and all(key in self.aid_supplied_information for key in keys):
-            return True
-        return not all(manifest.covers(key) for key in keys)
-
     def with_manifest(self, manifest: PlannerInformationManifest) -> PlannerDiscoveryPolicy:
-        retained = tuple(name for name in self.discovery_tool_names if self._retains_tool(manifest, name))
         return PlannerDiscoveryPolicy(
             manifest=manifest,
-            discovery_tool_names=retained,
+            # Delivered evidence informs the manifest, not permission to read
+            # it again. A reread may be needed to repair a rejected candidate.
+            discovery_tool_names=self.discovery_tool_names,
             unresolved_classes=self.unresolved_classes,
             aid_supplied_information=self.aid_supplied_information,
         )
@@ -890,7 +868,8 @@ class PlannerModelConfig:
     prompt_guard_mount: PromptGuardMount | None = field(default=None, repr=False)
     escape_hatch_prompt_guard_mount: PromptGuardMount | None = field(default=None, repr=False)
     prompt_guard_mode: PromptGuardMode = "required"
-    # Senior advisor model for the one-shot escape-hatch overtime turn.
+    # Senior advisor model for discovery and one terminal candidate within the
+    # same physical request allowances.
     # None disables the hatch: budget exhaustion raises exactly as before.
     escape_hatch_model: str | None = None
     escape_hatch_provider: str | None = None
@@ -1969,7 +1948,8 @@ def _escape_hatch_notice() -> str:
     return (
         "You are a senior advisor model reviewing the retained transcript above as one freeform puzzle. "
         "Only protocol-complete turns are retained above; incomplete responses and calls rejected before execution are omitted. "
-        "Either "
+        "Read-only discovery tools remain available when evidence is missing or needs another look. "
+        "Use their actual results to resolve the gap, then either "
         "call emit_pipeline_proposal once with a complete, valid pipeline that satisfies the request, "
         "or reply in plain text honestly explaining why the request cannot be built with the available "
         "plugins. You may instead call handoff_to_user or restore_parked_graph alone to end authoring "
@@ -2949,14 +2929,17 @@ def _serialize_provider_discovery_result(
     if call.name == "get_plugin_schema" and result.success:
         contract, projection_available = _project_discovery_plugin_contract(admitted)
         if not projection_available:
-            return json.dumps(closed_provider_envelope(result, success=False, data=schema_projection_failure()).to_wire())
+            return serialize_admitted_discovery_result(admitted)
         assert contract is not None
         contract_payload = contract.to_dict()
         if (
             schema_contract_budget_remaining is not None
             and len(canonical_json(contract_payload).encode("utf-8")) > schema_contract_budget_remaining
         ):
-            return json.dumps(closed_provider_envelope(result, success=False, data=schema_budget_failure()).to_wire())
+            # This is a targeted read, not the optional aggregate repair
+            # attachment. Supply the admitted canonical contract; the exact
+            # whole-request physical bound still applies before the next call.
+            return serialize_admitted_discovery_result(admitted)
         return serialize_tool_result(replace(result, data=contract_payload))
     return serialize_admitted_discovery_result(admitted)
 
@@ -3512,10 +3495,8 @@ async def _plan_pipeline_inner(
     repair_count = 0
     prose_nudges = 0
     decline_notice_given = False
-    seen_discovery: set[tuple[str, str]] = set()
-    seen_discovery_round = 0
-    no_gain_calls_in_round = 0
     argument_retry = AntiAnchorTracker()
+    argument_failure_repair_count = repair_count
     last_argument_failure: tuple[str, str] | None = None
     consecutive_argument_failures = 0
     # Account for selected plugin contracts as the exact canonical aggregate
@@ -3523,6 +3504,7 @@ async def _plan_pipeline_inner(
     # Summing each contract independently creates a small but real gap at the
     # 48 KiB boundary.
     selected_schema_contracts: list[dict[str, Any]] = []
+    pending_schema_loaded: list[tuple[str, str]] = []
     # Pair recurrence informs feedback, but does not measure semantic progress.
     seen_rejection_fingerprints: set[tuple[tuple[str, str], ...]] = set()
     # Internal only: bind the actual authored values and order semantics, not
@@ -3541,9 +3523,8 @@ async def _plan_pipeline_inner(
         same request-scoped policy view, so a failure means the view changed
         under the request. That propagates, exactly as
         ``build_plugin_schemas_for_failure`` documents for the freeform twin.
-        A schema the BOUNDED projection cannot represent is an ordinary miss
-        and simply goes unattached — the model still has
-        ``get_plugin_assistance``.
+        A schema the compact projection cannot represent goes unattached here;
+        targeted ``get_plugin_schema`` can still supply its admitted full form.
         """
         contract, projection_available = _project_planner_plugin_contract(
             policy_catalog.get_schema(kind, plugin_name),
@@ -3616,7 +3597,7 @@ async def _plan_pipeline_inner(
             tools=marked_tools,
             canonical_schema=canonical_set_pipeline_schema(),
             capability_schema=canonical_set_pipeline_schema(),
-            tool_surface="full" if tools_override is None else "terminal_only",
+            tool_surface="full",
         )
         request_size = len(canonical_json({"messages": marked_messages, "tools": marked_tools}).encode("utf-8"))
         if request_size > budget_policy.max_request_bytes:
@@ -4137,15 +4118,19 @@ async def _plan_pipeline_inner(
         # Body success is insufficient: owned settlement must have unwound.
         if turn_evidence is not None and pending_delivery is not None:
             turn_evidence.confirm_delivery(pending_delivery, recorder.llm_calls)
+        # The result must have reached a successful physical round. A schema
+        # merely read or staged before a request/guard refusal is not loaded.
+        if mark_schema_loaded is not None:
+            for plugin_type, plugin_name in pending_schema_loaded:
+                mark_schema_loaded(plugin_type, plugin_name)
+        pending_schema_loaded.clear()
         return result
 
     # ── Escape-hatch state ────────────────────────────────────────────────
-    # On budget exhaustion, instead of failing immediately, one overtime turn
-    # runs on the senior advisor model with the terminal tool only. A text
-    # reply on that turn is an honest decline (PlannerDeclined); anything
-    # other than one clean accepted proposal re-raises the original error.
+    # The senior model can discover missing evidence before its proposal,
+    # under this same request's total provider/cost/byte/deadline bounds.
+    # A rejected senior candidate still preserves the original exhaustion.
     hatch_error: PipelinePlannerError | None = None
-    hatch_turn_next = False
     hatch_spent = False
     # Closed validation codes of the most recent candidate rejection, recorded
     # on any resulting exhaustion so the durable disposition names the wall.
@@ -4169,9 +4154,8 @@ async def _plan_pipeline_inner(
         return model_config.escape_hatch_model is not None and not hatch_spent
 
     def _engage_escape_hatch(error: PipelinePlannerError) -> None:
-        nonlocal hatch_error, hatch_turn_next, hatch_spent
+        nonlocal hatch_error, hatch_spent
         hatch_error = error
-        hatch_turn_next = True
         hatch_spent = True
         messages.append({"role": "user", "content": _escape_hatch_notice()})
 
@@ -4198,16 +4182,14 @@ async def _plan_pipeline_inner(
         )
 
     while True:
-        is_hatch_turn = hatch_turn_next
-        hatch_turn_next = False
+        is_hatch_turn = hatch_error is not None
         # A text decline is legal on an ordinary turn once catalog.selection
         # is supplied and no declared or requested information key remains
         # unresolved — vacuously true on turn 1 for a gapless request, which
         # permits a one-call decline by design. Because eligible turns keep
         # the full tool palette, classification requires the taught marker
         # prefix; marker-less text keeps the nudge treatment. The hatch turn
-        # accepts any text (its advisor is tool-restricted and taught by its
-        # own notice).
+        # accepts any text, as taught by its own notice.
         prose_decline_eligible = information_manifest.supplies(_CATALOG_SELECTION_INFORMATION) and all(
             information_manifest.covers(key) for key in pending_information
         )
@@ -4220,10 +4202,7 @@ async def _plan_pipeline_inner(
                 assert hatch_error is not None
                 message, calls, audited_call = await call_model(
                     model_override=model_config.escape_hatch_model,
-                    tools_override=[
-                        *recovery_tool_definitions(model_config.escape_hatch_tool_contract_dialect),
-                        planner_terminal_tool_definition(dialect=model_config.escape_hatch_tool_contract_dialect),
-                    ],
+                    tools_override=planner_tool_definitions(discovery_policy, dialect=model_config.escape_hatch_tool_contract_dialect),
                     allow_text_reply=True,
                     reasoning_effort=model_config.candidate_reasoning_effort,
                     attempt_phase_hint=ComposerPlannerAttemptPhase.HATCH,
@@ -4291,8 +4270,8 @@ async def _plan_pipeline_inner(
                     raise hatch_error from None
                 raise
             if is_hatch_turn:
-                # The advisor's one shot overflowed: the hatch is spent, the
-                # original exhaustion stands.
+                # The senior candidate overflowed: preserve the original
+                # exhaustion rather than extending its candidate allowance.
                 trail.finish_attempt("hatch", "truncated", led_to="terminal")
                 assert hatch_error is not None
                 raise hatch_error from None
@@ -4808,27 +4787,23 @@ async def _plan_pipeline_inner(
             recorder.settle_private_candidate(candidate_evidence_id, status="accepted")
             return accepted_plan
 
-        if is_hatch_turn:
-            # The advisor did anything other than one clean terminal proposal
-            # or an honest text decline: the hatch is spent, the original
-            # exhaustion stands.
+        if any(call.name not in _PLANNER_DISCOVERY_TOOL_NAME_SET for call in calls):
             trail.finish_attempt(
-                "hatch",
+                "hatch" if is_hatch_turn else "discovery",
                 "guard_fired",
                 planner_code="DISCOVERY_ONLY",
                 led_to="terminal",
                 tool_calls=len(calls),
             )
-            assert hatch_error is not None
-            raise hatch_error
-        if any(call.name not in _PLANNER_DISCOVERY_TOOL_NAME_SET for call in calls):
-            trail.finish_attempt("discovery", "guard_fired", planner_code="DISCOVERY_ONLY", led_to="terminal", tool_calls=len(calls))
+            if is_hatch_turn:
+                assert hatch_error is not None
+                raise hatch_error
             raise PipelinePlannerError(
                 "planner may execute read-only discovery tools only before its terminal proposal",
                 code="DISCOVERY_ONLY",
             )
         discovery_turns += 1
-        if discovery_turns > model_config.max_discovery_turns:
+        if not is_hatch_turn and discovery_turns > model_config.max_discovery_turns:
             if _hatch_available():
                 trail.finish_attempt(
                     "discovery", "budget_exhausted", planner_code="DISCOVERY_EXHAUSTED", led_to="hatch", tool_calls=len(calls)
@@ -4839,100 +4814,26 @@ async def _plan_pipeline_inner(
                 "discovery", "budget_exhausted", planner_code="DISCOVERY_EXHAUSTED", led_to="terminal", tool_calls=len(calls)
             )
             raise PipelinePlannerError("planner discovery turn budget exhausted", code="DISCOVERY_EXHAUSTED")
-        if repair_count != seen_discovery_round:
-            # Exact-call repetition stays round-scoped, but semantic
-            # information facts remain request-scoped: a successfully read
-            # schema is not forgotten just because a candidate was rejected.
-            seen_discovery.clear()
-            seen_discovery_round = repair_count
-            no_gain_calls_in_round = 0
+        if repair_count != argument_failure_repair_count:
+            # A candidate rejection separates discovery argument-error
+            # windows. Preserve that boundary without suppressing rereads.
             argument_retry.record_success()
             last_argument_failure = None
             consecutive_argument_failures = 0
+            argument_failure_repair_count = repair_count
         information_keys = {call.call_id: planner_discovery_information_keys(call) for call in calls}
-        no_gain_calls = tuple(
-            call
-            for call in calls
-            if information_keys[call.call_id] and all(information_manifest.covers(key) for key in information_keys[call.call_id])
-        )
-        useful_calls = tuple(call for call in calls if call not in no_gain_calls)
-        # Aid-supplied keys draw the same per-call no-gain teaching below but
-        # never feed the escalation counter: their palette tools stay
-        # advertised BY DESIGN (the parity/oversize escape), so calling one is
-        # an invited redundancy for the turn budget to absorb — not the
-        # stuck-planner signal this escalation exists for. Without the
-        # exemption, one list_models + get_expression_grammar pair (the exact
-        # batching the manifest usage line teaches) terminates the request or
-        # burns the one-shot hatch on turn 1.
-        escalating_no_gain_calls = tuple(
-            call
-            for call in no_gain_calls
-            if not all(
-                ("model.catalog" if key.startswith("model.catalog.") else key) in discovery_policy.aid_supplied_information
-                for key in information_keys[call.call_id]
-            )
-        )
-        no_gain_calls_in_round += len(escalating_no_gain_calls)
-        escalate_no_gain = bool(escalating_no_gain_calls) and no_gain_calls_in_round >= 2
-        for call in useful_calls:
+        for call in calls:
             pending_information.update(information_keys[call.call_id])
-        keys = tuple((call.name, stable_hash(call.arguments)) for call in useful_calls if call.wire_error is None)
-        if any(key in seen_discovery for key in keys) or len(set(keys)) != len(keys):
-            # A cycling planner is stuck by definition — hand the puzzle to
-            # the advisor rather than failing the request.
-            if _hatch_available():
-                trail.finish_attempt("discovery", "guard_fired", planner_code="DISCOVERY_CYCLE", led_to="hatch", tool_calls=len(calls))
-                _engage_escape_hatch(PipelinePlannerError("planner discovery repetition/cycle guard fired", code="DISCOVERY_CYCLE"))
-                continue
-            trail.finish_attempt("discovery", "guard_fired", planner_code="DISCOVERY_CYCLE", led_to="terminal", tool_calls=len(calls))
-            raise PipelinePlannerError("planner discovery repetition/cycle guard fired", code="DISCOVERY_CYCLE")
-        seen_discovery.update(keys)
         await emit_progress(lifecycle.progress, tool_batch_progress_event(tuple(call.name for call in calls)))
         messages.append(_assistant_tool_calls_message(message, calls, thinking_blocks=audited_call.thinking_blocks))
-        for call in useful_calls:
+        for call in calls:
             await emit_progress(lifecycle.progress, tool_started_progress_event(call.name))
-
-        if not useful_calls:
-            trail.finish_attempt(
-                "discovery",
-                "guard_fired",
-                planner_code="DISCOVERY_NO_GAIN",
-                led_to="hatch" if escalate_no_gain and _hatch_available() else "terminal" if escalate_no_gain else "continue",
-                tool_calls=len(calls),
-            )
-            for call in no_gain_calls:
-                no_gain_feedback_json = canonical_json(
-                    {
-                        "success": False,
-                        "error_code": "DISCOVERY_NO_GAIN",
-                        "information_keys": list(information_keys[call.call_id]),
-                        "message": "The requested information is already supplied or unavailable.",
-                    }
-                )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.call_id,
-                        "content": no_gain_feedback_json,
-                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
-                            no_gain_feedback_json,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                            encoder=_primitive_canonical_json,
-                            decoder=canonical_json_loads,
-                        ),
-                    }
-                )
-            if escalate_no_gain:
-                if _hatch_available():
-                    _engage_escape_hatch(PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN"))
-                    continue
-                raise PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN")
-            continue
 
         async def execute_one_discovery(
             call: _ParsedToolCall,
+            wire_dialect: ToolContractDialect = (
+                model_config.escape_hatch_tool_contract_dialect if is_hatch_turn else model_config.tool_contract_dialect
+            ),
         ) -> tuple[_ParsedToolCall, AdmittedDiscoveryResult | _PlannerArgumentRejection, bool]:
             dispatch = begin_dispatch(
                 call.call_id,
@@ -4999,16 +4900,14 @@ async def _plan_pipeline_inner(
                             affected_nodes=(),
                         ),
                         argument_error_response(exc),
-                        wire_argument_repair_message(_WIRE_TOOL_DEFS[model_config.tool_contract_dialect][call.name])
-                        if call.wire_error is not None
-                        else None,
+                        wire_argument_repair_message(_WIRE_TOOL_DEFS[wire_dialect][call.name]) if call.wire_error is not None else None,
                     ),
                     False,
                 )
             carrier = cast(_AuditedDiscoveryResult, audited.result)
             return call, carrier.admitted, True
 
-        discovery_tasks = [asyncio.create_task(execute_one_discovery(call)) for call in useful_calls]
+        discovery_tasks = [asyncio.create_task(execute_one_discovery(call)) for call in calls]
         try:
             done, pending = await asyncio.wait(discovery_tasks, return_when=asyncio.FIRST_EXCEPTION)
         except BaseException:
@@ -5045,31 +4944,6 @@ async def _plan_pipeline_inner(
         discovery_results = iter(task.result() for task in discovery_tasks)
         new_information: list[ComposerPlannerInformationClass] = []
         for call in calls:
-            if call in no_gain_calls:
-                no_gain_feedback_json = canonical_json(
-                    {
-                        "success": False,
-                        "error_code": "DISCOVERY_NO_GAIN",
-                        "information_keys": list(information_keys[call.call_id]),
-                        "message": "The requested information is already supplied or unavailable.",
-                    }
-                )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.call_id,
-                        "content": no_gain_feedback_json,
-                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
-                            no_gain_feedback_json,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                            encoder=_primitive_canonical_json,
-                            decoder=canonical_json_loads,
-                        ),
-                    }
-                )
-                continue
             result_call, discovery_result, information_resolved = next(discovery_results)
             result = discovery_result.result
             if result_call is not call:
@@ -5110,24 +4984,16 @@ async def _plan_pipeline_inner(
                 }
             )
             information_available = result.success
-            newly_covered_keys = tuple(key for key in information_keys[call.call_id] if not information_manifest.covers(key))
+            newly_covered_keys = tuple(key for key in information_keys[call.call_id] if not information_manifest.supplies(key))
             if call.name == "get_plugin_schema" and result.success:
                 assert isinstance(discovery_result, AdmittedDiscoveryResult)
-                if mark_schema_loaded is not None:
-                    # Same per-session tracker and key shape the freeform
-                    # batch writes (tool_batch.py); a successful dispatch has
-                    # already validated both arguments. Failures never mark.
-                    mark_schema_loaded(str(call.arguments["plugin_type"]), str(call.arguments["name"]))
+                pending_schema_loaded.append((str(call.arguments["plugin_type"]), str(call.arguments["name"])))
                 contract, projection_available = _project_discovery_plugin_contract(discovery_result)
-                if not projection_available:
-                    information_available = False
-                else:
+                if projection_available:
                     assert contract is not None
                     contract_payload = contract.to_dict()
                     candidate_contracts = [*selected_schema_contracts, contract_payload]
-                    if len(canonical_json(candidate_contracts).encode("utf-8")) > _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES:
-                        information_available = False
-                    else:
+                    if len(canonical_json(candidate_contracts).encode("utf-8")) <= _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES:
                         selected_schema_contracts.append(contract_payload)
             if information_resolved:
                 # A non-argument outcome breaks the rejection sequence. In
@@ -5141,7 +5007,8 @@ async def _plan_pipeline_inner(
                     _resolved_discovery_information_keys(call, discovery_result),
                     available=information_available,
                 )
-                new_information.extend(_planner_information_classes(newly_covered_keys))
+                if information_available:
+                    new_information.extend(_planner_information_classes(newly_covered_keys))
             else:
                 failure = (call.name, stable_hash(call.arguments))
                 consecutive_argument_failures = consecutive_argument_failures + 1 if failure == last_argument_failure else 1
@@ -5192,16 +5059,10 @@ async def _plan_pipeline_inner(
         trail.finish_attempt(
             "discovery",
             "discovery_executed",
-            planner_code="DISCOVERY_NO_GAIN" if escalate_no_gain else None,
-            led_to="hatch" if escalate_no_gain and _hatch_available() else "terminal" if escalate_no_gain else "continue",
+            led_to="continue",
             tool_calls=len(calls),
             new_information=tuple(new_information),
         )
-        if escalate_no_gain:
-            if _hatch_available():
-                _engage_escape_hatch(PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN"))
-                continue
-            raise PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN")
         if pending_information and all(information_manifest.supplies(key) for key in pending_information):
             messages.append({"role": "user", "content": _ALL_INFORMATION_GAPS_CLOSED_NOTICE})
 

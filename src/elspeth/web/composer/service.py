@@ -1831,9 +1831,9 @@ class ComposerServiceImpl:
             )
 
         # §7.7 anti-anchor hint: if the last 3 failed tool calls share the
-        # same (tool_name, arguments_hash), the model has stopped reading
-        # validator feedback. Inject a synthetic role="user" hint before
-        # the next LLM turn so the model breaks the anchor. consume_fire()
+        # same tool (with identical or different argument hashes), report
+        # those observations without inferring whether repairs progressed.
+        # Inject a synthetic role="user" hint before the next LLM turn. consume_fire()
         # clears the deque so the hint cannot re-fire on the same anchor.
         # Persisted first as a system-origin audit row whose closed envelope
         # records the provider role. Replay restores that exact role/content.
@@ -1857,21 +1857,21 @@ class ComposerServiceImpl:
                 )
             anti_anchor.consume_fire()
             llm_messages.append({"role": "user", "content": hint_text})
-            is_drift_hint = "drift without convergence" in hint_text
+            is_drift_hint = "with different arguments" in hint_text or "sending different arguments" in hint_text
             await emit_progress(
                 progress,
                 ComposerProgressEvent(
                     phase="using_tools",
-                    headline="ELSPETH detected a no-progress retry pattern.",
+                    headline="ELSPETH observed three failed calls to the same tool.",
                     evidence=(
                         (
-                            "The last 3 tool calls used different arguments but failed the same repair loop."
+                            "The last 3 tool calls used different arguments and failed; their error details and progress were not compared."
                             if is_drift_hint
                             else "The last 3 tool calls used identical arguments and failed."
                         ),
                         "A structural hint was injected to help the model converge.",
                     ),
-                    likely_next="The model will see the hint and try a different argument shape.",
+                    likely_next="The model will review the actual tool results before choosing its next step.",
                 ),
             )
 
