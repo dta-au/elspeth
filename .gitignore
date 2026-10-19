@@ -359,4 +359,3 @@ Thumbs.db
 # FINAL RULE: keep .gitkeep files everywhere (overrides earlier ignores).
 !.gitkeep
 evals/composer-battery/planner_probe.py
-
