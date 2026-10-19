@@ -200,7 +200,7 @@ class TestSchemaShapeBoundSplit:
 class TestClosedRootLookup:
     def test_every_advertised_tool_resolves_to_a_closed_root(self) -> None:
         names = [definition["name"] for definition in get_tool_definitions()]
-        assert len(names) == 42
+        assert len(names) == 43
         for name in names:
             schema = _closed_root_schema(name)
             assert schema["type"] == "object"

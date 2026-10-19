@@ -14,6 +14,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCal
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.prompt_guard import PromptGuardContentPart
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer._attachment_response import CompleteAttachmentDataModel
 from elspeth.web.composer.advisor_abandonment import AdvisorAbandonmentReview, build_abandonment_review
@@ -190,6 +191,23 @@ class AdvisorPublicationReview:
     semantic_repair_key: str
     payload_json: str = field(repr=False)
     provider_payload_json: str = field(repr=False)
+
+    def current_request_text(self) -> str:
+        """The complete centrally redacted request owned by this snapshot."""
+        return cast(str, json.loads(self.provider_payload_json)["current_request"])
+
+    def provider_review_context_json(self) -> str:
+        """Refer to the preceding request section instead of sending it twice."""
+        payload = json.loads(self.provider_payload_json)
+        del payload["current_request"]
+        payload["current_request_ref"] = "complete_original_user_request_section"
+        return json.dumps(payload, ensure_ascii=False)
+
+    def untrusted_content_parts(self) -> tuple[PromptGuardContentPart, ...]:
+        """Inspect the exact rendered publication projection as untrusted data."""
+        from elspeth.web.composer.prompt_guard_rendering import json_content_parts
+
+        return json_content_parts(self.provider_review_context_json(), ensure_ascii=False)
 
 
 def _coverage(pages: Sequence[_RegisteredInspection]) -> tuple[BlobInspectionCoverage, ...]:

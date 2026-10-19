@@ -116,7 +116,6 @@ if TYPE_CHECKING:
 
 _ADVISOR_RECENT_ERRORS_MAX_ITEMS: Final[int] = 5
 _ADVISOR_LIST_ITEM_MAX_CHARS: Final[int] = 2_000
-_ADVISOR_USER_MESSAGE_MAX_CHARS: Final[int] = 2_000
 
 
 def _compose_deadline_time() -> float:
@@ -693,15 +692,10 @@ class AdvisorCheckpointOwner:
         (topology + node options + field contracts) is passed as
         ``schema_excerpt``.
 
-        ``user_message`` (R2-F8a, elspeth-583c2a0792) is the ORIGINATING user
-        chat turn, threaded ONLY for ``phase="end"`` — the one advisory review
-        positioned to catch visible mismatches such as "user said fixed,
-        config says flexible". It is genuinely untrusted (user-authored) text,
-        bounded to
-        :data:`_ADVISOR_USER_MESSAGE_MAX_CHARS` and rendered inside the same
-        untrusted fence as ``schema_excerpt`` by ``build_advisor_user_message``
-        — never as a new unfenced channel. The EARLY phase reviews only
-        topology/field-contract coherence because it receives no user intent.
+        ``user_message`` is the complete originating user turn, rendered as
+        untrusted data. END publication evidence already owns that complete
+        request, so its separate fallback is omitted rather than duplicated.
+        Required request text is not part of the optional graph-prose allowance.
         """
         pipeline_summary = _advisor_context.summarize_pipeline_for_advisor(state)
         # Identity covers complete evidence, before optional prose fitting.
@@ -754,7 +748,7 @@ class AdvisorCheckpointOwner:
             "trigger": ADVISOR_TRIGGER_DETERMINISTIC_END,
             "problem_summary": (
                 pass_context + "Advisory review of the supplied evidence. Assess whether the visible "
-                "pipeline evidence is internally sound and whether the visible user-request excerpt "
+                "pipeline evidence is internally sound and whether the complete current user request, when supplied, "
                 "aligns with it. Flag any concrete visible mismatch, broken field contract, or "
                 "subjective rubric that should have been surfaced. "
                 "Use each LLM node's visible effective prompt text (its prompt_template, or in "
@@ -771,9 +765,10 @@ class AdvisorCheckpointOwner:
                 "across rows. "
                 "Do not infer or verify constraints whose required value is withheld, omitted, or "
                 "truncated. Deterministic validation, not this advisor, owns full pipeline and schema "
-                "correctness outside the supplied evidence; omitted user text is outside this review. "
+                "correctness outside the supplied evidence. Missing prior history or reference text is an evidence gap, "
+                "not proof that the user never supplied a constraint. "
                 "Within that scope, quote each explicit configuration constraint visible in the "
-                "user's request excerpt (schema mode, field names/types, named plugins/values) and "
+                "user's complete request (schema mode, field names/types, named plugins/values) and "
                 "compare it only when the pipeline excerpt exposes the corresponding fact; FLAG any "
                 "visible mismatch. "
                 "Keys listed under values withheld are present-but-not-shown, and any "
@@ -786,12 +781,12 @@ class AdvisorCheckpointOwner:
             "attempted_actions": attempted_actions,
             "schema_excerpt": pipeline_summary,
         }
-        if user_message is not None and user_message.strip():
-            end_arguments["user_message"] = _advisor_context.truncate_advisor_text(user_message, _ADVISOR_USER_MESSAGE_MAX_CHARS)
         if publication_review is not None:
             if type(publication_review) is not AdvisorPublicationReview:
                 raise TypeError("END publication review must be an owned snapshot")
             end_arguments["publication_review"] = publication_review
+        elif user_message is not None and user_message.strip():
+            end_arguments["user_message"] = user_message
         summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap)
         end_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
         end_arguments["_elspeth_advisor_summary_parts"] = summary_parts
@@ -1077,7 +1072,7 @@ class AdvisorCheckpointOwner:
         ``user_message`` (R2-F8a, elspeth-583c2a0792) is the ORIGINATING user
         chat turn — the only piece of caller-supplied (untrusted) text this
         operation accepts, and it is forwarded exactly as
-        :meth:`_run_advisor_checkpoint` requires: bounded, redacted, and
+        :meth:`_run_advisor_checkpoint` requires: complete, redacted, and
         rendered inside the existing untrusted fence — never as a new
         unfenced channel and never used for any phase but ``"end"``.
         """

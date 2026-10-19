@@ -38,6 +38,7 @@ describe("read-only / mutating membership", () => {
     "explain_validation_error",
     "generate_yaml",
     "get_blob_content",
+    "read_attachment",
     "get_blob_metadata",
     "inspect_source",
     "list_blobs",
@@ -201,6 +202,9 @@ describe("describeToolCall", () => {
   it("keeps the merged catalog covering both halves of the read-only/mutating split", () => {
     expect(TOOL_CALL_DESCRIPTIONS.get_plugin_schema).toBe(
       "Reads a plugin's configuration schema to understand its options.",
+    );
+    expect(describeToolCall("read_attachment")).toBe(
+      "Reads a session attachment's complete text for inspection.",
     );
     expect(TOOL_CALL_DESCRIPTIONS.set_pipeline).toBe(
       "Replaces the entire pipeline configuration in a single operation.",

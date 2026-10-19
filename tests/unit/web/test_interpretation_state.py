@@ -1287,7 +1287,29 @@ def test_prompt_shield_warning_uses_available_draft_in_state_b() -> None:
     pairs_c = prompt_shield_recommendation_warning_pairs(state, shield_available=False)
     assert pairs_c
     assert any(PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT in message for _component, message in pairs_c)
-    assert any("continuing without a shield is allowed" in message for _component, message in pairs_c)
+    assert any("Shield installation is optional and may be declined by the user." in message for _component, message in pairs_c)
+
+
+@pytest.mark.parametrize("shield_available", [False, True])
+def test_operator_upload_does_not_exempt_external_text_from_required_shield_recommendation(shield_available: bool) -> None:
+    from elspeth.web.interpretation_state import refine_prompt_shield_warnings_for_availability
+
+    validation = _state_with_plain_llm_only().validate()
+    warnings = refine_prompt_shield_warnings_for_availability(
+        [{"component": entry.component, "message": entry.message, "severity": entry.severity} for entry in validation.warnings],
+        shield_available=shield_available,
+    )
+    warning = next(entry for entry in warnings if entry["component"] == "node:rate_node" and "prompt-injection shield" in entry["message"])
+    message = warning["message"]
+
+    assert "Operator-supplied or uploaded data is not necessarily trusted." in message
+    assert "If this LLM consumes untrusted or externally controlled text" in message
+    assert "stage the required prompt-injection-shield recommendation decision card" in message
+    assert "Shield installation is optional and may be declined by the user." in message
+    assert "Trusted internal-only values do not require this recommendation." in message
+    assert "Continue authoring while review is pending" in message
+    assert "pending review does not approve or execute the pipeline" in message
+    assert warning["severity"] == "medium"
 
 
 def test_field_mapper_projection_without_web_scrape_raw_fields_does_not_create_cleanup_review_site() -> None:

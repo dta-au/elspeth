@@ -276,8 +276,8 @@ def _without(kwargs: Mapping[str, Any], *keys: str) -> dict[str, Any]:
 
 
 def _loop_request(requests: list[dict[str, Any]]) -> dict[str, Any]:
-    loop_requests = [request for request in requests if "tools" in request and len(request["tools"]) == 44]
-    assert loop_requests, "the ordinary compose loop made no 44-tool request"
+    loop_requests = [request for request in requests if "tools" in request and len(request["tools"]) == 45]
+    assert loop_requests, "the ordinary compose loop made no 45-tool request"
     return loop_requests[0]
 
 

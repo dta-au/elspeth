@@ -872,7 +872,7 @@ async def test_sessionless_gateway_boot_probe_is_unqualified_without_dispatch(
         composer_prompt_guard_mode=mode,
     )
     assert [request.surface for request in requests] == ["loop_tools", "planner_tools"]
-    assert requests[0].tool_count == 44
+    assert requests[0].tool_count == 45
 
     for request in requests:
         assert request.model == model
@@ -1062,12 +1062,12 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
 
 
 def _loop_tools_stamped(flag: bool) -> list[dict[str, Any]]:
-    """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (34 true, 10 false)."""
+    """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (35 true, 10 false)."""
     from elspeth.contracts.composer_llm_audit import ToolContractDialect
     from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
     tools = [tool for tool in composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT) if tool["function"]["strict"] is flag]
-    assert len(tools) == (34 if flag else 10)
+    assert len(tools) == (35 if flag else 10)
     return tools
 
 
@@ -1130,7 +1130,7 @@ async def test_gateway_accepts_the_preferred_route_tool_list(gateway_base_url: s
     resolution = resolve_strict_transport(model=_MODEL_ALIAS, api_base=f"{gateway_base_url}/v1", setting="preferred", env={})
     assert resolution.transport is StrictTransport.NONE
     tools = composer_loop_tool_definitions(dialect_for(resolution.transport))
-    assert len(tools) == 44
+    assert len(tools) == 45
     assert [tool for tool in tools if "strict" in tool["function"]] == []
 
     response = await litellm.acompletion(

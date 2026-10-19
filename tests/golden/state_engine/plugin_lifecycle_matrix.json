@@ -964,6 +964,35 @@
       "release_lane": "local"
     },
     {
+      "plugin_key": "transform:batch_duplicate_annotator",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_duplicate_annotator",
+      "qualname": "BatchDuplicateAnnotator",
+      "source_path": "src/elspeth/plugins/transforms/batch_duplicate_annotator.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_duplicate_annotator:BatchDuplicateAnnotator",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.infrastructure.base:BaseTransform"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
       "plugin_key": "transform:batch_effect_size",
       "kind": "transform",
       "module": "elspeth.plugins.transforms.batch_effect_size",

@@ -20,10 +20,12 @@ from unittest.mock import MagicMock
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlMode, PluginCapability
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_CONTENT_PARTS_KEY
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSecretRequirement, PluginSummary
+from elspeth.web.composer.discovery_cache import serialize_tool_result, tool_result_content_parts
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
 from elspeth.web.composer.prompts import (
     CATALOG_CONTEXT_PREFIX,
@@ -45,6 +47,7 @@ from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolContext
 from elspeth.web.composer.tools.sessions import _execute_set_pipeline
+from elspeth.web.composer.tools.transforms import _execute_set_metadata
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
@@ -326,6 +329,57 @@ class TestBuildMessages:
         assert empty_messages[-2]["role"] == "user"
         assert sourced_messages[-2]["role"] == "user"
         assert empty_messages[-2]["content"] != sourced_messages[-2]["content"]
+
+    def test_state_snapshot_remains_honest_after_two_successful_mutations(self) -> None:
+        catalog = _stub_catalog()
+        state = replace(_empty_state(), version=2)
+        messages = build_messages([], state, "Update the pipeline metadata.", catalog, schemas_loaded=frozenset())
+        snapshot_message = messages[-2]
+        snapshot_content = snapshot_message["content"]
+        snapshot = json.loads(snapshot_content.split("\n", 1)[1])
+        view, plugin_snapshot = _trained_policy_context(catalog)
+        context = ToolContext(catalog=view, plugin_snapshot=plugin_snapshot)
+
+        for call_id, patch in (("rename", {"name": "Renamed pipeline"}), ("describe", {"description": "Updated description"})):
+            arguments = {"patch": patch}
+            result = _execute_set_metadata(arguments, state, context)
+            assert result.success
+            serialized = serialize_tool_result(result)
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {"id": call_id, "type": "function", "function": {"name": "set_metadata", "arguments": json.dumps(arguments)}}
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": serialized,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(result, serialized),
+                    },
+                ]
+            )
+            state = result.updated_state
+
+        assert [json.loads(message["content"])["version"] for message in messages if message["role"] == "tool"] == [3, 4]
+        assert snapshot["current_state"]["version"] == 2
+        assert snapshot["current_state"]["metadata"]["name"] == "Test Pipeline"
+        header = snapshot_content.split("\n", 1)[0]
+        assert "snapshot at context construction" in header
+        assert "as of current_state.version" in header
+        assert "Later successful mutation/tool results with newer state versions take precedence for the state they report" in header
+        assert "Current pipeline state" not in header
+        assert "UNTRUSTED DATA" in header
+        assert "".join(part.text for part in snapshot_message[PROMPT_GUARD_CONTENT_PARTS_KEY]) == snapshot_content
+
+        refreshed = build_messages([], state, "Continue.", catalog, schemas_loaded=frozenset())
+        refreshed_snapshot = json.loads(refreshed[-2]["content"].split("\n", 1)[1])
+        assert refreshed_snapshot["current_state"]["version"] == 4
+        assert refreshed_snapshot["current_state"]["metadata"]["name"] == "Renamed pipeline"
+        assert refreshed_snapshot["composer_progress"] == snapshot["composer_progress"]
 
     def test_untrusted_state_is_not_emitted_as_system_message(self) -> None:
         catalog = _stub_catalog()

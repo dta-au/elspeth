@@ -209,6 +209,7 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "batch_data_quality_report": Determinism.DETERMINISTIC,
     "batch_distribution_profile": Determinism.DETERMINISTIC,
     "batch_drift_compare": Determinism.DETERMINISTIC,
+    "batch_duplicate_annotator": Determinism.DETERMINISTIC,
     "batch_effect_size": Determinism.DETERMINISTIC,
     "batch_experiment_compare": Determinism.DETERMINISTIC,
     "batch_outlier_annotator": Determinism.DETERMINISTIC,

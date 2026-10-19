@@ -39,8 +39,8 @@ def test_publication_provider_projection_preserves_digest_and_scrubs_text(monkey
     message = build_advisor_user_message(
         {"trigger": "test", "problem_summary": "test", "recent_errors": [], "attempted_actions": [], "publication_review": review}
     )
-    assert message.count(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) == message.count(_ADVISOR_UNTRUSTED_SUMMARY_END) == 1
-    wire = message.split(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1].split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0]
+    assert message.count(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) == message.count(_ADVISOR_UNTRUSTED_SUMMARY_END) == 2
+    wire = message.rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1].split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0]
     payload = json.loads(wire)
     assert payload["current_graph_hash"] == digest
     assert payload["saved_effects"]["initial_authored_state_hash"] == digest

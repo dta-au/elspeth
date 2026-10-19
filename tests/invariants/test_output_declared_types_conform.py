@@ -192,6 +192,12 @@ _CASES: list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]] = [
         [{"copies": 2, "id": 1}, {"copies": 1, "id": 2}],
     ),
     ("report", "report_assemble", {"schema": {"mode": "observed"}, "text_field": "line"}, [{"line": "one"}, {"line": "two"}]),
+    (
+        "duplicates-mixed-members",
+        "batch_duplicate_annotator",
+        {"schema": {"mode": "observed"}, "rules": [{"name": "repeated", "cells": [{"field": "v"}]}]},
+        [{"v": "same"}, {"v": "same"}, {"v": "different"}, {"v": None}],
+    ),
 ]
 
 
@@ -214,7 +220,7 @@ def test_every_declared_type_holds_on_the_real_computation(
 ) -> None:
     transform = _transform(plugin_name, config)
     input_rows = [make_pipeline_row(row) for row in rows]
-    result = transform.process(input_rows, _probe_context(transform))
+    result = transform.process(input_rows, _probe_context(transform, batch_size=len(input_rows)))
     assert result.status == "success", (case_id, result.reason)
     emitted = _emitted_rows_from_result(result)
     assert emitted, case_id
@@ -254,7 +260,7 @@ def test_every_concrete_declaration_of_every_batch_plugin_is_exercised() -> None
         transform = _transform(plugin_name, config)
         concrete = _concrete_declarations(transform)
         declared.setdefault(plugin_name, set()).update(concrete)
-        result = transform.process([make_pipeline_row(row) for row in rows], _probe_context(transform))
+        result = transform.process([make_pipeline_row(row) for row in rows], _probe_context(transform, batch_size=len(rows)))
         assert result.status == "success", (plugin_name, result.reason)
         covered.setdefault(plugin_name, set()).update(_checked_concrete_fields(_emitted_rows_from_result(result), concrete))
 

@@ -5,7 +5,7 @@ From T8 the service resolves each route's dialect from ``composer_model`` /
 (``strict_transport.resolve_composer_tool_contract``). Under the default
 ``preferred``:
 
-- an OpenRouter planner with no custom base (row 4) sends the 34 mechanical
+- an OpenRouter planner with no custom base (row 4) sends the 35 mechanical
   tools with ``strict: true`` and the 10 option tools with ``strict: false``,
   and each LLM call records ``openai_strict`` with its strict-tool count;
 - ``composer_strict_tools="off"`` and the default ``gpt-5.5`` (row 7, ruling 7)
@@ -165,10 +165,10 @@ def _strict_flags(tools: list[dict[str, Any]]) -> list[object]:
 @pytest.mark.parametrize(
     ("overrides", "dialect", "strict_count"),
     [
-        ({"composer_model": _OPENROUTER_PLANNER}, _STRICT, 34),
+        ({"composer_model": _OPENROUTER_PLANNER}, _STRICT, 35),
         ({"composer_model": _OPENROUTER_PLANNER, "composer_strict_tools": "off"}, _NONE, 0),
         ({}, _NONE, 0),
-        ({"composer_strict_tools": "forward_to_endpoint"}, _STRICT, 34),
+        ({"composer_strict_tools": "forward_to_endpoint"}, _STRICT, 35),
     ],
     ids=["openrouter_preferred", "openrouter_off", "default_gpt_5_5", "gpt_5_5_forward_to_endpoint"],
 )
@@ -189,9 +189,9 @@ async def test_compose_turn_sends_and_records_the_resolved_dialect(
     assert result.repair_turns_used == 0
     for request, call in zip(completion.call_args_list, result.llm_calls, strict=True):
         sent = request.kwargs["tools"]
-        assert len(sent) == 44
+        assert len(sent) == 45
         if dialect is _STRICT:
-            assert _strict_flags(sent).count(True) == 34
+            assert _strict_flags(sent).count(True) == 35
             assert _strict_flags(sent).count(False) == 10
         else:
             assert set(_strict_flags(sent)) == {"omitted"}

@@ -363,7 +363,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b0bbbcebb627bae3"
+    source_file_hash: str | None = "sha256:7d4ce6833cb24ca0"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -691,14 +691,15 @@ class ValueTransform(BaseTransform):
                 composer_hints=(
                     "Call get_expression_grammar to see the allowed operations — only stdlib-safe expressions are permitted.",
                     "Achievable here: arithmetic (row['a'] + row['b'], abs(row['n'])), field copies and overwrites, string "
-                    "concatenation, case folding/trimming via lower(row['x']), upper(row['x']), strip(row['x']), "
-                    "casefold(row['x']), strict leading-prefix predicates via starts_with(text, prefix), whitespace word_count(text), "
-                    "inclusive decimal-spelling tolerance via decimal_within(left, right, tolerance), membership tests, conditionals. "
-                    "decimal_within accepts finite int/float values, excluding bool, and a nonnegative tolerance; it does not "
-                    "repair earlier binary-float arithmetic. For type changes use type_coerce.",
+                    "concatenation, membership tests and conditionals.",
+                    "For case folding/trimming use lower(row['x']), upper(row['x']), strip(row['x']) and casefold(row['x']).",
+                    "Use starts_with(text, prefix) for strict leading-prefix predicates and word_count(text) for whitespace-delimited counts.",
+                    "Use decimal_within(left, right, tolerance) for inclusive decimal-spelling tolerance. It accepts finite int/float "
+                    "values, excluding bool, and a nonnegative tolerance; it does not repair earlier binary-float arithmetic.",
+                    "For type changes use type_coerce.",
                     "NOT achievable here: regex (pattern extraction, splitting), title-casing, and method-call syntax "
-                    "(row['x'].lower() is rejected; use lower(row['x'])). Only len, abs, lower, upper, strip, casefold, "
-                    "starts_with, word_count, decimal_within "
+                    "(row['x'].lower() is rejected; use lower(row['x'])).",
+                    "Only len, abs, lower, upper, strip, casefold, starts_with, word_count, decimal_within "
                     "are callable. Route text rewriting beyond case folding through an llm transform.",
                     "Declare arriving types for consumed fields and output types for new targets. A provably incompatible authored target is refused at build; a value-dependent mismatch routes to on_error.",
                     "Treat any as its own type at typed consumers and union branches, never as a wildcard.",

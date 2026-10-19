@@ -934,7 +934,7 @@ async def test_run_advisor_checkpoint_telemetry_failure_does_not_replace_complet
 @pytest.mark.asyncio
 async def test_run_advisor_checkpoint_end_threads_user_message(make_service, simple_state):
     """R2-F8a (elspeth-583c2a0792): the END checkpoint carries the originating
-    user message through to the advisor call, bounded and rendered inside the
+    user message through to the advisor call, complete and rendered inside the
     untrusted fence, with a visible-evidence-only constraint rubric."""
     service = make_service()
     service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_checkpoint_reply(), {}))
@@ -947,7 +947,7 @@ async def test_run_advisor_checkpoint_end_threads_user_message(make_service, sim
     )
     args = service._advisor_checkpoint._call_advisor_with_audit.call_args.args[0]
     assert args["user_message"] == "Use a strictly fixed schema, not a flexible one."
-    assert ("Within that scope, quote each explicit configuration constraint visible in the user's request excerpt") in args[
+    assert ("Within that scope, quote each explicit configuration constraint visible in the user's complete request") in args[
         "problem_summary"
     ]
     assert "compare it only when the pipeline excerpt exposes the corresponding fact" in args["problem_summary"]
@@ -1074,10 +1074,9 @@ def test_end_advisor_prompt_scopes_bounded_and_withheld_evidence(make_service) -
     CLEAN must not certify user text, schema fields, or option values that the
     safe projection intentionally omits.
     """
-    from elspeth.web.composer.advisor_checkpoint import _ADVISOR_USER_MESSAGE_MAX_CHARS
     from elspeth.web.composer.advisor_context import build_advisor_user_message
 
-    oversized = "Use a fixed schema. " * (_ADVISOR_USER_MESSAGE_MAX_CHARS // 5)
+    oversized = "Use a fixed schema. " * 400
     base_state = _textract_advisor_state()
     base_source = base_state.sources["source"]
     source_options = dict(base_source.options)
@@ -1108,8 +1107,8 @@ def test_end_advisor_prompt_scopes_bounded_and_withheld_evidence(make_service) -
     )
     prompt = build_advisor_user_message(arguments)
 
-    assert arguments["user_message"].endswith("…")
-    assert "Bounded, redacted excerpt of the user's original request" in prompt
+    assert arguments["user_message"] == oversized
+    assert "Complete original user request" in prompt
     assert "Do not infer or verify constraints whose required value is withheld, omitted, or truncated" in prompt
     assert "Deterministic validation, not this advisor" in prompt
     from elspeth.web.composer.advisor_context import advisor_system_instructions_for_trigger
@@ -1122,17 +1121,14 @@ def test_end_advisor_prompt_scopes_bounded_and_withheld_evidence(make_service) -
     assert "values withheld: blob_ref, path" in prompt
 
 
-def test_build_checkpoint_arguments_end_truncates_long_user_message(make_service, simple_state):
-    from elspeth.web.composer.advisor_checkpoint import _ADVISOR_USER_MESSAGE_MAX_CHARS
-
+def test_build_checkpoint_arguments_end_preserves_long_user_message(make_service, simple_state):
     service = make_service()
     oversized = "fixed schema please. " * 500
-    assert len(oversized) > _ADVISOR_USER_MESSAGE_MAX_CHARS
+    assert len(oversized) > 2_000
 
     args = service._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=simple_state, user_message=oversized)
 
-    assert len(args["user_message"]) <= _ADVISOR_USER_MESSAGE_MAX_CHARS
-    assert len(args["user_message"]) < len(oversized)
+    assert args["user_message"] == oversized
 
 
 def test_build_checkpoint_arguments_end_omits_blank_user_message(make_service, simple_state):
@@ -1184,8 +1180,9 @@ async def test_end_gate_flags_user_stated_schema_mode_mismatch(make_service, cle
     exactly like any other accepted FLAGGED structured reply."""
 
     def _advisor_side_effect(arguments, **_kwargs):
-        assert "user_message" in arguments
-        assert "fixed schema" in arguments["user_message"]
+        review = arguments["publication_review"]
+        assert "user_message" not in arguments
+        assert "fixed schema" in json.loads(review.provider_payload_json)["current_request"]
         assert "quote each explicit configuration constraint visible" in arguments["problem_summary"]
         return (
             _checkpoint_reply(
@@ -6361,6 +6358,48 @@ async def test_large_checkpoint_body_without_publication_fits_real_wire(make_ser
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_publication", [True, False])
+async def test_actual_advisor_receives_whole_current_request_once(
+    make_service, simple_state, monkeypatch, physical_advisor, with_publication
+):
+    service = make_service()
+    secret = "sk-" + "A1b2C3d4" * 6
+    request = "CURRENT_REQUEST_START " + "ordinary requirement text " * 800 + " CURRENT_REQUEST_TAIL " + secret
+    assert len(request) > 2_000
+    fenced = physical_advisor.bind(service, review_state=simple_state if with_publication else None, request=request)
+    arguments = service._advisor_checkpoint._build_checkpoint_arguments(
+        phase="end",
+        state=simple_state,
+        user_message=request,
+        publication_review=fenced.get("publication_review"),
+    )
+    calls = _install_budget_advisor_transport(monkeypatch, [_checkpoint_reply(publication_verdict="WITHHOLD")])
+    with prompt_guard_user_scope(""):
+        await service._advisor_checkpoint._call_advisor_with_audit(
+            arguments, recorder=make_recorder(), structured_output=True, provider_owner=physical_advisor.owner
+        )
+    prepared = calls[0]["messages"][1]["content"]
+    assert prepared.count("CURRENT_REQUEST_START") == 1
+    assert prepared.count("CURRENT_REQUEST_TAIL") == 1
+    from elspeth.web.validation import _redact_sensitive_content
+
+    assert prepared.count(_redact_sensitive_content(request)) == 1
+    assert secret not in prepared
+    assert "Bounded, redacted excerpt of the user's original request" not in prepared
+    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_HEADER
+
+    assert prepared.index("CURRENT_REQUEST_START") < prepared.index(_ADVISOR_UNTRUSTED_SUMMARY_HEADER)
+    if with_publication:
+        assert prepared.index("CURRENT_REQUEST_START") < prepared.index("Candidate/request and server-owned")
+    from elspeth.web.composer.advisor_context import advisor_user_content_parts
+
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == prepared
+    assert all(part.trust is None for part in parts)
+    assert max(len(part.inspection_text if part.inspection_text is not None else part.text) for part in parts) < 10_000
+
+
+@pytest.mark.asyncio
 async def test_unsent_format_retry_keeps_first_actual_call_without_completed_review(
     make_service, simple_state, monkeypatch, physical_advisor
 ):
@@ -6577,9 +6616,10 @@ def test_budgeted_end_retains_mandatory_context_and_tail_graph_facts(make_servic
     assert arguments["attempted_actions"] == [
         f"Successful pipeline mutation since the prior review: {name}" for name in previous.successful_mutating_actions
     ]
-    assert arguments["user_message"] == request and arguments["publication_review"] is review
+    assert "user_message" not in arguments
+    assert review.current_request_text() == request and arguments["publication_review"] is review
     prompt = build_advisor_user_message(arguments)
-    assert 0 <= _optional_summary_chars(arguments, state) <= 16000 and review.provider_payload_json in prompt
+    assert 0 <= _optional_summary_chars(arguments, state) <= 16000 and review.provider_review_context_json() in prompt
     assert "late_model_canary" not in review.provider_payload_json and "late_sink_field_canary" not in review.provider_payload_json
     fitting = dataclass_replace(state, nodes=(tail,))
     visible = service._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=fitting)["schema_excerpt"]

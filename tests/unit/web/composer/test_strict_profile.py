@@ -22,13 +22,14 @@ from elspeth.web.composer.tools.strict_profile import (
 
 K = StrictViolationKind
 
-# The 32 loop tools with no free-form object anywhere in their flat schema S.
+# The 33 loop tools with no free-form object anywhere in their flat schema S.
 _STRICT_CANDIDATES: frozenset[str] = frozenset(
     {
         "list_blobs",
         "list_composer_blobs",
         "get_blob_metadata",
         "get_blob_content",
+        "read_attachment",
         "create_blob",
         "update_blob",
         "delete_blob",
@@ -76,8 +77,8 @@ _OPTION_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# The 12 strict candidates that are NOT strict-clean as sent (optional
-# properties, or keywords outside the wire allowlist). The other 20 are.
+# The 14 strict candidates that are NOT strict-clean as sent (optional
+# properties, or keywords outside the wire allowlist). The other 19 are.
 _NOT_CLEAN_AS_SENT: frozenset[str] = frozenset(
     {
         "create_blob",
@@ -85,6 +86,8 @@ _NOT_CLEAN_AS_SENT: frozenset[str] = frozenset(
         "clear_source",
         "get_pipeline_state",
         "get_blob_content",
+        "read_attachment",
+        "inspect_source",
         "get_plugin_assistance",
         "list_models",
         "upsert_edge",
@@ -348,18 +351,26 @@ def test_checker_does_not_mutate_its_input() -> None:
 def test_inventory_partition_over_flat_s_is_pinned_by_name() -> None:
     definitions = {definition["name"]: definition["parameters"] for definition in get_tool_definitions()}
     assert set(definitions) == _STRICT_CANDIDATES | _OPTION_TOOLS
-    assert len(_STRICT_CANDIDATES) == 32
+    assert len(_STRICT_CANDIDATES) == 33
     assert len(_OPTION_TOOLS) == 10
 
     clean = {name for name in _STRICT_CANDIDATES if check_openai_strict(definitions[name], tool=name) == ()}
     assert clean == _STRICT_CANDIDATES - _NOT_CLEAN_AS_SENT
-    assert len(clean) == 20
+    assert len(clean) == 19
     # Native continuation defaults remain optional. The strict-wire projection
     # has its own controls; native inventory must not pretend it was projected.
     assert {(row.kind, row.path) for row in check_openai_strict(definitions["get_blob_content"], tool="get_blob_content")} == {
         (K.OPTIONAL_PROPERTY, "/properties/offset_chars"),
         (K.OPTIONAL_PROPERTY, "/properties/expected_content_hash"),
         (K.KEYWORD_NOT_ALLOWLISTED, "/properties/offset_chars/default"),
+    }
+    assert {(row.kind, row.path) for row in check_openai_strict(definitions["read_attachment"], tool="read_attachment")} == {
+        (K.OPTIONAL_PROPERTY, "/properties/expected_content_hash"),
+    }
+    assert {(row.kind, row.path) for row in check_openai_strict(definitions["inspect_source"], tool="inspect_source")} == {
+        (K.OPTIONAL_PROPERTY, "/properties/encoding"),
+        (K.KEYWORD_NOT_ALLOWLISTED, "/properties/encoding/minLength"),
+        (K.KEYWORD_NOT_ALLOWLISTED, "/properties/encoding/maxLength"),
     }
 
     for name in _STRICT_CANDIDATES:

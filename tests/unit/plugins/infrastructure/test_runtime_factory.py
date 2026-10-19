@@ -169,12 +169,15 @@ def test_flush_window_plugin_as_collector_reports_the_placement_not_the_plugins_
     assert "text_field" not in str(excinfo.value)  # the report_assemble constructor never ran
 
 
-def test_only_report_assemble_declares_the_aggregation_window_requirement():
-    """The declaration is opt-in: every other registered batch plugin stays a legal collector."""
+def test_registered_aggregation_window_requirements_are_exact():
+    """EOF duplicate comparison and report windows cannot run as collectors."""
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
     transforms = get_shared_plugin_manager().get_transforms()
-    assert {cls.name for cls in transforms if cls.requires_aggregation_batch_context} == {"report_assemble"}
+    assert {cls.name for cls in transforms if cls.requires_aggregation_batch_context} == {
+        "batch_duplicate_annotator",
+        "report_assemble",
+    }
     # Positive control: the registry is populated and batch plugins are in it.
     assert len({cls.name for cls in transforms if cls.is_batch_aware}) >= 13
 
@@ -182,9 +185,9 @@ def test_only_report_assemble_declares_the_aggregation_window_requirement():
 def test_every_registered_batch_plugin_states_whether_passthrough_can_carry_it():
     """flush_emits_one_row_per_buffered_row is ONE authority, stated in each batch plugin's own class body.
 
-    Exactly one shipped batch plugin emits one row per buffered row:
-    batch_rank, which emits every buffered row (an unranked one with a null
-    rank). Every other one reduces the batch, replicates rows, or
+    batch_rank emits every buffered row (an unranked one with a null rank),
+    and batch_duplicate_annotator retains every compared member. Every other
+    one reduces the batch, replicates rows, or
     (batch_outlier_annotator) skips rows whose value is null or non-finite, so
     passthrough admits none of them.
     """
@@ -194,7 +197,10 @@ def test_every_registered_batch_plugin_states_whether_passthrough_can_carry_it()
     assert len(batch_plugins) >= 13  # positive control: the registry is populated
     undeclared = sorted(cls.name for cls in batch_plugins if "flush_emits_one_row_per_buffered_row" not in cls.__dict__)
     assert undeclared == []
-    assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == ["batch_rank"]
+    assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == [
+        "batch_duplicate_annotator",
+        "batch_rank",
+    ]
 
 
 def test_the_passthrough_declaration_census_sees_a_declaring_plugin(monkeypatch):
@@ -204,7 +210,11 @@ def test_the_passthrough_declaration_census_sees_a_declaring_plugin(monkeypatch)
     batch_stats_cls = get_shared_plugin_manager().get_transform_by_name("batch_stats")
     monkeypatch.setattr(batch_stats_cls, "flush_emits_one_row_per_buffered_row", True)
     batch_plugins = [cls for cls in get_shared_plugin_manager().get_transforms() if cls.is_batch_aware]
-    assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == ["batch_rank", "batch_stats"]
+    assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == [
+        "batch_duplicate_annotator",
+        "batch_rank",
+        "batch_stats",
+    ]
 
 
 def test_a_passthrough_aggregation_reports_the_output_mode_not_the_plugins_config_error():

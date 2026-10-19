@@ -166,18 +166,24 @@ PROMPT_SHIELD_AVAILABLE_DRAFT: Final[str] = (
 # ContentTrust declaration: untrusted producers present -> the constants
 # above; none -> these.
 PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT: Final[str] = (
-    "Recommend inserting a prompt-injection shield transform "
-    "in front of this LLM if its input data may carry adversarial text. This pipeline has no "
-    "external-content fetch step: the LLM consumes operator-supplied source content, so the "
-    "exposure is limited to adversarial text already present in that data, and continuing "
-    "without a shield is allowed. "
+    "This pipeline has no declared untrusted-content producer upstream. "
+    "Operator-supplied or uploaded data is not necessarily trusted. "
+    "If this LLM consumes untrusted or externally controlled text, stage the required "
+    "prompt-injection-shield recommendation decision card. "
+    "Shield installation is optional and may be declined by the user. "
+    "Trusted internal-only values do not require this recommendation. "
+    "Continue authoring while review is pending; pending review does not approve or execute the pipeline. "
 )
 PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT: Final[str] = (
-    "An authorized prompt-injection shield IS available in this deployment. This pipeline has no "
-    "external-content fetch step: the LLM consumes operator-supplied source content, so the "
-    "exposure is limited to adversarial text already present in that data. Wiring the shield in "
-    "front of this LLM is recommended if that data may carry adversarial text, and you may "
-    "proceed without it. "
+    "An authorized prompt-injection shield IS available in this deployment and is strongly recommended "
+    "for untrusted or externally controlled text. "
+    "No upstream producer is declared untrusted in this pipeline. "
+    "Operator-supplied or uploaded data is not necessarily trusted. "
+    "If this LLM consumes untrusted or externally controlled text, stage the required "
+    "prompt-injection-shield recommendation decision card. "
+    "Shield installation is optional and may be declined by the user. "
+    "Trusted internal-only values do not require this recommendation. "
+    "Continue authoring while review is pending; pending review does not approve or execute the pipeline. "
 )
 
 _RAW_HTML_CLEANUP_DRAFT_MARKERS: Final[tuple[str, ...]] = ("raw html", "fingerprint")

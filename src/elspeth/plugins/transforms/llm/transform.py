@@ -1242,7 +1242,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2c0a844e8d80556d"
+    source_file_hash: str | None = "sha256:498b84f2c8939775"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -2166,12 +2166,17 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "For how <adjective> phrasing, use the adjective itself as user_term unless the user supplied a more specific criterion phrase; do not use the whole how-phrase.",
                     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model — don't hand-add them.",
                     "required_input_fields names upstream columns and bounds template visibility (ADR-051). Never require this node's generated fields as upstream inputs. options.schema.fields may declare output types (ADR-050); it does not extract fields from the reply.",
-                    "Declared inputs reject empty/whitespace strings before provider dispatch by default. For a prompt that must classify unavailable text, set allow_blank_input_fields to only the relevant required_input_fields. This preserves the original string, declared visibility, field presence and types; non-nullable nulls and other blank fields still fail. It does not generate an unavailable result or waive input/result checks.",
+                    "Declared inputs reject empty/whitespace strings before provider dispatch by default. For a prompt that must classify unavailable text, set allow_blank_input_fields to only the relevant required_input_fields.",
+                    "allow_blank_input_fields preserves the original string, declared visibility, field presence and types; non-nullable nulls and other blank fields still fail. It does not generate an unavailable result or waive input/result checks.",
                     "The plugin derives generated outputs from response_field and output_fields; pass-through guarantees come from upstream.",
-                    "Optional input_checks are named strict-Boolean expressions on the entry row, before any per-row model request. False/non-Boolean/evaluation errors route a nonretryable failure via on_error without widening prompt visibility. Operation startup preflight remains separate. Keep detailed admission causes in the incoming row for error-sink row_json retention.",
-                    "Multi-query input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered needs list-form named queries, pool_size=1; allows exact bindings to earlier validated generated fields, never self/forward. Per-query output_fields default to <queryname>_<suffix>.",
-                    "Per-query structured_output_prefix: null/omitted retains the query-name stem; empty string emits bare suffixes; a nonempty ASCII identifier (at most 64 characters) emits <stem>_<suffix>. JSON response keys and raw/usage/model names stay unchanged. Any non-null override requires unique final generated names across every query; ordered mode always rejects collisions.",
-                    "A separate semantic reviewer query must bind the actual earlier generated fields and relevant original evidence explicitly. A Boolean verdict plus result_checks can reject before downstream release. Separate model calls are not a certification of semantic correctness; both prompts and authored judgment semantics still need ordinary review.",
+                    "Optional input_checks are named strict-Boolean expressions on the entry row, before any per-row model request. False/non-Boolean/evaluation errors route a nonretryable failure via on_error without widening prompt visibility.",
+                    "input_checks do not replace operation startup preflight. Keep detailed admission causes in the incoming row for error-sink row_json retention.",
+                    "Multi-query input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered needs list-form named queries and pool_size=1; exact bindings may name earlier validated generated fields, never self/forward.",
+                    "Per-query output_fields default to <queryname>_<suffix>.",
+                    "Per-query structured_output_prefix: null/omitted retains the query-name stem; empty string emits bare suffixes; a nonempty ASCII identifier (at most 64 characters) emits <stem>_<suffix>.",
+                    "structured_output_prefix leaves JSON response keys and raw/usage/model names unchanged. Any non-null override requires unique final generated names across every query; ordered mode always rejects collisions.",
+                    "A separate semantic reviewer query must bind the actual earlier generated fields and relevant original evidence explicitly. A Boolean verdict plus result_checks can reject before downstream release.",
+                    "Separate model calls are not a certification of semantic correctness; both prompts and authored judgment semantics still need ordinary review.",
                     "Ordered mode preserves original-only source_row/images and atomic final output. Later failure routes the original entry row; prior calls/charges remain. Node-level restart may repeat calls; no durable mid-node resume or exactly-once guarantee.",
                     "Optional chain compaction is an operator choice. Inspect all consumers, exact output names/types, rendered prompts, effective provider/profile/settings, intermediate shields/gates/mappers/branches and failure policies.",
                     "For optional chain compaction, independent entry-row queries can qualify; dependent queries require ordered mode. Never promise fewer calls/tokens. Disclose changed quarantine/audit/checkpoint boundaries.",

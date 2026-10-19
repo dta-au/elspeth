@@ -32,8 +32,8 @@ V3_ASSESSMENT_SCHEMA_PATH = V3_CATALOG_DIRECTORY / "assessment.schema.json"
 ASSESSMENT_SCRIPT_PATH = REPOSITORY_ROOT / "scripts/state_engine_assessment.py"
 PROFILE_REPORTER_PLUGIN = "scripts.state_engine_profile_reporter"
 V1_CATALOG_SHA256 = "2e025df8fcb61869f4ac2575d2d1b0c5bba5aa63c88c0d059e630431062eef2e"
-V2_CATALOG_SHA256 = "fa7de10748467554c713c3f30710f69dd212816a0e085420ca4f74d27284a03a"
-V3_CATALOG_SHA256 = "0ae852cd4af7295bf9cc15baf0cce16c9416a10fa449359802505089e8cda98b"
+V2_CATALOG_SHA256 = "08f3faadaf07ee5aa8c1a793250b775e5a7b80a745b78e26f357d1e061dbd3dc"
+V3_CATALOG_SHA256 = "b78c4b6d007967fd000544b4cd06f27993936c30e6576cc48909b0f512fa4713"
 
 
 def _load_catalog(path: Path) -> dict[str, object]:
@@ -165,7 +165,7 @@ def test_v2_catalog_plugin_cases_exhaust_live_inventory() -> None:
     ]
 
     assert pb09["required_cases"] == expected
-    assert len(expected) == 59
+    assert len(expected) == 60
 
 
 def test_v1_catalog_remains_byte_identical_historical_evidence() -> None:
@@ -389,7 +389,14 @@ def _existing_artifact_record(repository: Path, path: str, kind: str) -> dict[st
     return {"kind": kind, "path": path, "sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest()}
 
 
+def _isolate_pytest_root(repository: Path) -> None:
+    # These fixtures live inside the project. Disabled plugin autoload must
+    # not inherit the ancestor checkout's xdist addopts or pytest root.
+    (repository / "pytest.ini").write_text("[pytest]\naddopts =\n", encoding="utf-8")
+
+
 def _genuine_sqlite_evidence(repository: Path) -> dict[str, Any]:
+    _isolate_pytest_root(repository)
     test_relative = "tests/test_state_engine_runtime_profile.py"
     test_path = repository / test_relative
     test_path.parent.mkdir(exist_ok=True)
@@ -403,7 +410,7 @@ def _genuine_sqlite_evidence(repository: Path) -> dict[str, Any]:
         "    )\n",
         encoding="utf-8",
     )
-    _git(repository, "add", test_relative)
+    _git(repository, "add", test_relative, "pytest.ini")
     _git(repository, "commit", "-qm", "add genuine profile evidence node")
     stem = "docs/architecture/state_engine/assessments/minimal-assessment/evidence/ev-genuine"
     junit_relative = f"{stem}.junit.xml"
@@ -989,6 +996,7 @@ def _materialize_executed_validator_fixture_assessment(
     repository: Path,
     assessment_path: Path,
 ) -> None:
+    _isolate_pytest_root(repository)
     catalog = json.loads((repository / "docs/architecture/state_engine/proof-catalog/v2/catalog.json").read_text())
     assessment = json.loads(assessment_path.read_text())
     cells = _required_cells(catalog)
@@ -1000,7 +1008,7 @@ def _materialize_executed_validator_fixture_assessment(
     }
     test_relative = "tests/test_state_engine_validator_mechanics.py"
     (repository / test_relative).write_text(_validator_fixture_module_source(subjects_by_profile), encoding="utf-8")
-    _git(repository, "add", test_relative)
+    _git(repository, "add", test_relative, "pytest.ini")
     _git(repository, "commit", "-qm", "add synthetic validator mechanics selectors")
     assessment["baseline"]["commit"] = _git(repository, "rev-parse", "HEAD")
     assessment["baseline"]["tree"] = _git(repository, "rev-parse", "HEAD^{tree}")
@@ -1197,6 +1205,7 @@ def test_load_unique_json_rejects_duplicate_keys(tmp_path: Path) -> None:
 def test_profile_reporter_emits_sqlite_runtime_observation_and_exact_junit_node(
     tmp_path: Path,
 ) -> None:
+    _isolate_pytest_root(tmp_path)
     test_path = tmp_path / "tests/test_runtime_profile.py"
     test_path.parent.mkdir()
     test_path.write_text(
@@ -1270,6 +1279,7 @@ def test_profile_reporter_emits_sqlite_runtime_observation_and_exact_junit_node(
 def test_profile_reporter_emits_exact_outcomes_and_warning_provenance(
     tmp_path: Path,
 ) -> None:
+    _isolate_pytest_root(tmp_path)
     test_path = tmp_path / "tests/test_runtime_outcomes.py"
     test_path.parent.mkdir()
     test_path.write_text(

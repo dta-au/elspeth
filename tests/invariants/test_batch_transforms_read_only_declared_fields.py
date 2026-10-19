@@ -67,7 +67,9 @@ _MEASURED_ANCHORS = frozenset({"batch_threshold_summary", "batch_stats"})
 # * batch_rank treats a row without value_field as unranked, not as a contract
 #   violation: the row passes through with rank and percentile null and is left
 #   out of ranked_count, which is what keeps its flush one row per buffered row.
-_DECLARES_NO_REQUIRED_INPUT = frozenset({"batch_replicate", "batch_rank"})
+# * batch_duplicate_annotator records missing/non-string cells as member causes
+#   instead of rejecting the whole batch through a required-input contract.
+_DECLARES_NO_REQUIRED_INPUT = frozenset({"batch_duplicate_annotator", "batch_replicate", "batch_rank"})
 
 
 def _batch_transform_roster() -> list[Any]:

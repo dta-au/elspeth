@@ -50,19 +50,19 @@ def _service(app: FastAPI) -> ComposerServiceImpl:
 
 
 def test_default_settings_publish_the_setting_and_the_tool_set_counts(tmp_path: Path) -> None:
-    assert _tool_contract(create_app(_settings(tmp_path))) == {"setting": "preferred", "strict_capable_tool_count": 32, "tool_count": 42}
+    assert _tool_contract(create_app(_settings(tmp_path))) == {"setting": "preferred", "strict_capable_tool_count": 33, "tool_count": 43}
 
 
 def test_off_publishes_the_same_counts(tmp_path: Path) -> None:
     assert _tool_contract(create_app(_settings(tmp_path, composer_strict_tools="off"))) == {
         "setting": "off",
-        "strict_capable_tool_count": 32,
-        "tool_count": 42,
+        "strict_capable_tool_count": 33,
+        "tool_count": 43,
     }
 
 
 def test_planner_route_is_not_disclosed(tmp_path: Path) -> None:
-    """Row 4 (OpenRouter host, effective 34) and row 5 (custom base, effective 0) publish identical values."""
+    """Row 4 (OpenRouter host, effective 35) and row 5 (custom base, effective 0) publish identical values."""
     hosted = create_app(_settings(tmp_path / "a", composer_model=_OPENROUTER_PLANNER))
     proxied = create_app(
         _settings(
@@ -73,7 +73,7 @@ def test_planner_route_is_not_disclosed(tmp_path: Path) -> None:
         )
     )
     # Not vacuous: the two configs really do send different strict counts.
-    assert _service(hosted).tool_contract_summary.loop_strict_tool_count == 34
+    assert _service(hosted).tool_contract_summary.loop_strict_tool_count == 35
     assert _service(proxied).tool_contract_summary.loop_strict_tool_count == 0
 
     assert repr(_tool_contract(hosted)) == repr(_tool_contract(proxied))
@@ -158,8 +158,8 @@ async def test_each_sent_surface_logs_one_owned_boot_outcome(tmp_path: Path, mon
         entry["probed_surface"]: (entry["tool_count"], entry["strict_true_count"], entry["strict_false_count"], entry["strict_key_omitted"])
         for entry in outcomes
     }
-    assert counts["loop_tools"] == (44, 34, 10, 0)
-    assert counts["planner_tools"] == (22, 21, 1, 0)
+    assert counts["loop_tools"] == (45, 35, 10, 0)
+    assert counts["planner_tools"] == (23, 22, 1, 0)
     assert counts["hatch_terminal"] == (3, 2, 1, 0)
     assert counts["advisor"] == (0, 0, 0, 0)
     rendered = repr(outcomes)

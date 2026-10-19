@@ -152,7 +152,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         metafunc.parametrize("_preserving_cls", preserving, ids=lambda c: c.__name__)
 
 
-def _probe_context(transform: BaseTransform) -> Any:
+def _probe_context(transform: BaseTransform, *, batch_size: int = 1) -> Any:
     """Minimal TransformContext for probe invocations.
 
     The harness runs transforms in isolation without a real run; the context
@@ -173,13 +173,13 @@ def _probe_context(transform: BaseTransform) -> Any:
     ctx = make_context()
     if transform.is_batch_aware:
         ctx.aggregation_batch = AggregationBatchContext(
-            trigger_type="count",
+            trigger_type="end_of_source" if transform.requires_complete_source_batch else "count",
             batch_id="probe-batch",
-            batch_size=1,
+            batch_size=batch_size,
             flush_index=1,
-            rows_seen_total=1,
+            rows_seen_total=batch_size,
             row_start=1,
-            row_end=1,
+            row_end=batch_size,
             is_end_of_source=True,
         )
     return ctx
